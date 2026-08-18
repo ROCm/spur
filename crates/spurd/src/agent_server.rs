@@ -262,13 +262,12 @@ impl RunningJobsHandle {
     /// Deregistering lets the controller reclaim them, matching the pre-manifest
     /// behavior of an unconditional deregister.
     pub async fn has_no_active_jobs(&self) -> bool {
-        if self
-            .running
-            .lock()
-            .await
-            .values()
-            .any(|t| !t.job.is_allocation_only())
-        {
+        // Hold `running` across both checks. Releasing it between them would
+        // reopen the very window this closes: a launch could insert into
+        // `running` after the first check and drop its `launching` reservation
+        // before the second. Lock order is running -> allocation, as elsewhere.
+        let running = self.running.lock().await;
+        if running.values().any(|t| !t.job.is_allocation_only()) {
             return false;
         }
         !self.allocation.lock().await.has_launching()
@@ -500,8 +499,7 @@ impl AgentService {
 
         if manifest.pending.all_discharged() {
             executor::cleanup_job_spool(job_id, manifest.run_attempt);
-            cleanup_completed_job_mpi(job_id, &manifest.mpi, &self.pmi_servers, &self.mpi_host)
-                .await;
+            cleanup_completed_job_mpi(job_id, &manifest.mpi, &self.mpi_host).await;
         }
     }
 
@@ -533,9 +531,8 @@ impl AgentService {
                         error!(job_id, error = ?e, "refusing to adopt job with conflicting resources");
                         continue;
                     }
-                    // Forked jobs ran under container namespaces; a PTY master fd can't survive restart.
-                    let is_root = nix::unistd::geteuid().is_root();
-                    let is_container = manifest.forked;
+                    // A PTY master fd can't survive a restart, so an adopted job
+                    // never has one.
                     self.running.lock().await.insert(
                         job_id,
                         TrackedJob {
@@ -543,9 +540,9 @@ impl AgentService {
                             rootfs_mode: manifest.rootfs_mode,
                             stdout_path: manifest.stdout_path,
                             stderr_path: manifest.stderr_path,
-                            has_pid_namespace: is_root || is_container,
-                            has_user_namespace: is_container && !is_root,
-                            has_mount_namespace: is_root || is_container,
+                            has_pid_namespace: manifest.has_pid_namespace,
+                            has_user_namespace: manifest.has_user_namespace,
+                            has_mount_namespace: manifest.has_mount_namespace,
                             _pty_master: None,
                             work_dir: manifest.work_dir,
                             uid: manifest.uid,
@@ -1783,40 +1780,60 @@ impl SlurmAgent for AgentService {
                 // restart can re-adopt it (see reconcile_running_jobs) instead
                 // of losing track of a job whose process survives the restart.
                 if let Some(pid) = result.job.pid() {
+                    // Captured here, at launch, so the manifest records the
+                    // namespace layout this job actually got rather than what a
+                    // future agent would infer from its own privilege.
+                    let launch_is_root = nix::unistd::geteuid().is_root();
+                    let launch_is_container = launch_cfg.container.is_some();
                     let sentinel = container_exit_status_path.clone().unwrap_or_else(|| {
                         executor::exit_status_path(&result.spool_dir)
                             .to_string_lossy()
                             .into_owned()
                     });
-                    executor::write_job_manifest(
-                        &result.spool_dir,
-                        &executor::JobManifest {
-                            schema_version: 1,
+                    // No start time means no defence against PID reuse, and a
+                    // placeholder would be worse than nothing: `proc_alive`
+                    // compares for equality, so a live process can never match
+                    // it and the next startup would report a still-running job
+                    // as finished. Skip the manifest instead.
+                    match executor::proc_start_time(pid as i32) {
+                        None => warn!(
                             job_id,
-                            run_attempt,
-                            pid: pid as i32,
-                            start_time: executor::proc_start_time(pid as i32).unwrap_or(0),
-                            cgroup_path: result.job.cgroup_path().map(|p| p.to_path_buf()),
-                            forked: matches!(result.job, executor::RunningJob::Forked { .. }),
-                            cpu_ids: launch_cfg.cpu_ids.clone(),
-                            gpu_devices: launch_cfg.gpu_devices.clone(),
-                            cpus: launch_cfg.cpus,
-                            memory_mb: launch_cfg.memory_mb,
-                            uid: launch_cfg.uid,
-                            gid: launch_cfg.gid,
-                            user: launch_cfg.user.clone(),
-                            stdout_path: result.stdout_path.clone(),
-                            stderr_path: result.stderr_path.clone(),
-                            work_dir: launch_cfg.work_dir.clone(),
-                            partition: launch_cfg.partition.clone(),
-                            nodelist: launch_cfg.nodelist.clone(),
-                            mpi: spec.mpi.clone(),
-                            rootfs_mode: rootfs_mode.clone(),
-                            exit_status_path: Some(sentinel),
-                            pending: executor::PendingObligations::default(),
-                            exit: None,
-                        },
-                    );
+                            pid,
+                            "could not read process start time; job will not survive a restart"
+                        ),
+                        Some(start_time) => executor::write_job_manifest(
+                            &result.spool_dir,
+                            &executor::JobManifest {
+                                schema_version: executor::MANIFEST_SCHEMA_VERSION,
+                                job_id,
+                                run_attempt,
+                                pid: pid as i32,
+                                start_time,
+                                cgroup_path: result.job.cgroup_path().map(|p| p.to_path_buf()),
+                                forked: matches!(result.job, executor::RunningJob::Forked { .. }),
+                                has_pid_namespace: launch_is_root || launch_is_container,
+                                has_user_namespace: launch_is_container && !launch_is_root,
+                                has_mount_namespace: launch_is_root || launch_is_container,
+                                cpu_ids: launch_cfg.cpu_ids.clone(),
+                                gpu_devices: launch_cfg.gpu_devices.clone(),
+                                cpus: launch_cfg.cpus,
+                                memory_mb: launch_cfg.memory_mb,
+                                uid: launch_cfg.uid,
+                                gid: launch_cfg.gid,
+                                user: launch_cfg.user.clone(),
+                                stdout_path: result.stdout_path.clone(),
+                                stderr_path: result.stderr_path.clone(),
+                                work_dir: launch_cfg.work_dir.clone(),
+                                partition: launch_cfg.partition.clone(),
+                                nodelist: launch_cfg.nodelist.clone(),
+                                mpi: spec.mpi.clone(),
+                                rootfs_mode: rootfs_mode.clone(),
+                                exit_status_path: Some(sentinel),
+                                pending: executor::PendingObligations::default(),
+                                exit: None,
+                            },
+                        ),
+                    }
                 }
 
                 let mut jobs = self.running.lock().await;
@@ -2177,6 +2194,15 @@ impl SlurmAgent for AgentService {
                         "job {} already registered on this node",
                         req.job_id
                     )),
+                    // Only reachable from restore_committed, which this path
+                    // never calls; map rather than panic so a future caller
+                    // can't turn a resource conflict into an abort.
+                    AllocError::CpusUnavailable => Status::resource_exhausted(
+                        "controller-allocated CPUs unavailable on this node",
+                    ),
+                    AllocError::MemoryUnavailable => Status::resource_exhausted(
+                        "controller-allocated memory unavailable on this node",
+                    ),
                 })?;
             let _ = alloc.commit_job(req.job_id);
         }
@@ -3061,6 +3087,15 @@ impl AgentService {
                 return Err(Status::already_exists(format!(
                     "job {job_id} already has a launch in flight on this node"
                 )));
+            }
+            // Produced only by restore_committed on the restart-adoption path,
+            // which allocate_for_job never reaches. Reject rather than panic so
+            // a future caller can't turn a resource conflict into an abort.
+            Err(e @ (AllocError::CpusUnavailable | AllocError::MemoryUnavailable)) => {
+                warn!(job_id, error = ?e, "rejecting dispatch: node resources unavailable");
+                return Err(Status::resource_exhausted(
+                    "controller-allocated resources unavailable on this node",
+                ));
             }
         };
 
@@ -5489,6 +5524,9 @@ mod tests {
                 start_time,
                 cgroup_path: None,
                 forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
                 cpu_ids: vec![0],
                 gpu_devices: vec![],
                 cpus: 1,
@@ -5563,6 +5601,9 @@ mod tests {
                 start_time: 0,
                 cgroup_path: None,
                 forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
                 cpu_ids: vec![],
                 gpu_devices: vec![],
                 cpus: 1,
@@ -5651,6 +5692,9 @@ mod tests {
                 start_time: 0,
                 cgroup_path: None,
                 forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
                 cpu_ids: vec![],
                 gpu_devices: vec![],
                 cpus: 1,
@@ -5707,6 +5751,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            new_running_jobs(),
         ))
     }
 
@@ -5746,6 +5791,9 @@ mod tests {
             start_time: 0,
             cgroup_path: None,
             forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
             cpu_ids: vec![],
             gpu_devices: vec![],
             cpus: 1,
@@ -5845,6 +5893,9 @@ mod tests {
             start_time,
             cgroup_path: None,
             forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
             cpu_ids,
             gpu_devices: vec![],
             cpus: 1,

@@ -522,7 +522,7 @@ impl RunningJob {
     }
 }
 
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// What the agent still owes a job whose process has ended. Persisted in the
 /// manifest and cleared step by step as each obligation is discharged, so a
@@ -590,6 +590,16 @@ pub struct JobManifest {
     pub start_time: u64,
     pub cgroup_path: Option<PathBuf>,
     pub forked: bool,
+    /// Namespace layout as it was at launch. Recorded rather than re-derived,
+    /// because the formula depends on whether the agent was privileged, and a
+    /// restarted agent may not match the one that launched the job — getting
+    /// these wrong sends exec/attach into the wrong namespaces.
+    #[serde(default)]
+    pub has_pid_namespace: bool,
+    #[serde(default)]
+    pub has_user_namespace: bool,
+    #[serde(default)]
+    pub has_mount_namespace: bool,
     /// Host path to the job's exit-status sentinel (inside rootfs for containers).
     #[serde(default)]
     pub exit_status_path: Option<String>,
@@ -776,10 +786,28 @@ fn read_exit_status(path: &Path) -> Option<i32> {
 /// before any of it runs, which would change failure semantics for every job on
 /// the universal launch path to buy an exit code only on the rare restart path.
 pub(crate) fn wrap_with_exit_sentinel(script: &str, exit_status_path: &Path) -> String {
+    // Signals need their own traps. bash does run the EXIT trap when the shell
+    // is terminated, but `$?` there holds the last *completed* command's status
+    // rather than 128+N — so an EXIT trap alone records a job we stopped as
+    // having finished successfully. Each handler clears the traps first so the
+    // status is written exactly once even though `exit` re-enters EXIT.
+    //
+    // SIGKILL cannot be trapped; it leaves no sentinel, and the reader treats a
+    // missing sentinel as a failure, which is the correct answer there.
+    //
+    // These stay top-level simple commands so bash's incremental execution
+    // still runs them when a later line of the user script fails to parse.
     format!(
-        "trap '_spur_rc=$?; echo $_spur_rc > {}; exit $_spur_rc' EXIT\n{}\n",
-        exit_status_path.display(),
-        script,
+        "_spur_rc_file='{path}'\n\
+         _spur_exit() {{ trap - EXIT HUP INT QUIT TERM; echo \"$1\" > \"$_spur_rc_file\"; exit \"$1\"; }}\n\
+         trap '_spur_exit $?' EXIT\n\
+         trap '_spur_exit 129' HUP\n\
+         trap '_spur_exit 130' INT\n\
+         trap '_spur_exit 131' QUIT\n\
+         trap '_spur_exit 143' TERM\n\
+         {script}\n",
+        path = exit_status_path.display(),
+        script = script,
     )
 }
 
@@ -796,7 +824,42 @@ pub enum ReconcileOutcome {
 }
 
 /// Find every job manifest left behind by a previous spurd process.
+/// Warn when records left by a previous *unprivileged* agent exist but cannot
+/// be trusted by this privileged one.
+///
+/// A root agent deliberately refuses to read the user-writable temp base — a
+/// user could plant a manifest there and have root act on it verbatim. But
+/// silently skipping it means that correcting a deployment from unprivileged to
+/// privileged strands every job that was running under the old agent, with no
+/// completion report, no epilog and no resources released. Say so loudly.
+fn warn_on_unreadable_foreign_spool() {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let foreign = std::env::temp_dir().join("spur");
+    let Ok(entries) = std::fs::read_dir(&foreign) else {
+        return;
+    };
+    let stranded: Vec<String> = entries
+        .flatten()
+        .filter(|e| manifest_path(&e.path()).exists())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if !stranded.is_empty() {
+        warn!(
+            base = %foreign.display(),
+            count = stranded.len(),
+            dirs = ?stranded,
+            "ignoring job records written by an unprivileged agent: this agent is privileged and \
+             will not trust a user-writable location. Those jobs cannot be adopted, will never \
+             report completion, and their resources stay charged until the controller reclaims \
+             them. Clean the directory once the processes are gone."
+        );
+    }
+}
+
 pub fn scan_job_manifests() -> Vec<(PathBuf, JobManifest)> {
+    warn_on_unreadable_foreign_spool();
     let mut found = Vec::new();
     for base in spool_bases() {
         let Ok(entries) = std::fs::read_dir(&base) else {
@@ -854,6 +917,13 @@ pub fn reconcile_manifest(spool_dir: &Path, mut manifest: JobManifest) -> Reconc
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| exit_status_path(spool_dir));
+    // A recorded exit is final. Checking liveness first would let a recycled
+    // PID resurrect an already-finished job and re-run its teardown, and no
+    // liveness answer can be more authoritative than an outcome we already
+    // observed and persisted.
+    if manifest.exit.is_some() {
+        return ReconcileOutcome::Dead { manifest };
+    }
     if proc_alive(manifest.pid, manifest.start_time) {
         let job = RunningJob::Resumed {
             pid: manifest.pid,
@@ -2219,6 +2289,9 @@ mod tests {
             start_time: 0,
             cgroup_path: None,
             forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
             cpu_ids: vec![0, 1],
             gpu_devices: vec![],
             cpus: 2,
@@ -2281,6 +2354,41 @@ mod tests {
         // unaffected by wrapping.
         assert_eq!(status.code(), Some(5));
         assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "5");
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_records_terminate_signal_not_a_stale_status() {
+        // The shell itself being terminated is the `scancel` path. `true` leaves
+        // $? == 0, so an EXIT-only trap would observe that 0 and record a
+        // stopped job as a clean success — the defect this guards.
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let script = wrap_with_exit_sentinel("true\nkill -TERM $$", &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(143));
+        assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "143");
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_records_interrupt_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let script = wrap_with_exit_sentinel("true\nkill -INT $$", &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(130));
+        assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "130");
     }
 
     #[test]
@@ -2536,6 +2644,106 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_trusts_a_recorded_exit_over_a_live_pid() {
+        // A record whose outcome was already resolved must stay dead even if its
+        // PID now belongs to something else, or teardown runs twice.
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = JobManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id: 7,
+            run_attempt: 1,
+            // Our own PID, so the liveness check would say "alive" if consulted.
+            pid: std::process::id() as i32,
+            start_time: proc_start_time(std::process::id() as i32).unwrap(),
+            cgroup_path: None,
+            forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            exit_status_path: None,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            pending: PendingObligations::default(),
+            exit: Some((3, 0)),
+            cpu_ids: vec![],
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid: 0,
+            gid: 0,
+            user: String::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: String::new(),
+            partition: String::new(),
+            nodelist: String::new(),
+            mpi: String::new(),
+        };
+        match reconcile_manifest(dir.path(), m.clone()) {
+            ReconcileOutcome::Dead { manifest } => assert_eq!(manifest.exit, Some((3, 0))),
+            ReconcileOutcome::Alive { .. } => panic!("a recorded exit must not be re-litigated"),
+        }
+        // Without a recorded exit the same record is correctly seen as alive.
+        m.exit = None;
+        assert!(matches!(
+            reconcile_manifest(dir.path(), m),
+            ReconcileOutcome::Alive { .. }
+        ));
+    }
+
+    #[test]
+    fn manifest_namespace_layout_survives_a_round_trip_and_defaults_safely() {
+        // The layout must come from the record, not from the reading agent's own
+        // privilege — a privileged agent adopting a job launched by an
+        // unprivileged one (or vice versa) would otherwise send exec/attach into
+        // the wrong namespaces.
+        let m = JobManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id: 7,
+            run_attempt: 1,
+            pid: 1234,
+            start_time: 99,
+            cgroup_path: None,
+            forked: false,
+            has_pid_namespace: true,
+            has_user_namespace: false,
+            has_mount_namespace: true,
+            exit_status_path: None,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            pending: PendingObligations::default(),
+            exit: None,
+            cpu_ids: vec![],
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid: 1000,
+            gid: 1000,
+            user: "vm".into(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: String::new(),
+            partition: String::new(),
+            nodelist: String::new(),
+            mpi: String::new(),
+        };
+        let back: JobManifest = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(back.has_pid_namespace);
+        assert!(!back.has_user_namespace);
+        assert!(back.has_mount_namespace);
+
+        // A record written before these fields existed must still load, and must
+        // default to the conservative "no namespaces" answer rather than failing.
+        let mut value: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("has_pid_namespace");
+        obj.remove("has_user_namespace");
+        obj.remove("has_mount_namespace");
+        let older: JobManifest = serde_json::from_value(value).unwrap();
+        assert!(!older.has_pid_namespace);
+        assert!(!older.has_user_namespace);
+        assert!(!older.has_mount_namespace);
+    }
+
+    #[test]
     fn manifest_round_trip_scan_and_reconcile_alive() {
         // Serialize against other tests that scan the shared spool-root
         // manifest tree — see MANIFEST_SCAN_TEST_LOCK.
@@ -2563,6 +2771,9 @@ mod tests {
                 start_time,
                 cgroup_path: None,
                 forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
                 cpu_ids: vec![0, 1],
                 gpu_devices: vec![],
                 cpus: 2,
@@ -2627,6 +2838,9 @@ mod tests {
             start_time: 0,
             cgroup_path: None,
             forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
             cpu_ids: vec![],
             gpu_devices: vec![],
             cpus: 1,
@@ -2680,6 +2894,9 @@ mod tests {
             start_time: 0,
             cgroup_path: Some(cgroup.path().to_path_buf()),
             forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
             cpu_ids: vec![],
             gpu_devices: vec![],
             cpus: 1,
@@ -2754,6 +2971,9 @@ mod tests {
                 start_time: 0,
                 cgroup_path: None,
                 forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
                 cpu_ids: vec![],
                 gpu_devices: vec![],
                 cpus: 1,
