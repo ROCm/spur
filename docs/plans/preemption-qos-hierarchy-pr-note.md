@@ -21,4 +21,4 @@ Fix: adding `preempt_exempt_time` at global config, partition, and QOS level. A 
 
 **Workaround today:** setting `preempt_mode = off` on a partition makes its jobs fully immune to preemption. It's a blunt instrument but is the reliable protection available now.
 
-Both fixes are in design. Will share PRs for review shortly.
+Both fixes are implemented and shipped in this PR. See `docs/admin-guide/accounting.rst` for the new QOS fields and the preemption hierarchy section, and `docs/admin-guide/configuration.rst` for `scheduler.preempt_type` and `scheduler.preempt_exempt_time`.
