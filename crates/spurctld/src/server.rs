@@ -436,18 +436,21 @@ impl ControllerService {
 
     /// Apply the configured job-info visibility policy for `get_job`.
     ///
-    /// The owner and admins always get the full record. Everyone else is governed by
+    /// The owner and admins always get the full record. An identified non-owner is governed by
     /// `[controller] job_info_visibility`: `Full` returns everything (legacy), `OwnerOnly` returns
-    /// `None` (the caller maps it to `NOT_FOUND`, so the job is invisible), and `Redacted` (default)
-    /// returns the record with the targeting-sensitive fields blanked. An unauthenticated caller
-    /// (permissive/disabled) is never privileged.
+    /// `None` (the caller maps it to `NOT_FOUND`), and `Redacted` (default) blanks the
+    /// targeting-sensitive fields. A caller with no verified identity gets the full record: scoping
+    /// is only meaningful once callers are actually identified (`auth.mode = required`, or a
+    /// credential presented under `permissive`), and blanking anonymous reads would break the
+    /// no-auth/permissive deployments — and internal consumers like the k8s operator, which reads a
+    /// job's nodelist over an unauthenticated channel.
     fn scoped_job_info(
         &self,
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
         let privileged =
-            identity.is_some_and(|id| id.user == job.spec.user) || self.caller_is_admin(identity);
+            viewer_is_privileged(identity, &job.spec.user, self.caller_is_admin(identity));
         match job_info_disclosure(
             privileged,
             self.cluster.config().controller.job_info_visibility,
@@ -1734,17 +1737,18 @@ impl SlurmController for ControllerService {
         // Step names can leak intent, so they are blanked under `redacted` and the list is empty
         // under `owner_only`. Owner determined from the parent job; if it is gone from the display
         // cache, only an admin is privileged.
+        // Owner from the parent job; if it is gone from the display cache, `""` makes only an admin
+        // (or an anonymous caller, per `viewer_is_privileged`) privileged.
         let owner = self
             .cluster
             .get_job_for_display(job_id)
-            .map(|j| j.spec.user);
-        let privileged = match &owner {
-            Some(o) => {
-                identity.as_ref().is_some_and(|id| &id.user == o)
-                    || self.caller_is_admin(identity.as_ref())
-            }
-            None => self.caller_is_admin(identity.as_ref()),
-        };
+            .map(|j| j.spec.user)
+            .unwrap_or_default();
+        let privileged = viewer_is_privileged(
+            identity.as_ref(),
+            &owner,
+            self.caller_is_admin(identity.as_ref()),
+        );
         let redact_names = match job_info_disclosure(
             privileged,
             self.cluster.config().controller.job_info_visibility,
@@ -3286,6 +3290,21 @@ enum JobInfoDisclosure {
     Hidden,
 }
 
+/// Whether a caller may see a job's full record unconditionally: the owner, an admin, or a caller
+/// with no verified identity at all. The last case preserves the pre-auth behaviour — scoping only
+/// bites once callers are actually identified, so no-auth/permissive deployments and internal
+/// unauthenticated consumers (the k8s operator's nodelist read) are unaffected. Pure for testing.
+fn viewer_is_privileged(
+    identity: Option<&spur_core::auth::Identity>,
+    owner: &str,
+    caller_is_admin: bool,
+) -> bool {
+    match identity {
+        None => true,
+        Some(id) => id.user == owner || caller_is_admin,
+    }
+}
+
 /// Resolve the disclosure level for a job-info read. The owner and admins (`privileged`) always get
 /// the full record; everyone else is governed by the configured policy. Pure so the policy matrix is
 /// unit-testable without a live service.
@@ -3858,6 +3877,31 @@ mod tests {
             JobInfoDisclosure::Hidden
         );
         assert_eq!(job_info_disclosure(false, Full), JobInfoDisclosure::Full);
+    }
+
+    #[test]
+    fn viewer_privilege_owner_admin_and_anonymous() {
+        use spur_core::auth::Identity;
+        let bob = Identity {
+            user: "bob".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
+        let alice = Identity {
+            user: "alice".into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+        };
+        // Owner and admin are privileged.
+        assert!(viewer_is_privileged(Some(&bob), "bob", false));
+        assert!(viewer_is_privileged(Some(&alice), "bob", true));
+        // A different, non-admin identified user is not.
+        assert!(!viewer_is_privileged(Some(&alice), "bob", false));
+        // No verified identity (auth disabled, or permissive with no credential, or an internal
+        // consumer like the k8s operator) is privileged: scoping only applies to identified callers.
+        assert!(viewer_is_privileged(None, "bob", false));
     }
 
     #[test]
