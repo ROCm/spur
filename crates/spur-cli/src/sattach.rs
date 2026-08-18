@@ -87,7 +87,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 /// Stream job output without interactive input (legacy behavior).
 async fn stream_output_only(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     stream_name: &str,
 ) -> Result<()> {
@@ -130,7 +130,7 @@ async fn stream_output_only(
 
 /// Interactive attach via InteractiveSession RPC. Returns the remote exit code.
 async fn interactive_attach(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();

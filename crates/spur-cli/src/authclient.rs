@@ -79,9 +79,10 @@ fn interceptor() -> AuthInterceptor {
     AuthInterceptor { header }
 }
 
-/// Wrap an already-established channel, for callers that build one directly (a lazily connected
-/// test channel) instead of going through [`connect`]. Test-only today.
-#[cfg(test)]
+/// Wrap an already-established channel with the caller's credential.
+///
+/// Used when the channel is built by the caller (e.g. agent connections, test channels) rather
+/// than going through [`connect`].
 pub fn wrap(channel: Channel) -> AuthChannel {
     InterceptedService::new(channel, interceptor())
 }
