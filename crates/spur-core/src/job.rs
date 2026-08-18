@@ -33,6 +33,9 @@ pub enum JobState {
     Suspended,
     Deadline,
     OutOfMemory,
+    /// Finalized end-of-run for an admin requeue; like `Preempted`, the run is
+    /// over but the job returns to `Pending` rather than staying terminal.
+    Requeued,
 }
 
 /// Sentinel bit spurd OR's into a completion `signal` for an OOM kill, so the
@@ -55,6 +58,7 @@ impl JobState {
             Self::Suspended => "S",
             Self::Deadline => "DL",
             Self::OutOfMemory => "OOM",
+            Self::Requeued => "RQ",
         }
     }
 
@@ -73,6 +77,7 @@ impl JobState {
             Self::Suspended => "SUSPENDED",
             Self::Deadline => "DEADLINE",
             Self::OutOfMemory => "OUT_OF_MEMORY",
+            Self::Requeued => "REQUEUED",
         }
     }
 
@@ -92,6 +97,7 @@ impl JobState {
             Self::Preempted => 9,
             Self::Deadline => 10,
             Self::OutOfMemory => 11,
+            Self::Requeued => 12,
         }
     }
 
@@ -112,10 +118,11 @@ impl JobState {
         matches!(self, Self::Running | Self::Completing | Self::Suspended)
     }
 
-    /// End of a run: `is_terminal()` plus `Preempted` (which may still requeue).
+    /// End of a run: `is_terminal()` plus `Preempted` and `Requeued`, which
+    /// finalize the current run but return the job to `Pending`.
     /// Distinct from `is_terminal()`, whose semantics must not shift.
     pub fn is_finalized(&self) -> bool {
-        self.is_terminal() || matches!(self, Self::Preempted)
+        self.is_terminal() || matches!(self, Self::Preempted | Self::Requeued)
     }
 
     /// Per-node completion state implied by one exit code.
@@ -152,7 +159,7 @@ impl JobState {
     }
 
     /// Every core variant, in proto discriminant order for iteration only.
-    pub const ALL: [JobState; 12] = [
+    pub const ALL: [JobState; 13] = [
         Self::Pending,
         Self::Running,
         Self::Completing,
@@ -165,6 +172,7 @@ impl JobState {
         Self::Suspended,
         Self::Deadline,
         Self::OutOfMemory,
+        Self::Requeued,
     ];
 
     pub const COUNT: usize = Self::ALL.len();
@@ -184,6 +192,7 @@ impl JobState {
             spur_proto::proto::JobState::JobSuspended => Self::Suspended,
             spur_proto::proto::JobState::JobDeadline => Self::Deadline,
             spur_proto::proto::JobState::JobOutOfMemory => Self::OutOfMemory,
+            spur_proto::proto::JobState::JobRequeued => Self::Requeued,
         }
     }
 
@@ -202,6 +211,7 @@ impl JobState {
             Self::Suspended => spur_proto::proto::JobState::JobSuspended,
             Self::Deadline => spur_proto::proto::JobState::JobDeadline,
             Self::OutOfMemory => spur_proto::proto::JobState::JobOutOfMemory,
+            Self::Requeued => spur_proto::proto::JobState::JobRequeued,
         }
     }
 
@@ -725,6 +735,11 @@ pub struct Job {
     /// separately since it isn't a failure signal and never counts toward `max_batch_requeue`.
     #[serde(default)]
     pub preempt_requeue_count: u32,
+    /// Number of times an admin requeued this job (`scontrol requeue`); tracked
+    /// separately as it is an operator action, never a failure, and never counts
+    /// toward `max_batch_requeue`.
+    #[serde(default)]
+    pub user_requeue_count: u32,
 
     /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
     /// the controller drop a completion report from a superseded run.
@@ -818,6 +833,7 @@ impl Job {
             derived_exit_code: 0,
             requeue_count: 0,
             preempt_requeue_count: 0,
+            user_requeue_count: 0,
             run_attempt: 0,
             het_job_id: None,
             het_group: None,
@@ -1218,7 +1234,9 @@ impl Job {
             (JobState::Suspended, JobState::Timeout) => true,
             (JobState::Suspended, JobState::NodeFail) => true,
             (JobState::Suspended, JobState::OutOfMemory) => true,
-            // Requeue transitions: terminal → Pending (for --requeue jobs)
+            // Only failure/preempt states auto-requeue here; a finished or live
+            // run re-pends only via the admin `requeue_to_pending`, so nothing
+            // else can resurrect a finished job.
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
             (JobState::Preempted, JobState::Cancelled) => true,
@@ -1243,6 +1261,23 @@ impl Job {
                 to,
             })
         }
+    }
+
+    /// Admin requeue (`scontrol requeue`): return a live or terminal job to
+    /// Pending. Kept off the general `transition()` machine so nothing else can
+    /// resurrect a finished run.
+    pub fn requeue_to_pending(&mut self) -> Result<(), JobTransitionError> {
+        let ok = self.state.is_terminal()
+            || matches!(self.state, JobState::Running | JobState::Suspended);
+        if !ok {
+            return Err(JobTransitionError::Invalid {
+                from: self.state,
+                to: JobState::Pending,
+            });
+        }
+        self.state = JobState::Pending;
+        self.end_time = None;
+        Ok(())
     }
 
     /// WAL-apply transition: a move to the current state is a `NoOp` (replay /
@@ -1905,6 +1940,70 @@ mod tests {
     }
 
     #[test]
+    fn requeued_is_finalized_but_not_terminal() {
+        // Like Preempted, Requeued ends a run for accounting but returns the
+        // job to Pending, so it must not be treated as terminal.
+        assert!(JobState::Requeued.is_finalized());
+        assert!(!JobState::Requeued.is_terminal());
+        assert!(!JobState::Requeued.is_active());
+        assert_eq!(JobState::Requeued.display(), "REQUEUED");
+        assert_eq!(JobState::Requeued.code(), "RQ");
+        assert_eq!(
+            JobState::from_proto(JobState::Requeued.to_proto()),
+            JobState::Requeued
+        );
+    }
+
+    #[test]
+    fn requeue_to_pending_covers_live_and_terminal_states() {
+        // A live run finalizes through Requeued to Pending.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.requeue_to_pending().unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.end_time.is_none(), "re-pend clears end_time");
+
+        // Every terminal batch state can be put back in the queue.
+        for terminal in [
+            JobState::Completed,
+            JobState::Cancelled,
+            JobState::Failed,
+            JobState::Timeout,
+            JobState::NodeFail,
+            JobState::OutOfMemory,
+            JobState::Deadline,
+        ] {
+            let mut j = make_job();
+            j.state = terminal;
+            j.requeue_to_pending()
+                .unwrap_or_else(|e| panic!("{terminal:?} must be requeue-able: {e}"));
+            assert_eq!(j.state, JobState::Pending);
+        }
+    }
+
+    #[test]
+    fn general_transition_never_resurrects_a_finished_job() {
+        // The invariant the guarded requeue path preserves: no ordinary
+        // `transition()` caller can move a finished run back to Pending.
+        for terminal in [
+            JobState::Completed,
+            JobState::Cancelled,
+            JobState::OutOfMemory,
+            JobState::Deadline,
+        ] {
+            let mut j = make_job();
+            j.state = terminal;
+            assert!(
+                j.transition(JobState::Pending).is_err(),
+                "{terminal:?} -> Pending must not be a general transition"
+            );
+        }
+        // Requeuing a Pending or Completing job is likewise rejected.
+        let mut pending = make_job();
+        assert!(pending.requeue_to_pending().is_err());
+    }
+
+    #[test]
     fn apply_transition_noop_on_non_terminal_repeat() {
         let mut job = make_job();
         job.transition(JobState::Running).unwrap();
@@ -2257,6 +2356,7 @@ mod tests {
             (P::JobSuspended, JobState::Suspended),
             (P::JobDeadline, JobState::Deadline),
             (P::JobOutOfMemory, JobState::OutOfMemory),
+            (P::JobRequeued, JobState::Requeued),
         ];
 
         assert_eq!(TABLE.len(), JobState::COUNT);
