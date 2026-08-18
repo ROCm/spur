@@ -114,9 +114,10 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
 
 ``grp_wall_window_days``
    Trailing window over which a QOS's wall-clock consumption is measured for
-   ``grpwall``. See `Group wall-clock budgets (GrpWall)`_.
+   ``grpwall``. Independent of ``scheduler.fairshare_halflife_days``; see
+   `Group wall-clock budgets (GrpWall)`_.
 
-   :Default: ``scheduler.fairshare_halflife_days`` (``14``)
+   :Default: ``14``
 
 .. warning::
 
@@ -521,11 +522,16 @@ reaches the cap, jobs in that QOS stop being scheduled and wait with reason
 consumption falls back below the cap.
 
 Consumption is summed from job history over a trailing window, set by
-``grp_wall_window_days`` under ``[accounting]`` (default: the value of
-``scheduler.fairshare_halflife_days``). Running jobs contribute the time they
-have accrued so far, and a job that began before the window contributes only the
-part inside it. The figure is refreshed on the same interval as the other
-accounting caches, ``fairshare_refresh_secs``.
+``grp_wall_window_days`` under ``[accounting]`` (default ``14``). Running jobs
+contribute the time they have accrued so far, and a job that began before the
+window contributes only the part inside it. The figure is refreshed on the same
+interval as the other accounting caches, ``fairshare_refresh_secs``.
+
+The window is deliberately independent of ``scheduler.fairshare_halflife_days``.
+The half-life fades old usage for priority scoring, a soft curve that never
+reaches zero; this window is a hard cutoff on a budget. Changing one must not
+move the other, so a cluster can pair, say, a seven-day half-life for responsive
+priority with a thirty-day window for monthly budget enforcement.
 
 Three deliberate differences from Slurm:
 

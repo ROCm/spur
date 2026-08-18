@@ -470,8 +470,9 @@ pub struct AccountingConfig {
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
     /// Trailing window over which a QOS's wall-clock consumption is measured for
-    /// `GrpWall`. Defaults to `scheduler.fairshare_halflife_days` so a cluster has
-    /// a single usage horizon.
+    /// `GrpWall`. Independent of `scheduler.fairshare_halflife_days`: that fades
+    /// old usage for priority scoring, while this is a hard cutoff on a budget, so
+    /// the two are tuned for different reasons and are expected to diverge.
     #[serde(default = "default_grp_wall_window_days")]
     pub grp_wall_window_days: u32,
     /// Cluster-wide fallback QOS, applied at submit when a job resolves to no
@@ -490,7 +491,7 @@ fn default_fairshare_refresh_secs() -> u32 {
 }
 
 fn default_grp_wall_window_days() -> u32 {
-    default_halflife()
+    14
 }
 
 impl Default for AccountingConfig {
@@ -2055,6 +2056,31 @@ high_cardinality = true
             config.metrics.effective_listen_addr().unwrap(),
             "[::]:9999".parse().unwrap()
         );
+    }
+
+    /// A budget window and a priority-decay half-life are tuned for different
+    /// reasons, so retuning one must never move the other.
+    #[test]
+    fn grp_wall_window_is_independent_of_the_fairshare_halflife() {
+        let toml = r#"
+cluster_name = "x"
+
+[scheduler]
+fairshare_halflife_days = 7
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.scheduler.fairshare_halflife_days, 7);
+        assert_eq!(config.accounting.grp_wall_window_days, 14);
+
+        let toml = r#"
+cluster_name = "x"
+
+[accounting]
+grp_wall_window_days = 30
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.accounting.grp_wall_window_days, 30);
+        assert_eq!(config.scheduler.fairshare_halflife_days, 14);
     }
 
     #[test]

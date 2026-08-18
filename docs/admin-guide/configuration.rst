@@ -300,8 +300,8 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - ``14``
      - Restart
      - Trailing window over which a QOS's wall-clock consumption is measured for
-       the ``grpwall`` limit. Defaults to ``scheduler.fairshare_halflife_days`` so
-       a cluster has one usage horizon.
+       the ``grpwall`` limit. Independent of ``scheduler.fairshare_halflife_days``:
+       that fades usage for priority scoring, this is a hard budget cutoff.
    * - ``default_qos``
      - string
      - ``""``
