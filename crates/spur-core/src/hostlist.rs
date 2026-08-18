@@ -295,6 +295,31 @@ fn split_top_level(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Parse one bracket term (`start-end`, or a bare value) into numeric bounds.
+///
+/// Returns `Some((start, end, width))` for a range, where `width` is the
+/// zero-pad width taken from the start token; returns `None` for a non-range
+/// term, which the caller emits verbatim. Shared by `expand_single` and
+/// `first_single` so the range grammar and its error handling live in one place.
+fn parse_range_bounds(part: &str) -> Result<Option<(u64, u64, usize)>, HostlistError> {
+    let Some(dash) = part.find('-') else {
+        return Ok(None);
+    };
+    let start_str = &part[..dash];
+    let end_str = &part[dash + 1..];
+    let width = start_str.len();
+    let start: u64 = start_str
+        .parse()
+        .map_err(|_| HostlistError::InvalidRange(part.into()))?;
+    let end: u64 = end_str
+        .parse()
+        .map_err(|_| HostlistError::InvalidRange(part.into()))?;
+    if start > end {
+        return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
+    }
+    Ok(Some((start, end, width)))
+}
+
 /// Expand a single hostlist term (no top-level commas).
 fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), HostlistError> {
     if let Some(bracket_start) = pattern.find('[') {
@@ -307,21 +332,7 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
         let suffix = &pattern[bracket_end + 1..];
 
         for range_part in range_str.split(',') {
-            if let Some(dash) = range_part.find('-') {
-                let start_str = &range_part[..dash];
-                let end_str = &range_part[dash + 1..];
-                let width = start_str.len();
-                let start: u64 = start_str
-                    .parse()
-                    .map_err(|_| HostlistError::InvalidRange(range_part.into()))?;
-                let end: u64 = end_str
-                    .parse()
-                    .map_err(|_| HostlistError::InvalidRange(range_part.into()))?;
-
-                if start > end {
-                    return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
-                }
-
+            if let Some((start, end, width)) = parse_range_bounds(range_part)? {
                 for i in start..=end {
                     let name = format!("{}{:0>width$}{}", prefix, i, suffix, width = width);
                     if suffix.contains('[') {
@@ -365,22 +376,9 @@ fn first_single(pattern: &str) -> Result<Option<String>, HostlistError> {
     let suffix = &pattern[bracket_end + 1..];
 
     let first_part = range_str.split(',').next().unwrap_or_default();
-    let first_value = if let Some(dash) = first_part.find('-') {
-        let start_str = &first_part[..dash];
-        let end_str = &first_part[dash + 1..];
-        let width = start_str.len();
-        let start: u64 = start_str
-            .parse()
-            .map_err(|_| HostlistError::InvalidRange(first_part.into()))?;
-        let end: u64 = end_str
-            .parse()
-            .map_err(|_| HostlistError::InvalidRange(first_part.into()))?;
-        if start > end {
-            return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
-        }
-        format!("{:0>width$}", start, width = width)
-    } else {
-        first_part.to_string()
+    let first_value = match parse_range_bounds(first_part)? {
+        Some((start, _end, width)) => format!("{:0>width$}", start, width = width),
+        None => first_part.to_string(),
     };
 
     let name = format!("{prefix}{first_value}{suffix}");
