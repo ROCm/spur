@@ -1625,7 +1625,7 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
     if let Some((days, rest)) = s.split_once('-') {
         let days: u32 = days.parse().ok()?;
         let hms = parse_hms(rest)?;
-        return Some(days * 24 * 60 + hms);
+        return days.checked_mul(24 * 60)?.checked_add(hms);
     }
 
     // hours:minutes:seconds or hours:minutes or just minutes
@@ -1635,7 +1635,7 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
         2 => {
             let h: u32 = parts[0].parse().ok()?;
             let m: u32 = parts[1].parse().ok()?;
-            Some(h * 60 + m)
+            h.checked_mul(60)?.checked_add(m)
         }
         3 => parse_hms(s),
         _ => None,
@@ -1659,7 +1659,9 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
     // days-hours:minutes:seconds
     if let Some((days, rest)) = s.split_once('-') {
         let days: u64 = days.parse().ok()?;
-        return Some(days * 86400 + parse_hms_seconds(rest)?);
+        return days
+            .checked_mul(86400)?
+            .checked_add(parse_hms_seconds(rest)?);
     }
 
     let parts: Vec<&str> = s.split(':').collect();
@@ -1667,20 +1669,22 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
         1 => {
             // Just minutes → convert to seconds
             let mins: u64 = parts[0].parse().ok()?;
-            Some(mins * 60)
+            mins.checked_mul(60)
         }
         2 => {
             // HH:MM → hours and minutes (no seconds)
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
-            Some(h * 3600 + m * 60)
+            h.checked_mul(3600)?.checked_add(m.checked_mul(60)?)
         }
         3 => {
             // HH:MM:SS
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
             let sec: u64 = parts[2].parse().ok()?;
-            Some(h * 3600 + m * 60 + sec)
+            h.checked_mul(3600)?
+                .checked_add(m.checked_mul(60)?)?
+                .checked_add(sec)
         }
         _ => None,
     }
@@ -1726,13 +1730,15 @@ fn parse_hms_seconds(s: &str) -> Option<u64> {
         2 => {
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
-            Some(h * 3600 + m * 60)
+            h.checked_mul(3600)?.checked_add(m.checked_mul(60)?)
         }
         3 => {
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
             let sec: u64 = parts[2].parse().ok()?;
-            Some(h * 3600 + m * 60 + sec)
+            h.checked_mul(3600)?
+                .checked_add(m.checked_mul(60)?)?
+                .checked_add(sec)
         }
         _ => None,
     }
@@ -1750,7 +1756,10 @@ fn parse_hms(s: &str) -> Option<u32> {
     } else {
         0
     };
-    Some(h * 60 + m + if s > 0 { 1 } else { 0 }) // Round up seconds
+    // Round up seconds
+    h.checked_mul(60)?
+        .checked_add(m)?
+        .checked_add(if s > 0 { 1 } else { 0 })
 }
 
 /// Format minutes as D-HH:MM:SS or HH:MM:SS.
@@ -2279,6 +2288,31 @@ memory_mb = 1024000
         // Slurm grammar unchanged.
         assert_eq!(parse_time_seconds("60"), Some(3600));
         assert_eq!(parse_time_seconds("00:00:30"), Some(30));
+    }
+
+    #[test]
+    fn parse_time_rejects_overflowing_slurm_durations() {
+        // u32 minutes overflow: 2982617 days * 1440 is u32::MAX + 1185.
+        assert_eq!(parse_time_minutes("2982617-00:00:00"), None);
+        // Overflow on the `+ hms`, not the multiply: 2982616 days leaves only
+        // 255 minutes of headroom and "05:00:00" is 300.
+        assert_eq!(parse_time_minutes("2982616-05:00:00"), None);
+        // HH:MM arm.
+        assert_eq!(parse_time_minutes("71582789:00"), None);
+        // u64 seconds overflow.
+        assert_eq!(parse_time_seconds("213503982334602-00:00:00"), None);
+        // The largest non-overflowing value is still accepted unchanged.
+        assert_eq!(parse_time_minutes("2982616-00:00:00"), Some(4_294_967_040));
+    }
+
+    #[test]
+    fn parse_partition_time_rejects_overflowing_duration() {
+        // validate() promises a bad partition time fails loudly rather than
+        // silently enforcing a different cap.
+        assert!(matches!(
+            parse_partition_time("partitions.gpu.max_time", "2982617-00:00:00"),
+            Err(ConfigError::InvalidValue { .. })
+        ));
     }
 
     #[test]
