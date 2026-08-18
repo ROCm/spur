@@ -1238,15 +1238,19 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     .await
 }
 
+pub(crate) fn is_all_node_pattern(pattern: &str) -> bool {
+    pattern.eq_ignore_ascii_case("ALL")
+}
+
 /// Resolve a node name pattern to a list of individual node names.
 ///
 /// Supports Slurm-compatible hostlist expressions (`node[1-3]`),
 /// comma-separated lists (`node1,node2`), and the `ALL` keyword.
-async fn resolve_node_names(
+pub(crate) async fn resolve_node_names(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     pattern: &str,
 ) -> Result<Vec<String>> {
-    if pattern.eq_ignore_ascii_case("ALL") {
+    if is_all_node_pattern(pattern) {
         let resp = client
             .get_nodes(spur_proto::proto::GetNodesRequest {
                 nodelist: String::new(),
