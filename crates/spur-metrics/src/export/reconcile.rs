@@ -178,9 +178,9 @@ mod tests {
                 nodes_overcharged: 1,
                 last_nodes_undercharged: 2,
                 cpus_undercharged: 8,
-                cpus_overcharged: 0,
+                cpus_overcharged: 9,
                 memory_undercharged_mb: 2048,
-                memory_overcharged_mb: 0,
+                memory_overcharged_mb: 4096,
                 devices_undercharged: 4,
                 devices_overcharged: 1,
                 unaccounted_slices: 3,
@@ -209,6 +209,13 @@ mod tests {
         );
         assert!(body.contains("spur_reconcile_unaccounted_slices{trigger=\"restore\"} 3"));
         assert!(body.contains("spur_reconcile_nodes_checked{trigger=\"restore\"} 12"));
+        // Distinct values per dimension, so a family wired to the wrong snapshot
+        // field cannot pass by coincidence.
+        assert!(body.contains("spur_reconcile_overcharged_cpus_total{trigger=\"restore\"} 9"));
+        assert!(
+            body.contains("spur_reconcile_overcharged_memory_mb_total{trigger=\"restore\"} 4096")
+        );
+        assert!(body.contains("spur_reconcile_overcharged_devices_total{trigger=\"restore\"} 1"));
         assert!(body.ends_with("# EOF\n"));
     }
 

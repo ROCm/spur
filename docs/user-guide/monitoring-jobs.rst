@@ -460,19 +460,30 @@ records that own them, and as a running per-node total. The job records are
 authoritative, and the total is checked against them whenever a process's view of
 the cluster is newly assembled — restoring a snapshot, or gaining leadership.
 
+The check runs once each time that view is assembled. There is no periodic pass,
+so on a cluster whose leader never changes it runs at startup and not again.
+
 Undercharges are corrected automatically. Overcharges are reported but never
 released, because a leaked charge and a release still in flight are
-indistinguishable, so a sustained overcharge needs manual investigation: drain
-the node and restart it once its jobs have finished.
+indistinguishable. Clearing one takes operator action: once the node's jobs have
+finished, remove it with ``spur node remove <node>`` and let the agent register
+again — re-registration is the only path that rebuilds the node's record.
+Draining alone does not clear it, and a node carrying a phantom charge reports
+``Draining`` rather than ``Drain`` because nothing is left to release.
 
-Alert on growth in the ``undercharged``, ``overcharged``, ``unaccounted`` and
-``reclaims`` counters. Do **not** alert on ``rebuilds_total`` or the heartbeat
-counters — they increment in normal operation and are useful as denominators.
+Alert on growth in the ``undercharged``, ``overcharged`` and ``reclaims``
+counters, and on ``unaccounted_slices`` being non-zero at all — it is a gauge for
+the most recent pass, not a counter. Do **not** alert on ``rebuilds_total`` or the
+heartbeat counters; they increment in normal operation and are useful as
+denominators.
 
-Two caveats when building queries. These are process-lifetime counters that reset
-when ``spurctld`` restarts. And because this endpoint is not leader-gated, every
+Three caveats when building queries. These are process-lifetime counters that
+reset when ``spurctld`` restarts. Because this endpoint is not leader-gated, every
 controller in an HA set serves its own independent series — inspect them per
-instance rather than summing across the set.
+instance rather than summing across the set, and note the heartbeat counters only
+advance on the leader. And a single node can be both undercharged and overcharged
+in one pass (short of one GPU while holding another it should not), so the two
+node counts can add up to more than ``nodes_checked``.
 
 ``trigger`` is ``restore`` or ``leadership_gain``. "Device units" counts GPUs and
 other generic resources together, with countable resources contributing their
@@ -503,10 +514,12 @@ count.
        ``spur_reconcile_overcharged_devices_total{trigger}``
      - CPUs, memory (MB) and device units held beyond the job records.
    * - ``spur_reconcile_unaccounted_slices{trigger}``
-     - Running jobs whose record names a node the controller no longer tracks, or
-       names a node but carries no allocation for it. Nothing is charged for that
-       work and the check above cannot see it, so it is counted directly. Any
-       non-zero value is a bug worth reporting.
+     - Running job/node pairs where the record names a node the controller no
+       longer tracks, or names one but carries no allocation for it. Nothing is
+       charged for that work and the check above cannot see it, so it is counted
+       directly. Worth reporting, except immediately after upgrading from a
+       release that predates per-node allocations, where jobs still running from
+       before the upgrade land here legitimately.
    * - ``spur_reconcile_agent_job_reclaims_total{cause}``
      - Jobs an agent reported holding that the controller told it to release.
        ``cause`` is ``terminal`` (the run is over), ``active_elsewhere`` (the job

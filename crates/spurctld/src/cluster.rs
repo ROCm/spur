@@ -4639,6 +4639,7 @@ impl ClusterManager {
     /// `allocated_nodes` but not yet in `node_completions`.
     fn derive_node_alloc(
         jobs: &HashMap<JobId, Job>,
+        nodes: &HashMap<String, Node>,
     ) -> (HashMap<String, ResourceAllocations>, usize) {
         let mut derived: HashMap<String, ResourceAllocations> = HashMap::new();
         let mut unaccounted = 0;
@@ -4650,9 +4651,13 @@ impl ClusterManager {
                 if job.node_completions.contains_key(name) {
                     continue;
                 }
+                // Both cases charge nothing and are invisible to a diff that
+                // walks the index, so they are counted per job/node pair here.
+                if !nodes.contains_key(name) {
+                    unaccounted += 1;
+                    continue;
+                }
                 let Some(slice) = job.per_node_alloc.get(name) else {
-                    // The record names the node but carries no slice, so nothing
-                    // can be charged and the shortfall is invisible to the diff.
                     unaccounted += 1;
                     continue;
                 };
@@ -4673,7 +4678,7 @@ impl ClusterManager {
         nodes: &mut HashMap<String, Node>,
         trigger: RebuildTrigger,
     ) -> AllocDrift {
-        let (derived, unaccounted_slices) = Self::derive_node_alloc(jobs);
+        let (derived, unaccounted_slices) = Self::derive_node_alloc(jobs, nodes);
         let empty = ResourceAllocations::default();
         let mut drift = AllocDrift {
             nodes_checked: nodes.len(),
@@ -4684,7 +4689,7 @@ impl ClusterManager {
             error!(
                 trigger = trigger.as_str(),
                 unaccounted_slices,
-                "active jobs name a node with no per-node allocation recorded; those nodes are running work nothing is charged for"
+                "active jobs name a node the controller does not track or holds no allocation for; that work is charged to nobody"
             );
         }
 
@@ -4735,6 +4740,14 @@ impl ClusterManager {
             // the Draining -> Drain retirement the release path does has no place.
             node.alloc_resources.add(&missing);
             node.update_state_from_alloc();
+            if node.alloc_resources.cpus > node.total_resources.cpus {
+                error!(
+                    node = %name,
+                    charged = node.alloc_resources.cpus,
+                    capacity = node.total_resources.cpus,
+                    "job records claim more CPUs than the node has; two records name the same resource"
+                );
+            }
         }
 
         // A job record can name a node the index no longer has, which the loop
@@ -4958,7 +4971,7 @@ impl ClusterManager {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
                 let freed_nodes;
-                let allocated_resources;
+                let allocation_live;
                 let per_node_map;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -4980,7 +4993,7 @@ impl ClusterManager {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
                     freed_nodes = job.allocated_nodes.clone();
-                    allocated_resources = job.allocated_resources.clone();
+                    allocation_live = job.allocated_resources.is_some();
                     per_node_map = job.per_node_alloc.clone();
                     job.node_completions.clear();
 
@@ -4995,7 +5008,7 @@ impl ClusterManager {
                 Self::deallocate_job_slices(
                     &mut nodes,
                     &freed_nodes,
-                    allocated_resources.is_some(),
+                    allocation_live,
                     &per_node_map,
                     &[],
                     *job_id,
@@ -5026,7 +5039,7 @@ impl ClusterManager {
                 // avoid double-counting. NoOp on replay / non-requeuable states.
                 let was_live;
                 let freed_nodes;
-                let allocated_resources;
+                let allocation_live;
                 let per_node_map;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -5041,7 +5054,7 @@ impl ClusterManager {
                             // The live run still holds its allocation; capture it
                             // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
-                            allocated_resources = job.allocated_resources.clone();
+                            allocation_live = job.allocated_resources.is_some();
                             per_node_map = job.per_node_alloc.clone();
                         }
                         s if s.is_terminal() => {
@@ -5049,7 +5062,7 @@ impl ClusterManager {
                             // again would double-subtract on any shared node.
                             was_live = false;
                             freed_nodes = Vec::new();
-                            allocated_resources = None;
+                            allocation_live = false;
                             per_node_map = HashMap::new();
                         }
                         _ => {
@@ -5082,7 +5095,7 @@ impl ClusterManager {
                 Self::deallocate_job_slices(
                     &mut nodes,
                     &freed_nodes,
-                    allocated_resources.is_some(),
+                    allocation_live,
                     &per_node_map,
                     &[],
                     *job_id,
@@ -5108,7 +5121,7 @@ impl ClusterManager {
             }
             WalOperation::JobPreemptCancel { job_id } => {
                 let freed_nodes;
-                let allocated_resources;
+                let allocation_live;
                 let per_node_map;
                 let already_deallocated;
                 {
@@ -5128,7 +5141,7 @@ impl ClusterManager {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
                     freed_nodes = job.allocated_nodes.clone();
-                    allocated_resources = job.allocated_resources.clone();
+                    allocation_live = job.allocated_resources.is_some();
                     per_node_map = job.per_node_alloc.clone();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
                     job.node_completions.clear();
@@ -5142,7 +5155,7 @@ impl ClusterManager {
                 Self::deallocate_job_slices(
                     &mut nodes,
                     &freed_nodes,
-                    allocated_resources.is_some(),
+                    allocation_live,
                     &per_node_map,
                     &already_deallocated,
                     *job_id,
@@ -5373,7 +5386,7 @@ impl ClusterManager {
                 state,
             } => {
                 let freed_nodes;
-                let allocated_resources;
+                let allocation_live;
                 let already_deallocated;
                 if let Some(job) = jobs.get_mut(job_id) {
                     // is_finalized (incl. Preempted): a stale/replayed complete
@@ -5412,7 +5425,7 @@ impl ClusterManager {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
                     freed_nodes = job.allocated_nodes.clone();
-                    allocated_resources = job.allocated_resources.clone();
+                    allocation_live = job.allocated_resources.is_some();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
                     job.node_completions.clear();
                 } else {
@@ -5426,7 +5439,7 @@ impl ClusterManager {
                 Self::deallocate_job_slices(
                     &mut nodes,
                     &freed_nodes,
-                    allocated_resources.is_some(),
+                    allocation_live,
                     &per_node_map,
                     &already_deallocated,
                     *job_id,
@@ -20760,12 +20773,16 @@ mod tests {
     fn assert_matches_job_records(cm: &ClusterManager, context: &str) {
         let jobs = cm.jobs.read();
         let nodes = cm.nodes.read();
-        let (derived, _) = ClusterManager::derive_node_alloc(&jobs);
+        let (derived, _) = ClusterManager::derive_node_alloc(&jobs, &nodes);
         for (name, node) in nodes.iter() {
             let want = derived.get(name).cloned().unwrap_or_default();
-            assert_eq!(
-                node.alloc_resources, want,
-                "{context}: node {name} charge disagrees with its job records"
+            // Compare both directions rather than `==`: device vectors carry no
+            // meaningful order, and the two sides build them in different orders.
+            assert!(
+                shortfall(&node.alloc_resources, &want).is_empty()
+                    && shortfall(&want, &node.alloc_resources).is_empty(),
+                "{context}: node {name} charge {:?} disagrees with its job records {want:?}",
+                node.alloc_resources,
             );
         }
     }
@@ -20818,15 +20835,21 @@ mod tests {
                     let picked: Vec<String> = (0..span)
                         .map(|i| node_names[(start + i) % node_names.len()].to_string())
                         .collect();
-                    let gpus_per_node = rng.below(3) as u32;
-                    let slice = gpu_alloc(2, 1024, &(0..gpus_per_node).collect::<Vec<_>>());
-                    let per_node: HashMap<String, ResourceAllocations> =
-                        picked.iter().map(|n| (n.clone(), slice.clone())).collect();
-                    let total = gpu_alloc(
-                        2 * picked.len() as u32,
-                        1024 * picked.len() as u64,
-                        &(0..gpus_per_node).collect::<Vec<_>>(),
-                    );
+                    // Give each node of the job a different slice, and start the
+                    // device ids at a per-job offset, so a lookup keyed on the
+                    // wrong node or a device match keyed on the wrong id shows up.
+                    let gpu_base = rng.below(3) as u32;
+                    let mut per_node: HashMap<String, ResourceAllocations> = HashMap::new();
+                    let mut total = ResourceAllocations::default();
+                    for (i, n) in picked.iter().enumerate() {
+                        let cpus = 1 + (i as u32 % 3);
+                        let gpus: Vec<u32> = (0..rng.below(2) as u32)
+                            .map(|g| (gpu_base + g + i as u32) % 4)
+                            .collect();
+                        let slice = gpu_alloc(cpus, 512 * (i as u64 + 1), &gpus);
+                        total.add(&slice);
+                        per_node.insert(n.clone(), slice);
+                    }
                     cm.apply_operation(&WalOperation::job_state_change(
                         job_id,
                         JobState::Pending,
@@ -21305,15 +21328,69 @@ mod tests {
         });
 
         // Simulate drift: the index lost the charge the job record still proves.
-        cm.nodes.write().get_mut("n1").unwrap().alloc_resources = ResourceAllocations::default();
+        // Zeroing the charge also makes the node look idle, so the rebuild has to
+        // re-derive the state as well as the numbers.
+        {
+            let mut nodes = cm.nodes.write();
+            let node = nodes.get_mut("n1").unwrap();
+            node.alloc_resources = ResourceAllocations::default();
+            node.update_state_from_alloc();
+            assert_eq!(node.state, NodeState::Idle);
+        }
 
         let drift = cm.rebuild_node_alloc(RebuildTrigger::LeadershipGain);
         assert_eq!(drift.nodes_undercharged, 1);
         assert_eq!(drift.cpus_undercharged, 4);
         assert_eq!(drift.devices_undercharged, 2);
         assert_eq!(drift.nodes_overcharged, 0);
-        assert_eq!(cm.get_node("n1").unwrap().alloc_resources, slice);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.alloc_resources, slice);
+        assert_eq!(
+            node.state,
+            NodeState::Mixed,
+            "a topped-up node must stop reporting itself idle"
+        );
         assert_matches_job_records(&cm, "after rebuild");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drift_reaches_the_metrics_collector() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::reconcile_stats::ReconcileStatsCollector::new());
+        cm.set_reconcile_stats(stats.clone());
+        register_gpu_node(&cm, "n1", 16, 4);
+
+        submit_pending_job(&cm, 1);
+        let slice = gpu_alloc(4, 8000, &[0, 1]);
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+        cm.nodes.write().get_mut("n1").unwrap().alloc_resources = ResourceAllocations::default();
+
+        cm.rebuild_node_alloc(RebuildTrigger::LeadershipGain);
+
+        let snap = stats.snapshot();
+        let r = snap
+            .rebuilds
+            .iter()
+            .find(|r| r.trigger == "leadership_gain")
+            .expect("the rebuild must reach the collector, not just return a value");
+        assert_eq!(r.rebuilds, 1);
+        assert_eq!(r.nodes_undercharged, 1);
+        assert_eq!(r.cpus_undercharged, 4);
+        assert_eq!(r.devices_undercharged, 2);
+        assert_eq!(r.nodes_checked, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
