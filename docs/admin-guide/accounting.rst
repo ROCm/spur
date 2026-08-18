@@ -467,7 +467,7 @@ Two families behave differently:
 - **Standalone resource limits** (per-job TRES and QOS wall) reject at submit
   only when the governing QOS carries the ``DenyOnLimit`` flag; otherwise the
   job is accepted and **pends** until it fits. A job that resolves to **no QOS**
-  is treated as ``DenyOnLimit`` on, so an unsatisfiable request is rejected
+  is treated as ``DenyOnLimit`` on, so a request that can never fit is rejected
   rather than pending forever.
 
 Set ``DenyOnLimit`` through the QOS ``flags`` key:
