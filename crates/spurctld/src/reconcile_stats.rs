@@ -31,7 +31,7 @@ impl RebuildTrigger {
 }
 
 /// Why a job reported by an agent was reclaimed. Mirrors the branches of
-/// `is_reclaimable`, so a shift in the mix points at which fault is occurring.
+/// `reclaim_cause`, so a shift in the mix points at which fault is occurring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimCause {
     /// The controller has the job in a terminal state.
