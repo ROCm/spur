@@ -71,6 +71,7 @@ impl std::fmt::Display for PartitionState {
 
 /// Controls cross-QOS preemption eligibility. Mirrors Slurm's `PreemptType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum PreemptType {
     /// No QOS-level restrictions — eligibility is determined solely by priority
     /// gap, partition mode, and reservation tier (existing behaviour).

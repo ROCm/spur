@@ -3737,7 +3737,9 @@ impl ClusterManager {
                 priority_tier: Some(part.priority_tier),
                 preempt_mode: Some(preempt_str.to_string()),
                 is_default: Some(part.is_default),
-                preempt_exempt_time: Some(part.preempt_exempt_time),
+                // Only push a WAL change when TOML explicitly sets the field;
+                // absent means "leave whatever the runtime WAL already has".
+                preempt_exempt_time: part.preempt_exempt_time.map(Some),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
