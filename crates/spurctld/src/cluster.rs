@@ -12852,7 +12852,9 @@ mod tests {
         let partitions = cm.get_partitions();
 
         let burst_job = cm.get_job(burst_id).unwrap();
-        let burst_effective = cm.current_effective_priority(&burst_job, &partitions);
+        let burst_qos = cm.resolve_qos(&burst_job);
+        let burst_effective =
+            cm.current_effective_priority_with_qos(&burst_job, &burst_qos, &partitions);
         let primus_effective = pending_refs[0].priority;
         assert!(
             primus_effective >= burst_effective * 2,
