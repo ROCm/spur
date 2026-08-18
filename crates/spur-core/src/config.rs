@@ -337,6 +337,36 @@ pub struct ControllerConfig {
     /// resources-unavailable, so it isn't re-picked every tick (default 30, 0 disables).
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
+
+    /// How much of another user's job a non-owner may see via `get_job` /
+    /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
+    /// the full record; this governs everyone else. Default: `redacted`.
+    #[serde(default)]
+    pub job_info_visibility: JobInfoVisibility,
+}
+
+/// Controls how much of another user's job a non-owner (non-admin) caller can
+/// read back from `get_job` / `get_job_steps`.
+///
+/// The list RPC `get_jobs` already scopes to the caller; the single-fetch paths
+/// historically did not, exposing every job's work_dir, command line, stdio
+/// paths, and — most usefully to an attacker — its allocated nodelist. This
+/// setting closes that leak while leaving the Slurm-standard cluster-visible
+/// queue intact for the fields that are not targeting-sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JobInfoVisibility {
+    /// Non-owners see identity/state/timing/account/priority, but work_dir,
+    /// command, stdio paths, allocated nodelist, comment, and resource detail are
+    /// blanked. The default: preserves visibility, removes the targeting oracle.
+    #[default]
+    Redacted,
+    /// Non-owners get `NOT_FOUND` — the job is invisible unless you own it (or
+    /// are an admin). Strictest; matches `get_jobs`' owner-scoped behaviour.
+    OwnerOnly,
+    /// Legacy: every field is visible to any caller. Opt-in for deployments that
+    /// relied on the previous unscoped behaviour.
+    Full,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -405,6 +435,7 @@ impl Default for ControllerConfig {
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
             terminal_job_retention_secs: default_terminal_job_retention_secs(),
             dispatch_reject_cooldown_secs: default_dispatch_reject_cooldown_secs(),
+            job_info_visibility: JobInfoVisibility::default(),
         }
     }
 }
@@ -526,6 +557,15 @@ pub struct SchedulerConfig {
     /// abandoned allocations behave as before. Mirrors Slurm's `InactiveLimit`.
     #[serde(default)]
     pub inactive_limit_secs: u32,
+    /// Highest base priority a non-admin caller may request at submit (or via
+    /// `scontrol update`). Requests above this are clamped, not rejected; at
+    /// submit the clamp is reported to the caller as a warning, on the update
+    /// path (which has no response field) it is logged. Admins are unaffected.
+    /// Defaults to [`crate::job::DEFAULT_PRIORITY`], so a non-admin can lower but
+    /// not raise priority — Slurm's `nice`-only model, where boosting priority is
+    /// operator-only. Raise it to grant users a band above the baseline.
+    #[serde(default = "default_max_user_priority")]
+    pub max_user_priority: u32,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -548,6 +588,9 @@ fn default_time_limit() -> u32 {
 fn default_complete_wait() -> u32 {
     300
 }
+fn default_max_user_priority() -> u32 {
+    crate::job::DEFAULT_PRIORITY
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -561,6 +604,7 @@ impl Default for SchedulerConfig {
             complete_wait_secs: 300,
             resv_overrun_minutes: 0,
             inactive_limit_secs: 0,
+            max_user_priority: default_max_user_priority(),
         }
     }
 }
