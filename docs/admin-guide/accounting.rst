@@ -544,10 +544,13 @@ Three deliberate differences from Slurm:
   association; Spur does not store it there, so it cannot be set or enforced per
   account.
 
-The budget is not applied when accounting is disabled or the database is
-unreachable, matching the rest of the accounting path: a database outage does not
-stop scheduling. Where a budget must hold, keep the accounting database
-available.
+Enforcement needs a consumption figure, and until one has been read there is
+none: with accounting disabled, or with the database unreachable when the
+controller starts, the budget is not applied and scheduling continues. Once a
+figure has been read, a later refresh failure leaves the last one in place rather
+than discarding it, exactly as the QOS cache retains its definitions, so a budget
+keeps applying across a brief outage at up to one refresh interval of staleness.
+Where a budget must hold precisely, keep the accounting database available.
 
 .. note::
 

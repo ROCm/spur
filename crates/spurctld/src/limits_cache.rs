@@ -108,6 +108,11 @@ impl Default for QosCache {
 /// Per-QOS wall-clock consumption for `GrpWall`, derived from job history in the
 /// accounting database. Reads return `None` until a first successful load, which
 /// is what leaves the limit unapplied when accounting is disabled or unreachable.
+///
+/// A failed refresh after that keeps the last figure rather than reverting to
+/// `None`: consumption over a multi-day window barely moves between refreshes, so
+/// a slightly stale figure is a far better basis than dropping the budget
+/// entirely and letting spend run unbounded through a database blip.
 pub struct GrpWallCache {
     snapshot: RwLock<Option<HashMap<String, u64>>>,
 }
