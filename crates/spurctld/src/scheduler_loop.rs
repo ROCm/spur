@@ -22,6 +22,7 @@ use spur_sched::traits::{ClusterState, Scheduler};
 use crate::cluster::{ClusterManager, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
+use crate::reconcile_stats::RebuildTrigger;
 
 /// Upper bound on a single CancelJob RPC (connect + call) when the caller
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
@@ -111,6 +112,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
+    let mut was_leader = false;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -122,7 +124,16 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         if !raft.is_leader() {
+            was_leader = false;
             continue;
+        }
+
+        if !was_leader {
+            // Placement decisions start reading the node index here, so correct
+            // it against the job records first: a snapshot this process installed
+            // carries whatever drift the leader that wrote it had.
+            cluster.rebuild_node_alloc(RebuildTrigger::LeadershipGain);
+            was_leader = true;
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop

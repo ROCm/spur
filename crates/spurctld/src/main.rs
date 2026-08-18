@@ -15,6 +15,7 @@ mod metrics_server;
 mod pmix_dispatch;
 mod raft;
 mod raft_server;
+mod reconcile_stats;
 mod rest;
 mod rpc_middleware;
 mod rpc_stats;
@@ -29,6 +30,7 @@ use clap::Parser;
 use tracing::info;
 
 use cluster::ClusterManager;
+use reconcile_stats::ReconcileStatsCollector;
 use rpc_stats::RpcStatsCollector;
 use sched_stats::SchedStatsCollector;
 
@@ -186,6 +188,9 @@ async fn main() -> anyhow::Result<()> {
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
+    let reconcile_stats = Arc::new(ReconcileStatsCollector::new());
+    cluster.set_reconcile_stats(reconcile_stats.clone());
+
     // Accounting stays best-effort so a database outage does not stop scheduling.
     let accounting_service = if config.accounting.database_url.is_empty() {
         info!("accounting disabled (database_url not configured)");
@@ -323,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
         let metrics_raft = raft_handle.clone();
         let metrics_rpc_stats = rpc_stats.clone();
         let metrics_sched_stats = sched_stats.clone();
+        let metrics_reconcile_stats = reconcile_stats.clone();
         tokio::spawn(async move {
             if let Err(e) = metrics_server::serve(
                 metrics_addr,
@@ -330,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics_raft,
                 metrics_rpc_stats,
                 metrics_sched_stats,
+                metrics_reconcile_stats,
             )
             .await
             {

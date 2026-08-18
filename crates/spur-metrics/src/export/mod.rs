@@ -17,6 +17,7 @@ pub mod jobs_users_accts;
 pub mod k8s_cluster;
 pub mod nodes;
 pub mod partitions;
+pub mod reconcile;
 pub mod rpc;
 pub mod scheduler;
 
