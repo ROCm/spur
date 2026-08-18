@@ -71,17 +71,13 @@ pub fn spawn_keepalive(
 /// from `$SPUR_AUTH_TOKEN` / `~/.spur/token` is signed with the cluster key and will be accepted.
 /// Without a token the connection still succeeds against agents in `permissive` mode, but will be
 /// refused in `required` mode.
-pub async fn connect_agent(
-    addr: &str,
-) -> Result<SlurmAgentClient<crate::authclient::AuthChannel>> {
+pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<crate::authclient::AuthChannel>> {
     let channel = spur_client::connect_channel(addr)
         .await
         .context("cannot connect to agent")?;
-    Ok(
-        SlurmAgentClient::new(crate::authclient::wrap(channel))
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
-    )
+    Ok(SlurmAgentClient::new(crate::authclient::wrap(channel))
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
 }
 
 /// Local username sent with authenticated job requests.

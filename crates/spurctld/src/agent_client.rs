@@ -138,7 +138,9 @@ mod tests {
     #[test]
     fn valid_key_produces_a_verifiable_credential() {
         let cred = credential_with_key(TEST_KEY);
-        let header = cred.header.expect("a non-empty key must produce a credential");
+        let header = cred
+            .header
+            .expect("a non-empty key must produce a credential");
         let header_str = header.to_str().expect("header must be valid ASCII");
         let token = header_str
             .strip_prefix("Bearer ")
@@ -153,11 +155,7 @@ mod tests {
     fn credential_signed_with_wrong_key_is_rejected_by_verifier() {
         let cred = credential_with_key(TEST_KEY);
         let header = cred.header.unwrap();
-        let token = header
-            .to_str()
-            .unwrap()
-            .strip_prefix("Bearer ")
-            .unwrap();
+        let token = header.to_str().unwrap().strip_prefix("Bearer ").unwrap();
         assert!(
             verify_token(token, b"attacker-key").is_err(),
             "a credential signed with one key must not verify against a different key"
@@ -178,8 +176,8 @@ mod tests {
             .unwrap()
             .to_string();
         // generate_token for comparison — confirm our subject constant matches what we mint
-        let reference = generate_token(CONTROLLER_SUBJECT, 0, true, TEST_KEY.as_bytes(), 300)
-            .unwrap();
+        let reference =
+            generate_token(CONTROLLER_SUBJECT, 0, true, TEST_KEY.as_bytes(), 300).unwrap();
         // Both tokens are signed with the same key and subject; verify both decode consistently.
         let id1 = verify_token(&token, TEST_KEY.as_bytes()).unwrap();
         let id2 = verify_token(&reference, TEST_KEY.as_bytes()).unwrap();

@@ -17,7 +17,6 @@ pub(crate) fn spurd_runs_as_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
-
 /// Refuse to execute work as uid 0 unless the operator opted in.
 ///
 /// `PrivDrop::resolve_if_needed` returns `None` for uid 0, which means "no privilege drop" — so a

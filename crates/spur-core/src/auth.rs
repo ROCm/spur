@@ -385,12 +385,7 @@ mod tests {
     #[test]
     fn required_rejects_missing_credential() {
         assert!(matches!(
-            authenticate_bearer(
-                crate::config::AuthMode::Required,
-                TEST_SECRET,
-                None,
-                "hint"
-            ),
+            authenticate_bearer(crate::config::AuthMode::Required, TEST_SECRET, None, "hint"),
             BearerOutcome::Reject(_)
         ));
     }
@@ -471,7 +466,12 @@ mod tests {
         // disabled must not silently verify — that would make `disabled` secretly stricter.
         let h = bearer(TEST_SECRET);
         assert!(matches!(
-            authenticate_bearer(crate::config::AuthMode::Disabled, TEST_SECRET, Some(&h), "hint"),
+            authenticate_bearer(
+                crate::config::AuthMode::Disabled,
+                TEST_SECRET,
+                Some(&h),
+                "hint"
+            ),
             BearerOutcome::Anonymous
         ));
     }
