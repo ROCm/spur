@@ -825,7 +825,10 @@ impl K0sAgent {
             // a surviving token was minted against the torn-down CA and makes the node fail its next
             // join with a kubernetes-ca verification error. Surface the reset failure only after
             // purging. The probe supervisor carries no token path, so also remove the token directly.
-            let reset_result = self.probe_supervisor(ClusterRole::Controller).k0s_reset().await;
+            let reset_result = self
+                .probe_supervisor(ClusterRole::Controller)
+                .k0s_reset()
+                .await;
             for role in [ClusterRole::Controller, ClusterRole::Worker] {
                 self.probe_supervisor(role).purge_unit().await;
             }
