@@ -127,6 +127,14 @@ pub enum WalOperation {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
     },
+    /// Preempt a running job with cancel. The job transitions Running →
+    /// Preempted → Cancelled: Preempted is reported to accounting so the
+    /// PREEMPTED counter increments; Cancelled is the terminal live state so
+    /// dependents and arrays resolve. Single atomic entry so a leadership
+    /// change cannot strand the job running with its allocations held.
+    JobPreemptCancel {
+        job_id: JobId,
+    },
     JobSuspend {
         job_id: JobId,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
@@ -939,6 +947,17 @@ mod deregistration_wal_tests {
 #[cfg(test)]
 mod suspend_wal_tests {
     use super::*;
+
+    #[test]
+    fn preempt_cancel_op_round_trips() {
+        let op = WalOperation::JobPreemptCancel { job_id: 7 };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobPreemptCancel { job_id } => assert_eq!(job_id, 7),
+            _ => panic!("wrong variant"),
+        }
+    }
 
     #[test]
     fn preempt_requeue_op_round_trips() {

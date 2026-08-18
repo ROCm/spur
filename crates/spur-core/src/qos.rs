@@ -165,13 +165,6 @@ pub fn check_qos_limits(
     QosCheckResult::Allowed
 }
 
-/// Add a QOS's flat priority delta on top of an already fairshare/age/tier
-/// weighted priority; applying it earlier would let those factors amplify it.
-pub fn qos_adjusted_priority(base_priority: u32, qos: &Qos) -> u32 {
-    let adjusted = base_priority as i64 + qos.priority as i64;
-    adjusted.clamp(1, u32::MAX as i64) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,39 +690,6 @@ mod tests {
             result,
             QosCheckResult::Blocked(PendingReason::QosGrpMemLimit)
         );
-    }
-
-    #[test]
-    fn test_qos_priority_adjustment() {
-        let qos = Qos {
-            priority: 500,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos), 1500);
-
-        let qos_neg = Qos {
-            priority: -200,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos_neg), 800);
-    }
-
-    #[test]
-    fn test_qos_priority_floor() {
-        let qos = Qos {
-            priority: -2000,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos), 1); // Floor at 1
-    }
-
-    #[test]
-    fn test_qos_priority_saturation() {
-        let qos = Qos {
-            priority: i32::MAX,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(u32::MAX, &qos), u32::MAX); // Saturates instead of wrapping
     }
 
     #[test]
