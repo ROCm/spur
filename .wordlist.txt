@@ -1,5 +1,6 @@
 Ansible
 backfill
+backfilled
 backfilling
 CDI
 CIDR
@@ -139,6 +140,7 @@ gapped
 GiB
 GPUs
 GrpTRES
+GrpWall
 Healthcheck
 Hostlists
 hostname
@@ -227,6 +229,7 @@ Slurm's
 Spur's
 repo's
 submitter's
+QOS's
 linters
 reStructuredText
 rocm
