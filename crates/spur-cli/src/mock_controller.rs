@@ -176,6 +176,8 @@ mock_controller_impl! {
         cluster_down(proto::ClusterDownRequest) -> proto::ClusterDownResponse;
         cluster_status(proto::ClusterStatusRequest) -> proto::ClusterStatusResponse;
         cluster_kubeconfig(proto::ClusterKubeconfigRequest) -> proto::ClusterKubeconfigResponse;
+        cluster_add_nodes(proto::ClusterAddNodesRequest) -> proto::ClusterAddNodesResponse;
+        cluster_remove_nodes(proto::ClusterRemoveNodesRequest) -> proto::ClusterRemoveNodesResponse;
     }
 }
 

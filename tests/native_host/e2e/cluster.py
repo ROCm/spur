@@ -501,8 +501,23 @@ class SpurCluster:
         extra = ["--reset"] if reset else []
         return self.cli_as_user("root", ["spur", "k8s", "down"] + extra)
 
+    def k8s_add_nodes(self, args: list[str]) -> str:
+        # add-nodes is admin-gated; run as root so it passes without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "add-nodes"] + args)
+
+    def k8s_remove_nodes(self, args: list[str]) -> str:
+        # remove-nodes is admin-gated; run as root so it passes without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "remove-nodes"] + args)
+
     def k8s_status(self) -> str:
         return self.cli(["spur", "k8s", "status"])
+
+    def k8s_member_list(self) -> list[str]:
+        """Parse `members:` into a name list; empty list means "all nodes" (whole inventory)."""
+        members = self.k8s_members()
+        if not members or members == "all nodes":
+            return []
+        return [n.strip() for n in members.split(",") if n.strip()]
 
     def k8s_control_planes(self) -> list[str]:
         """Parse the control-plane node list from `spur k8s status`."""

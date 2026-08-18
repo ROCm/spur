@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    ClusterDownRequest, ClusterKubeconfigRequest, ClusterStatusRequest, ClusterUpRequest,
+    ClusterAddNodesRequest, ClusterDownRequest, ClusterKubeconfigRequest,
+    ClusterRemoveNodesRequest, ClusterStatusRequest, ClusterUpRequest,
 };
 
 /// Manage the SPUR-provisioned k0s cluster.
@@ -52,6 +53,33 @@ pub enum K8sCommand {
         /// Scope the cluster to nodes matching every key=value label (repeatable).
         #[arg(long = "selector", value_parser = parse_key_val)]
         selector: Vec<(String, String)>,
+    },
+    /// Add worker nodes to a running cluster (scoped clusters only; no down/reset needed).
+    AddNodes {
+        /// Nodes to add (hostlist, e.g. "gpu[09-12]"), unioned with --partition/--selector.
+        #[arg(long)]
+        nodes: Option<String>,
+        /// Add a partition's nodes.
+        #[arg(long)]
+        partition: Option<String>,
+        /// Add nodes matching every key=value label (repeatable).
+        #[arg(long = "selector", value_parser = parse_key_val)]
+        selector: Vec<(String, String)>,
+    },
+    /// Remove worker nodes from a running cluster: cordon + drain, then `k0s reset` the node
+    /// (destructive — the node re-downloads/re-seeds on a later add). Use `spur node drain` instead
+    /// for a temporary "stop scheduling here".
+    RemoveNodes {
+        /// Worker nodes to remove (hostlist, e.g. "gpu[09-12]").
+        #[arg(long)]
+        nodes: String,
+        /// Max seconds to wait for the k8s drain per node (0 = server default).
+        #[arg(long)]
+        drain_timeout: Option<u32>,
+        /// Proceed even if a node has running jobs (they are left running — this only skips the
+        /// busy-node check) or its drain does not complete (bypasses PodDisruptionBudgets).
+        #[arg(long)]
+        force: bool,
     },
     /// Tear the k0s cluster down.
     Down {
@@ -113,6 +141,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             )
             .await
         }
+        K8sCommand::AddNodes {
+            nodes,
+            partition,
+            selector,
+        } => cmd_add_nodes(&controller, nodes, partition, selector).await,
+        K8sCommand::RemoveNodes {
+            nodes,
+            drain_timeout,
+            force,
+        } => cmd_remove_nodes(&controller, nodes, drain_timeout, force).await,
         K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
         K8sCommand::Kubeconfig { user, admin } => cmd_kubeconfig(&controller, user, admin).await,
@@ -201,6 +239,61 @@ async fn cmd_up(
         println!("k0s cluster up requested: {}", resp.message);
     } else {
         eprintln!("k0s cluster up NOT accepted: {}", resp.message);
+    }
+    for n in resp.nodes {
+        println!("  {} [{}] {}", n.node, n.role, n.component_state);
+    }
+    Ok(())
+}
+
+async fn cmd_add_nodes(
+    controller: &str,
+    nodes: Option<String>,
+    partition: Option<String>,
+    selector: Vec<(String, String)>,
+) -> Result<()> {
+    let selector = selector_map(selector)?;
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let resp = client
+        .cluster_add_nodes(ClusterAddNodesRequest {
+            nodes: nodes.unwrap_or_default(),
+            partition: partition.unwrap_or_default(),
+            selector,
+            caller: effective_user(),
+        })
+        .await?
+        .into_inner();
+    if resp.accepted {
+        println!("k0s add-nodes requested: {}", resp.message);
+    } else {
+        eprintln!("k0s add-nodes NOT accepted: {}", resp.message);
+    }
+    for n in resp.nodes {
+        println!("  {} [{}] {}", n.node, n.role, n.component_state);
+    }
+    Ok(())
+}
+
+async fn cmd_remove_nodes(
+    controller: &str,
+    nodes: String,
+    drain_timeout: Option<u32>,
+    force: bool,
+) -> Result<()> {
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let resp = client
+        .cluster_remove_nodes(ClusterRemoveNodesRequest {
+            nodes,
+            caller: effective_user(),
+            drain_timeout_secs: drain_timeout,
+            force: Some(force),
+        })
+        .await?
+        .into_inner();
+    if resp.accepted {
+        println!("k0s remove-nodes requested: {}", resp.message);
+    } else {
+        eprintln!("k0s remove-nodes NOT accepted: {}", resp.message);
     }
     for n in resp.nodes {
         println!("  {} [{}] {}", n.node, n.role, n.component_state);
@@ -384,6 +477,47 @@ mod tests {
         assert!(matches!(args.command, K8sCommand::Down { reset: true }));
         let args = K8sArgs::try_parse_from(["k8s", "status"]).unwrap();
         assert!(matches!(args.command, K8sCommand::Status));
+    }
+
+    #[test]
+    fn parses_add_nodes_scope_flags() {
+        let args = K8sArgs::try_parse_from(["k8s", "add-nodes", "--nodes", "gpu[09-12]"]).unwrap();
+        match args.command {
+            K8sCommand::AddNodes { nodes, .. } => assert_eq!(nodes.as_deref(), Some("gpu[09-12]")),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn parses_remove_nodes_with_flags() {
+        let args = K8sArgs::try_parse_from([
+            "k8s",
+            "remove-nodes",
+            "--nodes",
+            "gpu[09-12]",
+            "--drain-timeout",
+            "300",
+            "--force",
+        ])
+        .unwrap();
+        match args.command {
+            K8sCommand::RemoveNodes {
+                nodes,
+                drain_timeout,
+                force,
+            } => {
+                assert_eq!(nodes, "gpu[09-12]");
+                assert_eq!(drain_timeout, Some(300));
+                assert!(force);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn remove_nodes_requires_nodes() {
+        // --nodes is mandatory for remove-nodes.
+        assert!(K8sArgs::try_parse_from(["k8s", "remove-nodes"]).is_err());
     }
 
     #[test]
