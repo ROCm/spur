@@ -558,10 +558,11 @@ pub struct SchedulerConfig {
     #[serde(default)]
     pub inactive_limit_secs: u32,
     /// Highest base priority a non-admin caller may request at submit (or via
-    /// `scontrol update`). Requests above this are clamped, not rejected, and a
-    /// warning is returned; admins are unaffected. Defaults to
-    /// [`crate::job::DEFAULT_PRIORITY`], so a non-admin can lower but not raise
-    /// priority — Slurm's `nice`-only model, where boosting priority is
+    /// `scontrol update`). Requests above this are clamped, not rejected; at
+    /// submit the clamp is reported to the caller as a warning, on the update
+    /// path (which has no response field) it is logged. Admins are unaffected.
+    /// Defaults to [`crate::job::DEFAULT_PRIORITY`], so a non-admin can lower but
+    /// not raise priority — Slurm's `nice`-only model, where boosting priority is
     /// operator-only. Raise it to grant users a band above the baseline.
     #[serde(default = "default_max_user_priority")]
     pub max_user_priority: u32,
