@@ -157,12 +157,11 @@ None.
 - **Unit (fix [1]):** `reconcile_phase_reports_no_error_for_down_and_degraded`
   (`spurctld/src/cluster.rs`) extended to seed a token into `join_tokens` and
   assert the `Down` tick clears it. Exercises the real reconcile code. — DONE, passes.
-- **Unit (fix [2]):** `stop_reset_purges_token_even_when_k0s_reset_fails`
-  (`spurd/src/cluster.rs`): `ClusterSupervisor::stop(reset=true)` with a
-  non-existent k0s binary must (a) return `Err` (reset surfaced) and (b) still
-  remove the token + unit files. `#[ignore]`d because `stop()` probes `systemctl`
-  (env-dependent, matching the file's `derisk_*` convention); run explicitly with
-  `--ignored`. — DONE, passes.
+- **Unit (fix [2]):** `reset_and_purge_removes_token_even_when_k0s_reset_fails`
+  (`spurd/src/cluster.rs`): drives `ClusterSupervisor::reset_and_purge` with a
+  non-existent k0s binary and asserts (a) it returns `Err` (reset surfaced) and
+  (b) the token + unit files are still removed. Fully hermetic (no systemd/k0s
+  host state), so it runs in normal CI. — DONE, passes.
 - **Hardware E2E (done, 2026-08-18, testbed master 10.11.98.229 + galena
   10.11.194.197):**
   - *Baseline reproduced on pre-fix build `f9c31da9`:* with galena's k0s made

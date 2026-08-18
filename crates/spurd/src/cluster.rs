@@ -317,16 +317,20 @@ impl ClusterSupervisor {
         }
         self.disable_unit().await;
         if reset {
-            // `k0s reset` wipes /var/lib/k0s; purge_unit removes the spurd-owned unit (Restart=always)
-            // + join token, which would otherwise restart and rejoin the node. Purge UNCONDITIONALLY,
-            // even if `k0s reset` fails (e.g. a broken/half-installed k0s binary): a surviving token is
-            // minted against the torn-down CA and makes the node fail its next join with a
-            // kubernetes-ca verification error. Surface the reset failure only after purging.
-            let reset_result = self.k0s_reset().await;
-            self.purge_unit().await;
-            reset_result?;
+            self.reset_and_purge().await?;
         }
         Ok(())
+    }
+
+    /// `k0s reset` (wipes /var/lib/k0s) followed by `purge_unit` (removes the spurd-owned unit +
+    /// join token). Purges UNCONDITIONALLY, even if `k0s reset` fails (e.g. a broken/half-installed
+    /// k0s binary): a surviving token was minted against the torn-down CA and makes the node fail its
+    /// next join with a kubernetes-ca verification error, while the `Restart=always` unit keeps
+    /// restarting k0s with it. The reset failure is surfaced, but only after the purge.
+    async fn reset_and_purge(&self) -> anyhow::Result<()> {
+        let reset_result = self.k0s_reset().await;
+        self.purge_unit().await;
+        reset_result
     }
 
     /// `systemctl disable --now <unit>` — stop + remove the enable symlink. Idempotent (ignores an
@@ -1307,13 +1311,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires systemctl on PATH; run explicitly on a Linux host"]
-    async fn stop_reset_purges_token_even_when_k0s_reset_fails() {
+    async fn reset_and_purge_removes_token_even_when_k0s_reset_fails() {
         // Regression: `down --reset` must purge the spurd-owned unit + join token even if `k0s reset`
         // fails (e.g. a broken/half-installed k0s binary). A surviving token was minted against the
         // torn-down CA, so the node fails its next join with a kubernetes-ca verification error. The
-        // reset failure must still be surfaced (Err), but only AFTER the purge.
-        // Gated: `stop()` probes `systemctl --version`, so this needs systemd on PATH.
+        // reset failure must still be surfaced (Err), but only AFTER the purge. Drives
+        // `reset_and_purge` directly so no systemd/k0s host state is touched (`k0s reset` fails via a
+        // non-existent binary; `purge_unit`'s trailing daemon-reload is best-effort/ignored).
         let dir = tempfile::TempDir::new().unwrap();
         let unit_dir = dir.path().join("systemd");
         tokio::fs::create_dir_all(&unit_dir).await.unwrap();
@@ -1334,7 +1338,7 @@ mod tests {
         let unit_path = unit_dir.join(sup.unit_file_name());
         tokio::fs::write(&unit_path, b"[Unit]\n").await.unwrap();
 
-        let result = sup.stop(true).await;
+        let result = sup.reset_and_purge().await;
 
         assert!(
             result.is_err(),
