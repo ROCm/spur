@@ -150,12 +150,58 @@ much data — model caches, datasets — point it at a large scratch disk:
 
 Set ``storage_provisioner = "none"`` to bring your own storage.
 
-Adding a node later
-~~~~~~~~~~~~~~~~~~~~~
+Adding and removing worker nodes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Start ``spurd`` on the new node (registered to the same controller) and, if using
-the mesh CNI, join it to the mesh first. On the next ``spur k8s up`` (or the next
-reconcile tick) it is assigned a role + mesh IP + pod CIDR and joins.
+How a worker joins depends on how the cluster was scoped at ``spur k8s up``:
+
+**Whole-inventory cluster** (``spur k8s up`` with no scope flags) — every
+registered node is a member. Start ``spurd`` on the new node (registered to the
+same controller) and, if using the mesh CNI, join it to the mesh first. On the
+next reconcile tick it is assigned a role + mesh IP + pod CIDR and joins
+automatically. No further command is needed.
+
+**Scoped cluster** (``spur k8s up --nodes/--partition/--selector``) — membership
+is frozen at up-time, so a newly-registered node stays *outside* the cluster until
+you add it explicitly. Grow the cluster online, no ``down``/``--reset`` needed:
+
+.. code-block:: bash
+
+   spur k8s add-nodes --nodes gpu[09-12]        # or --partition <p> / --selector k=v
+   spur k8s status                              # the new workers converge to active
+
+Added nodes are workers; they are unioned into the member set and enrolled by the
+reconcile loop exactly as an in-scope node is. Adding a node already in the
+cluster is a no-op.
+
+Remove a worker gracefully — cordon, drain (evict pods, PDB-aware), then stop and
+``k0s reset`` the node:
+
+.. code-block:: bash
+
+   spur k8s remove-nodes --nodes gpu12
+   spur k8s remove-nodes --nodes gpu12 --drain-timeout 180
+   spur k8s remove-nodes --nodes gpu12 --force   # proceed past running jobs / a blocked drain
+
+.. warning::
+
+   ``remove-nodes`` is **destructive**: it runs ``k0s reset`` on the departing
+   node, wiping its k0s state (etcd/kine data, pulled images, containerd state,
+   certs). Re-adding the same node later re-downloads k0s and re-seeds state
+   (~262 MB plus an image re-pull). For a temporary "stop scheduling here", use
+   ``spur node drain`` (the SPUR-scheduling layer) instead — it does not touch k0s.
+
+   ``--force`` only skips the running-jobs guard (the jobs keep running) and lets
+   the drain proceed past a ``PodDisruptionBudget`` or its timeout — it can evict
+   pods that would otherwise block. ``remove-nodes`` refuses a control-plane node,
+   the last remaining worker (would empty the member set), and any node not in a
+   scoped cluster.
+
+``spur k8s remove-nodes`` is distinct from ``spur node remove``: the former is the
+graceful, k0s-aware path for shrinking a running cluster (drain + reset); the
+latter is inventory-only (it does not drain pods or stop k0s) and is for
+decommissioning a host from SPUR entirely. Use ``k8s remove-nodes`` first, then
+``node remove`` if the host is also leaving SPUR.
 
 Tear down
 ~~~~~~~~~
@@ -233,6 +279,10 @@ Command reference
      - Purpose
    * - ``spur k8s up [--control-plane-node <h>]``
      - Provision + start the cluster (idempotent).
+   * - ``spur k8s add-nodes --nodes <hostlist> | --partition <p> | --selector k=v``
+     - Add worker nodes to a running scoped cluster (no down/reset).
+   * - ``spur k8s remove-nodes --nodes <hostlist> [--drain-timeout <secs>] [--force]``
+     - Drain + ``k0s reset`` + remove a worker (destructive; re-add re-seeds state).
    * - ``spur k8s status``
      - Cluster phase + per-node component state.
    * - ``spur k8s kubeconfig``
