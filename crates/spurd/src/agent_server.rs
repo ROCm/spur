@@ -233,7 +233,7 @@ pub struct AgentService {
     spank: Arc<Option<SpankHost>>,
     mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
-    memlock: spur_core::config::MemlockLimit,
+    limits: spur_core::config::JobLimits,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
@@ -262,7 +262,10 @@ impl AgentService {
             hooks,
             device_registry,
             &spur_core::config::ClusterConfig::default(),
-            memlock,
+            spur_core::config::JobLimits {
+                memlock,
+                ..Default::default()
+            },
             MpiConfig::default(),
             new_running_jobs(),
             spur_core::config::AuthConfig::default().allow_root_jobs,
@@ -280,7 +283,7 @@ impl AgentService {
         hooks: HooksConfig,
         device_registry: Arc<Mutex<DeviceRegistry>>,
         cluster: &spur_core::config::ClusterConfig,
-        memlock: spur_core::config::MemlockLimit,
+        limits: spur_core::config::JobLimits,
         mpi: MpiConfig,
         running: RunningJobs,
         allow_root_jobs: bool,
@@ -343,7 +346,7 @@ impl AgentService {
             spank: Arc::new(spank),
             mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
-            memlock,
+            limits,
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
@@ -583,13 +586,7 @@ impl Drop for LaunchReservationGuard {
     }
 }
 
-fn controller_rpc_retryable(status: &tonic::Status) -> bool {
-    use tonic::Code;
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
-    )
-}
+use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1483,7 +1480,8 @@ impl SlurmAgent for AgentService {
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
-            memlock: self.memlock,
+            memlock: self.limits.memlock,
+            swap_limit: self.limits.swap,
             io_mode: if spec.pty {
                 executor::LaunchIo::Pty
             } else {
@@ -2186,7 +2184,7 @@ impl SlurmAgent for AgentService {
             cmd.env(k, v);
         }
 
-        let memlock = self.memlock;
+        let memlock = self.limits.memlock;
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {
@@ -4937,7 +4935,7 @@ mod tests {
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             &spur_core::config::ClusterConfig::default(),
-            spur_core::config::MemlockLimit::Unlimited,
+            spur_core::config::JobLimits::default(),
             MpiConfig::default(),
             running,
             false, // allow_root_jobs
