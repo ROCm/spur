@@ -203,7 +203,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
 
-                try_preempt(&cluster, &partitions, &unscheduled, &cluster.config().scheduler).await;
+                try_preempt(
+                    &cluster,
+                    &partitions,
+                    &unscheduled,
+                    &cluster.config().scheduler,
+                )
+                .await;
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
                 if !cluster.config().federation.clusters.is_empty() {
@@ -601,11 +607,13 @@ pub(crate) async fn try_preempt(
 
     // Pending job's QOS is resolved once per pending job; used for the
     // QosPriority hierarchy check.
-    let pending_qos_map: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
-        unscheduled
-            .iter()
-            .map(|j| (j.job_id, cluster.resolve_qos(j)))
-            .collect();
+    let pending_qos_map: std::collections::HashMap<
+        spur_core::job::JobId,
+        spur_core::accounting::Qos,
+    > = unscheduled
+        .iter()
+        .map(|j| (j.job_id, cluster.resolve_qos(j)))
+        .collect();
 
     for pending in unscheduled {
         let Some(pending_part) = partition_for(pending) else {
@@ -2612,7 +2620,10 @@ mod tests {
     #[test]
     fn effective_exempt_secs_falls_back_to_global() {
         let job = job_in_partitions("gpu");
-        let parts = vec![partition_with_mode("gpu", spur_core::partition::PreemptMode::Cancel)];
+        let parts = vec![partition_with_mode(
+            "gpu",
+            spur_core::partition::PreemptMode::Cancel,
+        )];
         let qos = no_qos_override();
         let sched = sched_config_with_exempt(120);
         assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 120);
@@ -2639,7 +2650,10 @@ mod tests {
     #[test]
     fn effective_exempt_secs_zero_global_and_no_overrides_is_zero() {
         let job = job_in_partitions("gpu");
-        let parts = vec![partition_with_mode("gpu", spur_core::partition::PreemptMode::Cancel)];
+        let parts = vec![partition_with_mode(
+            "gpu",
+            spur_core::partition::PreemptMode::Cancel,
+        )];
         let qos = no_qos_override();
         let sched = sched_config_default();
         assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 0);
