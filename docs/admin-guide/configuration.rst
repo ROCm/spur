@@ -250,6 +250,21 @@ and Raft high-availability topology.
      - Live
      - How long a node is skipped for dispatch after rejecting a launch as
        resources-unavailable.
+   * - ``job_info_visibility``
+     - string
+     - ``redacted``
+     - Live
+     - How much of another user's job an identified non-owner (non-admin) may
+       read via ``get_job`` / ``scontrol show job``. ``redacted`` (default) shows
+       identity, state, timing, and account but blanks the working directory,
+       command, stdio paths, comment, resource detail, and allocated nodelist;
+       ``owner_only`` returns ``NOT_FOUND`` for other users' jobs; ``full`` is the
+       legacy behaviour where every field is visible to any caller. Owners and
+       admins always see the full record. Scoping applies only to identified
+       callers — under ``auth.mode = required``, or when a credential is
+       presented under ``permissive``; with authentication disabled or no
+       credential presented, the full record is returned (so no-auth deployments
+       and internal consumers are unaffected).
 
 ``[accounting]``
 ----------------
@@ -362,6 +377,21 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``300``
      - Live
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
+   * - ``max_user_priority``
+     - integer
+     - ``1000``
+     - Live
+     - Highest base priority a non-admin may request, at submit (``--priority``)
+       or via ``scontrol update``. Requests above this are clamped down, not
+       rejected; at submit the clamp is returned to the caller as a warning, while
+       on the ``scontrol update`` path (which has no response field) it is only
+       logged. Defaults to the base priority (``1000``), so a non-admin can lower
+       but not raise priority, matching Slurm, where boosting priority is
+       operator-only. Raise it to grant users a band above the baseline. The
+       ceiling applies only to identified non-admin callers: admins are exempt, and
+       so are callers with no verified identity (``auth.mode = disabled``, or
+       ``permissive`` with no credential), where the cluster trusts the client as
+       before.
    * - ``inactive_limit_secs``
      - integer
      - ``0``

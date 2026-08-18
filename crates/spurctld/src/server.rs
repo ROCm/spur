@@ -393,6 +393,77 @@ impl ControllerService {
         Ok(())
     }
 
+    /// Whether the verified caller is an administrator for policy decisions that are neither
+    /// job-ownership nor k0s-cluster gates: priority ceilings, job-info visibility.
+    ///
+    /// Accepts either the token's `admin` claim or the accounting `Admin` level, so the check works
+    /// before the accounting DB is populated and stays consistent with the rest of the control plane
+    /// (`is_k0s_admin`). An unauthenticated caller (permissive/disabled) is not an admin.
+    fn caller_is_admin(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        identity.is_some_and(|id| {
+            id.is_admin || is_k0s_admin(self.cluster.association_cache(), &id.user)
+        })
+    }
+
+    /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
+    /// or a caller with no verified identity. The latter keeps the pre-auth behaviour — `disabled`,
+    /// or `permissive` with no credential, trusts the client — so restricting it would break no-auth
+    /// deployments. `required` never reaches here without an identity, so real users are still bound.
+    fn caller_is_privileged(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        identity.is_none() || self.caller_is_admin(identity)
+    }
+
+    /// Clamp a non-privileged caller's base priority to `[scheduler] max_user_priority`, mirroring
+    /// Slurm's operator-only priority raising (an ordinary user may only lower it). Clamped down, not
+    /// rejected, so a fat-fingered `--priority` still runs. Privileged callers and an unset priority
+    /// are untouched. Returns a warning string; `submit_job` surfaces it in the response, and
+    /// `update_job` logs it (UpdateJob has no response field). Operates on the raw `Option<u32>` so
+    /// submit and `scontrol update` share one policy — the ceiling can't be dodged by boosting later.
+    fn clamp_priority(
+        priority: &mut Option<u32>,
+        caller_is_privileged: bool,
+        max_user_priority: u32,
+    ) -> Option<String> {
+        if caller_is_privileged {
+            return None;
+        }
+        match *priority {
+            Some(p) if p > max_user_priority => {
+                *priority = Some(max_user_priority);
+                Some(format!(
+                    "requested priority {p} exceeds the non-admin ceiling {max_user_priority}; \
+                     clamped to {max_user_priority} (raising priority is operator-only)"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply `[controller] job_info_visibility` for `get_job`. Owner, admin, and unauthenticated
+    /// callers (see [`viewer_is_privileged`]) get the full record; an identified non-owner gets
+    /// `Full` (legacy), `None` → `NOT_FOUND` (`OwnerOnly`), or the targeting-sensitive fields blanked
+    /// (`Redacted`, the default).
+    fn scoped_job_info(
+        &self,
+        job: &spur_core::job::Job,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Option<JobInfo> {
+        let privileged =
+            viewer_is_privileged(identity, &job.spec.user, self.caller_is_admin(identity));
+        match job_info_disclosure(
+            privileged,
+            self.cluster.config().controller.job_info_visibility,
+        ) {
+            JobInfoDisclosure::Full => Some(job_to_proto(job)),
+            JobInfoDisclosure::Hidden => None,
+            JobInfoDisclosure::Redacted => {
+                let mut info = job_to_proto(job);
+                redact_sensitive_job_info(&mut info);
+                Some(info)
+            }
+        }
+    }
+
     /// Forwarding metadata that carries the caller's credential through to the leader.
     ///
     /// The leader is what authorizes the request, so it must see the ORIGINAL caller — not the
@@ -554,14 +625,25 @@ impl SlurmController for ControllerService {
 
         let mut core_spec = proto_to_job_spec(spec)?;
         Self::bind_spec_to_identity(&mut core_spec, identity.as_ref())?;
+
+        // Clamp a non-privileged caller's base priority to the configured ceiling before it reaches
+        // the scheduler, so one submission cannot front-run the whole queue. Non-fatal: clamp + warn.
+        let priority_warning = Self::clamp_priority(
+            &mut core_spec.priority,
+            self.caller_is_privileged(identity.as_ref()),
+            self.cluster.config().scheduler.max_user_priority,
+        );
+
         let outcome = self
             .cluster
             .submit_job(core_spec)
             .map_err(submit_rpc_status)?;
 
+        let mut warnings = outcome.warnings;
+        warnings.extend(priority_warning);
         Ok(Response::new(SubmitJobResponse {
             job_id: outcome.job_id,
-            warnings: outcome.warnings,
+            warnings,
         }))
     }
 
@@ -631,7 +713,12 @@ impl SlurmController for ControllerService {
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
         let forward = self.read_should_forward(&request);
         let meta = request.metadata().clone();
+        // Capture identity before the forward so the serving node (leader or read-allowed follower)
+        // can scope the record to the caller; the credential is preserved on forward, so a forwarded
+        // read is scoped on the leader instead.
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
+        let job_id = req.job_id;
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
@@ -644,13 +731,17 @@ impl SlurmController for ControllerService {
             return Ok(resp);
         }
 
-        let job_id = req.job_id;
         let job = self
             .cluster
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        Ok(Response::new(job_to_proto(&job)))
+        // A non-owner, non-admin caller does not get another tenant's work_dir, command, stdio
+        // paths, or (the targeting-sensitive one) allocated nodelist. Policy is configurable; the
+        // default redacts those fields while leaving the Slurm-standard queue view intact.
+        self.scoped_job_info(&job, identity.as_ref())
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))
     }
 
     async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
@@ -881,7 +972,8 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let caller_is_privileged = self.caller_is_privileged(Self::verified_identity(&request));
+        let mut req = request.into_inner();
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
@@ -895,6 +987,17 @@ impl SlurmController for ControllerService {
                     .map_err(|e| Status::internal(e.to_string()))?;
             }
             return Ok(Response::new(()));
+        }
+
+        // Same ceiling as submit: a non-privileged caller cannot raise priority above the cap
+        // post-submit. UpdateJob returns Empty, so there is no response field to carry a warning —
+        // log it instead, so a clamp on this path is at least observable.
+        if let Some(w) = Self::clamp_priority(
+            &mut req.priority,
+            caller_is_privileged,
+            self.cluster.config().scheduler.max_user_priority,
+        ) {
+            warn!(job_id = req.job_id, "{w}");
         }
 
         let time_limit = req.time_limit.map(|d| chrono::Duration::seconds(d.seconds));
@@ -1658,7 +1761,9 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<GetJobStepsResponse>, Status> {
         let forward = self.read_should_forward(&request);
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
+        let job_id = req.job_id;
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
@@ -1671,14 +1776,42 @@ impl SlurmController for ControllerService {
             return Ok(resp);
         }
 
-        let job_id = req.job_id;
+        // Scope step visibility to the same policy as get_job: step names can leak intent, so they
+        // are blanked under `redacted` and the list is empty under `owner_only`. Resolve the parent
+        // job first and return NOT_FOUND if it is gone — matching get_job, and so the owner is never
+        // mis-derived as `""` (which would treat the true owner as unprivileged).
+        let job = self
+            .cluster
+            .get_job_for_display(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let privileged = viewer_is_privileged(
+            identity.as_ref(),
+            &job.spec.user,
+            self.caller_is_admin(identity.as_ref()),
+        );
+        let redact_names = match job_info_disclosure(
+            privileged,
+            self.cluster.config().controller.job_info_visibility,
+        ) {
+            JobInfoDisclosure::Full => false,
+            JobInfoDisclosure::Redacted => true,
+            // Owner-only: the job is invisible to this caller, so are its steps.
+            JobInfoDisclosure::Hidden => {
+                return Ok(Response::new(GetJobStepsResponse { steps: Vec::new() }));
+            }
+        };
+
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
             .iter()
             .map(|s| JobStepInfo {
                 job_id: s.job_id,
                 step_id: s.step_id,
-                name: s.name.clone(),
+                name: if redact_names {
+                    String::new()
+                } else {
+                    s.name.clone()
+                },
                 state: s.state.display().to_string(),
                 num_tasks: s.num_tasks,
             })
@@ -3404,6 +3537,65 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
     }
 }
 
+/// What a caller may see of a job, once ownership/admin status and the visibility policy are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobInfoDisclosure {
+    /// Full record.
+    Full,
+    /// Full record minus the targeting-sensitive fields (see [`redact_sensitive_job_info`]).
+    Redacted,
+    /// Not disclosed at all — the caller sees `NOT_FOUND`.
+    Hidden,
+}
+
+/// Whether a caller may see a job's full record unconditionally: the owner, an admin, or a caller
+/// with no verified identity at all. The last case preserves the pre-auth behaviour — scoping only
+/// bites once callers are actually identified, so no-auth/permissive deployments and internal
+/// unauthenticated consumers (the k8s operator's nodelist read) are unaffected. Pure for testing.
+fn viewer_is_privileged(
+    identity: Option<&spur_core::auth::Identity>,
+    owner: &str,
+    caller_is_admin: bool,
+) -> bool {
+    match identity {
+        None => true,
+        Some(id) => id.user == owner || caller_is_admin,
+    }
+}
+
+/// Resolve the disclosure level for a job-info read. The owner and admins (`privileged`) always get
+/// the full record; everyone else is governed by the configured policy. Pure so the policy matrix is
+/// unit-testable without a live service.
+fn job_info_disclosure(
+    privileged: bool,
+    visibility: spur_core::config::JobInfoVisibility,
+) -> JobInfoDisclosure {
+    use spur_core::config::JobInfoVisibility;
+    if privileged {
+        return JobInfoDisclosure::Full;
+    }
+    match visibility {
+        JobInfoVisibility::Full => JobInfoDisclosure::Full,
+        JobInfoVisibility::Redacted => JobInfoDisclosure::Redacted,
+        JobInfoVisibility::OwnerOnly => JobInfoDisclosure::Hidden,
+    }
+}
+
+/// Blank the fields of a `JobInfo` that a non-owner should not see: the working directory, the first
+/// command line, the stdio paths, the comment, the resource detail, and — most importantly for
+/// cross-tenant targeting — the allocated nodelist. The identity/state/timing/account fields are
+/// left intact so the Slurm-standard cluster-visible queue view still works.
+fn redact_sensitive_job_info(info: &mut JobInfo) {
+    info.work_dir = String::new();
+    info.command = String::new();
+    info.stdout_path = String::new();
+    info.stderr_path = String::new();
+    info.stdin_path = String::new();
+    info.comment = String::new();
+    info.nodelist = String::new();
+    info.resources = None;
+}
+
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
@@ -3898,6 +4090,220 @@ mod tests {
         // Cold cache = accounting disabled/not loaded: only root/internal are admin.
         let cache = crate::association_cache::AssociationCache::new();
         assert!(!is_k0s_admin(&cache, "alice"));
+    }
+
+    #[test]
+    fn clamp_priority_caps_a_non_admin_above_the_ceiling() {
+        let mut p = Some(u32::MAX);
+        let warning = ControllerService::clamp_priority(&mut p, false, 1000);
+        assert_eq!(p, Some(1000), "over-ceiling request is clamped down");
+        assert!(warning.is_some(), "a clamp returns a warning");
+    }
+
+    #[test]
+    fn clamp_priority_leaves_a_non_admin_at_or_below_the_ceiling() {
+        for req in [None, Some(0), Some(500), Some(1000)] {
+            let mut p = req;
+            let warning = ControllerService::clamp_priority(&mut p, false, 1000);
+            assert_eq!(p, req, "request within the ceiling is untouched");
+            assert!(warning.is_none(), "no warning when nothing is clamped");
+        }
+    }
+
+    #[test]
+    fn clamp_priority_never_touches_a_privileged_caller() {
+        // Privileged = admin or unauthenticated (auth not enforced); see caller_is_privileged.
+        let mut p = Some(u32::MAX);
+        let warning = ControllerService::clamp_priority(&mut p, true, 1000);
+        assert_eq!(
+            p,
+            Some(u32::MAX),
+            "a privileged caller may set any priority"
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn job_info_disclosure_matrix() {
+        use spur_core::config::JobInfoVisibility::*;
+        // The owner/admin (privileged) always sees the full record, whatever the policy.
+        for v in [Redacted, OwnerOnly, Full] {
+            assert_eq!(job_info_disclosure(true, v), JobInfoDisclosure::Full);
+        }
+        // A non-owner is governed by the policy.
+        assert_eq!(
+            job_info_disclosure(false, Redacted),
+            JobInfoDisclosure::Redacted
+        );
+        assert_eq!(
+            job_info_disclosure(false, OwnerOnly),
+            JobInfoDisclosure::Hidden
+        );
+        assert_eq!(job_info_disclosure(false, Full), JobInfoDisclosure::Full);
+    }
+
+    #[test]
+    fn viewer_privilege_owner_admin_and_anonymous() {
+        use spur_core::auth::Identity;
+        let bob = Identity {
+            user: "bob".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
+        let alice = Identity {
+            user: "alice".into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+        };
+        // Owner and admin are privileged.
+        assert!(viewer_is_privileged(Some(&bob), "bob", false));
+        assert!(viewer_is_privileged(Some(&alice), "bob", true));
+        // A different, non-admin identified user is not.
+        assert!(!viewer_is_privileged(Some(&alice), "bob", false));
+        // No verified identity (auth disabled, or permissive with no credential, or an internal
+        // consumer like the k8s operator) is privileged: scoping only applies to identified callers.
+        assert!(viewer_is_privileged(None, "bob", false));
+    }
+
+    #[test]
+    fn redact_blanks_sensitive_fields_and_keeps_the_rest() {
+        let mut info = JobInfo {
+            job_id: 42,
+            name: "train".into(),
+            user: "bob".into(),
+            account: "team-b".into(),
+            state_reason: "Running".into(),
+            // sensitive
+            work_dir: "/home/bob/run".into(),
+            command: "python train.py --secret".into(),
+            stdout_path: "/home/bob/out".into(),
+            stderr_path: "/home/bob/err".into(),
+            stdin_path: "/home/bob/in".into(),
+            comment: "internal".into(),
+            nodelist: "gpu-b-[01-04]".into(),
+            ..Default::default()
+        };
+        redact_sensitive_job_info(&mut info);
+        // Sensitive fields are gone — the nodelist in particular (the co-residency targeting oracle).
+        assert!(info.work_dir.is_empty());
+        assert!(info.command.is_empty());
+        assert!(info.stdout_path.is_empty());
+        assert!(info.stderr_path.is_empty());
+        assert!(info.stdin_path.is_empty());
+        assert!(info.comment.is_empty());
+        assert!(info.nodelist.is_empty());
+        assert!(info.resources.is_none());
+        // Non-sensitive identity/state fields survive so the queue view still works.
+        assert_eq!(info.job_id, 42);
+        assert_eq!(info.name, "train");
+        assert_eq!(info.user, "bob");
+        assert_eq!(info.account, "team-b");
+        assert_eq!(info.state_reason, "Running");
+    }
+
+    /// Identity for a viewer in the get_job/get_job_steps handler tests. No NSS resolution happens
+    /// on the read path (only ownership/admin comparison), so any username works.
+    fn viewer(user: &str, is_admin: bool) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: user.to_string(),
+            uid: 1000,
+            gid: 1000,
+            is_admin,
+        }
+    }
+
+    fn get_job_req(job_id: u32, id: Option<spur_core::auth::Identity>) -> Request<GetJobRequest> {
+        let mut req = Request::new(GetJobRequest { job_id });
+        if let Some(id) = id {
+            req.extensions_mut().insert(id);
+        }
+        req
+    }
+
+    fn owned_job(user: &str, work_dir: &str) -> spur_core::job::JobSpec {
+        spur_core::job::JobSpec {
+            name: "j".into(),
+            user: user.to_string(),
+            work_dir: work_dir.to_string(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_scopes_by_identity_under_default_redacted_policy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = svc
+            .cluster
+            .submit_job(owned_job("bob", "/home/bob"))
+            .unwrap()
+            .job_id;
+
+        // Owner, admin, and unauthenticated callers all get the full record.
+        for id in [
+            Some(viewer("bob", false)),
+            Some(viewer("carol", true)),
+            None,
+        ] {
+            let info = svc
+                .get_job(get_job_req(job_id, id))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(info.work_dir, "/home/bob");
+        }
+
+        // An identified non-owner is redacted: the work_dir (and other sensitive fields) are blanked,
+        // but the non-sensitive identity fields survive.
+        let other = svc
+            .get_job(get_job_req(job_id, Some(viewer("alice", false))))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(other.work_dir, "", "a non-owner must not see the work_dir");
+        assert_eq!(other.user, "bob", "non-sensitive fields survive redaction");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_owner_only_hides_the_job_from_a_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.controller.job_info_visibility = spur_core::config::JobInfoVisibility::OwnerOnly;
+        let svc = test_service_with(&dir, config).await;
+        let job_id = svc
+            .cluster
+            .submit_job(owned_job("bob", "/home/bob"))
+            .unwrap()
+            .job_id;
+
+        // Owner still sees the job; a non-owner gets NOT_FOUND rather than a redacted record.
+        assert!(svc
+            .get_job(get_job_req(job_id, Some(viewer("bob", false))))
+            .await
+            .is_ok());
+        let err = svc
+            .get_job(get_job_req(job_id, Some(viewer("alice", false))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_steps_returns_not_found_for_an_unknown_job() {
+        // Regression guard: a job absent from the display cache must be NOT_FOUND, not a response
+        // whose owner is mis-derived as "" (which treated the true owner as unprivileged).
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let err = svc
+            .get_job_steps(Request::new(GetJobStepsRequest { job_id: 999_999 }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[test]
