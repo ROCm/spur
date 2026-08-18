@@ -383,10 +383,13 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Highest base priority a non-admin may request, at submit (``--priority``)
        or via ``scontrol update``. Requests above this are clamped down — not
-       rejected — with a warning; admins are unaffected. Defaults to the base
-       priority (``1000``), so a non-admin can lower but not raise priority,
-       matching Slurm, where boosting priority is operator-only. Raise it to grant
-       users a band above the baseline.
+       rejected — with a warning. Defaults to the base priority (``1000``), so a
+       non-admin can lower but not raise priority, matching Slurm, where boosting
+       priority is operator-only. Raise it to grant users a band above the
+       baseline. The ceiling applies only to identified non-admin callers: admins
+       are exempt, and so are callers with no verified identity
+       (``auth.mode = disabled``, or ``permissive`` with no credential), where the
+       cluster trusts the client as before.
    * - ``inactive_limit_secs``
      - integer
      - ``0``

@@ -405,21 +405,31 @@ impl ControllerService {
         })
     }
 
-    /// Clamp a non-admin caller's requested base priority to the configured ceiling.
+    /// Whether a caller is exempt from the non-admin restrictions (currently the priority ceiling):
+    /// an admin, or a caller with no verified identity. The latter preserves the pre-auth behaviour —
+    /// under `auth.mode = disabled`, or `permissive` with no credential presented, the cluster trusts
+    /// the client, so restricting it would break no-auth deployments (and internal callers, e.g. the
+    /// CLI raising priority in an unauthenticated cluster). `required` mode never reaches here without
+    /// an identity, so the restriction still applies to every real user there.
+    fn caller_is_privileged(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        identity.is_none() || self.caller_is_admin(identity)
+    }
+
+    /// Clamp a non-privileged caller's requested base priority to the configured ceiling.
     ///
     /// Slurm lets an ordinary user only *lower* their priority (`nice >= 0`); raising it is
-    /// operator-only. We mirror that: a non-admin request above `[scheduler] max_user_priority`
+    /// operator-only. We mirror that: a request above `[scheduler] max_user_priority`
     /// (default [`DEFAULT_PRIORITY`]) is clamped down and a warning is returned — not rejected, so a
-    /// fat-fingered `--priority` still runs. Admins, and an unset priority, are untouched.
-    /// Returns the warning to surface to the caller, if any. Operates on the raw `Option<u32>` so
-    /// both the submit path (`JobSpec::priority`) and the `scontrol update` path (`req.priority`)
-    /// share one policy — a user cannot dodge the ceiling by boosting priority after submit.
+    /// fat-fingered `--priority` still runs. Privileged callers (admin or unauthenticated, see
+    /// [`Self::caller_is_privileged`]), and an unset priority, are untouched. Operates on the raw
+    /// `Option<u32>` so both the submit path (`JobSpec::priority`) and the `scontrol update` path
+    /// (`req.priority`) share one policy — a user cannot dodge the ceiling by boosting after submit.
     fn clamp_priority(
         priority: &mut Option<u32>,
-        caller_is_admin: bool,
+        caller_is_privileged: bool,
         max_user_priority: u32,
     ) -> Option<String> {
-        if caller_is_admin {
+        if caller_is_privileged {
             return None;
         }
         match *priority {
@@ -627,11 +637,11 @@ impl SlurmController for ControllerService {
         let mut core_spec = proto_to_job_spec(spec)?;
         Self::bind_spec_to_identity(&mut core_spec, identity.as_ref())?;
 
-        // Clamp a non-admin's base priority to the configured ceiling before it reaches the
-        // scheduler, so one submission cannot front-run the whole queue. Non-fatal: clamp + warn.
+        // Clamp a non-privileged caller's base priority to the configured ceiling before it reaches
+        // the scheduler, so one submission cannot front-run the whole queue. Non-fatal: clamp + warn.
         let priority_warning = Self::clamp_priority(
             &mut core_spec.priority,
-            self.caller_is_admin(identity.as_ref()),
+            self.caller_is_privileged(identity.as_ref()),
             self.cluster.config().scheduler.max_user_priority,
         );
 
@@ -973,7 +983,7 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let caller_is_admin = self.caller_is_admin(Self::verified_identity(&request));
+        let caller_is_privileged = self.caller_is_privileged(Self::verified_identity(&request));
         let mut req = request.into_inner();
 
         // Handle hold/release via priority
@@ -990,10 +1000,11 @@ impl SlurmController for ControllerService {
             return Ok(Response::new(()));
         }
 
-        // Same ceiling as submit: a non-admin cannot raise priority above the cap post-submit.
+        // Same ceiling as submit: a non-privileged caller cannot raise priority above the cap
+        // post-submit.
         Self::clamp_priority(
             &mut req.priority,
-            caller_is_admin,
+            caller_is_privileged,
             self.cluster.config().scheduler.max_user_priority,
         );
 
@@ -3853,10 +3864,15 @@ mod tests {
     }
 
     #[test]
-    fn clamp_priority_never_touches_an_admin() {
+    fn clamp_priority_never_touches_a_privileged_caller() {
+        // Privileged = admin or unauthenticated (auth not enforced); see caller_is_privileged.
         let mut p = Some(u32::MAX);
         let warning = ControllerService::clamp_priority(&mut p, true, 1000);
-        assert_eq!(p, Some(u32::MAX), "an admin may set any priority");
+        assert_eq!(
+            p,
+            Some(u32::MAX),
+            "a privileged caller may set any priority"
+        );
         assert!(warning.is_none());
     }
 
