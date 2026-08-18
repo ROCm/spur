@@ -82,12 +82,22 @@ impl RebuildAccum {
             .cpus_undercharged
             .saturating_add(drift.cpus_undercharged);
         self.cpus_overcharged = self.cpus_overcharged.saturating_add(drift.cpus_overcharged);
+        self.memory_undercharged_mb = self
+            .memory_undercharged_mb
+            .saturating_add(drift.memory_undercharged_mb);
+        self.memory_overcharged_mb = self
+            .memory_overcharged_mb
+            .saturating_add(drift.memory_overcharged_mb);
         self.devices_undercharged = self
             .devices_undercharged
             .saturating_add(drift.devices_undercharged);
         self.devices_overcharged = self
             .devices_overcharged
             .saturating_add(drift.devices_overcharged);
+        // Last-value, not cumulative: both are exported as gauges describing the
+        // most recent pass.
+        self.unaccounted_slices = drift.unaccounted_slices as u64;
+        self.nodes_checked = drift.nodes_checked as u64;
     }
 }
 
@@ -200,6 +210,60 @@ mod tests {
             cpus_overcharged: cpus_over,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn every_drift_dimension_reaches_the_snapshot() {
+        let stats = ReconcileStatsCollector::new();
+        stats.record_rebuild(
+            RebuildTrigger::Restore,
+            AllocDrift {
+                nodes_checked: 12,
+                unaccounted_slices: 3,
+                nodes_undercharged: 1,
+                nodes_overcharged: 2,
+                cpus_undercharged: 4,
+                cpus_overcharged: 5,
+                memory_undercharged_mb: 6,
+                memory_overcharged_mb: 7,
+                devices_undercharged: 8,
+                devices_overcharged: 9,
+            },
+        );
+
+        let r = &stats.snapshot().rebuilds[0];
+        assert_eq!(r.nodes_checked, 12);
+        assert_eq!(r.unaccounted_slices, 3);
+        assert_eq!(r.nodes_undercharged, 1);
+        assert_eq!(r.nodes_overcharged, 2);
+        assert_eq!(r.cpus_undercharged, 4);
+        assert_eq!(r.cpus_overcharged, 5);
+        assert_eq!(r.memory_undercharged_mb, 6);
+        assert_eq!(r.memory_overcharged_mb, 7);
+        assert_eq!(r.devices_undercharged, 8);
+        assert_eq!(r.devices_overcharged, 9);
+    }
+
+    #[test]
+    fn the_last_pass_gauges_replace_rather_than_accumulate() {
+        let stats = ReconcileStatsCollector::new();
+        for slices in [5, 2] {
+            stats.record_rebuild(
+                RebuildTrigger::Restore,
+                AllocDrift {
+                    nodes_checked: 12,
+                    unaccounted_slices: slices,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let r = &stats.snapshot().rebuilds[0];
+        assert_eq!(
+            r.unaccounted_slices, 2,
+            "gauge reports the most recent pass"
+        );
+        assert_eq!(r.nodes_checked, 12);
     }
 
     #[test]

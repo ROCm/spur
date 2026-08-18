@@ -4695,9 +4695,12 @@ impl ClusterManager {
 
             if !excess.is_empty() {
                 drift.nodes_overcharged += 1;
-                drift.cpus_overcharged += u64::from(excess.cpus);
-                drift.memory_overcharged_mb += excess.memory_mb;
-                drift.devices_overcharged += device_total(&excess);
+                drift.cpus_overcharged = drift.cpus_overcharged.saturating_add(excess.cpus.into());
+                drift.memory_overcharged_mb =
+                    drift.memory_overcharged_mb.saturating_add(excess.memory_mb);
+                drift.devices_overcharged = drift
+                    .devices_overcharged
+                    .saturating_add(device_total(&excess));
                 warn!(
                     trigger = trigger.as_str(),
                     node = %name,
@@ -4712,9 +4715,13 @@ impl ClusterManager {
                 continue;
             }
             drift.nodes_undercharged += 1;
-            drift.cpus_undercharged += u64::from(missing.cpus);
-            drift.memory_undercharged_mb += missing.memory_mb;
-            drift.devices_undercharged += device_total(&missing);
+            drift.cpus_undercharged = drift.cpus_undercharged.saturating_add(missing.cpus.into());
+            drift.memory_undercharged_mb = drift
+                .memory_undercharged_mb
+                .saturating_add(missing.memory_mb);
+            drift.devices_undercharged = drift
+                .devices_undercharged
+                .saturating_add(device_total(&missing));
             warn!(
                 trigger = trigger.as_str(),
                 node = %name,
@@ -4728,6 +4735,17 @@ impl ClusterManager {
             // the Draining -> Drain retirement the release path does has no place.
             node.alloc_resources.add(&missing);
             node.update_state_from_alloc();
+        }
+
+        // A job record can name a node the index no longer has, which the loop
+        // above cannot see because it walks the index.
+        let orphaned = derived.keys().filter(|n| !nodes.contains_key(*n)).count();
+        if orphaned > 0 {
+            drift.unaccounted_slices = drift.unaccounted_slices.saturating_add(orphaned);
+            error!(
+                trigger = trigger.as_str(),
+                orphaned, "active jobs are allocated to nodes the controller no longer tracks"
+            );
         }
 
         drift
@@ -5263,11 +5281,8 @@ impl ClusterManager {
                     );
 
                     if job.allocated_resources.is_some() && !already_reported {
-                        match (
-                            nodes.get_mut(node_name),
-                            job.per_node_alloc.get(node_name).cloned(),
-                        ) {
-                            (Some(node), Some(slice)) => Self::release_node_slice(node, &slice),
+                        match (nodes.get_mut(node_name), job.per_node_alloc.get(node_name)) {
+                            (Some(node), Some(slice)) => Self::release_node_slice(node, slice),
                             (Some(_), None) => {
                                 warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, leaving charge in place");
                             }
@@ -20665,9 +20680,6 @@ mod tests {
 
     // ---- allocation reconciliation ----------------------------------------
 
-    /// Deterministic PRNG so a failing sequence is reproducible from its seed
-    /// alone. Test-local on purpose: no dependency, and no dependence on the
-    /// runner's environment.
     /// Operations the generator got to actually apply, so a refactor that turns
     /// every step into a silent no-op cannot leave the suite green.
     #[derive(Debug, Default, Clone, Copy)]
@@ -20678,6 +20690,8 @@ mod tests {
         released: usize,
     }
 
+    /// Deterministic PRNG so a failing sequence replays from its seed alone.
+    /// Test-local: no dependency, no dependence on the runner's environment.
     struct Rng(u64);
 
     impl Rng {
@@ -20740,28 +20754,6 @@ mod tests {
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
         });
-    }
-
-    /// Every node holds at least what the job records prove is in use — being
-    /// short is what lets the scheduler place work on resources already held.
-    #[allow(dead_code)]
-    fn assert_never_undercharged(cm: &ClusterManager, context: &str) {
-        let jobs = cm.jobs.read();
-        let nodes = cm.nodes.read();
-        let (derived, _) = ClusterManager::derive_node_alloc(&jobs);
-        for (name, want) in &derived {
-            let Some(node) = nodes.get(name) else {
-                continue;
-            };
-            let missing = shortfall(&node.alloc_resources, want);
-            assert!(
-                missing.is_empty(),
-                "{context}: node {name} is charged {:?} but its job records prove {:?} is in use (short by {:?})",
-                node.alloc_resources,
-                want,
-                missing,
-            );
-        }
     }
 
     /// The charge a node carries equals what its job records imply, exactly.
@@ -21081,6 +21073,36 @@ mod tests {
         assert_eq!(
             drift.nodes_undercharged, 0,
             "no node disagrees; the gap is that nothing was charged at all"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_allocated_to_an_untracked_node_is_counted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_gpu_node(&cm, "n1", 16, 4);
+
+        submit_pending_job(&cm, 1);
+        let slice = gpu_alloc(4, 8000, &[0]);
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+        cm.nodes.write().remove("n1");
+
+        let drift = cm.rebuild_node_alloc(RebuildTrigger::LeadershipGain);
+        assert_eq!(
+            drift.unaccounted_slices, 1,
+            "a record naming a node the index lost is invisible to a walk of the index"
         );
     }
 

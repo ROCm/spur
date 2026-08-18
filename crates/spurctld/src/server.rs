@@ -241,12 +241,13 @@ impl ControllerService {
         let cluster = self.cluster.clone();
         let node = node.to_string();
         tokio::spawn(async move {
-            for (job_id, cause) in stale {
+            for (job_id, _) in stale {
                 // Re-check: a requeue since the snapshot above would otherwise
-                // send an unguarded cancel into the job's new run.
-                if reclaim_cause(&cluster, &node, job_id).is_none() {
+                // send an unguarded cancel into the job's new run. Record the
+                // cause it returns now, which may differ from the snapshot's.
+                let Some(cause) = reclaim_cause(&cluster, &node, job_id) else {
                     continue;
-                }
+                };
                 cluster.record_reclaim(cause);
                 warn!(
                     job_id,
