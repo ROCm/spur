@@ -665,6 +665,16 @@ mod tests {
     }
 
     #[test]
+    fn expand_rejects_recursive_overshoot_past_cap() {
+        // A comma-list suffix pushes per element without consulting the pre-loop
+        // bound, so the running total steps past the cap instead of being
+        // rejected in advance. Exercises the incremental backstop, which the
+        // nested-range case above never reaches.
+        let err = expand("rack[0-999999]-node[1,2]").unwrap_err();
+        assert!(matches!(err, HostlistError::TooLarge { .. }));
+    }
+
+    #[test]
     fn count_rejects_oversized_range() {
         assert!(count("node[0-18446744073709551615]").is_err());
     }
