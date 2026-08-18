@@ -38,7 +38,126 @@ pub enum QosCheckResult {
     Blocked(PendingReason),
 }
 
-/// Check if a job would violate QOS limits.
+/// Whether the job's requested wall time exceeds `max_wall` minutes.
+fn wall_breach(job: &Job, max_wall: u32) -> bool {
+    job.spec
+        .time_limit
+        .is_some_and(|w| w.num_minutes() > max_wall as i64)
+}
+
+/// The four TRES quantities a single job requests: (cpu, node, mem_mb, gpu).
+fn job_tres(job: &Job) -> (u64, u64, u64, u64) {
+    let cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
+    let nodes = job.spec.num_nodes as u64;
+    let mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
+    let gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+    (cpus, nodes, mem, gpus)
+}
+
+/// Per-job TRES cap breach. Each dimension is checked only when the cap is set
+/// (> 0). `reasons` names the reason for (cpu, node, mem, gpu) so callers can
+/// distinguish the per-job vs per-user/grp variants.
+fn tres_cap_breach(
+    job_cpu: u64,
+    job_node: u64,
+    job_mem: u64,
+    job_gpu: u64,
+    cap: &TresRecord,
+    reasons: (PendingReason, PendingReason, PendingReason, PendingReason),
+) -> Option<PendingReason> {
+    if cap.get(TresType::Cpu) > 0 && job_cpu > cap.get(TresType::Cpu) {
+        return Some(reasons.0);
+    }
+    if cap.get(TresType::Node) > 0 && job_node > cap.get(TresType::Node) {
+        return Some(reasons.1);
+    }
+    if cap.get(TresType::Memory) > 0 && job_mem > cap.get(TresType::Memory) {
+        return Some(reasons.2);
+    }
+    if cap.get(TresType::Gpu) > 0 && job_gpu > cap.get(TresType::Gpu) {
+        return Some(reasons.3);
+    }
+    None
+}
+
+/// Standalone TRES/wall breach: does this job, evaluated on its own (no other
+/// load), exceed any QOS resource cap? This is what Slurm's `DenyOnLimit`
+/// converts into a submission denial, and what the scheduler also re-checks
+/// with real aggregates folded in. `running_*` fold in existing load; pass
+/// empty records for the standalone (submit-time) evaluation.
+fn qos_resource_breach(
+    job: &Job,
+    qos: &Qos,
+    user_running_tres: &TresRecord,
+    qos_running_tres: &TresRecord,
+) -> Option<PendingReason> {
+    let limits = &qos.limits;
+    let (job_cpu, job_node, job_mem, job_gpu) = job_tres(job);
+
+    if let Some(max_wall) = limits.max_wall_minutes {
+        if wall_breach(job, max_wall) {
+            return Some(PendingReason::QosMaxWallDurationPerJobLimit);
+        }
+    }
+
+    if let Some(ref max_tres) = limits.max_tres_per_job {
+        if let Some(reason) = tres_cap_breach(
+            job_cpu,
+            job_node,
+            job_mem,
+            job_gpu,
+            max_tres,
+            (
+                PendingReason::QosMaxCpuPerJobLimit,
+                PendingReason::QosMaxNodePerJobLimit,
+                PendingReason::QosMaxMemoryPerJob,
+                PendingReason::QosMaxGpuPerJobLimit,
+            ),
+        ) {
+            return Some(reason);
+        }
+    }
+
+    if let Some(ref max_tres) = limits.max_tres_per_user {
+        if let Some(reason) = tres_cap_breach(
+            user_running_tres.get(TresType::Cpu) + job_cpu,
+            user_running_tres.get(TresType::Node) + job_node,
+            user_running_tres.get(TresType::Memory) + job_mem,
+            user_running_tres.get(TresType::Gpu) + job_gpu,
+            max_tres,
+            (
+                PendingReason::QosMaxCpuPerUserLimit,
+                PendingReason::QosMaxNodePerUserLimit,
+                PendingReason::QosMaxMemoryPerUser,
+                PendingReason::QosMaxGpuPerUserLimit,
+            ),
+        ) {
+            return Some(reason);
+        }
+    }
+
+    if let Some(ref grp) = limits.grp_tres {
+        if let Some(reason) = tres_cap_breach(
+            qos_running_tres.get(TresType::Cpu) + job_cpu,
+            qos_running_tres.get(TresType::Node) + job_node,
+            qos_running_tres.get(TresType::Memory) + job_mem,
+            qos_running_tres.get(TresType::Gpu) + job_gpu,
+            grp,
+            (
+                PendingReason::QosGrpCpuLimit,
+                PendingReason::QosGrpNodeLimit,
+                PendingReason::QosGrpMemLimit,
+                PendingReason::QosGrpGpuLimit,
+            ),
+        ) {
+            return Some(reason);
+        }
+    }
+
+    None
+}
+
+/// Check if a job would violate QOS limits (scheduler path).
 ///
 /// `user_running_*` aggregate the requesting user's load; `qos_running_tres`
 /// aggregates all running jobs in the QOS (for the `Grp*` group limits).
@@ -55,114 +174,64 @@ pub fn check_qos_limits(
 ) -> QosCheckResult {
     let limits = &qos.limits;
 
-    // Max jobs per user
+    // Max jobs per user (running count).
     if let Some(max) = limits.max_jobs_per_user {
         if user_running_count >= max {
             return QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser);
         }
     }
 
-    // Max submit jobs per user
+    // Max submit jobs per user. Slurm distinguishes the submit-job cap
+    // (WAIT_QOS_MAX_SUB_JOB, "QOSMaxSubmitJobPerUserLimit") from the
+    // running-job cap above.
     if let Some(max) = limits.max_submit_jobs_per_user {
         if user_submitted_count >= max {
-            // Slurm distinguishes the submit-job cap (WAIT_QOS_MAX_SUB_JOB,
-            // "QOSMaxSubmitJobPerUserLimit") from the running-job cap above.
             return QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit);
         }
     }
 
-    // Max wall time
-    if let Some(max_wall) = limits.max_wall_minutes {
-        if let Some(job_wall) = job.spec.time_limit {
-            if job_wall.num_minutes() > max_wall as i64 {
-                // This is a QOS wall cap, not a partition cap: Slurm reports
-                // WAIT_QOS_MAX_WALL_PER_JOB ("QOSMaxWallDurationPerJobLimit").
-                return QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit);
-            }
+    match qos_resource_breach(job, qos, user_running_tres, qos_running_tres) {
+        Some(reason) => QosCheckResult::Blocked(reason),
+        None => QosCheckResult::Allowed,
+    }
+}
+
+/// QOS submit-count limits (`MaxSubmitJobsPerUser`, `MaxSubmitJobsPerAccount`,
+/// `GrpSubmitJobs`). These always deny at submission (Slurm's
+/// `acct_policy_validate`), independent of `DenyOnLimit`, because admitting the
+/// job would itself increment the counted quantity. `incoming` is how many jobs
+/// this submission adds (array size or 1).
+pub fn check_qos_submit_limits(
+    qos: &Qos,
+    user_submitted: u32,
+    account_submitted: u32,
+    qos_submitted: u32,
+    incoming: u32,
+) -> Option<PendingReason> {
+    let limits = &qos.limits;
+    if let Some(max) = limits.max_submit_jobs_per_user {
+        if user_submitted.saturating_add(incoming) > max {
+            return Some(PendingReason::QosMaxSubmitJobPerUserLimit);
         }
     }
-
-    // Max TRES per job
-    if let Some(ref max_tres) = limits.max_tres_per_job {
-        let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-        if max_tres.get(TresType::Cpu) > 0 && job_cpus > max_tres.get(TresType::Cpu) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit);
-        }
-
-        let job_nodes = job.spec.num_nodes as u64;
-        if max_tres.get(TresType::Node) > 0 && job_nodes > max_tres.get(TresType::Node) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit);
-        }
-
-        let total_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-        if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob);
-        }
-
-        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
-        if max_tres.get(TresType::Gpu) > 0 && job_gpus > max_tres.get(TresType::Gpu) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit);
+    if let Some(max) = limits.max_submit_jobs_per_account {
+        if account_submitted.saturating_add(incoming) > max {
+            return Some(PendingReason::QosMaxSubmitJobPerAccountLimit);
         }
     }
-
-    // Max TRES per user (group limit)
-    if let Some(ref max_tres) = limits.max_tres_per_user {
-        let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-        let new_total_cpu = user_running_tres.get(TresType::Cpu) + job_cpus;
-        if max_tres.get(TresType::Cpu) > 0 && new_total_cpu > max_tres.get(TresType::Cpu) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit);
-        }
-
-        let job_nodes = job.spec.num_nodes as u64;
-        let new_total_nodes = user_running_tres.get(TresType::Node) + job_nodes;
-        if max_tres.get(TresType::Node) > 0 && new_total_nodes > max_tres.get(TresType::Node) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxNodePerUserLimit);
-        }
-
-        let job_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-        let new_total_mem = user_running_tres.get(TresType::Memory) + job_mem;
-        if max_tres.get(TresType::Memory) > 0 && new_total_mem > max_tres.get(TresType::Memory) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerUser);
-        }
-
-        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
-        let new_total_gpus = user_running_tres.get(TresType::Gpu) + job_gpus;
-        if max_tres.get(TresType::Gpu) > 0 && new_total_gpus > max_tres.get(TresType::Gpu) {
-            return QosCheckResult::Blocked(PendingReason::QosMaxGpuPerUserLimit);
+    if let Some(max) = limits.grp_submit_jobs {
+        if qos_submitted.saturating_add(incoming) > max {
+            return Some(PendingReason::QosGrpSubmitJobsLimit);
         }
     }
+    None
+}
 
-    if let Some(ref grp) = limits.grp_tres {
-        let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-        if grp.get(TresType::Cpu) > 0
-            && qos_running_tres.get(TresType::Cpu) + job_cpus > grp.get(TresType::Cpu)
-        {
-            return QosCheckResult::Blocked(PendingReason::QosGrpCpuLimit);
-        }
-
-        let job_nodes = job.spec.num_nodes as u64;
-        if grp.get(TresType::Node) > 0
-            && qos_running_tres.get(TresType::Node) + job_nodes > grp.get(TresType::Node)
-        {
-            return QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit);
-        }
-
-        let job_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-        if grp.get(TresType::Memory) > 0
-            && qos_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
-        {
-            return QosCheckResult::Blocked(PendingReason::QosGrpMemLimit);
-        }
-
-        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
-        if grp.get(TresType::Gpu) > 0
-            && qos_running_tres.get(TresType::Gpu) + job_gpus > grp.get(TresType::Gpu)
-        {
-            return QosCheckResult::Blocked(PendingReason::QosGrpGpuLimit);
-        }
-    }
-
-    QosCheckResult::Allowed
+/// Standalone QOS resource/wall breach for the submission gate: evaluates the
+/// job on its own (no other load). Denied at submit only when the QOS has
+/// `DenyOnLimit`; otherwise the scheduler pends it.
+pub fn check_qos_standalone_limits(job: &Job, qos: &Qos) -> Option<PendingReason> {
+    qos_resource_breach(job, qos, &TresRecord::new(), &TresRecord::new())
 }
 
 #[cfg(test)]

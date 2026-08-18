@@ -316,6 +316,11 @@ pub enum PendingReason {
     AssocGrpMemLimit,
     AssocGrpGpuLimit,
     AssocMaxWallDurationPerJobLimit,
+
+    // Submit-count group limits (deny unconditionally at submission).
+    AssocGrpSubmitJobsLimit,
+    QosGrpSubmitJobsLimit,
+    QosMaxSubmitJobPerAccountLimit,
     K8sReserved,
 }
 
@@ -395,7 +400,46 @@ impl PendingReason {
             Self::AssocGrpMemLimit => "AssocGrpMemLimit",
             Self::AssocGrpGpuLimit => "AssocGrpGRES",
             Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
+            Self::AssocGrpSubmitJobsLimit => "AssocGrpSubmitJobsLimit",
+            Self::QosGrpSubmitJobsLimit => "QOSGrpSubmitJobsLimit",
+            Self::QosMaxSubmitJobPerAccountLimit => "MaxSubmitJobsPerAccount",
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
+        }
+    }
+
+    /// Human-readable explanation for a submit-time denial, shown alongside the
+    /// exact Slurm code (which `display()` yields for squeue scrapers). Reasons
+    /// outside the submit gate fall back to a generic phrase.
+    pub fn submit_denial_message(&self) -> &'static str {
+        match self {
+            Self::AssocMaxJobsLimit => {
+                "your association has reached its maximum number of running jobs"
+            }
+            Self::AssocMaxSubmitJobLimit => {
+                "you have reached the maximum submitted (pending + running) jobs for your association"
+            }
+            Self::AssocGrpSubmitJobsLimit => {
+                "your association has reached its aggregate submitted-jobs limit"
+            }
+            Self::AssocMaxWallDurationPerJobLimit => {
+                "the requested wall time exceeds your association's per-job limit"
+            }
+            Self::QoSMaxJobsPerUser => {
+                "you have reached the QOS limit on running jobs per user"
+            }
+            Self::QosMaxSubmitJobPerUserLimit => {
+                "you have reached the QOS limit on submitted jobs per user"
+            }
+            Self::QosMaxSubmitJobPerAccountLimit => {
+                "your account has reached the QOS limit on submitted jobs per account"
+            }
+            Self::QosGrpSubmitJobsLimit => {
+                "the QOS has reached its aggregate submitted-jobs limit"
+            }
+            Self::QosMaxWallDurationPerJobLimit => {
+                "the requested wall time exceeds the QOS per-job limit"
+            }
+            _ => "the job exceeds a configured accounting or QOS limit",
         }
     }
 }
@@ -2169,6 +2213,18 @@ mod tests {
             PendingReason::AssocMaxWallDurationPerJobLimit,
             "AssocMaxWallDurationPerJobLimit",
         ),
+        (
+            PendingReason::AssocGrpSubmitJobsLimit,
+            "AssocGrpSubmitJobsLimit",
+        ),
+        (
+            PendingReason::QosGrpSubmitJobsLimit,
+            "QOSGrpSubmitJobsLimit",
+        ),
+        (
+            PendingReason::QosMaxSubmitJobPerAccountLimit,
+            "MaxSubmitJobsPerAccount",
+        ),
     ];
 
     #[test]
@@ -2177,6 +2233,23 @@ mod tests {
             assert_eq!(reason.display(), *expected, "Display for {reason:?}");
             assert_eq!(format!("{reason}"), *expected, "fmt for {reason:?}");
         }
+    }
+
+    #[test]
+    fn submit_denial_message_is_human_readable_and_not_the_bare_code() {
+        // Submit-count reasons get a specific sentence, distinct from the
+        // machine-facing Slurm code.
+        let per_account = PendingReason::QosMaxSubmitJobPerAccountLimit;
+        assert_ne!(per_account.submit_denial_message(), per_account.display());
+        assert!(per_account
+            .submit_denial_message()
+            .contains("submitted jobs per account"));
+
+        // Reasons outside the submit gate fall back to a generic sentence.
+        assert_eq!(
+            PendingReason::BurstBufferResources.submit_denial_message(),
+            "the job exceeds a configured accounting or QOS limit"
+        );
     }
 
     #[test]

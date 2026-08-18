@@ -106,7 +106,10 @@ impl Default for QosCache {
 }
 
 fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
-    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    // A stored NULL (None) is "no limit"; a literal 0 is a real value (block
+    // all). A stray negative predates the sentinel flip or was edited
+    // out-of-band, so treat it as unset rather than a huge cap.
+    let opt_u32 = |v: Option<i32>| v.filter(|&x| x >= 0).map(|x| x as u32);
     // Values are validated by `create_qos` before being stored, so a parse
     // failure here means the DB row predates that check or was edited
     // out-of-band; treat it as unset rather than poisoning the whole refresh.
@@ -133,6 +136,8 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
         limits: QosLimits {
             max_jobs_per_user: opt_u32(r.max_jobs_per_user),
             max_submit_jobs_per_user: opt_u32(r.max_submit_per_user),
+            max_submit_jobs_per_account: opt_u32(r.max_submit_per_account),
+            grp_submit_jobs: opt_u32(r.grp_submit_jobs),
             max_tres_per_job: opt_tres(r.max_tres_per_job),
             max_tres_per_user: opt_tres(r.max_tres_per_user),
             grp_tres: opt_tres(r.grp_tres),
@@ -141,7 +146,15 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
         },
         usage_factor: r.usage_factor,
+        deny_on_limit: parse_deny_on_limit(&r.flags),
     }
+}
+
+/// Parse the QOS `flags` column (comma-separated) for the `DenyOnLimit` flag.
+fn parse_deny_on_limit(flags: &str) -> bool {
+    flags
+        .split(',')
+        .any(|f| f.trim().eq_ignore_ascii_case("denyonlimit"))
 }
 
 #[cfg(test)]
@@ -237,15 +250,21 @@ mod tests {
             max_wall_min: Some(60),
             max_tres_per_job: Some("cpu=32,mem=131072".into()),
             max_submit_per_user: Some(50),
+            max_submit_per_account: Some(40),
+            grp_submit_jobs: Some(30),
             max_tres_per_user: Some("cpu=64".into()),
             grp_tres: Some("gpu=8".into()),
             grp_wall_min: Some(120),
             preempt_exempt_time: None,
+            flags: "DenyOnLimit".into(),
         };
 
         let qos = qos_from_record(record);
 
         assert_eq!(qos.name, "high");
+        assert!(qos.deny_on_limit);
+        assert_eq!(qos.limits.max_submit_jobs_per_account, Some(40));
+        assert_eq!(qos.limits.grp_submit_jobs, Some(30));
         assert_eq!(qos.priority, 100);
         assert_eq!(qos.preempt_mode, QosPreemptMode::Cancel);
         assert_eq!(qos.usage_factor, 2.0);
@@ -275,7 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn test_qos_from_record_zero_and_none_are_none() {
+    fn test_qos_from_record_zero_is_literal_negative_and_null_are_unset() {
+        // Post sentinel-flip: a stored 0 is a real "block all" value; NULL and a
+        // stray negative are "no limit" (unset).
         let record = crate::accounting::db::QosRecord {
             name: "minimal".into(),
             description: String::new(),
@@ -287,20 +308,25 @@ mod tests {
             max_wall_min: None,
             max_tres_per_job: Some(String::new()),
             max_submit_per_user: Some(-1),
+            max_submit_per_account: None,
+            grp_submit_jobs: Some(0),
             max_tres_per_user: None,
             grp_tres: None,
-            grp_wall_min: Some(0),
+            grp_wall_min: None,
             preempt_exempt_time: None,
+            flags: String::new(),
         };
 
         let qos = qos_from_record(record);
 
-        assert_eq!(qos.limits.max_jobs_per_user, None);
+        assert_eq!(qos.limits.max_jobs_per_user, Some(0));
         assert_eq!(qos.limits.max_wall_minutes, None);
         assert!(qos.limits.max_tres_per_job.is_none());
         assert_eq!(qos.limits.max_submit_jobs_per_user, None);
+        assert_eq!(qos.limits.grp_submit_jobs, Some(0));
         assert!(qos.limits.max_tres_per_user.is_none());
         assert!(qos.limits.grp_tres.is_none());
         assert_eq!(qos.limits.grp_wall_minutes, None);
+        assert!(!qos.deny_on_limit);
     }
 }

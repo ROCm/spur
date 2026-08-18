@@ -1275,6 +1275,8 @@ message CreateAccountRequest {
   optional string organization = 3;
   optional string parent_account = 4;
   optional double fairshare_weight = 5;
+  // Unset preserves the stored value; the INFINITE sentinel (4294967295) clears
+  // to no-limit; any other value (including a literal 0) is stored as-is.
   optional uint32 max_running_jobs = 6;
   optional string grp_tres = 7;
 }
@@ -1300,8 +1302,11 @@ message AccountInfo {
 }
 
 // Add or modify a user-account association (proto3 presence: unset = leave
-// unchanged on modify, set = write; `add` sets every field). The limit/QOS
-// fields below are nullable and clear to NULL when set empty/0; admin_level is
+// unchanged on modify, set = write; `add` sets every field). For the numeric
+// limit fields below: unset preserves the stored value, the INFINITE sentinel
+// (4294967295) clears to no-limit (SQL NULL), and any other value (including a
+// literal 0, which means "block all") is stored as-is. Text limit fields
+// (max_tres_*, grp_tres) clear to NULL when set empty. admin_level is
 // non-nullable, storing the literal sent (unset keeps it, 'none' on create).
 message AddUserRequest {
   string user = 1;
@@ -1311,8 +1316,8 @@ message AddUserRequest {
   // Default QOS for this user's association with `account`. Unset preserves
   // the stored default; explicit empty clears it.
   optional string default_qos = 5;
-  // Association-level resource limits for `user` within `account`. Unset
-  // preserves the stored limit; an explicit 0/empty clears it (no limit).
+  // Association-level resource limits for `user` within `account`. See the
+  // message-level comment for the unset/INFINITE/literal sentinel semantics.
   optional uint32 max_running_jobs = 6;
   optional uint32 max_submit_jobs = 7;
   optional string max_tres_per_job = 8;
@@ -1322,6 +1327,8 @@ message AddUserRequest {
   // stored allow-list; explicit empty clears it back to unrestricted.
   // default_qos must be a member when both are set in the same request.
   optional string allowed_qos = 11;
+  // Max submitted (pending + running) jobs across all users in the account.
+  optional uint32 grp_submit_jobs = 12;
 }
 
 message RemoveUserRequest {
@@ -1345,12 +1352,24 @@ message UserInfo {
   string default_account = 4;
   string default_qos = 5;
   string allowed_qos = 6;
+  // Per-association limits (read-back of what `sacctmgr add/modify user` set).
+  // Numeric fields use the INFINITE sentinel (4294967295) for "no limit"; a
+  // literal 0 means "block all". Text fields are empty when unset.
+  uint32 max_running_jobs = 7;
+  uint32 max_submit_jobs = 8;
+  uint32 grp_submit_jobs = 9;
+  uint32 max_wall_minutes = 10;
+  string max_tres_per_job = 11;
+  string grp_tres = 12;
 }
 
 // Add or modify a QOS (proto3 presence: unset = leave unchanged on modify, set =
-// write; `add` sets every field). Empty/0 clears the nullable limits
-// (max_*_per_user, *_wall_minutes, max_tres_*, grp_tres) to NULL; description,
-// preempt_mode, priority, and usage_factor store their literal value (0 is real).
+// write; `add` sets every field). For the numeric limit fields: unset preserves
+// the stored value, the INFINITE sentinel (4294967295) clears to no-limit (SQL
+// NULL), and any other value (including a literal 0, which means "block all") is
+// stored as-is. Text limits (max_tres_*, grp_tres) clear to NULL when set empty.
+// description, preempt_mode, priority, and usage_factor store their literal
+// value (0 is real).
 message CreateQosRequest {
   string name = 1;
   optional string description = 2;
@@ -1375,6 +1394,13 @@ message CreateQosRequest {
   // Set to true to clear preempt_exempt_time back to NULL (inherit from
   // partition / global default). Takes precedence over preempt_exempt_time.
   bool clear_preempt_exempt_time = 15;
+  // Max submitted (pending + running) jobs per account within this QOS.
+  optional uint32 max_submit_jobs_per_account = 16;
+  // Max submitted (pending + running) jobs across all users in this QOS.
+  optional uint32 grp_submit_jobs = 17;
+  // Comma-separated QOS flags. Recognized: DenyOnLimit. Unset preserves the
+  // stored flags; explicit empty clears them.
+  optional string flags = 18;
 }
 
 message DeleteQosRequest {
@@ -1403,6 +1429,9 @@ message QosInfo {
   // Comma-separated QOS names this QOS may preempt (empty = none allowed).
   string preempt = 13;
   optional uint32 preempt_exempt_time = 14;  // absent = unset (inherits partition/global); 0 = no exemption
+  uint32 max_submit_jobs_per_account = 16;
+  uint32 grp_submit_jobs = 17;
+  string flags = 18;
 }
 
 // ============================================================

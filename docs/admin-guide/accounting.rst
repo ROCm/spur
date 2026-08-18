@@ -45,6 +45,22 @@ each builds on the one before it:
 The term **association** is used throughout this page to mean the
 ``(cluster, account, user, partition)`` tuple defined above.
 
+.. _limit-values:
+
+Limit values
+~~~~~~~~~~~~~
+
+Numeric limits (job counts, wall time) share one convention throughout this
+page:
+
+- **Unset / omitted** — no limit. This is the default for any limit you do not
+  name.
+- ``-1`` — clears a limit back to "no limit". Use it on ``modify`` to lift a cap.
+- ``0`` — a literal value meaning **block all**: a ``maxsubmitjobs=0`` rejects
+  every submission for that association. ``0`` does **not** mean "no limit".
+
+``show`` renders an unset limit as a blank cell and a literal ``0`` as ``0``.
+
 Enabling accounting
 -------------------
 
@@ -166,17 +182,17 @@ Account keys
      - ``1.0``
      - Fairshare weight. Shown in the ``Share`` column as an integer.
    * - ``maxrunningjobs`` (alias ``maxjobs``)
-     - ``0`` (no limit)
-     - Maximum jobs running at once for the account.
+     - unset (no limit)
+     - Maximum jobs running at once for the account. See :ref:`limit-values`.
    * - ``grptres``
      - ``""``
      - Aggregate TRES cap for the account (see `TRES`_).
 
 .. note::
 
-   ``modify`` is an upsert: it re-sends the whole account record through the same
-   RPC as ``add``. Numeric fields you omit reset to their defaults (``0`` for
-   limits, ``1.0`` for fairshare). Always set the fields you want to keep.
+   ``modify`` sends only the fields you name; every field you omit is preserved
+   (re-read from the stored record, not reset). To lift a numeric limit, set it
+   to ``-1``; to clear a text field, set it empty (e.g. ``grptres=``).
 
 Managing users
 --------------
@@ -237,11 +253,16 @@ Filter by ``account=`` or ``name=``.
 
    sacctmgr show user account=ml
 
+``show user`` also prints the per-association limits (``MaxJobs``,
+``MaxSubmit``, ``GrpSubmit``, ``MaxWall``, ``MaxTRES``, ``GrpTRES``), so you can
+read back what ``add``/``modify user`` set. An unset limit renders as a blank
+cell.
+
 .. code-block:: text
 
-   User    Account  Admin  Default Acct  QOS              Def QOS
+   User    Account  Admin  Default Acct  QOS              Def QOS   MaxJobs  MaxSubmit  GrpSubmit  MaxWall  MaxTRES  GrpTRES
    alice   ml        None   ml            highprio,normal  highprio
-   carol   ml        None   ml
+   carol   ml        None   ml                                       4        8                     1440     cpu=64
 
 User keys
 ~~~~~~~~~
@@ -270,11 +291,15 @@ User keys
      - ``""``
      - Comma-separated allow-list of QOS the user may request.
    * - ``maxrunningjobs`` (alias ``maxjobs``)
-     - ``0`` (no limit)
-     - Maximum jobs running at once for this association.
+     - unset (no limit)
+     - Maximum jobs running at once for this association. See
+       :ref:`limit-values`.
    * - ``maxsubmitjobs``
-     - ``0`` (no limit)
+     - unset (no limit)
      - Maximum jobs the user may have submitted (pending + running).
+   * - ``grpsubmit`` (alias ``grpsubmitjobs``)
+     - unset (no limit)
+     - Aggregate submitted jobs (pending + running) across the association.
    * - ``maxtresperjob``
      - ``""``
      - TRES cap for a single job (see `TRES`_).
@@ -282,7 +307,7 @@ User keys
      - ``""``
      - Aggregate TRES cap across the association's jobs.
    * - ``maxwall`` (alias ``maxwallduration``)
-     - ``0`` (no limit)
+     - unset (no limit)
      - Maximum wall-clock time per job.
 
 .. note::
@@ -293,18 +318,19 @@ User keys
 
 .. note::
 
-   On ``modify user``, QOS fields you omit (``qos``/``defaultqos``) are
-   **preserved** — they are re-read from the stored association rather than
-   cleared. Numeric limits you omit still reset to their defaults, as with
-   accounts.
+   On ``modify user``, every field you omit is **preserved**. QOS
+   (``qos``/``defaultqos``) and numeric limits alike are re-read from the stored
+   association rather than reset. To lift a limit, set it to ``-1``; to clear the
+   QOS allow-list, set ``qos=`` empty.
 
 QOS
 ---
 
 A QOS (Quality of Service) is a named policy with its own priority, preemption
 mode, usage factor, and limits. Manage QOS with ``sacctmgr add qos``; the
-equivalent Slurm command is ``sacctmgr add qos``. Every limit defaults to ``0``,
-meaning no limit.
+equivalent Slurm command is ``sacctmgr add qos``. Every limit defaults to unset
+(no limit); ``0`` means block all and ``-1`` clears a limit (see
+:ref:`limit-values`).
 
 Create a high-priority QOS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -394,17 +420,24 @@ QOS keys
      - ``1.0``
      - Multiplier applied to usage charged under this QOS.
    * - ``maxjobsperuser`` (alias ``maxjobspu``)
-     - ``0`` (no limit)
-     - Maximum running jobs per user under this QOS.
+     - unset (no limit)
+     - Maximum running jobs per user under this QOS. See :ref:`limit-values`.
    * - ``maxwall``
-     - ``0`` (no limit)
+     - unset (no limit)
      - Maximum wall-clock time per job.
    * - ``maxtresperjob``
      - ``""``
      - TRES cap for a single job (see `TRES`_).
    * - ``maxsubmitjobsperuser``
-     - ``0`` (no limit)
+     - unset (no limit)
      - Maximum submitted jobs (pending + running) per user.
+   * - ``maxsubmitjobsperaccount`` (aliases ``maxsubmitpa``, ``maxsubmitjobspa``)
+     - unset (no limit)
+     - Maximum submitted jobs (pending + running) per account.
+   * - ``grpsubmit`` (alias ``grpsubmitjobs``)
+     - unset (no limit)
+     - Aggregate submitted jobs (pending + running) across all jobs under this
+       QOS.
    * - ``maxtresperuser``
      - ``""``
      - TRES cap across all of one user's jobs under this QOS.
@@ -412,8 +445,36 @@ QOS keys
      - ``""``
      - Aggregate TRES cap across all jobs under this QOS.
    * - ``grpwall``
-     - ``0`` (no limit)
+     - unset (no limit)
      - Aggregate wall-clock time across all jobs under this QOS.
+   * - ``flags``
+     - ``""``
+     - Comma-separated QOS flags. ``DenyOnLimit`` is supported (see
+       :ref:`deny-on-limit`).
+
+.. _deny-on-limit:
+
+How limits are enforced at submit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur checks limits at submit time, matching Slurm's ``acct_policy_validate``.
+Two families behave differently:
+
+- **Submit-count limits** (``maxsubmitjobs``, ``grpsubmit``,
+  ``maxsubmitjobsperuser``, ``maxsubmitjobsperaccount``) and the association
+  ``maxwall`` always **reject** the submission when breached. A rejected job is
+  never queued.
+- **Standalone resource limits** (per-job TRES and QOS wall) reject at submit
+  only when the governing QOS carries the ``DenyOnLimit`` flag; otherwise the
+  job is accepted and **pends** until it fits. A job that resolves to **no QOS**
+  is treated as ``DenyOnLimit`` on, so an unsatisfiable request is rejected
+  rather than pending forever.
+
+Set ``DenyOnLimit`` through the QOS ``flags`` key:
+
+.. code-block:: bash
+
+   sacctmgr modify qos name=highprio set flags=DenyOnLimit
 
 QOS preemption hierarchy
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -508,14 +569,14 @@ Associations
 An association is the ``(cluster, account, user, partition)`` tuple. Associations
 are created implicitly by ``sacctmgr add user`` — there is no standalone ``add
 association`` command. Inspect them through ``sacctmgr show user``, which lists
-each user's account, default account, and QOS.
+each user's account, default account, QOS, and per-association limits.
 
 Limits resolve in two layers:
 
 - **Association limits.** The per-association caps set on the user
-  (``maxjobs``, ``maxsubmitjobs``, ``maxtresperjob``, ``grptres``, ``maxwall``)
-  and the association's QOS allow-list together gate whether a submit is
-  accepted.
+  (``maxjobs``, ``maxsubmitjobs``, ``grpsubmit``, ``maxtresperjob``,
+  ``grptres``, ``maxwall``) and the association's QOS allow-list together gate
+  whether a submit is accepted.
 - **QOS limits.** The limits on the job's resolved QOS layer on top of the
   association limits. Where a QOS limit is defined, it takes precedence over the
   association's corresponding limit — matching Slurm's rule that QOS limits

@@ -124,7 +124,9 @@ pub async fn association_maps(
 }
 
 fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
-    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    // A stored NULL (None) is "no limit"; a literal 0 is a real value (block
+    // all). A stray negative predates the sentinel flip; treat it as unset.
+    let opt_u32 = |v: Option<i32>| v.filter(|&x| x >= 0).map(|x| x as u32);
     // Values are validated by `add_user` before being stored, so a parse
     // failure here means the DB row predates that check or was edited
     // out-of-band; treat it as unset rather than poisoning the whole load.
@@ -141,6 +143,7 @@ fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
     AccountLimits {
         max_running_jobs: opt_u32(r.max_running_jobs),
         max_submit_jobs: opt_u32(r.max_submit_jobs),
+        grp_submit_jobs: opt_u32(r.grp_submit_jobs),
         max_tres_per_job: opt_tres(r.max_tres_per_job),
         grp_tres: opt_tres(r.grp_tres),
         max_wall_minutes: opt_u32(r.max_wall_min),

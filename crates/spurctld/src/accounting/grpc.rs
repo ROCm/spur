@@ -31,15 +31,43 @@ fn nullable_str(field: &Option<String>) -> Option<Option<&str>> {
 }
 
 /// Map an optional u32 limit proto field to a nullable-int patch: unset ->
-/// keep, 0 -> clear (no limit), n -> set. Errors if `n` overflows i32.
+/// keep, INFINITE (`u32::MAX`) -> clear (no limit / SQL NULL), n -> set the
+/// literal (including 0, which means "block all"). Errors if `n` overflows i32.
 fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>, Status> {
     match field {
         None => Ok(None),
-        Some(0) => Ok(Some(None)),
+        Some(spur_core::accounting::INFINITE) => Ok(Some(None)),
         Some(n) => Ok(Some(Some(i32::try_from(n).map_err(|_| {
             Status::invalid_argument(format!("{what} exceeds i32::MAX"))
         })?))),
     }
+}
+
+/// Map a stored nullable limit to its proto `uint32`: NULL (and any stray
+/// negative) becomes the INFINITE sentinel so the CLI can tell "no limit" apart
+/// from a literal 0; a stored value is emitted as-is.
+fn limit_to_proto(v: Option<i32>) -> u32 {
+    match v {
+        Some(n) if n >= 0 => n as u32,
+        _ => spur_core::accounting::INFINITE,
+    }
+}
+
+/// Validate and canonicalize the QOS `flags` string. Only `DenyOnLimit` is
+/// recognized; an unknown token errors loudly rather than being silently
+/// dropped (a dropped flag reads as "set" but never takes effect).
+fn canonicalize_qos_flags(raw: &str) -> Result<String, Status> {
+    let mut deny_on_limit = false;
+    for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if token.eq_ignore_ascii_case("denyonlimit") {
+            deny_on_limit = true;
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "unknown QOS flag '{token}'. Supported: DenyOnLimit"
+            )));
+        }
+    }
+    Ok(if deny_on_limit { "DenyOnLimit" } else { "" }.to_string())
 }
 
 /// Fairshare is a whole share count stored as `INTEGER`, but the proto carries
@@ -391,7 +419,7 @@ impl SlurmAccounting for AccountingService {
                 organization: r.organization,
                 parent_account: r.parent.unwrap_or_default(),
                 fairshare_weight: r.fairshare_weight as f64,
-                max_running_jobs: r.max_running_jobs.unwrap_or(0) as u32,
+                max_running_jobs: limit_to_proto(r.max_running_jobs),
                 grp_tres: r.grp_tres.unwrap_or_default(),
             })
             .collect();
@@ -467,6 +495,7 @@ impl SlurmAccounting for AccountingService {
             }),
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             max_submit_jobs: nullable_limit(req.max_submit_jobs, "max_submit_jobs")?,
+            grp_submit_jobs: nullable_limit(req.grp_submit_jobs, "grp_submit_jobs")?,
             max_tres_per_job: nullable_str(&req.max_tres_per_job),
             grp_tres: nullable_str(&req.grp_tres),
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
@@ -526,6 +555,12 @@ impl SlurmAccounting for AccountingService {
                 default_account: r.default_account.unwrap_or_default(),
                 default_qos: r.default_qos.unwrap_or_default(),
                 allowed_qos: r.allowed_qos.unwrap_or_default(),
+                max_running_jobs: limit_to_proto(r.max_running_jobs),
+                max_submit_jobs: limit_to_proto(r.max_submit_jobs),
+                grp_submit_jobs: limit_to_proto(r.grp_submit_jobs),
+                max_wall_minutes: limit_to_proto(r.max_wall_min),
+                max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
+                grp_tres: r.grp_tres.unwrap_or_default(),
             })
             .collect();
 
@@ -567,6 +602,11 @@ impl SlurmAccounting for AccountingService {
             }
         };
 
+        let flags = req
+            .flags
+            .as_deref()
+            .map(canonicalize_qos_flags)
+            .transpose()?;
         let update = db::QosUpdate {
             description: req.description.as_deref(),
             priority: req.priority,
@@ -580,6 +620,11 @@ impl SlurmAccounting for AccountingService {
                 req.max_submit_jobs_per_user,
                 "max_submit_jobs_per_user",
             )?,
+            max_submit_per_account: nullable_limit(
+                req.max_submit_jobs_per_account,
+                "max_submit_jobs_per_account",
+            )?,
+            grp_submit_jobs: nullable_limit(req.grp_submit_jobs, "grp_submit_jobs")?,
             max_tres_per_user: nullable_str(&req.max_tres_per_user),
             grp_tres: nullable_str(&req.grp_tres),
             grp_wall_min: nullable_limit(req.grp_wall_minutes, "grp_wall_minutes")?,
@@ -588,6 +633,7 @@ impl SlurmAccounting for AccountingService {
             } else {
                 req.preempt_exempt_time.map(|v| Some(v as i32))
             },
+            flags: flags.as_deref(),
         };
         db::upsert_qos(pool, &req.name, update)
             .await
@@ -622,14 +668,17 @@ impl SlurmAccounting for AccountingService {
                 preempt_mode: r.preempt_mode,
                 preempt: r.preempt,
                 usage_factor: r.usage_factor,
-                max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
-                max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
+                max_jobs_per_user: limit_to_proto(r.max_jobs_per_user),
+                max_wall_minutes: limit_to_proto(r.max_wall_min),
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
-                max_submit_jobs_per_user: r.max_submit_per_user.unwrap_or(0) as u32,
+                max_submit_jobs_per_user: limit_to_proto(r.max_submit_per_user),
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
-                grp_wall_minutes: r.grp_wall_min.unwrap_or(0) as u32,
+                grp_wall_minutes: limit_to_proto(r.grp_wall_min),
                 preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
+                max_submit_jobs_per_account: limit_to_proto(r.max_submit_per_account),
+                grp_submit_jobs: limit_to_proto(r.grp_submit_jobs),
+                flags: r.flags,
             })
             .collect();
 

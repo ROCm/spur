@@ -11,7 +11,10 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use spur_core::account_limits::{check_account_limits, AccountCheckResult};
+use spur_core::account_limits::{
+    check_account_limits, check_account_standalone_limits, check_account_submit_limits,
+    check_account_wall_limit, AccountCheckResult,
+};
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, SlurmConfig};
@@ -21,7 +24,9 @@ use spur_core::job::{
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
-use spur_core::qos::{check_qos_limits, QosCheckResult};
+use spur_core::qos::{
+    check_qos_limits, check_qos_standalone_limits, check_qos_submit_limits, QosCheckResult,
+};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
@@ -635,6 +640,19 @@ impl ClusterManager {
             spur_core::dependency::try_parse_dependencies(&spec.dependency)
                 .map_err(|e| SubmitError::invalid(format!("invalid dependency: {e}")))?;
         }
+
+        // Submission gate: deny the submit-count family and (for DenyOnLimit
+        // QOS) unsatisfiable stand-alone resource requests before the job ever
+        // enters the queue. The scheduler path stays a safety net for the
+        // limit-lowered-after-submit edge case. Each array task counts
+        // individually toward submit caps; the whole submission is rejected.
+        let incoming_tasks = match spec.array_spec.as_deref() {
+            Some(s) => spur_core::array::parse_array_spec(s)
+                .map(|a| a.task_ids.len() as u32)
+                .unwrap_or(1),
+            None => 1,
+        };
+        self.enforce_submit_limits(&spec, incoming_tasks)?;
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
         let specs =
@@ -4441,6 +4459,118 @@ impl ClusterManager {
         }
     }
 
+    /// Submit-time limit gate (Slurm's `acct_policy_validate`). Submit-count
+    /// limits and the association per-job wall deny unconditionally; stand-alone
+    /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
+    /// (treated as on when the job has no QOS). `incoming` is the task count added.
+    fn enforce_submit_limits(&self, spec: &JobSpec, incoming: u32) -> Result<(), SubmitError> {
+        let jobs = self.jobs.read();
+        let user = spec.user.as_str();
+        let account = spec.account.as_deref().filter(|a| !a.is_empty());
+        let qos_name = spec.qos.as_deref().filter(|n| !n.is_empty());
+
+        // Representative job for the stand-alone/wall breach checks. The job_id
+        // is irrelevant here (these evaluate the request in isolation).
+        let job = Job::new(0, spec.clone());
+
+        let is_submitted = |j: &Job| matches!(j.state, JobState::Pending | JobState::Running);
+
+        // Surface a human sentence plus the exact Slurm reason code, so the
+        // rejection is readable while machine consumers keep the bare code.
+        let deny = |reason: PendingReason| {
+            SubmitError::invalid(format!("{} ({reason})", reason.submit_denial_message()))
+        };
+
+        // Association submit-count + unconditional wall.
+        let assoc_loaded = self.association_cache.is_loaded();
+        if assoc_loaded {
+            if let Some(account) = account {
+                let limits = self.association_cache.limits(user, account);
+                let user_submitted = jobs
+                    .values()
+                    .filter(|j| {
+                        is_submitted(j)
+                            && j.spec.user == user
+                            && j.spec.account.as_deref() == Some(account)
+                    })
+                    .count() as u32;
+                let account_submitted = jobs
+                    .values()
+                    .filter(|j| is_submitted(j) && j.spec.account.as_deref() == Some(account))
+                    .count() as u32;
+                if let Some(reason) = check_account_submit_limits(
+                    &limits,
+                    user_submitted,
+                    account_submitted,
+                    incoming,
+                ) {
+                    return Err(deny(reason));
+                }
+                if let Some(reason) = check_account_wall_limit(&job, &limits) {
+                    return Err(deny(reason));
+                }
+            }
+        }
+
+        // QOS submit-count + (DenyOnLimit-gated) stand-alone resource breach.
+        // A job with no QOS is treated as DenyOnLimit-on so an unsatisfiable
+        // association request is rejected rather than pending forever.
+        let mut deny_on_limit = true;
+        if self.qos_cache.is_loaded() {
+            if let Some(qos_name) = qos_name {
+                if let Some(qos) = self.qos_cache.get(qos_name) {
+                    deny_on_limit = qos.deny_on_limit;
+                    let user_submitted = jobs
+                        .values()
+                        .filter(|j| {
+                            is_submitted(j)
+                                && j.spec.user == user
+                                && j.spec.qos.as_deref() == Some(qos_name)
+                        })
+                        .count() as u32;
+                    let account_submitted = jobs
+                        .values()
+                        .filter(|j| {
+                            is_submitted(j)
+                                && j.spec.account.as_deref() == account
+                                && j.spec.qos.as_deref() == Some(qos_name)
+                        })
+                        .count() as u32;
+                    let qos_submitted = jobs
+                        .values()
+                        .filter(|j| is_submitted(j) && j.spec.qos.as_deref() == Some(qos_name))
+                        .count() as u32;
+                    if let Some(reason) = check_qos_submit_limits(
+                        &qos,
+                        user_submitted,
+                        account_submitted,
+                        qos_submitted,
+                        incoming,
+                    ) {
+                        return Err(deny(reason));
+                    }
+                    if deny_on_limit {
+                        if let Some(reason) = check_qos_standalone_limits(&job, &qos) {
+                            return Err(deny(reason));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Association stand-alone TRES breach, gated the same way as QOS.
+        if deny_on_limit && assoc_loaded {
+            if let Some(account) = account {
+                let limits = self.association_cache.limits(user, account);
+                if let Some(reason) = check_account_standalone_limits(&job, &limits) {
+                    return Err(deny(reason));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Recompute a job's live effective priority. A running job's stored
     /// `priority` is stale; this recalculates from age, fair-share, and tier.
     pub(crate) fn current_effective_priority(&self, job: &Job, partitions: &[Partition]) -> u32 {
@@ -6917,6 +7047,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use spur_core::accounting::AccountLimits;
     use spur_core::job::JobSpec;
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
@@ -7113,6 +7244,15 @@ mod tests {
         let mut spec = basic_spec(name);
         spec.srun_job = true;
         spec
+    }
+
+    /// Assert a submission was denied and the rejection carries the exact Slurm
+    /// reason `code` in parentheses, alongside the human sentence.
+    fn assert_submit_denied(err: &SubmitError, code: &str) {
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains(&format!("({code})")), "got: {msg}");
     }
 
     /// Build a cluster backed by a real spur.conf on disk so `reconfigure()`
@@ -12078,6 +12218,172 @@ mod tests {
         assert!(cm.submit_job(spec).is_ok());
     }
 
+    fn qos_with_limits(name: &str, limits: spur_core::accounting::QosLimits, deny: bool) -> Qos {
+        Qos {
+            name: name.into(),
+            limits,
+            deny_on_limit: deny,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_assoc_max_submit_jobs_zero_blocks_all() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            AccountLimits {
+                max_submit_jobs: Some(0),
+                ..Default::default()
+            },
+        );
+        let mut spec = basic_spec("blocked");
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_submit_denied(&err, "AssocMaxSubmitJobLimit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_assoc_max_submit_jobs_over_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut first = basic_spec("first");
+        first.account = Some("research".into());
+        assert!(cm.submit_job(first).is_ok());
+
+        let mut second = basic_spec("second");
+        second.account = Some("research".into());
+        let err = cm.submit_job(second).unwrap_err();
+        assert_submit_denied(&err, "AssocMaxSubmitJobLimit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_assoc_wall_unconditionally() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            AccountLimits {
+                max_wall_minutes: Some(60),
+                ..Default::default()
+            },
+        );
+        let mut spec = basic_spec("longwall");
+        spec.account = Some("research".into());
+        spec.time_limit = Some(chrono::Duration::hours(2));
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_submit_denied(&err, "AssocMaxWallDurationPerJobLimit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_array_that_overflows_submit_cap() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            AccountLimits {
+                max_submit_jobs: Some(5),
+                ..Default::default()
+            },
+        );
+        let mut spec = basic_spec("bigarray");
+        spec.account = Some("research".into());
+        spec.array_spec = Some("0-9".into()); // 10 tasks > 5
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_submit_denied(&err, "AssocMaxSubmitJobLimit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_qos_grp_submit_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["normal"]);
+        cm.qos_cache().insert(qos_with_limits(
+            "normal",
+            spur_core::accounting::QosLimits {
+                grp_submit_jobs: Some(0),
+                ..Default::default()
+            },
+            false,
+        ));
+        let mut spec = basic_spec("qosgrp");
+        spec.account = Some("research".into());
+        spec.qos = Some("normal".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_submit_denied(&err, "QOSGrpSubmitJobsLimit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_qos_max_submit_per_account() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["normal"]);
+        cm.qos_cache().insert(qos_with_limits(
+            "normal",
+            spur_core::accounting::QosLimits {
+                max_submit_jobs_per_account: Some(0),
+                ..Default::default()
+            },
+            false,
+        ));
+        let mut spec = basic_spec("qospa");
+        spec.account = Some("research".into());
+        spec.qos = Some("normal".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_submit_denied(&err, "MaxSubmitJobsPerAccount");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_denies_qos_standalone_tres_only_with_deny_on_limit() {
+        let mut cap = TresRecord::new();
+        cap.set(TresType::Cpu, 1);
+        let limits = spur_core::accounting::QosLimits {
+            max_tres_per_job: Some(cap),
+            ..Default::default()
+        };
+
+        // Without DenyOnLimit the unsatisfiable request is admitted (pends).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["normal"]);
+        cm.qos_cache()
+            .insert(qos_with_limits("normal", limits.clone(), false));
+        let mut spec = basic_spec("pends");
+        spec.account = Some("research".into());
+        spec.qos = Some("normal".into());
+        spec.num_tasks = 2; // 2 CPUs > cap of 1
+        assert!(cm.submit_job(spec).is_ok());
+
+        // With DenyOnLimit the same request is denied at submit.
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.association_cache()
+            .insert_allowed_qos("testuser", "research", &["normal"]);
+        cm2.qos_cache()
+            .insert(qos_with_limits("normal", limits, true));
+        let mut spec2 = basic_spec("denied");
+        spec2.account = Some("research".into());
+        spec2.qos = Some("normal".into());
+        spec2.num_tasks = 2;
+        let err = cm2.submit_job(spec2).unwrap_err();
+        assert_submit_denied(&err, "QOSMaxCpuPerJobLimit");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_admits_over_maxtime_when_enforcement_off() {
         // Default EnforcePartLimits=No: an over-MaxTime job is admitted (and
@@ -14323,14 +14629,11 @@ mod tests {
     async fn tag_blocked_sets_account_max_submit_jobs_reason() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        cm.association_cache().insert_limits(
-            "testuser",
-            "research",
-            spur_core::accounting::AccountLimits {
-                max_submit_jobs: Some(1),
-                ..Default::default()
-            },
-        );
+        // Submit within limits, then lower the cap: this exercises the
+        // scheduler safety-net path (the submit gate would reject up front, so
+        // it can only be reached when the limit is tightened after submission).
+        cm.association_cache()
+            .insert_association("testuser", "research");
 
         let mut s1 = basic_spec("b1");
         s1.account = Some("research".into());
@@ -14339,6 +14642,15 @@ mod tests {
         let mut s2 = basic_spec("b2");
         s2.account = Some("research".into());
         let j2 = submit_and_wait(&cm, s2);
+
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
 
         cm.tag_blocked_pending_reasons();
         // j1 alone is within the limit (max_submit_jobs=1) and must not be
@@ -14355,12 +14667,11 @@ mod tests {
     async fn tag_blocked_sets_qos_max_submit_jobs_reason() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
+        // Submit under an uncapped QOS, then tighten it: the submit gate would
+        // reject up front, so the scheduler tagging path is only reachable when
+        // the limit is lowered after submission.
         cm.qos_cache().insert(Qos {
             name: "capped".into(),
-            limits: spur_core::accounting::QosLimits {
-                max_submit_jobs_per_user: Some(1),
-                ..Default::default()
-            },
             ..Default::default()
         });
 
@@ -14371,6 +14682,15 @@ mod tests {
         let mut s2 = basic_spec("c2");
         s2.qos = Some("capped".into());
         let j2 = submit_and_wait(&cm, s2);
+
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_submit_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
 
         cm.tag_blocked_pending_reasons();
         // j1 alone is within the limit (max_submit_jobs_per_user=1) and must
