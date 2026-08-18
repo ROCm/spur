@@ -220,6 +220,10 @@ pub enum ScontrolCommand {
         /// New preemption mode: OFF, CANCEL, REQUEUE, SUSPEND
         #[arg(long)]
         preempt_mode: Option<String>,
+        /// Minimum seconds a job must have been running before it is eligible for
+        /// preemption (0 = defer to global default)
+        #[arg(long)]
+        preempt_exempt_time: Option<u32>,
     },
     /// Delete a partition
     #[command(name = "delete-partition")]
@@ -433,6 +437,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             set_allow_qos,
             priority_tier,
             preempt_mode,
+            preempt_exempt_time,
         } => {
             let selector_map = match selector {
                 Some(ref s) => parse_selector(s)?,
@@ -462,6 +467,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 set_allow_qos,
                 priority_tier,
                 preempt_mode,
+                preempt_exempt_time,
             };
             update_partition(&args.controller, req).await
         }
@@ -723,11 +729,15 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         part.max_nodes.to_string()
                     },
                 );
-                println!(
+                print!(
                     "   PreemptMode={} PriorityTier={}",
                     part.preempt_mode.to_uppercase(),
                     part.priority_tier
                 );
+                if part.preempt_exempt_time > 0 {
+                    print!(" PreemptExemptTime={}", part.preempt_exempt_time);
+                }
+                println!();
                 println!();
             }
         }
@@ -1304,6 +1314,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut allow_qos: Option<String> = None;
     let mut priority_tier: Option<u32> = None;
     let mut preempt_mode: Option<String> = None;
+    let mut preempt_exempt_time: Option<u32> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1332,6 +1343,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 "allowqos" => allow_qos = Some(value.into()),
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().ok(),
                 "preemptmode" => preempt_mode = Some(value.to_uppercase()),
+                "preemptexempttime" => preempt_exempt_time = value.parse().ok(),
                 // silently ignore Slurm-only keys
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
@@ -1371,6 +1383,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         allow_qos: allow_qos.as_deref().map(split_csv).unwrap_or_default(),
         priority_tier,
         preempt_mode,
+        preempt_exempt_time,
     };
 
     update_partition(controller, req).await

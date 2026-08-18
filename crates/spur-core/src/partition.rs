@@ -37,6 +37,11 @@ pub struct Partition {
     /// Scheduling
     pub preempt_mode: PreemptMode,
     pub priority_tier: u32,
+    /// Partition-level override for the minimum seconds a job must have been
+    /// running before it is eligible for preemption. `None` defers to the
+    /// cluster-wide `preempt_exempt_time` in `SchedulerConfig`.
+    #[serde(default)]
+    pub preempt_exempt_time: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +67,18 @@ impl std::fmt::Display for PartitionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.display())
     }
+}
+
+/// Controls cross-QOS preemption eligibility. Mirrors Slurm's `PreemptType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PreemptType {
+    /// No QOS-level restrictions — eligibility is determined solely by priority
+    /// gap, partition mode, and reservation tier (existing behaviour).
+    #[default]
+    None,
+    /// A pending job may only preempt a running job when the pending job's QOS
+    /// lists the running job's QOS in its `preempt` allow-list.
+    QosPriority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -138,6 +155,7 @@ impl Default for Partition {
             deny_qos: Vec::new(),
             preempt_mode: PreemptMode::Off,
             priority_tier: 1,
+            preempt_exempt_time: None,
         }
     }
 }

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
-use crate::partition::{Partition, PartitionState, PreemptMode};
+use crate::partition::{Partition, PartitionState, PreemptMode, PreemptType};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -566,6 +566,19 @@ pub struct SchedulerConfig {
     /// operator-only. Raise it to grant users a band above the baseline.
     #[serde(default = "default_max_user_priority")]
     pub max_user_priority: u32,
+    /// Controls which jobs are eligible to preempt which. `None` (default)
+    /// enforces no cross-QOS restrictions — any job with sufficient priority gap
+    /// may preempt any other. `QosPriority` requires the pending job's QOS to
+    /// list the running job's QOS in its `preempt` allow-list. Mirrors Slurm's
+    /// `PreemptType`.
+    #[serde(default)]
+    pub preempt_type: PreemptType,
+    /// Cluster-wide minimum number of seconds a job must have been running before
+    /// it becomes eligible for preemption. Can be overridden per-partition and
+    /// per-QOS. `0` (default) means immediately eligible. Mirrors Slurm's
+    /// `PreemptExemptTime`.
+    #[serde(default)]
+    pub preempt_exempt_time: u32,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -605,6 +618,8 @@ impl Default for SchedulerConfig {
             resv_overrun_minutes: 0,
             inactive_limit_secs: 0,
             max_user_priority: default_max_user_priority(),
+            preempt_type: PreemptType::None,
+            preempt_exempt_time: 0,
         }
     }
 }
