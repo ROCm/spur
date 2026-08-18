@@ -33,6 +33,38 @@ use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
+/// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
+///
+/// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
+/// devices" so they cannot inherit the runtime's all-visible default.
+fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u32]) {
+    if allocated_device_ids.is_empty() {
+        spur_core::task_launch::gpu_deny_visibility(env);
+    }
+}
+
+#[cfg(test)]
+mod gpu_deny_tests {
+    use std::collections::HashMap;
+
+    #[test]
+    fn empty_allocation_denies_gpu_env() {
+        let mut env = HashMap::new();
+        super::maybe_deny_gpu_env(&mut env, &[]);
+        assert_eq!(
+            env.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("-1")
+        );
+    }
+
+    #[test]
+    fn nonempty_allocation_leaves_gpu_env_untouched() {
+        let mut env = HashMap::new();
+        super::maybe_deny_gpu_env(&mut env, &[0u32, 1]);
+        assert!(!env.contains_key("ROCR_VISIBLE_DEVICES"));
+    }
+}
+
 pub(crate) struct TrackedJob {
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
@@ -1393,8 +1425,13 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        maybe_deny_gpu_env(&mut env, &allocated_device_ids);
+
         if let Some(ref mut cfg) = container_config {
             cfg.environment = env.clone();
+            // container_env (user `--container-env`) is layered over environment
+            // at launch, so a zero-GPU job could re-enable visibility through it.
+            maybe_deny_gpu_env(&mut cfg.container_env, &allocated_device_ids);
         }
 
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
@@ -1947,7 +1984,7 @@ impl SlurmAgent for AgentService {
             .position(|n| *n == agent_hostname)
             .unwrap_or(0) as u32;
 
-        let gpu_env = if gpu_devices.is_empty() {
+        let mut gpu_env = if gpu_devices.is_empty() {
             HashMap::new()
         } else {
             self.device_registry
@@ -1960,6 +1997,7 @@ impl SlurmAgent for AgentService {
                 .0
                 .env
         };
+        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
 
         let mut senv = SpurEnv::new();
         senv.extend(&req.environment);
