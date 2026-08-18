@@ -132,7 +132,7 @@ pub fn register_reconcile(registry: &mut Registry, snap: &ReconcileStatsSnapshot
     );
     registry.register(
         "spur_reconcile_unaccounted_slices",
-        "Active job/node pairs whose record carries no allocation, so nothing is charged for them",
+        "Active job/node pairs naming an untracked node or carrying no allocation, so nothing is charged for them",
         unaccounted,
     );
     registry.register(

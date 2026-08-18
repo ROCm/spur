@@ -514,7 +514,7 @@ count.
        ``spur_reconcile_overcharged_devices_total{trigger}``
      - CPUs, memory (MB) and device units held beyond the job records.
    * - ``spur_reconcile_unaccounted_slices{trigger}``
-     - Running job/node pairs where the record names a node the controller no
+     - Active job/node pairs where the record names a node the controller no
        longer tracks, or names one but carries no allocation for it. Nothing is
        charged for that work and the check above cannot see it, so it is counted
        directly. Worth reporting, except immediately after upgrading from a

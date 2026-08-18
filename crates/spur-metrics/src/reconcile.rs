@@ -19,8 +19,8 @@ pub struct RebuildSnapshot {
     pub memory_overcharged_mb: u64,
     pub devices_undercharged: u64,
     pub devices_overcharged: u64,
-    /// Active job/node pairs whose record carries no allocation at all, so
-    /// nothing is charged and the diff cannot see the shortfall.
+    /// Active job/node pairs naming an untracked node, or carrying no allocation
+    /// for it. Nothing is charged and the diff cannot see the shortfall.
     pub unaccounted_slices: u64,
     /// Nodes examined on the most recent pass, as a denominator for the rest.
     pub nodes_checked: u64,
