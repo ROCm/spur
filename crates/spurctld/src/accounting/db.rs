@@ -517,6 +517,47 @@ pub async fn get_usage(
     Ok(records)
 }
 
+/// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
+/// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
+/// that started before the window contributes only the part inside it.
+pub async fn consumed_wall_minutes_by_qos(
+    pool: &PgPool,
+    window_days: u32,
+) -> anyhow::Result<HashMap<String, u64>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT qos,
+               SUM(
+                 EXTRACT(EPOCH FROM (
+                   LEAST(COALESCE(end_time, now()), now())
+                   - GREATEST(start_time, now() - make_interval(days => $1))
+                 ))
+               )::BIGINT as wall_seconds
+        FROM jobs
+        WHERE qos <> ''
+          AND start_time IS NOT NULL
+          AND COALESCE(end_time, now()) > now() - make_interval(days => $1)
+        GROUP BY qos
+        "#,
+    )
+    .bind(window_days as i32)
+    .fetch_all(pool)
+    .await?;
+
+    let consumed = rows
+        .iter()
+        .map(|row| {
+            let seconds = row
+                .get::<Option<i64>, _>("wall_seconds")
+                .unwrap_or(0)
+                .max(0);
+            (row.get::<String, _>("qos"), seconds as u64 / 60)
+        })
+        .collect();
+
+    Ok(consumed)
+}
+
 #[derive(Debug)]
 pub struct UsageRecord {
     pub user_name: String,

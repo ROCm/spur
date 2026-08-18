@@ -469,6 +469,11 @@ pub struct AccountingConfig {
     /// How often to refresh fairshare/QoS caches from the accounting database.
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
+    /// Trailing window over which a QOS's wall-clock consumption is measured for
+    /// `GrpWall`. Defaults to `scheduler.fairshare_halflife_days` so a cluster has
+    /// a single usage horizon.
+    #[serde(default = "default_grp_wall_window_days")]
+    pub grp_wall_window_days: u32,
     /// Cluster-wide fallback QOS, applied at submit when a job resolves to no
     /// QOS. The last link in the resolution chain (Slurm's stock `normal`
     /// analogue). Empty (default) = no fallback.
@@ -484,11 +489,16 @@ fn default_fairshare_refresh_secs() -> u32 {
     300
 }
 
+fn default_grp_wall_window_days() -> u32 {
+    default_halflife()
+}
+
 impl Default for AccountingConfig {
     fn default() -> Self {
         Self {
             database_url: String::new(),
             fairshare_refresh_secs: 300,
+            grp_wall_window_days: default_grp_wall_window_days(),
             default_qos: String::new(),
             require_qos: false,
         }

@@ -39,7 +39,7 @@ use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 use crate::accounting::{AccountingNotifier, JobStartRecord};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
-use crate::limits_cache::QosCache;
+use crate::limits_cache::{GrpWallCache, QosCache};
 use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
@@ -403,6 +403,7 @@ pub struct ClusterManager {
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
+    grp_wall_cache: Arc<GrpWallCache>,
     association_cache: Arc<AssociationCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
@@ -473,6 +474,7 @@ impl ClusterManager {
         let first_job_id = config.controller.first_job_id;
         let scheduler_interval_secs = config.scheduler.interval_secs;
         let qos_cache = Arc::new(QosCache::new());
+        let grp_wall_cache = Arc::new(GrpWallCache::new());
         let association_cache = Arc::new(AssociationCache::new());
 
         let cm = Self {
@@ -498,6 +500,7 @@ impl ClusterManager {
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
+            grp_wall_cache,
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
@@ -3158,9 +3161,18 @@ impl ClusterManager {
                 {
                     return GateOutcome::Block(reason);
                 }
-                if let Some(reason) =
-                    qos_block_with(job, &qos_by_job[&job.job_id], &jobs, &reserved)
-                {
+                let consumed_wall = job
+                    .spec
+                    .qos
+                    .as_deref()
+                    .and_then(|name| self.grp_wall_cache.consumed_minutes(name));
+                if let Some(reason) = qos_block_with(
+                    job,
+                    &qos_by_job[&job.job_id],
+                    &jobs,
+                    &reserved,
+                    consumed_wall,
+                ) {
                     return GateOutcome::Block(reason);
                 }
                 reserved.reserve(job);
@@ -4447,6 +4459,10 @@ impl ClusterManager {
 
     pub fn qos_cache(&self) -> &Arc<QosCache> {
         &self.qos_cache
+    }
+
+    pub fn grp_wall_cache(&self) -> &Arc<GrpWallCache> {
+        &self.grp_wall_cache
     }
 
     pub fn association_cache(&self) -> &Arc<AssociationCache> {
@@ -6297,6 +6313,7 @@ fn qos_block_with(
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
     reserved: &PassReservations,
+    consumed_wall_minutes: Option<u64>,
 ) -> Option<spur_core::job::PendingReason> {
     let qos_name = job.spec.qos.as_ref()?;
     let user = &job.spec.user;
@@ -6341,6 +6358,7 @@ fn qos_block_with(
         submitted_count,
         &user_running_tres,
         &qos_running_tres,
+        consumed_wall_minutes,
     ) {
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
@@ -11173,6 +11191,93 @@ mod tests {
             cm.get_node("worker1").unwrap().alloc_resources.cpus,
             0,
             "replayed preempt-cancel must not double-free"
+        );
+    }
+
+    fn budget_qos(cap: u32) -> Qos {
+        Qos {
+            name: "budget".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_wall_minutes: Some(cap),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grp_wall_budget_blocks_scheduling_and_tags_the_slurm_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(budget_qos(600));
+        cm.grp_wall_cache()
+            .seed(HashMap::from([("budget".to_string(), 600)]));
+
+        let mut spec = basic_spec("over-budget");
+        spec.qos = Some("budget".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            !pending.contains(&job_id),
+            "a QOS at its GrpWall budget must not be scheduled"
+        );
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::QosGrpWallLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grp_wall_budget_admits_while_consumption_is_below_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(budget_qos(600));
+        cm.grp_wall_cache()
+            .seed(HashMap::from([("budget".to_string(), 599)]));
+
+        let mut spec = basic_spec("within-budget");
+        spec.qos = Some("budget".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            pending.contains(&job_id),
+            "consumption below the budget must still schedule"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grp_wall_budget_is_unenforced_while_usage_is_unavailable() {
+        // An unseeded cache is what accounting being disabled or unreachable looks
+        // like. Scheduling must continue rather than stall on an unknown figure.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(budget_qos(1));
+
+        let mut spec = basic_spec("no-usage-data");
+        spec.qos = Some("budget".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            pending.contains(&job_id),
+            "an unavailable usage figure must not block scheduling"
         );
     }
 

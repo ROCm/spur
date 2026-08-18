@@ -105,6 +105,74 @@ impl Default for QosCache {
     }
 }
 
+/// Per-QOS wall-clock consumption for `GrpWall`, derived from job history in the
+/// accounting database. Reads return `None` until a first successful load, which
+/// is what leaves the limit unapplied when accounting is disabled or unreachable.
+pub struct GrpWallCache {
+    snapshot: RwLock<Option<HashMap<String, u64>>>,
+}
+
+impl GrpWallCache {
+    pub fn new() -> Self {
+        Self {
+            snapshot: RwLock::new(None),
+        }
+    }
+
+    /// Minutes consumed by `qos_name` in the window. A loaded cache reports zero
+    /// for a QOS with no job history; an unloaded one reports `None`.
+    pub fn consumed_minutes(&self, qos_name: &str) -> Option<u64> {
+        let snap = self.snapshot.read();
+        let consumed = snap.as_ref()?;
+        Some(consumed.get(qos_name).copied().unwrap_or(0))
+    }
+
+    fn replace(&self, consumed: HashMap<String, u64>) {
+        *self.snapshot.write() = Some(consumed);
+    }
+
+    /// Test-only seam: populates consumption without a database.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, consumed: HashMap<String, u64>) {
+        self.replace(consumed);
+    }
+
+    pub fn spawn_refresh_loop(
+        self: &Arc<Self>,
+        pool: PgPool,
+        refresh_interval_secs: u64,
+        window_days: u32,
+    ) {
+        let cache = Arc::clone(self);
+        let interval = Duration::from_secs(refresh_interval_secs.max(10));
+
+        tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::accounting::db::consumed_wall_minutes_by_qos(&pool, window_days),
+                )
+                .await
+                {
+                    Ok(Ok(consumed)) => cache.replace(consumed),
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "grpwall usage refresh failed, retaining stale data")
+                    }
+                    Err(_) => warn!("grpwall usage refresh timed out, retaining stale data"),
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+}
+
+impl Default for GrpWallCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
     use spur_core::accounting::limit_from_db;
     // Values are validated by `create_qos` before being stored, so a parse
@@ -202,7 +270,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_qos_limits(&job, &qos, 0, 2, &TresRecord::new(), &TresRecord::new());
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            0,
+            2,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit)
@@ -230,7 +306,7 @@ mod tests {
         );
         let mut running = TresRecord::new();
         running.set(TresType::Cpu, 6);
-        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new(), None);
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)

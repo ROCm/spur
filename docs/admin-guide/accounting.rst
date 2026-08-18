@@ -84,6 +84,7 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
    default_qos = "normal"
    require_qos = false
    fairshare_refresh_secs = 300
+   grp_wall_window_days = 14
 
 ``database_url``
    PostgreSQL DSN for the accounting store. A non-empty value enables accounting
@@ -110,6 +111,12 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
    database.
 
    :Default: ``300``
+
+``grp_wall_window_days``
+   Trailing window over which a QOS's wall-clock consumption is measured for
+   ``grpwall``. See `Group wall-clock budgets (GrpWall)`_.
+
+   :Default: ``scheduler.fairshare_halflife_days`` (``14``)
 
 .. warning::
 
@@ -456,7 +463,9 @@ QOS keys
      - Aggregate TRES cap across all jobs under this QOS.
    * - ``grpwall``
      - unset (no limit)
-     - Aggregate wall-clock time across all jobs under this QOS.
+     - Aggregate wall-clock budget, in minutes, across all jobs under this QOS.
+       See `Group wall-clock budgets (GrpWall)`_ for how consumption is measured
+       and where the behaviour departs from Slurm.
    * - ``flags``
      - ``""``
      - Comma-separated QOS flags. ``DenyOnLimit`` is supported (see
@@ -502,6 +511,37 @@ Set ``DenyOnLimit`` through the QOS ``flags`` key:
 .. code-block:: bash
 
    sacctmgr modify qos name=highprio set flags=DenyOnLimit
+
+Group wall-clock budgets (GrpWall)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``grpwall`` caps the total wall-clock time a QOS may consume. Once consumption
+reaches the cap, jobs in that QOS stop being scheduled and wait with reason
+``QOSGrpWallLimit`` (visible in ``squeue``); they become eligible again as
+consumption falls back below the cap.
+
+Consumption is summed from job history over a trailing window, set by
+``grp_wall_window_days`` under ``[accounting]`` (default: the value of
+``scheduler.fairshare_halflife_days``). Running jobs contribute the time they
+have accrued so far, and a job that began before the window contributes only the
+part inside it. The figure is refreshed on the same interval as the other
+accounting caches, ``fairshare_refresh_secs``.
+
+Three deliberate differences from Slurm:
+
+* **Running jobs are never killed.** Slurm cancels running jobs when the limit is
+  reached; Spur only stops admitting new ones. Work already under way finishes.
+* **Consumption uses a rolling window, not decayed usage.** Slurm decays usage by
+  ``PriorityDecayHalfLife``/``PriorityUsageResetPeriod``, which Spur has no
+  equivalent of. A trailing window is a hard budget with no decay curve.
+* **The limit applies to a QOS only.** Slurm also accepts ``GrpWall`` on an
+  association; Spur does not store it there, so it cannot be set or enforced per
+  account.
+
+The budget is not applied when accounting is disabled or the database is
+unreachable, matching the rest of the accounting path: a database outage does not
+stop scheduling. Where a budget must hold, keep the accounting database
+available.
 
 QOS preemption hierarchy
 ~~~~~~~~~~~~~~~~~~~~~~~~
