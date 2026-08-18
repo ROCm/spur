@@ -227,13 +227,115 @@ fn format_field(value: &str, field: &FormatField) -> String {
 
 /// Print a header row followed by a separator line (dashes under text, spaces under spaces).
 pub fn print_header(tokens: &[FormatToken]) {
-    let header = format_header(tokens);
-    let sep: String = header
-        .chars()
-        .map(|c| if c == ' ' { ' ' } else { '-' })
-        .collect();
-    println!("{header}");
-    println!("{sep}");
+    OutputStyle::default().print_header(tokens);
+}
+
+/// Separator used by Slurm's `--parsable` family.
+const DELIMITER: char = '|';
+
+/// How a row's fields are separated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowLayout {
+    /// Padded to each field's width, the human-readable table.
+    #[default]
+    Aligned,
+    /// Slurm's `-P`/`--parsable2`: delimited, no closing delimiter.
+    Delimited,
+    /// Slurm's `-p`/`--parsable`: delimited, with a closing delimiter.
+    DelimitedTrailing,
+}
+
+/// Header visibility and row layout, resolved once from a command's flags and passed to
+/// wherever it prints.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutputStyle {
+    noheader: bool,
+    layout: RowLayout,
+}
+
+impl OutputStyle {
+    pub fn new(noheader: bool, layout: RowLayout) -> Self {
+        Self { noheader, layout }
+    }
+
+    /// The header block: nothing when suppressed, a single delimited line, or a padded
+    /// header plus its dashed rule.
+    pub fn header_lines(&self, tokens: &[FormatToken]) -> Vec<String> {
+        if self.noheader {
+            return Vec::new();
+        }
+
+        if let Some(trailing) = self.delimited() {
+            return vec![join_fields(tokens, &|field| field.header.clone(), trailing)];
+        }
+
+        let header = format_header(tokens);
+        let rule = header
+            .chars()
+            .map(|c| if c == ' ' { ' ' } else { '-' })
+            .collect();
+        vec![header, rule]
+    }
+
+    pub fn print_header(&self, tokens: &[FormatToken]) {
+        for line in self.header_lines(tokens) {
+            println!("{line}");
+        }
+    }
+
+    /// For callers printing a fixed-width table that `format_engine` does not model.
+    pub fn shows_header(&self) -> bool {
+        !self.noheader
+    }
+
+    pub fn is_delimited(&self) -> bool {
+        self.delimited().is_some()
+    }
+
+    pub fn row(&self, tokens: &[FormatToken], resolver: &dyn Fn(char) -> String) -> String {
+        match self.delimited() {
+            Some(trailing) => join_fields(tokens, &|field| resolver(field.spec), trailing),
+            None => format_row(tokens, resolver),
+        }
+    }
+
+    /// `Some(trailing)` when delimited, where `trailing` asks for a closing delimiter.
+    fn delimited(&self) -> Option<bool> {
+        match self.layout {
+            RowLayout::Aligned => None,
+            RowLayout::Delimited => Some(false),
+            RowLayout::DelimitedTrailing => Some(true),
+        }
+    }
+}
+
+/// Join field values with the delimiter, unpadded and untruncated. Literal tokens are
+/// dropped: the delimiter replaces whatever spacing the format string asked for. Empty
+/// values keep their separators, so the field count stays fixed for the caller parsing it.
+fn join_fields(
+    tokens: &[FormatToken],
+    value: &dyn Fn(&FormatField) -> String,
+    trailing: bool,
+) -> String {
+    let mut out = String::new();
+    let mut seen_field = false;
+
+    for token in tokens {
+        let FormatToken::Field(field) = token else {
+            continue;
+        };
+        if seen_field {
+            out.push(DELIMITER);
+        }
+        out.push_str(&value(field));
+        seen_field = true;
+    }
+
+    if trailing && seen_field {
+        out.push(DELIMITER);
+    }
+
+    out
 }
 
 /// Resolve a `format=` parameter into tokens.
@@ -500,5 +602,87 @@ mod tests {
             .filter(|t| matches!(t, FormatToken::Field(_)))
             .count();
         assert_eq!(field_count, 2);
+    }
+
+    /// Two padded columns, `JOBID` then `NAME`, with a literal space between them.
+    fn styled_tokens() -> Vec<FormatToken> {
+        parse_format("%.10i %.8j", &squeue_header)
+    }
+
+    fn styled_row(style: OutputStyle, name: &str) -> String {
+        style.row(&styled_tokens(), &|spec| match spec {
+            'i' => "42".to_string(),
+            'j' => name.to_string(),
+            other => panic!("unexpected spec {other}"),
+        })
+    }
+
+    #[test]
+    fn aligned_style_is_byte_identical_to_the_padded_helpers() {
+        let tokens = styled_tokens();
+        let style = OutputStyle::default();
+
+        assert_eq!(styled_row(style, "train"), "        42    train");
+        assert_eq!(
+            style.header_lines(&tokens),
+            vec!["     JOBID     NAME", "     -----     ----"]
+        );
+    }
+
+    #[test]
+    fn parsable2_joins_fields_with_a_pipe_and_no_trailing_pipe() {
+        let style = OutputStyle::new(false, RowLayout::Delimited);
+
+        assert_eq!(styled_row(style, "train"), "42|train");
+        assert_eq!(style.header_lines(&styled_tokens()), vec!["JOBID|NAME"]);
+    }
+
+    #[test]
+    fn parsable_appends_a_trailing_pipe() {
+        let style = OutputStyle::new(false, RowLayout::DelimitedTrailing);
+
+        assert_eq!(styled_row(style, "train"), "42|train|");
+        assert_eq!(style.header_lines(&styled_tokens()), vec!["JOBID|NAME|"]);
+    }
+
+    #[test]
+    fn delimited_rows_keep_an_empty_trailing_field() {
+        // Trimming here would drop the last separator and change the field count a
+        // script sees, which is the whole point of asking for delimited output.
+        assert_eq!(
+            styled_row(OutputStyle::new(false, RowLayout::Delimited), ""),
+            "42|"
+        );
+        assert_eq!(
+            styled_row(OutputStyle::new(false, RowLayout::DelimitedTrailing), ""),
+            "42||"
+        );
+    }
+
+    #[test]
+    fn delimited_output_drops_padding_and_truncation() {
+        let tokens = parse_format("%.3i", &squeue_header);
+        let long = |_: char| "1234567890".to_string();
+
+        assert_eq!(format_row(&tokens, &long), "123");
+        assert_eq!(
+            OutputStyle::new(false, RowLayout::Delimited).row(&tokens, &long),
+            "1234567890"
+        );
+    }
+
+    #[test]
+    fn noheader_suppresses_the_header_in_every_layout() {
+        for layout in [
+            RowLayout::Aligned,
+            RowLayout::Delimited,
+            RowLayout::DelimitedTrailing,
+        ] {
+            let style = OutputStyle::new(true, layout);
+            assert!(
+                style.header_lines(&styled_tokens()).is_empty(),
+                "{layout:?} emitted a header"
+            );
+        }
     }
 }
