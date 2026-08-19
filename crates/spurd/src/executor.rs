@@ -603,7 +603,10 @@ pub struct JobManifest {
     /// Host path to the job's exit-status sentinel (inside rootfs for containers).
     #[serde(default)]
     pub exit_status_path: Option<String>,
-    pub rootfs_mode: crate::container::RootfsMode,
+    /// Rootfs this job owns and must remove. None for non-container jobs, and
+    /// for named containers, which outlive the job.
+    #[serde(default)]
+    pub rootfs: Option<crate::container::JobRootfs>,
 
     // --- Obligations: what the agent still owes this job. ---
     /// Remaining teardown steps; each cleared as it is discharged.
@@ -2305,11 +2308,53 @@ mod tests {
             partition: "default".into(),
             nodelist: "n1".into(),
             mpi: String::new(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             exit_status_path: None,
             pending: PendingObligations::default(),
             exit: None,
         }
+    }
+
+    /// Frozen at the pre-`rootfs` shape on purpose — never regenerate it. A
+    /// manifest written by an older agent must still load, not strand the job.
+    #[test]
+    fn manifest_without_rootfs_field_still_loads() {
+        let frozen = r#"{
+            "schema_version": 1, "job_id": 7, "run_attempt": 2,
+            "pid": 4242, "start_time": 99, "cgroup_path": null, "forked": true,
+            "has_pid_namespace": true, "has_user_namespace": false,
+            "has_mount_namespace": true, "exit_status_path": "/var/spool/spur/job7_2/rc",
+            "rootfs_mode": "Extracted",
+            "cpu_ids": [0, 1], "gpu_devices": [3], "cpus": 2, "memory_mb": 1024,
+            "uid": 1000, "gid": 1000, "user": "alice",
+            "stdout_path": "/tmp/o", "stderr_path": "/tmp/e", "work_dir": "/tmp",
+            "partition": "default", "nodelist": "n1", "mpi": ""
+        }"#;
+
+        let m: JobManifest = serde_json::from_str(frozen).expect("old manifest must deserialize");
+
+        assert_eq!(m.job_id, 7);
+        assert_eq!(m.run_attempt, 2);
+        assert!(m.rootfs.is_none(), "unknown rootfs must not be invented");
+        assert!(m.has_mount_namespace);
+    }
+
+    /// The teardown path reads the rootfs back off disk, so it has to survive
+    /// the real write, not just an in-memory round trip.
+    #[test]
+    fn recorded_rootfs_survives_the_manifest_write() {
+        let spool = tempfile::tempdir().unwrap();
+        let mut m = sample_manifest(11, 4);
+        m.rootfs = Some(crate::container::JobRootfs {
+            base_dir: PathBuf::from("/var/spool/spur/containers/job_11_4"),
+            mode: crate::container::RootfsMode::Overlay,
+        });
+
+        write_job_manifest(spool.path(), &m);
+        let raw = std::fs::read_to_string(spool.path().join("manifest.json")).unwrap();
+        let decoded: JobManifest = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(decoded.rootfs, m.rootfs);
     }
 
     #[test]
@@ -2661,7 +2706,7 @@ mod tests {
             has_user_namespace: false,
             has_mount_namespace: false,
             exit_status_path: None,
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             pending: PendingObligations::default(),
             exit: Some((3, 0)),
             cpu_ids: vec![],
@@ -2708,7 +2753,7 @@ mod tests {
             has_user_namespace: false,
             has_mount_namespace: true,
             exit_status_path: None,
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             pending: PendingObligations::default(),
             exit: None,
             cpu_ids: vec![],
@@ -2787,7 +2832,7 @@ mod tests {
                 partition: "default".into(),
                 nodelist: "n1".into(),
                 mpi: String::new(),
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 exit_status_path: None,
                 pending: PendingObligations::default(),
                 exit: None,
@@ -2854,7 +2899,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "n1".into(),
             mpi: String::new(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             exit_status_path: None,
             pending: PendingObligations::default(),
             exit: None,
@@ -2910,7 +2955,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "n1".into(),
             mpi: String::new(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             exit_status_path: None,
             pending: PendingObligations::default(),
             exit: None,
@@ -2987,7 +3032,7 @@ mod tests {
                 partition: "default".into(),
                 nodelist: "n1".into(),
                 mpi: String::new(),
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 exit_status_path: None,
                 pending: PendingObligations::default(),
                 exit: None,

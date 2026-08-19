@@ -67,7 +67,7 @@ mod gpu_deny_tests {
 
 pub(crate) struct TrackedJob {
     job: executor::RunningJob,
-    rootfs_mode: crate::container::RootfsMode,
+    rootfs: Option<crate::container::JobRootfs>,
     stdout_path: String,
     stderr_path: String,
     has_pid_namespace: bool,
@@ -95,7 +95,7 @@ struct CompletedJob {
     exit_code: i32,
     signal: i32,
     run_attempt: u32,
-    rootfs_mode: crate::container::RootfsMode,
+    rootfs: Option<crate::container::JobRootfs>,
     cgroup: Option<std::path::PathBuf>,
     work_dir: String,
     uid: u32,
@@ -537,7 +537,7 @@ impl AgentService {
                         job_id,
                         TrackedJob {
                             job,
-                            rootfs_mode: manifest.rootfs_mode,
+                            rootfs: manifest.rootfs.clone(),
                             stdout_path: manifest.stdout_path,
                             stderr_path: manifest.stderr_path,
                             has_pid_namespace: manifest.has_pid_namespace,
@@ -571,7 +571,9 @@ impl AgentService {
                     // stays accurate after the sentinel/rootfs are gone. The
                     // spool (and manifest) is kept until every obligation is
                     // discharged (see reconcile_running_jobs).
-                    crate::container::cleanup_rootfs(job_id, &manifest.rootfs_mode);
+                    if let Some(ref rootfs) = manifest.rootfs {
+                        crate::container::cleanup_rootfs(rootfs);
+                    }
                     if let Some(ref cgroup) = manifest.cgroup_path {
                         executor::cleanup_cgroup(cgroup);
                     }
@@ -616,7 +618,7 @@ impl AgentService {
                                 exit_code,
                                 signal,
                                 run_attempt: tracked.run_attempt,
-                                rootfs_mode: tracked.rootfs_mode.clone(),
+                                rootfs: tracked.rootfs.clone(),
                                 cgroup,
                                 work_dir: tracked.work_dir.clone(),
                                 uid: tracked.uid,
@@ -638,7 +640,9 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    if let Some(ref rootfs) = c.rootfs {
+                        crate::container::cleanup_rootfs(rootfs);
+                    }
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
@@ -779,6 +783,32 @@ impl Drop for LaunchReservationGuard {
             handle.spawn(async move {
                 allocation.lock().await.release_job(job_id);
             });
+        }
+    }
+}
+
+/// Tears down a rootfs created by a launch that exits before commit, including
+/// on cancellation. Attempt-keyed dirs are never reused, so a leak is permanent.
+struct LaunchRootfsGuard {
+    rootfs: Option<crate::container::JobRootfs>,
+}
+
+impl LaunchRootfsGuard {
+    fn new(rootfs: Option<crate::container::JobRootfs>) -> Self {
+        Self { rootfs }
+    }
+
+    /// Hand ownership back once the job is committed and teardown belongs to
+    /// the normal completion path.
+    fn disarm(&mut self) -> Option<crate::container::JobRootfs> {
+        self.rootfs.take()
+    }
+}
+
+impl Drop for LaunchRootfsGuard {
+    fn drop(&mut self) {
+        if let Some(rootfs) = self.rootfs.take() {
+            crate::container::cleanup_rootfs(&rootfs);
         }
     }
 }
@@ -1489,7 +1519,7 @@ impl SlurmAgent for AgentService {
         let mut rootfs_path: Option<std::path::PathBuf> = None;
         let mut container_exit_status_path: Option<String> = None;
 
-        let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
+        let (launch_script, owned_rootfs) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
             let mounts: Vec<crate::container::BindMount> = spec
@@ -1545,9 +1575,13 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            let (rootfs, rootfs_mode) =
-                crate::container::setup_rootfs(&image_path, job_id, cfg.name.as_deref())
-                    .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
+            let (rootfs, owned_rootfs) = crate::container::setup_rootfs(
+                &image_path,
+                job_id,
+                run_attempt,
+                cfg.name.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
             // Copy user script into rootfs/tmp/ so it's accessible after pivot_root.
             // Wrap it to record the exit code at an in-container path, so a
@@ -1580,9 +1614,9 @@ impl SlurmAgent for AgentService {
             // The launch_script passed to executor is the user's script
             // (used as fallback for non-container path; for container path,
             // the executor reads from rootfs/tmp/ directly).
-            (script, rootfs_mode)
+            (script, owned_rootfs)
         } else {
-            (script, crate::container::RootfsMode::Extracted)
+            (script, None)
         };
 
         let mut pmix_guard = None;
@@ -1647,6 +1681,9 @@ impl SlurmAgent for AgentService {
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
+        // Armed before any fallible step so every early return, and future
+        // cancellation, tears the rootfs down.
+        let mut rootfs_guard = LaunchRootfsGuard::new(owned_rootfs);
         let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
 
         let injection = {
@@ -1827,7 +1864,7 @@ impl SlurmAgent for AgentService {
                                 partition: launch_cfg.partition.clone(),
                                 nodelist: launch_cfg.nodelist.clone(),
                                 mpi: spec.mpi.clone(),
-                                rootfs_mode: rootfs_mode.clone(),
+                                rootfs: rootfs_guard.rootfs.clone(),
                                 exit_status_path: Some(sentinel),
                                 pending: executor::PendingObligations::default(),
                                 exit: None,
@@ -1860,14 +1897,12 @@ impl SlurmAgent for AgentService {
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
-                    let running = self.running.clone();
+                    let aborted_rootfs = rootfs_guard.disarm();
                     tokio::spawn(async move {
                         reap_killed_job(result.job).await;
-                        // Spool/cgroup are attempt-scoped; rootfs is job_id-keyed,
-                        // so skip it if a live run for job_id reappeared.
                         crate::executor::cleanup_job_spool(job_id, run_attempt);
-                        if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                        if let Some(ref rootfs) = aborted_rootfs {
+                            crate::container::cleanup_rootfs(rootfs);
                         }
                         if let Some(ref cg) = cgroup {
                             crate::executor::cleanup_cgroup(cg);
@@ -1893,7 +1928,7 @@ impl SlurmAgent for AgentService {
                     job_id,
                     TrackedJob {
                         job: result.job,
-                        rootfs_mode: rootfs_mode.clone(),
+                        rootfs: rootfs_guard.disarm(),
                         stdout_path: result.stdout_path,
                         stderr_path: result.stderr_path,
                         has_pid_namespace: is_root || is_container,
@@ -1921,7 +1956,17 @@ impl SlurmAgent for AgentService {
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                        tokio::spawn(reap_killed_job(old.job));
+                        let old_rootfs = old.rootfs;
+                        let old_attempt = old.run_attempt;
+                        tokio::spawn(async move {
+                            reap_killed_job(old.job).await;
+                            // Attempt-keyed, so this is the displaced run's own
+                            // rootfs and spool, not the one just launched.
+                            crate::executor::cleanup_job_spool(job_id, old_attempt);
+                            if let Some(ref rootfs) = old_rootfs {
+                                crate::container::cleanup_rootfs(rootfs);
+                            }
+                        });
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
@@ -2219,7 +2264,7 @@ impl SlurmAgent for AgentService {
             req.job_id,
             TrackedJob {
                 job: executor::RunningJob::AllocationOnly,
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 has_pid_namespace: false,
@@ -3553,7 +3598,7 @@ impl TrackedJob {
                 child,
                 cgroup_path: None,
             },
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -3579,7 +3624,7 @@ impl TrackedJob {
     fn dummy_allocation_only() -> Self {
         Self {
             job: executor::RunningJob::AllocationOnly,
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             stdout_path: String::new(),
             stderr_path: String::new(),
             has_pid_namespace: false,
@@ -5540,7 +5585,7 @@ mod tests {
                 partition: "default".into(),
                 nodelist: "test-node".into(),
                 mpi: String::new(),
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 exit_status_path: None,
                 pending: executor::PendingObligations::default(),
                 exit: None,
@@ -5617,7 +5662,7 @@ mod tests {
                 partition: "default".into(),
                 nodelist: "test-node".into(),
                 mpi: String::new(),
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 exit_status_path: None,
                 pending: executor::PendingObligations::default(),
                 exit: None,
@@ -5708,7 +5753,7 @@ mod tests {
                 partition: "default".into(),
                 nodelist: "test-node".into(),
                 mpi: String::new(),
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 exit_status_path: None,
                 pending: executor::PendingObligations::default(),
                 exit: None,
@@ -5807,7 +5852,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "test-node".into(),
             mpi: String::new(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             exit_status_path: None,
             pending: executor::PendingObligations::default(),
             exit: Some((3, 0)),
@@ -5909,7 +5954,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "test-node".into(),
             mpi: String::new(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             exit_status_path: None,
             pending: executor::PendingObligations::default(),
             exit: None,
@@ -6060,7 +6105,7 @@ mod tests {
                 child,
                 cgroup_path: None,
             },
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -6120,7 +6165,7 @@ mod tests {
                     child,
                     cgroup_path: None,
                 },
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
                 has_pid_namespace: false,
@@ -6388,5 +6433,43 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    fn owned_rootfs_at(base: &std::path::Path) -> crate::container::JobRootfs {
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+        crate::container::JobRootfs {
+            base_dir: base.to_path_buf(),
+            mode: crate::container::RootfsMode::Extracted,
+        }
+    }
+
+    /// A launch that fails after creating the rootfs must not leak it — the dir
+    /// is attempt-keyed, so no later attempt reuses or reclaims it.
+    #[test]
+    fn launch_rootfs_guard_tears_down_an_uncommitted_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("job_1_0");
+
+        drop(LaunchRootfsGuard::new(Some(owned_rootfs_at(&base))));
+
+        assert!(!base.exists(), "uncommitted rootfs should be removed");
+    }
+
+    #[test]
+    fn launch_rootfs_guard_leaves_a_committed_rootfs_to_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("job_1_0");
+        let mut guard = LaunchRootfsGuard::new(Some(owned_rootfs_at(&base)));
+
+        let handed_over = guard.disarm();
+        drop(guard);
+
+        assert_eq!(handed_over.map(|r| r.base_dir), Some(base.clone()));
+        assert!(base.exists(), "committed rootfs is the job's to keep");
+    }
+
+    #[test]
+    fn launch_rootfs_guard_is_inert_for_non_container_jobs() {
+        drop(LaunchRootfsGuard::new(None));
     }
 }
