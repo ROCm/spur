@@ -78,15 +78,17 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
 /// The accounting service is served behind the same auth layer as the controller, so a verified
 /// [`Identity`](spur_core::auth::Identity) rides in the request extensions when one was
 /// authenticated. These handlers mutate account/user/QOS records — `add_user` even sets
-/// `admin_level`, the self-promotion vector — so they are admin-only. Deny-by-default: a caller with
-/// no verified admin identity (`disabled`, or `permissive` with no credential) is refused. The
-/// ruling itself is [`Identity::require_admin`](spur_core::auth::Identity::require_admin), the same
-/// gate the controller uses; read-only handlers (`list_*`, `get_*`) stay open.
+/// `admin_level`, the self-promotion vector — so an *identified* non-admin is refused. A caller with
+/// no verified identity is allowed, matching the controller's `require_admin` and the auth model:
+/// `disabled`, or `permissive` with no credential, trusts the client, so refusing anonymous here
+/// would break no-auth deployments; in `required` mode every caller is authenticated and bound. The
+/// ruling itself is [`Identity::require_admin`](spur_core::auth::Identity::require_admin);
+/// read-only handlers (`list_*`, `get_*`) stay open.
 fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
     let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
     match request.extensions().get::<spur_core::auth::Identity>() {
         Some(id) => id.require_admin().map_err(|_| denied()),
-        None => Err(denied()),
+        None => Ok(()),
     }
 }
 
@@ -922,9 +924,11 @@ mod tests {
         }
     }
 
-    /// The account/user/QOS mutations are admin-only. A verified admin passes; a verified non-admin
-    /// and (deny-by-default) an unauthenticated caller are both rejected — this closes the
-    /// self-promotion path where `add_user(admin_level = Admin)` had no authorization.
+    /// The account/user/QOS mutations are admin-only for an identified caller: a verified admin
+    /// passes, a verified non-admin is rejected — this closes the self-promotion path where
+    /// `add_user(admin_level = Admin)` had no authorization. An unauthenticated caller is allowed,
+    /// matching the auth model: `disabled`/`permissive`-with-no-credential trust the client, so the
+    /// gate binds real users only in `required` mode.
     #[test]
     fn require_admin_gates_accounting_mutations() {
         let mut admin = Request::new(AddUserRequest::default());
@@ -938,10 +942,10 @@ mod tests {
         let err = require_admin(&non_admin, "add user").expect_err("non-admin must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-        // No verified identity at all (disabled, or permissive with no credential) is denied.
+        // No verified identity (disabled, or permissive with no credential) is allowed — the gate
+        // enforces once callers are identified, not in the non-enforcing modes.
         let anon = Request::new(AddUserRequest::default());
-        let err = require_admin(&anon, "add user").expect_err("anonymous caller must be rejected");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(require_admin(&anon, "add user").is_ok());
     }
 
     #[test]

@@ -491,15 +491,17 @@ impl ControllerService {
     /// Reject a control-plane mutation unless the request carries a verified administrator identity.
     ///
     /// These RPCs define cluster tenancy — partition membership, node placement, admission tokens,
-    /// reservations. Deny-by-default: a caller with no verified identity (`disabled`, or
-    /// `permissive` with no credential) is not an admin and is refused, so the partition/node-pool
-    /// boundary cannot be redrawn from an ordinary or anonymous credential. Admin is the same ruling
-    /// the rest of the control plane uses (`caller_is_admin`): the token's `admin` claim or an
-    /// accounting `Admin` level. Call it as a prologue, before `into_inner`, so the identity the auth
-    /// layer verified is what decides — never a client-asserted field.
+    /// reservations. An *identified* non-admin is refused, so the partition/node-pool boundary cannot
+    /// be redrawn from an ordinary credential. A caller with no verified identity is allowed, keeping
+    /// the pre-auth behaviour: `disabled`, or `permissive` with no credential, trusts the client, and
+    /// refusing anonymous admin ops there would break no-auth deployments and outage-free adoption —
+    /// this is the same `caller_is_privileged` ruling the priority ceiling uses. In `required` mode
+    /// every caller is authenticated, so the gate binds every real user. Admin is the same ruling the
+    /// rest of the control plane uses (`caller_is_admin`): the token's `admin` claim or an accounting
+    /// `Admin` level. Call it as a prologue, before `into_inner`, so the verified identity decides.
     #[allow(clippy::result_large_err)]
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
-        if self.caller_is_admin(Self::verified_identity(request)) {
+        if self.caller_is_privileged(Self::verified_identity(request)) {
             Ok(())
         } else {
             Err(Status::permission_denied(format!(
@@ -6853,13 +6855,13 @@ mod tests {
     // --- control-plane mutation authorization ---
     //
     // Every RPC that defines cluster tenancy (partitions, node placement/labels, admission tokens,
-    // reservations) must require a verified administrator. Deny-by-default is the contract: a
-    // verified non-admin AND an anonymous caller (no identity — `disabled`, or `permissive` with no
-    // credential) are both refused. Enumerated as a table so the next handler added cannot quietly
-    // reopen the boundary without a failing test.
+    // reservations) must reject an identified non-admin. An anonymous caller (no identity —
+    // `disabled`, or `permissive` with no credential) passes the gate, matching the auth model's
+    // non-enforcing modes; the gate binds real users in `required` mode. Enumerated as a table so the
+    // next handler added cannot quietly reopen the boundary to an identified non-admin.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn control_plane_mutations_deny_non_admin_and_anonymous() {
+    async fn control_plane_mutations_deny_identified_non_admin() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
 
@@ -6878,16 +6880,16 @@ mod tests {
                     concat!(stringify!($method), " (non-admin) must be PermissionDenied")
                 );
 
-                // Deny-by-default: no verified identity at all is also rejected.
-                let err = svc.$method(Request::new($req)).await.expect_err(concat!(
-                    stringify!($method),
-                    " must reject an anonymous caller"
-                ));
-                assert_eq!(
-                    err.code(),
-                    Code::PermissionDenied,
-                    concat!(stringify!($method), " (anonymous) must be PermissionDenied")
-                );
+                // No verified identity (disabled, or permissive with no credential) passes the gate,
+                // keeping the non-enforcing modes working; the call then proceeds and may fail for
+                // unrelated reasons, but must never be rejected as PermissionDenied by the gate.
+                if let Err(e) = svc.$method(Request::new($req)).await {
+                    assert_ne!(
+                        e.code(),
+                        Code::PermissionDenied,
+                        concat!(stringify!($method), " (anonymous) must not be gate-rejected")
+                    );
+                }
             }};
         }
 
