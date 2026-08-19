@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
+use spur_core::job::JobId;
+
 /// Apply the database schema, serialized across controllers by a fixed advisory
 /// lock: migrate now also rewrites data (default-account dedup) and builds a
 /// unique index, so concurrent runs against a shared database must not overlap.
@@ -178,6 +180,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
     ON users (name) WHERE default_account IS NOT NULL;
 "#;
 
+/// What accounting persists when a job starts. Named fields rather than positional
+/// arguments because several share a type, so a transposed pair would compile
+/// silently and mis-attribute the job.
+pub struct JobStartRecord {
+    pub job_id: JobId,
+    pub name: String,
+    pub user: String,
+    pub account: String,
+    pub partition: String,
+    pub qos: String,
+    pub num_nodes: u32,
+    pub num_tasks: u32,
+    pub cpus_per_task: u32,
+    pub memory_mb: u64,
+    pub submit_time: DateTime<Utc>,
+    pub start_time: DateTime<Utc>,
+    pub reservation: Option<String>,
+}
+
 /// Record a job start in the database.
 ///
 /// Takes a `&mut PgConnection` (not a hard `&PgPool`) so callers can either
@@ -185,32 +206,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
 /// one borrowed from an open `Transaction` (`Transaction` derefs to
 /// `PgConnection`) to run this alongside other writes atomically, as
 /// reconciliation's backfill-then-finalize does.
-#[allow(clippy::too_many_arguments)]
-pub async fn record_job_start(
-    conn: &mut PgConnection,
-    job_id: i32,
-    name: &str,
-    user: &str,
-    account: &str,
-    partition: &str,
-    num_nodes: i32,
-    num_tasks: i32,
-    cpus_per_task: i32,
-    memory_mb: i64,
-    submit_time: DateTime<Utc>,
-    start_time: DateTime<Utc>,
-    reservation: &str,
-) -> anyhow::Result<()> {
+pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> anyhow::Result<()> {
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'RUNNING', $12)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
             account = EXCLUDED.account,
             partition_name = EXCLUDED.partition_name,
+            qos = EXCLUDED.qos,
             num_nodes = EXCLUDED.num_nodes,
             num_tasks = EXCLUDED.num_tasks,
             cpus_per_task = EXCLUDED.cpus_per_task,
@@ -224,18 +231,19 @@ pub async fn record_job_start(
             end_time = NULL
         "#,
     )
-    .bind(job_id)
-    .bind(name)
-    .bind(user)
-    .bind(account)
-    .bind(partition)
-    .bind(num_nodes)
-    .bind(num_tasks)
-    .bind(cpus_per_task)
-    .bind(memory_mb)
-    .bind(submit_time)
-    .bind(start_time)
-    .bind(reservation)
+    .bind(rec.job_id as i32)
+    .bind(&rec.name)
+    .bind(&rec.user)
+    .bind(&rec.account)
+    .bind(&rec.partition)
+    .bind(&rec.qos)
+    .bind(rec.num_nodes as i32)
+    .bind(rec.num_tasks as i32)
+    .bind(rec.cpus_per_task as i32)
+    .bind(rec.memory_mb as i64)
+    .bind(rec.submit_time)
+    .bind(rec.start_time)
+    .bind(rec.reservation.as_deref().unwrap_or_default())
     .execute(&mut *conn)
     .await?;
 
@@ -244,7 +252,7 @@ pub async fn record_job_start(
     let row = sqlx::query(
         "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
     )
-    .bind(job_id)
+    .bind(rec.job_id as i32)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -515,6 +523,53 @@ pub async fn get_usage(
         .collect();
 
     Ok(records)
+}
+
+/// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
+/// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
+/// that started before the window contributes only the part inside it.
+///
+/// Each row is clamped at zero inside the `SUM`, not after it: start/end times can
+/// be written by callers outside the controller and can skew, and a single
+/// end-before-start row would otherwise cancel real consumption in the same QOS
+/// and under-report the budget.
+pub async fn consumed_wall_minutes_by_qos(
+    pool: &PgPool,
+    window_days: u32,
+) -> anyhow::Result<HashMap<String, u64>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT qos,
+               SUM(GREATEST(
+                 EXTRACT(EPOCH FROM (
+                   LEAST(COALESCE(end_time, now()), now())
+                   - GREATEST(start_time, now() - make_interval(days => $1))
+                 )),
+                 0
+               ))::BIGINT as wall_seconds
+        FROM jobs
+        WHERE qos <> ''
+          AND start_time IS NOT NULL
+          AND (end_time IS NULL OR end_time > now() - make_interval(days => $1))
+        GROUP BY qos
+        "#,
+    )
+    .bind(window_days as i32)
+    .fetch_all(pool)
+    .await?;
+
+    let consumed = rows
+        .iter()
+        .map(|row| {
+            let seconds = row
+                .get::<Option<i64>, _>("wall_seconds")
+                .unwrap_or(0)
+                .max(0);
+            (row.get::<String, _>("qos"), seconds as u64 / 60)
+        })
+        .collect();
+
+    Ok(consumed)
 }
 
 #[derive(Debug)]
@@ -1221,14 +1276,14 @@ mod job_history_tests {
         start_time: DateTime<Utc>,
         reservation: &str,
     ) -> anyhow::Result<()> {
-        let mut conn = pool.acquire().await?;
-        record_job_start(
-            &mut conn,
+        start_with_qos(
+            pool,
             job_id,
             name,
             user,
             account,
             partition,
+            "",
             num_nodes,
             num_tasks,
             cpus_per_task,
@@ -1236,6 +1291,45 @@ mod job_history_tests {
             submit_time,
             start_time,
             reservation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_qos(
+        pool: &PgPool,
+        job_id: i32,
+        name: &str,
+        user: &str,
+        account: &str,
+        partition: &str,
+        qos: &str,
+        num_nodes: i32,
+        num_tasks: i32,
+        cpus_per_task: i32,
+        memory_mb: i64,
+        submit_time: DateTime<Utc>,
+        start_time: DateTime<Utc>,
+        reservation: &str,
+    ) -> anyhow::Result<()> {
+        let mut conn = pool.acquire().await?;
+        record_job_start(
+            &mut conn,
+            &JobStartRecord {
+                job_id: job_id as JobId,
+                name: name.to_string(),
+                user: user.to_string(),
+                account: account.to_string(),
+                partition: partition.to_string(),
+                qos: qos.to_string(),
+                num_nodes: num_nodes as u32,
+                num_tasks: num_tasks as u32,
+                cpus_per_task: cpus_per_task as u32,
+                memory_mb: memory_mb as u64,
+                submit_time,
+                start_time,
+                reservation: Some(reservation.to_string()),
+            },
         )
         .await
     }
@@ -1441,6 +1535,193 @@ mod job_history_tests {
         );
 
         delete_jobs(&pool, &[id]).await?;
+        Ok(())
+    }
+
+    /// GrpWall attributes consumption by the QOS recorded on each job, so a start
+    /// that fails to persist it leaves every budget reading zero and the limit
+    /// silently unenforced. Exercise the write and the aggregate together.
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn consumed_wall_minutes_attributes_a_job_to_the_qos_it_ran_under() -> anyhow::Result<()>
+    {
+        let pool = test_pool().await?;
+        let inside = test_job_id(4);
+        let running = test_job_id(5);
+        let expired = test_job_id(6);
+        let clipped = test_job_id(7);
+        let unqualified = test_job_id(8);
+        let ids = [inside, running, expired, clipped, unqualified];
+        delete_jobs(&pool, &ids).await.ok();
+
+        let qos = format!("spur_gw_{}", std::process::id());
+        let other = format!("{qos}_other");
+        let clip = format!("{qos}_clip");
+        let now = Utc::now();
+
+        // Finished 30 minutes ago, ran 20 minutes: fully inside the window.
+        start_with_qos(
+            &pool,
+            inside,
+            "inside",
+            "root",
+            "",
+            "",
+            &qos,
+            1,
+            1,
+            1,
+            0,
+            now - Duration::minutes(60),
+            now - Duration::minutes(50),
+            "",
+        )
+        .await?;
+        end(
+            &pool,
+            inside,
+            "COMPLETED",
+            0,
+            now - Duration::minutes(30),
+            0,
+            0,
+        )
+        .await?;
+
+        // Still running: contributes the 10 minutes accrued so far. Seeded half a
+        // minute past 10 so the truncating division cannot tip to 9 or 11 if the
+        // test body takes a moment to reach the aggregate.
+        start_with_qos(
+            &pool,
+            running,
+            "running",
+            "root",
+            "",
+            "",
+            &qos,
+            1,
+            1,
+            1,
+            0,
+            now - Duration::minutes(15),
+            now - Duration::seconds(630),
+            "",
+        )
+        .await?;
+
+        // Ran a year ago under a different QOS: outside the window entirely.
+        start_with_qos(
+            &pool,
+            expired,
+            "expired",
+            "root",
+            "",
+            "",
+            &other,
+            1,
+            1,
+            1,
+            0,
+            now - Duration::days(365),
+            now - Duration::days(365),
+            "",
+        )
+        .await?;
+        end(
+            &pool,
+            expired,
+            "COMPLETED",
+            0,
+            now - Duration::days(365) + Duration::minutes(90),
+            0,
+            0,
+        )
+        .await?;
+
+        // Started 20 days ago and ended 2 days ago: with a 14-day window only the
+        // last 12 days count. This is the only case that exercises the lower clamp
+        // on `start_time`; without it, the whole 18-day run would be charged.
+        start_with_qos(
+            &pool,
+            clipped,
+            "clipped",
+            "root",
+            "",
+            "",
+            &clip,
+            1,
+            1,
+            1,
+            0,
+            now - Duration::days(20),
+            now - Duration::days(20),
+            "",
+        )
+        .await?;
+        end(
+            &pool,
+            clipped,
+            "COMPLETED",
+            0,
+            now - Duration::days(2),
+            0,
+            0,
+        )
+        .await?;
+
+        // No QOS: the `qos <> ''` filter is the only thing keeping every un-QOS'd
+        // job in the cluster out of one shared bucket, so assert it is applied.
+        start_with_qos(
+            &pool,
+            unqualified,
+            "unqualified",
+            "root",
+            "",
+            "",
+            "",
+            1,
+            1,
+            1,
+            0,
+            now - Duration::minutes(90),
+            now - Duration::minutes(90),
+            "",
+        )
+        .await?;
+        end(
+            &pool,
+            unqualified,
+            "COMPLETED",
+            0,
+            now - Duration::minutes(30),
+            0,
+            0,
+        )
+        .await?;
+
+        let consumed = consumed_wall_minutes_by_qos(&pool, 14).await?;
+        assert_eq!(
+            consumed.get(&qos).copied(),
+            Some(30),
+            "20 finished + 10 accrued minutes must be attributed to the job's QOS"
+        );
+        assert_eq!(
+            consumed.get(&other),
+            None,
+            "a job older than the window must not contribute"
+        );
+        assert_eq!(
+            consumed.get(&clip).copied(),
+            Some(12 * 24 * 60),
+            "a job that began before the window must contribute only the part inside it"
+        );
+        assert_eq!(
+            consumed.get(""),
+            None,
+            "jobs with no QOS must not collect in a shared bucket"
+        );
+
+        delete_jobs(&pool, &ids).await?;
         Ok(())
     }
 

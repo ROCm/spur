@@ -203,18 +203,21 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
     let start_time = job.start_time.unwrap_or(job.submit_time);
     db::record_job_start(
         conn,
-        job.job_id as i32,
-        &spec.name,
-        &spec.user,
-        spec.account.as_deref().unwrap_or_default(),
-        spec.partition.as_deref().unwrap_or_default(),
-        spec.num_nodes as i32,
-        spec.num_tasks as i32,
-        spec.cpus_per_task as i32,
-        memory_mb as i64,
-        job.submit_time,
-        start_time,
-        spec.reservation.as_deref().unwrap_or_default(),
+        &db::JobStartRecord {
+            job_id: job.job_id,
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            account: spec.account.clone().unwrap_or_default(),
+            partition: spec.partition.clone().unwrap_or_default(),
+            qos: spec.qos.clone().unwrap_or_default(),
+            num_nodes: spec.num_nodes,
+            num_tasks: spec.num_tasks,
+            cpus_per_task: spec.cpus_per_task,
+            memory_mb,
+            submit_time: job.submit_time,
+            start_time,
+            reservation: spec.reservation.clone(),
+        },
     )
     .await
 }
@@ -565,18 +568,21 @@ mod tests {
             let mut conn = pool.acquire().await?;
             db::record_job_start(
                 &mut conn,
-                job_id as i32,
-                &job.spec.name,
-                &job.spec.user,
-                "",
-                "",
-                job.spec.num_nodes as i32,
-                job.spec.num_tasks as i32,
-                job.spec.cpus_per_task as i32,
-                0,
-                job.submit_time,
-                job.start_time.unwrap(),
-                "",
+                &db::JobStartRecord {
+                    job_id,
+                    name: job.spec.name.clone(),
+                    user: job.spec.user.clone(),
+                    account: String::new(),
+                    partition: String::new(),
+                    qos: String::new(),
+                    num_nodes: job.spec.num_nodes,
+                    num_tasks: job.spec.num_tasks,
+                    cpus_per_task: job.spec.cpus_per_task,
+                    memory_mb: 0,
+                    submit_time: job.submit_time,
+                    start_time: job.start_time.unwrap(),
+                    reservation: None,
+                },
             )
             .await?;
             db::record_job_end(

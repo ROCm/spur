@@ -413,6 +413,15 @@ impl WalOperation {
 mod job_state_change_wal_tests {
     use super::*;
 
+    /// A reason's variant name is its wire form in the Raft log, and a controller
+    /// on an older binary cannot read a name it does not know. Freeze the newest
+    /// one so a rename has to be a deliberate, versioned decision.
+    #[test]
+    fn grp_wall_reason_has_a_frozen_wire_name() {
+        let json = serde_json::to_string(&PendingReason::QosGrpWallLimit).unwrap();
+        assert_eq!(json, "\"QosGrpWallLimit\"");
+    }
+
     #[test]
     fn job_state_change_held_pending_round_trips() {
         let op = WalOperation::job_state_change_held_pending(

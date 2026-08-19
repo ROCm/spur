@@ -295,6 +295,16 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Restart
      - How often (seconds) to refresh fairshare and QOS caches from the database.
        The interval is baked into the refresh loops when they are spawned.
+   * - ``grp_wall_window_days``
+     - integer
+     - ``14``
+     - Restart
+     - Trailing window over which a QOS's wall-clock consumption is measured for
+       the ``grpwall`` limit. Must be between ``1`` and ``3650``; a zero window
+       would measure nothing and silently stop every ``grpwall`` budget applying,
+       so it is rejected at startup. Independent of
+       ``scheduler.fairshare_halflife_days``: that fades usage for priority
+       scoring, this is a hard budget cutoff.
    * - ``default_qos``
      - string
      - ``""``

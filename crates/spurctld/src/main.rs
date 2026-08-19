@@ -234,6 +234,12 @@ async fn main() -> anyhow::Result<()> {
                         config.accounting.fairshare_refresh_secs as u64,
                     );
 
+                    cluster.grp_wall_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.accounting.fairshare_refresh_secs as u64,
+                        config.accounting.grp_wall_window_days,
+                    );
+
                     Some(accounting::AccountingService::available(pool))
                 }
             }
