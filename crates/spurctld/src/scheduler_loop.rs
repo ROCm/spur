@@ -678,7 +678,12 @@ pub(crate) async fn try_preempt(
                 mode = ?mode,
                 "preempting lower-priority job"
             );
-            match cluster.preempt_job(candidate.job_id, mode) {
+            let preempt_qos = if sched.preempt_type == PreemptType::QosPriority {
+                Some(pending_qos.name.clone())
+            } else {
+                None
+            };
+            match cluster.preempt_job(candidate.job_id, mode, pending.job_id, preempt_qos) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;

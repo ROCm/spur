@@ -67,7 +67,7 @@ pub struct SacctArgs {
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
 const SACCT_LONG_FORMAT: &str =
-    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l";
+    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
 
 pub fn sacct_header(spec: char) -> &'static str {
@@ -91,6 +91,9 @@ pub fn sacct_header(spec: char) -> &'static str {
         'C' => "NCPUS",
         'R' => "ReqMem",
         'Q' => "QOS",
+        'y' => "PreemptedBy",
+        'm' => "PreemptMode",
+        'q' => "PreemptQOS",
         _ => "?",
     }
 }
@@ -115,6 +118,9 @@ fn sacct_field_spec(name: &str) -> Option<char> {
         "ncpus" => Some('C'),
         "reqmem" => Some('R'),
         "qos" => Some('Q'),
+        "preemptedby" => Some('y'),
+        "preemptmode" => Some('m'),
+        "preemptqos" => Some('q'),
         _ => None,
     }
 }
@@ -216,6 +222,27 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'n' => job.nodelist.clone(),
         'C' => (job.num_tasks * job.cpus_per_task.max(1)).to_string(),
         'Q' => job.qos.clone(),
+        'y' => {
+            if job.preempted_by == 0 {
+                "N/A".into()
+            } else {
+                job.preempted_by.to_string()
+            }
+        }
+        'm' => {
+            if job.preempt_mode.is_empty() {
+                "N/A".into()
+            } else {
+                job.preempt_mode.clone()
+            }
+        }
+        'q' => {
+            if job.preempt_qos.is_empty() {
+                "N/A".into()
+            } else {
+                job.preempt_qos.clone()
+            }
+        }
         _ => "?".into(),
     }
 }
@@ -233,6 +260,7 @@ fn parse_acct_state(s: &str) -> Option<i32> {
         "CA" | "CANCELLED" => Some(5),
         "TO" | "TIMEOUT" => Some(6),
         "NF" | "NODE_FAIL" => Some(7),
+        "PR" | "PREEMPTED" => Some(8),
         "DL" | "DEADLINE" => Some(10),
         "R" | "RUNNING" => Some(1),
         "PD" | "PENDING" => Some(0),
@@ -377,6 +405,7 @@ mod tests {
             ("CANCELLED", JobState::JobCancelled),
             ("TIMEOUT", JobState::JobTimeout),
             ("NODE_FAIL", JobState::JobNodeFail),
+            ("PREEMPTED", JobState::JobPreempted),
             ("DEADLINE", JobState::JobDeadline),
         ];
         for (s, expected) in cases {

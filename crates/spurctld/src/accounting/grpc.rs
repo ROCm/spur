@@ -185,6 +185,9 @@ impl SlurmAccounting for AccountingService {
             end_time,
             req.exit_signal,
             req.derived_exit_code,
+            None,
+            "",
+            "",
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -214,6 +217,7 @@ impl SlurmAccounting for AccountingService {
                 4 => Some("FAILED".into()),
                 5 => Some("CANCELLED".into()),
                 6 => Some("TIMEOUT".into()),
+                8 => Some("PREEMPTED".into()),
                 10 => Some("DEADLINE".into()),
                 _ => None,
             })
@@ -256,6 +260,7 @@ impl SlurmAccounting for AccountingService {
                     "FAILED" => JobState::JobFailed as i32,
                     "CANCELLED" => JobState::JobCancelled as i32,
                     "TIMEOUT" => JobState::JobTimeout as i32,
+                    "PREEMPTED" => JobState::JobPreempted as i32,
                     "DEADLINE" => JobState::JobDeadline as i32,
                     "RUNNING" => JobState::JobRunning as i32,
                     "PENDING" => JobState::JobPending as i32,
@@ -295,6 +300,9 @@ impl SlurmAccounting for AccountingService {
                 srun_step_dispatch: false,
                 req_gpus: 0,
                 req_gpus_detail: String::new(),
+                preempted_by: r.preempted_by.unwrap_or(0) as u32,
+                preempt_mode: r.preempt_mode.clone(),
+                preempt_qos: r.preempt_qos.clone(),
             })
             .collect();
 

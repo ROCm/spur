@@ -3663,6 +3663,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         srun_step_dispatch: job.srun_step_dispatch,
         req_gpus: spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32,
         req_gpus_detail: requested_gpus_detail(&job.spec),
+        preempted_by: job.preempted_by.unwrap_or(0),
+        preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
+        preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
     }
 }
 

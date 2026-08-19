@@ -126,6 +126,13 @@ pub enum WalOperation {
     JobPreemptRequeue {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+        /// Job that triggered this preemption. Absent in WAL entries written by
+        /// older controllers; defaults to `None` on replay.
+        #[serde(default)]
+        preempted_by: Option<JobId>,
+        /// QOS of the preempting job (`None` for plain priority-based preemption).
+        #[serde(default)]
+        preempt_qos: Option<String>,
     },
     /// Preempt a running job with cancel. The job transitions Running →
     /// Preempted → Cancelled: Preempted is reported to accounting so the
@@ -134,6 +141,13 @@ pub enum WalOperation {
     /// change cannot strand the job running with its allocations held.
     JobPreemptCancel {
         job_id: JobId,
+        /// Job that triggered this preemption. Absent in WAL entries written by
+        /// older controllers; defaults to `None` on replay.
+        #[serde(default)]
+        preempted_by: Option<JobId>,
+        /// QOS of the preempting job (`None` for plain priority-based preemption).
+        #[serde(default)]
+        preempt_qos: Option<String>,
     },
     /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
     /// Pending with the same spec in one atomic step. A running/suspended job is
@@ -152,6 +166,13 @@ pub enum WalOperation {
         job_id: JobId,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
         at: chrono::DateTime<chrono::Utc>,
+        /// Preemption provenance — set when suspension is triggered by preemption,
+        /// absent (None) for admin-initiated suspends. Defaults to None on replay
+        /// so old WAL entries remain backward compatible.
+        #[serde(default)]
+        preempted_by: Option<JobId>,
+        #[serde(default)]
+        preempt_qos: Option<String>,
     },
     JobResume {
         job_id: JobId,
@@ -1001,11 +1022,39 @@ mod suspend_wal_tests {
 
     #[test]
     fn preempt_cancel_op_round_trips() {
-        let op = WalOperation::JobPreemptCancel { job_id: 7 };
+        let op = WalOperation::JobPreemptCancel {
+            job_id: 7,
+            preempted_by: Some(3),
+            preempt_qos: Some("burst".into()),
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobPreemptCancel { job_id } => assert_eq!(job_id, 7),
+            WalOperation::JobPreemptCancel {
+                job_id,
+                preempted_by,
+                preempt_qos,
+            } => {
+                assert_eq!(job_id, 7);
+                assert_eq!(preempted_by, Some(3));
+                assert_eq!(preempt_qos.as_deref(), Some("burst"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Deserializing a legacy entry (no provenance fields) must succeed with None defaults.
+        let legacy = r#"{"JobPreemptCancel":{"job_id":7}}"#;
+        let back: WalOperation = serde_json::from_str(legacy).unwrap();
+        match back {
+            WalOperation::JobPreemptCancel {
+                job_id,
+                preempted_by,
+                preempt_qos,
+            } => {
+                assert_eq!(job_id, 7);
+                assert_eq!(preempted_by, None, "legacy entry defaults to None");
+                assert_eq!(preempt_qos, None, "legacy entry defaults to None");
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -1016,6 +1065,8 @@ mod suspend_wal_tests {
         let op = WalOperation::JobPreemptRequeue {
             job_id: 42,
             begin_time,
+            preempted_by: Some(7),
+            preempt_qos: Some("highprio".into()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1023,9 +1074,28 @@ mod suspend_wal_tests {
             WalOperation::JobPreemptRequeue {
                 job_id,
                 begin_time: b,
+                preempted_by,
+                preempt_qos,
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
+                assert_eq!(preempted_by, Some(7));
+                assert_eq!(preempt_qos.as_deref(), Some("highprio"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Deserializing a legacy entry (no provenance fields) must succeed with None defaults.
+        let legacy = r#"{"JobPreemptRequeue":{"job_id":42,"begin_time":"2026-01-01T00:00:00Z"}}"#;
+        let back: WalOperation = serde_json::from_str(legacy).unwrap();
+        match back {
+            WalOperation::JobPreemptRequeue {
+                preempted_by,
+                preempt_qos,
+                ..
+            } => {
+                assert_eq!(preempted_by, None, "legacy entry defaults to None");
+                assert_eq!(preempt_qos, None, "legacy entry defaults to None");
             }
             _ => panic!("wrong variant"),
         }
@@ -1081,7 +1151,12 @@ mod suspend_wal_tests {
     fn suspend_resume_ops_round_trip() {
         let at = chrono::Utc::now();
         for op in [
-            WalOperation::JobSuspend { job_id: 7, at },
+            WalOperation::JobSuspend {
+                job_id: 7,
+                at,
+                preempted_by: None,
+                preempt_qos: None,
+            },
             WalOperation::JobResume { job_id: 7, at },
         ] {
             let json = serde_json::to_string(&op).unwrap();
@@ -1091,10 +1166,12 @@ mod suspend_wal_tests {
                     WalOperation::JobSuspend {
                         job_id: a,
                         at: at_a,
+                        ..
                     },
                     WalOperation::JobSuspend {
                         job_id: b,
                         at: at_b,
+                        ..
                     },
                 ) => {
                     assert_eq!(a, b);

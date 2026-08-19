@@ -156,6 +156,9 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
 
 -- users.default_account is the single source of truth for a user's default
 -- account (the scheduler reads it via the association cache). associations
@@ -267,18 +270,25 @@ pub async fn record_job_end(
     end_time: DateTime<Utc>,
     exit_signal: i32,
     derived_exit_code: i32,
+    preempted_by: Option<i32>,
+    preempt_mode: &str,
+    preempt_qos: &str,
 ) -> anyhow::Result<()> {
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code)
-        VALUES ($1, '', $2, $3, $4, $5, $6)
+        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
+                          preempted_by, preempt_mode, preempt_qos)
+        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
             end_time = $4,
             exit_signal = $5,
-            derived_exit_code = $6
+            derived_exit_code = $6,
+            preempted_by = $7,
+            preempt_mode = $8,
+            preempt_qos = $9
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task
         "#,
     )
@@ -288,6 +298,9 @@ pub async fn record_job_end(
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
+    .bind(preempted_by)
+    .bind(preempt_mode)
+    .bind(preempt_qos)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -403,6 +416,9 @@ pub struct JobRecord {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub reservation: String,
+    pub preempted_by: Option<i32>,
+    pub preempt_mode: String,
+    pub preempt_qos: String,
 }
 
 /// Query job history.
@@ -418,7 +434,8 @@ pub async fn get_job_history(
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
-         submit_time, start_time, end_time, reservation \
+         submit_time, start_time, end_time, reservation, \
+         preempted_by, preempt_mode, preempt_qos \
          FROM jobs WHERE 1=1",
     );
 
@@ -468,6 +485,9 @@ pub async fn get_job_history(
             start_time: row.get("start_time"),
             end_time: row.get("end_time"),
             reservation: row.get("reservation"),
+            preempted_by: row.get("preempted_by"),
+            preempt_mode: row.get("preempt_mode"),
+            preempt_qos: row.get("preempt_qos"),
         })
         .collect();
 
@@ -1258,6 +1278,9 @@ mod job_history_tests {
             end_time,
             exit_signal,
             derived_exit_code,
+            None,
+            "",
+            "",
         )
         .await
     }

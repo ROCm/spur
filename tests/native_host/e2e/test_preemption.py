@@ -86,6 +86,12 @@ class TestChronicPreemption:
                 assert "Reason=JobHoldMaxRequeue" not in show, (
                     f"low-priority job held after preemption cycle {i}:\n{show}"
                 )
+                assert f"PreemptedBy={hi_id}" in show, (
+                    f"PreemptedBy not set on preempted job at cycle {i}:\n{show}"
+                )
+                assert "PreemptMode=Requeue" in show, (
+                    f"PreemptMode not set on preempted job at cycle {i}:\n{show}"
+                )
 
                 state = wait_job(cluster, hi_id, timeout=30)
                 assert state == "CD", f"high job {hi_id} did not complete: {state}"
