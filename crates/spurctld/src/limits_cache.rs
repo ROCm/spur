@@ -106,10 +106,7 @@ impl Default for QosCache {
 }
 
 fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
-    // A stored NULL (None) is "no limit"; a literal 0 is a real value (block
-    // all). A stray negative predates the sentinel flip or was edited
-    // out-of-band, so treat it as unset rather than a huge cap.
-    let opt_u32 = |v: Option<i32>| v.filter(|&x| x >= 0).map(|x| x as u32);
+    use spur_core::accounting::limit_from_db;
     // Values are validated by `create_qos` before being stored, so a parse
     // failure here means the DB row predates that check or was edited
     // out-of-band; treat it as unset rather than poisoning the whole refresh.
@@ -134,15 +131,15 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             .map(str::to_string)
             .collect(),
         limits: QosLimits {
-            max_jobs_per_user: opt_u32(r.max_jobs_per_user),
-            max_submit_jobs_per_user: opt_u32(r.max_submit_per_user),
-            max_submit_jobs_per_account: opt_u32(r.max_submit_per_account),
-            grp_submit_jobs: opt_u32(r.grp_submit_jobs),
+            max_jobs_per_user: limit_from_db(r.max_jobs_per_user),
+            max_submit_jobs_per_user: limit_from_db(r.max_submit_per_user),
+            max_submit_jobs_per_account: limit_from_db(r.max_submit_per_account),
+            grp_submit_jobs: limit_from_db(r.grp_submit_jobs),
             max_tres_per_job: opt_tres(r.max_tres_per_job),
             max_tres_per_user: opt_tres(r.max_tres_per_user),
             grp_tres: opt_tres(r.grp_tres),
-            max_wall_minutes: opt_u32(r.max_wall_min),
-            grp_wall_minutes: opt_u32(r.grp_wall_min),
+            max_wall_minutes: limit_from_db(r.max_wall_min),
+            grp_wall_minutes: limit_from_db(r.grp_wall_min),
             preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
         },
         usage_factor: r.usage_factor,
@@ -151,6 +148,9 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
 }
 
 /// Parse the QOS `flags` column (comma-separated) for the `DenyOnLimit` flag.
+/// Unknown flags are ignored on read (writes reject them via
+/// `canonicalize_qos_flags`); this tolerates rows imported from Slurm dumps that
+/// carry flags Spur does not model yet.
 fn parse_deny_on_limit(flags: &str) -> bool {
     flags
         .split(',')

@@ -22,8 +22,13 @@ pub enum AccountCheckResult {
     Blocked(PendingReason),
 }
 
-/// Whether the job's requested wall time exceeds `max_wall` minutes.
+/// Whether the job's requested wall time exceeds `max_wall` minutes. A cap of 0
+/// is "block all" per the limit convention, so it breaches even a job with no
+/// explicit time limit.
 fn wall_breach(job: &Job, max_wall: u32) -> bool {
+    if max_wall == 0 {
+        return true;
+    }
     job.spec
         .time_limit
         .is_some_and(|w| w.num_minutes() > max_wall as i64)
@@ -245,6 +250,31 @@ mod tests {
             result,
             AccountCheckResult::Blocked(PendingReason::AssocMaxWallDurationPerJobLimit)
         );
+    }
+
+    #[test]
+    fn max_wall_zero_blocks_time_less_job() {
+        let limits = AccountLimits {
+            max_wall_minutes: Some(0), // 0 = block all
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.time_limit = None;
+        assert_eq!(
+            check_account_wall_limit(&job, &limits),
+            Some(PendingReason::AssocMaxWallDurationPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn positive_max_wall_leaves_time_less_job_alone() {
+        let limits = AccountLimits {
+            max_wall_minutes: Some(60),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.time_limit = None;
+        assert_eq!(check_account_wall_limit(&job, &limits), None);
     }
 
     #[test]

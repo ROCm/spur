@@ -53,13 +53,23 @@ Limit values
 Numeric limits (job counts, wall time) share one convention throughout this
 page:
 
-- **Unset / omitted** — no limit. This is the default for any limit you do not
-  name.
+- **Unset / omitted** — on ``add``, any limit you do not name defaults to no
+  limit. On ``modify``, an omitted field is left unchanged (partial patch); only
+  the fields you name are written. To lift an existing cap on ``modify``, set it
+  to ``-1`` explicitly rather than omitting it.
 - ``-1`` — clears a limit back to "no limit". Use it on ``modify`` to lift a cap.
 - ``0`` — a literal value meaning **block all**: a ``maxsubmitjobs=0`` rejects
-  every submission for that association. ``0`` does **not** mean "no limit".
+  every submission for that association (likewise ``grpsubmitjobs=0`` for the
+  whole account). ``maxwall=0`` likewise blocks every job, including one that
+  requests no wall time. ``0`` does **not** mean "no limit"; use ``-1`` to lift
+  it.
 
 ``show`` renders an unset limit as a blank cell and a literal ``0`` as ``0``.
+
+Limit changes are not instant: the controller reads accounting and QOS limits
+from a cache that refreshes every ``fairshare_refresh_secs`` (default 300s,
+floored at 10s), so a ``sacctmgr modify`` can take up to one refresh interval
+to affect new submissions.
 
 Enabling accounting
 -------------------
@@ -458,17 +468,34 @@ How limits are enforced at submit
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Spur checks limits at submit time, matching Slurm's ``acct_policy_validate``.
-Two families behave differently:
+Three families behave differently:
 
 - **Submit-count limits** (``maxsubmitjobs``, ``grpsubmit``,
   ``maxsubmitjobsperuser``, ``maxsubmitjobsperaccount``) and the association
   ``maxwall`` always **reject** the submission when breached. A rejected job is
-  never queued.
-- **Standalone resource limits** (per-job TRES and QOS wall) reject at submit
-  only when the governing QOS carries the ``DenyOnLimit`` flag; otherwise the
-  job is accepted and **pends** until it fits. A job that resolves to **no QOS**
-  is treated as ``DenyOnLimit`` on, so a request that can never fit is rejected
-  rather than pending forever.
+  never queued. These count pending **and** running jobs.
+- **Standalone resource limits** (per-job TRES on both the QOS **and** the
+  association, plus QOS wall) reject at submit only when the governing QOS
+  carries the ``DenyOnLimit`` flag; otherwise the job is accepted and **pends**
+  until it fits. This matches Slurm, where ``DenyOnLimit`` applies to QOS and
+  association limits alike, so a permissive QOS (``DenyOnLimit`` off) pends an
+  association TRES breach instead of rejecting it. A job that resolves to **no
+  QOS** is treated as ``DenyOnLimit`` on, so a request that can never fit is
+  rejected rather than pending forever.
+- **Running-count limits** (``maxjobs``, ``maxjobsperuser``) never reject at
+  submit. They count only **running** jobs, so the submit is always accepted and
+  the job **pends** once the running cap is reached.
+
+When the submit gate rejects a job, the denial carries the canonical Slurm
+reason code alongside a human-readable sentence. The codes the gate can emit
+are: ``AssocMaxSubmitJobLimit``, ``AssocGrpSubmitJobsLimit``,
+``AssocMaxWallDurationPerJobLimit``, ``QOSMaxSubmitJobPerUserLimit``,
+``MaxSubmitJobsPerAccount``, ``QOSGrpSubmitJobsLimit``,
+``QOSMaxWallDurationPerJobLimit``, and the QOS per-job TRES codes
+(e.g. ``QOSMaxCpuPerJobLimit``, ``QOSMaxNodePerJobLimit``, ``QOSMaxMemoryPerJob``,
+``QOSMaxGRESPerJob``). Running-count reasons (``AssocMaxJobsLimit``,
+``QOSMaxJobsPerUserLimit``) never appear at submit; they surface as pending
+reasons instead.
 
 Set ``DenyOnLimit`` through the QOS ``flags`` key:
 
@@ -578,9 +605,11 @@ Limits resolve in two layers:
   ``grptres``, ``maxwall``) and the association's QOS allow-list together gate
   whether a submit is accepted.
 - **QOS limits.** The limits on the job's resolved QOS layer on top of the
-  association limits. Where a QOS limit is defined, it takes precedence over the
-  association's corresponding limit — matching Slurm's rule that QOS limits
-  override association limits.
+  association limits. Both sets are enforced: the submit gate checks the
+  association's submit-count and per-job wall limits first, then the QOS limits,
+  and rejects on the first breach it finds. A job must satisfy both the
+  association and the QOS to be accepted, so a denial may carry an ``Assoc*``
+  reason even when a QOS limit also applies.
 
 Associations are managed via ``add user`` and inspected via ``sacctmgr show
 user`` (see `Managing users`_).

@@ -647,9 +647,11 @@ impl ClusterManager {
         // limit-lowered-after-submit edge case. Each array task counts
         // individually toward submit caps; the whole submission is rejected.
         let incoming_tasks = match spec.array_spec.as_deref() {
-            Some(s) => spur_core::array::parse_array_spec(s)
-                .map(|a| a.task_ids.len() as u32)
-                .unwrap_or(1),
+            Some(s) => {
+                let parsed = spur_core::array::parse_array_spec(s)
+                    .map_err(|e| SubmitError::invalid(e.to_string()))?;
+                u32::try_from(parsed.task_ids.len()).unwrap_or(u32::MAX)
+            }
             None => 1,
         };
         self.enforce_submit_limits(&spec, incoming_tasks)?;
@@ -4486,18 +4488,25 @@ impl ClusterManager {
         if assoc_loaded {
             if let Some(account) = account {
                 let limits = self.association_cache.limits(user, account);
-                let user_submitted = jobs
-                    .values()
-                    .filter(|j| {
-                        is_submitted(j)
-                            && j.spec.user == user
-                            && j.spec.account.as_deref() == Some(account)
-                    })
-                    .count() as u32;
-                let account_submitted = jobs
-                    .values()
-                    .filter(|j| is_submitted(j) && j.spec.account.as_deref() == Some(account))
-                    .count() as u32;
+                // Only scan the job table for a count a set limit actually needs.
+                let user_submitted = if limits.max_submit_jobs.is_some() {
+                    jobs.values()
+                        .filter(|j| {
+                            is_submitted(j)
+                                && j.spec.user == user
+                                && j.spec.account.as_deref() == Some(account)
+                        })
+                        .count() as u32
+                } else {
+                    0
+                };
+                let account_submitted = if limits.grp_submit_jobs.is_some() {
+                    jobs.values()
+                        .filter(|j| is_submitted(j) && j.spec.account.as_deref() == Some(account))
+                        .count() as u32
+                } else {
+                    0
+                };
                 if let Some(reason) = check_account_submit_limits(
                     &limits,
                     user_submitted,
@@ -4520,26 +4529,36 @@ impl ClusterManager {
             if let Some(qos_name) = qos_name {
                 if let Some(qos) = self.qos_cache.get(qos_name) {
                     deny_on_limit = qos.deny_on_limit;
-                    let user_submitted = jobs
-                        .values()
-                        .filter(|j| {
-                            is_submitted(j)
-                                && j.spec.user == user
-                                && j.spec.qos.as_deref() == Some(qos_name)
-                        })
-                        .count() as u32;
-                    let account_submitted = jobs
-                        .values()
-                        .filter(|j| {
-                            is_submitted(j)
-                                && j.spec.account.as_deref() == account
-                                && j.spec.qos.as_deref() == Some(qos_name)
-                        })
-                        .count() as u32;
-                    let qos_submitted = jobs
-                        .values()
-                        .filter(|j| is_submitted(j) && j.spec.qos.as_deref() == Some(qos_name))
-                        .count() as u32;
+                    // Only scan the job table for a count a set limit actually needs.
+                    let user_submitted = if qos.limits.max_submit_jobs_per_user.is_some() {
+                        jobs.values()
+                            .filter(|j| {
+                                is_submitted(j)
+                                    && j.spec.user == user
+                                    && j.spec.qos.as_deref() == Some(qos_name)
+                            })
+                            .count() as u32
+                    } else {
+                        0
+                    };
+                    let account_submitted = if qos.limits.max_submit_jobs_per_account.is_some() {
+                        jobs.values()
+                            .filter(|j| {
+                                is_submitted(j)
+                                    && j.spec.account.as_deref() == account
+                                    && j.spec.qos.as_deref() == Some(qos_name)
+                            })
+                            .count() as u32
+                    } else {
+                        0
+                    };
+                    let qos_submitted = if qos.limits.grp_submit_jobs.is_some() {
+                        jobs.values()
+                            .filter(|j| is_submitted(j) && j.spec.qos.as_deref() == Some(qos_name))
+                            .count() as u32
+                    } else {
+                        0
+                    };
                     if let Some(reason) = check_qos_submit_limits(
                         &qos,
                         user_submitted,

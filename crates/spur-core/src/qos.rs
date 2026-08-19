@@ -38,8 +38,13 @@ pub enum QosCheckResult {
     Blocked(PendingReason),
 }
 
-/// Whether the job's requested wall time exceeds `max_wall` minutes.
+/// Whether the job's requested wall time exceeds `max_wall` minutes. A cap of 0
+/// is "block all" per the limit convention, so it breaches even a job with no
+/// explicit time limit.
 fn wall_breach(job: &Job, max_wall: u32) -> bool {
+    if max_wall == 0 {
+        return true;
+    }
     job.spec
         .time_limit
         .is_some_and(|w| w.num_minutes() > max_wall as i64)
@@ -302,6 +307,25 @@ mod tests {
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit)
         );
+    }
+
+    #[test]
+    fn max_wall_zero_blocks_time_less_job() {
+        let qos = make_qos(None, Some(0)); // 0 = block all
+        let mut job = make_test_job();
+        job.spec.time_limit = None;
+        assert_eq!(
+            check_qos_standalone_limits(&job, &qos),
+            Some(PendingReason::QosMaxWallDurationPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn positive_max_wall_leaves_time_less_job_alone() {
+        let qos = make_qos(None, Some(60));
+        let mut job = make_test_job();
+        job.spec.time_limit = None;
+        assert_eq!(check_qos_standalone_limits(&job, &qos), None);
     }
 
     #[test]

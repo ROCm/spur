@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 
-use spur_core::accounting::TresRecord;
+use spur_core::accounting::{limit_to_wire, TresRecord};
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
@@ -40,16 +40,6 @@ fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>,
         Some(n) => Ok(Some(Some(i32::try_from(n).map_err(|_| {
             Status::invalid_argument(format!("{what} exceeds i32::MAX"))
         })?))),
-    }
-}
-
-/// Map a stored nullable limit to its proto `uint32`: NULL (and any stray
-/// negative) becomes the INFINITE sentinel so the CLI can tell "no limit" apart
-/// from a literal 0; a stored value is emitted as-is.
-fn limit_to_proto(v: Option<i32>) -> u32 {
-    match v {
-        Some(n) if n >= 0 => n as u32,
-        _ => spur_core::accounting::INFINITE,
     }
 }
 
@@ -419,7 +409,7 @@ impl SlurmAccounting for AccountingService {
                 organization: r.organization,
                 parent_account: r.parent.unwrap_or_default(),
                 fairshare_weight: r.fairshare_weight as f64,
-                max_running_jobs: limit_to_proto(r.max_running_jobs),
+                max_running_jobs: limit_to_wire(r.max_running_jobs),
                 grp_tres: r.grp_tres.unwrap_or_default(),
             })
             .collect();
@@ -555,10 +545,10 @@ impl SlurmAccounting for AccountingService {
                 default_account: r.default_account.unwrap_or_default(),
                 default_qos: r.default_qos.unwrap_or_default(),
                 allowed_qos: r.allowed_qos.unwrap_or_default(),
-                max_running_jobs: limit_to_proto(r.max_running_jobs),
-                max_submit_jobs: limit_to_proto(r.max_submit_jobs),
-                grp_submit_jobs: limit_to_proto(r.grp_submit_jobs),
-                max_wall_minutes: limit_to_proto(r.max_wall_min),
+                max_running_jobs: limit_to_wire(r.max_running_jobs),
+                max_submit_jobs: limit_to_wire(r.max_submit_jobs),
+                grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
+                max_wall_minutes: limit_to_wire(r.max_wall_min),
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
             })
@@ -668,16 +658,16 @@ impl SlurmAccounting for AccountingService {
                 preempt_mode: r.preempt_mode,
                 preempt: r.preempt,
                 usage_factor: r.usage_factor,
-                max_jobs_per_user: limit_to_proto(r.max_jobs_per_user),
-                max_wall_minutes: limit_to_proto(r.max_wall_min),
+                max_jobs_per_user: limit_to_wire(r.max_jobs_per_user),
+                max_wall_minutes: limit_to_wire(r.max_wall_min),
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
-                max_submit_jobs_per_user: limit_to_proto(r.max_submit_per_user),
+                max_submit_jobs_per_user: limit_to_wire(r.max_submit_per_user),
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
-                grp_wall_minutes: limit_to_proto(r.grp_wall_min),
+                grp_wall_minutes: limit_to_wire(r.grp_wall_min),
                 preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
-                max_submit_jobs_per_account: limit_to_proto(r.max_submit_per_account),
-                grp_submit_jobs: limit_to_proto(r.grp_submit_jobs),
+                max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
+                grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
                 flags: r.flags,
             })
             .collect();
@@ -879,5 +869,40 @@ mod tests {
                 .code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn nullable_limit_maps_sentinels() {
+        assert_eq!(nullable_limit(None, "x").unwrap(), None);
+        assert_eq!(
+            nullable_limit(Some(spur_core::accounting::INFINITE), "x").unwrap(),
+            Some(None)
+        );
+        // 0 is a real value ("block all"), not a clear.
+        assert_eq!(nullable_limit(Some(0), "x").unwrap(), Some(Some(0)));
+        assert_eq!(nullable_limit(Some(5), "x").unwrap(), Some(Some(5)));
+    }
+
+    #[test]
+    fn nullable_limit_rejects_over_i32_max() {
+        let err = nullable_limit(Some(i32::MAX as u32 + 1), "maxsubmit").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("maxsubmit"));
+    }
+
+    #[test]
+    fn canonicalize_qos_flags_normalizes_and_validates() {
+        assert_eq!(canonicalize_qos_flags("").unwrap(), "");
+        assert_eq!(
+            canonicalize_qos_flags("denyonlimit").unwrap(),
+            "DenyOnLimit"
+        );
+        assert_eq!(
+            canonicalize_qos_flags(" DENYONLIMIT , ").unwrap(),
+            "DenyOnLimit"
+        );
+        let err = canonicalize_qos_flags("bogus").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("bogus"));
     }
 }

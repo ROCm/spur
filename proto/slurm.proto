@@ -1266,9 +1266,11 @@ message ReportJobStatusRequest {
 // ============================================================
 
 // Add or modify an account (proto3 presence: unset = leave unchanged on modify,
-// set = write; `add` sets every field). Empty/0 clears parent_account, grp_tres,
-// and max_running_jobs to NULL; description, organization, and fairshare_weight
-// store their literal value (0 is a real weight, not a clear).
+// set = write; `add` sets every field). Empty string clears the text fields
+// parent_account and grp_tres to NULL. max_running_jobs follows the sentinel
+// rule on its field (INFINITE clears, a literal 0 is stored). description,
+// organization, and fairshare_weight store their literal value (0 is a real
+// weight, not a clear).
 message CreateAccountRequest {
   string name = 1;
   optional string description = 2;

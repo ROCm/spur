@@ -220,7 +220,12 @@ fn parse_wall_limit(key: &str, val: &str) -> Result<u32> {
     if val == "-1" {
         return Ok(spur_core::accounting::INFINITE);
     }
-    parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+    let minutes =
+        parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))?;
+    if minutes == spur_core::accounting::INFINITE {
+        bail!("invalid value for {key}=: '{val}'");
+    }
+    Ok(minutes)
 }
 
 /// Parse a floating-point field (e.g. `fairshare=`/`usagefactor=`), failing
@@ -1847,9 +1852,16 @@ mod tests {
         assert!(cols.contains(&"8"));
         assert!(cols.contains(&"1440"));
         assert!(cols.contains(&"cpu=64"));
-        // grp_submit_jobs is the INFINITE sentinel: rendered as a blank cell, so
-        // no stray value shows up between MaxSubmit and MaxWall.
-        assert!(row.contains("8"));
+        // grp_submit_jobs is the INFINITE sentinel: it must render as a blank
+        // cell. The header and row share the same fixed-width layout, so the
+        // GrpSubmit column occupies the same byte range in both; assert that
+        // slice of the row is all whitespace.
+        let start = header.find("GrpSubmit").expect("header has GrpSubmit");
+        let cell = &row[start..start + "GrpSubmit".len()];
+        assert!(
+            cell.trim().is_empty(),
+            "GrpSubmit cell should be blank, got {cell:?}"
+        );
     }
 
     #[test]

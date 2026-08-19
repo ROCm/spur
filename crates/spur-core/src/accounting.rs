@@ -15,6 +15,21 @@ use serde::{Deserialize, Serialize};
 /// sacctmgr `-1` keyword.
 pub const INFINITE: u32 = u32::MAX;
 
+/// Convert a stored nullable limit (`Option<i32>` from the DB) into the
+/// in-memory `Option<u32>`: SQL `NULL` (`None`) is "no limit", a literal `0`
+/// survives as `Some(0)` ("block all"), and a stray negative (predates the
+/// sentinel flip) is treated as unset.
+pub fn limit_from_db(v: Option<i32>) -> Option<u32> {
+    v.filter(|&x| x >= 0).map(|x| x as u32)
+}
+
+/// Convert a stored nullable limit into its proto `uint32`: NULL (and any
+/// stray negative) becomes the `INFINITE` sentinel so the CLI can tell "no
+/// limit" apart from a literal `0`; a stored value is emitted as-is.
+pub fn limit_to_wire(v: Option<i32>) -> u32 {
+    limit_from_db(v).unwrap_or(INFINITE)
+}
+
 /// Trackable RESource types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TresType {
@@ -266,6 +281,24 @@ mod tests {
     #[test]
     fn test_tres_parse_rejects_unknown_type() {
         assert!(TresRecord::parse("bogus=5").is_err());
+    }
+
+    #[test]
+    fn limit_from_db_maps_sentinels() {
+        assert_eq!(limit_from_db(None), None);
+        // A literal 0 is a real value ("block all"), not a clear.
+        assert_eq!(limit_from_db(Some(0)), Some(0));
+        assert_eq!(limit_from_db(Some(5)), Some(5));
+        // A stray negative predates the sentinel flip; treat as unset.
+        assert_eq!(limit_from_db(Some(-1)), None);
+    }
+
+    #[test]
+    fn limit_to_wire_maps_null_and_values() {
+        assert_eq!(limit_to_wire(None), INFINITE);
+        assert_eq!(limit_to_wire(Some(-1)), INFINITE);
+        assert_eq!(limit_to_wire(Some(0)), 0);
+        assert_eq!(limit_to_wire(Some(7)), 7);
     }
 
     #[test]

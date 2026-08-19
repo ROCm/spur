@@ -412,9 +412,6 @@ impl PendingReason {
     /// outside the submit gate fall back to a generic phrase.
     pub fn submit_denial_message(&self) -> &'static str {
         match self {
-            Self::AssocMaxJobsLimit => {
-                "your association has reached its maximum number of running jobs"
-            }
             Self::AssocMaxSubmitJobLimit => {
                 "you have reached the maximum submitted (pending + running) jobs for your association"
             }
@@ -423,9 +420,6 @@ impl PendingReason {
             }
             Self::AssocMaxWallDurationPerJobLimit => {
                 "the requested wall time exceeds your association's per-job limit"
-            }
-            Self::QoSMaxJobsPerUser => {
-                "you have reached the QOS limit on running jobs per user"
             }
             Self::QosMaxSubmitJobPerUserLimit => {
                 "you have reached the QOS limit on submitted jobs per user"
