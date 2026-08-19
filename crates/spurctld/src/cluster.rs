@@ -2593,6 +2593,45 @@ impl ClusterManager {
             None => None,
         };
 
+        // Re-validate placement, account and wall-time against the resulting spec
+        // before mutating, exactly as submit_job does. An owner editing a job's
+        // partition/account/time_limit must still satisfy the same partition ACLs,
+        // account associations and MaxTime limits — otherwise a post-submit rewrite
+        // would slip a job onto nodes or into an account the user is not entitled to
+        // (the QOS arm above already re-validates for the same reason). Reject before
+        // mutating so a failed edit leaves the job untouched.
+        {
+            let partitions = self.partitions.read().clone();
+            let config = self.config();
+            let candidate = {
+                let jobs = self.jobs.read();
+                let job = jobs
+                    .get(&job_id)
+                    .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+                let mut spec = job.spec.clone();
+                if let Some(tl) = time_limit {
+                    spec.time_limit = Some(tl);
+                }
+                if let Some(part) = partition.as_ref() {
+                    spec.partition = Some(part.clone());
+                }
+                if let Some(acct) = account.as_ref() {
+                    spec.account = Some(acct.clone());
+                }
+                if let Some(q) = qos.as_ref() {
+                    spec.qos = Some(q.clone());
+                }
+                spec
+            };
+            validate_user_account(&candidate, &self.association_cache)?;
+            self.validate_partition(&candidate, &partitions)?;
+            validate_partition_time_limit(
+                &candidate,
+                config.scheduler.enforce_part_limits,
+                &partitions,
+            )?;
+        }
+
         if let Some(p) = priority {
             let old = self
                 .jobs
