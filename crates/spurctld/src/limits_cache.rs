@@ -106,15 +106,24 @@ impl Default for QosCache {
 }
 
 /// Per-QOS wall-clock consumption for `GrpWall`, derived from job history in the
-/// accounting database. Reads return `None` until a first successful load, which
-/// is what leaves the limit unapplied when accounting is disabled or unreachable.
-///
-/// A failed refresh after that keeps the last figure rather than reverting to
-/// `None`: consumption over a multi-day window barely moves between refreshes, so
-/// a slightly stale figure is a far better basis than dropping the budget
-/// entirely and letting spend run unbounded through a database blip.
+/// accounting database. Reads return `None` until a first successful load, leaving
+/// the limit unapplied while accounting is unavailable. A later failed refresh
+/// keeps the last figure rather than reverting to `None`, so spend cannot run
+/// unbounded through a database blip.
 pub struct GrpWallCache {
-    snapshot: RwLock<Option<HashMap<String, u64>>>,
+    snapshot: RwLock<Option<Arc<HashMap<String, u64>>>>,
+}
+
+/// A scheduling pass's view of consumption, taken once so a pass over thousands of
+/// candidates does not re-acquire the cache lock per job. `None` means no figure has
+/// been read yet, which is what leaves budgets unapplied.
+pub type GrpWallUsage = Option<Arc<HashMap<String, u64>>>;
+
+/// Minutes consumed by `qos_name` within a pass's snapshot. A loaded snapshot
+/// reports zero for a QOS with no job history; an unloaded one reports `None`.
+pub fn consumed_minutes(usage: &GrpWallUsage, qos_name: &str) -> Option<u64> {
+    let consumed = usage.as_ref()?;
+    Some(consumed.get(qos_name).copied().unwrap_or(0))
 }
 
 impl GrpWallCache {
@@ -124,22 +133,22 @@ impl GrpWallCache {
         }
     }
 
-    /// Minutes consumed by `qos_name` in the window. A loaded cache reports zero
-    /// for a QOS with no job history; an unloaded one reports `None`.
-    pub fn consumed_minutes(&self, qos_name: &str) -> Option<u64> {
-        let snap = self.snapshot.read();
-        let consumed = snap.as_ref()?;
-        Some(consumed.get(qos_name).copied().unwrap_or(0))
+    /// Snapshot for one scheduling pass. Read [`consumed_minutes`] from it per job.
+    pub fn usage(&self) -> GrpWallUsage {
+        self.snapshot.read().clone()
     }
 
-    fn replace(&self, consumed: HashMap<String, u64>) {
-        *self.snapshot.write() = Some(consumed);
+    fn replace(&self, consumed: HashMap<String, u64>) -> bool {
+        let mut snap = self.snapshot.write();
+        let first = snap.is_none();
+        *snap = Some(Arc::new(consumed));
+        first
     }
 
     /// Test-only seam: populates consumption without a database.
     #[cfg(test)]
     pub(crate) fn seed(&self, consumed: HashMap<String, u64>) {
-        self.replace(consumed);
+        let _ = self.replace(consumed);
     }
 
     pub fn spawn_refresh_loop(
@@ -152,23 +161,38 @@ impl GrpWallCache {
         let interval = Duration::from_secs(refresh_interval_secs.max(10));
 
         tokio::spawn(async move {
-            loop {
-                match tokio::time::timeout(
-                    Duration::from_secs(10),
-                    crate::accounting::db::consumed_wall_minutes_by_qos(&pool, window_days),
-                )
-                .await
-                {
-                    Ok(Ok(consumed)) => cache.replace(consumed),
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "grpwall usage refresh failed, retaining stale data")
-                    }
-                    Err(_) => warn!("grpwall usage refresh timed out, retaining stale data"),
-                }
+            // Short first attempt, as `QosCache` does: a slow or failed startup
+            // read must not leave the budget unapplied for a whole interval.
+            Self::refresh_once(&cache, &pool, window_days, Duration::from_secs(5)).await;
 
+            loop {
                 tokio::time::sleep(interval).await;
+                Self::refresh_once(&cache, &pool, window_days, Duration::from_secs(10)).await;
             }
         });
+    }
+
+    async fn refresh_once(cache: &Arc<Self>, pool: &PgPool, window_days: u32, timeout: Duration) {
+        match tokio::time::timeout(
+            timeout,
+            crate::accounting::db::consumed_wall_minutes_by_qos(pool, window_days),
+        )
+        .await
+        {
+            Ok(Ok(consumed)) => {
+                let qos_count = consumed.len();
+                if cache.replace(consumed) {
+                    // Until this line appears, no GrpWall budget is being applied.
+                    // Operators need a positive signal for that, not just silence.
+                    info!(
+                        qos_count,
+                        window_days, "grpwall usage cache initialized, budgets now enforced"
+                    );
+                }
+            }
+            Ok(Err(e)) => warn!(error = %e, "grpwall usage refresh failed, retaining last figure"),
+            Err(_) => warn!("grpwall usage refresh timed out, retaining last figure"),
+        }
     }
 }
 
