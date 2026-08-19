@@ -398,6 +398,12 @@ pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
 /// guardrail: retaining terminal jobs longer defeats the memory bound.
 pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 
+/// Upper bound for `grp_wall_window_days` (ten years). The window is bound into
+/// the consumption query as an `i32`, so anything that could wrap there must be
+/// rejected first: a negative interval moves the cutoff into the future and the
+/// query matches nothing, leaving every `GrpWall` budget unenforced.
+pub const MAX_GRP_WALL_WINDOW_DAYS: u32 = 3650;
+
 fn default_listen_addr() -> String {
     "[::]:6817".into()
 }
@@ -1403,6 +1409,21 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Zero collapses the consumption window, so every QOS reads zero consumed
+        // and every GrpWall budget silently stops applying while `sacctmgr show
+        // qos` still displays the cap — the exact failure the limit exists to
+        // prevent, one layer up.
+        if self.accounting.grp_wall_window_days == 0
+            || self.accounting.grp_wall_window_days > MAX_GRP_WALL_WINDOW_DAYS
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "accounting.grp_wall_window_days".into(),
+                value: format!(
+                    "{} (must be between 1 and {})",
+                    self.accounting.grp_wall_window_days, MAX_GRP_WALL_WINDOW_DAYS
+                ),
+            });
+        }
         // A limit below the client's ping interval would reap a live client
         // between its own keepalives. Require at least two intervals of slack.
         let inactive = self.scheduler.inactive_limit_secs;
@@ -2081,6 +2102,38 @@ grp_wall_window_days = 30
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.accounting.grp_wall_window_days, 30);
         assert_eq!(config.scheduler.fairshare_halflife_days, 14);
+    }
+
+    /// A zero window makes the consumption query match nothing, so every budget
+    /// reads zero consumed and stops applying while `show qos` still displays the
+    /// cap. An out-of-range value wraps negative through the `i32` bind and lands
+    /// in the same place, so both are rejected at load.
+    #[test]
+    fn grp_wall_window_rejects_values_that_would_disable_enforcement() {
+        let with_window = |days: &str| {
+            format!(
+                r#"
+cluster_name = "x"
+
+[accounting]
+grp_wall_window_days = {days}
+"#
+            )
+        };
+
+        for bad in ["0", "3651", "4294967295"] {
+            let err = SlurmConfig::load_from_str(&with_window(bad))
+                .expect_err("a window that disables enforcement must not load");
+            assert!(
+                err.to_string().contains("accounting.grp_wall_window_days"),
+                "error must name the offending field, got: {err}"
+            );
+        }
+
+        for good in ["1", "3650"] {
+            SlurmConfig::load_from_str(&with_window(good))
+                .expect("a window inside the range must load");
+        }
     }
 
     #[test]
