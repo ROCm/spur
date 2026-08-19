@@ -497,8 +497,9 @@ impl ControllerService {
     /// refusing anonymous admin ops there would break no-auth deployments and outage-free adoption —
     /// this is the same `caller_is_privileged` ruling the priority ceiling uses. In `required` mode
     /// every caller is authenticated, so the gate binds every real user. Admin is the same ruling the
-    /// rest of the control plane uses (`caller_is_admin`): the token's `admin` claim or an accounting
-    /// `Admin` level. Call it as a prologue, before `into_inner`, so the verified identity decides.
+    /// rest of the control plane uses (`caller_is_admin`): the token's `admin` claim, an accounting
+    /// `Admin` level, or the `root` user (via `is_k0s_admin`). Call it as a prologue, before
+    /// `into_inner`, so the verified identity decides.
     #[allow(clippy::result_large_err)]
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
         if self.caller_is_privileged(Self::verified_identity(request)) {

@@ -79,11 +79,13 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
 /// [`Identity`](spur_core::auth::Identity) rides in the request extensions when one was
 /// authenticated. These handlers mutate account/user/QOS records — `add_user` even sets
 /// `admin_level`, the self-promotion vector — so an *identified* non-admin is refused. A caller with
-/// no verified identity is allowed, matching the controller's `require_admin` and the auth model:
-/// `disabled`, or `permissive` with no credential, trusts the client, so refusing anonymous here
-/// would break no-auth deployments; in `required` mode every caller is authenticated and bound. The
-/// ruling itself is [`Identity::require_admin`](spur_core::auth::Identity::require_admin);
-/// read-only handlers (`list_*`, `get_*`) stay open.
+/// no verified identity is allowed — like the controller's gate and the auth model, `disabled` or
+/// `permissive`-with-no-credential trusts the client, so refusing anonymous here would break no-auth
+/// deployments; in `required` mode every caller is authenticated and bound. The admin criterion is
+/// narrower than the controller's `caller_is_admin`: this uses only the token's `admin` claim
+/// ([`Identity::require_admin`](spur_core::auth::Identity::require_admin)), not the accounting `Admin`
+/// level, because the accounting service holds no association-cache handle. Read-only handlers
+/// (`list_*`, `get_*`) stay open.
 fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
     let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
     match request.extensions().get::<spur_core::auth::Identity>() {
