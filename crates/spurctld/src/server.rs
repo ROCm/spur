@@ -488,6 +488,26 @@ impl ControllerService {
             .map_err(reservation_rpc_status)
     }
 
+    /// Reject a control-plane mutation unless the request carries a verified administrator identity.
+    ///
+    /// These RPCs define cluster tenancy — partition membership, node placement, admission tokens,
+    /// reservations. Deny-by-default: a caller with no verified identity (`disabled`, or
+    /// `permissive` with no credential) is not an admin and is refused, so the partition/node-pool
+    /// boundary cannot be redrawn from an ordinary or anonymous credential. Admin is the same ruling
+    /// the rest of the control plane uses (`caller_is_admin`): the token's `admin` claim or an
+    /// accounting `Admin` level. Call it as a prologue, before `into_inner`, so the identity the auth
+    /// layer verified is what decides — never a client-asserted field.
+    #[allow(clippy::result_large_err)]
+    fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
+        if self.caller_is_admin(Self::verified_identity(request)) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "{op} requires cluster admin"
+            )))
+        }
+    }
+
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
     /// or a caller with no verified identity. The latter keeps the pre-auth behaviour — `disabled`,
     /// or `permissive` with no credential, trusts the client — so restricting it would break no-auth
@@ -1234,6 +1254,8 @@ impl SlurmController for ControllerService {
             }
         }
 
+        self.require_admin(&request, "update node")?;
+
         let req = request.into_inner();
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
@@ -1770,14 +1792,16 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    fwd.metadata_mut()
-                        .insert("x-forwarded", "true".parse().unwrap());
+                    // Preserve the caller's credential (and set the forwarded marker) so the leader
+                    // authorizes the ORIGINAL caller, not an anonymous forwarded request.
+                    let fwd = Self::forward_request(request);
                     return client.create_token(fwd).await;
                 }
                 Err(_) => return Err(status),
             }
         }
+
+        self.require_admin(&request, "create token")?;
 
         let req = request.into_inner();
         let ttl_secs = req.ttl_secs.filter(|&v| v > 0);
@@ -1795,9 +1819,12 @@ impl SlurmController for ControllerService {
 
     async fn list_tokens(
         &self,
-        _request: Request<ListTokensRequest>,
+        request: Request<ListTokensRequest>,
     ) -> Result<Response<ListTokensResponse>, Status> {
         use spur_proto::proto::TokenInfo;
+
+        // Admission tokens are cluster secrets; only an admin may enumerate them.
+        self.require_admin(&request, "list tokens")?;
 
         let tokens = self.cluster.list_tokens();
         let infos = tokens
@@ -1821,14 +1848,16 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    fwd.metadata_mut()
-                        .insert("x-forwarded", "true".parse().unwrap());
+                    // Preserve the caller's credential (and set the forwarded marker) so the leader
+                    // authorizes the ORIGINAL caller, not an anonymous forwarded request.
+                    let fwd = Self::forward_request(request);
                     return client.revoke_token(fwd).await;
                 }
                 Err(_) => return Err(status),
             }
         }
+
+        self.require_admin(&request, "revoke token")?;
 
         let req = request.into_inner();
         self.cluster
@@ -1997,6 +2026,8 @@ impl SlurmController for ControllerService {
             }
         }
 
+        self.require_admin(&request, "create partition")?;
+
         let req = request.into_inner();
 
         if req.nodes.is_empty() && req.selector.is_empty() {
@@ -2101,6 +2132,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "update partition")?;
 
         let req = request.into_inner();
 
@@ -2211,6 +2244,8 @@ impl SlurmController for ControllerService {
             }
         }
 
+        self.require_admin(&request, "delete partition")?;
+
         let name = request.into_inner().name;
         self.cluster
             .delete_partition(&name)
@@ -2233,6 +2268,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "reconfigure")?;
 
         self.cluster
             .reconfigure()
@@ -2258,6 +2295,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "create reservation")?;
 
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -2303,6 +2342,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "update reservation")?;
 
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -2362,6 +2403,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "delete reservation")?;
 
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -4334,6 +4377,14 @@ mod tests {
         if let Some(id) = id {
             req.extensions_mut().insert(id);
         }
+        req
+    }
+
+    /// Wrap a request body with a verified admin identity, as the auth layer would for an admin
+    /// token. Used to exercise the admin-gated control-plane mutation handlers.
+    fn admin_request<T>(inner: T) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.extensions_mut().insert(viewer("root", true));
         req
     }
 
@@ -6744,7 +6795,7 @@ mod tests {
         }
 
         for (name, node) in [("rocm_patch", "n1"), ("other_resv", "n2")] {
-            svc.create_reservation(Request::new(CreateReservationRequest {
+            svc.create_reservation(admin_request(CreateReservationRequest {
                 name: name.into(),
                 start_time: "now".into(),
                 duration_minutes: 60,
@@ -6797,6 +6848,131 @@ mod tests {
             .into_inner()
             .reservations;
         assert!(none.is_empty());
+    }
+
+    // --- control-plane mutation authorization ---
+    //
+    // Every RPC that defines cluster tenancy (partitions, node placement/labels, admission tokens,
+    // reservations) must require a verified administrator. Deny-by-default is the contract: a
+    // verified non-admin AND an anonymous caller (no identity — `disabled`, or `permissive` with no
+    // credential) are both refused. Enumerated as a table so the next handler added cannot quietly
+    // reopen the boundary without a failing test.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_mutations_deny_non_admin_and_anonymous() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        macro_rules! assert_admin_gated {
+            ($method:ident, $req:expr) => {{
+                // A verified but non-admin identity is rejected.
+                let mut r = Request::new($req);
+                r.extensions_mut().insert(viewer("mallory", false));
+                let err = svc.$method(r).await.expect_err(concat!(
+                    stringify!($method),
+                    " must reject a non-admin caller"
+                ));
+                assert_eq!(
+                    err.code(),
+                    Code::PermissionDenied,
+                    concat!(stringify!($method), " (non-admin) must be PermissionDenied")
+                );
+
+                // Deny-by-default: no verified identity at all is also rejected.
+                let err = svc.$method(Request::new($req)).await.expect_err(concat!(
+                    stringify!($method),
+                    " must reject an anonymous caller"
+                ));
+                assert_eq!(
+                    err.code(),
+                    Code::PermissionDenied,
+                    concat!(stringify!($method), " (anonymous) must be PermissionDenied")
+                );
+            }};
+        }
+
+        assert_admin_gated!(
+            create_partition,
+            CreatePartitionRequest {
+                name: "pwn".into(),
+                nodes: "ALL".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            update_partition,
+            UpdatePartitionRequest {
+                name: "tenant-b".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            delete_partition,
+            DeletePartitionRequest {
+                name: "tenant-b".into(),
+            }
+        );
+        assert_admin_gated!(
+            update_node,
+            UpdateNodeRequest {
+                name: "victim-node".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(reconfigure, ());
+        assert_admin_gated!(create_token, CreateTokenRequest::default());
+        assert_admin_gated!(list_tokens, ListTokensRequest::default());
+        assert_admin_gated!(
+            revoke_token,
+            RevokeTokenRequest {
+                token_id: "t".into(),
+            }
+        );
+        assert_admin_gated!(
+            create_reservation,
+            CreateReservationRequest {
+                name: "r".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            update_reservation,
+            UpdateReservationRequest {
+                name: "r".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            delete_reservation,
+            DeleteReservationRequest {
+                name: "r".into(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_mutation_allows_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6820).await;
+
+        // An admin identity passes the gate and the partition is actually created.
+        svc.create_partition(admin_request(CreatePartitionRequest {
+            name: "team-a".into(),
+            nodes: "node-a".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an admin caller may create a partition");
+
+        assert!(
+            svc.cluster
+                .get_partitions()
+                .iter()
+                .any(|p| p.name == "team-a"),
+            "the admin's partition must exist after the gated call succeeds"
+        );
     }
 
     // --- authoritative_user ---

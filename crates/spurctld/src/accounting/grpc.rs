@@ -73,6 +73,23 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
+/// Reject an accounting mutation unless the request carries a verified administrator.
+///
+/// The accounting service is served behind the same auth layer as the controller, so a verified
+/// [`Identity`](spur_core::auth::Identity) rides in the request extensions when one was
+/// authenticated. These handlers mutate account/user/QOS records — `add_user` even sets
+/// `admin_level`, the self-promotion vector — so they are admin-only. Deny-by-default: a caller with
+/// no verified admin identity (`disabled`, or `permissive` with no credential) is refused. The
+/// ruling itself is [`Identity::require_admin`](spur_core::auth::Identity::require_admin), the same
+/// gate the controller uses; read-only handlers (`list_*`, `get_*`) stay open.
+fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
+    let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
+    match request.extensions().get::<spur_core::auth::Identity>() {
+        Some(id) => id.require_admin().map_err(|_| denied()),
+        None => Err(denied()),
+    }
+}
+
 pub(crate) enum AccountingService {
     Available(PgPool),
     Unavailable { reason: &'static str },
@@ -369,6 +386,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        require_admin(&request, "create account")?;
         let req = request.into_inner();
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
@@ -392,6 +410,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        require_admin(&request, "delete account")?;
         let req = request.into_inner();
         db::delete_account(pool, &req.name)
             .await
@@ -426,6 +445,7 @@ impl SlurmAccounting for AccountingService {
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        require_admin(&request, "add user")?;
         let req = request.into_inner();
         // QOS references are validated against the live DB, not QosCache: a QOS
         // created just now may not have reached the cache's next refresh yet,
@@ -508,6 +528,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        require_admin(&request, "remove user")?;
         let req = request.into_inner();
         let deleted = db::remove_user(pool, &req.user, &req.account)
             .await
@@ -566,6 +587,7 @@ impl SlurmAccounting for AccountingService {
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        require_admin(&request, "create qos")?;
         let req = request.into_inner();
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
@@ -640,6 +662,7 @@ impl SlurmAccounting for AccountingService {
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        require_admin(&request, "delete qos")?;
         let req = request.into_inner();
         db::delete_qos(pool, &req.name)
             .await
@@ -888,6 +911,37 @@ mod tests {
             status.message(),
             "accounting service is not available (database migration failed at startup)"
         );
+    }
+
+    fn identity(user: &str, is_admin: bool) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: user.into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin,
+        }
+    }
+
+    /// The account/user/QOS mutations are admin-only. A verified admin passes; a verified non-admin
+    /// and (deny-by-default) an unauthenticated caller are both rejected — this closes the
+    /// self-promotion path where `add_user(admin_level = Admin)` had no authorization.
+    #[test]
+    fn require_admin_gates_accounting_mutations() {
+        let mut admin = Request::new(AddUserRequest::default());
+        admin.extensions_mut().insert(identity("root", true));
+        assert!(require_admin(&admin, "add user").is_ok());
+
+        let mut non_admin = Request::new(AddUserRequest::default());
+        non_admin
+            .extensions_mut()
+            .insert(identity("mallory", false));
+        let err = require_admin(&non_admin, "add user").expect_err("non-admin must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // No verified identity at all (disabled, or permissive with no credential) is denied.
+        let anon = Request::new(AddUserRequest::default());
+        let err = require_admin(&anon, "add user").expect_err("anonymous caller must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[test]
