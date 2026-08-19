@@ -129,7 +129,8 @@ work. Authentication mirrors the cluster ``[auth] mode``:
 
 - ``--auth-mode permissive`` (default) verifies a credential when one is presented and otherwise
   logs and allows — the migration default.
-- ``--auth-mode required`` rejects every uncredentialed call. It refuses to start without a key.
+- ``--auth-mode required`` rejects every call that carries no credential. It refuses to start
+  without a key.
 - ``--jwt-key`` / ``SPUR_JWT_KEY`` is the cluster ``[auth] jwt_key`` the operator verifies
   credentials against; source it from a Secret. In ``permissive`` mode with no key, a controller
   that *does* present a credential is rejected (there is no key to verify it), so set the key before
