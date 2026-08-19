@@ -956,8 +956,13 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "send keepalive for")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            req.user == "root",
+            &job.spec.user,
+            "send keepalive for",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Only interactive allocations are reaped, so only they need tracking.
         if !(job.spec.interactive || job.spec.srun_job) {
@@ -1063,14 +1068,19 @@ impl SlurmController for ControllerService {
         // Reject a caller who does not own the target job before any mutation —
         // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
         // update touches placement, account and time limit, so it must be gated the
-        // same way. An empty/root user (unauthenticated permissive/disabled) is
-        // treated as authorized by check_job_owner.
+        // same way. An empty/root caller (unauthenticated permissive/disabled, or
+        // the internal control plane) is treated as internal, as at the attach path.
         let job = self
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "modify")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            req.user.is_empty() || req.user == "root",
+            &job.spec.user,
+            "modify",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
@@ -1944,8 +1954,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "attach to")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            req.user.is_empty() || req.user == "root",
+            &job.spec.user,
+            "attach to",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -2463,8 +2478,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "exec into")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            req.user.is_empty() || req.user == "root",
+            &job.spec.user,
+            "exec into",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -2531,8 +2551,13 @@ impl SlurmController for ControllerService {
 
         // A step executes arbitrary commands on the job's allocated nodes, so the
         // caller must own the target job — same gate as create_job_step / exec_in_job.
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "run a step in")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            req.user.is_empty() || req.user == "root",
+            &job.spec.user,
+            "run a step in",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.allocated_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(

@@ -16,6 +16,11 @@
 //!
 //! The ruling itself is `spur_core::auth::authenticate_bearer`, shared with the controller so the
 //! two daemons cannot drift apart on a security decision.
+//!
+//! On success the verified [`spur_core::auth::Identity`] is inserted into the request extensions so
+//! handlers can gate on *who* the caller is — the controller's subject for controller-only RPCs, or
+//! the tracked job owner for user-facing ones. Only this layer inserts an `Identity`, so a handler
+//! that finds one knows it was verified here.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -92,7 +97,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
         let header = req
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -100,9 +105,13 @@ where
             .map(str::to_owned);
 
         match decide(&self.config, header.as_deref()) {
-            // The agent does not act *as* the caller — it runs what the controller allocated — so
-            // the identity is not carried into handlers; verifying the credential is the point.
-            BearerOutcome::Authenticated(_) => {}
+            // Carry the verified identity into the handlers so they can enforce caller scope: the
+            // controller's subject for controller-only RPCs, and the tracked job owner for
+            // user-facing ones. Verifying the credential is necessary but not sufficient — a valid
+            // *user* token must not be able to drive a controller-only RPC.
+            BearerOutcome::Authenticated(identity) => {
+                req.extensions_mut().insert(*identity);
+            }
             BearerOutcome::Anonymous => {
                 if self.config.mode == AuthMode::Permissive {
                     warn!(

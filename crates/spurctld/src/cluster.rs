@@ -1190,9 +1190,14 @@ impl ClusterManager {
     }
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
-    /// Delegates to [`spur_core::auth::check_job_owner`]; see there for the bypass rules.
+    ///
+    /// These are control-plane paths where `user` has already been bound to the verified identity
+    /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller and
+    /// a literal `"root"` is the admin override, so both are treated as internal here; the raw
+    /// [`spur_core::auth::check_job_owner`] no longer infers that itself.
     fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
-        spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
+        let is_internal = user.is_empty() || user == "root";
+        spur_core::auth::check_job_owner(user, is_internal, owner, action).map_err(Into::into)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or
