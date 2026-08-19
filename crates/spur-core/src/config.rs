@@ -490,6 +490,10 @@ pub struct AccountingConfig {
     /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
     #[serde(default)]
     pub require_qos: bool,
+    /// Delete `txn` audit-log rows older than this many days. `None` (default)
+    /// keeps them forever, matching Slurm's default-off purge behavior.
+    #[serde(default)]
+    pub txn_retention_days: Option<u32>,
 }
 
 fn default_fairshare_refresh_secs() -> u32 {
@@ -508,6 +512,7 @@ impl Default for AccountingConfig {
             grp_wall_window_days: default_grp_wall_window_days(),
             default_qos: String::new(),
             require_qos: false,
+            txn_retention_days: None,
         }
     }
 }

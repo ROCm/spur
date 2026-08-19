@@ -36,7 +36,9 @@ use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
-use crate::accounting::{AccountingNotifier, JobStartRecord};
+use crate::accounting::{
+    txn, AccountingNotifier, JobStartRecord, TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource,
+};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
@@ -3970,6 +3972,14 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Fire a best-effort audit write when accounting is configured; no-op
+    /// otherwise. Mirrors the job start/end notification path.
+    pub(crate) fn record_txn(&self, record: TxnRecord) {
+        if let Some(ref notifier) = *self.accounting.read() {
+            notifier.notify_txn(record);
+        }
+    }
+
     /// Remove reservations past their end time when no jobs still reference them.
     pub fn purge_expired_reservations(&self) {
         let now = Utc::now();
@@ -3990,9 +4000,35 @@ impl ClusterManager {
             if in_use {
                 continue;
             }
-            if let Err(e) = self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
-                warn!(name = %name, error = %e, "failed to purge expired reservation");
-            }
+            let error = match self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(name = %name, error = %e, "failed to purge expired reservation");
+                    Some(e.to_string())
+                }
+            };
+            // Audit both outcomes (like the RPC handlers) so a repeatedly-failing
+            // system purge leaves a trail, not just an ephemeral warn.
+            let outcome = if error.is_none() {
+                TxnOutcome::Success
+            } else {
+                TxnOutcome::Error
+            };
+            self.record_txn(TxnRecord {
+                ts: Utc::now(),
+                actor: "system".to_string(),
+                actor_uid: None,
+                verified: false,
+                source: TxnSource::System,
+                action: TxnAction::Delete,
+                entity_type: TxnEntity::Reservation,
+                entity_name: name.clone(),
+                outcome,
+                details: txn::finalize_details(
+                    txn::delete_details(Some("expired")),
+                    error.as_deref(),
+                ),
+            });
         }
     }
 

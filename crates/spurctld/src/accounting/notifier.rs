@@ -11,6 +11,7 @@ use tracing::error;
 use spur_core::job::{JobId, JobState};
 
 use super::db::JobStartRecord;
+use super::txn::{TxnOutcome, TxnRecord};
 
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
@@ -103,6 +104,35 @@ impl AccountingNotifier {
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job end in accounting after retries");
+            }
+        });
+    }
+
+    /// Best-effort async write of an audit record. Only committed (`Success`)
+    /// rows retry; `Denied`/`Error` rows use a single attempt so a flood of
+    /// (cheaply-triggered, possibly unauthenticated) failed attempts cannot pin
+    /// the connection pool against real accounting writes.
+    pub fn notify_txn(&self, record: TxnRecord) {
+        let pool = self.pool.clone();
+        let attempts = if record.outcome == TxnOutcome::Success {
+            RETRY_ATTEMPTS
+        } else {
+            1
+        };
+        tokio::spawn(async move {
+            let write = || async {
+                let mut conn = pool.acquire().await?;
+                super::db::record_txn(&mut conn, &record).await
+            };
+            if let Err(e) = retry_with_backoff(write, attempts, RETRY_BACKOFF).await {
+                error!(
+                    actor = %record.actor,
+                    action = record.action.as_str(),
+                    entity = %record.entity_name,
+                    attempts,
+                    error = %e,
+                    "failed to record txn in accounting"
+                );
             }
         });
     }

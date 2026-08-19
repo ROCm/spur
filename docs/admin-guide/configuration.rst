@@ -318,6 +318,13 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Live
      - Reject at submit any job that still has no QOS after the resolution chain.
        Mirrors Slurm's ``AccountingStorageEnforce=qos``.
+   * - ``txn_retention_days``
+     - integer
+     - unset
+     - Restart
+     - Delete admin audit-log (``txn``) rows older than this many days. Unset (the
+       default) keeps them forever, matching Slurm's default purge-off behavior.
+       See :doc:`accounting`.
 
 See :doc:`accounting` for how ``default_qos`` and ``require_qos`` interact with the
 per-job QOS resolution chain.
