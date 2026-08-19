@@ -225,6 +225,38 @@ pub(crate) fn provision_assignments(
         }
     }
 
+    // Adopt each node's REAL mesh address: a node on the mesh advertises its `spur0` IP as
+    // `Node.address`; when that address falls within `mesh_cidr` it IS the node's mesh IP, and is the
+    // single source of truth for it. Re-deriving from an independent pool is what silently corrupts the
+    // mesh when the control-plane set isn't an alphabetical prefix of join order. A node whose comm
+    // address is OUTSIDE `mesh_cidr` (e.g. a control plane advertising its routable underlay address)
+    // is simply not reporting a mesh address — it falls through to pool allocation, not an error.
+    // Reserve every adopted address up front so pooled nodes never collide, and fail loud only on a
+    // genuine conflict: two nodes claiming the same in-mesh address.
+    let mut real_ip: HashMap<String, Ipv4Addr> = HashMap::new();
+    let mut claimed: HashMap<Ipv4Addr, String> = HashMap::new();
+    for n in &nodes {
+        if n.k0s_role.is_some() {
+            continue; // already assigned; its persisted mesh IP is authoritative
+        }
+        let Some(addr) = real_mesh_address(n, &net.mesh_cidr)? else {
+            continue; // no in-mesh address reported — pool allocation handles it below
+        };
+        if let Some(other) = claimed.insert(addr, n.name.clone()) {
+            // Surface the conflict on BOTH sides so `spur k8s status` points at each node sharing the
+            // address, not just the second one seen.
+            let reason = format!(
+                "network mismatch: mesh address {addr} claimed by both {} and {other}",
+                n.name
+            );
+            record_node_k0s_error(cluster, &n.name, &reason);
+            record_node_k0s_error(cluster, &other, &reason);
+            anyhow::bail!("{reason}");
+        }
+        pool.mark_allocated(addr);
+        real_ip.insert(n.name.clone(), addr);
+    }
+
     // Pod-/24 ordinals already in use (so a new node never collides).
     let pod_base = cidr_base(&net.pod_cidr)?;
     let mut used_ordinals: HashSet<u32> = nodes
@@ -255,7 +287,13 @@ pub(crate) fn provision_assignments(
         } else {
             K0sRole::Worker
         };
-        let mesh_ip = if node.name == bootstrap {
+        // Prefer the node's real WireGuard address (adopt-from-host); the bootstrap is treated the
+        // same as any other node — `.1` results naturally when the operator gave the controller `.1`,
+        // and a divergent join order works instead of corrupting the mesh. Fall back to `.1` for a
+        // not-yet-meshed bootstrap, else the pool.
+        let mesh_ip = if let Some(addr) = real_ip.get(&node.name) {
+            *addr
+        } else if node.name == bootstrap {
             controller_ip
         } else {
             pool.allocate()?
@@ -417,6 +455,59 @@ fn order_bootstrap_first(set: &mut [String], pinned_bootstrap: Option<&str>) {
 /// The `.1` host of a CIDR (mesh controller IP).
 fn first_host(cidr: &str) -> anyhow::Result<Ipv4Addr> {
     Ok(Ipv4Addr::from(u32::from(cidr_base(cidr)?) + 1))
+}
+
+/// A node's real WireGuard mesh address: the `spur0` IP it advertises (`Node.address`) once it has
+/// joined the mesh (non-empty `wg_pubkey`), but only when that address falls within `mesh_cidr`.
+/// Returns Ok(None) for a node not on the mesh (no pubkey / unparseable address) OR one whose comm
+/// address is outside the mesh (e.g. a control plane advertising its routable underlay address) — in
+/// both cases the caller falls back to pool allocation. Errs only on a malformed `mesh_cidr`.
+fn real_mesh_address(
+    node: &spur_core::node::Node,
+    mesh_cidr: &str,
+) -> anyhow::Result<Option<Ipv4Addr>> {
+    if node
+        .wg_pubkey
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let Some(addr) = node
+        .address
+        .as_deref()
+        .and_then(|a| a.parse::<Ipv4Addr>().ok())
+    else {
+        return Ok(None);
+    };
+    if cidr_contains(mesh_cidr, addr)? {
+        Ok(Some(addr))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether `ip` falls within `cidr` (same network prefix).
+fn cidr_contains(cidr: &str, ip: Ipv4Addr) -> anyhow::Result<bool> {
+    let (base, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("{cidr} is not a CIDR"))?;
+    let base: Ipv4Addr = base
+        .parse()
+        .with_context(|| format!("CIDR base in {cidr}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .with_context(|| format!("CIDR prefix in {cidr}"))?;
+    if prefix > 32 {
+        anyhow::bail!("{cidr} prefix must be <= 32");
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !((1u32 << (32 - prefix)) - 1)
+    };
+    Ok(u32::from(base) & mask == u32::from(ip) & mask)
 }
 
 /// The base address of a CIDR string.
@@ -858,6 +949,15 @@ fn clear_node_error(cluster: &ClusterManager, node: &spur_core::node::Node) {
     }
     if let Err(e) = cluster.set_node_k0s_error(&node.name, None) {
         warn!(node = %node.name, error = %e, "failed to clear k0s node error");
+    }
+}
+
+/// Record a node's k0s error reason so it surfaces in `spur k8s status`. A failed WAL write is logged
+/// rather than dropped silently — otherwise the reason for a fail-loud abort would vanish on a Raft
+/// write error, leaving status with no explanation.
+fn record_node_k0s_error(cluster: &ClusterManager, node: &str, reason: &str) {
+    if let Err(e) = cluster.set_node_k0s_error(node, Some(reason.to_string())) {
+        warn!(node = %node, error = %e, "failed to record k0s node error");
     }
 }
 
