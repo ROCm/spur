@@ -180,11 +180,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
     ON users (name) WHERE default_account IS NOT NULL;
 "#;
 
-/// What accounting persists when a job starts.
-///
-/// Grouped into a struct rather than passed positionally: five of the fields are
-/// strings and four are counts, so a transposed pair would compile silently and
-/// mis-attribute the job.
+/// What accounting persists when a job starts. Named fields rather than positional
+/// arguments because several share a type, so a transposed pair would compile
+/// silently and mis-attribute the job.
 pub struct JobStartRecord {
     pub job_id: JobId,
     pub name: String,
@@ -530,6 +528,11 @@ pub async fn get_usage(
 /// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
 /// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
 /// that started before the window contributes only the part inside it.
+///
+/// Each row is clamped at zero inside the `SUM`, not after it: start/end times can
+/// be written by callers outside the controller and can skew, and a single
+/// end-before-start row would otherwise cancel real consumption in the same QOS
+/// and under-report the budget.
 pub async fn consumed_wall_minutes_by_qos(
     pool: &PgPool,
     window_days: u32,
@@ -537,16 +540,17 @@ pub async fn consumed_wall_minutes_by_qos(
     let rows = sqlx::query(
         r#"
         SELECT qos,
-               SUM(
+               SUM(GREATEST(
                  EXTRACT(EPOCH FROM (
                    LEAST(COALESCE(end_time, now()), now())
                    - GREATEST(start_time, now() - make_interval(days => $1))
-                 ))
-               )::BIGINT as wall_seconds
+                 )),
+                 0
+               ))::BIGINT as wall_seconds
         FROM jobs
         WHERE qos <> ''
           AND start_time IS NOT NULL
-          AND COALESCE(end_time, now()) > now() - make_interval(days => $1)
+          AND (end_time IS NULL OR end_time > now() - make_interval(days => $1))
         GROUP BY qos
         "#,
     )
@@ -1545,11 +1549,14 @@ mod job_history_tests {
         let inside = test_job_id(4);
         let running = test_job_id(5);
         let expired = test_job_id(6);
-        let ids = [inside, running, expired];
+        let clipped = test_job_id(7);
+        let unqualified = test_job_id(8);
+        let ids = [inside, running, expired, clipped, unqualified];
         delete_jobs(&pool, &ids).await.ok();
 
         let qos = format!("spur_gw_{}", std::process::id());
         let other = format!("{qos}_other");
+        let clip = format!("{qos}_clip");
         let now = Utc::now();
 
         // Finished 30 minutes ago, ran 20 minutes: fully inside the window.
@@ -1581,7 +1588,9 @@ mod job_history_tests {
         )
         .await?;
 
-        // Still running: contributes the 10 minutes accrued so far.
+        // Still running: contributes the 10 minutes accrued so far. Seeded half a
+        // minute past 10 so the truncating division cannot tip to 9 or 11 if the
+        // test body takes a moment to reach the aggregate.
         start_with_qos(
             &pool,
             running,
@@ -1595,7 +1604,7 @@ mod job_history_tests {
             1,
             0,
             now - Duration::minutes(15),
-            now - Duration::minutes(10),
+            now - Duration::seconds(630),
             "",
         )
         .await?;
@@ -1629,6 +1638,67 @@ mod job_history_tests {
         )
         .await?;
 
+        // Started 20 days ago and ended 2 days ago: with a 14-day window only the
+        // last 12 days count. This is the only case that exercises the lower clamp
+        // on `start_time`; without it, the whole 18-day run would be charged.
+        start_with_qos(
+            &pool,
+            clipped,
+            "clipped",
+            "root",
+            "",
+            "",
+            &clip,
+            1,
+            1,
+            1,
+            0,
+            now - Duration::days(20),
+            now - Duration::days(20),
+            "",
+        )
+        .await?;
+        end(
+            &pool,
+            clipped,
+            "COMPLETED",
+            0,
+            now - Duration::days(2),
+            0,
+            0,
+        )
+        .await?;
+
+        // No QOS: the `qos <> ''` filter is the only thing keeping every un-QOS'd
+        // job in the cluster out of one shared bucket, so assert it is applied.
+        start_with_qos(
+            &pool,
+            unqualified,
+            "unqualified",
+            "root",
+            "",
+            "",
+            "",
+            1,
+            1,
+            1,
+            0,
+            now - Duration::minutes(90),
+            now - Duration::minutes(90),
+            "",
+        )
+        .await?;
+        end(
+            &pool,
+            unqualified,
+            "COMPLETED",
+            0,
+            now - Duration::minutes(30),
+            0,
+            0,
+        )
+        .await?;
+
         let consumed = consumed_wall_minutes_by_qos(&pool, 14).await?;
         assert_eq!(
             consumed.get(&qos).copied(),
@@ -1639,6 +1709,16 @@ mod job_history_tests {
             consumed.get(&other),
             None,
             "a job older than the window must not contribute"
+        );
+        assert_eq!(
+            consumed.get(&clip).copied(),
+            Some(12 * 24 * 60),
+            "a job that began before the window must contribute only the part inside it"
+        );
+        assert_eq!(
+            consumed.get(""),
+            None,
+            "jobs with no QOS must not collect in a shared bucket"
         );
 
         delete_jobs(&pool, &ids).await?;
