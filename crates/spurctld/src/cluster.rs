@@ -39,7 +39,7 @@ use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 use crate::accounting::{AccountingNotifier, JobStartRecord};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
-use crate::limits_cache::{GrpWallCache, QosCache};
+use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
 use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
@@ -3156,6 +3156,7 @@ impl ClusterManager {
 
         {
             let mut reserved = PassReservations::default();
+            let grp_wall_usage = self.grp_wall_cache.usage();
             retain_eligible(&mut candidates, &mut blocked, |job| {
                 if let Some(reason) =
                     account_block_with(job, &self.association_cache, &jobs, &reserved)
@@ -3166,7 +3167,7 @@ impl ClusterManager {
                     .spec
                     .qos
                     .as_deref()
-                    .and_then(|name| self.grp_wall_cache.consumed_minutes(name));
+                    .and_then(|name| consumed_minutes(&grp_wall_usage, name));
                 if let Some(reason) = qos_block_with(
                     job,
                     &qos_by_job[&job.job_id],
@@ -11256,6 +11257,14 @@ mod tests {
             pending.contains(&job_id),
             "consumption below the budget must still schedule"
         );
+        // Differential: admitting alone would also hold with the limit deleted
+        // outright. The reason must be absent too, which pins the boundary as
+        // `>=` — 599 of 600 admits, and the sibling test above blocks at 600.
+        assert_ne!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::QosGrpWallLimit,
+            "a job inside its budget must not be tagged with the GrpWall reason"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11279,6 +11288,11 @@ mod tests {
         assert!(
             pending.contains(&job_id),
             "an unavailable usage figure must not block scheduling"
+        );
+        assert_ne!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::QosGrpWallLimit,
+            "an unknown figure must not be read as a breached budget"
         );
     }
 
