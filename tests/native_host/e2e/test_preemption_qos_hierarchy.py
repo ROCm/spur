@@ -294,12 +294,8 @@ class TestReconfigurePreservesExemptTime:
         c.scontrol("reconfigure")
         time.sleep(3)  # let the controller apply the reload
 
-        # The override must survive: it was set at runtime, not from TOML.
-        # In Spur, a live scontrol update writes a WAL entry; reconfigure
-        # sends its own WAL update from the TOML values. After this fix,
-        # the reconfigure WAL entry carries preempt_exempt_time=None (no change)
-        # for partitions whose TOML does not have the field set, so the
-        # runtime value is preserved.
+        # reconfigure must not clobber a runtime-set override when the TOML
+        # partition entry does not specify preempt_exempt_time.
         out_after = c.scontrol("show", "partition", "default")
         assert "PreemptExemptTime=120" in out_after, (
             f"preempt_exempt_time was wiped by reconfigure:\nbefore: {out}\nafter: {out_after}"

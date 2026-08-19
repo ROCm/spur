@@ -565,9 +565,9 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
        before it is eligible for preemption. Overrides ``scheduler.preempt_exempt_time``
        for jobs in this partition. Can be further overridden per-job by the QOS's
        ``preemptexempttime`` field. Can also be set at runtime without restart via
-       ``scontrol update-partition PartitionName=<name> PreemptExemptTime=<secs>``
-       or ``scontrol update-partition --name=<name> --preempt-exempt-time=<secs>``;
-       use ``--clear-preempt-exempt-time`` to revert to the global default.
+       ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
+       use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
+       to revert to the global default.
 
 ``[[nodes]]``
 -------------

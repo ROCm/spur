@@ -380,16 +380,16 @@ QOS keys
        preempt. Only enforced when ``scheduler.preempt_type = "qos_priority"``
        (see :doc:`configuration`). An empty value means this QOS may not preempt
        any other QOS under that mode. Example: ``preempt=low,batch`` allows jobs
-       in this QOS to preempt ``low`` and ``batch`` jobs. To clear the list at
-       runtime: ``sacctmgr modify qos name=<name> set clearpreemptexempttime``.
+       in this QOS to preempt ``low`` and ``batch`` jobs. To clear the list:
+       ``sacctmgr modify qos name=<name> set preempt=`` (empty value).
    * - ``preemptexempttime``
-     - ``0`` (inherit partition / global)
+     - unset (inherits partition / global)
      - Per-QOS override for the minimum seconds a job must have been running
        before it is eligible for preemption. Overrides the partition-level
        ``preempt_exempt_time`` and the global ``scheduler.preempt_exempt_time``
        (see :doc:`configuration`). ``0`` means immediately preemptable (no
        exemption). To revert to inheriting from the partition or global default:
-       ``sacctmgr modify qos name=<name> set clearpreemptexempttime``.
+       ``sacctmgr modify qos name=<name> set clearpreemptexempttime=1``.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to usage charged under this QOS.
@@ -471,13 +471,13 @@ order: QOS > partition > global.
    sacctmgr modify qos name=burst set preemptexempttime=120
 
    # Per-partition via scontrol (runtime, no restart needed):
-   scontrol update-partition PartitionName=gpu PreemptExemptTime=600
+   scontrol update PartitionName=gpu PreemptExemptTime=600
 
    # Clear a per-QOS override (revert to partition/global):
-   sacctmgr modify qos name=burst set clearpreemptexempttime
+   sacctmgr modify qos name=burst set clearpreemptexempttime=1
 
    # Clear a per-partition override (revert to global):
-   scontrol update-partition --name=gpu --clear-preempt-exempt-time
+   scontrol update PartitionName=gpu ClearPreemptExemptTime=yes
 
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

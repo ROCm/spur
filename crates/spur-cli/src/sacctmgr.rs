@@ -216,6 +216,20 @@ fn parse_i32(key: &str, val: &str) -> Result<i32> {
         .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
 }
 
+/// Parse an unsigned integer field, failing loudly rather than silently
+/// defaulting so a typo never quietly changes a limit on a partial `modify`.
+fn parse_u32(key: &str, val: &str) -> Result<u32> {
+    val.parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Return true when a key=value pair explicitly opts in to a boolean action
+/// (value is "1", "yes", or "true", case-insensitive). Bare keys (no `=value`)
+/// never match because `parse_params` maps them to an empty string.
+fn is_truthy(val: &str) -> bool {
+    matches!(val.to_lowercase().as_str(), "1" | "yes" | "true")
+}
+
 /// Look up a field by its accepted aliases in priority order, returning the key
 /// the caller actually wrote alongside its value. Parsers use the returned key
 /// so an invalid-value error names the exact parameter the user passed (e.g.
@@ -488,7 +502,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     grp_wall_minutes: Some(grp_wall),
                     preempt_exempt_time: p
                         .get("preemptexempttime")
-                        .and_then(|v| v.parse::<u32>().ok()),
+                        .map(|v| parse_u32("preemptexempttime", v))
+                        .transpose()?,
                     clear_preempt_exempt_time: false,
                 })
                 .await
@@ -655,8 +670,12 @@ fn build_modify_qos_request(
             .transpose()?,
         preempt_exempt_time: p
             .get("preemptexempttime")
-            .and_then(|v| v.parse::<u32>().ok()),
-        clear_preempt_exempt_time: p.contains_key("clearpreemptexempttime"),
+            .map(|v| parse_u32("preemptexempttime", v))
+            .transpose()?,
+        clear_preempt_exempt_time: p
+            .get("clearpreemptexempttime")
+            .map(|v| is_truthy(v))
+            .unwrap_or(false),
     })
 }
 
@@ -1004,7 +1023,7 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'p' => q.priority.to_string(),
         'P' => q.preempt_mode.clone(),
         'Q' => q.preempt.clone(),
-        'E' => blank_if_zero(q.preempt_exempt_time),
+        'E' => q.preempt_exempt_time.map(blank_if_zero).unwrap_or_default(),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
@@ -1835,6 +1854,87 @@ mod tests {
         assert!(
             !header.contains("MaxJobs"),
             "default should omit MaxJobs: {header}"
+        );
+    }
+
+    // --- parse_u32 / is_truthy ---
+
+    #[test]
+    fn parse_u32_accepts_valid_integer() {
+        assert_eq!(parse_u32("preemptexempttime", "120").unwrap(), 120);
+        assert_eq!(parse_u32("preemptexempttime", "0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_u32_rejects_non_integer() {
+        let err = parse_u32("preemptexempttime", "abc").unwrap_err();
+        assert!(
+            err.to_string().contains("preemptexempttime"),
+            "error names the field: {err}"
+        );
+        assert!(
+            err.to_string().contains("abc"),
+            "error names the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_u32_rejects_negative() {
+        assert!(parse_u32("preemptexempttime", "-1").is_err());
+    }
+
+    #[test]
+    fn is_truthy_accepts_canonical_values() {
+        for v in &["1", "yes", "YES", "true", "True", "TRUE"] {
+            assert!(is_truthy(v), "{v} should be truthy");
+        }
+    }
+
+    #[test]
+    fn is_truthy_rejects_other_values() {
+        for v in &["0", "no", "false", "", "maybe"] {
+            assert!(!is_truthy(v), "{v} should not be truthy");
+        }
+    }
+
+    // --- clearpreemptexempttime must require explicit value ---
+
+    #[test]
+    fn clear_preempt_exempt_time_requires_truthy_value() {
+        // A bare key (parse_params maps it to "") must NOT trigger the clear.
+        let p: std::collections::HashMap<String, String> = [
+            ("name".into(), "q".into()),
+            ("clearpreemptexempttime".into(), "".into()),
+        ]
+        .into_iter()
+        .collect();
+        let req = build_modify_qos_request(&p).unwrap();
+        assert!(!req.clear_preempt_exempt_time, "bare key must not clear");
+    }
+
+    #[test]
+    fn clear_preempt_exempt_time_fires_on_explicit_one() {
+        let p: std::collections::HashMap<String, String> = [
+            ("name".into(), "q".into()),
+            ("clearpreemptexempttime".into(), "1".into()),
+        ]
+        .into_iter()
+        .collect();
+        let req = build_modify_qos_request(&p).unwrap();
+        assert!(req.clear_preempt_exempt_time);
+    }
+
+    #[test]
+    fn preempt_exempt_time_bad_value_errors() {
+        let p: std::collections::HashMap<String, String> = [
+            ("name".into(), "q".into()),
+            ("preemptexempttime".into(), "not-a-number".into()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            build_modify_qos_request(&p).is_err(),
+            "malformed preemptexempttime should error"
         );
     }
 }

@@ -296,7 +296,7 @@ message PartitionInfo {
 
   string preempt_mode = 40;
   uint32 priority_tier = 41;
-  uint32 preempt_exempt_time = 44;   // 0 = no exemption; absent/unset = defer to global default
+  optional uint32 preempt_exempt_time = 44;   // absent = unset (inherits global default); 0 = no exemption
 }
 
 // ============================================================
@@ -1402,7 +1402,7 @@ message QosInfo {
   uint32 grp_wall_minutes = 12;
   // Comma-separated QOS names this QOS may preempt (empty = none allowed).
   string preempt = 13;
-  uint32 preempt_exempt_time = 14;  // 0 = defer to partition/global default
+  optional uint32 preempt_exempt_time = 14;  // absent = unset (inherits partition/global); 0 = no exemption
 }
 
 // ============================================================

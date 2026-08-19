@@ -746,8 +746,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     part.preempt_mode.to_uppercase(),
                     part.priority_tier
                 );
-                if part.preempt_exempt_time > 0 {
-                    print!(" PreemptExemptTime={}", part.preempt_exempt_time);
+                if let Some(t) = part.preempt_exempt_time {
+                    if t > 0 {
+                        print!(" PreemptExemptTime={t}");
+                    }
                 }
                 println!();
                 println!();
@@ -1027,7 +1029,11 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                 "denyqos" => deny_qos = value.into(),
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
                 "preemptmode" => preempt_mode = value.to_uppercase(),
-                "preemptexempttime" => preempt_exempt_time = value.parse().ok(),
+                "preemptexempttime" => {
+                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
+                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
+                    })?);
+                }
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
@@ -1363,7 +1369,11 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 "allowqos" => allow_qos = Some(value.into()),
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().ok(),
                 "preemptmode" => preempt_mode = Some(value.to_uppercase()),
-                "preemptexempttime" => preempt_exempt_time = value.parse().ok(),
+                "preemptexempttime" => {
+                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
+                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
+                    })?);
+                }
                 "clearpreemptexempttime" => {
                     clear_preempt_exempt_time = value.eq_ignore_ascii_case("yes")
                         || value == "1"
