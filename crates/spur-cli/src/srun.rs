@@ -995,14 +995,13 @@ async fn try_stream_output(
     job_id: u32,
     user: &str,
 ) -> bool {
-    let first_node = nodelist.split(',').next().unwrap_or_default().trim();
-    if first_node.is_empty() {
+    let Some(first_node) = crate::nodelist::first_allocated_node(nodelist) else {
         return false;
-    }
+    };
 
     if controller
         .get_node(GetNodeRequest {
-            name: first_node.to_string(),
+            name: first_node.clone(),
         })
         .await
         .is_err()
