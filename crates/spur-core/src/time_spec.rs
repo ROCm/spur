@@ -80,11 +80,30 @@ pub fn parse_time_spec<Tz: TimeZone>(
 
     // An explicit offset is unambiguous, so it wins over any local reading and
     // keeps every input that already parsed working unchanged.
-    if let Ok(absolute) = DateTime::parse_from_rfc3339(spec) {
-        return Ok(absolute.with_timezone(&Utc));
+    if let Some(absolute) = parse_absolute(spec) {
+        return Ok(absolute);
     }
 
     resolve(parse_local(spec, now)?, now, spec)
+}
+
+/// Any ISO 8601 form carrying an explicit offset, read as an absolute instant.
+/// `now` never enters into it, so these resolve identically in every zone.
+///
+/// `parse_from_rfc3339` handles the seconds-bearing `Z` and `±HH:MM` forms, but
+/// requires the seconds it is named for; Slurm users also write the seconds-less
+/// variants, so those are parsed explicitly. A trailing `Z` (Zulu, i.e. UTC) is
+/// not something `%:z` will accept, so it is stripped and the wall clock pinned
+/// to UTC.
+fn parse_absolute(spec: &str) -> Option<DateTime<Utc>> {
+    if let Ok(absolute) = DateTime::parse_from_rfc3339(spec) {
+        return Some(absolute.with_timezone(&Utc));
+    }
+    if let Ok(absolute) = DateTime::parse_from_str(spec, "%Y-%m-%dT%H:%M%:z") {
+        return Some(absolute.with_timezone(&Utc));
+    }
+    let body = spec.strip_suffix('Z').or_else(|| spec.strip_suffix('z'))?;
+    parse_datetime(body).map(|naive| naive.and_utc())
 }
 
 /// The signed offset body of a `now+…` / `now-…` spec, or `None` when `spec`
@@ -412,6 +431,22 @@ mod tests {
         // must not be re-read in the local zone.
         assert_eq!(parse("2010-01-20T12:34:00Z"), "2010-01-20T12:34:00Z");
         assert_eq!(parse("2010-01-20T12:34:00+05:30"), "2010-01-20T07:04:00Z");
+        // The seconds-less variants that RFC 3339 rejects: an explicit offset
+        // still means an absolute instant, so they must not be re-read locally.
+        assert_eq!(parse("2026-08-15T06:30Z"), "2026-08-15T06:30:00Z");
+        assert_eq!(parse("2026-08-15T06:30+05:30"), "2026-08-15T01:00:00Z");
+        assert_eq!(parse("2026-08-15T06:30-04:00"), "2026-08-15T10:30:00Z");
+    }
+
+    #[test]
+    fn a_nonexistent_local_time_is_rejected() {
+        // The Skipped path needs a real spring-forward gap, which a FixedOffset
+        // can never produce. America/New_York jumps 02:00 -> 03:00 on
+        // 2026-03-08, so 02:30 that day does not exist in the local zone.
+        use chrono_tz::America::New_York;
+        let now = New_York.with_ymd_and_hms(2026, 3, 8, 0, 0, 0).unwrap();
+        let err = parse_time_spec("2026-03-08T02:30:00", &now).unwrap_err();
+        assert!(matches!(err, TimeSpecError::Skipped(_)), "{err}");
     }
 
     #[test]
