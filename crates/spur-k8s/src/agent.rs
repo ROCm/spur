@@ -24,6 +24,49 @@ use spur_proto::proto::*;
 
 const NS_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
 
+/// The placement facts the agent reads off a job's SpurJob before creating pods: which namespace it
+/// belongs to, and which nodes the controller recorded as its allocation.
+struct ResolvedJob {
+    namespace: String,
+    /// `status.assignedNodes` — the controller's recorded allocation, projected onto the CRD. Empty
+    /// until the operator's job controller has patched it (see [`validate_target_node`]).
+    assigned_nodes: Vec<String>,
+}
+
+/// Refuse a launch that pins a node the controller did not allocate to this job.
+///
+/// `target_node` becomes the pod's `spec.nodeName`, which bypasses the scheduler; honoring one
+/// outside the job's recorded allocation would let a caller place work on another tenant's node.
+/// The allocation is `status.assignedNodes`, projected from the controller. When it is not yet
+/// visible the pin cannot be checked, so it is allowed but logged — a legitimate launch can race
+/// the status projection; closing that residual window needs an authoritative controller lookup
+/// (deferred, see the advisory remediation).
+fn validate_target_node(
+    target_node: &str,
+    assigned_nodes: &[String],
+    job_id: u32,
+) -> Result<(), Status> {
+    if target_node.is_empty() {
+        return Ok(());
+    }
+    if assigned_nodes.is_empty() {
+        warn!(
+            job_id,
+            target_node,
+            "launch pins a node before the job's allocation is visible; placement not validated"
+        );
+        return Ok(());
+    }
+    if assigned_nodes.iter().any(|n| n == target_node) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "target node '{target_node}' is not in job {job_id}'s allocation {assigned_nodes:?}: \
+             refusing to place a pod outside the recorded allocation"
+        )))
+    }
+}
+
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
@@ -34,9 +77,9 @@ impl VirtualAgent {
         Self { client }
     }
 
-    /// Look up the namespace of the SpurJob labeled `spur.amd.com/job-id=<id>`.
+    /// Look up the SpurJob labeled `spur.amd.com/job-id=<id>` and return its placement facts.
     /// Fails loudly if not found so pods are never placed in the wrong namespace.
-    async fn resolve_namespace(&self, job_id: u32) -> Result<String, Status> {
+    async fn resolve_job(&self, job_id: u32) -> Result<ResolvedJob, Status> {
         let api: Api<SpurJob> = Api::all(self.client.clone());
         let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
 
@@ -48,15 +91,11 @@ impl VirtualAgent {
                     .map_err(|_| Status::unavailable("k8s API timeout"))?
                     .map_err(|e| Status::internal(e.to_string()))?;
 
-                list.items
-                    .into_iter()
-                    .next()
-                    .and_then(|j| j.metadata.namespace)
-                    .ok_or_else(|| {
-                        Status::not_found(format!(
-                            "spur.amd.com/job-id={job_id} label not yet visible"
-                        ))
-                    })
+                list.items.into_iter().next().ok_or_else(|| {
+                    Status::not_found(format!(
+                        "spur.amd.com/job-id={job_id} label not yet visible"
+                    ))
+                })
             })
             .retry(
                 ExponentialBuilder::default()
@@ -70,14 +109,32 @@ impl VirtualAgent {
         )
         .await;
 
-        match result {
-            Ok(Ok(ns)) => Ok(ns),
-            Ok(Err(status)) => Err(status),
-            Err(_elapsed) => Err(Status::deadline_exceeded(format!(
-                "namespace lookup for spur.amd.com/job-id={job_id} timed out after {}s",
-                NS_LOOKUP_BUDGET.as_secs()
-            ))),
-        }
+        let job = match result {
+            Ok(Ok(job)) => job,
+            Ok(Err(status)) => return Err(status),
+            Err(_elapsed) => {
+                return Err(Status::deadline_exceeded(format!(
+                    "namespace lookup for spur.amd.com/job-id={job_id} timed out after {}s",
+                    NS_LOOKUP_BUDGET.as_secs()
+                )))
+            }
+        };
+
+        let namespace = job.metadata.namespace.ok_or_else(|| {
+            Status::not_found(format!(
+                "SpurJob for spur.amd.com/job-id={job_id} has no namespace"
+            ))
+        })?;
+        let assigned_nodes = job.status.map(|s| s.assigned_nodes).unwrap_or_default();
+        Ok(ResolvedJob {
+            namespace,
+            assigned_nodes,
+        })
+    }
+
+    /// Look up the namespace of the SpurJob labeled `spur.amd.com/job-id=<id>`.
+    async fn resolve_namespace(&self, job_id: u32) -> Result<String, Status> {
+        Ok(self.resolve_job(job_id).await?.namespace)
     }
 }
 
@@ -94,8 +151,13 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
-        let ns = self.resolve_namespace(job_id).await?;
+        let job = self.resolve_job(job_id).await?;
+        let ns = job.namespace;
         let target_node = req.target_node.clone();
+        // `target_node` becomes the pod's spec.nodeName (scheduler-bypassing). Refuse to pin a node
+        // the controller did not allocate to this job so a caller can't place work on another
+        // tenant's node.
+        validate_target_node(&target_node, &job.assigned_nodes, job_id)?;
         let peer_nodes = &req.peer_nodes;
         let num_peers = peer_nodes.len();
 
@@ -945,6 +1007,34 @@ pub fn gpu_request_to_gres(count: u32, gpu_type: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- validate_target_node ---
+
+    #[test]
+    fn target_node_in_allocation_is_allowed() {
+        let alloc = vec!["gpu-a-01".to_string(), "gpu-a-02".to_string()];
+        assert!(validate_target_node("gpu-a-02", &alloc, 7).is_ok());
+    }
+
+    #[test]
+    fn target_node_outside_allocation_is_rejected() {
+        // The core hardening: a caller pinning another tenant's node is refused.
+        let alloc = vec!["gpu-a-01".to_string()];
+        let err = validate_target_node("gpu-b-07", &alloc, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn empty_target_node_is_allowed() {
+        // No pin: the scheduler (or a peer node) places the pod; nothing to validate.
+        assert!(validate_target_node("", &["gpu-a-01".to_string()], 7).is_ok());
+    }
+
+    #[test]
+    fn target_node_allowed_when_allocation_not_yet_visible() {
+        // Races the status projection: allowed but (in the real path) logged.
+        assert!(validate_target_node("gpu-a-01", &[], 7).is_ok());
+    }
 
     // --- gpu_request_to_gres ---
 

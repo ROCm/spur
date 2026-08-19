@@ -3747,6 +3747,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hostname",
+ "http",
  "k8s-openapi",
  "kube",
  "prost-types",
@@ -3759,6 +3760,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
