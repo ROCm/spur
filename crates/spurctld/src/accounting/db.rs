@@ -95,12 +95,15 @@ CREATE TABLE IF NOT EXISTS qos (
     usage_factor    REAL NOT NULL DEFAULT 1.0,
     max_jobs_per_user INTEGER,
     max_submit_per_user INTEGER,
+    max_submit_per_account INTEGER,
+    grp_submit_jobs INTEGER,
     max_tres_per_job TEXT,
     max_tres_per_user TEXT,
     grp_tres        TEXT,
     max_wall_min    INTEGER,
     grp_wall_min    INTEGER,
     preempt_exempt_time INTEGER,
+    flags           TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -112,6 +115,7 @@ CREATE TABLE IF NOT EXISTS associations (
     fairshare_weight INTEGER NOT NULL DEFAULT 1,
     max_running_jobs INTEGER,
     max_submit_jobs INTEGER,
+    grp_submit_jobs INTEGER,
     max_tres_per_job TEXT,
     grp_tres        TEXT,
     max_wall_min    INTEGER,
@@ -145,6 +149,10 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 -- Comma-separated QOS names, same degrade-gracefully rationale as default_qos.
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_wall_min INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS max_submit_per_account INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS flags TEXT NOT NULL DEFAULT '';
+ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
@@ -763,6 +771,7 @@ pub struct UserUpdate<'a> {
     pub allowed_qos: Option<Option<&'a str>>,
     pub max_running_jobs: Option<Option<i32>>,
     pub max_submit_jobs: Option<Option<i32>>,
+    pub grp_submit_jobs: Option<Option<i32>>,
     pub max_tres_per_job: Option<Option<&'a str>>,
     pub grp_tres: Option<Option<&'a str>>,
     pub max_wall_min: Option<Option<i32>>,
@@ -841,6 +850,9 @@ pub async fn add_user<'a>(
     if let Some(v) = u.max_submit_jobs {
         assoc.push(("max_submit_jobs", SqlVal::NullInt(v)));
     }
+    if let Some(v) = u.grp_submit_jobs {
+        assoc.push(("grp_submit_jobs", SqlVal::NullInt(v)));
+    }
     if let Some(v) = u.max_tres_per_job {
         assoc.push(("max_tres_per_job", SqlVal::NullText(v)));
     }
@@ -890,7 +902,9 @@ pub async fn list_users(
         r#"
         SELECT DISTINCT ON (u.name, u.account)
             u.name, u.account, u.admin_level, u.default_account,
-            a.default_qos, a.allowed_qos
+            a.default_qos, a.allowed_qos,
+            a.max_running_jobs, a.max_submit_jobs, a.grp_submit_jobs,
+            a.max_wall_min, a.max_tres_per_job, a.grp_tres
         FROM users u
         LEFT JOIN associations a
             ON a.user_name = u.name AND a.account = u.account
@@ -914,6 +928,12 @@ pub async fn list_users(
             default_account: r.get("default_account"),
             default_qos: r.get("default_qos"),
             allowed_qos: r.get("allowed_qos"),
+            max_running_jobs: r.get("max_running_jobs"),
+            max_submit_jobs: r.get("max_submit_jobs"),
+            grp_submit_jobs: r.get("grp_submit_jobs"),
+            max_wall_min: r.get("max_wall_min"),
+            max_tres_per_job: r.get("max_tres_per_job"),
+            grp_tres: r.get("grp_tres"),
         })
         .collect())
 }
@@ -926,6 +946,12 @@ pub struct UserRecord {
     pub default_account: Option<String>,
     pub default_qos: Option<String>,
     pub allowed_qos: Option<String>,
+    pub max_running_jobs: Option<i32>,
+    pub max_submit_jobs: Option<i32>,
+    pub grp_submit_jobs: Option<i32>,
+    pub max_wall_min: Option<i32>,
+    pub max_tres_per_job: Option<String>,
+    pub grp_tres: Option<String>,
 }
 
 /// List every user-account association's resource limits, one row per
@@ -936,7 +962,7 @@ pub async fn list_associations(pool: &PgPool) -> anyhow::Result<Vec<AssociationR
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (user_name, account)
-            user_name, account, max_running_jobs, max_submit_jobs,
+            user_name, account, max_running_jobs, max_submit_jobs, grp_submit_jobs,
             max_tres_per_job, grp_tres, max_wall_min
         FROM associations
         WHERE partition_name IS NULL OR partition_name = ''
@@ -953,6 +979,7 @@ pub async fn list_associations(pool: &PgPool) -> anyhow::Result<Vec<AssociationR
             account: r.get("account"),
             max_running_jobs: r.get("max_running_jobs"),
             max_submit_jobs: r.get("max_submit_jobs"),
+            grp_submit_jobs: r.get("grp_submit_jobs"),
             max_tres_per_job: r.get("max_tres_per_job"),
             grp_tres: r.get("grp_tres"),
             max_wall_min: r.get("max_wall_min"),
@@ -966,6 +993,7 @@ pub struct AssociationRecord {
     pub account: String,
     pub max_running_jobs: Option<i32>,
     pub max_submit_jobs: Option<i32>,
+    pub grp_submit_jobs: Option<i32>,
     pub max_tres_per_job: Option<String>,
     pub grp_tres: Option<String>,
     pub max_wall_min: Option<i32>,
@@ -986,10 +1014,13 @@ pub struct QosUpdate<'a> {
     pub max_wall_min: Option<Option<i32>>,
     pub max_tres_per_job: Option<Option<&'a str>>,
     pub max_submit_per_user: Option<Option<i32>>,
+    pub max_submit_per_account: Option<Option<i32>>,
+    pub grp_submit_jobs: Option<Option<i32>>,
     pub max_tres_per_user: Option<Option<&'a str>>,
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
     pub preempt_exempt_time: Option<Option<i32>>,
+    pub flags: Option<&'a str>,
 }
 
 /// Create or update a QOS, writing only the fields set in `u`. `modify` sends
@@ -1022,6 +1053,12 @@ pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> a
     if let Some(v) = u.max_submit_per_user {
         updates.push(("max_submit_per_user", SqlVal::NullInt(v)));
     }
+    if let Some(v) = u.max_submit_per_account {
+        updates.push(("max_submit_per_account", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.grp_submit_jobs {
+        updates.push(("grp_submit_jobs", SqlVal::NullInt(v)));
+    }
     if let Some(v) = u.max_tres_per_user {
         updates.push(("max_tres_per_user", SqlVal::NullText(v)));
     }
@@ -1036,6 +1073,9 @@ pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> a
     }
     if let Some(v) = u.preempt_exempt_time {
         updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.flags {
+        updates.push(("flags", SqlVal::Text(v)));
     }
     upsert_row(pool, UpsertTable::Qos, &keys, &updates).await
 }
@@ -1082,7 +1122,7 @@ pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<St
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1099,10 +1139,13 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             max_wall_min: r.get("max_wall_min"),
             max_tres_per_job: r.get("max_tres_per_job"),
             max_submit_per_user: r.get("max_submit_per_user"),
+            max_submit_per_account: r.get("max_submit_per_account"),
+            grp_submit_jobs: r.get("grp_submit_jobs"),
             max_tres_per_user: r.get("max_tres_per_user"),
             grp_tres: r.get("grp_tres"),
             grp_wall_min: r.get("grp_wall_min"),
             preempt_exempt_time: r.get("preempt_exempt_time"),
+            flags: r.get("flags"),
         })
         .collect())
 }
@@ -1120,10 +1163,13 @@ pub struct QosRecord {
     pub max_wall_min: Option<i32>,
     pub max_tres_per_job: Option<String>,
     pub max_submit_per_user: Option<i32>,
+    pub max_submit_per_account: Option<i32>,
+    pub grp_submit_jobs: Option<i32>,
     pub max_tres_per_user: Option<String>,
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
     pub preempt_exempt_time: Option<i32>,
+    pub flags: String,
 }
 
 #[cfg(test)]
@@ -1424,10 +1470,13 @@ mod job_history_tests {
                 max_wall_min: Some(Some(60)),
                 max_tres_per_job: Some(Some("cpu=2")),
                 max_submit_per_user: Some(Some(4)),
+                max_submit_per_account: Some(Some(7)),
+                grp_submit_jobs: Some(Some(9)),
                 max_tres_per_user: Some(Some("cpu=16")),
                 grp_tres: Some(Some("cpu=64")),
                 grp_wall_min: Some(Some(120)),
                 preempt_exempt_time: None,
+                flags: Some("DenyOnLimit"),
             },
         )
         .await?;
@@ -1443,9 +1492,12 @@ mod job_history_tests {
         assert_eq!(got.max_wall_min, Some(60));
         assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=2"));
         assert_eq!(got.max_submit_per_user, Some(4));
+        assert_eq!(got.max_submit_per_account, Some(7));
+        assert_eq!(got.grp_submit_jobs, Some(9));
         assert_eq!(got.max_tres_per_user.as_deref(), Some("cpu=16"));
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
         assert_eq!(got.grp_wall_min, Some(120));
+        assert_eq!(got.flags, "DenyOnLimit");
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)

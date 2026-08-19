@@ -124,7 +124,7 @@ pub async fn association_maps(
 }
 
 fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
-    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    use spur_core::accounting::limit_from_db;
     // Values are validated by `add_user` before being stored, so a parse
     // failure here means the DB row predates that check or was edited
     // out-of-band; treat it as unset rather than poisoning the whole load.
@@ -139,11 +139,12 @@ fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
     };
 
     AccountLimits {
-        max_running_jobs: opt_u32(r.max_running_jobs),
-        max_submit_jobs: opt_u32(r.max_submit_jobs),
+        max_running_jobs: limit_from_db(r.max_running_jobs),
+        max_submit_jobs: limit_from_db(r.max_submit_jobs),
+        grp_submit_jobs: limit_from_db(r.grp_submit_jobs),
         max_tres_per_job: opt_tres(r.max_tres_per_job),
         grp_tres: opt_tres(r.grp_tres),
-        max_wall_minutes: opt_u32(r.max_wall_min),
+        max_wall_minutes: limit_from_db(r.max_wall_min),
     }
 }
 
@@ -173,5 +174,40 @@ mod tests {
         merge_admin_level(&mut m, "dave", "none");
         merge_admin_level(&mut m, "dave", "");
         assert!(!m.contains_key("dave"));
+    }
+
+    fn record_with_submit(grp_submit_jobs: Option<i32>) -> super::db::AssociationRecord {
+        super::db::AssociationRecord {
+            user_name: "alice".into(),
+            account: "research".into(),
+            max_running_jobs: None,
+            max_submit_jobs: None,
+            grp_submit_jobs,
+            max_tres_per_job: None,
+            grp_tres: None,
+            max_wall_min: None,
+        }
+    }
+
+    #[test]
+    fn account_limits_preserve_zero_as_block_all() {
+        let limits = super::account_limits_from_record(record_with_submit(Some(0)));
+        assert_eq!(limits.grp_submit_jobs, Some(0));
+    }
+
+    #[test]
+    fn account_limits_map_null_and_negative_to_unset() {
+        let from_null = super::account_limits_from_record(record_with_submit(None));
+        assert_eq!(from_null.grp_submit_jobs, None);
+
+        // A stray negative predates the sentinel flip; treat it as unset.
+        let from_negative = super::account_limits_from_record(record_with_submit(Some(-1)));
+        assert_eq!(from_negative.grp_submit_jobs, None);
+    }
+
+    #[test]
+    fn account_limits_pass_through_positive() {
+        let limits = super::account_limits_from_record(record_with_submit(Some(5)));
+        assert_eq!(limits.grp_submit_jobs, Some(5));
     }
 }

@@ -9,6 +9,27 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// Slurm's `INFINITE` sentinel for numeric limits carried over the wire as
+/// `uint32`. It marks "clear to no limit" (stored as SQL `NULL`), distinct
+/// from a literal `0`, which means "block all". See `nullable_limit` and the
+/// sacctmgr `-1` keyword.
+pub const INFINITE: u32 = u32::MAX;
+
+/// Convert a stored nullable limit (`Option<i32>` from the DB) into the
+/// in-memory `Option<u32>`: SQL `NULL` (`None`) is "no limit", a literal `0`
+/// survives as `Some(0)` ("block all"), and a stray negative (predates the
+/// sentinel flip) is treated as unset.
+pub fn limit_from_db(v: Option<i32>) -> Option<u32> {
+    v.filter(|&x| x >= 0).map(|x| x as u32)
+}
+
+/// Convert a stored nullable limit into its proto `uint32`: NULL (and any
+/// stray negative) becomes the `INFINITE` sentinel so the CLI can tell "no
+/// limit" apart from a literal `0`; a stored value is emitted as-is.
+pub fn limit_to_wire(v: Option<i32>) -> u32 {
+    limit_from_db(v).unwrap_or(INFINITE)
+}
+
 /// Trackable RESource types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TresType {
@@ -128,6 +149,9 @@ pub struct AccountLimits {
     pub max_running_jobs: Option<u32>,
     /// Max submitted (pending + running) jobs for a single user within this account.
     pub max_submit_jobs: Option<u32>,
+    /// Max submitted (pending + running) jobs across all users in this account.
+    #[serde(default)]
+    pub grp_submit_jobs: Option<u32>,
     /// Max TRES per job.
     pub max_tres_per_job: Option<TresRecord>,
     /// Max total TRES across all running jobs in this account, summed over every user.
@@ -153,6 +177,11 @@ pub struct Qos {
     /// field on a QOS.
     #[serde(default)]
     pub preempt: Vec<String>,
+    /// When set, a stand-alone resource/wall limit breach is denied at
+    /// submission instead of leaving the job pending. Mirrors Slurm's QOS
+    /// `DenyOnLimit` flag; the submit-count family always denies regardless.
+    #[serde(default)]
+    pub deny_on_limit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -182,6 +211,12 @@ impl FromStr for QosPreemptMode {
 pub struct QosLimits {
     pub max_jobs_per_user: Option<u32>,
     pub max_submit_jobs_per_user: Option<u32>,
+    /// Max submitted (pending + running) jobs per account within this QOS.
+    #[serde(default)]
+    pub max_submit_jobs_per_account: Option<u32>,
+    /// Max submitted (pending + running) jobs across all users in this QOS.
+    #[serde(default)]
+    pub grp_submit_jobs: Option<u32>,
     pub max_tres_per_job: Option<TresRecord>,
     pub max_tres_per_user: Option<TresRecord>,
     pub grp_tres: Option<TresRecord>,
@@ -218,6 +253,7 @@ impl Default for Qos {
             limits: QosLimits::default(),
             usage_factor: 1.0,
             preempt: Vec::new(),
+            deny_on_limit: false,
         }
     }
 }
@@ -245,6 +281,24 @@ mod tests {
     #[test]
     fn test_tres_parse_rejects_unknown_type() {
         assert!(TresRecord::parse("bogus=5").is_err());
+    }
+
+    #[test]
+    fn limit_from_db_maps_sentinels() {
+        assert_eq!(limit_from_db(None), None);
+        // A literal 0 is a real value ("block all"), not a clear.
+        assert_eq!(limit_from_db(Some(0)), Some(0));
+        assert_eq!(limit_from_db(Some(5)), Some(5));
+        // A stray negative predates the sentinel flip; treat as unset.
+        assert_eq!(limit_from_db(Some(-1)), None);
+    }
+
+    #[test]
+    fn limit_to_wire_maps_null_and_values() {
+        assert_eq!(limit_to_wire(None), INFINITE);
+        assert_eq!(limit_to_wire(Some(-1)), INFINITE);
+        assert_eq!(limit_to_wire(Some(0)), 0);
+        assert_eq!(limit_to_wire(Some(7)), 7);
     }
 
     #[test]
