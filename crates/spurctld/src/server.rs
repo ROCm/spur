@@ -3345,8 +3345,12 @@ pub async fn serve(
 
     let jwt_key = resolve_startup_jwt_key(&cluster.config());
     let auth_mode = cluster.config().auth.mode;
-    // Same key the node-admission path already uses; cloned because `jwt_key` moves into the service.
-    let jwt_key_for_auth = jwt_key.clone();
+    // User-identity RPC verification uses the operator's real signing key, NOT the node-admission
+    // default fallback. An unset key here must mean "no credential can be verified" (presented tokens
+    // are rejected by the auth layer), never "verify against a public constant" — which would let
+    // anyone forge an admin identity. `auth.mode = required` refuses to start key-less (see
+    // config validation), so an empty key here can only accompany permissive/disabled.
+    let auth_verification_key = cluster.config().auth.jwt_key.clone().unwrap_or_default();
 
     let service = ControllerService {
         cluster,
@@ -3362,7 +3366,7 @@ pub async fn serve(
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
-    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &jwt_key_for_auth);
+    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &auth_verification_key);
 
     let mut builder = tonic::transport::Server::builder()
         .layer(stats_layer)

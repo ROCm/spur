@@ -73,6 +73,12 @@ impl AssociationCache {
                 .is_some_and(|lvl| lvl.eq_ignore_ascii_case("admin"))
     }
 
+    /// Whether `user` is associated with `account`. Fails closed like [`is_admin`](Self::is_admin):
+    /// an unloaded cache reports `CacheUnavailable`, which callers enforcing a tenancy fence MUST
+    /// treat as "cannot verify — deny" (see `validate_user_account`), never as an implicit allow.
+    /// The distinction is left to the caller because "cache never loaded" spans two cases — accounting
+    /// genuinely off (nothing to enforce) versus accounting on but the first fetch not yet completed
+    /// (the fence is real and must hold) — that this cache cannot tell apart on its own.
     pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {
         let snapshot = self.snapshot.read();
         if !snapshot.loaded {

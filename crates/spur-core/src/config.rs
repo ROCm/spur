@@ -501,6 +501,14 @@ pub struct AccountingConfig {
     pub txn_retention_days: Option<u32>,
 }
 
+impl AccountingConfig {
+    /// True when accounting is configured (a database URL is set). When false there is no
+    /// association database to consult, so account/association checks have nothing to enforce.
+    pub fn enabled(&self) -> bool {
+        !self.database_url.is_empty()
+    }
+}
+
 fn default_fairshare_refresh_secs() -> u32 {
     300
 }
@@ -689,8 +697,12 @@ pub struct AuthConfig {
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// JWT secret key (file path or inline). Currently used only to sign/verify NODE admission
-    /// tokens, not user identity.
+    /// HMAC signing secret, used verbatim as the HS256 key — the string's bytes are the key, this is
+    /// not a path to a key file. It is the cluster-wide authentication secret: it verifies both node
+    /// admission tokens and, under `auth.mode = permissive`/`required`, the user-identity credentials
+    /// callers present on the control-plane RPCs. Leave it unset only with `auth.mode =
+    /// disabled`/`permissive`; `required` refuses to start without it, because an unset key would
+    /// otherwise fall back to a well-known constant that anyone can forge against.
     pub jwt_key: Option<String>,
     /// Allow jobs to execute as uid 0 (root).
     ///
@@ -1471,6 +1483,21 @@ impl SlurmConfig {
                 field: "auth.mode".into(),
                 value: "required with auth.plugin = \"none\" (no credential can be verified)"
                     .into(),
+            });
+        }
+        // `required` promises every caller is verified against the cluster signing key. Without a key
+        // the controller would fall back to a well-known constant that anyone can sign with, turning
+        // the hardened mode into universal forgeability (an attacker could mint an admin identity).
+        // Refuse to start rather than run in that strictly-worse-than-default posture.
+        if self.auth.mode == AuthMode::Required
+            && self.auth.jwt_key.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.jwt_key".into(),
+                value:
+                    "unset with auth.mode = \"required\" (set a secret signing key; the hardened \
+                        mode cannot verify credentials without one)"
+                        .into(),
             });
         }
 
@@ -2600,6 +2627,71 @@ max_batch_requeue = 0
             err.to_string().contains("max_batch_requeue"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn auth_required_without_jwt_key_is_refused() {
+        // `required` with no signing key would fall back to a public constant that anyone can forge
+        // an admin identity against — strictly worse than the default. Startup must refuse it.
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "required"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("jwt_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_required_with_empty_jwt_key_is_refused() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "required"
+jwt_key = ""
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("jwt_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_required_with_jwt_key_is_accepted() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "required"
+jwt_key = "a-real-secret"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("required + a key must be accepted");
+        assert_eq!(config.auth.mode, AuthMode::Required);
+        assert_eq!(config.auth.jwt_key.as_deref(), Some("a-real-secret"));
+    }
+
+    #[test]
+    fn auth_permissive_without_jwt_key_is_accepted() {
+        // Only `required` is refused key-less; permissive must still come up so a cluster can adopt
+        // authentication incrementally.
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "permissive"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("permissive must not require a key");
+        assert_eq!(config.auth.mode, AuthMode::Permissive);
     }
 
     #[test]
