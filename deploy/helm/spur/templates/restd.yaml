@@ -1,0 +1,123 @@
+{{- if .Values.restd.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurrestd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "restd") | nindent 4 }}
+spec:
+  type: {{ .Values.restd.service.type }}
+  selector:
+    {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "restd") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.restd.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spurrestd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "restd") | nindent 4 }}
+spec:
+  replicas: {{ .Values.restd.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "restd") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spur.componentLabels" (dict "ctx" . "component" "restd") | nindent 8 }}
+        {{- with .Values.restd.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.restd.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "spur.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.restd.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.restd.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.restd.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spurrestd
+          image: {{ include "spur.image" (dict "ctx" . "component" .Values.restd) }}
+          imagePullPolicy: {{ include "spur.imagePullPolicy" (dict "ctx" . "component" .Values.restd) }}
+          command: [spurrestd]
+          args:
+            - --listen=[::]:{{ .Values.restd.service.port }}
+            - --controller=http://{{ include "spur.controllerHost" . }}:{{ .Values.controller.service.grpcPort }}
+          ports:
+            - containerPort: {{ .Values.restd.service.port }}
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /api/v1/ping
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/ping
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          {{- with .Values.restd.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- if and .Values.restd.ingress.enabled .Values.restd.ingress.hosts }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spurrestd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "restd") | nindent 4 }}
+  {{- with .Values.restd.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.restd.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.restd.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.restd.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: spurrestd
+                port:
+                  number: {{ $.Values.restd.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

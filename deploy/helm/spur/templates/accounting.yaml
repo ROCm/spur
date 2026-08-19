@@ -1,0 +1,142 @@
+{{- if .Values.accounting.enabled }}
+{{- $useExternal := or (ne .Values.accounting.externalDatabase.url "") (ne .Values.accounting.externalDatabase.existingSecret "") -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurdbd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "accounting") | nindent 4 }}
+spec:
+  selector:
+    {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "accounting") | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.accounting.service.port }}
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spurdbd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "accounting") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # single PVC, no rolling
+  selector:
+    matchLabels:
+      {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "accounting") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spur.componentLabels" (dict "ctx" . "component" "accounting") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "spur.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.accounting.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.accounting.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.accounting.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spurdbd
+          image: {{ include "spur.image" (dict "ctx" . "component" .Values.accounting) }}
+          imagePullPolicy: {{ include "spur.imagePullPolicy" (dict "ctx" . "component" .Values.accounting) }}
+          command: [spurdbd]
+          args:
+            - --listen=[::]:{{ .Values.accounting.service.port }}
+            {{- if $useExternal }}
+            {{- if .Values.accounting.externalDatabase.url }}
+            - --database-url=$(SPUR_DB_URL)
+            {{- else }}
+            - --database-url=$(SPUR_DB_URL)
+            {{- end }}
+            {{- else }}
+            - --database-url=postgresql://{{ .Values.accounting.embeddedPostgres.user }}:{{ .Values.accounting.embeddedPostgres.password }}@localhost:5432/{{ .Values.accounting.embeddedPostgres.database }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.accounting.service.port }}
+              name: grpc
+          {{- if $useExternal }}
+          env:
+            - name: SPUR_DB_URL
+              {{- if .Values.accounting.externalDatabase.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.accounting.externalDatabase.existingSecret }}
+                  key: url
+              {{- else }}
+              value: {{ .Values.accounting.externalDatabase.url | quote }}
+              {{- end }}
+          {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with .Values.accounting.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- if and (not $useExternal) .Values.accounting.embeddedPostgres.enabled }}
+        # Dev-only sidecar. Production: set accounting.externalDatabase.url.
+        - name: postgres
+          image: {{ .Values.accounting.embeddedPostgres.image }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.accounting.embeddedPostgres.user | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.accounting.embeddedPostgres.password | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.accounting.embeddedPostgres.database | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+        {{- end }}
+      volumes:
+        {{- if and (not $useExternal) .Values.accounting.embeddedPostgres.enabled }}
+        - name: pgdata
+          {{- if .Values.accounting.embeddedPostgres.storage.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "spur.fullname" . }}-pgdata
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+{{- if and (not $useExternal) .Values.accounting.embeddedPostgres.enabled .Values.accounting.embeddedPostgres.storage.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "spur.fullname" . }}-pgdata
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "accounting") | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.accounting.embeddedPostgres.storage.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.accounting.embeddedPostgres.storage.size | quote }}
+{{- end }}
+{{- end }}
