@@ -6,7 +6,7 @@
 //! Checks per-QOS limits before allowing a job to be scheduled.
 
 use crate::accounting::{Qos, QosPreemptMode, TresRecord, TresType};
-use crate::job::{effective_gpus, effective_memory_mb, Job, PendingReason};
+use crate::job::{effective_gpus, effective_memory_mb, Job, JobSpec, PendingReason};
 use crate::partition::PreemptMode;
 
 impl From<QosPreemptMode> for PreemptMode {
@@ -41,21 +41,20 @@ pub enum QosCheckResult {
 /// Whether the job's requested wall time exceeds `max_wall` minutes. A cap of 0
 /// is "block all" per the limit convention, so it breaches even a job with no
 /// explicit time limit.
-fn wall_breach(job: &Job, max_wall: u32) -> bool {
+fn wall_breach(spec: &JobSpec, max_wall: u32) -> bool {
     if max_wall == 0 {
         return true;
     }
-    job.spec
-        .time_limit
+    spec.time_limit
         .is_some_and(|w| w.num_minutes() > max_wall as i64)
 }
 
 /// The four TRES quantities a single job requests: (cpu, node, mem_mb, gpu).
-fn job_tres(job: &Job) -> (u64, u64, u64, u64) {
-    let cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-    let nodes = job.spec.num_nodes as u64;
-    let mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-    let gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+fn job_tres(spec: &JobSpec) -> (u64, u64, u64, u64) {
+    let cpus = (spec.num_tasks * spec.cpus_per_task) as u64;
+    let nodes = spec.num_nodes as u64;
+    let mem = effective_memory_mb(spec, spec.num_nodes);
+    let gpus = effective_gpus(spec, spec.num_nodes);
     (cpus, nodes, mem, gpus)
 }
 
@@ -91,16 +90,16 @@ fn tres_cap_breach(
 /// with real aggregates folded in. `running_*` fold in existing load; pass
 /// empty records for the standalone (submit-time) evaluation.
 fn qos_resource_breach(
-    job: &Job,
+    spec: &JobSpec,
     qos: &Qos,
     user_running_tres: &TresRecord,
     qos_running_tres: &TresRecord,
 ) -> Option<PendingReason> {
     let limits = &qos.limits;
-    let (job_cpu, job_node, job_mem, job_gpu) = job_tres(job);
+    let (job_cpu, job_node, job_mem, job_gpu) = job_tres(spec);
 
     if let Some(max_wall) = limits.max_wall_minutes {
-        if wall_breach(job, max_wall) {
+        if wall_breach(spec, max_wall) {
             return Some(PendingReason::QosMaxWallDurationPerJobLimit);
         }
     }
@@ -195,7 +194,7 @@ pub fn check_qos_limits(
         }
     }
 
-    match qos_resource_breach(job, qos, user_running_tres, qos_running_tres) {
+    match qos_resource_breach(&job.spec, qos, user_running_tres, qos_running_tres) {
         Some(reason) => QosCheckResult::Blocked(reason),
         None => QosCheckResult::Allowed,
     }
@@ -235,8 +234,8 @@ pub fn check_qos_submit_limits(
 /// Standalone QOS resource/wall breach for the submission gate: evaluates the
 /// job on its own (no other load). Denied at submit only when the QOS has
 /// `DenyOnLimit`; otherwise the scheduler pends it.
-pub fn check_qos_standalone_limits(job: &Job, qos: &Qos) -> Option<PendingReason> {
-    qos_resource_breach(job, qos, &TresRecord::new(), &TresRecord::new())
+pub fn check_qos_standalone_limits(spec: &JobSpec, qos: &Qos) -> Option<PendingReason> {
+    qos_resource_breach(spec, qos, &TresRecord::new(), &TresRecord::new())
 }
 
 #[cfg(test)]
@@ -315,7 +314,7 @@ mod tests {
         let mut job = make_test_job();
         job.spec.time_limit = None;
         assert_eq!(
-            check_qos_standalone_limits(&job, &qos),
+            check_qos_standalone_limits(&job.spec, &qos),
             Some(PendingReason::QosMaxWallDurationPerJobLimit)
         );
     }
@@ -325,7 +324,7 @@ mod tests {
         let qos = make_qos(None, Some(60));
         let mut job = make_test_job();
         job.spec.time_limit = None;
-        assert_eq!(check_qos_standalone_limits(&job, &qos), None);
+        assert_eq!(check_qos_standalone_limits(&job.spec, &qos), None);
     }
 
     #[test]

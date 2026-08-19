@@ -11,7 +11,7 @@
 //! across all its users.
 
 use crate::accounting::{AccountLimits, TresRecord, TresType};
-use crate::job::{effective_gpus, effective_memory_mb, Job, PendingReason};
+use crate::job::{effective_gpus, effective_memory_mb, Job, JobSpec, PendingReason};
 
 /// Result of an account/association limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,21 +25,20 @@ pub enum AccountCheckResult {
 /// Whether the job's requested wall time exceeds `max_wall` minutes. A cap of 0
 /// is "block all" per the limit convention, so it breaches even a job with no
 /// explicit time limit.
-fn wall_breach(job: &Job, max_wall: u32) -> bool {
+fn wall_breach(spec: &JobSpec, max_wall: u32) -> bool {
     if max_wall == 0 {
         return true;
     }
-    job.spec
-        .time_limit
+    spec.time_limit
         .is_some_and(|w| w.num_minutes() > max_wall as i64)
 }
 
 /// The four TRES quantities a single job requests: (cpu, node, mem_mb, gpu).
-fn job_tres(job: &Job) -> (u64, u64, u64, u64) {
-    let cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-    let nodes = job.spec.num_nodes as u64;
-    let mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-    let gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+fn job_tres(spec: &JobSpec) -> (u64, u64, u64, u64) {
+    let cpus = (spec.num_tasks * spec.cpus_per_task) as u64;
+    let nodes = spec.num_nodes as u64;
+    let mem = effective_memory_mb(spec, spec.num_nodes);
+    let gpus = effective_gpus(spec, spec.num_nodes);
     (cpus, nodes, mem, gpus)
 }
 
@@ -48,11 +47,11 @@ fn job_tres(job: &Job) -> (u64, u64, u64, u64) {
 /// exceed the per-job or account-group cap? Wall is handled separately because
 /// the association wall cap denies unconditionally at submission.
 fn account_resource_breach(
-    job: &Job,
+    spec: &JobSpec,
     limits: &AccountLimits,
     account_running_tres: &TresRecord,
 ) -> Option<PendingReason> {
-    let (job_cpu, job_node, job_mem, job_gpu) = job_tres(job);
+    let (job_cpu, job_node, job_mem, job_gpu) = job_tres(spec);
 
     if let Some(ref max_tres) = limits.max_tres_per_job {
         if max_tres.get(TresType::Cpu) > 0 && job_cpu > max_tres.get(TresType::Cpu) {
@@ -120,12 +119,12 @@ pub fn check_account_limits(
     }
 
     if let Some(max_wall) = limits.max_wall_minutes {
-        if wall_breach(job, max_wall) {
+        if wall_breach(&job.spec, max_wall) {
             return AccountCheckResult::Blocked(PendingReason::AssocMaxWallDurationPerJobLimit);
         }
     }
 
-    match account_resource_breach(job, limits, account_running_tres) {
+    match account_resource_breach(&job.spec, limits, account_running_tres) {
         Some(reason) => AccountCheckResult::Blocked(reason),
         None => AccountCheckResult::Allowed,
     }
@@ -155,9 +154,9 @@ pub fn check_account_submit_limits(
 
 /// Association `MaxWallDurationPerJob` breach. Slurm denies this
 /// unconditionally at submission (it does not depend on `DenyOnLimit`).
-pub fn check_account_wall_limit(job: &Job, limits: &AccountLimits) -> Option<PendingReason> {
+pub fn check_account_wall_limit(spec: &JobSpec, limits: &AccountLimits) -> Option<PendingReason> {
     match limits.max_wall_minutes {
-        Some(max_wall) if wall_breach(job, max_wall) => {
+        Some(max_wall) if wall_breach(spec, max_wall) => {
             Some(PendingReason::AssocMaxWallDurationPerJobLimit)
         }
         _ => None,
@@ -167,8 +166,11 @@ pub fn check_account_wall_limit(job: &Job, limits: &AccountLimits) -> Option<Pen
 /// Standalone association TRES breach for the submission gate: evaluates the
 /// job on its own. Denied at submit only when the governing QOS has
 /// `DenyOnLimit`; otherwise the scheduler pends it.
-pub fn check_account_standalone_limits(job: &Job, limits: &AccountLimits) -> Option<PendingReason> {
-    account_resource_breach(job, limits, &TresRecord::new())
+pub fn check_account_standalone_limits(
+    spec: &JobSpec,
+    limits: &AccountLimits,
+) -> Option<PendingReason> {
+    account_resource_breach(spec, limits, &TresRecord::new())
 }
 
 #[cfg(test)]
@@ -261,7 +263,7 @@ mod tests {
         let mut job = make_test_job();
         job.spec.time_limit = None;
         assert_eq!(
-            check_account_wall_limit(&job, &limits),
+            check_account_wall_limit(&job.spec, &limits),
             Some(PendingReason::AssocMaxWallDurationPerJobLimit)
         );
     }
@@ -274,7 +276,7 @@ mod tests {
         };
         let mut job = make_test_job();
         job.spec.time_limit = None;
-        assert_eq!(check_account_wall_limit(&job, &limits), None);
+        assert_eq!(check_account_wall_limit(&job.spec, &limits), None);
     }
 
     #[test]

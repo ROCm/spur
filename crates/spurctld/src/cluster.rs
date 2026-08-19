@@ -4471,10 +4471,6 @@ impl ClusterManager {
         let account = spec.account.as_deref().filter(|a| !a.is_empty());
         let qos_name = spec.qos.as_deref().filter(|n| !n.is_empty());
 
-        // Representative job for the stand-alone/wall breach checks. The job_id
-        // is irrelevant here (these evaluate the request in isolation).
-        let job = Job::new(0, spec.clone());
-
         let is_submitted = |j: &Job| matches!(j.state, JobState::Pending | JobState::Running);
 
         // Surface a human sentence plus the exact Slurm reason code, so the
@@ -4515,7 +4511,7 @@ impl ClusterManager {
                 ) {
                     return Err(deny(reason));
                 }
-                if let Some(reason) = check_account_wall_limit(&job, &limits) {
+                if let Some(reason) = check_account_wall_limit(spec, &limits) {
                     return Err(deny(reason));
                 }
             }
@@ -4569,7 +4565,7 @@ impl ClusterManager {
                         return Err(deny(reason));
                     }
                     if deny_on_limit {
-                        if let Some(reason) = check_qos_standalone_limits(&job, &qos) {
+                        if let Some(reason) = check_qos_standalone_limits(spec, &qos) {
                             return Err(deny(reason));
                         }
                     }
@@ -4581,7 +4577,7 @@ impl ClusterManager {
         if deny_on_limit && assoc_loaded {
             if let Some(account) = account {
                 let limits = self.association_cache.limits(user, account);
-                if let Some(reason) = check_account_standalone_limits(&job, &limits) {
+                if let Some(reason) = check_account_standalone_limits(spec, &limits) {
                     return Err(deny(reason));
                 }
             }
