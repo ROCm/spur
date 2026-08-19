@@ -3,6 +3,8 @@
 
 use thiserror::Error;
 
+pub const MAX_HOSTLIST_SIZE: usize = 1_000_000;
+
 /// Errors from hostlist parsing.
 #[derive(Debug, Error)]
 pub enum HostlistError {
@@ -10,6 +12,8 @@ pub enum HostlistError {
     InvalidPattern(String),
     #[error("invalid range: {0}")]
     InvalidRange(String),
+    #[error("hostlist too large: {count} hosts exceeds maximum {max}")]
+    TooLarge { count: u64, max: usize },
 }
 
 /// Expand a Slurm hostlist pattern into individual hostnames.
@@ -314,12 +318,30 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
                     return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
                 }
 
+                // Bound element count BEFORE materializing. Saturating so the count
+                // arithmetic itself can't overflow on a u64::MAX range.
+                let range_count = (end - start).saturating_add(1);
+                if (results.len() as u64).saturating_add(range_count) > MAX_HOSTLIST_SIZE as u64 {
+                    return Err(HostlistError::TooLarge {
+                        count: (results.len() as u64).saturating_add(range_count),
+                        max: MAX_HOSTLIST_SIZE,
+                    });
+                }
+
                 for i in start..=end {
                     let name = format!("{}{:0>width$}{}", prefix, i, suffix, width = width);
                     if suffix.contains('[') {
                         expand_single(&name, results)?;
                     } else {
                         results.push(name);
+                    }
+                    // Incremental backstop: nested products like rack[0-9999]-node[0-9999]
+                    // can exceed the cap even when each single range is under it.
+                    if results.len() > MAX_HOSTLIST_SIZE {
+                        return Err(HostlistError::TooLarge {
+                            count: results.len() as u64,
+                            max: MAX_HOSTLIST_SIZE,
+                        });
                     }
                 }
             } else {
@@ -622,5 +644,38 @@ mod tests {
     #[test]
     fn recursive_suffix_bracket_order_rejected() {
         assert!(expand("node[1-2]a]b[3-4]").is_err());
+    }
+
+    #[test]
+    fn expand_rejects_oversized_range() {
+        let err = expand("node[0-18446744073709551615]").unwrap_err();
+        assert!(matches!(err, HostlistError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn expand_allows_cap_boundary() {
+        let hosts = expand("node[0-999999]").unwrap();
+        assert_eq!(hosts.len(), 1_000_000);
+    }
+
+    #[test]
+    fn expand_rejects_nested_product_over_cap() {
+        let err = expand("rack[0-9999]-node[0-9999]").unwrap_err();
+        assert!(matches!(err, HostlistError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn expand_rejects_recursive_overshoot_past_cap() {
+        // A comma-list suffix pushes per element without consulting the pre-loop
+        // bound, so the running total steps past the cap instead of being
+        // rejected in advance. Exercises the incremental backstop, which the
+        // nested-range case above never reaches.
+        let err = expand("rack[0-999999]-node[1,2]").unwrap_err();
+        assert!(matches!(err, HostlistError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn count_rejects_oversized_range() {
+        assert!(count("node[0-18446744073709551615]").is_err());
     }
 }
