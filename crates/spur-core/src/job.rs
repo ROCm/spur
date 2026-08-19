@@ -2182,6 +2182,7 @@ mod tests {
         (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
         (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
         (PendingReason::QosGrpGpuLimit, "QOSGrpGRES"),
+        (PendingReason::QosGrpWallLimit, "QOSGrpWallLimit"),
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),

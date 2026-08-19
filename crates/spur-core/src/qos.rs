@@ -1001,21 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn grp_wall_reason_uses_slurms_exact_string() {
-        assert_eq!(PendingReason::QosGrpWallLimit.display(), "QOSGrpWallLimit");
-    }
-
-    #[test]
-    fn grp_wall_reason_survives_the_wal_serde_round_trip() {
-        // `PendingReason` rides in the Raft log on job state changes, so a new
-        // variant must serialize and read back identically.
-        let json = serde_json::to_string(&PendingReason::QosGrpWallLimit)
-            .expect("reason serializes for the WAL");
-        let back: PendingReason = serde_json::from_str(&json).expect("reason reads back");
-        assert_eq!(back, PendingReason::QosGrpWallLimit);
-    }
-
-    #[test]
     fn test_qos_preempt_override_off_is_none() {
         let qos = Qos {
             preempt_mode: QosPreemptMode::Off,
