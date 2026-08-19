@@ -862,6 +862,51 @@ in the cluster and silently exceeding the cap. ``MaxTRESPerJob``'s and
 a job's actual requested node count, since they bound a single job's or
 user's own footprint rather than group-wide capacity reuse.
 
+Scripted output
+---------------
+
+``sacctmgr show`` prints a column-aligned table for reading. For scripts, three
+Slurm flags change that rendering; they are global, so they may appear before or
+after the subcommand.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 74
+
+   * - Flag
+     - Effect
+   * - ``-n``, ``--noheader``
+     - Omit the header line and its dashed rule.
+   * - ``-p``, ``--parsable``
+     - Print fields ``|`` delimited, **with** a trailing ``|``.
+   * - ``-P``, ``--parsable2``
+     - Print fields ``|`` delimited, **without** a trailing ``|``.
+
+.. code-block:: bash
+
+   sacctmgr -n -P show qos format=Name,Priority,MaxWall
+   sacctmgr -n -P show qos format=Name,Priority | cut -d'|' -f1
+
+The trailing delimiter is the only difference between ``-p`` and ``-P``, and it
+changes the field count that ``cut``, ``awk``, and ``IFS`` splitting see. Choose
+one deliberately. Delimited output keeps empty fields as empty, so a row whose
+last columns are unset still carries its separators and the field count stays
+stable across rows.
+
+Delimited output ignores column widths and truncation, so a long value is printed
+in full rather than clipped to fit a column.
+
+.. note::
+
+   ``-p`` and ``-P`` work for ``show account`` and ``show qos``.
+   For ``show user``, ``show association``, and ``show tres``, Spur does not
+   model the columns, so it refuses the flag with an error naming the entity
+   rather than printing padded text a script cannot parse. ``-n`` works for
+   every entity.
+
+   Passing both ``-p`` and ``-P`` gives ``-P``. Slurm applies whichever came
+   last; the flag order is not visible here, so the no-trailing form wins.
+
 Managing nodes at runtime
 -------------------------
 
