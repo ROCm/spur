@@ -7575,6 +7575,35 @@ mod tests {
         });
     }
 
+    /// Register a node already on the WireGuard mesh: it advertises its real `spur0` address (what
+    /// `detect_node_address` reports when WireGuard is up) and a wg pubkey, so `provision_assignments`
+    /// adopts that real address as its `k0s_mesh_ip` instead of allocating from a pool.
+    fn register_meshed_node(cm: &ClusterManager, name: &str, mesh_addr: &str) {
+        cm.register_node(
+            name.into(),
+            name.into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            mesh_addr.into(),
+            6818,
+            format!("pk-{name}"),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+        )
+        .unwrap();
+        let n = name.to_string();
+        let want = mesh_addr.to_string();
+        wait_for(&format!("meshed node '{n}' registered"), || {
+            cm.get_node(&n)
+                .map(|x| x.address.as_deref() == Some(want.as_str()))
+                .unwrap_or(false)
+        });
+    }
+
     fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
         let id = cm.submit_job(spec).unwrap().job_id;
         wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
@@ -16113,6 +16142,245 @@ mod tests {
         assert_eq!(b.k0s_pod_cidr, b_cidr, "same pod CIDR after re-add");
         // The untouched node keeps its assignment (provisioning is idempotent).
         assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_some());
+    }
+
+    // ---- k0s adopts each node's real WireGuard address as its mesh IP ----
+
+    fn provision_net_calico() -> crate::cluster_k8s::ClusterNetworking {
+        crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "calico".into(),
+            control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
+        }
+    }
+
+    /// Record the HA control-plane set (what `cluster_up` persists) so `provision_assignments`
+    /// treats `cp` as controllers and the first as bootstrap.
+    fn record_cp_set(cm: &ClusterManager, bootstrap: &str, cp: &[&str]) {
+        use spur_core::k0s::K0sPhase;
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some(bootstrap.into()),
+            cp.iter().map(|s| s.to_string()).collect(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        wait_for("cp set recorded", || {
+            cm.k0s_state().control_plane_nodes.len() == cp.len()
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_adopts_real_address_adversarial_cp_selection() {
+        // The core regression: nodes joined the mesh in address order matching hostname
+        // order (005=.1 .. 009=.5), but the chosen control-plane set is NOT an alphabetical prefix
+        // of that order ({006,007,008}). Each node's k0s_mesh_ip must equal its REAL address — not
+        // a pool-allocated value that drifts one-off from reality and corrupts the mesh.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let reals = [
+            ("n005", "10.44.0.1"),
+            ("n006", "10.44.0.2"),
+            ("n007", "10.44.0.3"),
+            ("n008", "10.44.0.4"),
+            ("n009", "10.44.0.5"),
+        ];
+        for (name, addr) in reals {
+            register_meshed_node(&cm, name, addr);
+        }
+        // Adversarial: CP set is the middle three, bootstrap 006 (whose real addr is .2, not .1).
+        record_cp_set(&cm, "n006", &["n006", "n007", "n008"]);
+
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+        wait_for("all assigned", || {
+            reals
+                .iter()
+                .all(|(n, _)| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        for (name, addr) in reals {
+            let n = cm.get_node(name).unwrap();
+            assert_eq!(
+                n.k0s_mesh_ip.as_deref(),
+                Some(addr),
+                "{name}: k0s_mesh_ip must equal its real spur0 address"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_adopts_real_address_scrambled_join_order() {
+        // Even an alphabetical-prefix CP set mismatches under a pool allocator if physical join
+        // order was scrambled (real addresses not in hostname order). Adopting the real address
+        // must track physical reality regardless of the name sort.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let reals = [
+            ("n005", "10.44.0.5"),
+            ("n006", "10.44.0.3"),
+            ("n007", "10.44.0.1"),
+            ("n008", "10.44.0.4"),
+            ("n009", "10.44.0.2"),
+        ];
+        for (name, addr) in reals {
+            register_meshed_node(&cm, name, addr);
+        }
+        record_cp_set(&cm, "n005", &["n005", "n006", "n007"]);
+
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+        wait_for("all assigned", || {
+            reals
+                .iter()
+                .all(|(n, _)| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        for (name, addr) in reals {
+            let n = cm.get_node(name).unwrap();
+            assert_eq!(
+                n.k0s_mesh_ip.as_deref(),
+                Some(addr),
+                "{name}: k0s_mesh_ip must track the real address, not the name sort"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_pools_node_with_underlay_comm_address() {
+        // A node whose advertised comm address is OUTSIDE mesh_cidr (e.g. a control plane advertising
+        // its routable underlay address, as real deployments do) is not reporting a mesh address — it
+        // must fall through to pool allocation, NOT be refused. Only an in-mesh address is adopted.
+        // (wg_cidr-vs-mesh_cidr config validation is a separate concern.)
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_meshed_node(&cm, "n005", "198.51.100.5"); // underlay, outside 10.44.0.0/16
+        register_meshed_node(&cm, "n006", "10.44.0.3"); // in-mesh -> adopted
+        record_cp_set(&cm, "n005", &["n005"]);
+
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+        wait_for("both assigned", || {
+            cm.get_node("n005").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("n006").and_then(|n| n.k0s_role).is_some()
+        });
+        // Bootstrap n005 advertised underlay -> pool gives it .1; n006 adopts its real .3.
+        assert_eq!(
+            cm.get_node("n005").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1"),
+            "underlay-advertising bootstrap falls back to pool .1"
+        );
+        assert_eq!(
+            cm.get_node("n006").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.3"),
+            "in-mesh node adopts its real address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_refuses_conflicting_real_addresses() {
+        // Two unassigned meshed nodes advertising the same real address is a genuine operator mistake:
+        // assigning either would push an exclusive AllowedIPs entry for an address two peers claim. Both
+        // stay unprovisioned and both carry the reason, but the call still succeeds so any other node in
+        // the same tick provisions normally.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_meshed_node(&cm, "n005", "10.44.0.7");
+        register_meshed_node(&cm, "n006", "10.44.0.7"); // duplicate
+        register_meshed_node(&cm, "n007", "10.44.0.9"); // healthy bystander
+        record_cp_set(&cm, "n005", &["n005"]);
+
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+
+        // The healthy node adopts its real address and provisions despite the conflicting pair.
+        wait_for("healthy bystander provisions", || {
+            cm.get_node("n007").and_then(|n| n.k0s_role).is_some()
+        });
+        assert_eq!(
+            cm.get_node("n007").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.9")
+        );
+
+        // Neither conflicting node is assigned, and both name each other in an exact-shape reason so
+        // `spur k8s status` points at the whole conflict.
+        assert!(cm.get_node("n005").and_then(|n| n.k0s_role).is_none());
+        assert!(cm.get_node("n006").and_then(|n| n.k0s_role).is_none());
+        let want = "network mismatch: mesh address 10.44.0.7 claimed by n005, n006";
+        wait_for("both conflicting nodes carry the exact reason", || {
+            cm.get_node("n005")
+                .and_then(|n| n.k0s_last_error)
+                .as_deref()
+                == Some(want)
+                && cm
+                    .get_node("n006")
+                    .and_then(|n| n.k0s_last_error)
+                    .as_deref()
+                    == Some(want)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_refuses_newcomer_colliding_with_assigned_node() {
+        // An already-assigned member owns its mesh IP. A newcomer advertising that same address is the
+        // one refused — the incumbent keeps its assignment, the newcomer stays out with a reason.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_meshed_node(&cm, "n005", "10.44.0.7");
+        record_cp_set(&cm, "n005", &["n005"]);
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+        wait_for("incumbent assigned", || {
+            cm.get_node("n005").and_then(|n| n.k0s_role).is_some()
+        });
+
+        register_meshed_node(&cm, "n006", "10.44.0.7"); // collides with the incumbent's owned address
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+
+        // Incumbent untouched; newcomer refused and told who owns the address.
+        assert_eq!(
+            cm.get_node("n005").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.7")
+        );
+        assert!(cm.get_node("n006").and_then(|n| n.k0s_role).is_none());
+        let want = "network mismatch: mesh address 10.44.0.7 already owned by n005";
+        wait_for("newcomer carries the ownership reason", || {
+            cm.get_node("n006")
+                .and_then(|n| n.k0s_last_error)
+                .as_deref()
+                == Some(want)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_falls_back_to_pool_for_unmeshed_node() {
+        // A node not yet on the mesh (no wg pubkey / no real mesh address) keeps pool allocation so
+        // the pre-mesh provisioning path still works. Bootstrap still gets .1 in that path.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000); // 127.0.0.1, no pubkey -> unmeshed
+        register_node(&cm, "node-b", 4, 8000);
+        record_cp_set(&cm, "node-a", &["node-a"]);
+
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+        wait_for("assigned", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        // Bootstrap keeps .1 via the pool path; the other gets a distinct pooled address.
+        assert_eq!(
+            cm.get_node("node-a").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1")
+        );
+        let b = cm.get_node("node-b").unwrap().k0s_mesh_ip.clone().unwrap();
+        assert_ne!(b, "10.44.0.1", "second node gets a distinct pooled address");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
