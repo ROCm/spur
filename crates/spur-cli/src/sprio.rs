@@ -7,7 +7,13 @@ use spur_proto::proto::{GetJobsRequest, GetPartitionsRequest, JobState};
 
 /// View job priority breakdown for pending jobs.
 #[derive(Parser, Debug)]
-#[command(name = "sprio", about = "View job priority factors")]
+// -h is sprio's --noheader (Slurm convention), so disable clap's auto -h and
+// re-add --help below as long-only.
+#[command(
+    name = "sprio",
+    about = "View job priority factors",
+    disable_help_flag = true
+)]
 pub struct SprioArgs {
     /// Show only these job IDs (comma-separated)
     #[arg(short = 'j', long)]
@@ -24,6 +30,10 @@ pub struct SprioArgs {
     /// Don't print header
     #[arg(short = 'h', long)]
     pub noheader: bool,
+
+    /// Print help
+    #[arg(long, action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
 
     /// Controller address
     #[arg(
@@ -162,4 +172,21 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_h_means_noheader() {
+        let args = SprioArgs::try_parse_from(["sprio", "-h"]).expect("-h is accepted");
+        assert!(args.noheader);
+    }
+
+    #[test]
+    fn help_is_still_reachable_by_its_long_name() {
+        let err = SprioArgs::try_parse_from(["sprio", "--help"]).expect_err("--help stops parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
 }
