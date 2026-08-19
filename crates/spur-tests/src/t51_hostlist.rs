@@ -141,4 +141,70 @@ mod tests {
     fn t51_19_invalid_closing_before_opening_bracket() {
         assert!(hostlist::expand("a]b[1-2]").is_err());
     }
+
+    // ── T51.20: First host ───────────────────────────────────────
+
+    #[test]
+    fn t51_20_first_host_of_range() {
+        assert_eq!(
+            hostlist::expand_first("node[001-003]").unwrap(),
+            Some("node001".to_string())
+        );
+    }
+
+    #[test]
+    fn t51_21_first_host_of_comma_inside_brackets() {
+        assert_eq!(
+            hostlist::expand_first("node[7,1,3]").unwrap(),
+            Some("node7".to_string())
+        );
+    }
+
+    #[test]
+    fn t51_22_first_host_of_multiple_prefixes() {
+        assert_eq!(
+            hostlist::expand_first("gpu[01-02],cpu[01-02]").unwrap(),
+            Some("gpu01".to_string())
+        );
+    }
+
+    #[test]
+    fn t51_23_first_host_of_plain_list_and_single() {
+        assert_eq!(
+            hostlist::expand_first("node1,node2").unwrap(),
+            Some("node1".to_string())
+        );
+        assert_eq!(
+            hostlist::expand_first("login01").unwrap(),
+            Some("login01".to_string())
+        );
+    }
+
+    #[test]
+    fn t51_24_first_host_of_empty_pattern_is_none() {
+        assert_eq!(hostlist::expand_first("").unwrap(), None);
+    }
+
+    #[test]
+    fn t51_25_first_host_agrees_with_full_expansion() {
+        for pattern in [
+            "node[001-003]",
+            "node[9,010-011]",
+            "gpu[01-02],cpu[01-02]",
+            "node1,node2,node3",
+            "login01",
+        ] {
+            assert_eq!(
+                hostlist::expand_first(pattern).unwrap(),
+                hostlist::expand(pattern).unwrap().into_iter().next(),
+                "first host of {pattern} must match full expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn t51_26_first_host_of_invalid_pattern_is_an_error() {
+        assert!(hostlist::expand_first("node[001-003").is_err());
+        assert!(hostlist::expand_first("node[5-1]").is_err());
+    }
 }
