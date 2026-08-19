@@ -253,6 +253,8 @@ pub enum WalOperation {
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         is_default: Option<bool>,
+        #[serde(default)]
+        preempt_exempt_time: Option<Option<u32>>,
     },
     PartitionDelete {
         name: String,

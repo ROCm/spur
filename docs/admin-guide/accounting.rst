@@ -374,6 +374,22 @@ QOS keys
        A job from a higher-``priority`` QOS can preempt a running job from a
        lower-``priority`` QOS when its effective priority exceeds twice the
        victim's.
+   * - ``preempt``
+     - ``""`` (no restriction)
+     - Comma-separated list of QOS names that jobs in this QOS are allowed to
+       preempt. Only enforced when ``scheduler.preempt_type = "qos_priority"``
+       (see :doc:`configuration`). An empty value means this QOS may not preempt
+       any other QOS under that mode. Example: ``preempt=low,batch`` allows jobs
+       in this QOS to preempt ``low`` and ``batch`` jobs. To clear the list:
+       ``sacctmgr modify qos name=<name> set preempt=`` (empty value).
+   * - ``preemptexempttime``
+     - unset (inherits partition / global)
+     - Per-QOS override for the minimum seconds a job must have been running
+       before it is eligible for preemption. Overrides the partition-level
+       ``preempt_exempt_time`` and the global ``scheduler.preempt_exempt_time``
+       (see :doc:`configuration`). ``0`` means immediately preemptable (no
+       exemption). To revert to inheriting from the partition or global default:
+       ``sacctmgr modify qos name=<name> set clearpreemptexempttime=1``.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to usage charged under this QOS.
@@ -398,6 +414,70 @@ QOS keys
    * - ``grpwall``
      - ``0`` (no limit)
      - Aggregate wall-clock time across all jobs under this QOS.
+
+QOS preemption hierarchy
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, Spur's preemption eligibility is based purely on the numeric
+priority gap: any job with an effective priority more than 2× the running
+job's may preempt it (subject to the partition's ``preempt_mode`` gate).
+
+To restrict which QOS tiers may preempt which, enable the QOS preemption
+hierarchy in ``spur.conf``:
+
+.. code-block:: toml
+
+   [scheduler]
+   preempt_type = "qos_priority"
+
+With ``preempt_type = "qos_priority"``, a job may only preempt a running job
+when the pending job's QOS lists the running job's QOS name in its ``preempt``
+allow-list. An empty allow-list means the QOS may not preempt anything.
+
+**Example: two-tier system**
+
+.. code-block:: bash
+
+   # "burst" pool — high-throughput, low-priority, immediately preemptable.
+   sacctmgr add qos name=burst priority=100 preemptmode=cancel
+
+   # "priority" pool — reserved capacity; may preempt burst jobs only.
+   sacctmgr add qos name=priority priority=10000 preempt=burst
+
+   # "reserved" pool — guaranteed; cannot be preempted by anyone,
+   # and cannot preempt anyone (no preemptmode, no preempt list).
+   sacctmgr add qos name=reserved priority=50000
+
+With this setup:
+
+- A ``priority`` job preempts ``burst`` jobs when the priority gap is large enough.
+- A ``priority`` job cannot preempt ``reserved`` jobs (``reserved`` is not in
+  ``priority``'s allow-list).
+- A ``burst`` job never preempts anyone (empty allow-list).
+- ``reserved`` jobs are never preempted (``preemptmode=off`` is the default).
+
+**Minimum exempt time**
+
+To protect recently-started jobs from being immediately evicted, set
+``preempt_exempt_time`` at the global, partition, or QOS level. Resolution
+order: QOS > partition > global.
+
+.. code-block:: bash
+
+   # Global: no job can be preempted in its first 5 minutes.
+   # (Set in spur.conf: scheduler.preempt_exempt_time = 300)
+
+   # Per-QOS: burst jobs are protected for 2 minutes regardless of global.
+   sacctmgr modify qos name=burst set preemptexempttime=120
+
+   # Per-partition via scontrol (runtime, no restart needed):
+   scontrol update PartitionName=gpu PreemptExemptTime=600
+
+   # Clear a per-QOS override (revert to partition/global):
+   sacctmgr modify qos name=burst set clearpreemptexempttime=1
+
+   # Clear a per-partition override (revert to global):
+   scontrol update PartitionName=gpu ClearPreemptExemptTime=yes
 
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

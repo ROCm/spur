@@ -544,10 +544,34 @@ impl SlurmAccounting for AccountingService {
         if let Some(t) = &req.grp_tres {
             validate_tres("grptres", t)?;
         }
+        // Validate that every QOS name in the preempt allow-list exists before
+        // writing — a typo here becomes silent dead config that could retroactively
+        // grant preempt rights if a QOS with that name is created later.
+        let preempt_normalized: Option<String> = match req.preempt.as_deref() {
+            None | Some("") => req.preempt.clone(),
+            Some(list) => {
+                let names: Vec<&str> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let missing = db::missing_qos(pool, &names)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if let Some(name) = missing.first() {
+                    return Err(Status::not_found(format!(
+                        "QOS '{name}' does not exist (in preempt allow-list)"
+                    )));
+                }
+                Some(names.join(","))
+            }
+        };
+
         let update = db::QosUpdate {
             description: req.description.as_deref(),
             priority: req.priority,
             preempt_mode: req.preempt_mode.as_deref(),
+            preempt: preempt_normalized.as_deref(),
             usage_factor: req.usage_factor,
             max_jobs_per_user: nullable_limit(req.max_jobs_per_user, "max_jobs_per_user")?,
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
@@ -559,6 +583,11 @@ impl SlurmAccounting for AccountingService {
             max_tres_per_user: nullable_str(&req.max_tres_per_user),
             grp_tres: nullable_str(&req.grp_tres),
             grp_wall_min: nullable_limit(req.grp_wall_minutes, "grp_wall_minutes")?,
+            preempt_exempt_time: if req.clear_preempt_exempt_time {
+                Some(None)
+            } else {
+                req.preempt_exempt_time.map(|v| Some(v as i32))
+            },
         };
         db::upsert_qos(pool, &req.name, update)
             .await
@@ -591,6 +620,7 @@ impl SlurmAccounting for AccountingService {
                 description: r.description,
                 priority: r.priority,
                 preempt_mode: r.preempt_mode,
+                preempt: r.preempt,
                 usage_factor: r.usage_factor,
                 max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
                 max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
@@ -599,6 +629,7 @@ impl SlurmAccounting for AccountingService {
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
                 grp_wall_minutes: r.grp_wall_min.unwrap_or(0) as u32,
+                preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
             })
             .collect();
 

@@ -430,6 +430,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
+            preempt_exempt_time: None,
         }],
         nodes: Vec::new(),
         network: Default::default(),

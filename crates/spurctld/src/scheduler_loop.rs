@@ -203,7 +203,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
 
-                try_preempt(&cluster, &partitions, &unscheduled).await;
+                try_preempt(
+                    &cluster,
+                    &partitions,
+                    &unscheduled,
+                    &cluster.config().scheduler,
+                )
+                .await;
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
                 if !cluster.config().federation.clusters.is_empty() {
@@ -534,16 +540,37 @@ fn job_preempt_mode(
         .unwrap_or(PreemptMode::Off)
 }
 
+/// Effective preempt-exempt seconds for a running job: QOS > partition > global.
+/// When the job spans multiple partitions, the maximum partition override wins
+/// (most protective), consistent with how `job_preempt_mode` uses the most
+/// aggressive mode across partitions.
+fn effective_exempt_secs(
+    job: &spur_core::job::Job,
+    partitions: &[spur_core::partition::Partition],
+    qos: &spur_core::accounting::Qos,
+    sched: &spur_core::config::SchedulerConfig,
+) -> u32 {
+    if let Some(t) = qos.limits.preempt_exempt_time {
+        return t;
+    }
+    spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+        .into_iter()
+        .filter_map(|p| p.preempt_exempt_time)
+        .max()
+        .unwrap_or(sched.preempt_exempt_time)
+}
+
 /// Preempt lower-priority running jobs per their partition PreemptMode
 /// (Off jobs are never preempted).
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
     unscheduled: &[&spur_core::job::Job],
+    sched: &spur_core::config::SchedulerConfig,
 ) {
     use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
-    use spur_core::partition::{Partition, PreemptMode};
+    use spur_core::partition::{Partition, PreemptMode, PreemptType};
     use spur_core::reservation::job_runs_in_active_reservation;
 
     let now = chrono::Utc::now();
@@ -578,6 +605,16 @@ pub(crate) async fn try_preempt(
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
 
+    // Pending job's QOS is resolved once per pending job; used for the
+    // QosPriority hierarchy check.
+    let pending_qos_map: std::collections::HashMap<
+        spur_core::job::JobId,
+        spur_core::accounting::Qos,
+    > = unscheduled
+        .iter()
+        .map(|j| (j.job_id, cluster.resolve_qos(j)))
+        .collect();
+
     for pending in unscheduled {
         let Some(pending_part) = partition_for(pending) else {
             continue;
@@ -586,6 +623,7 @@ pub(crate) async fn try_preempt(
             continue;
         }
         let pending_tier = pending_part.priority_tier;
+        let pending_qos = &pending_qos_map[&pending.job_id];
 
         for candidate in &running {
             let candidate_priority = running_priority[&candidate.job_id];
@@ -606,7 +644,29 @@ pub(crate) async fn try_preempt(
                 }
             }
 
-            let mode = job_preempt_mode(candidate, partitions, &running_qos[&candidate.job_id]);
+            // QOS hierarchy: pending job may only preempt candidate when the
+            // pending QOS explicitly lists the candidate's QOS in its allow-list.
+            let candidate_qos = &running_qos[&candidate.job_id];
+            if sched.preempt_type == PreemptType::QosPriority
+                && !pending_qos.preempt.contains(&candidate_qos.name)
+            {
+                continue;
+            }
+
+            // Exempt time: skip candidates that haven't been running long enough.
+            // A missing start_time is treated as immediately preemptable — we
+            // can't know when it started, so we don't grant extra protection.
+            let exempt_secs = effective_exempt_secs(candidate, partitions, candidate_qos, sched);
+            if exempt_secs > 0 {
+                if let Some(started_at) = candidate.start_time {
+                    let running_for = (now - started_at).num_seconds().max(0) as u32;
+                    if running_for < exempt_secs {
+                        continue;
+                    }
+                }
+            }
+
+            let mode = job_preempt_mode(candidate, partitions, candidate_qos);
             if mode == PreemptMode::Off {
                 continue;
             }
@@ -2521,6 +2581,118 @@ mod tests {
         qos_with_mode(spur_core::accounting::QosPreemptMode::Off)
     }
 
+    fn sched_config_default() -> spur_core::config::SchedulerConfig {
+        spur_core::config::SchedulerConfig::default()
+    }
+
+    fn sched_config_with_exempt(secs: u32) -> spur_core::config::SchedulerConfig {
+        spur_core::config::SchedulerConfig {
+            preempt_exempt_time: secs,
+            ..Default::default()
+        }
+    }
+
+    fn partition_with_exempt(name: &str, secs: u32) -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: name.into(),
+            preempt_exempt_time: Some(secs),
+            ..Default::default()
+        }
+    }
+
+    fn qos_with_exempt(secs: u32) -> spur_core::accounting::Qos {
+        spur_core::accounting::Qos {
+            limits: spur_core::accounting::QosLimits {
+                preempt_exempt_time: Some(secs),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn qos_with_preempt_list(names: &[&str]) -> spur_core::accounting::Qos {
+        spur_core::accounting::Qos {
+            preempt: names.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn effective_exempt_secs_falls_back_to_global() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_mode(
+            "gpu",
+            spur_core::partition::PreemptMode::Cancel,
+        )];
+        let qos = no_qos_override();
+        let sched = sched_config_with_exempt(120);
+        assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 120);
+    }
+
+    #[test]
+    fn effective_exempt_secs_partition_overrides_global() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_exempt("gpu", 60)];
+        let qos = no_qos_override();
+        let sched = sched_config_with_exempt(300);
+        assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 60);
+    }
+
+    #[test]
+    fn effective_exempt_secs_qos_overrides_partition_and_global() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_exempt("gpu", 60)];
+        let qos = qos_with_exempt(10);
+        let sched = sched_config_with_exempt(300);
+        assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 10);
+    }
+
+    #[test]
+    fn effective_exempt_secs_zero_global_and_no_overrides_is_zero() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_mode(
+            "gpu",
+            spur_core::partition::PreemptMode::Cancel,
+        )];
+        let qos = no_qos_override();
+        let sched = sched_config_default();
+        assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 0);
+    }
+
+    #[test]
+    fn qos_preempt_allow_list_permits_listed_qos() {
+        let pending_qos = qos_with_preempt_list(&["low", "batch"]);
+        let candidate_qos = spur_core::accounting::Qos {
+            name: "low".into(),
+            ..Default::default()
+        };
+        // Simulate the allow-list check from try_preempt.
+        let permitted = pending_qos.preempt.contains(&candidate_qos.name);
+        assert!(permitted);
+    }
+
+    #[test]
+    fn qos_preempt_allow_list_blocks_unlisted_qos() {
+        let pending_qos = qos_with_preempt_list(&["low"]);
+        let candidate_qos = spur_core::accounting::Qos {
+            name: "medium".into(),
+            ..Default::default()
+        };
+        let permitted = pending_qos.preempt.contains(&candidate_qos.name);
+        assert!(!permitted);
+    }
+
+    #[test]
+    fn qos_preempt_empty_allow_list_blocks_all() {
+        let pending_qos = qos_with_preempt_list(&[]);
+        let candidate_qos = spur_core::accounting::Qos {
+            name: "low".into(),
+            ..Default::default()
+        };
+        let permitted = pending_qos.preempt.contains(&candidate_qos.name);
+        assert!(!permitted);
+    }
+
     #[test]
     fn job_preempt_mode_single_partition() {
         use spur_core::partition::PreemptMode;
@@ -2956,6 +3128,7 @@ mod tests {
                     deny_qos: Vec::new(),
                     priority_tier: 1,
                     preempt_mode: String::new(),
+                    preempt_exempt_time: None,
                 }],
                 nodes: Vec::new(),
                 network: Default::default(),

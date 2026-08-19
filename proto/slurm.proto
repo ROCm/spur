@@ -296,6 +296,7 @@ message PartitionInfo {
 
   string preempt_mode = 40;
   uint32 priority_tier = 41;
+  optional uint32 preempt_exempt_time = 44;   // absent = unset (inherits global default); 0 = no exemption
 }
 
 // ============================================================
@@ -1363,6 +1364,17 @@ message CreateQosRequest {
   optional string max_tres_per_user = 10;
   optional string grp_tres = 11;
   optional uint32 grp_wall_minutes = 12;
+  // Comma-separated list of QOS names this QOS is allowed to preempt.
+  // Only enforced when scheduler.preempt_type = qos_priority.
+  // Empty string clears the list. Absent = no change on update.
+  optional string preempt = 13;
+  // Minimum seconds a job must run before eligible for preemption.
+  // 0 is a valid value meaning "immediately preemptable" (no exemption).
+  // Absent = no change on update.
+  optional uint32 preempt_exempt_time = 14;
+  // Set to true to clear preempt_exempt_time back to NULL (inherit from
+  // partition / global default). Takes precedence over preempt_exempt_time.
+  bool clear_preempt_exempt_time = 15;
 }
 
 message DeleteQosRequest {
@@ -1388,6 +1400,9 @@ message QosInfo {
   string max_tres_per_user = 10;
   string grp_tres = 11;
   uint32 grp_wall_minutes = 12;
+  // Comma-separated QOS names this QOS may preempt (empty = none allowed).
+  string preempt = 13;
+  optional uint32 preempt_exempt_time = 14;  // absent = unset (inherits partition/global); 0 = no exemption
 }
 
 // ============================================================
@@ -1448,6 +1463,9 @@ message CreatePartitionRequest {
   repeated string deny_accounts = 14;
   repeated string deny_qos = 15;
   repeated string allow_qos = 16;
+  // Minimum seconds a job must run before it is eligible for preemption.
+  // 0 = no exemption (immediately preemptable). Absent = use global default.
+  optional uint32 preempt_exempt_time = 17;
 }
 
 message UpdatePartitionRequest {
@@ -1468,6 +1486,13 @@ message UpdatePartitionRequest {
   bool set_allow_groups = 14;
   optional uint32 priority_tier = 15;
   optional string preempt_mode = 16;
+  // Minimum seconds a job must run before eligible for preemption.
+  // 0 is a valid value meaning "immediately preemptable" (no exemption).
+  // Absent = no change.
+  optional uint32 preempt_exempt_time = 24;
+  // Set to true to clear preempt_exempt_time back to NULL (inherit from global
+  // default). Takes precedence over preempt_exempt_time.
+  bool clear_preempt_exempt_time = 25;
   repeated string deny_accounts = 17;
   bool set_deny_accounts = 18;
   repeated string deny_qos = 19;

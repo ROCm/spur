@@ -410,6 +410,28 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Grace minutes after a reservation ends before its still-running jobs are
        cancelled.
+   * - ``preempt_type``
+     - string
+     - ``"none"``
+     - Live
+     - Controls cross-QOS preemption eligibility. ``"none"`` (default) applies no
+       QOS-level restrictions — any job with a sufficient priority gap may preempt
+       any other. ``"qos_priority"`` enforces the per-QOS ``preempt`` allow-list:
+       a pending job may only preempt a running job when the pending job's QOS
+       explicitly lists the running job's QOS name in its ``preempt`` field. An
+       empty allow-list means the QOS may not preempt anything. Mirrors Slurm's
+       ``PreemptType=preempt/qos``. See :doc:`accounting` for the QOS
+       ``preempt`` field.
+   * - ``preempt_exempt_time``
+     - integer
+     - ``0``
+     - Live
+     - Cluster-wide minimum number of seconds a job must have been running before
+       it becomes eligible for preemption. ``0`` (default) means a job is
+       immediately eligible. Can be overridden per-partition (``preempt_exempt_time``
+       in ``[[partitions]]``) and per-QOS (``preemptexempttime`` via
+       ``sacctmgr``); the most specific value wins (QOS > partition > global).
+       Mirrors Slurm's ``PreemptExemptTime``.
 
 ``[auth]``
 ----------
@@ -536,6 +558,16 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
      - string
      - ``"off"``
      - Preemption mode: ``cancel``, ``requeue``, ``suspend``; anything else is off.
+   * - ``preempt_exempt_time``
+     - integer or null
+     - ``null`` (inherit global)
+     - Per-partition override for the minimum seconds a job must have been running
+       before it is eligible for preemption. Overrides ``scheduler.preempt_exempt_time``
+       for jobs in this partition. Can be further overridden per-job by the QOS's
+       ``preemptexempttime`` field. Can also be set at runtime without restart via
+       ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
+       use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
+       to revert to the global default.
 
 ``[[nodes]]``
 -------------
