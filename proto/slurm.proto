@@ -62,6 +62,8 @@ enum JobState {
   JOB_SUSPENDED = 9;
   JOB_DEADLINE = 10;
   JOB_OUT_OF_MEMORY = 11;
+  // Finalized end-of-run for an admin requeue; the job returns to PENDING.
+  JOB_REQUEUED = 12;
 }
 
 enum NodeState {
@@ -94,6 +96,8 @@ message JobSpec {
 
   // Resources
   uint32 num_nodes = 10;
+  // 0 means unset: the controller defaults it to one task per node (num_nodes),
+  // matching Slurm, rather than collapsing a multi-node request onto one node.
   uint32 num_tasks = 11;
   uint32 tasks_per_node = 12;
   uint32 cpus_per_task = 13;
@@ -288,9 +292,11 @@ message PartitionInfo {
   string allow_groups = 33;
   string allow_qos = 34;
   string deny_accounts = 42;
+  string deny_qos = 43;
 
   string preempt_mode = 40;
   uint32 priority_tier = 41;
+  optional uint32 preempt_exempt_time = 44;   // absent = unset (inherits global default); 0 = no exemption
 }
 
 // ============================================================
@@ -307,9 +313,14 @@ service SlurmController {
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
   // Finish a standalone srun allocation after its step completes.
   rpc CompleteJob(CompleteJobRequest) returns (google.protobuf.Empty);
+  // Keepalive from an interactive client so an abandoned allocation can be reaped.
+  rpc JobKeepalive(JobKeepaliveRequest) returns (JobKeepaliveResponse);
   rpc SuspendJob(SuspendJobRequest) returns (google.protobuf.Empty);
   rpc ResumeJob(ResumeJobRequest) returns (google.protobuf.Empty);
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
+  // Requeue a running/suspended or finished batch job back to PENDING,
+  // keeping the same job_id and spec. `hold` parks it in a held state.
+  rpc RequeueJob(RequeueJobRequest) returns (RequeueJobResponse);
 
   // Node management
   rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
@@ -354,6 +365,12 @@ service SlurmController {
   // K8s operator callback: report job completion from Pod watcher
   rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
 
+  // Partition management
+  rpc CreatePartition(CreatePartitionRequest) returns (google.protobuf.Empty);
+  rpc UpdatePartition(UpdatePartitionRequest) returns (google.protobuf.Empty);
+  rpc DeletePartition(DeletePartitionRequest) returns (google.protobuf.Empty);
+  rpc Reconfigure(google.protobuf.Empty) returns (google.protobuf.Empty);
+
   // Reservation management
   rpc CreateReservation(CreateReservationRequest) returns (google.protobuf.Empty);
   rpc UpdateReservation(UpdateReservationRequest) returns (google.protobuf.Empty);
@@ -372,18 +389,28 @@ service SlurmController {
   rpc ClusterDown(ClusterDownRequest) returns (ClusterDownResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
   rpc ClusterKubeconfig(ClusterKubeconfigRequest) returns (ClusterKubeconfigResponse);
+  // Grow a running cluster's worker set online (scoped clusters only; no down/reset needed).
+  rpc ClusterAddNodes(ClusterAddNodesRequest) returns (ClusterAddNodesResponse);
+  // Gracefully remove workers from a running cluster (cordon+drain, then k0s reset the node).
+  rpc ClusterRemoveNodes(ClusterRemoveNodesRequest) returns (ClusterRemoveNodesResponse);
 }
 
 // -- Agent service (slurmd) --
 
 service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
+  // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
+  rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
+  // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
+  rpc ReleasePmix(ReleasePmixRequest) returns (ReleasePmixResponse);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+  // Stop an in-flight srun step on this node without cancelling the allocation job.
+  rpc CancelStep(CancelStepRequest) returns (google.protobuf.Empty);
   // Record an allocation on this node without launching a batch process.
   rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
@@ -402,6 +429,11 @@ service SlurmAgent {
   //    the admin kubeconfig or a scoped per-user token. Erroring on a
   //    non-control-plane node is expected. --
   rpc CreateK0sJoinToken(CreateK0sJoinTokenRequest) returns (CreateK0sJoinTokenResponse);
+  // Cordon + drain a k8s node by name (shells `k0s kubectl`). Control-plane-only.
+  rpc DrainK8sNode(DrainK8sNodeRequest) returns (DrainK8sNodeResponse);
+  // Delete a (drained, stopped) k8s Node object by name (shells `k0s kubectl delete node`).
+  // Control-plane-only. Called after the component is stopped so the kubelet can't re-register.
+  rpc DeleteK8sNode(DeleteK8sNodeRequest) returns (DeleteK8sNodeResponse);
   rpc GetKubeconfig(GetKubeconfigRequest) returns (GetKubeconfigResponse);
 
   // Apply the full-mesh WireGuard membership on this node: the controller pushes the
@@ -449,6 +481,7 @@ message SubmitJobRequest {
 
 message SubmitJobResponse {
   uint32 job_id = 1;
+  repeated string warnings = 2;
 }
 
 message GetJobsRequest {
@@ -458,6 +491,8 @@ message GetJobsRequest {
   string account = 4;
   repeated uint32 job_ids = 5;
   string name = 6;
+  // Filter: only jobs allocated on any of these nodes (expanded hostlist).
+  repeated string nodes = 7;
 }
 
 message GetJobsResponse {
@@ -480,6 +515,15 @@ message CompleteJobRequest {
   string user = 3;   // For authorization
 }
 
+// Liveness ping from an interactive client (salloc/srun) so the controller
+// knows the allocation is still attended. Absence past InactiveLimit reaps it.
+message JobKeepaliveRequest {
+  uint32 job_id = 1;
+  string user = 2;   // For authorization (owner or root required).
+}
+
+message JobKeepaliveResponse {}
+
 message SuspendJobRequest {
   uint32 job_id = 1;
   string user = 2;   // For authorization (owner or root required).
@@ -499,6 +543,17 @@ message UpdateJobRequest {
   optional bool hold = 6;
   optional string comment = 7;
   optional string qos = 8;
+}
+
+message RequeueJobRequest {
+  uint32 job_id = 1;   // Array parent id fans out to every task.
+  string user = 2;     // For authorization (owner or root).
+  bool hold = 3;       // Requeue into a held state (requeuehold).
+}
+
+message RequeueJobResponse {
+  uint32 requeued = 1;         // Jobs/array tasks returned to the queue.
+  repeated string skipped = 2; // "job N: reason" for tasks that could not be requeued (array fan-out).
 }
 
 message GetNodesRequest {
@@ -662,6 +717,16 @@ message HeartbeatRequest {
   // learns a key that appears/changes after registration (late mesh, spur0 recreated) and can
   // include the node in ApplyMesh without a spurd restart. Empty when the node has no mesh key.
   string wg_pubkey = 6;
+  // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
+  optional K0sNodeStatus k0s_status = 7;
+}
+
+// Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
+message K0sNodeStatus {
+  bool unit_active = 1;               // node's k0s systemd unit currently reports active
+  // systemd NRestarts for the k0s unit: persists across spurd restarts, resets when the unit is recreated.
+  uint64 restart_count = 2;
+  double install_duration_seconds = 3; // install-to-active seconds, reported once after an install
 }
 
 message RunningJobStatus {
@@ -686,6 +751,13 @@ message PmixLaunchPlan {
   string tmpdir = 6;
   uint32 job_uid = 7;
   uint32 job_gid = 8;
+  uint32 num_nodes = 9;
+  uint32 node_index = 10;
+  repeated string peer_hosts = 11;
+  // 0 = agent falls back to [mpi] config defaults.
+  uint32 modex_connect_timeout_secs = 12;
+  uint32 modex_fence_timeout_secs = 13;
+  uint32 modex_verify_timeout_secs = 14;
 }
 
 // -- Agent --
@@ -705,6 +777,18 @@ message LaunchJobRequest {
   // the controller can drop stale-run reports. 0 = unset (legacy), check off.
   uint32 run_attempt = 9;
   PmixLaunchPlan pmix_plan = 10;
+  // True when this dispatch is itself a per-task fan-out mechanism (a
+  // standalone `srun` request routed through the batch dispatch path, e.g.
+  // an allocation spanning Kubernetes-backed nodes) and `spec.script` is the
+  // literal command that should run `tasks_per_node` times on this node.
+  // False (default) for a genuine `sbatch` batch script: it runs exactly
+  // once per node regardless of tasks_per_node or mpi, matching Slurm
+  // semantics — task multiplicity (including multi-rank MPI) is only
+  // advertised via environment variables, and any fan-out is the script's
+  // own responsibility, typically via an internal `srun` call.
+  bool task_fanout = 11;
+  // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
+  bool pmix_prepared = 12;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -717,6 +801,23 @@ enum LaunchFailureKind {
   // context and so fails the same way everywhere.
   LAUNCH_FAILURE_PROLOG = 1;
 }
+
+message PreparePmixRequest {
+  uint32 job_id = 1;
+  PmixLaunchPlan pmix_plan = 2;
+  uint32 run_attempt = 3;
+}
+
+message PreparePmixResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ReleasePmixRequest {
+  uint32 job_id = 1;
+}
+
+message ReleasePmixResponse {}
 
 message LaunchJobResponse {
   bool success = 1;
@@ -744,6 +845,7 @@ message NodeResourcesResponse {
 message ExecInJobRequest {
   uint32 job_id = 1;
   repeated string command = 2;  // Command to exec inside the container
+  string user = 3;              // Requesting user; must own the job (empty/root bypasses)
 }
 
 message ExecInJobResponse {
@@ -781,6 +883,18 @@ message ClusterUpRequest {
   // Override the control-plane node; empty = pick from [cluster] config / inventory.
   optional string control_plane_node = 1;
   reserved 2; // was install_arc — ARC is not installed by spur/k0s
+  // HA control-plane count (1, 3, or 5). 0/absent = the [cluster] config default. Ignored if
+  // control_plane_nodes is set.
+  optional uint32 control_plane_replicas = 3;
+  // Explicit control-plane node names (1, 3, or 5). First is the etcd bootstrap node.
+  repeated string control_plane_nodes = 4;
+  string caller = 5;   // For authorization (cluster admin required).
+  // Scope the cluster to a subset of the inventory: UNION of a nodes hostlist (e.g. "gpu[01-08]"),
+  // a partition's members, and a label selector (all key=val match). Empty = whole inventory.
+  // Resolved once at up time and persisted; not re-evaluated as inventory changes.
+  string nodes = 6;
+  string partition = 7;
+  map<string, string> selector = 8;
 }
 message ClusterUpResponse {
   bool accepted = 1;
@@ -791,6 +905,7 @@ message ClusterUpResponse {
 message ClusterDownRequest {
   // Also `k0s reset` each node (destructive: wipes cluster state).
   bool reset = 1;
+  string caller = 2;   // For authorization (cluster admin required).
 }
 message ClusterDownResponse {
   bool accepted = 1;
@@ -803,6 +918,10 @@ message ClusterStatusResponse {
   string phase = 1;
   string control_plane_node = 2;
   repeated ClusterNodeStatus nodes = 3;
+  // All control-plane nodes (HA). Bootstrap node first; empty pre-multi-CP (see control_plane_node).
+  repeated string control_plane_nodes = 4;
+  // Member nodes the cluster is scoped to. Empty = the whole inventory is enrolled.
+  repeated string member_nodes = 5;
 }
 
 message ClusterNodeStatus {
@@ -810,12 +929,49 @@ message ClusterNodeStatus {
   string role = 2;             // "controller" | "worker" | "single"
   string component_state = 3;  // systemd active-state: "active" | "inactive" | "failed" | "unknown"
   bool enabled = 4;
+  string reason = 5;           // why this node blocked convergence when degraded; empty otherwise
+}
+
+message ClusterAddNodesRequest {
+  // Nodes to add to a scoped cluster's worker set: UNION of a hostlist (e.g. "gpu[09-12]"), a
+  // partition's members, and a label selector (all key=val match). Same resolution as ClusterUp's
+  // scope fields. At least one selector must be non-empty.
+  string nodes = 1;
+  string partition = 2;
+  map<string, string> selector = 3;
+  string caller = 4;   // For authorization (cluster admin required).
+}
+message ClusterAddNodesResponse {
+  bool accepted = 1;
+  string message = 2;
+  // Current per-node status. A just-added node only appears once the reconcile loop has assigned it
+  // a role (it has none at accept time), so it may be absent from the immediate response.
+  repeated ClusterNodeStatus nodes = 3;
+}
+
+message ClusterRemoveNodesRequest {
+  // Worker nodes to remove (hostlist, e.g. "gpu[09-12]").
+  string nodes = 1;
+  string caller = 2;   // For authorization (cluster admin required).
+  // Max seconds to wait for the k8s drain per node. 0/absent = server default.
+  optional uint32 drain_timeout_secs = 3;
+  // Proceed even if a node has running SPUR jobs (they are left running — this only skips the
+  // busy-node check, it does not evict them) or its drain does not complete (bypasses
+  // PodDisruptionBudgets via kubectl --force --disable-eviction). Destructive.
+  optional bool force = 4;
+}
+message ClusterRemoveNodesResponse {
+  bool accepted = 1;
+  string message = 2;
+  repeated ClusterNodeStatus nodes = 3;  // resulting per-node status after the removal
 }
 
 message ClusterKubeconfigRequest {
-  // Empty -> the cluster-admin kubeconfig. Set -> a namespace-scoped kubeconfig for this SPUR user
-  // (a ServiceAccount + bound token in the user's account namespace).
+  // Target user for the scoped kubeconfig. Empty -> the caller's own namespace. A non-empty value
+  // other than the caller requires cluster admin.
   string user = 1;
+  string caller = 2;   // For authorization; empty is treated as root (internal).
+  bool admin = 3;      // Request the cluster-admin kubeconfig (cluster admin required).
 }
 message ClusterKubeconfigResponse {
   // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP), or the scoped kubeconfig
@@ -864,6 +1020,24 @@ message CreateK0sJoinTokenRequest {
 message CreateK0sJoinTokenResponse {
   // k0s join token (bearer secret — never log).
   string join_token = 1;
+}
+
+message DrainK8sNodeRequest {
+  string node = 1;                  // k8s node name to cordon + drain
+  uint32 timeout_secs = 2;          // drain timeout; 0 = agent default
+  bool force = 3;                   // when set, pass kubectl drain --force --disable-eviction (bypass PDBs)
+}
+message DrainK8sNodeResponse {
+  bool drained = 1;                 // true if cordon+drain completed
+  string message = 2;               // detail when not drained (e.g. PDB blocked, timeout)
+}
+
+message DeleteK8sNodeRequest {
+  string node = 1;                  // k8s node name to delete (after its component is stopped)
+}
+message DeleteK8sNodeResponse {
+  bool deleted = 1;                 // true if the Node object was deleted (or already absent)
+  string message = 2;               // detail on failure
 }
 
 message GetKubeconfigRequest {
@@ -915,6 +1089,8 @@ message RunCommandRequest {
   bool label = 11;             // Prefix output with [rank] inside wrapper
   PmixLaunchPlan pmix_plan = 12;
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
+  // When true, PMIx was prepared via PreparePmix on the controller before RunCommand.
+  bool pmix_prepared = 14;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -930,6 +1106,7 @@ message RegisterJobAllocationRequest {
   ResourceAllocations allocated = 9;
   string mpi = 10;
   string work_dir = 11;
+  string user = 12;  // Job owner; the agent gates exec/attach on it
 }
 
 message RegisterJobAllocationResponse {}
@@ -940,9 +1117,16 @@ message RunCommandResponse {
   string stderr = 3;
 }
 
+message CancelStepRequest {
+  uint32 job_id = 1;
+  uint32 step_id = 2;
+  int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
+}
+
 message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
+  string user = 3;    // Requesting user; must own the job (empty/root bypasses)
 }
 
 message StreamJobOutputChunk {
@@ -967,6 +1151,7 @@ message InitSession {
   WindowSize winsize = 5;    // Initial terminal dimensions
   repeated string argv = 6;  // Command to run (empty = default shell)
   map<string, string> env = 7;
+  string user = 8;           // Requesting user; must own the job (empty/root bypasses)
 }
 
 message InteractiveInput {
@@ -1179,6 +1364,17 @@ message CreateQosRequest {
   optional string max_tres_per_user = 10;
   optional string grp_tres = 11;
   optional uint32 grp_wall_minutes = 12;
+  // Comma-separated list of QOS names this QOS is allowed to preempt.
+  // Only enforced when scheduler.preempt_type = qos_priority.
+  // Empty string clears the list. Absent = no change on update.
+  optional string preempt = 13;
+  // Minimum seconds a job must run before eligible for preemption.
+  // 0 is a valid value meaning "immediately preemptable" (no exemption).
+  // Absent = no change on update.
+  optional uint32 preempt_exempt_time = 14;
+  // Set to true to clear preempt_exempt_time back to NULL (inherit from
+  // partition / global default). Takes precedence over preempt_exempt_time.
+  bool clear_preempt_exempt_time = 15;
 }
 
 message DeleteQosRequest {
@@ -1204,6 +1400,9 @@ message QosInfo {
   string max_tres_per_user = 10;
   string grp_tres = 11;
   uint32 grp_wall_minutes = 12;
+  // Comma-separated QOS names this QOS may preempt (empty = none allowed).
+  string preempt = 13;
+  optional uint32 preempt_exempt_time = 14;  // absent = unset (inherits partition/global); 0 = no exemption
 }
 
 // ============================================================
@@ -1235,11 +1434,75 @@ message CreateJobStepRequest {
   bool pty = 6;               // Allocate a PTY for the step
   WindowSize winsize = 7;     // Initial terminal dimensions
   string node = 8;            // Target node (-w); empty = first allocated node
+  string user = 9;            // Requesting user; must own the job (empty/root bypasses)
 }
 
 message CreateJobStepResponse {
   uint32 step_id = 1;
   string node_addr = 2;        // Address of the selected node (-w target, else first allocated); host:port for agent
+}
+
+// ============================================================
+// Partition Management
+// ============================================================
+
+message CreatePartitionRequest {
+  string name = 1;
+  string nodes = 2;               // hostlist pattern; a node matches if it satisfies this OR selector
+  map<string, string> selector = 3; // label selector; a node matches if it satisfies this OR nodes
+  string state = 4;               // "UP" | "DOWN" | "DRAIN" | "INACTIVE" (default "UP")
+  bool is_default = 5;
+  string max_time = 6;            // e.g. "24:00:00" or "INFINITE" (empty = INFINITE)
+  string default_time = 7;        // e.g. "01:00:00" (empty = no default)
+  optional uint32 max_nodes = 8;
+  uint32 min_nodes = 9;
+  repeated string allow_accounts = 10;
+  repeated string allow_groups = 11;
+  uint32 priority_tier = 12;
+  string preempt_mode = 13;       // "OFF" | "CANCEL" | "REQUEUE" | "SUSPEND"
+  repeated string deny_accounts = 14;
+  repeated string deny_qos = 15;
+  repeated string allow_qos = 16;
+  // Minimum seconds a job must run before it is eligible for preemption.
+  // 0 = no exemption (immediately preemptable). Absent = use global default.
+  optional uint32 preempt_exempt_time = 17;
+}
+
+message UpdatePartitionRequest {
+  string name = 1;                // Required: partition to update
+  optional string nodes = 2;
+  map<string, string> selector = 3;     // replaces; empty = no change unless set_selector
+  bool set_selector = 21;               // true = apply selector (even if empty, to clear it)
+  optional string state = 4;
+  optional bool is_default = 5;
+  optional string max_time = 6;   // "INFINITE" clears the limit
+  optional string default_time = 7;
+  optional uint32 max_nodes_value = 8;  // 0 = clear limit
+  bool clear_max_nodes = 9;
+  optional uint32 min_nodes = 10;
+  repeated string allow_accounts = 11;  // replaces; empty = no change
+  bool set_allow_accounts = 12;         // true = apply allow_accounts (even if empty)
+  repeated string allow_groups = 13;
+  bool set_allow_groups = 14;
+  optional uint32 priority_tier = 15;
+  optional string preempt_mode = 16;
+  // Minimum seconds a job must run before eligible for preemption.
+  // 0 is a valid value meaning "immediately preemptable" (no exemption).
+  // Absent = no change.
+  optional uint32 preempt_exempt_time = 24;
+  // Set to true to clear preempt_exempt_time back to NULL (inherit from global
+  // default). Takes precedence over preempt_exempt_time.
+  bool clear_preempt_exempt_time = 25;
+  repeated string deny_accounts = 17;
+  bool set_deny_accounts = 18;
+  repeated string deny_qos = 19;
+  bool set_deny_qos = 20;
+  repeated string allow_qos = 22;
+  bool set_allow_qos = 23;
+}
+
+message DeletePartitionRequest {
+  string name = 1;
 }
 
 // ============================================================
@@ -1274,7 +1537,9 @@ message DeleteReservationRequest {
   string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
-message ListReservationsRequest { }
+message ListReservationsRequest {
+  string name = 1;  // empty = all
+}
 
 message ListReservationsResponse {
   repeated ReservationInfo reservations = 1;

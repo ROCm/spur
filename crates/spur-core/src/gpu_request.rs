@@ -149,8 +149,9 @@ pub enum GpuRequestError {
 /// Number of tasks placed on each of `num_nodes` nodes.
 ///
 /// Prefers an explicit `tasks_per_node` (uniform); otherwise derives the
-/// per-node counts from the task distribution policy.
-fn tasks_per_node_counts(spec: &JobSpec, num_nodes: u32) -> Vec<u32> {
+/// per-node counts from the task distribution policy. Shared with the scheduler
+/// so per-node CPU reservations follow the same block/cyclic split as GPUs.
+pub fn tasks_per_node_counts(spec: &JobSpec, num_nodes: u32) -> Vec<u32> {
     if let Some(tpn) = spec.tasks_per_node {
         return vec![tpn; num_nodes as usize];
     }

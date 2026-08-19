@@ -12,6 +12,11 @@ use crate::resource::ResourceAllocations;
 /// Unique job identifier assigned by the controller.
 pub type JobId = u32;
 
+/// Base priority assigned to a job that does not request one explicitly.
+/// Non-zero so the multiplicative effective-priority formula (fair-share, age,
+/// partition tier) has a factor to scale, rather than collapsing to the floor.
+pub const DEFAULT_PRIORITY: u32 = 1000;
+
 /// Job states matching Slurm's state model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -28,6 +33,9 @@ pub enum JobState {
     Suspended,
     Deadline,
     OutOfMemory,
+    /// Finalized end-of-run for an admin requeue; like `Preempted`, the run is
+    /// over but the job returns to `Pending` rather than staying terminal.
+    Requeued,
 }
 
 /// Sentinel bit spurd OR's into a completion `signal` for an OOM kill, so the
@@ -50,6 +58,7 @@ impl JobState {
             Self::Suspended => "S",
             Self::Deadline => "DL",
             Self::OutOfMemory => "OOM",
+            Self::Requeued => "RQ",
         }
     }
 
@@ -68,6 +77,7 @@ impl JobState {
             Self::Suspended => "SUSPENDED",
             Self::Deadline => "DEADLINE",
             Self::OutOfMemory => "OUT_OF_MEMORY",
+            Self::Requeued => "REQUEUED",
         }
     }
 
@@ -87,6 +97,7 @@ impl JobState {
             Self::Preempted => 9,
             Self::Deadline => 10,
             Self::OutOfMemory => 11,
+            Self::Requeued => 12,
         }
     }
 
@@ -107,10 +118,11 @@ impl JobState {
         matches!(self, Self::Running | Self::Completing | Self::Suspended)
     }
 
-    /// End of a run: `is_terminal()` plus `Preempted` (which may still requeue).
+    /// End of a run: `is_terminal()` plus `Preempted` and `Requeued`, which
+    /// finalize the current run but return the job to `Pending`.
     /// Distinct from `is_terminal()`, whose semantics must not shift.
     pub fn is_finalized(&self) -> bool {
-        self.is_terminal() || matches!(self, Self::Preempted)
+        self.is_terminal() || matches!(self, Self::Preempted | Self::Requeued)
     }
 
     /// Per-node completion state implied by one exit code.
@@ -147,7 +159,7 @@ impl JobState {
     }
 
     /// Every core variant, in proto discriminant order for iteration only.
-    pub const ALL: [JobState; 12] = [
+    pub const ALL: [JobState; 13] = [
         Self::Pending,
         Self::Running,
         Self::Completing,
@@ -160,6 +172,7 @@ impl JobState {
         Self::Suspended,
         Self::Deadline,
         Self::OutOfMemory,
+        Self::Requeued,
     ];
 
     pub const COUNT: usize = Self::ALL.len();
@@ -179,6 +192,7 @@ impl JobState {
             spur_proto::proto::JobState::JobSuspended => Self::Suspended,
             spur_proto::proto::JobState::JobDeadline => Self::Deadline,
             spur_proto::proto::JobState::JobOutOfMemory => Self::OutOfMemory,
+            spur_proto::proto::JobState::JobRequeued => Self::Requeued,
         }
     }
 
@@ -197,6 +211,7 @@ impl JobState {
             Self::Suspended => spur_proto::proto::JobState::JobSuspended,
             Self::Deadline => spur_proto::proto::JobState::JobDeadline,
             Self::OutOfMemory => spur_proto::proto::JobState::JobOutOfMemory,
+            Self::Requeued => spur_proto::proto::JobState::JobRequeued,
         }
     }
 
@@ -245,6 +260,9 @@ pub enum PendingReason {
     ReqNodeNotAvail,
     BeginTime,
     DeadLine,
+    /// Slurm's `FAIL_TIMEOUT`: the run ended because it exhausted its wall-clock
+    /// time limit. Sibling of `DeadLine`, which fires before the job ever starts.
+    TimeLimit,
     Licenses,
     NonZeroExitCode,
     RaisedSignal,
@@ -298,6 +316,7 @@ pub enum PendingReason {
     AssocGrpMemLimit,
     AssocGrpGpuLimit,
     AssocMaxWallDurationPerJobLimit,
+    K8sReserved,
 }
 
 impl PendingReason {
@@ -331,6 +350,7 @@ impl PendingReason {
             Self::ReqNodeNotAvail => "ReqNodeNotAvail",
             Self::BeginTime => "BeginTime",
             Self::DeadLine => "DeadLine",
+            Self::TimeLimit => "TimeLimit",
             Self::Licenses => "Licenses",
             Self::NonZeroExitCode => "NonZeroExitCode",
             Self::RaisedSignal => "RaisedSignal",
@@ -375,6 +395,7 @@ impl PendingReason {
             Self::AssocGrpMemLimit => "AssocGrpMemLimit",
             Self::AssocGrpGpuLimit => "AssocGrpGRES",
             Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
+            Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
         }
     }
 }
@@ -430,6 +451,10 @@ pub struct JobSpec {
 
     // Scheduling
     pub qos: Option<String>,
+    /// Explicit base priority request; `None` means "unset", resolved to
+    /// [`DEFAULT_PRIORITY`] in [`Job::new`] (except when `hold` is set, which
+    /// forces base priority to 0). Not the effective priority the scheduler
+    /// ranks on (that is derived from this each cycle).
     pub priority: Option<u32>,
     pub reservation: Option<String>,
     pub dependency: Vec<String>,
@@ -593,6 +618,20 @@ impl Default for JobSpec {
     }
 }
 
+impl JobSpec {
+    /// Node count to actually allocate: `min(num_nodes, num_tasks)`, since a
+    /// task never spans nodes. An explicit `--ntasks-per-node` pins the layout
+    /// and skips the cap.
+    pub fn effective_num_nodes(&self) -> u32 {
+        let nodes = self.num_nodes.max(1);
+        if self.tasks_per_node.is_some() {
+            nodes
+        } else {
+            nodes.min(self.num_tasks.max(1))
+        }
+    }
+}
+
 /// Total memory (MB) a job of `num_nodes` nodes requests, derived from
 /// either an explicit per-node request or a per-CPU request applied across
 /// the job's total CPU count. Falls back to 0 (unconstrained) if neither is
@@ -696,6 +735,11 @@ pub struct Job {
     /// separately since it isn't a failure signal and never counts toward `max_batch_requeue`.
     #[serde(default)]
     pub preempt_requeue_count: u32,
+    /// Number of times an admin requeued this job (`scontrol requeue`); tracked
+    /// separately as it is an operator action, never a failure, and never counts
+    /// toward `max_batch_requeue`.
+    #[serde(default)]
+    pub user_requeue_count: u32,
 
     /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
     /// the controller drop a completion report from a superseded run.
@@ -718,6 +762,15 @@ pub struct Job {
     #[serde(default)]
     pub srun_step_dispatch: bool,
 
+    /// Wall-clock instant the controller signalled this run for exceeding its
+    /// time limit, cleared on requeue. Replicated rather than kept in the
+    /// watchdog's memory for two reasons: the completion path runs inside the
+    /// Raft apply and must reach the same verdict on every replica, and a
+    /// leadership change mid-grace-period would otherwise restart the grace
+    /// period from scratch.
+    #[serde(default)]
+    pub time_limit_signaled_at: Option<DateTime<Utc>>,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
@@ -739,6 +792,10 @@ pub struct Job {
     pub actual_stdout_path: Option<String>,
     #[serde(default)]
     pub actual_stderr_path: Option<String>,
+
+    /// Set when a job is evicted during PMIx bootstrap or partial dispatch.
+    #[serde(default)]
+    pub launch_failure_detail: Option<String>,
 }
 
 impl Job {
@@ -746,7 +803,7 @@ impl Job {
         let priority = if spec.hold {
             0
         } else {
-            spec.priority.unwrap_or(1000)
+            spec.priority.unwrap_or(DEFAULT_PRIORITY)
         };
         let state = JobState::Pending;
         let pending_reason = if spec.hold {
@@ -776,17 +833,35 @@ impl Job {
             derived_exit_code: 0,
             requeue_count: 0,
             preempt_requeue_count: 0,
+            user_requeue_count: 0,
             run_attempt: 0,
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            time_limit_signaled_at: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
             srun_step_dispatch: false,
             actual_stdout_path: None,
             actual_stderr_path: None,
+            launch_failure_detail: None,
         }
+    }
+
+    /// Slurm-style state reason, including PMIx bootstrap detail when present.
+    /// When `pending_reason_desc` is set it wins over the reason code, matching
+    /// Slurm `state_desc` and [`Job::state_reason_display`].
+    pub fn state_reason(&self) -> String {
+        if let Some(ref desc) = self.pending_reason_desc {
+            return desc.clone();
+        }
+        if self.pending_reason == PendingReason::JobLaunchFailure {
+            if let Some(ref detail) = self.launch_failure_detail {
+                return format!("{} ({detail})", self.pending_reason.display());
+            }
+        }
+        self.pending_reason.display().to_string()
     }
 
     /// Derive a job's `ExitCode` and state from per-node completions, matching
@@ -827,6 +902,39 @@ impl Job {
             }
             None => (JobState::Completed, 0, 0),
         }
+    }
+
+    /// Reconcile the per-node completion verdict with what the controller
+    /// already knows about the run, yielding its final `(state, reason)`.
+    ///
+    /// A run signalled for exceeding its time limit reports `Timeout` however
+    /// the process itself ended: the exit signal records how it was stopped,
+    /// not why. An OOM kill outranks even that, being direct kernel evidence of
+    /// a distinct failure the user has to act on.
+    pub fn completion_verdict(
+        &self,
+        derived_state: JobState,
+        exit_code: i32,
+        signal: i32,
+        oom: bool,
+    ) -> (JobState, PendingReason) {
+        let state = if oom {
+            JobState::OutOfMemory
+        } else if self.time_limit_signaled_at.is_some() {
+            JobState::Timeout
+        } else {
+            derived_state
+        };
+
+        let reason = match state {
+            JobState::OutOfMemory => PendingReason::OutOfMemory,
+            JobState::Timeout => PendingReason::TimeLimit,
+            _ if signal != 0 => PendingReason::RaisedSignal,
+            _ if exit_code != 0 => PendingReason::NonZeroExitCode,
+            _ => PendingReason::None,
+        };
+
+        (state, reason)
     }
 
     pub fn all_nodes_completed(&self) -> bool {
@@ -1059,23 +1167,35 @@ impl Job {
     /// carried. Every write to `pending_reason` goes through here or
     /// [`Job::set_pending_reason_desc`]: a description left behind by an
     /// earlier reason would mask the new one everywhere it is displayed.
+    ///
+    /// Clearing `launch_failure_detail` here is in-memory only; durable detail
+    /// lives in the WAL (`JobLaunchFailureDetail`) until `JobStart` or a new
+    /// detail proposal overwrites it.
     pub fn set_pending_reason(&mut self, reason: PendingReason) {
+        if self.pending_reason == PendingReason::JobLaunchFailure
+            && reason != PendingReason::JobLaunchFailure
+        {
+            self.launch_failure_detail = None;
+        }
         self.pending_reason = reason;
         self.pending_reason_desc = None;
     }
 
     /// Set the reason together with a Slurm-style `state_desc` override.
     pub fn set_pending_reason_desc(&mut self, reason: PendingReason, desc: impl Into<String>) {
+        if self.pending_reason == PendingReason::JobLaunchFailure
+            && reason != PendingReason::JobLaunchFailure
+        {
+            self.launch_failure_detail = None;
+        }
         self.pending_reason = reason;
         self.pending_reason_desc = Some(desc.into());
     }
 
     /// The reason as users see it. Mirrors Slurm, where a `state_desc` wins
     /// over the reason code in both `squeue` and `scontrol show job`.
-    pub fn state_reason_display(&self) -> &str {
-        self.pending_reason_desc
-            .as_deref()
-            .unwrap_or_else(|| self.pending_reason.display())
+    pub fn state_reason_display(&self) -> String {
+        self.state_reason()
     }
 
     /// Attempt a state transition, enforcing the state machine.
@@ -1096,6 +1216,10 @@ impl Job {
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Completing, JobState::Cancelled) => true,
+            // A job signalled for exceeding its time limit routes through
+            // Completing like any other, so the final verdict lands from there
+            // (Slurm's JOB_TIMEOUT | JOB_COMPLETING).
+            (JobState::Completing, JobState::Timeout) => true,
             (JobState::Completing, JobState::NodeFail) => true,
             (JobState::Completing, JobState::OutOfMemory) => true,
             (JobState::Suspended, JobState::Running) => true,
@@ -1110,7 +1234,9 @@ impl Job {
             (JobState::Suspended, JobState::Timeout) => true,
             (JobState::Suspended, JobState::NodeFail) => true,
             (JobState::Suspended, JobState::OutOfMemory) => true,
-            // Requeue transitions: terminal → Pending (for --requeue jobs)
+            // Only failure/preempt states auto-requeue here; a finished or live
+            // run re-pends only via the admin `requeue_to_pending`, so nothing
+            // else can resurrect a finished job.
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
             (JobState::Preempted, JobState::Cancelled) => true,
@@ -1135,6 +1261,23 @@ impl Job {
                 to,
             })
         }
+    }
+
+    /// Admin requeue (`scontrol requeue`): return a live or terminal job to
+    /// Pending. Kept off the general `transition()` machine so nothing else can
+    /// resurrect a finished run.
+    pub fn requeue_to_pending(&mut self) -> Result<(), JobTransitionError> {
+        let ok = self.state.is_terminal()
+            || matches!(self.state, JobState::Running | JobState::Suspended);
+        if !ok {
+            return Err(JobTransitionError::Invalid {
+                from: self.state,
+                to: JobState::Pending,
+            });
+        }
+        self.state = JobState::Pending;
+        self.end_time = None;
+        Ok(())
     }
 
     /// WAL-apply transition: a move to the current state is a `NoOp` (replay /
@@ -1281,6 +1424,72 @@ mod tests {
             },
         );
         assert_eq!(job.resolved_stdout(), "relwork/out.log");
+    }
+
+    #[test]
+    fn effective_num_nodes_caps_at_task_count() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn effective_num_nodes_caps_at_partial_task_count() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 3,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 3);
+    }
+
+    #[test]
+    fn effective_num_nodes_keeps_exact_fit() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 4,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_does_not_grow_beyond_request() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 8,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_honors_explicit_tasks_per_node() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            tasks_per_node: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_floors_at_one() {
+        let spec = JobSpec {
+            num_nodes: 0,
+            num_tasks: 0,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 1);
     }
 
     #[test]
@@ -1519,6 +1728,68 @@ mod tests {
         assert_eq!(signal, 11);
     }
 
+    /// A job whose run the watchdog signalled for exhausting its time limit.
+    fn timed_out_job() -> Job {
+        let mut job = make_job();
+        job.time_limit_signaled_at = Some(Utc::now());
+        job
+    }
+
+    #[test]
+    fn completion_verdict_reports_timeout_for_a_job_killed_by_its_time_limit() {
+        // The regression: SIGTERM from the watchdog looks exactly like any other
+        // signal death to derived_completion, which reports Failed.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_reports_timeout_when_the_job_exits_cleanly_on_sigterm() {
+        // A script that traps SIGTERM, checkpoints, and exits 0 still ran out of
+        // time; the run's outcome is not the handler's exit status.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_leaves_an_unsignalled_death_alone() {
+        // Nothing to do with the time limit: a job killed by an external SIGKILL
+        // must keep reporting Failed / RaisedSignal.
+        let (state, reason) = make_job().completion_verdict(JobState::Failed, 0, 9, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::RaisedSignal);
+
+        let (state, reason) = make_job().completion_verdict(JobState::Failed, 42, 0, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::NonZeroExitCode);
+
+        let (state, reason) = make_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Completed);
+        assert_eq!(reason, PendingReason::None);
+    }
+
+    #[test]
+    fn completion_verdict_lets_an_oom_kill_outrank_the_time_limit() {
+        // Kernel evidence of a specific failure the user must act on beats the
+        // controller's own reason for signalling the job.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 9, true);
+        assert_eq!(state, JobState::OutOfMemory);
+        assert_eq!(reason, PendingReason::OutOfMemory);
+    }
+
+    #[test]
+    fn a_timed_out_job_finalizes_from_completing() {
+        // The completion path routes every job through Completing, so without
+        // this transition a timed-out job could not reach its verdict.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completing).unwrap();
+        job.transition(JobState::Timeout).unwrap();
+        assert_eq!(job.state, JobState::Timeout);
+    }
+
     #[test]
     fn completion_state_for_exit_code_maps_expected_states() {
         assert_eq!(
@@ -1669,6 +1940,70 @@ mod tests {
     }
 
     #[test]
+    fn requeued_is_finalized_but_not_terminal() {
+        // Like Preempted, Requeued ends a run for accounting but returns the
+        // job to Pending, so it must not be treated as terminal.
+        assert!(JobState::Requeued.is_finalized());
+        assert!(!JobState::Requeued.is_terminal());
+        assert!(!JobState::Requeued.is_active());
+        assert_eq!(JobState::Requeued.display(), "REQUEUED");
+        assert_eq!(JobState::Requeued.code(), "RQ");
+        assert_eq!(
+            JobState::from_proto(JobState::Requeued.to_proto()),
+            JobState::Requeued
+        );
+    }
+
+    #[test]
+    fn requeue_to_pending_covers_live_and_terminal_states() {
+        // A live run finalizes through Requeued to Pending.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.requeue_to_pending().unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.end_time.is_none(), "re-pend clears end_time");
+
+        // Every terminal batch state can be put back in the queue.
+        for terminal in [
+            JobState::Completed,
+            JobState::Cancelled,
+            JobState::Failed,
+            JobState::Timeout,
+            JobState::NodeFail,
+            JobState::OutOfMemory,
+            JobState::Deadline,
+        ] {
+            let mut j = make_job();
+            j.state = terminal;
+            j.requeue_to_pending()
+                .unwrap_or_else(|e| panic!("{terminal:?} must be requeue-able: {e}"));
+            assert_eq!(j.state, JobState::Pending);
+        }
+    }
+
+    #[test]
+    fn general_transition_never_resurrects_a_finished_job() {
+        // The invariant the guarded requeue path preserves: no ordinary
+        // `transition()` caller can move a finished run back to Pending.
+        for terminal in [
+            JobState::Completed,
+            JobState::Cancelled,
+            JobState::OutOfMemory,
+            JobState::Deadline,
+        ] {
+            let mut j = make_job();
+            j.state = terminal;
+            assert!(
+                j.transition(JobState::Pending).is_err(),
+                "{terminal:?} -> Pending must not be a general transition"
+            );
+        }
+        // Requeuing a Pending or Completing job is likewise rejected.
+        let mut pending = make_job();
+        assert!(pending.requeue_to_pending().is_err());
+    }
+
+    #[test]
     fn apply_transition_noop_on_non_terminal_repeat() {
         let mut job = make_job();
         job.transition(JobState::Running).unwrap();
@@ -1810,6 +2145,7 @@ mod tests {
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
+        (PendingReason::TimeLimit, "TimeLimit"),
         (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
         (
             PendingReason::AssocMaxSubmitJobLimit,
@@ -1874,10 +2210,51 @@ mod tests {
 
         job.set_pending_reason_desc(PendingReason::Held, "launch failed requeued held");
         assert_eq!(job.state_reason_display(), "launch failed requeued held");
+        assert_eq!(job.state_reason(), "launch failed requeued held");
         assert_eq!(
             job.pending_reason,
             PendingReason::Held,
             "the description explains the code, it does not replace it"
+        );
+    }
+
+    #[test]
+    fn state_reason_shows_launch_failure_detail_while_pending() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n1: connect failed)"
+        );
+        assert_eq!(
+            job.state_reason_display(),
+            "JobLaunchFailure (PMIx prepare failed: n1: connect failed)"
+        );
+    }
+
+    #[test]
+    fn state_reason_omits_stale_launch_failure_detail_after_requeue() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
+        job.set_pending_reason(PendingReason::Priority);
+        assert_eq!(job.state_reason(), "Priority");
+        assert!(job.launch_failure_detail.is_none());
+    }
+
+    #[test]
+    fn job_dispatch_backoff_preserves_launch_failure_detail() {
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: timeout".into());
+        job.requeue_count += 1;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n1: timeout)"
         );
     }
 
@@ -1979,6 +2356,7 @@ mod tests {
             (P::JobSuspended, JobState::Suspended),
             (P::JobDeadline, JobState::Deadline),
             (P::JobOutOfMemory, JobState::OutOfMemory),
+            (P::JobRequeued, JobState::Requeued),
         ];
 
         assert_eq!(TABLE.len(), JobState::COUNT);

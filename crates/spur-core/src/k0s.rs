@@ -101,6 +101,70 @@ pub fn k0s_controller_config_yaml(
 }
 
 #[cfg(test)]
+mod cluster_state_tests {
+    use super::{K0sClusterState, K0sPhase};
+
+    // Frozen pre-multi-CP snapshot shape (no control_plane_nodes); must still deserialize or
+    // spurctld crashes restoring an old raft snapshot. Never regenerate.
+    #[test]
+    fn pre_multi_cp_state_deserializes_and_folds_into_controllers() {
+        const PRE_MULTI_CP: &str =
+            r#"{"phase":"ready","control_plane_node":"head-node","reset_requested":false}"#;
+        let st: K0sClusterState = serde_json::from_str(PRE_MULTI_CP).expect(
+            "pre-multi-CP K0sClusterState must deserialize; a new field needs serde(default)",
+        );
+        assert_eq!(st.phase, K0sPhase::Ready);
+        assert!(st.control_plane_nodes.is_empty());
+        assert_eq!(st.controllers(), vec!["head-node"]);
+        assert_eq!(st.bootstrap().as_deref(), Some("head-node"));
+    }
+
+    #[test]
+    fn controllers_prefers_the_set_when_present() {
+        let st = K0sClusterState {
+            phase: K0sPhase::Ready,
+            control_plane_node: Some("cp-1".into()),
+            control_plane_nodes: vec!["cp-1".into(), "cp-2".into(), "cp-3".into()],
+            ..Default::default()
+        };
+        assert_eq!(st.controllers(), vec!["cp-1", "cp-2", "cp-3"]);
+        assert_eq!(st.bootstrap().as_deref(), Some("cp-1"));
+    }
+
+    #[test]
+    fn bootstrap_falls_back_to_first_of_set_when_singular_absent() {
+        let st = K0sClusterState {
+            phase: K0sPhase::Ready,
+            control_plane_nodes: vec!["cp-1".into(), "cp-2".into(), "cp-3".into()],
+            ..Default::default()
+        };
+        assert_eq!(st.bootstrap().as_deref(), Some("cp-1"));
+    }
+
+    #[test]
+    fn controllers_empty_when_down() {
+        assert!(K0sClusterState::default().controllers().is_empty());
+    }
+
+    #[test]
+    fn is_member_empty_scope_matches_all() {
+        let st = K0sClusterState::default();
+        assert!(st.is_member("anything"), "empty scope = whole inventory");
+    }
+
+    #[test]
+    fn is_member_respects_recorded_scope() {
+        let st = K0sClusterState {
+            member_nodes: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert!(st.is_member("a"));
+        assert!(st.is_member("b"));
+        assert!(!st.is_member("c"), "out-of-scope node excluded");
+    }
+}
+
+#[cfg(test)]
 mod k0s_config_tests {
     use super::k0s_controller_config_yaml;
 
@@ -139,6 +203,48 @@ mod k0s_config_tests {
     }
 }
 
+/// Valid HA control-plane counts. Odd only (etcd quorum); capped at 5 (diminishing returns, more
+/// etcd write latency). A single control plane (1) is the non-HA default.
+pub const VALID_CONTROL_PLANE_REPLICAS: [u32; 3] = [1, 3, 5];
+
+/// Validate an HA control-plane replica count: must be 1, 3, or 5. Shared by config load and the
+/// `spur k8s up` gRPC boundary so an even/too-large count fails closed with one consistent message.
+pub fn validate_control_plane_replicas(replicas: u32) -> Result<(), String> {
+    if VALID_CONTROL_PLANE_REPLICAS.contains(&replicas) {
+        return Ok(());
+    }
+    Err(format!(
+        "control-plane replicas must be 1, 3, or 5 for etcd quorum (got {replicas})"
+    ))
+}
+
+/// The majority of `n` (`n/2 + 1`) — the number of control planes whose k0s unit must be active for
+/// the reconcile loop to gate `Ready` (a proxy for etcd quorum, not a direct etcd health check).
+/// `quorum(0)` is 0 (no control plane assigned yet — never a satisfiable quorum).
+pub fn quorum(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    n / 2 + 1
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    use super::quorum;
+
+    #[test]
+    fn quorum_is_majority_for_valid_cp_counts() {
+        assert_eq!(quorum(1), 1);
+        assert_eq!(quorum(3), 2);
+        assert_eq!(quorum(5), 3);
+    }
+
+    #[test]
+    fn quorum_of_zero_is_zero() {
+        assert_eq!(quorum(0), 0);
+    }
+}
+
 /// Which k0s role a node's spurd-owned systemd unit runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -164,8 +270,39 @@ pub enum K0sPhase {
 pub struct K0sClusterState {
     #[serde(default)]
     pub phase: K0sPhase,
+    /// Bootstrap control-plane: seeds etcd (started tokenless), primary endpoint for admin/token RPCs.
     #[serde(default)]
     pub control_plane_node: Option<String>,
+    /// All control-plane nodes (1/3/5). Empty on pre-multi-CP state — read via [`Self::controllers`].
+    #[serde(default)]
+    pub control_plane_nodes: Vec<String>,
+    /// Nodes the cluster is scoped to. Empty = enroll the whole inventory (back-compat).
+    #[serde(default)]
+    pub member_nodes: Vec<String>,
     #[serde(default)]
     pub reset_requested: bool,
+}
+
+impl K0sClusterState {
+    /// The control-plane node set, back-compat with pre-multi-CP state: falls back to the singular
+    /// `control_plane_node` when `control_plane_nodes` is empty (old snapshots/WAL entries).
+    pub fn controllers(&self) -> Vec<String> {
+        if !self.control_plane_nodes.is_empty() {
+            return self.control_plane_nodes.clone();
+        }
+        self.control_plane_node.iter().cloned().collect()
+    }
+
+    /// The bootstrap control-plane (etcd seed): the recorded singular node, else the first of the
+    /// set for HA state where the singular field was never written.
+    pub fn bootstrap(&self) -> Option<String> {
+        self.control_plane_node
+            .clone()
+            .or_else(|| self.control_plane_nodes.first().cloned())
+    }
+
+    /// Whether `name` is in scope for enrollment. An empty `member_nodes` means the whole inventory.
+    pub fn is_member(&self, name: &str) -> bool {
+        self.member_nodes.is_empty() || self.member_nodes.iter().any(|n| n == name)
+    }
 }

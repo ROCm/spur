@@ -1,0 +1,39 @@
+# Spur documentation table of contents (sphinx-external-toc format).
+# rocm-docs-core processes this into ./_toc.yml at build time. This replaces
+# Sphinx `toctree` directives — do not add toctrees to the content pages.
+root: index
+subtrees:
+  - entries:
+      - file: getting-started
+      - file: user-guide/index
+        subtrees:
+          - entries:
+              - file: user-guide/architecture
+              - file: user-guide/submitting-jobs
+              - file: user-guide/interactive
+              - file: user-guide/monitoring-jobs
+              - file: user-guide/running-containers
+              - file: user-guide/slurm-compatibility
+      - file: admin-guide/index
+        subtrees:
+          - entries:
+              - file: admin-guide/configuration
+              - file: admin-guide/accounting
+              - file: admin-guide/dme-integration
+      - file: deployment/index
+        subtrees:
+          - entries:
+              - file: deployment/ansible
+              - file: deployment/native-host
+              - file: deployment/kubernetes
+              - file: deployment/managed-kubernetes
+              - file: deployment/partitioning
+              - file: deployment/upgrading
+              - file: deployment/uninstalling
+      - file: migration-from-slurm
+      - file: developer/index
+        subtrees:
+          - entries:
+              - file: developer/building
+              - file: developer/documentation
+              - file: developer/contributing

@@ -11,10 +11,14 @@ use tracing::{error, info, warn};
 
 use spur_core::job::{Job, JobId, JobState};
 
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, JobFilter};
 use crate::raft::RaftHandle;
 
 use super::db::{self, AccountingRowState};
+
+/// How often the reconcile pass runs. Terminal-job eviction floors its
+/// effective retention above this so a job's DB row can always be repaired first.
+pub const RECONCILE_INTERVAL_SECS: u64 = 120;
 
 /// Periodically re-issue accounting writes for jobs whose accounting DB
 /// record is missing or stale relative to the in-memory job store. Closes
@@ -50,7 +54,7 @@ pub fn spawn_loop(
 /// not candidates.
 async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     let candidates: Vec<Job> = cluster
-        .get_jobs(&[], None, None, None, None, &[])
+        .get_jobs(&JobFilter::default())
         .into_iter()
         .filter(|j| j.start_time.is_some())
         .collect();

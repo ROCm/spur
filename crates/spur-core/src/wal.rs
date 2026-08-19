@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
-use crate::node::NodeState;
+use crate::node::{NodeSource, NodeState};
+use crate::partition::Partition;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
 
@@ -68,6 +69,15 @@ pub enum WalOperation {
         exit_code: i32,
         signal: i32,
     },
+    /// The time-limit watchdog signalled a running job for exhausting its wall
+    /// clock. Durable so the grace period survives a leadership change and so
+    /// every replica finalizes the run as `Timeout` rather than reading the
+    /// terminating signal as an ordinary failure. `at` is stamped on the leader
+    /// so replicas share one instant instead of consulting their own clocks.
+    JobTimeLimitSignaled {
+        job_id: JobId,
+        at: chrono::DateTime<chrono::Utc>,
+    },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
     JobStepComplete {
@@ -86,12 +96,24 @@ pub enum WalOperation {
         /// When set, applied on all replicas so pending reason survives replay.
         #[serde(default)]
         pending_reason: Option<PendingReason>,
+        /// Overrides the reason's default display text, same as
+        /// `JobStateChange`'s `pending_reason_desc`. `#[serde(default)]` so
+        /// older WAL/snapshot entries without this field replay as `None`.
+        #[serde(default)]
+        pending_reason_desc: Option<String>,
         /// When true, clears automatic requeue counter (admin release after max requeue).
         #[serde(default)]
         reset_requeue_count: bool,
         /// When true, clears `spec.reservation` (admin release after reservation delete hold).
         #[serde(default)]
         clear_reservation: bool,
+    },
+    /// Back off a job that failed dispatch before ever leaving Pending, where
+    /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
+    /// if the job has since left Pending.
+    JobDispatchBackoff {
+        job_id: JobId,
+        begin_time: chrono::DateTime<chrono::Utc>,
     },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to
@@ -104,6 +126,27 @@ pub enum WalOperation {
     JobPreemptRequeue {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+    },
+    /// Preempt a running job with cancel. The job transitions Running →
+    /// Preempted → Cancelled: Preempted is reported to accounting so the
+    /// PREEMPTED counter increments; Cancelled is the terminal live state so
+    /// dependents and arrays resolve. Single atomic entry so a leadership
+    /// change cannot strand the job running with its allocations held.
+    JobPreemptCancel {
+        job_id: JobId,
+    },
+    /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
+    /// Pending with the same spec in one atomic step. A running/suspended job is
+    /// finalized once (steps, allocations, accounting-end as REQUEUED) before
+    /// re-pending; an already-terminal job re-pends with no re-finalization.
+    /// `hold` parks it held; `begin_time` defers eligibility (leader-computed).
+    /// NoOp on replay once Pending.
+    JobUserRequeue {
+        job_id: JobId,
+        #[serde(default)]
+        hold: bool,
+        #[serde(default)]
+        begin_time: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobSuspend {
         job_id: JobId,
@@ -121,11 +164,21 @@ pub enum WalOperation {
     /// job's assigned nodes never received the launch dispatch.
     JobEvict {
         job_id: JobId,
+        /// Human-readable bootstrap failure (shown via scontrol / logs).
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    /// Record why a requeued job is back in Pending (survives controller restart).
+    JobLaunchFailureDetail {
+        job_id: JobId,
+        detail: String,
     },
 
     // Node operations
     NodeRegister {
         name: String,
+        #[serde(default)]
+        hostname: String,
         resources: ResourceSet,
         address: String,
         #[serde(default = "default_port")]
@@ -136,14 +189,20 @@ pub enum WalOperation {
         version: String,
         #[serde(default)]
         labels: HashMap<String, String>,
+        #[serde(default)]
+        source: NodeSource,
     },
     NodeUpdate {
         name: String,
+        #[serde(default)]
+        hostname: String,
         resources: ResourceSet,
         address: String,
         port: u16,
         wg_pubkey: String,
         version: String,
+        #[serde(default)]
+        source: NodeSource,
     },
     NodeStateChange {
         name: String,
@@ -171,6 +230,34 @@ pub enum WalOperation {
     },
     TokenRevoke {
         token_id: String,
+    },
+
+    PartitionCreate {
+        partition: Partition,
+    },
+    PartitionUpdate {
+        name: String,
+        /// Fields present in the update; absent fields are left unchanged.
+        nodes: Option<String>,
+        selector: Option<HashMap<String, String>>,
+        state: Option<String>,
+        max_time_minutes: Option<Option<u32>>,
+        default_time_minutes: Option<Option<u32>>,
+        max_nodes: Option<Option<u32>>,
+        min_nodes: Option<u32>,
+        allow_accounts: Option<Vec<String>>,
+        allow_groups: Option<Vec<String>>,
+        deny_accounts: Option<Vec<String>>,
+        deny_qos: Option<Vec<String>>,
+        allow_qos: Option<Vec<String>>,
+        priority_tier: Option<u32>,
+        preempt_mode: Option<String>,
+        is_default: Option<bool>,
+        #[serde(default)]
+        preempt_exempt_time: Option<Option<u32>>,
+    },
+    PartitionDelete {
+        name: String,
     },
 
     ReservationCreate {
@@ -203,7 +290,36 @@ pub enum WalOperation {
         #[serde(default)]
         control_plane_node: Option<String>,
         #[serde(default)]
+        control_plane_nodes: Vec<String>,
+        #[serde(default)]
+        member_nodes: Vec<String>,
+        #[serde(default)]
         reset_requested: bool,
+    },
+    NodeK0sClear {
+        name: String,
+    },
+
+    /// Evict the named terminal jobs to bound controller memory. The leader
+    /// resolves the aged-out set so every replica evicts identically.
+    EvictTerminalJobs {
+        job_ids: Vec<JobId>,
+    },
+    NodeK0sSetError {
+        name: String,
+        error: Option<String>,
+    },
+    /// Grow a scoped k0s cluster's member set online (`spur k8s add-nodes`). Applied as a union into
+    /// `K0sClusterState.member_nodes`, so replaying it is idempotent. Never emitted for a
+    /// whole-inventory cluster (empty `member_nodes`), where every node is already a member.
+    K0sMemberNodesAdd {
+        nodes: Vec<String>,
+    },
+    /// Shrink a scoped k0s cluster's member set online (`spur k8s remove-nodes`). Applied as a
+    /// set-subtraction from `K0sClusterState.member_nodes`, so replaying it is idempotent. Never
+    /// emitted for a whole-inventory cluster (empty `member_nodes`).
+    K0sMemberNodesRemove {
+        nodes: Vec<String>,
     },
 }
 
@@ -444,6 +560,24 @@ mod job_state_change_wal_tests {
     }
 
     #[test]
+    fn job_dispatch_backoff_round_trips() {
+        let hold = chrono::Utc::now() + chrono::Duration::seconds(20);
+        let op = WalOperation::JobDispatchBackoff {
+            job_id: 8,
+            begin_time: hold,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+                assert_eq!(job_id, 8);
+                assert_eq!(begin_time, hold);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn pre_upgrade_job_state_change_without_begin_time_deserializes() {
         // A WAL written before the backoff field existed must still replay.
         let json = r#"{"JobStateChange":{"job_id":3,"old_state":"FAILED","new_state":"PENDING"}}"#;
@@ -454,6 +588,74 @@ mod job_state_change_wal_tests {
             } => {
                 assert_eq!(job_id, 3);
                 assert_eq!(begin_time, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_priority_change_wal_tests {
+    use super::*;
+
+    #[test]
+    fn job_priority_change_carries_a_description_alongside_its_reason() {
+        // Mirrors JobStateChange's pending_reason_desc: a hold applied while a
+        // job is still Pending (e.g. hold_job_for_launch_failure) has nowhere
+        // else to carry a custom description, since there is no state
+        // transition for it to ride along with.
+        let op = WalOperation::JobPriorityChange {
+            job_id: 4,
+            old_priority: 500,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: Some("launch failed requeued held".into()),
+            reset_requeue_count: false,
+            clear_reservation: false,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobPriorityChange {
+                job_id,
+                new_priority,
+                pending_reason,
+                pending_reason_desc,
+                ..
+            } => {
+                assert_eq!(job_id, 4);
+                assert_eq!(new_priority, 0);
+                assert_eq!(pending_reason, Some(PendingReason::Held));
+                assert_eq!(
+                    pending_reason_desc.as_deref(),
+                    Some("launch failed requeued held")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_job_priority_change_without_description_deserializes() {
+        // A WAL written before pending_reason_desc existed on this variant
+        // must still replay (e.g. hold_job / release_job entries from before
+        // this fix).
+        let json = r#"{"JobPriorityChange":{"job_id":4,"old_priority":500,"new_priority":0,"pending_reason":"Held"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobPriorityChange {
+                job_id,
+                pending_reason,
+                pending_reason_desc,
+                reset_requeue_count,
+                clear_reservation,
+                ..
+            } => {
+                assert_eq!(job_id, 4);
+                assert_eq!(pending_reason, Some(PendingReason::Held));
+                assert_eq!(pending_reason_desc, None);
+                assert!(!reset_requeue_count);
+                assert!(!clear_reservation);
             }
             _ => panic!("wrong variant"),
         }
@@ -535,6 +737,30 @@ mod tests {
     }
 
     #[test]
+    fn job_submit_mpi_pmix_round_trips() {
+        use crate::job::JobSpec;
+
+        let op = WalOperation::JobSubmit {
+            job_id: 99,
+            spec: Box::new(JobSpec {
+                name: "mpi-job".into(),
+                user: "alice".into(),
+                mpi: Some("pmix".into()),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobSubmit { job_id, spec } => {
+                assert_eq!(job_id, 99);
+                assert_eq!(spec.mpi.as_deref(), Some("pmix"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
             job_id: 1,
@@ -608,9 +834,40 @@ mod deregistration_wal_tests {
             _ => panic!("wrong variant"),
         }
 
+        let op = WalOperation::NodeK0sClear {
+            name: "gpu-node-1".into(),
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeK0sClear { name } => assert_eq!(name, "gpu-node-1"),
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::NodeK0sSetError {
+            name: "gpu-node-1".into(),
+            error: Some("not active after 10m".into()),
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeK0sSetError { name, error } => {
+                assert_eq!(name, "gpu-node-1");
+                assert_eq!(error.as_deref(), Some("not active after 10m"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
         let op = WalOperation::K0sSetPhase {
             phase: K0sPhase::Ready,
             control_plane_node: Some("head-node".into()),
+            control_plane_nodes: vec!["head-node".into(), "cp-2".into(), "cp-3".into()],
+            member_nodes: vec![
+                "head-node".into(),
+                "cp-2".into(),
+                "cp-3".into(),
+                "w-4".into(),
+            ],
             reset_requested: false,
         };
         let back: WalOperation =
@@ -619,11 +876,86 @@ mod deregistration_wal_tests {
             WalOperation::K0sSetPhase {
                 phase,
                 control_plane_node,
+                control_plane_nodes,
+                member_nodes,
                 reset_requested,
             } => {
                 assert_eq!(phase, K0sPhase::Ready);
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert_eq!(control_plane_nodes, vec!["head-node", "cp-2", "cp-3"]);
+                assert_eq!(member_nodes, vec!["head-node", "cp-2", "cp-3", "w-4"]);
                 assert!(!reset_requested);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::K0sMemberNodesAdd {
+            nodes: vec!["gpu-09".into(), "gpu-10".into()],
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::K0sMemberNodesAdd { nodes } => {
+                assert_eq!(nodes, vec!["gpu-09", "gpu-10"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::K0sMemberNodesRemove {
+            nodes: vec!["gpu-09".into()],
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::K0sMemberNodesRemove { nodes } => {
+                assert_eq!(nodes, vec!["gpu-09"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-multi-CP K0sSetPhase entry (no control_plane_nodes field); must still deserialize
+    // or spurctld crashes on upgrade replay. Never regenerate.
+    #[test]
+    fn k0s_set_phase_pre_multi_cp_payload_still_deserializes() {
+        const K0S_SET_PHASE_PRE_MULTI_CP: &str = r#"{"K0sSetPhase":{"phase":"ready","control_plane_node":"head-node","reset_requested":false}}"#;
+        let op: WalOperation = serde_json::from_str(K0S_SET_PHASE_PRE_MULTI_CP).expect(
+            "pre-multi-CP K0sSetPhase must deserialize; a new field needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                control_plane_nodes,
+                member_nodes,
+                reset_requested,
+            } => {
+                assert_eq!(phase, K0sPhase::Ready);
+                assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert!(control_plane_nodes.is_empty());
+                assert!(member_nodes.is_empty());
+                assert!(!reset_requested);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-member-scope K0sSetPhase entry (has control_plane_nodes, no member_nodes); must
+    // still deserialize with member_nodes defaulting empty (= whole inventory). Never regenerate.
+    #[test]
+    fn k0s_set_phase_pre_member_scope_payload_still_deserializes() {
+        const K0S_SET_PHASE_PRE_MEMBER_SCOPE: &str = r#"{"K0sSetPhase":{"phase":"ready","control_plane_node":"head-node","control_plane_nodes":["head-node","cp-2","cp-3"],"reset_requested":false}}"#;
+        let op: WalOperation = serde_json::from_str(K0S_SET_PHASE_PRE_MEMBER_SCOPE).expect(
+            "pre-member-scope K0sSetPhase must deserialize; member_nodes needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::K0sSetPhase {
+                control_plane_nodes,
+                member_nodes,
+                ..
+            } => {
+                assert_eq!(control_plane_nodes, vec!["head-node", "cp-2", "cp-3"]);
+                assert!(member_nodes.is_empty());
             }
             _ => panic!("wrong variant"),
         }
@@ -645,11 +977,38 @@ mod deregistration_wal_tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    // Frozen on-wire shape; a new field without #[serde(default)] fails here
+    // instead of crashing a controller replaying this entry after upgrade.
+    #[test]
+    fn evict_terminal_jobs_frozen_payload_still_deserializes() {
+        const EVICT: &str = r#"{"EvictTerminalJobs":{"job_ids":[7,42]}}"#;
+        let op: WalOperation = serde_json::from_str(EVICT).expect(
+            "frozen EvictTerminalJobs must deserialize; a new field needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::EvictTerminalJobs { job_ids } => {
+                assert_eq!(job_ids, vec![7, 42]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod suspend_wal_tests {
     use super::*;
+
+    #[test]
+    fn preempt_cancel_op_round_trips() {
+        let op = WalOperation::JobPreemptCancel { job_id: 7 };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobPreemptCancel { job_id } => assert_eq!(job_id, 7),
+            _ => panic!("wrong variant"),
+        }
+    }
 
     #[test]
     fn preempt_requeue_op_round_trips() {
@@ -667,6 +1026,52 @@ mod suspend_wal_tests {
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn user_requeue_op_round_trips() {
+        let begin = chrono::Utc::now();
+        for (hold, begin_time) in [(false, Some(begin)), (true, None), (false, None)] {
+            let op = WalOperation::JobUserRequeue {
+                job_id: 42,
+                hold,
+                begin_time,
+            };
+            let json = serde_json::to_string(&op).unwrap();
+            let back: WalOperation = serde_json::from_str(&json).unwrap();
+            match back {
+                WalOperation::JobUserRequeue {
+                    job_id,
+                    hold: got_hold,
+                    begin_time: got_begin,
+                } => {
+                    assert_eq!(job_id, 42);
+                    assert_eq!(got_hold, hold);
+                    assert_eq!(got_begin, begin_time);
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    /// The optional fields default when absent, so a minimal/older-encoded
+    /// entry still replays.
+    #[test]
+    fn user_requeue_op_defaults_missing_fields() {
+        let json = r#"{"JobUserRequeue":{"job_id":7}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobUserRequeue {
+                job_id,
+                hold,
+                begin_time,
+            } => {
+                assert_eq!(job_id, 7);
+                assert!(!hold);
+                assert_eq!(begin_time, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -712,6 +1117,24 @@ mod suspend_wal_tests {
             }
         }
     }
+
+    #[test]
+    fn job_time_limit_signaled_op_round_trips() {
+        let at = chrono::Utc::now();
+        let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobTimeLimitSignaled {
+                job_id,
+                at: at_back,
+            } => {
+                assert_eq!(job_id, 13);
+                assert_eq!(at_back, at);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -721,11 +1144,31 @@ mod evict_wal_tests {
 
     #[test]
     fn job_evict_op_round_trips() {
-        let op = WalOperation::JobEvict { job_id: 9 };
+        let op = WalOperation::JobEvict {
+            job_id: 9,
+            detail: Some("PMIx prepare failed".into()),
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobEvict { job_id } => assert_eq!(job_id, 9),
+            WalOperation::JobEvict { job_id, detail } => {
+                assert_eq!(job_id, 9);
+                assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let detail_op = WalOperation::JobLaunchFailureDetail {
+            job_id: 42,
+            detail: "PMIx prepare failed: n1: connect failed".into(),
+        };
+        let detail_json = serde_json::to_string(&detail_op).unwrap();
+        let detail_back: WalOperation = serde_json::from_str(&detail_json).unwrap();
+        match detail_back {
+            WalOperation::JobLaunchFailureDetail { job_id, detail } => {
+                assert_eq!(job_id, 42);
+                assert_eq!(detail, "PMIx prepare failed: n1: connect failed");
+            }
             _ => panic!("wrong variant"),
         }
     }

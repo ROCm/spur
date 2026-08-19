@@ -463,6 +463,22 @@ impl SlurmAgent for VirtualAgent {
         }
     }
 
+    async fn prepare_pmix(
+        &self,
+        _request: Request<PreparePmixRequest>,
+    ) -> Result<Response<PreparePmixResponse>, Status> {
+        Err(Status::unimplemented(
+            "PMIx prepare is not supported on the K8s virtual agent",
+        ))
+    }
+
+    async fn release_pmix(
+        &self,
+        _request: Request<ReleasePmixRequest>,
+    ) -> Result<Response<ReleasePmixResponse>, Status> {
+        Ok(Response::new(ReleasePmixResponse {}))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,
@@ -610,6 +626,15 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
+    async fn cancel_step(
+        &self,
+        _request: Request<CancelStepRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "CancelStep is not yet supported by the K8s virtual agent",
+        ))
+    }
+
     async fn register_job_allocation(
         &self,
         _request: Request<RegisterJobAllocationRequest>,
@@ -721,6 +746,24 @@ impl SlurmAgent for VirtualAgent {
         &self,
         _request: Request<CreateK0sJoinTokenRequest>,
     ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn drain_k8s_node(
+        &self,
+        _request: Request<DrainK8sNodeRequest>,
+    ) -> Result<Response<DrainK8sNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn delete_k8s_node(
+        &self,
+        _request: Request<DeleteK8sNodeRequest>,
+    ) -> Result<Response<DeleteK8sNodeResponse>, Status> {
         Err(Status::unimplemented(
             "cluster components not supported for K8s agent",
         ))

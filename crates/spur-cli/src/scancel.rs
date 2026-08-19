@@ -70,11 +70,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let signal = parse_signal(args.signal.as_deref())?;
 
-    let user = args
-        .user
-        .unwrap_or_else(|| whoami::username().unwrap_or_else(|_| "unknown".into()));
+    let user = match args.user {
+        Some(user) => user,
+        None => crate::interactive::current_user()?,
+    };
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -112,6 +113,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 account: args.account.unwrap_or_default(),
                 job_ids: Vec::new(),
                 name: args.name.unwrap_or_default(),
+                nodes: Vec::new(),
             })
             .await
             .context("failed to get jobs")?;

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
-use crate::partition::{Partition, PartitionState, PreemptMode};
+use crate::partition::{Partition, PartitionState, PreemptMode, PreemptType};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -168,8 +168,8 @@ pub struct MetricsConfig {
     /// `loopback` binds 127.0.0.1; `all` uses `listen_addr` as-is.
     #[serde(default)]
     pub bind: MetricsBind,
-    /// Reserved for `/metrics/jobs-users-accts` (high cardinality; off by default).
-    /// Route exists but returns 404 until a follow-up PR implements the exporter.
+    /// Serves `/metrics/jobs-users-accts`, which 404s while false. Off by default
+    /// because each job, user, and account becomes its own series.
     #[serde(default)]
     pub high_cardinality: bool,
 }
@@ -218,17 +218,16 @@ impl MetricsConfig {
 }
 
 /// REST API settings for spurctld (Slurm-compatible HTTP on a separate port).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RestApiConfig {
     /// When false, spurctld does not start the REST server.
-    #[serde(default = "default_true_fn")]
+    ///
+    /// Defaults to FALSE: the REST surface performs no authentication, and its submit handler builds
+    /// a job spec directly from the request body, so enabling it on a reachable address exposes
+    /// unauthenticated job submission. Enable it only behind an authenticating proxy or on a
+    /// loopback/administrative interface.
+    #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for RestApiConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// Prolog and epilog hook script configuration.
@@ -254,6 +253,12 @@ pub struct HooksConfig {
     pub srun_prolog: Option<String>,
     /// Script run on the srun invocation node after step completion (Slurm `SrunEpilog`).
     pub srun_epilog: Option<String>,
+    /// Script run on the controller at submission to accept/reject/modify a job.
+    /// Receives the resolved spec as JSON on stdin (Slurm `job_submit.lua` analog).
+    pub job_submit: Option<String>,
+    /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
+    /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
+    pub job_submit_lua: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,10 +325,60 @@ pub struct ControllerConfig {
     /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
     #[serde(default = "default_hold_on_prolog_fail")]
     pub hold_on_prolog_fail: bool,
+
+    /// Seconds a terminal job stays in controller memory before eviction (default
+    /// 3600). `sacct` history is unaffected but `scontrol show job` stops finding
+    /// it after the window; runs once per `scheduler.interval_secs` and is floored
+    /// to the accounting reconcile interval so a job's DB row can be repaired first.
+    #[serde(default = "default_terminal_job_retention_secs")]
+    pub terminal_job_retention_secs: u64,
+
+    /// Seconds a node is skipped for new dispatch after rejecting one as
+    /// resources-unavailable, so it isn't re-picked every tick (default 30, 0 disables).
+    #[serde(default = "default_dispatch_reject_cooldown_secs")]
+    pub dispatch_reject_cooldown_secs: u64,
+
+    /// How much of another user's job a non-owner may see via `get_job` /
+    /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
+    /// the full record; this governs everyone else. Default: `redacted`.
+    #[serde(default)]
+    pub job_info_visibility: JobInfoVisibility,
+}
+
+/// Controls how much of another user's job a non-owner (non-admin) caller can
+/// read back from `get_job` / `get_job_steps`.
+///
+/// The list RPC `get_jobs` already scopes to the caller; the single-fetch paths
+/// historically did not, exposing every job's work_dir, command line, stdio
+/// paths, and — most usefully to an attacker — its allocated nodelist. This
+/// setting closes that leak while leaving the Slurm-standard cluster-visible
+/// queue intact for the fields that are not targeting-sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JobInfoVisibility {
+    /// Non-owners see identity/state/timing/account/priority, but work_dir,
+    /// command, stdio paths, allocated nodelist, comment, and resource detail are
+    /// blanked. The default: preserves visibility, removes the targeting oracle.
+    #[default]
+    Redacted,
+    /// Non-owners get `NOT_FOUND` — the job is invisible unless you own it (or
+    /// are an admin). Strictest; matches `get_jobs`' owner-scoped behaviour.
+    OwnerOnly,
+    /// Legacy: every field is visible to any caller. Opt-in for deployments that
+    /// relied on the previous unscoped behaviour.
+    Full,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_terminal_job_retention_secs() -> u64 {
+    3600
+}
+
+fn default_dispatch_reject_cooldown_secs() -> u64 {
+    30
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -338,6 +393,10 @@ fn default_max_launch_backoff_secs() -> u64 {
 /// day is not a retry policy, and larger values push the computed hold instant
 /// out of chrono's representable range.
 pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
+
+/// Upper bound for `terminal_job_retention_secs` (one year). Operational
+/// guardrail: retaining terminal jobs longer defeats the memory bound.
+pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 
 fn default_listen_addr() -> String {
     "[::]:6817".into()
@@ -374,6 +433,9 @@ impl Default for ControllerConfig {
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
+            terminal_job_retention_secs: default_terminal_job_retention_secs(),
+            dispatch_reject_cooldown_secs: default_dispatch_reject_cooldown_secs(),
+            job_info_visibility: JobInfoVisibility::default(),
         }
     }
 }
@@ -433,6 +495,36 @@ impl Default for AccountingConfig {
     }
 }
 
+/// Submit-time enforcement of partition wall-time (Slurm `EnforcePartLimits`):
+/// `No` admits over-limit jobs to pend, `All` needs all fit, `Any` needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum EnforcePartLimits {
+    #[default]
+    No,
+    All,
+    Any,
+}
+
+// Case-insensitive, and accepts Slurm's `YES` alias for `ALL`, so a value like
+// `enforce_part_limits = "all"` in spur.conf does not fail controller startup.
+impl<'de> Deserialize<'de> for EnforcePartLimits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.trim().to_ascii_uppercase().as_str() {
+            "NO" => Ok(Self::No),
+            "ALL" | "YES" => Ok(Self::All),
+            "ANY" => Ok(Self::Any),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid enforce_part_limits '{other}' (expected NO, ALL, or ANY)"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
     /// Scheduler plugin name.
@@ -447,16 +539,52 @@ pub struct SchedulerConfig {
     /// Fair-share decay half-life (days).
     #[serde(default = "default_halflife")]
     pub fairshare_halflife_days: u32,
-    /// Default job time limit (minutes), if not set per-partition.
+    /// Cluster-wide fallback wall-time (minutes) for a `-t`-less job on a partition
+    /// with no `DefaultTime`. `0` (default) leaves such jobs unbounded; > 0 bounds them.
     #[serde(default = "default_time_limit")]
     pub default_time_limit_minutes: u32,
+    /// Whether to reject over-limit jobs at submit (Slurm `EnforcePartLimits`).
+    #[serde(default)]
+    pub enforce_part_limits: EnforcePartLimits,
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
+    /// Reap an interactive allocation (salloc/srun) whose client has sent no
+    /// keepalive for this many seconds. `0` (the default) disables reaping, so
+    /// abandoned allocations behave as before. Mirrors Slurm's `InactiveLimit`.
+    #[serde(default)]
+    pub inactive_limit_secs: u32,
+    /// Highest base priority a non-admin caller may request at submit (or via
+    /// `scontrol update`). Requests above this are clamped, not rejected; at
+    /// submit the clamp is reported to the caller as a warning, on the update
+    /// path (which has no response field) it is logged. Admins are unaffected.
+    /// Defaults to [`crate::job::DEFAULT_PRIORITY`], so a non-admin can lower but
+    /// not raise priority — Slurm's `nice`-only model, where boosting priority is
+    /// operator-only. Raise it to grant users a band above the baseline.
+    #[serde(default = "default_max_user_priority")]
+    pub max_user_priority: u32,
+    /// Controls which jobs are eligible to preempt which. `None` (default)
+    /// enforces no cross-QOS restrictions — any job with sufficient priority gap
+    /// may preempt any other. `QosPriority` requires the pending job's QOS to
+    /// list the running job's QOS in its `preempt` allow-list. Mirrors Slurm's
+    /// `PreemptType`.
+    #[serde(default)]
+    pub preempt_type: PreemptType,
+    /// Cluster-wide minimum number of seconds a job must have been running before
+    /// it becomes eligible for preemption. Can be overridden per-partition and
+    /// per-QOS. `0` (default) means immediately eligible. Mirrors Slurm's
+    /// `PreemptExemptTime`.
+    #[serde(default)]
+    pub preempt_exempt_time: u32,
 }
+
+/// How often an interactive client (`salloc`/`srun`) pings the controller to
+/// keep its allocation attended. Shared with the CLI so `inactive_limit_secs`
+/// can be validated against it.
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 fn default_scheduler_plugin() -> String {
     "backfill".into()
@@ -468,10 +596,13 @@ fn default_halflife() -> u32 {
     14
 }
 fn default_time_limit() -> u32 {
-    60
+    0
 }
 fn default_complete_wait() -> u32 {
     300
+}
+fn default_max_user_priority() -> u32 {
+    crate::job::DEFAULT_PRIORITY
 }
 
 impl Default for SchedulerConfig {
@@ -481,26 +612,75 @@ impl Default for SchedulerConfig {
             interval_secs: 1,
             max_jobs_per_cycle: 10000,
             fairshare_halflife_days: 14,
-            default_time_limit_minutes: 60,
+            default_time_limit_minutes: 0,
+            enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
             resv_overrun_minutes: 0,
+            inactive_limit_secs: 0,
+            max_user_priority: default_max_user_priority(),
+            preempt_type: PreemptType::None,
+            preempt_exempt_time: 0,
+        }
+    }
+}
+
+/// How strictly the control plane authenticates its callers.
+///
+/// Exists so a running cluster can adopt authentication without an outage: bring the control plane
+/// up in `permissive`, roll credentials out to clients (the logs name every caller still
+/// unauthenticated), then flip to `required`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Do not authenticate at all; trust the identity asserted by the client.
+    Disabled,
+    /// Verify a credential when one is presented, and reject it if invalid; fall back to the
+    /// client-asserted identity when none is presented, logging the caller. The default, because
+    /// flipping an existing cluster straight to `required` locks out every client at once.
+    #[default]
+    Permissive,
+    /// Require a valid credential on every request.
+    Required,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::Disabled => "disabled",
+            AuthMode::Permissive => "permissive",
+            AuthMode::Required => "required",
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Auth plugin: "jwt", "munge", "none".
+    /// Auth plugin: "jwt" (implemented) or "none". "munge" is recognised but not implemented and is
+    /// rejected at startup rather than silently ignored.
     pub plugin: String,
-    /// JWT secret key (file path or inline).
+    /// How strictly callers are authenticated. See [`AuthMode`].
+    #[serde(default)]
+    pub mode: AuthMode,
+    /// JWT secret key (file path or inline). Currently used only to sign/verify NODE admission
+    /// tokens, not user identity.
     pub jwt_key: Option<String>,
+    /// Allow jobs to execute as uid 0 (root).
+    ///
+    /// Default false, and deliberately so: `uid` arrives on the wire as part of the job spec, and a
+    /// job requesting uid 0 previously *skipped* the privilege drop rather than failing it, so any
+    /// peer that could reach the controller could obtain root on a compute node. Enable only on a
+    /// cluster where every submitter is already trusted with root.
+    #[serde(default)]
+    pub allow_root_jobs: bool,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             plugin: "jwt".into(),
+            mode: AuthMode::default(),
             jwt_key: None,
+            allow_root_jobs: false,
         }
     }
 }
@@ -528,9 +708,18 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub deny_accounts: Vec<String>,
     #[serde(default)]
+    pub deny_qos: Vec<String>,
+    #[serde(default)]
+    pub allow_qos: Vec<String>,
+    #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
+    /// Minimum seconds a job must have been running before it is eligible for
+    /// preemption from this partition. Overrides the cluster-wide default.
+    /// `None` defers to `scheduler.preempt_exempt_time`.
+    #[serde(default)]
+    pub preempt_exempt_time: Option<u32>,
 }
 
 fn default_partition_state() -> String {
@@ -556,7 +745,8 @@ pub struct NodeConfig {
     pub gres: Vec<String>,
     #[serde(default)]
     pub features: Vec<String>,
-    /// Override address (if different from hostname).
+    /// Default comm address when the agent has not registered one yet. Does not
+    /// override an agent-registered address.
     pub address: Option<String>,
     /// Scheduling weight. Higher weight = preferred for scheduling.
     #[serde(default = "default_one")]
@@ -581,6 +771,10 @@ pub struct NetworkConfig {
     /// Agent gRPC listen port (default: 6818).
     #[serde(default = "default_agent_port")]
     pub agent_port: u16,
+    /// Reject agent registrations whose comm address is not routable (loopback,
+    /// unspecified, or link-local).
+    #[serde(default)]
+    pub reject_loopback_comm_addr: bool,
 }
 
 fn default_wg_cidr() -> String {
@@ -604,6 +798,7 @@ impl Default for NetworkConfig {
             wg_interface: "spur0".into(),
             wg_port: 51820,
             agent_port: 6818,
+            reject_loopback_comm_addr: false,
         }
     }
 }
@@ -686,6 +881,9 @@ pub struct ClusterConfig {
     /// Hostname of the node that runs the k0s control plane. Empty = pick from inventory.
     #[serde(default)]
     pub control_plane_node: Option<String>,
+    /// HA control-plane count (1, 3, or 5). Overridden per-invocation by `spur k8s up --replicas`.
+    #[serde(default = "default_control_plane_replicas")]
+    pub control_plane_replicas: u32,
     /// k0s release to install/run (e.g. "v1.36.2+k0s.0", or "latest"). Pinned to a known-good
     /// version by default; bumped per spur release. spurd installs this if the binary is missing.
     #[serde(default = "default_k0s_version")]
@@ -708,6 +906,20 @@ pub struct ClusterConfig {
     /// large scratch disk if PVCs will hold much data — the default lives under `/var/lib` (root fs).
     #[serde(default = "default_local_path_dir")]
     pub local_path_dir: String,
+    /// Seconds a k8s (k0s) node may stay non-`active` during provisioning before the reconcile
+    /// loop marks the cluster `degraded` (surfacing which nodes failed). Covers the ~262 MB k0s
+    /// download plus multi-node join.
+    #[serde(default = "default_k8s_provisioning_timeout_secs")]
+    pub k8s_provisioning_timeout_secs: u64,
+    /// Allow `spur k8s kubeconfig --admin` to serve the k0s CLUSTER-ADMIN kubeconfig over RPC.
+    ///
+    /// Default false. The admin check it sits behind compares a client-supplied caller string, so
+    /// while user authentication is unenforced this RPC would hand a cluster-admin credential to any
+    /// peer that can reach the controller. With this off, obtain the admin kubeconfig on the
+    /// control-plane node itself (`k0s kubeconfig admin`); per-user scoped kubeconfigs are
+    /// unaffected.
+    #[serde(default)]
+    pub allow_admin_kubeconfig: bool,
 }
 
 fn default_cluster_distro() -> String {
@@ -715,6 +927,9 @@ fn default_cluster_distro() -> String {
 }
 fn default_k0s_version() -> String {
     crate::k0s::K0S_PINNED_VERSION.into()
+}
+fn default_control_plane_replicas() -> u32 {
+    1
 }
 fn default_k0s_binary() -> String {
     crate::k0s::K0S_DEFAULT_BINARY.into()
@@ -737,6 +952,9 @@ fn default_storage_provisioner() -> String {
 fn default_local_path_dir() -> String {
     crate::k0s::DEFAULT_LOCAL_PATH_DIR.into()
 }
+fn default_k8s_provisioning_timeout_secs() -> u64 {
+    600
+}
 
 impl Default for ClusterConfig {
     fn default() -> Self {
@@ -747,11 +965,14 @@ impl Default for ClusterConfig {
             service_cidr: default_service_cidr(),
             cni_mtu: default_cni_mtu(),
             control_plane_node: None,
+            control_plane_replicas: default_control_plane_replicas(),
             k0s_version: default_k0s_version(),
             k0s_binary: default_k0s_binary(),
             cni: default_cni(),
             storage_provisioner: default_storage_provisioner(),
             local_path_dir: default_local_path_dir(),
+            k8s_provisioning_timeout_secs: default_k8s_provisioning_timeout_secs(),
+            allow_admin_kubeconfig: false,
         }
     }
 }
@@ -999,6 +1220,12 @@ pub struct MpiConfig {
     pub pmix_tmpdir: String,
     #[serde(default = "default_pmix_min_version")]
     pub pmix_min_version: String,
+    #[serde(default = "default_modex_connect_timeout_secs")]
+    pub modex_connect_timeout_secs: u32,
+    #[serde(default = "default_modex_fence_timeout_secs")]
+    pub modex_fence_timeout_secs: u32,
+    #[serde(default = "default_modex_verify_timeout_secs")]
+    pub modex_verify_timeout_secs: u32,
 }
 
 fn default_mpi_plugin_dir() -> String {
@@ -1013,6 +1240,18 @@ fn default_pmix_min_version() -> String {
     "4.1.0".into()
 }
 
+fn default_modex_connect_timeout_secs() -> u32 {
+    5
+}
+
+fn default_modex_fence_timeout_secs() -> u32 {
+    120
+}
+
+fn default_modex_verify_timeout_secs() -> u32 {
+    30
+}
+
 impl Default for MpiConfig {
     fn default() -> Self {
         Self {
@@ -1020,6 +1259,9 @@ impl Default for MpiConfig {
             pmix_plugin: String::new(),
             pmix_tmpdir: default_pmix_tmpdir(),
             pmix_min_version: default_pmix_min_version(),
+            modex_connect_timeout_secs: default_modex_connect_timeout_secs(),
+            modex_fence_timeout_secs: default_modex_fence_timeout_secs(),
+            modex_verify_timeout_secs: default_modex_verify_timeout_secs(),
         }
     }
 }
@@ -1129,11 +1371,86 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Guardrail: retention beyond the cap defeats the memory bound.
+        if self.controller.terminal_job_retention_secs > MAX_TERMINAL_JOB_RETENTION_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.terminal_job_retention_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.terminal_job_retention_secs, MAX_TERMINAL_JOB_RETENTION_SECS
+                ),
+            });
+        }
+        // Capped at the same 1-day ceiling as max_launch_backoff_secs — a longer
+        // dispatch cooldown has no legitimate operational use.
+        if self.controller.dispatch_reject_cooldown_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.dispatch_reject_cooldown_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.dispatch_reject_cooldown_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // A limit below the client's ping interval would reap a live client
+        // between its own keepalives. Require at least two intervals of slack.
+        let inactive = self.scheduler.inactive_limit_secs;
+        if inactive > 0 && u64::from(inactive) < 2 * KEEPALIVE_INTERVAL_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.inactive_limit_secs".into(),
+                value: format!(
+                    "{inactive} (0 disables reaping; otherwise must be >= {})",
+                    2 * KEEPALIVE_INTERVAL_SECS
+                ),
+            });
+        }
+        // `plugin` used to be parsed and never read, so an operator could set "munge" (or a typo)
+        // and get no authentication with no warning — worse than the field not existing. Reject
+        // anything unimplemented instead of silently ignoring it.
+        match self.auth.plugin.as_str() {
+            "jwt" | "none" => {}
+            "munge" => {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.plugin".into(),
+                    value: "munge (not implemented; use \"jwt\", or \"none\" to disable)".into(),
+                })
+            }
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.plugin".into(),
+                    value: format!("{other} (expected \"jwt\" or \"none\")"),
+                })
+            }
+        }
+        // "none" and a mode that promises enforcement are contradictory; fail rather than pick one.
+        if self.auth.plugin == "none" && self.auth.mode == AuthMode::Required {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.mode".into(),
+                value: "required with auth.plugin = \"none\" (no credential can be verified)"
+                    .into(),
+            });
+        }
+
         if self.cluster.enabled {
             if self.cluster.distro != "k0s" {
                 return Err(ConfigError::InvalidValue {
                     field: "cluster.distro".into(),
                     value: format!("{} (only \"k0s\" is supported)", self.cluster.distro),
+                });
+            }
+            if let Err(msg) =
+                crate::k0s::validate_control_plane_replicas(self.cluster.control_plane_replicas)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.control_plane_replicas".into(),
+                    value: msg,
+                });
+            }
+            if self.cluster.k8s_provisioning_timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.k8s_provisioning_timeout_secs".into(),
+                    value: "0 (must be > 0; a cluster would degrade before any node could start)"
+                        .into(),
                 });
             }
             // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
@@ -1221,10 +1538,40 @@ impl SlurmConfig {
                 }
             }
         }
+
+        // Reject malformed partition time strings at load rather than silently
+        // treating them as UNLIMITED (a typo like "1 hour" must fail, not
+        // remove the cap).
+        for pc in &self.partitions {
+            let max = pc
+                .max_time
+                .as_ref()
+                .map(|t| parse_partition_time(&format!("partitions.{}.max_time", pc.name), t))
+                .transpose()?
+                .flatten();
+            let default = pc
+                .default_time
+                .as_ref()
+                .map(|t| parse_partition_time(&format!("partitions.{}.default_time", pc.name), t))
+                .transpose()?
+                .flatten();
+            // A finite DefaultTime above the partition's finite MaxTime would hand
+            // a -t-less job a limit its own partition rejects, so it pends forever.
+            if let (Some(max), Some(default)) = (max, default) {
+                if default > max {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("partitions.{}.default_time", pc.name),
+                        value: format!("{default}m exceeds max_time {max}m"),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Convert partition configs to Partition structs.
+    /// Convert partition configs to Partition structs. Time strings are assumed
+    /// valid here; [`Self::validate`] rejects malformed ones at load, so a stray
+    /// `None` below only ever means UNLIMITED, never a swallowed parse error.
     pub fn build_partitions(&self) -> Vec<Partition> {
         self.partitions
             .iter()
@@ -1243,6 +1590,11 @@ impl SlurmConfig {
                 default_time_minutes: pc.default_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 max_nodes: pc.max_nodes,
                 min_nodes: pc.min_nodes,
+                allow_accounts: pc.allow_accounts.clone(),
+                allow_groups: pc.allow_groups.clone(),
+                deny_accounts: pc.deny_accounts.clone(),
+                deny_qos: pc.deny_qos.clone(),
+                allow_qos: pc.allow_qos.clone(),
                 priority_tier: pc.priority_tier,
                 preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
                     "cancel" => PreemptMode::Cancel,
@@ -1250,21 +1602,46 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
-                allow_accounts: pc.allow_accounts.clone(),
-                deny_accounts: pc.deny_accounts.clone(),
+                preempt_exempt_time: pc.preempt_exempt_time,
                 ..Default::default()
             })
             .collect()
     }
 }
 
-/// Parse a time string like "72:00:00", "4-00:00:00", "INFINITE", "60" (minutes).
+/// Parse a partition time field, distinguishing UNLIMITED from a parse error:
+/// `INFINITE`/`UNLIMITED` -> `Ok(None)`, a valid duration -> `Ok(Some(minutes))`,
+/// anything else -> `Err`. Unlike [`parse_time_minutes`], a typo like `"1 hour"`
+/// fails loudly instead of collapsing to UNLIMITED.
+pub fn parse_partition_time(field: &str, s: &str) -> Result<Option<u32>, ConfigError> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("INFINITE") || trimmed.eq_ignore_ascii_case("UNLIMITED") {
+        return Ok(None);
+    }
+    match parse_time_minutes(trimmed) {
+        Some(minutes) => Ok(Some(minutes)),
+        None => Err(ConfigError::InvalidValue {
+            field: field.into(),
+            value: s.into(),
+        }),
+    }
+}
+
+/// Parse a time string to minutes: Slurm grammar (`60`, `H:MM`, `H:MM:SS`,
+/// `D-HH:MM:SS`, `INFINITE`/`UNLIMITED`) or a suffixed duration (`90m`, `1h`,
+/// `2d12h`, `30s`). Sub-minute remainders round up.
 pub fn parse_time_minutes(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("INFINITE") || s.eq_ignore_ascii_case("UNLIMITED") {
         return None; // No limit
     }
+    parse_slurm_time_minutes(s).or_else(|| {
+        let secs = parse_suffix_duration_seconds(s)?;
+        u32::try_from(secs.div_ceil(60)).ok()
+    })
+}
 
+fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
     // days-hours:minutes:seconds
     if let Some((days, rest)) = s.split_once('-') {
         let days: u32 = days.parse().ok()?;
@@ -1281,21 +1658,25 @@ pub fn parse_time_minutes(s: &str) -> Option<u32> {
             let m: u32 = parts[1].parse().ok()?;
             Some(h * 60 + m)
         }
-        3 => Some(parse_hms(s)?),
+        3 => parse_hms(s),
         _ => None,
     }
 }
 
 /// Parse a time string to total seconds (not minutes).
 ///
-/// Same Slurm-compatible format as `parse_time_minutes` but with second
-/// granularity: "N" → N minutes, "H:MM" → hours+minutes, "H:MM:SS" → exact.
+/// Same accepted formats as [`parse_time_minutes`] (Slurm grammar plus suffixed
+/// durations), but with second granularity: "N" → N minutes, "H:MM" →
+/// hours+minutes, "H:MM:SS" → exact, "90s" → 90 seconds.
 pub fn parse_time_seconds(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("INFINITE") || s.eq_ignore_ascii_case("UNLIMITED") {
         return None;
     }
+    parse_slurm_time_seconds(s).or_else(|| parse_suffix_duration_seconds(s))
+}
 
+fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
     // days-hours:minutes:seconds
     if let Some((days, rest)) = s.split_once('-') {
         let days: u64 = days.parse().ok()?;
@@ -1324,6 +1705,40 @@ pub fn parse_time_seconds(s: &str) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Sum a suffixed duration like `90m`, `1h40m`, `2d12h`, or `30s` to seconds.
+/// Units `d/h/m/s` (case-insensitive); a bare number or trailing digits fail
+/// (the Slurm grammar owns bare numbers).
+fn parse_suffix_duration_seconds(s: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut num: Option<u64> = None;
+    let mut saw_unit = false;
+    for c in s.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            num = Some(
+                num.unwrap_or(0)
+                    .checked_mul(10)?
+                    .checked_add(digit as u64)?,
+            );
+            continue;
+        }
+        let unit_secs: u64 = match c.to_ascii_lowercase() {
+            'd' => 86_400,
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        let value = num.take()?;
+        total = total.checked_add(value.checked_mul(unit_secs)?)?;
+        saw_unit = true;
+    }
+    // Trailing digits without a unit, or no unit at all, is not a duration.
+    if num.is_some() || !saw_unit {
+        return None;
+    }
+    Some(total)
 }
 
 fn parse_hms_seconds(s: &str) -> Option<u64> {
@@ -1371,6 +1786,26 @@ pub fn format_time(total_minutes: Option<u32>) -> String {
                 format!("{}-{:02}:{:02}:00", days, hours, minutes)
             } else {
                 format!("{:02}:{:02}:00", hours, minutes)
+            }
+        }
+    }
+}
+
+/// Format seconds as D-HH:MM:SS or HH:MM:SS. Unlike [`format_time`] this keeps
+/// second precision, so a sub-minute request is not rounded when reported.
+pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
+    match total_seconds {
+        None => "UNLIMITED".into(),
+        Some(secs) => {
+            let secs = secs.max(0);
+            let days = secs / 86_400;
+            let hours = (secs % 86_400) / 3_600;
+            let minutes = (secs % 3_600) / 60;
+            let seconds = secs % 60;
+            if days > 0 {
+                format!("{days}-{hours:02}:{minutes:02}:{seconds:02}")
+            } else {
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             }
         }
     }
@@ -1431,6 +1866,20 @@ cni_mtu = 1400
         // Unsupported distro is rejected.
         assert!(SlurmConfig::load_from_str(
             "cluster_name=\"t\"\n[cluster]\nenabled=true\ndistro=\"k3s\"\n"
+        )
+        .is_err());
+        // control_plane_replicas must be 1/3/5 (etcd quorum); even/too-large is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=2\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=3\n"
+        )
+        .is_ok());
+        // A zero provisioning timeout would degrade before any node could start; rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nk8s_provisioning_timeout_secs=0\n"
         )
         .is_err());
         // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
@@ -1654,6 +2103,8 @@ task_prolog = "/etc/spur/task_prolog.sh"
 task_epilog = "/etc/spur/task_epilog.sh"
 srun_prolog = "/etc/spur/srun_prolog.sh"
 srun_epilog = "/etc/spur/srun_epilog.sh"
+job_submit = "/etc/spur/job_submit.sh"
+job_submit_lua = "/etc/spur/job_submit.lua"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.hooks.prolog.as_deref(), Some("/etc/spur/prolog.sh"));
@@ -1682,6 +2133,14 @@ srun_epilog = "/etc/spur/srun_epilog.sh"
             config.hooks.srun_epilog.as_deref(),
             Some("/etc/spur/srun_epilog.sh")
         );
+        assert_eq!(
+            config.hooks.job_submit.as_deref(),
+            Some("/etc/spur/job_submit.sh")
+        );
+        assert_eq!(
+            config.hooks.job_submit_lua.as_deref(),
+            Some("/etc/spur/job_submit.lua")
+        );
         // metrics section omitted — should keep defaults
         assert!(config.metrics.enabled);
     }
@@ -1697,6 +2156,8 @@ srun_epilog = "/etc/spur/srun_epilog.sh"
         assert!(config.hooks.task_epilog.is_none());
         assert!(config.hooks.srun_prolog.is_none());
         assert!(config.hooks.srun_epilog.is_none());
+        assert!(config.hooks.job_submit.is_none());
+        assert!(config.hooks.job_submit_lua.is_none());
         // hooks section omitted — metrics should keep defaults
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.listen_addr, "[::]:6822");
@@ -1754,6 +2215,197 @@ memory_mb = 1024000
     }
 
     #[test]
+    fn parse_partition_time_distinguishes_unlimited_from_invalid() {
+        assert_eq!(
+            parse_partition_time("p.max_time", "UNLIMITED").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_partition_time("p.max_time", "infinite").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_partition_time("p.max_time", "01:00:00").unwrap(),
+            Some(60)
+        );
+        // Suffixed durations are accepted (honor intent instead of failing).
+        assert_eq!(parse_partition_time("p.max_time", "1h").unwrap(), Some(60));
+        assert_eq!(parse_partition_time("p.max_time", "90m").unwrap(), Some(90));
+        // A genuine typo still fails loudly.
+        assert!(parse_partition_time("p.max_time", "1 hour").is_err());
+        assert!(parse_partition_time("p.max_time", "banana").is_err());
+    }
+
+    #[test]
+    fn enforce_part_limits_parses_case_insensitively_and_yes_alias() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            v: EnforcePartLimits,
+        }
+        let parse = |v: &str| toml::from_str::<W>(&format!("v = \"{v}\"")).unwrap().v;
+        assert_eq!(parse("no"), EnforcePartLimits::No);
+        assert_eq!(parse("all"), EnforcePartLimits::All);
+        assert_eq!(parse("ALL"), EnforcePartLimits::All);
+        assert_eq!(parse("Yes"), EnforcePartLimits::All);
+        assert_eq!(parse("any"), EnforcePartLimits::Any);
+        assert_eq!(parse("ANY"), EnforcePartLimits::Any);
+    }
+
+    #[test]
+    fn enforce_part_limits_rejects_unknown_value() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            #[allow(dead_code)]
+            v: EnforcePartLimits,
+        }
+        assert!(toml::from_str::<W>("v = \"sometimes\"").is_err());
+    }
+
+    #[test]
+    fn format_time_seconds_keeps_second_precision() {
+        assert_eq!(format_time_seconds(Some(630)), "00:10:30");
+        assert_eq!(format_time_seconds(Some(3600)), "01:00:00");
+        assert_eq!(format_time_seconds(Some(90_061)), "1-01:01:01");
+        assert_eq!(format_time_seconds(None), "UNLIMITED");
+    }
+
+    #[test]
+    fn parse_time_minutes_accepts_suffixed_durations() {
+        assert_eq!(parse_time_minutes("1h"), Some(60));
+        assert_eq!(parse_time_minutes("90m"), Some(90));
+        assert_eq!(parse_time_minutes("1h40m"), Some(100));
+        assert_eq!(parse_time_minutes("2d"), Some(2880));
+        assert_eq!(parse_time_minutes("1d12h30m"), Some(2190));
+        // Sub-minute remainders round up, matching the "H:MM:SS" seconds rule.
+        assert_eq!(parse_time_minutes("30s"), Some(1));
+        assert_eq!(parse_time_minutes("1h15s"), Some(61));
+        // Slurm grammar is unchanged and still takes precedence.
+        assert_eq!(parse_time_minutes("60"), Some(60));
+        assert_eq!(parse_time_minutes("01:00:00"), Some(60));
+        assert_eq!(parse_time_minutes("1-00:00:00"), Some(1440));
+        // Non-durations are rejected, not silently accepted.
+        assert_eq!(parse_time_minutes("1 hour"), None);
+        assert_eq!(parse_time_minutes("1.5h"), None);
+        assert_eq!(parse_time_minutes("1h30"), None);
+        assert_eq!(parse_time_minutes("h"), None);
+        assert_eq!(parse_time_minutes("1x"), None);
+    }
+
+    #[test]
+    fn parse_time_seconds_accepts_suffixed_durations() {
+        assert_eq!(parse_time_seconds("1h"), Some(3600));
+        assert_eq!(parse_time_seconds("90m"), Some(5400));
+        assert_eq!(parse_time_seconds("30s"), Some(30));
+        assert_eq!(parse_time_seconds("1h30m15s"), Some(5415));
+        // Slurm grammar unchanged.
+        assert_eq!(parse_time_seconds("60"), Some(3600));
+        assert_eq!(parse_time_seconds("00:00:30"), Some(30));
+    }
+
+    #[test]
+    fn load_accepts_suffixed_partition_max_time() {
+        // "1h" is honored as a 60-minute cap rather than failing or silently
+        // becoming UNLIMITED.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "1h"
+default_time = "30m"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, Some(60));
+        assert_eq!(parts[0].default_time_minutes, Some(30));
+    }
+
+    #[test]
+    fn load_rejects_invalid_partition_max_time() {
+        // A value that is neither Slurm grammar nor a suffixed duration must
+        // fail loudly rather than silently becoming UNLIMITED.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "1 hour"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref field, .. } if field.contains("max_time")),
+            "expected InvalidValue for max_time, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_unlimited_partition_max_time() {
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "UNLIMITED"
+default_time = "INFINITE"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, None);
+        assert_eq!(parts[0].default_time_minutes, None);
+    }
+
+    #[test]
+    fn load_rejects_default_time_above_max_time() {
+        // A finite DefaultTime over MaxTime would auto-fill a -t-less job past the
+        // partition's own cap, pending it forever. Reject at load.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "01:00:00"
+default_time = "02:00:00"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref field, .. } if field.contains("default_time")),
+            "expected InvalidValue for default_time, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_default_time_equal_to_max_time() {
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "01:00:00"
+default_time = "01:00:00"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].default_time_minutes, Some(60));
+    }
+
+    #[test]
+    fn load_accepts_default_time_with_unlimited_max_time() {
+        // UNLIMITED MaxTime caps nothing, so any finite DefaultTime is coherent.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "UNLIMITED"
+default_time = "02:00:00"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, None);
+        assert_eq!(parts[0].default_time_minutes, Some(120));
+    }
+
+    #[test]
     fn build_partitions_propagates_partition_access_control() {
         let toml = r#"
 cluster_name = "test"
@@ -1804,6 +2456,35 @@ max_batch_requeue = 7
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.max_batch_requeue, 7);
+    }
+
+    #[test]
+    fn scheduler_config_rejects_inactive_limit_below_floor() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+inactive_limit_secs = 20
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("inactive_limit_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn scheduler_config_accepts_disabled_or_ample_inactive_limit() {
+        // 0 disables reaping and is always allowed.
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 0\n",
+        )
+        .expect("0 (disabled) must be accepted");
+        // A value at the floor (2x the keepalive interval) is accepted.
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
+        )
+        .expect("a value at the floor must be accepted");
     }
 
     #[test]
@@ -1883,6 +2564,78 @@ max_launch_backoff_secs = 0
         assert!(
             err.to_string().contains("max_launch_backoff_secs"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_terminal_job_retention_secs() {
+        // Beyond the guardrail, load must reject up front rather than silently
+        // retaining terminal jobs long enough to defeat the memory bound.
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {}
+"#,
+            MAX_TERMINAL_JOB_RETENTION_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("terminal_job_retention_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
+"#
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&ok)
+                .unwrap()
+                .controller
+                .terminal_job_retention_secs,
+            MAX_TERMINAL_JOB_RETENTION_SECS,
+            "the bound itself must be accepted"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_dispatch_reject_cooldown_secs() {
+        // Past this bound load must reject rather than accept an unbounded
+        // dispatch cooldown. Zero is valid (disables the cooldown).
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+dispatch_reject_cooldown_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("dispatch_reject_cooldown_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = r#"
+cluster_name = "test"
+
+[controller]
+dispatch_reject_cooldown_secs = 0
+"#;
+        assert_eq!(
+            SlurmConfig::load_from_str(ok)
+                .unwrap()
+                .controller
+                .dispatch_reject_cooldown_secs,
+            0,
+            "zero (disabled) must be accepted"
         );
     }
 

@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod agent_server;
+mod auth_middleware;
 mod cluster;
 pub mod container;
 mod executor;
 pub(crate) mod job_entry;
 mod landlock;
 mod mpi_plugin;
-pub mod pmi;
 pub(crate) mod privdrop;
 pub(crate) mod pty;
 mod reporter;
@@ -87,7 +87,7 @@ struct Args {
     #[arg(short = 'N', long)]
     hostname: Option<String>,
 
-    /// Advertised IP address for the controller to reach this agent.
+    /// Advertised comm address (IP or routable hostname) for inter-node reachability.
     /// If not set, auto-detected from WireGuard interface or hostname resolution.
     #[arg(long, env = "SPUR_NODE_ADDRESS")]
     address: Option<String>,
@@ -180,17 +180,58 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Detect node address (explicit --address > WireGuard > hostname)
-    let node_address = if let Some(ref addr) = args.address {
-        info!(ip = %addr, "using explicit node address");
-        spur_net::address::NodeAddress {
-            ip: addr.clone(),
-            hostname: hostname.clone(),
-            port: listen_port,
-            source: spur_net::address::AddressSource::Static,
+    let explicit_addr = args.address.clone();
+    let node_address = if let Some(ref addr) = explicit_addr {
+        let addr_input = addr.clone();
+        match tokio::task::spawn_blocking(move || spur_net::normalize_comm_address(&addr_input))
+            .await
+            .map_err(|e| anyhow::anyhow!("comm address normalization task failed: {e}"))?
+        {
+            Ok(normalized) => {
+                if spur_net::normalized_comm_addr_is_unusable(&normalized) {
+                    warn!(
+                        comm_addr = %normalized,
+                        input = %addr,
+                        "explicit comm address is not routable; inter-node jobs may fail"
+                    );
+                } else if normalized != *addr {
+                    info!(
+                        input = %addr,
+                        comm_addr = %normalized,
+                        "normalized explicit comm address"
+                    );
+                } else {
+                    info!(comm_addr = %normalized, "using explicit comm address");
+                }
+                spur_net::address::NodeAddress {
+                    ip: normalized,
+                    hostname: hostname.clone(),
+                    port: listen_port,
+                    source: spur_net::address::AddressSource::Static,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    input = %addr,
+                    error = %e,
+                    "failed to normalize comm address; using raw value"
+                );
+                spur_net::address::NodeAddress {
+                    ip: addr.clone(),
+                    hostname: hostname.clone(),
+                    port: listen_port,
+                    source: spur_net::address::AddressSource::Static,
+                }
+            }
         }
     } else {
+        let detect_hostname = hostname.clone();
         let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
-        spur_net::detect_node_address(&hostname, listen_port, &wg_interface)
+        tokio::task::spawn_blocking(move || {
+            spur_net::detect_node_address(&detect_hostname, listen_port, &wg_interface)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("node address detection task failed: {e}"))?
     };
     info!(
         ip = %node_address.ip,
@@ -229,6 +270,10 @@ async fn main() -> anyhow::Result<()> {
     // every register/heartbeat so the controller learns a key that appears/changes after startup.
     let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
 
+    // Shared between the reporter (reads held ids for heartbeats) and the agent
+    // service (owns/mutates it) so the controller can reconcile stale allocations.
+    let running_jobs = agent_server::new_running_jobs();
+
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
@@ -238,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         labels,
         args.token.unwrap_or_default(),
         wg_iface,
+        running_jobs.clone(),
     ));
 
     // Register with controller
@@ -261,6 +307,27 @@ async fn main() -> anyhow::Result<()> {
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
     let mpi_config = config.as_ref().map(|c| c.mpi.clone()).unwrap_or_default();
+    // Default-deny root execution: the job uid arrives on the wire and no RPC authenticates its
+    // caller, so a uid-0 request must be refused unless the operator opted in.
+    let allow_root_jobs = config
+        .as_ref()
+        .map(|c| c.auth.allow_root_jobs)
+        .unwrap_or(false);
+    if allow_root_jobs {
+        // The option only has an effect when spurd itself is root — a non-root spurd cannot grant
+        // root regardless — so do not claim the node will run jobs as root when it cannot.
+        if nix::unistd::geteuid().is_root() {
+            warn!(
+                "[auth] allow_root_jobs is true: this node will execute jobs as root when asked. \
+                 Only safe if every submitter is already trusted with root on this node."
+            );
+        } else {
+            info!(
+                "[auth] allow_root_jobs is true but spurd is not running as root, so it has no \
+                 effect: jobs already run with spurd's (unprivileged) credentials."
+            );
+        }
+    }
     let agent_service = agent_server::AgentService::with_cluster_config(
         reporter.clone(),
         hooks_config,
@@ -268,6 +335,8 @@ async fn main() -> anyhow::Result<()> {
         &cluster_config,
         memlock,
         mpi_config,
+        running_jobs,
+        allow_root_jobs,
     );
 
     // the RPC-driven k0s component owner is idle until the controller sends
@@ -277,6 +346,11 @@ async fn main() -> anyhow::Result<()> {
     // Re-adopt an already-running k0s unit (spurd restart leaves it running) so status/heal are
     // correct immediately, then spawn the heal loop.
     let k0s = agent_service.k0s();
+    // Only report k0s node status when this node actually supervises a k0s unit, so non-k0s
+    // deployments don't emit spur_k8s_node_* series.
+    if cluster_config.enabled {
+        reporter.set_k0s_status(k0s.node_state());
+    }
     k0s.adopt_running_unit().await;
     tokio::spawn(k0s.supervise());
 
@@ -285,7 +359,38 @@ async fn main() -> anyhow::Result<()> {
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
 
+    // Authenticate callers of the agent surface: without this, reaching this port is enough to ask
+    // the node to run work, which steps around the controller's authentication entirely.
+    let auth_mode = config.as_ref().map(|c| c.auth.mode).unwrap_or_default();
+    let jwt_key = config
+        .as_ref()
+        .and_then(|c| c.auth.jwt_key.clone())
+        .unwrap_or_default();
+    match auth_mode {
+        spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
+            anyhow::bail!(
+                "[auth] mode = \"required\" but no jwt_key is configured on this node: the agent \
+                 could never verify a credential and would refuse every launch"
+            )
+        }
+        spur_core::config::AuthMode::Required => {
+            info!("agent requires a cluster credential on every RPC")
+        }
+        spur_core::config::AuthMode::Permissive => warn!(
+            "agent accepts uncredentialed RPCs (auth.mode = permissive): any peer that can reach \
+             this port can ask this node to run work. Set mode = \"required\" once controllers are \
+             upgraded."
+        ),
+        spur_core::config::AuthMode::Disabled => warn!(
+            "agent does NOT authenticate callers (auth.mode = disabled): treat this port as an \
+             administrative boundary."
+        ),
+    }
+
     let server_future = tonic::transport::Server::builder()
+        .layer(crate::auth_middleware::AgentAuthLayer::new(
+            auth_mode, &jwt_key,
+        ))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
 

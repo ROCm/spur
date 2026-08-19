@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod accounting;
+mod agent_client;
 mod association_cache;
+mod auth_middleware;
 mod cluster;
 mod cluster_k8s;
 mod fairshare_cache;
+mod hooks;
 mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
+mod pmix_dispatch;
 mod raft;
 mod raft_server;
 mod rest;
@@ -98,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Fail fast on a broken submit hook (missing, non-executable, or a Lua that
+    // won't compile) instead of deferring the error to the first user submission.
+    hooks::validate_submit_hooks(&config.hooks)?;
+
     // CLI --listen overrides config file; otherwise use config's listen_addr.
     let listen_addr = args
         .listen
@@ -118,8 +126,18 @@ async fn main() -> anyhow::Result<()> {
         spur_update::SPUR_BINARIES,
     );
 
-    // Initialize cluster manager first so Raft recovery can apply entries
-    let cluster = Arc::new(ClusterManager::new(config.clone(), &args.state_dir)?);
+    // Initialize cluster manager first so Raft recovery can apply entries.
+    // Pass the config path so `scontrol reconfigure` can re-read spur.conf.
+    let config_path = if args.config.exists() {
+        Some(args.config.clone())
+    } else {
+        None
+    };
+    let cluster = Arc::new(ClusterManager::new_with_config_path(
+        config.clone(),
+        &args.state_dir,
+        config_path,
+    )?);
 
     // Raft is always-on. When no peers are configured, run a single-node
     // cluster that self-elects instantly (same pattern as Apache Kudu).
@@ -168,8 +186,8 @@ async fn main() -> anyhow::Result<()> {
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
-    // Build accounting PgPool (best-effort — scheduling works without it)
-    let accounting_pool = if config.accounting.database_url.is_empty() {
+    // Accounting stays best-effort so a database outage does not stop scheduling.
+    let accounting_service = if config.accounting.database_url.is_empty() {
         info!("accounting disabled (database_url not configured)");
         None
     } else {
@@ -181,8 +199,13 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(pool) => {
                 if let Err(e) = accounting::db::migrate(&pool).await {
-                    tracing::error!(error = %e, "accounting migration failed; disabling accounting");
-                    None
+                    tracing::error!(
+                        error = %e,
+                        "accounting migration failed; accounting service will report unavailable"
+                    );
+                    Some(accounting::AccountingService::unavailable(
+                        "database migration failed at startup",
+                    ))
                 } else {
                     info!("accounting database connected");
                     let notifier = accounting::AccountingNotifier::new(pool.clone());
@@ -192,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
                         pool.clone(),
                         cluster.clone(),
                         raft_handle.clone(),
-                        std::time::Duration::from_secs(120),
+                        std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
                     );
 
                     cluster.fairshare_cache().spawn_refresh_loop(
@@ -211,15 +234,17 @@ async fn main() -> anyhow::Result<()> {
                         config.accounting.fairshare_refresh_secs as u64,
                     );
 
-                    Some(pool)
+                    Some(accounting::AccountingService::available(pool))
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "failed to connect to accounting database; job history will not be recorded"
+                    "failed to connect to accounting database; accounting service will report unavailable"
                 );
-                None
+                Some(accounting::AccountingService::unavailable(
+                    "database connection failed at startup",
+                ))
             }
         }
     };
@@ -242,6 +267,9 @@ async fn main() -> anyhow::Result<()> {
             cni_mtu: config.cluster.cni_mtu,
             cni: config.cluster.cni.clone(),
             control_plane_node: config.cluster.control_plane_node.clone(),
+            provisioning_timeout: std::time::Duration::from_secs(
+                config.cluster.k8s_provisioning_timeout_secs,
+            ),
         };
         tokio::spawn(async move {
             cluster_k8s::run(k8s_cluster, k8s_raft, k8s_net).await;
@@ -249,17 +277,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start node health checker (only on leader).
+    const HEALTH_TICK_SECS: u64 = 30;
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(HEALTH_TICK_SECS));
+        // Floored at one tick because `LeadershipGrace::observe` is itself only
+        // called once per tick: a grace shorter than that can lapse before the
+        // first post-election check even runs, leaving the fleet exposed to a
+        // mass DOWN before any agent heartbeat lands.
+        let mut grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
+            hb_timeout.max(HEALTH_TICK_SECS),
+        ));
         loop {
             interval.tick().await;
-            if !health_raft.is_leader() {
+            let is_leader = health_raft.is_leader();
+            // Observed before the non-leader bail so a lost term restarts the window.
+            let mark_down = grace.observe(is_leader, std::time::Instant::now());
+            if !is_leader {
                 continue;
             }
-            let evicted = health_cluster.check_node_health(hb_timeout);
+            let evicted = health_cluster.check_node_health(hb_timeout, mark_down);
             for fin in &evicted {
                 if let Some(job) = health_cluster.get_job(fin.job_id) {
                     let c = health_cluster.clone();
@@ -300,6 +340,14 @@ async fn main() -> anyhow::Result<()> {
 
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
+        if !rest_addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %rest_addr,
+                "REST API is enabled on a non-loopback address and performs NO authentication: \
+                 any peer that can reach it can submit and cancel jobs. Restrict it to loopback or \
+                 front it with an authenticating proxy."
+            );
+        }
         let rest_cluster = cluster.clone();
         let rest_raft = raft_handle.clone();
         tokio::spawn(async move {
@@ -310,7 +358,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start gRPC server
-    let addr = listen_addr.parse()?;
+    let addr: std::net::SocketAddr = listen_addr.parse()?;
+    // The controller presents this key as its credential to agents (spurd authenticates callers).
+    crate::agent_client::set_signing_key(config.auth.jwt_key.clone().unwrap_or_default());
+
+    // State the authentication posture explicitly at startup: it determines whether the listening
+    // port is the trust boundary or merely the transport.
+    match config.auth.mode {
+        spur_core::config::AuthMode::Required => {
+            info!(
+                mode = "required",
+                "RPC callers must present a valid credential"
+            )
+        }
+        spur_core::config::AuthMode::Permissive => tracing::warn!(
+            mode = "permissive",
+            "RPC callers are authenticated WHEN they present a credential, and trusted on their \
+             own assertion when they do not. Unauthenticated callers are logged — roll credentials \
+             out (`spur token user`), then set [auth] mode = \"required\"."
+        ),
+        spur_core::config::AuthMode::Disabled => tracing::warn!(
+            mode = "disabled",
+            "RPC callers are NOT authenticated: the identity used for authorization is supplied by \
+             the client. Treat this port as an administrative boundary."
+        ),
+    }
+    if !addr.ip().is_loopback() && config.auth.mode != spur_core::config::AuthMode::Required {
+        tracing::warn!(
+            %addr,
+            "listening on a non-loopback address without required authentication — restrict this \
+             port to trusted hosts."
+        );
+    }
     info!(%addr, "gRPC server listening");
     server::serve(
         addr,
@@ -318,7 +397,8 @@ async fn main() -> anyhow::Result<()> {
         raft_handle,
         rpc_stats,
         sched_stats,
-        accounting_pool,
+        accounting_service,
+        config.cluster.control_plane_replicas,
     )
     .await?;
 
@@ -346,8 +426,11 @@ fn default_config() -> spur_core::config::SlurmConfig {
             allow_accounts: Vec::new(),
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
+            preempt_exempt_time: None,
         }],
         nodes: Vec::new(),
         network: Default::default(),

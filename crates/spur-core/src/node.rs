@@ -223,10 +223,52 @@ pub enum NodeSource {
     Kubernetes { namespace: String },
 }
 
+/// `RegisterAgentRequest.version` sent by the spur-k8s operator.
+pub const K8S_OPERATOR_VERSION: &str = "spur-k8s-operator";
+
+/// Node label carrying the operator's Kubernetes namespace.
+pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
+
+/// Derive node source from agent registration metadata.
+pub fn node_source_from_registration(
+    version: &str,
+    labels: &HashMap<String, String>,
+) -> NodeSource {
+    if version == K8S_OPERATOR_VERSION {
+        NodeSource::Kubernetes {
+            namespace: labels
+                .get(K8S_NAMESPACE_LABEL)
+                .cloned()
+                .filter(|ns| !ns.is_empty())
+                .unwrap_or_else(|| "default".to_string()),
+        }
+    } else {
+        NodeSource::NativeHost
+    }
+}
+
+/// Apply WAL-stored source on replay; re-derive from registration metadata when the
+/// persisted value is the default (pre-source WAL entries and native agents).
+pub fn resolve_wal_node_source(
+    source: &NodeSource,
+    version: &str,
+    labels: &HashMap<String, String>,
+) -> NodeSource {
+    if matches!(source, NodeSource::NativeHost) {
+        node_source_from_registration(version, labels)
+    } else {
+        source.clone()
+    }
+}
+
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
+    /// Cluster node name (NodeName): used by `-w`, partitions, and display.
     pub name: String,
+    /// OS hostname reported at agent registration (NodeHostname).
+    #[serde(default)]
+    pub hostname: String,
     pub state: NodeState,
     pub state_reason: Option<String>,
     /// When true, the current state was set by an operator (admin API, drain,
@@ -261,7 +303,7 @@ pub struct Node {
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 
-    /// Agent address for gRPC communication.
+    /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
     /// Agent gRPC listen port.
     pub port: u16,
@@ -284,6 +326,9 @@ pub struct Node {
     /// per-node pod /24 carved from the cluster pod_cidr.
     #[serde(default)]
     pub k0s_pod_cidr: Option<String>,
+    /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
+    #[serde(default)]
+    pub k0s_last_error: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -297,6 +342,7 @@ impl Node {
     pub fn new(name: String, resources: ResourceSet) -> Self {
         Self {
             name,
+            hostname: String::new(),
             state: NodeState::Unknown,
             state_reason: None,
             admin_locked: false,
@@ -323,6 +369,7 @@ impl Node {
             k0s_role: None,
             k0s_mesh_ip: None,
             k0s_pod_cidr: None,
+            k0s_last_error: None,
         }
     }
 
@@ -340,9 +387,25 @@ impl Node {
             .can_satisfy_with_allocated(&self.alloc_resources, request)
     }
 
+    /// Whether the node has any unallocated CPU headroom (a saturated node is full).
+    pub fn has_free_cpu_capacity(&self) -> bool {
+        !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
+    }
+
     /// Whether this node can accept new work.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available()
+    }
+
+    /// Routable comm address (NodeAddr), when registered.
+    pub fn comm_addr(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    /// True once `spur k8s up` has claimed this node for the managed k0s cluster.
+    /// Such nodes are owned by the k8s scheduler and must not also take Spur jobs.
+    pub fn is_k0s_reserved(&self) -> bool {
+        self.k0s_role.is_some()
     }
 
     /// Update state based on allocation level.
@@ -364,6 +427,27 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_k0s_reserved_tracks_role_assignment() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        assert!(!n.is_k0s_reserved());
+        n.k0s_role = Some(crate::k0s::K0sRole::Worker);
+        assert!(n.is_k0s_reserved());
+        n.k0s_role = None;
+        assert!(!n.is_k0s_reserved());
+    }
+
+    #[test]
+    fn a_node_snapshot_without_k0s_last_error_still_deserializes() {
+        // Pre-upgrade snapshots carry no k0s_last_error; replay must load it as absent
+        // rather than failing the whole restore.
+        let node = Node::new("n1".into(), ResourceSet::default());
+        let mut value = serde_json::to_value(&node).expect("serialize node");
+        value.as_object_mut().unwrap().remove("k0s_last_error");
+        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        assert_eq!(back.k0s_last_error, None);
+    }
 
     #[test]
     fn register_from_unknown_yields_idle() {

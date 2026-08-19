@@ -1,0 +1,53 @@
+matrix:
+- name: reST
+  sources:
+  - ['docs/**/*.rst|!docs/_build/**']
+  expect_match: false
+  aspell:
+    lang: en
+  dictionary:
+    wordlists:
+    - .wordlist.txt
+  pipeline:
+  - pyspelling.filters.text:
+  - pyspelling.filters.context:
+      context_visible_first: true
+      delimiters:
+      - open: '^ *\.\. spellcheck-disable$'
+        content: '[\s\S]*?'
+        close: '^ *\.\. spellcheck-enable$'
+      - open: '(?P<open>`+)'
+        content: '.*?'
+        close: '(?P=open)'
+      - open: ':(?:class|func|ref|doc|option|program|envvar|term|kbd|file|command|code):`'
+        content: '[^`]*?'
+        close: '`'
+      - open: '^ *\.\. (?:code-block|literalinclude|math|csv-table|list-table|toctree)::'
+        content: '[\s\S]*?'
+        close: '^(?=\S)'
+      - open: '^ *\.\. _[^:]+:'
+        content: '.*?'
+        close: '$'
+  - pyspelling.filters.url:
+- name: Markdown
+  sources:
+  - ['docs/**/*.md|!docs/_build/**']
+  expect_match: false
+  aspell:
+    lang: en
+  dictionary:
+    wordlists:
+    - .wordlist.txt
+  pipeline:
+  - pyspelling.filters.context:
+      context_visible_first: true
+      delimiters:
+      - open: '(?s)^ *<!-- *spellcheck-disable *-->'
+        close: '^ *<!-- *spellcheck-enable *-->'
+      - open: '\[[^]]*?]\('
+        content: '[^)]*?'
+        close: '\)'
+      - open: '(?P<open>`+)'
+        content: '.*?'
+        close: '(?P=open)'
+  - pyspelling.filters.url:

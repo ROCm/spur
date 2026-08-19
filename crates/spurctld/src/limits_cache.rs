@@ -4,7 +4,7 @@
 //! Controller-side cache of QoS definitions loaded from the accounting database.
 //!
 //! Mirrors `fairshare_cache`: an `RwLock<HashMap>` refreshed on a background
-//! loop that retains stale data on error. The scheduler's `qos_block_for` reads
+//! loop that retains stale data on error. The scheduler's `qos_block_with` reads
 //! this cache so the dormant `QOS*` pending-reasons fire against real limits.
 
 use std::collections::HashMap;
@@ -123,6 +123,13 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
         description: r.description,
         priority: r.priority,
         preempt_mode: r.preempt_mode.parse::<QosPreemptMode>().unwrap_or_default(),
+        preempt: r
+            .preempt
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
         limits: QosLimits {
             max_jobs_per_user: opt_u32(r.max_jobs_per_user),
             max_submit_jobs_per_user: opt_u32(r.max_submit_per_user),
@@ -131,6 +138,7 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             grp_tres: opt_tres(r.grp_tres),
             max_wall_minutes: opt_u32(r.max_wall_min),
             grp_wall_minutes: opt_u32(r.grp_wall_min),
+            preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
         },
         usage_factor: r.usage_factor,
     }
@@ -146,11 +154,7 @@ mod tests {
     fn make_qos(name: &str) -> Qos {
         Qos {
             name: name.into(),
-            description: String::new(),
-            priority: 0,
-            preempt_mode: QosPreemptMode::default(),
-            limits: QosLimits::default(),
-            usage_factor: 1.0,
+            ..Default::default()
         }
     }
 
@@ -227,6 +231,7 @@ mod tests {
             description: "High priority QoS".into(),
             priority: 100,
             preempt_mode: "cancel".into(),
+            preempt: String::new(),
             usage_factor: 2.0,
             max_jobs_per_user: Some(10),
             max_wall_min: Some(60),
@@ -235,6 +240,7 @@ mod tests {
             max_tres_per_user: Some("cpu=64".into()),
             grp_tres: Some("gpu=8".into()),
             grp_wall_min: Some(120),
+            preempt_exempt_time: None,
         };
 
         let qos = qos_from_record(record);
@@ -275,6 +281,7 @@ mod tests {
             description: String::new(),
             priority: 0,
             preempt_mode: "off".into(),
+            preempt: String::new(),
             usage_factor: 1.0,
             max_jobs_per_user: Some(0),
             max_wall_min: None,
@@ -283,6 +290,7 @@ mod tests {
             max_tres_per_user: None,
             grp_tres: None,
             grp_wall_min: Some(0),
+            preempt_exempt_time: None,
         };
 
         let qos = qos_from_record(record);

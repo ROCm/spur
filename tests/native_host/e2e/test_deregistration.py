@@ -38,12 +38,11 @@ def _wait_node_state(cluster, node_name, target_states, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = cluster.sinfo()
-            for line in out.splitlines():
-                if node_name in line:
-                    for state in target_states:
-                        if state in line:
-                            return state
+            state = cluster.sinfo_nodes().get(node_name)
+            if state is not None:
+                for target in target_states:
+                    if state.startswith(target):
+                        return state
         except Exception:
             pass
         time.sleep(2)
@@ -57,8 +56,7 @@ def _wait_node_gone(cluster, node_name, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = cluster.sinfo()
-            if node_name not in out:
+            if node_name not in cluster.sinfo_nodes():
                 return
         except Exception:
             pass
@@ -165,7 +163,7 @@ class TestForcedEviction:
             f"expected rejection, got: {out}"
         )
 
-        assert node0 in cluster.sinfo()
+        assert node0 in cluster.sinfo_nodes()
         cluster.scancel(str(job_id))
 
 
@@ -183,7 +181,10 @@ class TestAgentSelfDeregistration:
 class TestDownNodeFailsJobs:
     """Verify the bug fix: jobs on downed nodes transition to NODE_FAIL."""
 
-    HB_TIMEOUT = 10
+    # Agents heartbeat every 30s (hardcoded in spurd); a value at or below
+    # that makes a live node's heartbeat look stale to most health ticks and
+    # it never recovers. Keep well above 30s so only a truly dead agent trips it.
+    HB_TIMEOUT = 60
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -192,6 +193,12 @@ class TestDownNodeFailsJobs:
     def test_down_node_fails_jobs(self, multi_node_cluster):
         cluster = multi_node_cluster
         node0 = cluster.node_names[0]
+
+        # A freshly-elected leader withholds DOWN-marking until HB_TIMEOUT has
+        # elapsed since leadership was observed, and that observation can miss
+        # the first health tick — wait it out so detection below measures
+        # normal operation, not the startup grace window.
+        time.sleep(2 * self.HB_TIMEOUT)
 
         script = cluster.write_file(
             "down_sleep.sh", "#!/bin/bash\nsleep 600\n"

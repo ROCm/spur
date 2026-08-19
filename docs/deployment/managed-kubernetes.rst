@@ -1,9 +1,9 @@
-SPUR-Managed Kubernetes (k0s)
+Spur-Managed Kubernetes (k0s)
 =============================
 
-SPUR can **provision and own** a Kubernetes cluster across its own nodes using
+Spur can **provision and own** a Kubernetes cluster across its own nodes using
 `k0s <https://k0sproject.io>`_. This is the inverse of :doc:`kubernetes` (running
-SPUR *inside* an existing cluster): here ``spur k8s up`` builds the cluster and a
+Spur *inside* an existing cluster): here ``spur k8s up`` builds the cluster and a
 spurd-owned systemd unit keeps k0s running on each node.
 
 One command assigns roles, mesh IPs and pod CIDRs, installs a pinned k0s on every
@@ -23,7 +23,7 @@ Overview
   assignment and phase, replicated through Raft so it survives a restart.
 - **spurd** (on every node) owns that node's k0s systemd unit: it installs k0s if
   missing, writes the config/join-token, and reconciles the unit. k0s is never a
-  SPUR job, so it survives a spurd restart (spurd re-adopts it on startup).
+  Spur job, so it survives a spurd restart (spurd re-adopts it on startup).
 - **Roles** are assigned automatically: a single node becomes an all-in-one
   ``controller --single``; with two or more nodes the control-plane node becomes a
   ``controller`` and the rest become ``worker`` s.
@@ -34,7 +34,7 @@ For Administrators
 Prerequisites
 ~~~~~~~~~~~~~~
 
-- A working native-host SPUR deployment — ``spurctld`` on the head node and
+- A working native-host Spur deployment — ``spurctld`` on the head node and
   ``spurd`` on every node, all registered. See :doc:`native-host`.
 - ``spurd`` must run as root (it manages systemd units).
 - Outbound HTTPS to ``github.com`` on each node for the k0s download (or
@@ -113,7 +113,7 @@ queried live from each agent.
 Networking / CNI
 ~~~~~~~~~~~~~~~~~
 
-**kuberouter** (default) — k0s's built-in CNI. The control-plane API is advertised
+**kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
 on the node's primary interface and workers join over it. No mesh required.
 
 **calico** (``cni = "calico"``) — mesh-native routing. ``spur k8s up`` generates a
@@ -132,11 +132,11 @@ Storage
 ~~~~~~~
 
 k0s bundles no storage, so a plain cluster has no ``StorageClass`` and any
-``PersistentVolumeClaim`` stays ``Pending``. By default SPUR ships the
+``PersistentVolumeClaim`` stays ``Pending``. By default Spur ships the
 `local-path-provisioner <https://github.com/rancher/local-path-provisioner>`_
 (``storage_provisioner = "local-path"``) as the cluster's **default**
 StorageClass — RWO, node-local — so PVC workloads bind out of the box. The
-control-plane agent writes the manifest into k0s's manifest-deployer directory,
+control-plane agent writes the manifest into the k0s manifest-deployer directory,
 which k0s applies automatically (no in-cluster client).
 
 Local-path stores volumes under ``local_path_dir`` (default
@@ -150,12 +150,58 @@ much data — model caches, datasets — point it at a large scratch disk:
 
 Set ``storage_provisioner = "none"`` to bring your own storage.
 
-Adding a node later
-~~~~~~~~~~~~~~~~~~~~~
+Adding and removing worker nodes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Start ``spurd`` on the new node (registered to the same controller) and, if using
-the mesh CNI, join it to the mesh first. On the next ``spur k8s up`` (or the next
-reconcile tick) it is assigned a role + mesh IP + pod CIDR and joins.
+How a worker joins depends on how the cluster was scoped at ``spur k8s up``:
+
+**Whole-inventory cluster** (``spur k8s up`` with no scope flags) — every
+registered node is a member. Start ``spurd`` on the new node (registered to the
+same controller) and, if using the mesh CNI, join it to the mesh first. On the
+next reconcile tick it is assigned a role + mesh IP + pod CIDR and joins
+automatically. No further command is needed.
+
+**Scoped cluster** (``spur k8s up --nodes/--partition/--selector``) — membership
+is frozen at up-time, so a newly-registered node stays *outside* the cluster until
+you add it explicitly. Grow the cluster online, no ``down``/``--reset`` needed:
+
+.. code-block:: bash
+
+   spur k8s add-nodes --nodes gpu[09-12]        # or --partition <p> / --selector k=v
+   spur k8s status                              # the new workers converge to active
+
+Added nodes are workers; they are unioned into the member set and enrolled by the
+reconcile loop exactly as an in-scope node is. Adding a node already in the
+cluster is a no-op.
+
+Remove a worker gracefully — cordon, drain (evict pods, PDB-aware), then stop and
+``k0s reset`` the node:
+
+.. code-block:: bash
+
+   spur k8s remove-nodes --nodes gpu12
+   spur k8s remove-nodes --nodes gpu12 --drain-timeout 180
+   spur k8s remove-nodes --nodes gpu12 --force   # proceed past running jobs / a blocked drain
+
+.. warning::
+
+   ``remove-nodes`` is **destructive**: it runs ``k0s reset`` on the departing
+   node, wiping its k0s state (etcd/kine data, pulled images, containerd state,
+   certs). Re-adding the same node later re-downloads k0s and re-seeds state
+   (~262 MB plus an image re-pull). For a temporary "stop scheduling here", use
+   ``spur node drain`` (the SPUR-scheduling layer) instead — it does not touch k0s.
+
+   ``--force`` only skips the running-jobs guard (the jobs keep running) and lets
+   the drain proceed past a ``PodDisruptionBudget`` or its timeout — it can evict
+   pods that would otherwise block. ``remove-nodes`` refuses a control-plane node,
+   the last remaining worker (would empty the member set), and any node not in a
+   scoped cluster.
+
+``spur k8s remove-nodes`` is distinct from ``spur node remove``: the former is the
+graceful, k0s-aware path for shrinking a running cluster (drain + reset); the
+latter is inventory-only (it does not drain pods or stop k0s) and is for
+decommissioning a host from SPUR entirely. Use ``k8s remove-nodes`` first, then
+``node remove`` if the host is also leaving SPUR.
 
 Tear down
 ~~~~~~~~~
@@ -165,14 +211,17 @@ Tear down
    spur k8s down            # stop + disable the k0s unit on every node
    spur k8s down --reset    # also `k0s reset` (destructive: wipes cluster state)
 
-``--reset`` removes ``/var/lib/k0s`` on every node but leaves the WireGuard mesh
-(``spur0``) intact. To switch the CNI, tear down with ``--reset`` and bring the
-cluster back up with the new ``cni`` setting.
+``--reset`` removes ``/var/lib/k0s`` on every node, along with the spurd-owned
+systemd unit and cached join token, but leaves the WireGuard mesh (``spur0``)
+intact. Purging the join token matters: a token minted against the torn-down
+cluster's CA would fail the next join with a ``kubernetes-ca`` verification
+error. To switch the CNI, tear down with ``--reset`` and bring the cluster back
+up with the new ``cni`` setting.
 
 For Users
 ---------
 
-Users do not need SPUR access — they interact with the cluster through the
+Users do not need Spur access — they interact with the cluster through the
 standard Kubernetes tooling.
 
 Get a kubeconfig
@@ -233,6 +282,10 @@ Command reference
      - Purpose
    * - ``spur k8s up [--control-plane-node <h>]``
      - Provision + start the cluster (idempotent).
+   * - ``spur k8s add-nodes --nodes <hostlist> | --partition <p> | --selector k=v``
+     - Add worker nodes to a running scoped cluster (no down/reset).
+   * - ``spur k8s remove-nodes --nodes <hostlist> [--drain-timeout <secs>] [--force]``
+     - Drain + ``k0s reset`` + remove a worker (destructive; re-add re-seeds state).
    * - ``spur k8s status``
      - Cluster phase + per-node component state.
    * - ``spur k8s kubeconfig``
@@ -254,7 +307,7 @@ Configuration reference (``[cluster]``)
      - Meaning
    * - ``enabled``
      - ``false``
-     - Enable SPUR-managed k0s. When off, spurd never touches systemd/k0s.
+     - Enable Spur-managed k0s. When off, spurd never touches systemd/k0s.
    * - ``control_plane_node``
      - (first node)
      - Hostname of the k0s control plane.
@@ -272,7 +325,7 @@ Configuration reference (``[cluster]``)
      - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom).
    * - ``storage_provisioner``
      - ``local-path``
-     - Storage SPUR ships as the default StorageClass (``local-path`` or ``none``).
+     - Storage Spur ships as the default StorageClass (``local-path`` or ``none``).
    * - ``local_path_dir``
      - ``/var/lib/local-path-provisioner``
      - On-node directory local-path stores PVs in; point at a big disk for data-heavy PVCs.

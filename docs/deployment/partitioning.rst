@@ -82,6 +82,25 @@ The same dual-path matching applies to ``[[nodes]]`` config blocks (which set
 features and weight; see :doc:`native-host`), keyed by ``names`` (hostlist) or
 ``selector`` (labels).
 
+Applying Config Changes
+-----------------------
+
+After editing ``spur.conf``, apply the changes to the running controller:
+
+.. code-block:: bash
+
+   scontrol reconfigure
+
+``reconfigure`` re-reads ``spur.conf`` and makes the file authoritative:
+runtime-only changes not reflected in the file are overwritten.
+
+Partition changes apply immediately, and they are the only part of the file that
+also replicates to follower controllers. Many other sections apply live too, but
+some are read once at daemon startup and some are consumed by ``spurd`` on each
+compute node — see :ref:`the configuration reference <reload-scope>` for the
+per-field breakdown, the leader-only caveat, and the behaviour when a partition
+being removed still has active jobs (drain it first).
+
 Verifying Membership
 --------------------
 

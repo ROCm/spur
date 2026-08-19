@@ -37,7 +37,7 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = ExecArgs::try_parse_from(&args)?;
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to controller")?;
     let mut client = spur_proto::controller_client(channel);
@@ -46,6 +46,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .exec_in_job(ExecInJobRequest {
             job_id: args.job_id,
             command: args.command.clone(),
+            user: crate::interactive::current_user()?,
         })
         .await
         .context("exec failed")?;

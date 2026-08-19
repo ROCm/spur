@@ -3,9 +3,10 @@
 
 //! `spur node` subcommands for node lifecycle management.
 
+use crate::scontrol::{is_all_node_pattern, resolve_node_names};
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use spur_proto::proto::UpdateNodeRequest;
@@ -29,28 +30,31 @@ pub struct NodeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum NodeCommand {
-    /// Set or remove labels on a node.
+    /// Set or remove labels on one or more nodes.
     ///
     /// Labels are key=value pairs used for partition routing.
     /// Append a trailing dash to remove a label (e.g., "pool-").
     Label {
-        /// Node name
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Labels to set (key=value) or remove (key-)
         #[arg(required = true)]
         labels: Vec<String>,
     },
-    /// Drain a node: stop scheduling new jobs while existing jobs finish.
+    /// Drain one or more nodes: stop scheduling new jobs while existing jobs finish.
     Drain {
-        /// Node name
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Reason for draining
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Remove a node from the cluster entirely.
+    /// Remove one or more nodes from the cluster entirely.
+    ///
+    /// ALL removes every registered node, and with --force this evicts jobs from
+    /// every node.
     Remove {
-        /// Node name
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Force removal even if jobs are running (jobs will be failed with NODE_FAIL)
         #[arg(long)]
@@ -102,88 +106,171 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
     Ok((set_labels, remove_labels))
 }
 
-async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> Result<()> {
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<String>) -> Result<()> {
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
+    let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
+    } else {
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
 
-    client
-        .update_node(UpdateNodeRequest {
-            name: node.clone(),
-            state: None,
-            reason: None,
-            labels: set_labels.clone(),
-            remove_labels: remove_labels.clone(),
-        })
-        .await?;
-
-    for (k, v) in &set_labels {
-        println!("  {node}: {k}={v}");
+    let mut failed: Vec<String> = Vec::new();
+    for node in &nodes {
+        match client
+            .update_node(UpdateNodeRequest {
+                name: node.to_string(),
+                state: None,
+                reason: None,
+                labels: set_labels.clone(),
+                remove_labels: remove_labels.clone(),
+            })
+            .await
+        {
+            Ok(_) => {
+                for (k, v) in &set_labels {
+                    println!("  {node}: {k}={v}");
+                }
+                for k in &remove_labels {
+                    println!("  {node}: {k} removed");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
+        }
     }
-    for k in &remove_labels {
-        println!("  {node}: {k} removed");
-    }
 
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
-async fn cmd_drain(controller: &str, node: String, reason: Option<String>) -> Result<()> {
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
-    let resp = client
-        .drain_node(spur_proto::proto::DrainNodeRequest {
-            name: node.clone(),
-            reason: reason.clone().unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
-
-    if resp.running_jobs > 0 {
-        println!(
-            "Node {node} set to draining ({} running job{} will finish first)",
-            resp.running_jobs,
-            if resp.running_jobs == 1 { "" } else { "s" }
-        );
+async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String>) -> Result<()> {
+    let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
     } else {
-        println!("Node {node} set to drain");
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
+
+    let mut failed: Vec<String> = Vec::new();
+    for node in &nodes {
+        match client
+            .drain_node(spur_proto::proto::DrainNodeRequest {
+                name: node.to_string(),
+                reason: reason.clone().unwrap_or_default(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if resp.running_jobs > 0 {
+                    println!(
+                        "Node {node} set to draining ({} running job{} will finish first)",
+                        resp.running_jobs,
+                        if resp.running_jobs == 1 { "" } else { "s" }
+                    );
+                } else {
+                    println!("Node {node} set to drain");
+                }
+                if let Some(r) = &reason {
+                    println!("  reason: {r}");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
+        }
     }
-    if let Some(r) = reason {
-        println!("  reason: {r}");
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
 }
 
 async fn cmd_remove(
     controller: &str,
-    node: String,
+    node_pattern: String,
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
-    let resp = client
-        .deregister_node(spur_proto::proto::DeregisterNodeRequest {
-            name: node.clone(),
-            force,
-            reason: reason.clone().unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
-
-    if resp.evicted_jobs_count > 0 {
-        println!(
-            "Node {node} removed from cluster ({} job{} evicted)",
-            resp.evicted_jobs_count,
-            if resp.evicted_jobs_count == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
+    let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
     } else {
-        println!("Node {node} removed from cluster");
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
+
+    let mut failed: Vec<String> = Vec::new();
+    for node in &nodes {
+        match client
+            .deregister_node(spur_proto::proto::DeregisterNodeRequest {
+                name: node.to_string(),
+                force,
+                reason: reason.clone().unwrap_or_default(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if resp.evicted_jobs_count > 0 {
+                    println!(
+                        "Node {node} removed from cluster ({} job{} evicted)",
+                        resp.evicted_jobs_count,
+                        if resp.evicted_jobs_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    );
+                } else {
+                    println!("Node {node} removed from cluster");
+                }
+                if let Some(r) = &reason {
+                    println!("  reason: {r}");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
+        }
     }
-    if let Some(r) = reason {
-        println!("  reason: {r}");
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
+}
+
+fn expand_node_pattern(pattern: &str) -> Result<Option<Vec<String>>> {
+    if is_all_node_pattern(pattern) {
+        return Ok(None);
+    }
+    spur_core::hostlist::expand(pattern)
+        .map(Some)
+        .context("invalid node name pattern")
 }
 
 #[cfg(test)]
@@ -239,5 +326,118 @@ mod tests {
         let (set, remove) = parse_label_args(&args).unwrap();
         assert_eq!(set.get("env").unwrap(), "prod-");
         assert!(remove.is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_all_resolves_registered_nodes_case_insensitively() {
+        for pattern in ["ALL", "all", "All"] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
+
+            main_with_args(vec![
+                "node".into(),
+                "--controller".into(),
+                format!("http://{addr}"),
+                "label".into(),
+                pattern.into(),
+                "pool=gpu".into(),
+            ])
+            .await
+            .unwrap();
+
+            assert_eq!(capture.update_node_names(), vec!["n1", "n2"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_all_resolves_registered_nodes() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
+
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "drain".into(),
+            "ALL".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(capture.drain_node_names(), vec!["n1", "n2"]);
+    }
+
+    #[tokio::test]
+    async fn remove_all_forces_every_registered_node() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
+
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "remove".into(),
+            "ALL".into(),
+            "--force".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            capture.deregister_node_calls(),
+            vec![("n1".to_string(), true), ("n2".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn label_all_rejects_an_empty_cluster() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let err = main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "ALL".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no nodes registered"));
+        assert!(capture.update_node_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_hostlist_does_not_query_all_nodes() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "node[1-2]".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(capture.update_node_names(), vec!["node1", "node2"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_hostlist_is_rejected_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "node[".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid node name pattern"));
     }
 }

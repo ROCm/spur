@@ -3,19 +3,90 @@
 
 use anyhow::{Context, Result};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-use spur_proto::proto::{interactive_input, interactive_output, InitSession, InteractiveInput};
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_proto::proto::{
+    interactive_input, interactive_output, InitSession, InteractiveInput, JobKeepaliveRequest,
+};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
-/// Connect to a spurd agent, applying the standard gRPC size limits.
-pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transport::Channel>> {
+/// Keeps an interactive allocation attended by pinging the controller on a
+/// fixed interval, and stops the pings when dropped. Aborting on `Drop` means
+/// an early `?` return on the caller's path can't leak the task.
+pub struct KeepaliveGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the keepalive loop for `job_id`. `tool` prefixes the warning printed
+/// when a ping fails (e.g. "salloc", "srun"). A blocking client sends no other
+/// traffic, so without these pings the controller's InactiveLimit reaper would
+/// reclaim a live allocation.
+pub fn spawn_keepalive(
+    client: SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    user: String,
+    tool: &'static str,
+) -> KeepaliveGuard {
+    let handle = tokio::spawn(async move {
+        let mut client = client;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+            spur_core::config::KEEPALIVE_INTERVAL_SECS,
+        ));
+        // Warn once per failure streak: a persistent failure stays visible
+        // without printing a line every interval.
+        let mut warned = false;
+        loop {
+            tick.tick().await;
+            match client
+                .job_keepalive(JobKeepaliveRequest {
+                    job_id,
+                    user: user.clone(),
+                })
+                .await
+            {
+                Ok(_) => warned = false,
+                Err(e) if !warned => {
+                    eprintln!(
+                        "{tool}: warning: keepalive to controller failed ({}); \
+                         allocation may be reaped if this persists",
+                        e.message()
+                    );
+                    warned = true;
+                }
+                Err(_) => {}
+            }
+        }
+    });
+    KeepaliveGuard(handle)
+}
+
+/// Connect to a spurd agent, presenting the caller's credential if one is available.
+///
+/// The agent authenticates callers with the same JWT mechanism as the controller. A user token
+/// from `$SPUR_AUTH_TOKEN` / `~/.spur/token` is signed with the cluster key and will be accepted.
+/// Without a token the connection still succeeds against agents in `permissive` mode, but will be
+/// refused in `required` mode.
+pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<crate::authclient::AuthChannel>> {
     let channel = spur_client::connect_channel(addr)
         .await
         .context("cannot connect to agent")?;
-    Ok(SlurmAgentClient::new(channel)
+    Ok(SlurmAgentClient::new(crate::authclient::wrap(channel))
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
+}
+
+/// Local username sent with authenticated job requests.
+///
+/// Refuse to continue when the operating system cannot resolve the caller:
+/// recording a sentinel can either collide with a real account or disagree
+/// with a later exec/attach request.
+pub fn current_user() -> Result<String> {
+    whoami::username().context("failed to determine current username")
 }
 
 pub fn get_terminal_size() -> spur_proto::proto::WindowSize {
@@ -38,12 +109,13 @@ pub struct InteractiveSessionHandle {
 ///
 /// Returns `Err(tonic::Status)` on RPC failure.
 pub async fn open_interactive_session(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
+    user: &str,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
@@ -54,6 +126,7 @@ pub async fn open_interactive_session(
             winsize: Some(winsize),
             argv,
             env: HashMap::new(),
+            user: user.to_string(),
         })),
     };
 
@@ -165,14 +238,15 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
 /// Run a full interactive PTY session over the InteractiveSession RPC.
 /// Returns the remote exit code.
 pub async fn run_interactive_session(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
 ) -> Result<i32> {
-    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap)
+    let user = current_user()?;
+    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, &user)
         .await
         .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
     drive_interactive_session(handle).await

@@ -375,13 +375,17 @@ mod tests {
     }
 
     #[test]
-    fn t50_37_requeue_from_completed_fails() {
+    fn t50_37_requeue_from_completed_is_guarded() {
         let mut job = make_job("requeue-completed");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
-        // Completed → Pending should fail (Completed is not retriable)
+        // The general state machine must NOT resurrect a finished job; only the
+        // guarded admin path (`Job::requeue_to_pending`) may.
         assert_transition_err(&mut job, JobState::Pending);
         assert_job_state(&job, JobState::Completed);
+        job.requeue_to_pending()
+            .expect("admin requeue re-pends a completed job");
+        assert_job_state(&job, JobState::Pending);
     }
 
     // ── T50.38–40: Drain / Draining node behavior ──────────────
@@ -451,14 +455,18 @@ mod tests {
         assert_eq!(node.state, NodeState::Error);
     }
 
-    // ── T50.42–43: Requeue does not reset from Cancelled ───────
+    // ── T50.42–43: Cancelled re-pend is admin-guarded ─────────
 
     #[test]
-    fn t50_42_requeue_from_cancelled_fails() {
+    fn t50_42_requeue_from_cancelled_is_guarded() {
         let mut job = make_job("requeue-cancelled");
         assert_transition_ok(&mut job, JobState::Cancelled);
-        // Cancelled → Pending should fail
+        // The general machine rejects Cancelled → Pending; only the guarded
+        // admin requeue path re-pends it.
         assert_transition_err(&mut job, JobState::Pending);
+        job.requeue_to_pending()
+            .expect("admin requeue re-pends a cancelled job");
+        assert_job_state(&job, JobState::Pending);
     }
 
     #[test]
@@ -529,6 +537,14 @@ mod tests {
     }
 
     // ── T50.50–52: Heterogeneous job fields ────────────────────
+
+    #[test]
+    fn t50_49b_mpi_list_lines() {
+        let lines = spur_core::mpi::mpi_list_lines("/usr/lib/spur");
+        assert!(lines.iter().any(|l| l == "none"));
+        assert!(lines.iter().any(|l| l == "pmix"));
+        assert!(lines.iter().any(|l| l.contains("plugin_dir=/usr/lib/spur")));
+    }
 
     #[test]
     fn t50_50_het_job_fields_default_none() {
@@ -963,6 +979,7 @@ address = "http://peer-a:6817"
         let req = spur_proto::proto::ExecInJobRequest {
             job_id: 42,
             command: vec!["ls".into(), "-la".into()],
+            user: "alice".into(),
         };
         assert_eq!(req.job_id, 42);
         assert_eq!(req.command.len(), 2);
@@ -988,6 +1005,7 @@ address = "http://peer-a:6817"
                     }),
                     argv: vec!["/bin/bash".into()],
                     env: HashMap::new(),
+                    user: "alice".into(),
                 },
             )),
         };

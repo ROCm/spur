@@ -46,7 +46,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .context("sattach: invalid job ID format (expected JOB_ID or JOB_ID.STEP_ID)")?;
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -87,7 +87,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 /// Stream job output without interactive input (legacy behavior).
 async fn stream_output_only(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     stream_name: &str,
 ) -> Result<()> {
@@ -95,6 +95,7 @@ async fn stream_output_only(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: stream_name.to_string(),
+            user: crate::interactive::current_user()?,
         })
         .await
         .context("failed to start output stream")?
@@ -129,7 +130,7 @@ async fn stream_output_only(
 
 /// Interactive attach via InteractiveSession RPC. Returns the remote exit code.
 async fn interactive_attach(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();

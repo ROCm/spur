@@ -23,6 +23,10 @@ def pytest_configure(config):
         "markers",
         "mpi: MPI end-to-end tests requiring spur_mpi_pmix.so, libpmix, and mpicc",
     )
+    config.addinivalue_line(
+        "markers",
+        "k0s: native spur-managed k0s cluster tests (rootful spurd + systemd + etcd; slow)",
+    )
 
 
 def _get_nodes_config() -> list[str]:
@@ -193,6 +197,34 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 
 
 @pytest.fixture
+def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
+    """Native k0s enabled, spurd rootful. Skips unless >= 3 nodes (etcd quorum) + sudo."""
+    if len(ssh_nodes) < 3:
+        pytest.skip(
+            f"multi-CP k0s tests require at least 3 nodes for an etcd quorum "
+            f"(got {len(ssh_nodes)})"
+        )
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.provision()
+    c.root_agent_preflight()
+    try:
+        c.start(
+            config_overrides={"cluster": {"enabled": True, "cni": "kuberouter"}},
+            agent_as_root=True,
+        )
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    try:
+        c.k8s_down(reset=True)
+        c.wait_k8s_phase("down", timeout=180)
+    except Exception:
+        pass
+    c.teardown()
+
+
+@pytest.fixture
 def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture: a running cluster with Postgres on node 0.
@@ -281,6 +313,40 @@ def label_cluster(ssh_nodes, remote_bin_dir):
         },
         agent_labels={0: {"gpu": "mi300x"}},
     )
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
+def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """Multi-node MPI tests with spur_mpi_pmix.so deployed."""
+    if len(ssh_nodes) < 2:
+        pytest.skip(
+            f"Multi-node MPI tests require at least 2 nodes in SPUR_TEST_NODES "
+            f"(got {len(ssh_nodes)})"
+        )
+    try:
+        ensure_bins(
+            ssh_nodes,
+            _get_binaries_dir(),
+            remote_bin_dir,
+            with_mpi_plugin=True,
+        )
+    except FileNotFoundError as exc:
+        pytest.skip(str(exc))
+
+    plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
+    mpi_cfg = {
+        "mpi": {
+            "plugin_dir": plugin_dir,
+            "pmix_tmpdir": "/tmp/spur-pmix",
+        }
+    }
+    overrides = cluster_config_overrides or {}
+    merged = deep_merge(dict(overrides), mpi_cfg) if isinstance(overrides, dict) else mpi_cfg
+
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged)
+    c.mpi_preflight(2)
     yield c
     c.teardown()
 

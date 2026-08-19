@@ -55,19 +55,35 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
-pub(crate) struct AccountingService {
-    pool: PgPool,
+pub(crate) enum AccountingService {
+    Available(PgPool),
+    Unavailable { reason: &'static str },
 }
 
 impl AccountingService {
-    pub(super) fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn available(pool: PgPool) -> Self {
+        Self::Available(pool)
+    }
+
+    pub(crate) fn unavailable(reason: &'static str) -> Self {
+        Self::Unavailable { reason }
+    }
+
+    fn pool(&self) -> Result<&PgPool, Status> {
+        match self {
+            Self::Available(pool) => Ok(pool),
+            Self::Unavailable { reason } => Err(Status::unavailable(format!(
+                "accounting service is not available ({reason})"
+            ))),
+        }
     }
 }
 
 /// Build a ready-to-register tonic service for embedding in another server.
-pub fn accounting_server(pool: PgPool) -> SlurmAccountingServer<AccountingService> {
-    spur_proto::accounting_server(AccountingService::new(pool))
+pub(crate) fn accounting_server(
+    service: AccountingService,
+) -> SlurmAccountingServer<AccountingService> {
+    spur_proto::accounting_server(service)
 }
 
 #[tonic::async_trait]
@@ -76,6 +92,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RecordJobStartRequest>,
     ) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         let start_time = req
             .start_time
@@ -92,8 +109,7 @@ impl SlurmAccounting for AccountingService {
             .map(|r| (r.memory_mb as i64, r.cpus as i32))
             .unwrap_or((0, 1));
 
-        let mut conn = self
-            .pool
+        let mut conn = pool
             .acquire()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -122,6 +138,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RecordJobEndRequest>,
     ) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         let end_time = req
             .end_time
@@ -138,8 +155,7 @@ impl SlurmAccounting for AccountingService {
             _ => "UNKNOWN",
         };
 
-        let mut conn = self
-            .pool
+        let mut conn = pool
             .acquire()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -162,6 +178,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetJobHistoryRequest>,
     ) -> Result<Response<GetJobHistoryResponse>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
 
         let start_after = req
@@ -196,7 +213,7 @@ impl SlurmAccounting for AccountingService {
         };
 
         let records = db::get_job_history(
-            &self.pool,
+            pool,
             user,
             account,
             start_after,
@@ -270,6 +287,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetUsageRequest>,
     ) -> Result<Response<GetUsageResponse>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
 
         let since = req
@@ -288,7 +306,7 @@ impl SlurmAccounting for AccountingService {
             Some(req.account.as_str())
         };
 
-        let records = db::get_usage(&self.pool, user, account, since)
+        let records = db::get_usage(pool, user, account, since)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -325,6 +343,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
@@ -337,7 +356,7 @@ impl SlurmAccounting for AccountingService {
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
         };
-        db::upsert_account(&self.pool, &req.name, update)
+        db::upsert_account(pool, &req.name, update)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
@@ -347,8 +366,9 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
-        db::delete_account(&self.pool, &req.name)
+        db::delete_account(pool, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
@@ -358,7 +378,8 @@ impl SlurmAccounting for AccountingService {
         &self,
         _request: Request<ListAccountsRequest>,
     ) -> Result<Response<ListAccountsResponse>, Status> {
-        let records = db::list_accounts(&self.pool)
+        let pool = self.pool()?;
+        let records = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -379,6 +400,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         // QOS references are validated against the live DB, not QosCache: a QOS
         // created just now may not have reached the cache's next refresh yet,
@@ -386,7 +408,7 @@ impl SlurmAccounting for AccountingService {
         // check runs only for a field the request actually restated.
         if let Some(dq) = req.default_qos.as_deref() {
             if !dq.is_empty() {
-                let exists = db::qos_exists(&self.pool, dq)
+                let exists = db::qos_exists(pool, dq)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
                 if !exists {
@@ -404,7 +426,7 @@ impl SlurmAccounting for AccountingService {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .collect();
-                let missing = db::missing_qos(&self.pool, &names)
+                let missing = db::missing_qos(pool, &names)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
                 if let Some(name) = missing.first() {
@@ -449,7 +471,7 @@ impl SlurmAccounting for AccountingService {
             grp_tres: nullable_str(&req.grp_tres),
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
         };
-        db::add_user(&self.pool, &req.user, &req.account, update)
+        db::add_user(pool, &req.user, &req.account, update)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
@@ -459,8 +481,9 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
-        let deleted = db::remove_user(&self.pool, &req.user, &req.account)
+        let deleted = db::remove_user(pool, &req.user, &req.account)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if deleted == 0 {
@@ -478,6 +501,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         let account = if req.account.is_empty() {
             None
@@ -489,7 +513,7 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.user.as_str())
         };
-        let records = db::list_users(&self.pool, account, user)
+        let records = db::list_users(pool, account, user)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -509,6 +533,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
@@ -519,10 +544,34 @@ impl SlurmAccounting for AccountingService {
         if let Some(t) = &req.grp_tres {
             validate_tres("grptres", t)?;
         }
+        // Validate that every QOS name in the preempt allow-list exists before
+        // writing — a typo here becomes silent dead config that could retroactively
+        // grant preempt rights if a QOS with that name is created later.
+        let preempt_normalized: Option<String> = match req.preempt.as_deref() {
+            None | Some("") => req.preempt.clone(),
+            Some(list) => {
+                let names: Vec<&str> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let missing = db::missing_qos(pool, &names)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if let Some(name) = missing.first() {
+                    return Err(Status::not_found(format!(
+                        "QOS '{name}' does not exist (in preempt allow-list)"
+                    )));
+                }
+                Some(names.join(","))
+            }
+        };
+
         let update = db::QosUpdate {
             description: req.description.as_deref(),
             priority: req.priority,
             preempt_mode: req.preempt_mode.as_deref(),
+            preempt: preempt_normalized.as_deref(),
             usage_factor: req.usage_factor,
             max_jobs_per_user: nullable_limit(req.max_jobs_per_user, "max_jobs_per_user")?,
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
@@ -534,16 +583,22 @@ impl SlurmAccounting for AccountingService {
             max_tres_per_user: nullable_str(&req.max_tres_per_user),
             grp_tres: nullable_str(&req.grp_tres),
             grp_wall_min: nullable_limit(req.grp_wall_minutes, "grp_wall_minutes")?,
+            preempt_exempt_time: if req.clear_preempt_exempt_time {
+                Some(None)
+            } else {
+                req.preempt_exempt_time.map(|v| Some(v as i32))
+            },
         };
-        db::upsert_qos(&self.pool, &req.name, update)
+        db::upsert_qos(pool, &req.name, update)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
     }
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
-        db::delete_qos(&self.pool, &req.name)
+        db::delete_qos(pool, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
@@ -553,7 +608,8 @@ impl SlurmAccounting for AccountingService {
         &self,
         _request: Request<ListQosRequest>,
     ) -> Result<Response<ListQosResponse>, Status> {
-        let records = db::list_qos(&self.pool)
+        let pool = self.pool()?;
+        let records = db::list_qos(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -564,6 +620,7 @@ impl SlurmAccounting for AccountingService {
                 description: r.description,
                 priority: r.priority,
                 preempt_mode: r.preempt_mode,
+                preempt: r.preempt,
                 usage_factor: r.usage_factor,
                 max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
                 max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
@@ -572,6 +629,7 @@ impl SlurmAccounting for AccountingService {
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
                 grp_wall_minutes: r.grp_wall_min.unwrap_or(0) as u32,
+                preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
             })
             .collect();
 
@@ -582,6 +640,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetFairshareFactorsRequest>,
     ) -> Result<Response<GetFairshareFactorsResponse>, Status> {
+        let pool = self.pool()?;
         let req = request.into_inner();
         let halflife_days = if req.halflife_days == 0 {
             14
@@ -592,11 +651,11 @@ impl SlurmAccounting for AccountingService {
         let now = Utc::now();
         let since = now - chrono::Duration::days(halflife_days as i64 * 4);
 
-        let usage = db::get_usage(&self.pool, None, None, since)
+        let usage = db::get_usage(pool, None, None, since)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let accounts = db::list_accounts(&self.pool)
+        let accounts = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -631,6 +690,95 @@ fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_startup_unavailable<T>(result: Result<Response<T>, Status>) {
+        let status = match result {
+            Ok(_) => panic!("accounting RPC unexpectedly succeeded"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "accounting service is not available (database connection failed at startup)"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_service_rejects_every_accounting_rpc() {
+        let service = AccountingService::unavailable("database connection failed at startup");
+
+        macro_rules! assert_rpc_unavailable {
+            ($method:ident, $request:ty) => {
+                assert_startup_unavailable(
+                    service.$method(Request::new(<$request>::default())).await,
+                );
+            };
+        }
+
+        assert_rpc_unavailable!(record_job_start, RecordJobStartRequest);
+        assert_rpc_unavailable!(record_job_end, RecordJobEndRequest);
+        assert_rpc_unavailable!(get_job_history, GetJobHistoryRequest);
+        assert_rpc_unavailable!(get_usage, GetUsageRequest);
+        assert_rpc_unavailable!(create_account, CreateAccountRequest);
+        assert_rpc_unavailable!(delete_account, DeleteAccountRequest);
+        assert_rpc_unavailable!(list_accounts, ListAccountsRequest);
+        assert_rpc_unavailable!(add_user, AddUserRequest);
+        assert_rpc_unavailable!(remove_user, RemoveUserRequest);
+        assert_rpc_unavailable!(list_users, ListUsersRequest);
+        assert_rpc_unavailable!(create_qos, CreateQosRequest);
+        assert_rpc_unavailable!(delete_qos, DeleteQosRequest);
+        assert_rpc_unavailable!(list_qos, ListQosRequest);
+        assert_rpc_unavailable!(get_fairshare_factors, GetFairshareFactorsRequest);
+    }
+
+    #[tokio::test]
+    async fn unavailable_accounting_server_returns_unavailable_over_grpc() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(accounting_server(AccountingService::unavailable(
+                    "database connection failed at startup",
+                )))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = spur_proto::accounting_client(channel);
+        let status = client
+            .list_accounts(ListAccountsRequest::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "accounting service is not available (database connection failed at startup)"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_service_reports_migration_failure() {
+        let service = AccountingService::unavailable("database migration failed at startup");
+        let status = service
+            .list_accounts(Request::new(ListAccountsRequest::default()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "accounting service is not available (database migration failed at startup)"
+        );
+    }
 
     #[test]
     fn validate_tres_accepts_empty() {

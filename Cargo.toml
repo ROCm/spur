@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -66,6 +66,9 @@ schemars = "1"
 # Unix
 nix = { version = "0.31", features = ["process", "signal", "fs", "user", "sched", "mount", "socket", "term"] }
 
+# Embedded Lua for the job_submit hook (vendored: no system Lua needed)
+mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
+
 # Auth
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
@@ -91,6 +94,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 futures-util = "0.3"
 flate2 = "1"
 tar = "0.4"
+zstd = "0.13"
 semver = "1"
 sha2 = "0.11"
 base64 = "0.23"

@@ -36,6 +36,7 @@ axum = { workspace = true }
 http = "1"
 tower = { workspace = true }
 tower-http = { workspace = true }
+mlua = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

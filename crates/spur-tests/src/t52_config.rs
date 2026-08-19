@@ -184,7 +184,7 @@ plugin = "backfill"
 
         assert_eq!(config.scheduler.max_jobs_per_cycle, 10000);
         assert_eq!(config.scheduler.fairshare_halflife_days, 14);
-        assert_eq!(config.scheduler.default_time_limit_minutes, 60);
+        assert_eq!(config.scheduler.default_time_limit_minutes, 0);
     }
 
     // ── T52.15–17: listen_addr from config (#37) ──────────────────

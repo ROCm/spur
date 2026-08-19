@@ -67,7 +67,7 @@ Check Status
    spur queue              # View the job queue
    spur nodes              # View nodes
    spur show job 1         # Detailed job info
-   cat /tmp/spur-1.out     # Job output (default location)
+   cat spur-1.out          # Job output, written to the submit directory
 
 Run an Interactive Command
 --------------------------

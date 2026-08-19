@@ -78,9 +78,7 @@ impl BackfillScheduler {
             if !placement.matches(node, reservations, now) {
                 return false;
             }
-            if node.alloc_resources.cpus >= node.total_resources.cpus
-                && node.total_resources.cpus > 0
-            {
+            if !node.has_free_cpu_capacity() {
                 return false;
             }
             node.total_resources.can_satisfy(&required)
@@ -120,23 +118,34 @@ impl BackfillScheduler {
             .len() as u32
     }
 
-    /// Resolve concrete per-node GPU allocations for a heterogeneous demand.
-    ///
-    /// Nodes are ordered by free-GPU capacity (descending); the target per-node
-    /// counts (greedy packing for `Total`, the fixed vector for uneven
-    /// per-task) are matched to that order. Returns `None` if no assignment
-    /// fits the current free capacity.
-    fn plan_heterogeneous_alloc(
+    /// Resolve concrete per-node CPU and GPU allocations for non-uniform demand.
+    /// CPU counts are positional (aligned to task launch order); a GPU total is
+    /// packed greedily onto the most-available nodes. `None` if it cannot fit now.
+    fn plan_per_node_alloc(
         &self,
+        job: &Job,
         demand: &GpuDemand,
         assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
         nodes: &[Node],
-        base: &ResourceSet,
-        gpu_type: Option<&str>,
         now: chrono::DateTime<Utc>,
     ) -> Option<HashMap<String, ResourceAllocations>> {
-        debug_assert!(!demand.is_none());
-        match demand {
+        let base = base_node_request(job);
+        let cpu_counts = cpu_per_node_counts(job);
+        let gpu_type = demand.gpu_type();
+
+        // Per-node GPU target keyed by node index.
+        let gpu_targets: HashMap<usize, u32> = match demand {
+            GpuDemand::None => HashMap::new(),
+            GpuDemand::PerNode { counts, .. } => {
+                if counts.len() != assigned_nodes.len() {
+                    return None;
+                }
+                assigned_nodes
+                    .iter()
+                    .zip(counts.iter())
+                    .map(|((ni, _), &c)| (*ni, c))
+                    .collect()
+            }
             GpuDemand::Total { count, .. } => {
                 // Capacity-sorted greedy: pack GPUs onto most-available nodes.
                 let mut caps: Vec<(usize, u32)> = assigned_nodes
@@ -146,41 +155,42 @@ impl BackfillScheduler {
                 caps.sort_by_key(|(_, cap)| std::cmp::Reverse(*cap));
                 let cap_values: Vec<u32> = caps.iter().map(|(_, c)| *c).collect();
                 let targets = distribute_total(*count, &cap_values)?;
+                caps.iter()
+                    .zip(targets)
+                    .map(|((ni, _), give)| (*ni, give))
+                    .collect()
+            }
+        };
 
-                let mut per_node_alloc = HashMap::new();
-                for ((ni, _), give) in caps.iter().zip(targets) {
-                    let node = &nodes[*ni];
-                    let current = self.timelines[*ni].accumulated_at(now);
-                    let mut req = base.clone();
-                    req.gpus = placeholder_gpus(give, gpu_type);
-                    let alloc = build_node_allocation(&node.total_resources, &current, &req);
-                    per_node_alloc.insert(node.name.clone(), alloc);
-                }
-                Some(per_node_alloc)
+        let mut per_node_alloc = HashMap::new();
+        for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
+            let node = &nodes[*ni];
+            let current = self.timelines[*ni].accumulated_at(now);
+
+            let mut req = base.clone();
+            let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
+            req.cpus = cpus;
+            // A per-CPU memory request scales with this node's CPU share.
+            if let Some(mem_per_cpu) = job.spec.memory_per_cpu_mb {
+                req.memory_mb = mem_per_cpu * cpus as u64;
             }
-            GpuDemand::PerNode { counts, .. } => {
-                // Positional: counts[i] maps to assigned_nodes[i], matching the
-                // task-distribution node order used at launch.
-                if counts.len() != assigned_nodes.len() {
-                    return None;
-                }
-                let mut per_node_alloc = HashMap::new();
-                for ((ni, _), &want) in assigned_nodes.iter().zip(counts.iter()) {
-                    let free = self.free_gpus_at(*ni, &nodes[*ni], gpu_type, now);
-                    if want > free {
-                        return None;
-                    }
-                    let node = &nodes[*ni];
-                    let current = self.timelines[*ni].accumulated_at(now);
-                    let mut req = base.clone();
-                    req.gpus = placeholder_gpus(want, gpu_type);
-                    let alloc = build_node_allocation(&node.total_resources, &current, &req);
-                    per_node_alloc.insert(node.name.clone(), alloc);
-                }
-                Some(per_node_alloc)
+            req.gpus = placeholder_gpus(gpu_targets.get(ni).copied().unwrap_or(0), gpu_type);
+
+            // Exact per-node feasibility against current free capacity; if a node
+            // cannot hold its share the whole placement is deferred.
+            if !node
+                .total_resources
+                .can_satisfy_with_allocated(&current, &req)
+            {
+                return None;
             }
-            GpuDemand::None => None,
+
+            per_node_alloc.insert(
+                node.name.clone(),
+                build_node_allocation(&node.total_resources, &current, &req),
+            );
         }
+        Some(per_node_alloc)
     }
 }
 
@@ -262,10 +272,12 @@ impl Scheduler for BackfillScheduler {
 
             let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
             let gpu_type = demand.gpu_type().map(str::to_string);
-            // Heterogeneous demand (--gpus total, uneven --gpus-per-task) needs
-            // per-node counts resolved against actual free capacity; homogeneous
-            // demand rides the exact-per-node fast path.
-            let heterogeneous = !job.spec.exclusive && homogeneous_per_node(&demand).is_none();
+            // Per-node GPU counts (--gpus total, uneven --gpus-per-task) or an
+            // uneven per-node CPU split (e.g. -N2 -n7 -> [4,3]) need per-node
+            // counts resolved against actual free capacity; a fully uniform
+            // request rides the exact-per-node fast path.
+            let heterogeneous = !job.spec.exclusive
+                && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
 
             // Free GPUs of the requested type per candidate, used to pack the
             // job onto the most-available nodes.
@@ -400,24 +412,17 @@ impl Scheduler for BackfillScheduler {
 
             let mut per_node_alloc = HashMap::new();
             if heterogeneous {
-                // Total / uneven-per-task GPUs: resolve concrete per-node counts
-                // against current free capacity. We only place these when the
-                // job can start now (no heterogeneous future shadow reservation
-                // yet); otherwise leave it pending for a later cycle.
+                // Non-uniform per-node CPU or GPU counts: resolve concrete
+                // per-node allocations against current free capacity. We only
+                // place these when the job can start now (no heterogeneous
+                // future shadow reservation yet); otherwise leave it pending for
+                // a later cycle.
                 if earliest > now {
                     continue;
                 }
-                let base = base_node_request(job);
-                match self.plan_heterogeneous_alloc(
-                    &demand,
-                    &assigned_nodes,
-                    cluster.nodes,
-                    &base,
-                    gpu_type.as_deref(),
-                    now,
-                ) {
+                match self.plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, now) {
                     Some(allocs) => per_node_alloc = allocs,
-                    None => continue, // not enough free GPUs right now
+                    None => continue, // not enough free capacity right now
                 }
             } else {
                 for (ni, _) in &assigned_nodes {
@@ -480,11 +485,13 @@ impl Scheduler for BackfillScheduler {
 /// are modeled separately (see [`resolve_gpu_demand`]) so total-vs-per-node
 /// semantics are preserved.
 pub fn base_node_request(job: &Job) -> ResourceSet {
-    let cpus = if job.spec.tasks_per_node.is_some() {
-        job.spec.tasks_per_node.unwrap_or(1) * job.spec.cpus_per_task
-    } else {
-        (job.spec.num_tasks / job.spec.num_nodes.max(1)) * job.spec.cpus_per_task
-    };
+    // Minimum per-node CPU share for feasibility filtering; exact per-node
+    // counts are resolved at allocation. Floors at one CPU.
+    let cpus = match job.spec.tasks_per_node {
+        Some(tasks_per_node) => tasks_per_node * job.spec.cpus_per_task,
+        None => (job.spec.num_tasks / job.spec.num_nodes.max(1)) * job.spec.cpus_per_task,
+    }
+    .max(1);
 
     let memory = job
         .spec
@@ -548,6 +555,27 @@ fn homogeneous_per_node(demand: &GpuDemand) -> Option<u32> {
         }
         GpuDemand::Total { .. } => None,
     }
+}
+
+/// Per-node CPU counts honoring the task distribution (e.g. `-N2 -n7` ->
+/// `[4, 3]`), positionally aligned to the assigned nodes. Floors each node at
+/// one CPU.
+pub fn cpu_per_node_counts(job: &Job) -> Vec<u32> {
+    let cpt = job.spec.cpus_per_task.max(1);
+    spur_core::gpu_request::tasks_per_node_counts(&job.spec, job.spec.num_nodes.max(1))
+        .into_iter()
+        .map(|tasks| (tasks * cpt).max(1))
+        .collect()
+}
+
+/// Whether a job's per-node CPU demand is non-uniform, so it must take the
+/// heterogeneous allocation path rather than the uniform fast path.
+fn cpu_is_heterogeneous(job: &Job) -> bool {
+    if job.spec.exclusive {
+        return false;
+    }
+    let counts = cpu_per_node_counts(job);
+    counts.iter().min() != counts.iter().max()
 }
 
 /// The single-node resource request used for feasibility filtering and
@@ -650,6 +678,190 @@ mod tests {
 
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 2);
+    }
+
+    // I3: an uneven task split reserves the exact per-node CPU counts (block
+    // distribution 7 tasks over 2 nodes -> [4,3]), summing to the total instead
+    // of over-reserving [4,4] on both nodes.
+    #[test]
+    fn schedule_uneven_cpu_reserves_exact_split() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        let mut cpus: Vec<u32> = assignments[0]
+            .per_node_alloc
+            .values()
+            .map(|a| a.cpus)
+            .collect();
+        cpus.sort();
+        assert_eq!(cpus, vec![3, 4]);
+        assert_eq!(cpus.iter().sum::<u32>(), 7);
+    }
+
+    // I3 + C2: an uneven CPU split combined with a job-total GPU request places
+    // CPUs [4,3] and GPUs [4,4] on the same two nodes, staying positionally
+    // aligned (CPU vector and GPU vector are resolved independently).
+    #[test]
+    fn schedule_uneven_cpu_with_total_gpus() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = vec![make_gpu_node(8), make_gpu_node(8)];
+        nodes[0].name = "gpu-node1".into();
+        nodes[1].name = "gpu-node2".into();
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "combo".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                gpus: Some(spur_core::gpu_request::GpuRequest::new(8, None)),
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        // CPU vector is the exact block split, independent of GPU packing.
+        let mut cpus: Vec<u32> = assignments[0]
+            .per_node_alloc
+            .values()
+            .map(|a| a.cpus)
+            .collect();
+        cpus.sort();
+        assert_eq!(cpus, vec![3, 4]);
+
+        // GPUs follow the greedy job-total packing (see distribute_total); the
+        // invariant is that all 8 are placed across the two nodes.
+        let gpus: Vec<usize> = assignments[0]
+            .per_node_alloc
+            .values()
+            .map(|a| a.device_ids("gpu").len())
+            .collect();
+        assert_eq!(gpus.iter().sum::<usize>(), 8);
+        assert!(gpus.iter().all(|&g| g >= 1));
+    }
+
+    // C2: -N4 --gpus=8 (one task per node) keeps all four nodes and places the
+    // 8 GPUs across them (greedy packing), rather than collapsing onto one node.
+    #[test]
+    fn schedule_total_gpus_spread_across_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes: Vec<Node> = (0..4).map(|_| make_gpu_node(8)).collect();
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.name = format!("gpu-node{}", i + 1);
+        }
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "spread".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 4,
+                num_tasks: 4,
+                cpus_per_task: 1,
+                gpus: Some(spur_core::gpu_request::GpuRequest::new(8, None)),
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 4);
+        let gpus: Vec<usize> = assignments[0]
+            .per_node_alloc
+            .values()
+            .map(|a| a.device_ids("gpu").len())
+            .collect();
+        assert_eq!(gpus.iter().sum::<usize>(), 8);
+        assert!(
+            gpus.iter().all(|&g| g >= 1),
+            "every node should get part of the total, got {gpus:?}"
+        );
+    }
+
+    // I6: after submit reduces -N4 -n1 to a single node, a 4-node --nodelist is
+    // restrictive (a candidate pool), not additive: the job lands on exactly one
+    // of the named nodes. Documents the additive->restrictive shift.
+    #[test]
+    fn nodelist_is_restrictive_after_node_reduction() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // num_nodes already reduced to 1 (as submit_job would do for -N4 -n1).
+        let pending = vec![make_job_with_nodelist(
+            1,
+            1,
+            Some("node001,node002,node003,node004"),
+            None,
+        )];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 1);
+        assert!(["node001", "node002", "node003", "node004"]
+            .contains(&assignments[0].nodes[0].as_str()));
     }
 
     fn make_gpu_node(num_gpus: u32) -> Node {
@@ -2022,5 +2234,138 @@ mod tests {
 
         let request = job_resource_request(&job);
         assert_eq!(request.generic.get("bandwidth:lustre"), Some(&100));
+    }
+
+    fn cpu_request(num_nodes: u32, num_tasks: u32, cpus_per_task: u32) -> u32 {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "cpu-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes,
+                num_tasks,
+                cpus_per_task,
+                ..Default::default()
+            },
+        );
+        base_node_request(&job).cpus
+    }
+
+    // A per-node share that truncated to zero left the allocation invisible to
+    // resource tracking, so any number of such jobs could stack on one node.
+    #[test]
+    fn base_node_request_reserves_cpus_when_tasks_below_nodes() {
+        assert_eq!(cpu_request(4, 1, 1), 1);
+    }
+
+    #[test]
+    fn base_node_request_is_minimum_per_node_share() {
+        // Even split: the min (feasibility) share equals the exact share.
+        // 4 tasks over 2 nodes = 2 tasks/node * 3 cpus = 6.
+        assert_eq!(cpu_request(2, 4, 3), 6);
+    }
+
+    #[test]
+    fn base_node_request_uneven_uses_lightest_share() {
+        // 3 tasks over 2 nodes -> [2,1] tasks; the base is the lightest node's
+        // share (1 task * 2 cpus = 2). The exact per-node counts come from
+        // cpu_per_node_counts; feasibility must not exclude the lighter node.
+        assert_eq!(cpu_request(2, 3, 2), 2);
+        // 7 tasks over 2 nodes -> [4,3]; lightest share is 3.
+        assert_eq!(cpu_request(2, 7, 1), 3);
+    }
+
+    #[test]
+    fn base_node_request_keeps_exact_fit_unchanged() {
+        assert_eq!(cpu_request(4, 4, 1), 1);
+        assert_eq!(cpu_request(4, 8, 2), 4);
+    }
+
+    #[test]
+    fn cpu_per_node_counts_splits_uneven_tasks() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                ..Default::default()
+            },
+        );
+        // Block distribution: 4 tasks on node 0, 3 on node 1.
+        assert_eq!(cpu_per_node_counts(&job), vec![4, 3]);
+        assert!(cpu_is_heterogeneous(&job));
+    }
+
+    #[test]
+    fn cpu_per_node_counts_scales_cpus_per_task_and_sums_to_total() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 2,
+                ..Default::default()
+            },
+        );
+        // [4,3] tasks * 2 cpus/task = [8,6], summing to num_tasks*cpus = 14.
+        let counts = cpu_per_node_counts(&job);
+        assert_eq!(counts, vec![8, 6]);
+        assert_eq!(counts.iter().sum::<u32>(), 7 * 2);
+    }
+
+    #[test]
+    fn cpu_per_node_counts_uniform_is_homogeneous() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                num_nodes: 2,
+                num_tasks: 4,
+                cpus_per_task: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cpu_per_node_counts(&job), vec![6, 6]);
+        assert!(!cpu_is_heterogeneous(&job));
+    }
+
+    #[test]
+    fn base_node_request_uses_explicit_tasks_per_node() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "cpu-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 4,
+                num_tasks: 1,
+                tasks_per_node: Some(2),
+                cpus_per_task: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(base_node_request(&job).cpus, 6);
+    }
+
+    #[test]
+    fn base_node_request_derives_memory_from_cpu_share() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "cpu-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 4,
+                cpus_per_task: 2,
+                memory_per_cpu_mb: Some(512),
+                ..Default::default()
+            },
+        );
+        let request = base_node_request(&job);
+        // 4 tasks / 2 nodes = 2 tasks/node * 2 cpus = 4 cpus; 4 * 512 MB.
+        assert_eq!(request.cpus, 4);
+        assert_eq!(request.memory_mb, 2048);
     }
 }

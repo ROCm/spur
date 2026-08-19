@@ -25,6 +25,25 @@ pub enum AuthError {
         owner: String,
         action: String,
     },
+    #[error("no such user on this host: {0}")]
+    UnknownUser(String),
+}
+
+/// Resolve a username to its UNIX credentials through NSS.
+///
+/// The controller derives uid/gid from the *authenticated* username rather than accepting them from
+/// the wire: `TokenClaims` carries no gid at all, and a client-supplied uid is what allowed a job to
+/// run as an arbitrary user (see the `allow_root_jobs` guard in spurd). Fails closed — an
+/// unresolvable user is an error, never a fallback to uid 0.
+pub fn resolve_unix_credentials(user: &str) -> Result<(u32, u32), AuthError> {
+    if user.is_empty() {
+        return Err(AuthError::UnknownUser("<empty>".into()));
+    }
+    match nix::unistd::User::from_name(user) {
+        Ok(Some(u)) => Ok((u.uid.as_raw(), u.gid.as_raw())),
+        Ok(None) => Err(AuthError::UnknownUser(user.to_string())),
+        Err(e) => Err(AuthError::UnknownUser(format!("{user}: {e}"))),
+    }
 }
 
 /// Authenticated identity extracted from a token or peer credentials.
@@ -84,6 +103,23 @@ impl Identity {
             )))
         }
     }
+}
+
+/// Check that `user` is allowed to perform `action` on a job owned by `owner`.
+///
+/// Allows the owner, root, or an empty `user` (daemon calls and clients
+/// predating the identity field). Jobs with an empty owner are restricted to
+/// root only, since they run as root and granting access to any caller would
+/// be a privilege escalation.
+pub fn check_job_owner(user: &str, owner: &str, action: &str) -> Result<(), AuthError> {
+    if user.is_empty() || user == "root" || user == owner {
+        return Ok(());
+    }
+    Err(AuthError::NotJobOwner {
+        user: user.into(),
+        owner: owner.into(),
+        action: action.into(),
+    })
 }
 
 /// JWT token claims.
@@ -155,6 +191,71 @@ pub fn verify_token(token: &str, secret: &[u8]) -> Result<Identity, AuthError> {
     })
 }
 
+/// What to do with one request's `Authorization` header.
+///
+/// Shared by both daemons so the controller and the agent cannot drift apart on a security
+/// decision: they wrap this in their own Tower layer, but the ruling itself lives here.
+#[derive(Debug)]
+pub enum BearerOutcome {
+    /// Verified; carry this identity to the handler.
+    Authenticated(Box<Identity>),
+    /// No credential presented, and the mode tolerates that.
+    Anonymous,
+    /// Refuse the request with this message.
+    Reject(String),
+}
+
+/// Rule the `Authorization` header against the configured mode.
+///
+/// Deliberate properties:
+/// * an INVALID credential is rejected in every mode that verifies — `permissive` tolerates the
+///   *absence* of a credential, never a bad one, or forging would beat sending none;
+/// * a malformed header is rejected rather than silently downgraded to anonymous;
+/// * `disabled` ignores even a valid token, so it cannot be quietly stricter than it claims.
+pub fn authenticate_bearer(
+    mode: crate::config::AuthMode,
+    jwt_key: &[u8],
+    header: Option<&str>,
+    missing_credential_hint: &str,
+) -> BearerOutcome {
+    use crate::config::AuthMode;
+
+    let token = match header {
+        Some(h) => match h
+            .strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+        {
+            Some(t) if !t.trim().is_empty() => t.trim(),
+            _ => {
+                return BearerOutcome::Reject(
+                    "malformed authorization header: expected 'Bearer <token>'".into(),
+                )
+            }
+        },
+        None => {
+            return match mode {
+                AuthMode::Required => BearerOutcome::Reject(format!(
+                    "authentication required: {missing_credential_hint}"
+                )),
+                _ => BearerOutcome::Anonymous,
+            }
+        }
+    };
+
+    if mode == AuthMode::Disabled {
+        return BearerOutcome::Anonymous;
+    }
+    if jwt_key.is_empty() {
+        return BearerOutcome::Reject(
+            "a token was presented but no auth.jwt_key is configured".into(),
+        );
+    }
+    match verify_token(token, jwt_key) {
+        Ok(identity) => BearerOutcome::Authenticated(Box::new(identity)),
+        Err(e) => BearerOutcome::Reject(format!("invalid credential: {e}")),
+    }
+}
+
 /// "none" auth — always returns an identity based on UNIX user.
 pub fn auth_none() -> Identity {
     Identity {
@@ -214,6 +315,49 @@ mod tests {
     }
 
     #[test]
+    fn test_check_job_owner_allows_owner_root_and_daemon() {
+        assert!(check_job_owner("alice", "alice", "exec").is_ok());
+        assert!(check_job_owner("root", "alice", "exec").is_ok());
+        assert!(check_job_owner("", "alice", "exec").is_ok());
+    }
+
+    #[test]
+    fn test_check_job_owner_rejects_other_user() {
+        let err = check_job_owner("bob", "alice", "exec").expect_err("bob must be denied");
+        assert!(matches!(err, AuthError::NotJobOwner { .. }));
+        assert_eq!(
+            err.to_string(),
+            "user bob cannot exec job owned by alice",
+            "message names the requester, action, and owner"
+        );
+    }
+
+    /// Jobs with an empty owner run as root, so only root and daemon (empty
+    /// user) are allowed. A regular user must be denied.
+    #[test]
+    fn test_check_job_owner_empty_owner_restricts_to_root() {
+        assert!(check_job_owner("root", "", "exec").is_ok());
+        assert!(check_job_owner("", "", "exec").is_ok());
+        assert!(
+            check_job_owner("alice", "", "exec").is_err(),
+            "empty-owner jobs run as root; granting access is a privilege escalation"
+        );
+    }
+
+    /// A non-empty placeholder owner matches no caller, so it restricts the job
+    /// to root. Asserted so that introducing such a placeholder cannot silently
+    /// lock users out of their own jobs.
+    #[test]
+    fn test_check_job_owner_placeholder_owner_restricts_to_root() {
+        assert!(check_job_owner("root", "k8s", "exec").is_ok());
+        assert!(
+            check_job_owner("alice", "k8s", "exec").is_err(),
+            "a placeholder owner denies every named user; record the real \
+             submitter or leave the owner empty instead"
+        );
+    }
+
+    #[test]
     fn test_require_admin() {
         let user = Identity {
             user: "alice".into(),
@@ -223,5 +367,121 @@ mod tests {
         };
         assert!(user.require_admin().is_err());
         assert!(Identity::admin().require_admin().is_ok());
+    }
+
+    // --- authenticate_bearer ---
+    //
+    // The function is the shared ruling used by both the controller and the agent. Testing it
+    // directly (not just through the middleware wrappers) ensures the contract holds at the source
+    // so neither daemon can silently diverge.
+
+    fn bearer(key: &[u8]) -> String {
+        format!(
+            "Bearer {}",
+            generate_token("alice", 1000, false, key, 3600).unwrap()
+        )
+    }
+
+    #[test]
+    fn required_rejects_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Required, TEST_SECRET, None, "hint"),
+            BearerOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn permissive_allows_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Permissive,
+                TEST_SECRET,
+                None,
+                "hint"
+            ),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn disabled_allows_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Disabled, TEST_SECRET, None, "hint"),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn valid_token_is_authenticated_in_required_mode() {
+        let h = bearer(TEST_SECRET);
+        match authenticate_bearer(
+            crate::config::AuthMode::Required,
+            TEST_SECRET,
+            Some(&h),
+            "hint",
+        ) {
+            BearerOutcome::Authenticated(id) => {
+                assert_eq!(id.user, "alice");
+                assert_eq!(id.uid, 1000);
+            }
+            other => panic!("expected Authenticated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forged_token_rejected_in_permissive_mode() {
+        // permissive tolerates absence of a credential, never a bad one.
+        let forged = bearer(b"attacker-key");
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Permissive,
+                TEST_SECRET,
+                Some(&forged),
+                "hint"
+            ),
+            BearerOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_header_always_rejected() {
+        for bad in &["token-without-bearer-prefix", "Bearer ", "bearer", ""] {
+            assert!(
+                matches!(
+                    authenticate_bearer(
+                        crate::config::AuthMode::Permissive,
+                        TEST_SECRET,
+                        Some(bad),
+                        "hint"
+                    ),
+                    BearerOutcome::Reject(_)
+                ),
+                "header {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_ignores_a_valid_token() {
+        // disabled must not silently verify — that would make `disabled` secretly stricter.
+        let h = bearer(TEST_SECRET);
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Disabled,
+                TEST_SECRET,
+                Some(&h),
+                "hint"
+            ),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn token_presented_but_no_key_configured_is_rejected() {
+        let h = bearer(TEST_SECRET);
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Required, b"", Some(&h), "hint"),
+            BearerOutcome::Reject(_)
+        ));
     }
 }

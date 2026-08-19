@@ -3,13 +3,29 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
-use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet};
+use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Source of the job ids this node currently holds. The controller decides from
+/// its own authoritative state whether any reported id is stale.
+pub trait HeldJobs: Send + Sync {
+    fn held_job_ids(&self) -> Vec<u32>;
+}
+
+impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
+    fn held_job_ids(&self) -> Vec<u32> {
+        match self.try_lock() {
+            Ok(jobs) => jobs.keys().copied().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
 
 /// Discovers and reports node resources to the controller.
 pub struct NodeReporter {
@@ -26,9 +42,15 @@ pub struct NodeReporter {
     /// or changes after startup (late mesh join, `spur0` recreated) reaches the controller.
     pub wg_iface: String,
     node_token: RwLock<String>,
+    /// Job ids this node holds, reported each heartbeat so the controller can
+    /// reclaim allocations it no longer tracks. Shares the agent's running map.
+    held_jobs: Arc<dyn HeldJobs>,
+    /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
+    k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
 }
 
 impl NodeReporter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hostname: String,
         controller_addr: String,
@@ -37,6 +59,7 @@ impl NodeReporter {
         labels: HashMap<String, String>,
         join_token: String,
         wg_iface: String,
+        held_jobs: Arc<dyn HeldJobs>,
     ) -> Self {
         Self {
             hostname,
@@ -49,13 +72,26 @@ impl NodeReporter {
             join_token,
             wg_iface,
             node_token: RwLock::new(String::new()),
+            held_jobs,
+            k0s_status: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Wire the k0s node-status source so heartbeats carry `spur_k8s_node_*` fields. Called once,
+    /// after the K0sAgent is constructed. No-op on a node without k0s (field stays unset).
+    pub fn set_k0s_status(&self, status: Arc<crate::cluster::K0sNodeState>) {
+        let _ = self.k0s_status.set(status);
     }
 
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
     /// Read live from the interface so a key that appears or changes after startup is picked up.
     fn wg_pubkey(&self) -> String {
         spur_net::wireguard::interface_public_key(&self.wg_iface).unwrap_or_default()
+    }
+
+    /// Job ids this heartbeat would report, from the shared running map.
+    pub fn held_job_ids(&self) -> Vec<u32> {
+        self.held_jobs.held_job_ids()
     }
 
     /// Register with the controller.
@@ -124,6 +160,14 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
+            let running_jobs: Vec<RunningJobStatus> = self
+                .held_job_ids()
+                .into_iter()
+                .map(|job_id| RunningJobStatus {
+                    job_id,
+                    ..Default::default()
+                })
+                .collect();
 
             match spur_client::connect_channel(&self.controller_addr).await {
                 Ok(channel) => {
@@ -133,9 +177,18 @@ impl NodeReporter {
                             hostname: self.hostname.clone(),
                             cpu_load: load,
                             free_memory_mb: free_mem,
-                            running_jobs: vec![],
+                            running_jobs,
                             node_token: current_token,
                             wg_pubkey: self.wg_pubkey(),
+                            k0s_status: self.k0s_status.get().map(|s| {
+                                let (unit_active, restart_count, install_secs) =
+                                    s.take_for_heartbeat();
+                                spur_proto::proto::K0sNodeStatus {
+                                    unit_active,
+                                    restart_count,
+                                    install_duration_seconds: install_secs,
+                                }
+                            }),
                         })
                         .await
                     {
@@ -539,5 +592,13 @@ mod tests {
             "node token required"
         )));
         assert!(!should_reregister(&tonic::Status::internal("boom")));
+    }
+
+    #[test]
+    fn held_job_ids_accepts_send_but_not_sync_values() {
+        // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
+        let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
+            Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
+        assert_eq!(map.held_job_ids(), vec![7]);
     }
 }

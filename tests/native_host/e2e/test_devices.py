@@ -10,12 +10,19 @@ Complements test_gpu.py (HIP smoke without --gres) and test_container.py
 from __future__ import annotations
 
 import re
+import shlex
 import time
 from pathlib import Path
 
 import pytest
 
-from cluster import SpurCluster, job_state, parse_job_id, wait_job
+from cluster import (
+    SpurCluster,
+    job_state,
+    parse_job_id,
+    wait_job,
+    wait_job_state,
+)
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -66,6 +73,38 @@ def _gpu_type_on_node(cluster: SpurCluster, node_index: int = 0) -> str | None:
 
 def _max_gpus_per_node(cluster: SpurCluster) -> int:
     return max(cluster.node_gpu_count(name) for name in cluster.node_names)
+
+
+def _render_video_user(cluster: SpurCluster) -> str | None:
+    """Return a non-root user that is a member of both the render and video
+    groups on node 0, or None if none exists.
+
+    The supplementary-group loss on nsenter entry only manifests when the job
+    runs as a non-root user with GPU groups, so PrivDrop engages and the
+    nsenter paths must reinitialise the group set. Root jobs bypass PrivDrop
+    entirely, so they cannot exercise this path.
+    """
+    script = (
+        "for g in render video; do getent group \"$g\"; done | "
+        "awk -F: '{n=split($4,m,\",\"); for(i=1;i<=n;i++) if(m[i]!=\"\") "
+        "print $1, m[i]}'"
+    )
+    out = cluster.nodes[0].exec_allow_fail(f"bash -c {shlex.quote(script)}")
+    render_members: set[str] = set()
+    video_members: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        grp, user = parts
+        if user == "root":
+            continue
+        if grp == "render":
+            render_members.add(user)
+        elif grp == "video":
+            video_members.add(user)
+    both = sorted(render_members & video_members)
+    return both[0] if both else None
 
 
 
@@ -456,7 +495,15 @@ class TestContainerInjection:
 
 
 class TestMultiNodeSpread:
-    def test_multitask_per_node_gpu_partition(self, gpu_cluster):
+    def test_multitask_per_node_runs_batch_script_once(self, gpu_cluster):
+        # A plain (mpi=none) sbatch script must run exactly once per node,
+        # matching Slurm semantics, regardless of --ntasks-per-node. Without
+        # this, spurd forks one concurrent copy of the whole script per task,
+        # so this probe (a single, non-fan-out command) would print PROBE_OK
+        # 4 times with 4 distinct partitioned ROCR_VISIBLE_DEVICES subsets.
+        # Instead it prints once and sees every GPU allocated to the job —
+        # the script itself is responsible for any further per-task fan-out
+        # (typically via `srun`).
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
         if _max_gpus_per_node(cluster) < 4:
@@ -481,14 +528,15 @@ class TestMultiNodeSpread:
         assert job_id is not None
         wait_job(cluster, job_id, timeout=180)
         content = cluster.wait_output(out_path, "PROBE_OK")
-        assert content.count("PROBE_OK") >= 4, content
+        assert content.count("PROBE_OK") == 1, content
         rocr_lines = [
             ln.split("=", 1)[1]
             for ln in content.splitlines()
             if ln.startswith("ROCR_VISIBLE_DEVICES=")
         ]
-        assert len(rocr_lines) >= 4, content
-        assert len(set(rocr_lines)) >= 4, f"expected distinct per-task ROCR values\n{content}"
+        assert len(rocr_lines) == 1, content
+        visible_count = _parse_probe(content).get("VISIBLE_COUNT")
+        assert visible_count == "4", f"expected all 4 allocated GPUs visible\n{content}"
 
     def test_two_node_gres_spread(self, gpu_cluster):
         cluster = gpu_cluster
@@ -586,3 +634,96 @@ class TestConfigModes:
         )
         cluster.assert_spurd_registry(0, min_gpus=1)
         assert cluster.node_gpu_count(cluster.node_names[0]) >= 1
+
+
+def _parse_groups(id_output: str) -> set[str]:
+    """Extract group names from `id` output: uid=..(..) gid=..(..) groups=.."""
+    match = re.search(r"groups=(\S+)", id_output)
+    if not match:
+        return set()
+    names: set[str] = set()
+    for token in match.group(1).split(","):
+        name = re.search(r"\(([^)]+)\)", token)
+        if name:
+            names.add(name.group(1))
+    return names
+
+
+class TestNsenterSupplementaryGroups:
+    """Commands entering a running job via nsenter (`spur exec`,
+    `spur run --overlap`) must carry the job user's full supplementary group
+    set, matching the batch path. Without it, GPU device nodes gated on the
+    render/video groups (e.g. /dev/kfd, root:render) are unopenable.
+
+    Unit tests in spurd cover the nsenter argv construction; only an end-to-end
+    run against a real namespaced job exercises the runtime priv-drop
+    (`setpriv --init-groups`) inside the entered pid/mount namespace.
+    """
+
+    @pytest.mark.rootful
+    def test_exec_into_job_preserves_supplementary_groups(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        assert cluster.spurd_agent_user(0) == "root", (
+            f"expected rootful spurd, got user {cluster.spurd_agent_user(0)!r}"
+        )
+
+        user = _render_video_user(cluster)
+        if user is None:
+            pytest.skip(
+                "no non-root user in both render and video groups on the node"
+            )
+
+        kfd_perm = cluster.nodes[0].exec_allow_fail(
+            "stat -c '%U %G %A' /dev/kfd 2>/dev/null"
+        ).strip()
+        if not kfd_perm:
+            pytest.skip("no /dev/kfd on node")
+
+        hold = cluster.write_file("spur172-hold.sh", "#!/bin/bash\nsleep 300\n")
+        sb = cluster.cli_as_user(
+            user,
+            ["sbatch", "-J", "spur172", "-N", "1", "--gres=gpu:1", hold],
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch (as {user}) failed: {sb}"
+
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+
+            # nsenter path: spur exec into the running job.
+            exec_id = cluster.cli_as_user(user, ["spur", "exec", str(job_id), "id"])
+            exec_groups = _parse_groups(exec_id)
+            assert {"render", "video"} <= exec_groups, (
+                f"spur exec lost supplementary groups: "
+                f"groups={sorted(exec_groups)}\nraw: {exec_id}"
+            )
+
+            # The consequence that matters: /dev/kfd becomes readable.
+            exec_kfd = cluster.cli_as_user(
+                user,
+                [
+                    "spur",
+                    "exec",
+                    str(job_id),
+                    "bash",
+                    "-c",
+                    "test -r /dev/kfd && echo KFD_READABLE || echo KFD_NOT_READABLE",
+                ],
+            )
+            assert "KFD_READABLE" in exec_kfd, (
+                f"/dev/kfd not readable via spur exec:\n{exec_kfd}"
+            )
+
+            # Control: the plain-step path was never broken; assert it still
+            # carries the groups so a regression here is distinguishable from a
+            # blanket failure.
+            code, step_id = cluster.srun_in_allocation(job_id, ["id"])
+            assert code == 0, f"srun step failed (exit {code}):\n{step_id}"
+            step_groups = _parse_groups(step_id)
+            assert {"render", "video"} <= step_groups, (
+                f"plain step lost groups (unexpected regression): "
+                f"groups={sorted(step_groups)}\nraw: {step_id}"
+            )
+        finally:
+            cluster.scancel(str(job_id))

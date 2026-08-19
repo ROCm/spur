@@ -80,7 +80,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Built before connecting so an invalid `-t` fails without a round-trip.
     let nodes_req = build_get_nodes_request(&args)?;
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -305,11 +305,24 @@ fn resolve_partition_field(
                 effective_state_str(nodes[0])
             }
         }
-        'N' => nodes
-            .iter()
-            .map(|n| n.name.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
+        'N' => {
+            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            spur_core::hostlist::compress(&names)
+        }
+        'n' => {
+            // Expanded form of the same sorted hostlist as `%N`, so `%n` and
+            // `%N` stay consistent (Slurm derives both from one sorted list).
+            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            let compressed = spur_core::hostlist::compress(&names);
+            spur_core::hostlist::expand(&compressed)
+                .unwrap_or_else(|_| {
+                    let mut fallback = names;
+                    fallback.sort();
+                    fallback.dedup();
+                    fallback
+                })
+                .join(",")
+        }
         'c' => part.total_cpus.to_string(),
         _ => "?".into(),
     }
@@ -487,9 +500,11 @@ mod tests {
         get_job(pb::GetJobRequest) -> pb::JobInfo;
         cancel_job(pb::CancelJobRequest) -> ();
         complete_job(pb::CompleteJobRequest) -> ();
+        job_keepalive(pb::JobKeepaliveRequest) -> pb::JobKeepaliveResponse;
         suspend_job(pb::SuspendJobRequest) -> ();
         resume_job(pb::ResumeJobRequest) -> ();
         update_job(pb::UpdateJobRequest) -> ();
+        requeue_job(pb::RequeueJobRequest) -> pb::RequeueJobResponse;
         get_node(pb::GetNodeRequest) -> pb::NodeInfo;
         update_node(pb::UpdateNodeRequest) -> ();
         drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
@@ -497,6 +512,10 @@ mod tests {
         deregister_agent(pb::DeregisterAgentRequest) -> ();
         get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
         create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
+        create_partition(pb::CreatePartitionRequest) -> ();
+        update_partition(pb::UpdatePartitionRequest) -> ();
+        delete_partition(pb::DeletePartitionRequest) -> ();
+        reconfigure(()) -> ();
         ping(()) -> pb::PingResponse;
         get_job_metrics(()) -> pb::JobMetrics;
         get_node_metrics(()) -> pb::NodeMetrics;
@@ -519,6 +538,8 @@ mod tests {
         cluster_down(pb::ClusterDownRequest) -> pb::ClusterDownResponse;
         cluster_status(pb::ClusterStatusRequest) -> pb::ClusterStatusResponse;
         cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
+        cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
+        cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
     }
 
     #[tokio::test]
@@ -628,12 +649,8 @@ mod tests {
             "idle row should show 2 nodes: {idle_line}"
         );
         assert!(
-            idle_line.contains("n1"),
-            "idle row should list n1: {idle_line}"
-        );
-        assert!(
-            idle_line.contains("n2"),
-            "idle row should list n2: {idle_line}"
+            idle_line.contains("n[1-2]"),
+            "idle row should list a compressed n[1-2]: {idle_line}"
         );
         assert!(
             !idle_line.contains("n3"),
@@ -668,6 +685,39 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("idle"));
         assert!(lines[0].contains("3"));
+    }
+
+    #[test]
+    fn test_render_nodelist_compressed() {
+        let fields = default_fields();
+        let partitions = vec![make_partition("gpu", true)];
+        let nodes = vec![
+            make_node("gpu001", NodeState::NodeIdle, "gpu"),
+            make_node("gpu002", NodeState::NodeIdle, "gpu"),
+            make_node("gpu003", NodeState::NodeIdle, "gpu"),
+            make_node("gpu004", NodeState::NodeIdle, "gpu"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("gpu[001-004]"),
+            "NODELIST should be a compressed hostlist: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_render_nodelist_expanded_with_percent_n() {
+        let fields = format_engine::parse_format("%P|%n", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("gpu", true)];
+        let nodes = vec![
+            make_node("gpu001", NodeState::NodeIdle, "gpu"),
+            make_node("gpu002", NodeState::NodeIdle, "gpu"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines, ["gpu*|gpu001,gpu002"]);
     }
 
     #[test]
@@ -814,8 +864,10 @@ mod tests {
             .iter()
             .find(|l| l.contains("idle"))
             .expect("no idle row");
-        assert!(idle_line.contains("n1"), "idle row should list n1");
-        assert!(idle_line.contains("n2"), "idle row should list n2");
+        assert!(
+            idle_line.contains("n[1-2]"),
+            "idle row should list a compressed n[1-2]: {idle_line}"
+        );
         assert!(!idle_line.contains("n3"), "idle row should not list n3");
 
         let resv_line = lines

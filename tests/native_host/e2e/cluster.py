@@ -385,6 +385,20 @@ class SpurCluster:
         cmd = f"{self._sudo_prefix()}-u '{run_as}' env {' '.join(inner)}"
         return self.nodes[0].exec_allow_fail(cmd)
 
+    def cli_with_exit(
+        self, args: list[str], controller_addr: str | None = None
+    ) -> tuple[int, str]:
+        """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
+            f"PATH='{self.bin_dir}':$PATH",
+            f"'{self.bin_dir}/{args[0]}'",
+        ]
+        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
@@ -436,11 +450,125 @@ class SpurCluster:
     def sinfo(self) -> str:
         return self.cli(["sinfo"])
 
+    def sinfo_nodes(self, controller_addr: str | None = None) -> dict[str, str]:
+        """Map node name to state via node-oriented sinfo.
+
+        ``sinfo -N`` emits one line per node with the full, uncompressed name,
+        so this is agnostic to NODELIST hostlist compression (``node[1-4]``).
+        The state is the short form (idle/mix/alloc/down/drain/resv), with any
+        trailing ``*`` (non-responding marker) stripped.
+
+        *controller_addr* overrides the endpoint(s) as in :meth:`cli`.
+        """
+        out = self.cli(["sinfo", "-N", "-h", "-o", "%N %t"],
+                       controller_addr=controller_addr)
+        states: dict[str, str] = {}
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2:
+                states[fields[0]] = fields[1].rstrip("*")
+        return states
+
+    def nodes_in_partition(self, partition: str) -> set[str]:
+        """Return the set of node names belonging to *partition*.
+
+        Uses node-oriented sinfo so membership is exact even when the default
+        output would compress several nodes into one bracketed hostlist. A node
+        in multiple partitions appears once per partition. The partition name
+        carries a trailing ``*`` when it is the default, so that is stripped.
+        """
+        out = self.cli(["sinfo", "-N", "-h", "-o", "%N %P"])
+        members: set[str] = set()
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].rstrip("*") == partition:
+                members.add(fields[0])
+        return members
+
     def scancel(self, job_id: str) -> str:
         return self.cli(["scancel", job_id])
 
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
+
+    # --- Native k0s cluster (spur k8s) wrappers ---
+
+    def k8s_up(self, args: list[str] | None = None) -> str:
+        # k0s up/down are admin-gated; run as root so they pass without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "up"] + (args or []))
+
+    def k8s_down(self, reset: bool = True) -> str:
+        extra = ["--reset"] if reset else []
+        return self.cli_as_user("root", ["spur", "k8s", "down"] + extra)
+
+    def k8s_add_nodes(self, args: list[str]) -> str:
+        # add-nodes is admin-gated; run as root so it passes without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "add-nodes"] + args)
+
+    def k8s_remove_nodes(self, args: list[str]) -> str:
+        # remove-nodes is admin-gated; run as root so it passes without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "remove-nodes"] + args)
+
+    def k8s_status(self) -> str:
+        return self.cli(["spur", "k8s", "status"])
+
+    def k8s_member_list(self) -> list[str]:
+        """Parse `members:` into a name list; empty list means "all nodes" (whole inventory)."""
+        members = self.k8s_members()
+        if not members or members == "all nodes":
+            return []
+        return [n.strip() for n in members.split(",") if n.strip()]
+
+    def k8s_control_planes(self) -> list[str]:
+        """Parse the control-plane node list from `spur k8s status`."""
+        for line in self.k8s_status().splitlines():
+            if line.startswith("control-plane:"):
+                names = line.split(":", 1)[1].strip()
+                return [n.strip() for n in names.split(",") if n.strip()]
+        return []
+
+    def k8s_members(self) -> str:
+        """Parse the `members:` line from `spur k8s status` ("all nodes" or a name list)."""
+        for line in self.k8s_status().splitlines():
+            if line.startswith("members:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    def k8s_active_controllers(self) -> list[str]:
+        """Node names whose `spur k8s status` row is role=controller/single and active."""
+        out = []
+        for line in self.k8s_status().splitlines():
+            fields = line.split()
+            if len(fields) >= 3 and fields[1] in ("controller", "single") and fields[2] == "active":
+                out.append(fields[0])
+        return out
+
+    def wait_k8s_phase(self, phase: str, timeout: int = 600) -> str:
+        """Poll `spur k8s status` until it reports the given phase."""
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = self.k8s_status()
+            for line in last.splitlines():
+                if line.startswith("phase:") and line.split(":", 1)[1].strip() == phase:
+                    return last
+            time.sleep(5)
+        raise TimeoutError(f"k0s phase did not reach {phase} within {timeout}s:\n{last}")
+
+    def etcd_member_count(self) -> int:
+        """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
+        (etcd only exists there; node 0 may be a worker since CPs are chosen by lexical order)."""
+        cps = set(self.k8s_control_planes())
+        for i, name in enumerate(self.node_names):
+            if name not in cps:
+                continue
+            out = self.nodes[i].exec_allow_fail(
+                f"{self._sudo_prefix()}k0s etcd member-list 2>/dev/null"
+            )
+            members = re.findall(r"https?://[^\"]+:2380", out)
+            if members:
+                return len(members)
+        return 0
 
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
@@ -457,7 +585,10 @@ class SpurCluster:
         and *executable=False* for non-script files.
         """
         path = f"{self.remote_dir}/{name}"
-        mode = 0o755 if executable else None
+        # Even non-executable files get an explicit mode, not the remote umask:
+        # the job_submit hook refuses a group/world-writable file, so an umask
+        # of 002 would otherwise stop the controller from starting.
+        mode = 0o755 if executable else 0o644
         targets = self.nodes if all_nodes else self.nodes[:1]
         parent = path.rsplit("/", 1)[0]
         for node in targets:
@@ -719,7 +850,8 @@ class SpurCluster:
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
-                if all(n in self.sinfo() for n in self.node_names):
+                nodes = self.sinfo_nodes()
+                if all(n in nodes for n in self.node_names):
                     return
             except Exception:
                 pass
@@ -977,8 +1109,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                out = self.sinfo()
-                if self._cluster_is_ready(out):
+                if self._cluster_is_ready():
                     return
             except Exception:
                 pass
@@ -989,22 +1120,14 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             f"sinfo output:\n{self.sinfo()}"
         )
 
-    def _cluster_is_ready(self, sinfo_output: str) -> bool:
-        for name in self.node_names:
-            if name not in sinfo_output:
-                return False
-        total_idle = 0
-        for line in sinfo_output.splitlines():
-            if "idle" not in line:
-                continue
-            fields = line.split()
-            for j, field in enumerate(fields):
-                if field == "idle" and j > 0:
-                    try:
-                        total_idle += int(fields[j - 1])
-                    except ValueError:
-                        pass
-        return total_idle >= len(self.node_names)
+    def _cluster_is_ready(self) -> bool:
+        states = self.sinfo_nodes()
+        if not all(name in states for name in self.node_names):
+            return False
+        idle = sum(
+            1 for name in self.node_names if states[name].startswith("idle")
+        )
+        return idle >= len(self.node_names)
 
 
 # --- Job helpers ---
@@ -1023,7 +1146,7 @@ def parse_job_id(sbatch_output: str) -> int | None:
 
 def job_state(squeue_output: str, job_id: int) -> str | None:
     """Parse job state from squeue -t all output."""
-    valid_states = {"PD", "R", "CD", "CG", "F", "CA", "TO", "NF", "PR", "S"}
+    valid_states = {"PD", "R", "CD", "CG", "F", "CA", "TO", "NF", "PR", "S", "RQ"}
     id_str = str(job_id)
     for line in squeue_output.splitlines()[1:]:
         fields = line.split()

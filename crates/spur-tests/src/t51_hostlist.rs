@@ -136,4 +136,9 @@ mod tests {
     fn t51_18_invalid_reversed_range() {
         assert!(hostlist::expand("node[5-1]").is_err());
     }
+
+    #[test]
+    fn t51_19_invalid_closing_before_opening_bracket() {
+        assert!(hostlist::expand("a]b[1-2]").is_err());
+    }
 }

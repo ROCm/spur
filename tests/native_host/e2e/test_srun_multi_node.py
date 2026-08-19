@@ -82,15 +82,14 @@ class TestStandaloneSrun:
         assert re.search(r"NodeList=\S+", show), (
             f"missing NodeList in scontrol output:\n{show}"
         )
-        sinfo = cluster.sinfo()
-        assert not cluster._cluster_is_ready(sinfo), (
-            f"expected allocated nodes while srun sleep runs, sinfo:\n{sinfo}"
+        assert not cluster._cluster_is_ready(), (
+            f"expected allocated nodes while srun sleep runs, sinfo:\n{cluster.sinfo()}"
         )
 
         wait_job(cluster, job_id, timeout=60)
         deadline = time.time() + 60
         while time.time() < deadline:
-            if cluster._cluster_is_ready(cluster.sinfo()):
+            if cluster._cluster_is_ready():
                 return
             time.sleep(2)
         raise TimeoutError("nodes did not return to idle after srun completed")

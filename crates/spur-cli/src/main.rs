@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod authclient;
 mod env_defaults;
 mod exec;
 mod exit_fmt;
@@ -13,6 +14,7 @@ mod mock_controller;
 mod net;
 mod node;
 mod nodelist;
+mod privilege;
 mod sacct;
 mod sacctmgr;
 mod salloc;
@@ -63,6 +65,24 @@ fn load_controller_addr_from_config() {
     }
 }
 
+/// Route `tracing` output from the shared crates to stderr.
+///
+/// Without a subscriber, warnings emitted by libraries such as `spur-net` are
+/// dropped, so failures the CLI recovers from would be invisible. Warnings and
+/// above are shown by default; `RUST_LOG` opts into more.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+    // Timestamps and targets are noise next to the CLI's own stderr messages.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_target(false)
+        .try_init();
+}
+
 fn main() -> anyhow::Result<()> {
     // Rust sets SIGPIPE=SIG_IGN; restore default so pipe consumers exit cleanly.
     // SAFETY: called before the tokio runtime and any threads are started.
@@ -86,6 +106,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(0);
     }
 
+    init_logging();
     load_controller_addr_from_config();
 
     // Multi-call binary: dispatch based on argv[0] (symlink name).

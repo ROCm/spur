@@ -65,6 +65,7 @@ mod tests {
             ("S", "SUSPENDED"),
             ("DL", "DEADLINE"),
             ("OOM", "OUT_OF_MEMORY"),
+            ("RQ", "REQUEUED"),
         ];
         assert_eq!(JobState::ALL.len(), expected.len());
         for (i, state) in JobState::ALL.iter().enumerate() {
@@ -127,6 +128,7 @@ mod tests {
             ),
             (PendingReason::ReservationDeleted, "ReservationDeleted"),
             (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
+            (PendingReason::TimeLimit, "TimeLimit"),
             (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
             (
                 PendingReason::QosMaxWallDurationPerJobLimit,

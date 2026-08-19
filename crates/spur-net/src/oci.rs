@@ -11,18 +11,19 @@
 //! 1. Parse image reference (registry/repo:tag)
 //! 2. Authenticate (token-based for Docker Hub, anonymous for others)
 //! 3. Fetch manifest → list of layer digests
-//! 4. Download each layer (tar.gz blobs)
+//! 4. Download each layer blob
 //! 5. Extract layers in order to build rootfs
 //! 6. Pack rootfs into squashfs via mksquashfs
 
+use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use flate2::read::GzDecoder;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A parsed container image reference.
 #[derive(Debug, Clone)]
@@ -155,7 +156,10 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
     let rootfs_dir = tmp_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs_dir)?;
 
-    let result = pull_and_extract(&image_ref, &rootfs_dir).await;
+    let cache_override = std::env::var_os("SPUR_IMAGE_CACHE");
+    let cache = LayerCache::open(&layer_cache_dir(output_dir, cache_override.as_deref()));
+
+    let result = pull_and_extract(&image_ref, &rootfs_dir, &cache).await;
     if let Err(e) = &result {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(anyhow::anyhow!("{}", e));
@@ -209,7 +213,11 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
 }
 
 /// Download manifest and layers, extract to rootfs directory.
-async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Result<()> {
+async fn pull_and_extract(
+    image_ref: &ImageRef,
+    rootfs_dir: &Path,
+    cache: &LayerCache,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().user_agent("spur/0.1").build()?;
 
     // Get auth token
@@ -277,13 +285,6 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
 
     info!(layers = manifest.layers.len(), "downloading layers");
 
-    // Layer cache directory
-    let cache_dir = PathBuf::from(
-        std::env::var("SPUR_IMAGE_CACHE")
-            .unwrap_or_else(|_| "/var/spool/spur/images/.layers".into()),
-    );
-    let _ = std::fs::create_dir_all(&cache_dir);
-
     // Download layers in parallel, then extract sequentially (order matters)
     let mut layer_data: Vec<(usize, bytes::Bytes)> = Vec::new();
 
@@ -292,20 +293,16 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
     for (i, layer) in manifest.layers.iter().enumerate() {
         let digest = layer.digest.clone();
         let size = layer.size;
-        let cache_path = cache_dir.join(digest.replace(':', "_"));
 
-        // Check layer cache
-        if cache_path.exists() {
-            if let Ok(cached) = std::fs::read(&cache_path) {
-                info!(
-                    layer = i + 1,
-                    total = manifest.layers.len(),
-                    digest = %digest,
-                    "layer cached, skipping download"
-                );
-                layer_data.push((i, bytes::Bytes::from(cached)));
-                continue;
-            }
+        if let Some(cached) = cache.read_layer(&digest) {
+            info!(
+                layer = i + 1,
+                total = manifest.layers.len(),
+                digest = %digest,
+                "layer cached, skipping download"
+            );
+            layer_data.push((i, bytes::Bytes::from(cached)));
+            continue;
         }
 
         let blob_url = format!(
@@ -314,6 +311,7 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
         );
         let client = client.clone();
         let token = token.clone();
+        let cache = cache.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -335,8 +333,7 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
 
             let data = resp.bytes().await.context("failed to read layer body")?;
 
-            // Cache the layer
-            let _ = std::fs::write(&cache_path, &data);
+            cache.write_layer(&digest, &data);
 
             Ok::<(usize, bytes::Bytes), anyhow::Error>((i, data))
         });
@@ -355,13 +352,73 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
     // Extract layers sequentially (order matters for whiteout files)
     for (i, (_, data)) in layer_data.iter().enumerate() {
         let media_type = &manifest.layers[i].media_type;
-        if media_type.contains("gzip") || manifest.layers[i].digest.starts_with("sha256:") {
-            extract_tar_gz(data, rootfs_dir)
-                .with_context(|| format!("failed to extract layer {}", i + 1))?;
-        }
+        extract_layer(data, Some(media_type), rootfs_dir)
+            .with_context(|| format!("failed to extract layer {}", i + 1))?;
     }
 
     Ok(())
+}
+
+/// Resolve the layer cache directory for an image output directory.
+///
+/// The cache lives beside the images it belongs to so that it follows the
+/// non-root fallback from `/var/spool/spur/images` to `~/.spur/images`. An
+/// empty override is treated as unset, matching `SPUR_IMAGE_DIR` handling.
+fn layer_cache_dir(output_dir: &Path, override_dir: Option<&OsStr>) -> PathBuf {
+    match override_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => output_dir.join(".layers"),
+    }
+}
+
+/// Content-addressed store for downloaded image layers.
+///
+/// Caching is best effort: an unusable cache directory only costs a re-download,
+/// so failures downgrade the cache to a no-op instead of failing the pull.
+#[derive(Clone)]
+struct LayerCache {
+    dir: Option<PathBuf>,
+}
+
+impl LayerCache {
+    fn open(dir: &Path) -> Self {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            warn!(
+                path = %dir.display(),
+                %error,
+                "failed to create image layer cache; layers will not be cached"
+            );
+            return Self { dir: None };
+        }
+
+        Self {
+            dir: Some(dir.to_path_buf()),
+        }
+    }
+
+    fn layer_path(&self, digest: &str) -> Option<PathBuf> {
+        self.dir
+            .as_ref()
+            .map(|dir| dir.join(digest.replace(':', "_")))
+    }
+
+    fn read_layer(&self, digest: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.layer_path(digest)?).ok()
+    }
+
+    fn write_layer(&self, digest: &str, data: &[u8]) {
+        let Some(path) = self.layer_path(digest) else {
+            return;
+        };
+
+        if let Err(error) = std::fs::write(&path, data) {
+            warn!(
+                path = %path.display(),
+                %error,
+                "failed to cache image layer"
+            );
+        }
+    }
 }
 
 /// Registry credentials loaded from file or environment.
@@ -611,42 +668,38 @@ async fn resolve_manifest_list(
     Ok(manifest)
 }
 
-/// Extract a gzipped tarball into a directory.
-fn extract_tar_gz(data: &[u8], dest: &Path) -> anyhow::Result<()> {
-    let decoder = GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
+fn extract_layer(data: &[u8], media_type: Option<&str>, dest: &Path) -> anyhow::Result<()> {
+    extract_tar(crate::image_layer::decode(data, media_type)?, dest)
+}
+
+fn extract_tar(reader: impl Read, dest: &Path) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(reader);
     archive.set_overwrite(true);
     // Unpack, ignoring permission errors (common in rootless)
     for entry in archive.entries()? {
-        match entry {
-            Ok(mut entry) => {
-                // Skip whiteout files (.wh.*) — used for layer deletion
-                let path = entry.path()?.to_path_buf();
-                let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-                if filename.starts_with(".wh.") {
-                    // Whiteout: delete the corresponding file
-                    let target = if filename == ".wh..wh..opq" {
-                        // Opaque whiteout: directory should be empty
-                        // (skip for now — complex to handle)
-                        continue;
-                    } else {
-                        let real_name = filename.strip_prefix(".wh.").unwrap();
-                        dest.join(path.parent().unwrap_or(Path::new("")))
-                            .join(real_name)
-                    };
-                    let _ = std::fs::remove_file(&target);
-                    let _ = std::fs::remove_dir_all(&target);
-                    continue;
-                }
+        let mut entry = entry?;
+        // Skip whiteout files (.wh.*) — used for layer deletion
+        let path = entry.path()?.to_path_buf();
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        if filename.starts_with(".wh.") {
+            // Whiteout: delete the corresponding file
+            let target = if filename == ".wh..wh..opq" {
+                // Opaque whiteout: directory should be empty
+                // (skip for now — complex to handle)
+                continue;
+            } else {
+                let real_name = filename.strip_prefix(".wh.").unwrap_or(filename);
+                dest.join(path.parent().unwrap_or(Path::new("")))
+                    .join(real_name)
+            };
+            let _ = std::fs::remove_file(&target);
+            let _ = std::fs::remove_dir_all(&target);
+            continue;
+        }
 
-                if let Err(e) = entry.unpack_in(dest) {
-                    // Ignore permission errors on special files
-                    debug!(path = %path.display(), error = %e, "skipping entry");
-                }
-            }
-            Err(e) => {
-                debug!(error = %e, "skipping tar entry");
-            }
+        if let Err(e) = entry.unpack_in(dest) {
+            // Ignore permission errors on special files
+            debug!(path = %path.display(), error = %e, "skipping entry");
         }
     }
     Ok(())
@@ -671,8 +724,130 @@ pub fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use flate2::{write::GzEncoder, Compression};
 
     use super::*;
+
+    fn tar_layer(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, path, contents).unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_layer_supports_uncompressed_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer = tar_layer("plain.txt", b"plain layer");
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("plain.txt")).unwrap(),
+            b"plain layer"
+        );
+    }
+
+    #[test]
+    fn extract_layer_supports_gzip_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer = gzip(&tar_layer("gzip.txt", b"gzip layer"));
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar+gzip"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("gzip.txt")).unwrap(),
+            b"gzip layer"
+        );
+    }
+
+    #[test]
+    fn extract_layer_supports_zstd_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer =
+            zstd::stream::encode_all(tar_layer("zstd.txt", b"zstd layer").as_slice(), 0).unwrap();
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar+zstd"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("zstd.txt")).unwrap(),
+            b"zstd layer"
+        );
+    }
+
+    #[test]
+    fn extract_layer_applies_whiteout() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let removed = rootfs.path().join("nested/removed.txt");
+        let retained = rootfs.path().join("nested/retained.txt");
+        std::fs::create_dir_all(removed.parent().unwrap()).unwrap();
+        std::fs::write(&removed, b"remove me").unwrap();
+        std::fs::write(&retained, b"keep me").unwrap();
+        let layer = tar_layer("nested/.wh.removed.txt", b"");
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert!(!removed.exists());
+        assert_eq!(std::fs::read(retained).unwrap(), b"keep me");
+        assert!(!rootfs.path().join("nested/.wh.removed.txt").exists());
+    }
+
+    #[test]
+    fn extract_layer_rejects_truncated_compressed_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let contents: Vec<u8> = (0..65_536)
+            .scan(0x1234_5678_u32, |state, _| {
+                *state ^= *state << 13;
+                *state ^= *state >> 17;
+                *state ^= *state << 5;
+                Some(*state as u8)
+            })
+            .collect();
+        let mut layer =
+            zstd::stream::encode_all(tar_layer("data.bin", &contents).as_slice(), 0).unwrap();
+        layer.truncate(layer.len() / 2);
+
+        assert!(extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar+zstd"),
+            rootfs.path(),
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_decode_registry_auth_b64_valid() {
@@ -844,5 +1019,83 @@ mod tests {
             sanitize_name("docker://nvcr.io/nvidia/pytorch:24.01"),
             "nvcr.io+nvidia+pytorch+24.01"
         );
+    }
+
+    #[test]
+    fn layer_cache_defaults_below_output_directory() {
+        let output_dir = Path::new("/home/alice/.spur/images");
+
+        assert_eq!(
+            layer_cache_dir(output_dir, None),
+            output_dir.join(".layers")
+        );
+    }
+
+    #[test]
+    fn layer_cache_honors_environment_override() {
+        let output_dir = Path::new("/home/alice/.spur/images");
+        let override_dir = Path::new("/mnt/shared/spur-layers");
+
+        assert_eq!(
+            layer_cache_dir(output_dir, Some(override_dir.as_os_str())),
+            override_dir
+        );
+    }
+
+    #[test]
+    fn layer_cache_ignores_empty_environment_override() {
+        let output_dir = Path::new("/home/alice/.spur/images");
+
+        assert_eq!(
+            layer_cache_dir(output_dir, Some(OsStr::new(""))),
+            output_dir.join(".layers")
+        );
+    }
+
+    #[test]
+    fn layer_cache_round_trips_layers() {
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = layer_cache_dir(output_dir.path(), None);
+        let cache = LayerCache::open(&cache_dir);
+
+        assert!(cache_dir.is_dir());
+        assert_eq!(cache.read_layer("sha256:abc"), None);
+
+        cache.write_layer("sha256:abc", b"layer bytes");
+
+        assert_eq!(
+            cache.read_layer("sha256:abc").as_deref(),
+            Some(&b"layer bytes"[..])
+        );
+        assert!(cache_dir.join("sha256_abc").is_file());
+    }
+
+    #[test]
+    fn layer_cache_disabled_when_directory_cannot_be_created() {
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        // A regular file cannot become a parent directory, so this fails for
+        // every user including root.
+        let blocked = output_dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"").expect("write blocker");
+
+        let cache = LayerCache::open(&blocked.join(".layers"));
+
+        assert_eq!(cache.layer_path("sha256:abc"), None);
+        cache.write_layer("sha256:abc", b"layer bytes");
+        assert_eq!(cache.read_layer("sha256:abc"), None);
+    }
+
+    #[test]
+    fn layer_cache_write_failure_leaves_pull_usable() {
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        let cache = LayerCache::open(&layer_cache_dir(output_dir.path(), None));
+
+        // Occupying the entry path with a directory makes the layer write fail.
+        let entry = cache.layer_path("sha256:abc").expect("cache enabled");
+        std::fs::create_dir(&entry).expect("occupy entry path");
+
+        cache.write_layer("sha256:abc", b"layer bytes");
+
+        assert_eq!(cache.read_layer("sha256:abc"), None);
     }
 }

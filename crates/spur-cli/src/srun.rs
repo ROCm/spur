@@ -210,17 +210,21 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let matches = SrunArgs::command().try_get_matches_from(&args)?;
     let mut args = SrunArgs::from_arg_matches(&matches)?;
+
+    if args.jobid.is_some() && !args.overlap {
+        anyhow::bail!("--jobid requires --overlap");
+    }
+
     resolve_srun_env(&matches, &mut args)?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     // --jobid --overlap: exec into a running job (interactive PTY session)
     if let Some(job_id) = args.jobid {
-        if !args.overlap {
-            anyhow::bail!("--jobid requires --overlap");
-        }
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
+        let user = crate::interactive::current_user()?;
         let exit_code =
-            run_interactive_pty(&args.controller, job_id, args.command.clone(), node).await?;
+            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
+                .await?;
         std::process::exit(exit_code);
     }
 
@@ -561,7 +565,7 @@ fn build_srun_job_spec(
         partition: args.partition.clone().unwrap_or_default(),
         account: args.account.clone().unwrap_or_default(),
         qos: args.qos.clone().unwrap_or_default(),
-        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+        user: crate::interactive::current_user()?,
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
@@ -607,7 +611,7 @@ fn build_srun_job_spec(
 }
 
 fn install_ctrl_c_cancel(
-    client: SlurmControllerClient<tonic::transport::Channel>,
+    client: SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     user: String,
 ) -> tokio::task::JoinHandle<()> {
@@ -628,7 +632,7 @@ fn install_ctrl_c_cancel(
 }
 
 async fn wait_for_job_running(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
 ) -> Result<String> {
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -704,10 +708,11 @@ struct StepDispatchParams<'a> {
     work_dir: &'a str,
     io: &'a ResolvedIoPaths,
     mpi: &'a str,
+    user: &'a str,
 }
 
 async fn dispatch_step(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     params: &StepDispatchParams<'_>,
 ) -> Result<StepDispatchResult> {
@@ -726,6 +731,7 @@ async fn dispatch_step(
             pty: false,
             winsize: None,
             node: String::new(),
+            user: params.user.to_string(),
         })
         .await
         .context("failed to create job step")?
@@ -771,7 +777,7 @@ async fn dispatch_step(
 }
 
 async fn release_srun_allocation(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     user: &str,
     exit_code: i32,
@@ -805,7 +811,7 @@ async fn release_srun_allocation(
 }
 
 async fn dispatch_step_cancellable(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     params: &StepDispatchParams<'_>,
     cancel_job_on_interrupt: bool,
@@ -829,25 +835,30 @@ async fn run_standalone_srun(
     mpi: &str,
 ) -> Result<()> {
     let io = resolve_io_paths(args);
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
-    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
-
     let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
-    let job_id = client
+    let user = job_spec.user.clone();
+    let submit_resp = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
         })
         .await
         .context("job submission failed")?
-        .into_inner()
-        .job_id;
+        .into_inner();
+    for warning in &submit_resp.warnings {
+        eprintln!("srun: warning: {warning}");
+    }
+    let job_id = submit_resp.job_id;
 
     eprintln!("srun: Pending job allocation {}...", job_id);
 
     let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, user.clone());
+    // Guard drops (and stops pinging) on every return path, including `?`.
+    let _keepalive =
+        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "srun");
 
     let nodelist = wait_for_job_running(&mut client, job_id).await?;
     if !nodelist.is_empty() {
@@ -862,6 +873,7 @@ async fn run_standalone_srun(
             job_id,
             args.command.clone(),
             String::new(),
+            &user,
         )
         .await;
         let _ = client
@@ -886,6 +898,7 @@ async fn run_standalone_srun(
             work_dir,
             io: &io,
             mpi,
+            user: &user,
         };
         let dispatch_result =
             dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
@@ -913,7 +926,7 @@ async fn run_standalone_srun(
     }
 
     let output_streamed = if io.stdout.is_empty() {
-        try_stream_output(&mut client, &nodelist, job_id).await
+        try_stream_output(&mut client, &nodelist, job_id, &user).await
     } else {
         false
     };
@@ -977,9 +990,10 @@ fn first_node(nodelist: &str) -> String {
 }
 
 async fn try_stream_output(
-    controller: &mut SlurmControllerClient<tonic::transport::Channel>,
+    controller: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     nodelist: &str,
     job_id: u32,
+    user: &str,
 ) -> bool {
     let first_node = nodelist.split(',').next().unwrap_or_default().trim();
     if first_node.is_empty() {
@@ -1007,6 +1021,7 @@ async fn try_stream_output(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: "stdout".into(),
+            user: user.to_string(),
         })
         .await
     {
@@ -1032,7 +1047,7 @@ async fn try_stream_output(
 }
 
 async fn poll_for_completion(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     work_dir: &str,
     stdout_path: &str,
@@ -1190,8 +1205,9 @@ async fn run_interactive_pty(
     job_id: u32,
     command: Vec<String>,
     node: String,
+    user: &str,
 ) -> Result<i32> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("cannot connect to controller")?;
     let mut ctrl = SlurmControllerClient::new(channel);
@@ -1219,6 +1235,7 @@ async fn run_interactive_pty(
                     pty: true,
                     winsize: Some(winsize),
                     node: node.clone(),
+                    user: user.to_string(),
                 })
                 .await
             {
@@ -1255,6 +1272,7 @@ async fn run_interactive_pty(
             command.clone(),
             winsize,
             true,
+            user,
         )
         .await
         {
@@ -1291,7 +1309,7 @@ async fn run_as_step(
     work_dir: &str,
     step_mpi: &str,
 ) -> Result<()> {
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1301,12 +1319,14 @@ async fn run_as_step(
     }
 
     let io = resolve_io_paths(args);
+    let user = crate::interactive::current_user()?;
 
     let step_params = StepDispatchParams {
         args,
         work_dir,
         io: &io,
         mpi: step_mpi,
+        user: &user,
     };
     let dispatch_result =
         dispatch_step_cancellable(&mut client, job_id, &step_params, false).await?;
@@ -2097,7 +2117,7 @@ mod tests {
     }
 
     async fn dispatch_with(
-        client: &mut SlurmControllerClient<tonic::transport::Channel>,
+        client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
         cli: &[&str],
     ) -> Result<StepDispatchResult> {
         let args = SrunArgs::try_parse_from(cli).expect("parse failed");
@@ -2107,6 +2127,7 @@ mod tests {
             work_dir: "/tmp",
             io: &io,
             mpi: spur_core::mpi::MPI_NONE,
+            user: "tester",
         };
         dispatch_step(client, 1, &params).await
     }

@@ -168,6 +168,8 @@ pub struct SubmitJobFields {
 #[derive(Serialize)]
 pub struct SubmitResponse {
     pub job_id: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]

@@ -52,7 +52,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_default();
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -66,6 +66,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             account: String::new(),
             job_ids,
             name: String::new(),
+            nodes: Vec::new(),
         })
         .await
         .context("failed to get jobs")?;

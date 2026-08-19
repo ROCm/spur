@@ -11,8 +11,6 @@ pub mod raft_proto {
 
 pub use proto::*;
 
-use tonic::transport::Channel;
-
 /// Maximum size of a gRPC *response* (server encode / client decode), in bytes.
 /// Large `GetJobs`/`GetNodes` responses can exceed tonic's default 4 MiB on big
 /// clusters. The Raft-internal service uses a separate constant in `raft.rs`.
@@ -26,18 +24,30 @@ pub const MAX_GRPC_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
 /// Controller client with asymmetric size limits: requests capped at
 /// `MAX_GRPC_REQUEST_SIZE`, responses up to `MAX_GRPC_MESSAGE_SIZE`.
-pub fn controller_client(
-    channel: Channel,
-) -> proto::slurm_controller_client::SlurmControllerClient<Channel> {
+pub fn controller_client<T>(channel: T) -> proto::slurm_controller_client::SlurmControllerClient<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody:
+        tonic::codegen::Body<Data = tonic::codegen::Bytes> + std::marker::Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error:
+        Into<tonic::codegen::StdError> + std::marker::Send,
+{
     proto::slurm_controller_client::SlurmControllerClient::new(channel)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_GRPC_REQUEST_SIZE)
 }
 
 /// Accounting client with asymmetric size limits.
-pub fn accounting_client(
-    channel: Channel,
-) -> proto::slurm_accounting_client::SlurmAccountingClient<Channel> {
+pub fn accounting_client<T>(channel: T) -> proto::slurm_accounting_client::SlurmAccountingClient<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody:
+        tonic::codegen::Body<Data = tonic::codegen::Bytes> + std::marker::Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error:
+        Into<tonic::codegen::StdError> + std::marker::Send,
+{
     proto::slurm_accounting_client::SlurmAccountingClient::new(channel)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_GRPC_REQUEST_SIZE)
