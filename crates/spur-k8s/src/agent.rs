@@ -91,11 +91,21 @@ impl VirtualAgent {
                     .map_err(|_| Status::unavailable("k8s API timeout"))?
                     .map_err(|e| Status::internal(e.to_string()))?;
 
-                list.items.into_iter().next().ok_or_else(|| {
-                    Status::not_found(format!(
+                // Fail closed on ambiguity: a label is not unique in Kubernetes, so if more than one
+                // SpurJob carries this job-id, silently taking the first could launch pods into the
+                // wrong namespace. Zero is a not-yet-visible race (retried); two or more is a real
+                // conflict that must not be guessed.
+                let mut items = list.items.into_iter();
+                match (items.next(), items.next()) {
+                    (None, _) => Err(Status::not_found(format!(
                         "spur.amd.com/job-id={job_id} label not yet visible"
-                    ))
-                })
+                    ))),
+                    (Some(job), None) => Ok(job),
+                    (Some(_), Some(_)) => Err(Status::failed_precondition(format!(
+                        "multiple SpurJobs carry spur.amd.com/job-id={job_id}; refusing to guess \
+                         which one to launch"
+                    ))),
+                }
             })
             .retry(
                 ExponentialBuilder::default()

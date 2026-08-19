@@ -120,6 +120,23 @@ Apply with ``kubectl``:
 
 The operator watches SpurJob resources, submits them to the controller, and updates status fields as the job progresses.
 
+Authenticating the operator agent surface
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The operator serves a virtual-agent gRPC surface on ``--listen`` (port 6818) that carries a
+cluster-wide pod-create privilege, so reaching it must not be enough to ask the operator to run
+work. Authentication mirrors the cluster ``[auth] mode``:
+
+- ``--auth-mode permissive`` (default) verifies a credential when one is presented and otherwise
+  logs and allows — the migration default.
+- ``--auth-mode required`` rejects every uncredentialed call. It refuses to start without a key.
+- ``--jwt-key`` / ``SPUR_JWT_KEY`` is the cluster ``[auth] jwt_key`` the operator verifies
+  credentials against; source it from a Secret. In ``permissive`` mode with no key, a controller
+  that *does* present a credential is rejected (there is no key to verify it), so set the key before
+  controllers start sending one.
+
+See the commented ``--auth-mode`` / ``SPUR_JWT_KEY`` lines in ``examples/k8s/operator.yaml``.
+
 Verify
 ------
 

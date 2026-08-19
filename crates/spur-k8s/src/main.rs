@@ -229,6 +229,12 @@ async fn main() -> anyhow::Result<()> {
         spur_core::config::AuthMode::Required => {
             info!("operator agent requires a cluster credential on every RPC")
         }
+        spur_core::config::AuthMode::Permissive if jwt_key.is_empty() => tracing::warn!(
+            "operator agent is permissive but has no --jwt-key / SPUR_JWT_KEY: uncredentialed calls \
+             are allowed, but a controller that DOES present a credential is REJECTED (no key to \
+             verify it against). Set the key so presented credentials verify, then move to \
+             --auth-mode required."
+        ),
         spur_core::config::AuthMode::Permissive => tracing::warn!(
             "operator agent accepts uncredentialed RPCs (auth.mode = permissive): any peer that can \
              reach this port can ask the operator to create a pod. Set --auth-mode required once \
