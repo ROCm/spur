@@ -958,7 +958,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
         spur_core::auth::check_job_owner(
             &req.user,
-            req.user == "root",
+            self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
             "send keepalive for",
         )
@@ -1068,15 +1068,16 @@ impl SlurmController for ControllerService {
         // Reject a caller who does not own the target job before any mutation —
         // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
         // update touches placement, account and time limit, so it must be gated the
-        // same way. An empty/root caller (unauthenticated permissive/disabled, or
-        // the internal control plane) is treated as internal, as at the attach path.
+        // same way. `is_internal` is a verified admin only — derived from the
+        // verified identity, never the wire `user` string; an unauthenticated
+        // non-owner is still denied, ownership checked against the claimed user.
         let job = self
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
         spur_core::auth::check_job_owner(
             &req.user,
-            req.user.is_empty() || req.user == "root",
+            self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
             "modify",
         )
@@ -1956,7 +1957,7 @@ impl SlurmController for ControllerService {
 
         spur_core::auth::check_job_owner(
             &req.user,
-            req.user.is_empty() || req.user == "root",
+            self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
             "attach to",
         )
@@ -2480,7 +2481,7 @@ impl SlurmController for ControllerService {
 
         spur_core::auth::check_job_owner(
             &req.user,
-            req.user.is_empty() || req.user == "root",
+            self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
             "exec into",
         )
@@ -2553,7 +2554,7 @@ impl SlurmController for ControllerService {
         // caller must own the target job — same gate as create_job_step / exec_in_job.
         spur_core::auth::check_job_owner(
             &req.user,
-            req.user.is_empty() || req.user == "root",
+            self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
             "run a step in",
         )
@@ -5729,6 +5730,40 @@ mod tests {
             None,
             "a denied update must not mutate the job"
         );
+    }
+
+    // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
+    // (a) an admin whose username is not literally "root" is still treated as internal, and (b) an
+    // unauthenticated caller cannot bypass ownership by claiming user = "root".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_admin_override_uses_verified_identity_not_wire_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        // A verified admin whose name is not "root" may modify another user's job.
+        let mut admin_req = Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("by-admin".into()),
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        assert!(
+            svc.update_job(admin_req).await.is_ok(),
+            "a verified admin (non-root) must be able to modify any job"
+        );
+
+        // An unauthenticated caller cannot spoof admin by putting user = "root" on the wire.
+        let err = svc
+            .update_job(Request::new(UpdateJobRequest {
+                job_id,
+                comment: Some("spoof".into()),
+                user: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
