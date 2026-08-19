@@ -15656,33 +15656,77 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provision_refuses_conflicting_real_addresses() {
-        // Two meshed nodes claiming the same real address is a genuine operator mistake: assigning
-        // both would push an exclusive AllowedIPs entry for two peers. Refuse with a reason.
+        // Two unassigned meshed nodes advertising the same real address is a genuine operator mistake:
+        // assigning either would push an exclusive AllowedIPs entry for an address two peers claim. Both
+        // stay unprovisioned and both carry the reason, but the call still succeeds so any other node in
+        // the same tick provisions normally.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_meshed_node(&cm, "n005", "10.44.0.7");
         register_meshed_node(&cm, "n006", "10.44.0.7"); // duplicate
+        register_meshed_node(&cm, "n007", "10.44.0.9"); // healthy bystander
         record_cp_set(&cm, "n005", &["n005"]);
 
-        let err = crate::cluster_k8s::provision_assignments(
-            &cm,
-            &provision_net_calico(),
-            &cm.k0s_state(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").to_lowercase().contains("mismatch")
-                || format!("{err:#}").to_lowercase().contains("conflict"),
-            "duplicate real address must fail loud: {err:#}"
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+
+        // The healthy node adopts its real address and provisions despite the conflicting pair.
+        wait_for("healthy bystander provisions", || {
+            cm.get_node("n007").and_then(|n| n.k0s_role).is_some()
+        });
+        assert_eq!(
+            cm.get_node("n007").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.9")
         );
-        // The reason is surfaced on BOTH sides of the conflict so `spur k8s status` points at each.
-        wait_for("both nodes carry the conflict reason", || {
-            let a = cm.get_node("n005").and_then(|n| n.k0s_last_error);
-            let b = cm.get_node("n006").and_then(|n| n.k0s_last_error);
-            a.map(|e| e.to_lowercase().contains("mismatch"))
-                .unwrap_or(false)
-                && b.map(|e| e.to_lowercase().contains("mismatch"))
-                    .unwrap_or(false)
+
+        // Neither conflicting node is assigned, and both name each other in an exact-shape reason so
+        // `spur k8s status` points at the whole conflict.
+        assert!(cm.get_node("n005").and_then(|n| n.k0s_role).is_none());
+        assert!(cm.get_node("n006").and_then(|n| n.k0s_role).is_none());
+        let want = "network mismatch: mesh address 10.44.0.7 claimed by n005, n006";
+        wait_for("both conflicting nodes carry the exact reason", || {
+            cm.get_node("n005")
+                .and_then(|n| n.k0s_last_error)
+                .as_deref()
+                == Some(want)
+                && cm
+                    .get_node("n006")
+                    .and_then(|n| n.k0s_last_error)
+                    .as_deref()
+                    == Some(want)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_refuses_newcomer_colliding_with_assigned_node() {
+        // An already-assigned member owns its mesh IP. A newcomer advertising that same address is the
+        // one refused — the incumbent keeps its assignment, the newcomer stays out with a reason.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_meshed_node(&cm, "n005", "10.44.0.7");
+        record_cp_set(&cm, "n005", &["n005"]);
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+        wait_for("incumbent assigned", || {
+            cm.get_node("n005").and_then(|n| n.k0s_role).is_some()
+        });
+
+        register_meshed_node(&cm, "n006", "10.44.0.7"); // collides with the incumbent's owned address
+        crate::cluster_k8s::provision_assignments(&cm, &provision_net_calico(), &cm.k0s_state())
+            .unwrap();
+
+        // Incumbent untouched; newcomer refused and told who owns the address.
+        assert_eq!(
+            cm.get_node("n005").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.7")
+        );
+        assert!(cm.get_node("n006").and_then(|n| n.k0s_role).is_none());
+        let want = "network mismatch: mesh address 10.44.0.7 already owned by n005";
+        wait_for("newcomer carries the ownership reason", || {
+            cm.get_node("n006")
+                .and_then(|n| n.k0s_last_error)
+                .as_deref()
+                == Some(want)
         });
     }
 

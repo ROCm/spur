@@ -212,49 +212,76 @@ pub(crate) fn provision_assignments(
         cp_set.insert(bootstrap.clone());
     }
 
-    // Re-seed the mesh pool from persisted assignments + reserve .1 for the bootstrap controller.
+    // Re-seed the mesh pool from persisted assignments + reserve .1 for the bootstrap controller. An
+    // already-assigned node's persisted `k0s_mesh_ip` is authoritative, so remember which node owns each
+    // in-mesh address to arbitrate newcomer conflicts below.
     let mut pool = AddressPool::new(&net.mesh_cidr)?;
     let controller_ip = first_host(&net.mesh_cidr)?;
     let _ = pool.allocate_specific(controller_ip); // reserve .1 (ignore if already reserved)
+    let mut assigned_addr: HashMap<Ipv4Addr, String> = HashMap::new();
     for n in &nodes {
         if let Some(ip) = &n.k0s_mesh_ip {
             let parsed: Ipv4Addr = ip
                 .parse()
                 .with_context(|| format!("persisted k0s_mesh_ip {ip} for {}", n.name))?;
             pool.mark_allocated(parsed);
+            if n.k0s_role.is_some() {
+                assigned_addr.insert(parsed, n.name.clone());
+            }
         }
     }
 
-    // Adopt each node's REAL mesh address: a node on the mesh advertises its `spur0` IP as
-    // `Node.address`; when that address falls within `mesh_cidr` it IS the node's mesh IP, and is the
-    // single source of truth for it. Re-deriving from an independent pool is what silently corrupts the
-    // mesh when the control-plane set isn't an alphabetical prefix of join order. A node whose comm
-    // address is OUTSIDE `mesh_cidr` (e.g. a control plane advertising its routable underlay address)
-    // is simply not reporting a mesh address — it falls through to pool allocation, not an error.
-    // Reserve every adopted address up front so pooled nodes never collide, and fail loud only on a
-    // genuine conflict: two nodes claiming the same in-mesh address.
-    let mut real_ip: HashMap<String, Ipv4Addr> = HashMap::new();
-    let mut claimed: HashMap<Ipv4Addr, String> = HashMap::new();
+    // Adopt each node's REAL mesh address: a meshed node advertises its `spur0` IP as `Node.address`,
+    // and when it falls within `mesh_cidr` that IS its mesh IP — the single source of truth. Re-deriving
+    // from an independent pool is what silently corrupts the mesh when the control-plane set is not an
+    // alphabetical prefix of join order. An out-of-mesh (underlay) address falls through to pool
+    // allocation below.
+    //
+    // A conflict — two nodes advertising the same in-mesh address — is contained, not fatal: only the
+    // conflicting nodes stay unprovisioned (each tagged with the reason for `spur k8s status`), while
+    // healthy nodes provision normally. An already-assigned member owns its address, so a newcomer
+    // colliding with it is the one refused; two unassigned newcomers on the same address both stay out.
+    //
+    // Group unassigned claimants by advertised in-mesh address so an N-way conflict resolves in one shot.
+    let mut claimants: HashMap<Ipv4Addr, Vec<String>> = HashMap::new();
     for n in &nodes {
         if n.k0s_role.is_some() {
             continue; // already assigned; its persisted mesh IP is authoritative
         }
-        let Some(addr) = real_mesh_address(n, &net.mesh_cidr)? else {
-            continue; // no in-mesh address reported — pool allocation handles it below
-        };
-        if let Some(other) = claimed.insert(addr, n.name.clone()) {
-            // Surface the conflict on BOTH sides so `spur k8s status` points at each node sharing the
-            // address, not just the second one seen.
+        if let Some(addr) = real_mesh_address(n, &net.mesh_cidr)? {
+            claimants.entry(addr).or_default().push(n.name.clone());
+        }
+    }
+
+    let mut real_ip: HashMap<String, Ipv4Addr> = HashMap::new();
+    let mut refused: HashSet<String> = HashSet::new();
+    for (addr, mut names) in claimants {
+        if let Some(owner) = assigned_addr.get(&addr) {
+            // An in-cluster node already owns this address; every newcomer claiming it is refused.
+            for name in &names {
+                let reason =
+                    format!("network mismatch: mesh address {addr} already owned by {owner}");
+                record_node_k0s_error(cluster, name, &reason);
+                refused.insert(name.clone());
+            }
+            continue;
+        }
+        if names.len() > 1 {
+            // Two or more unassigned nodes advertise the same address: none can adopt it. Keep all out
+            // and name every claimant on each so status points at the whole conflict.
+            names.sort();
             let reason = format!(
-                "network mismatch: mesh address {addr} claimed by both {} and {other}",
-                n.name
+                "network mismatch: mesh address {addr} claimed by {}",
+                names.join(", ")
             );
-            record_node_k0s_error(cluster, &n.name, &reason);
-            record_node_k0s_error(cluster, &other, &reason);
-            anyhow::bail!("{reason}");
+            for name in &names {
+                record_node_k0s_error(cluster, name, &reason);
+                refused.insert(name.clone());
+            }
+            continue;
         }
         pool.mark_allocated(addr);
-        real_ip.insert(n.name.clone(), addr);
+        real_ip.insert(names.remove(0), addr);
     }
 
     // Pod-/24 ordinals already in use (so a new node never collides).
@@ -277,6 +304,9 @@ pub(crate) fn provision_assignments(
         if node.k0s_role.is_some() {
             continue; // already assigned
         }
+        if refused.contains(&node.name) {
+            continue; // conflicting mesh address; stays unprovisioned until the operator resolves it
+        }
         let is_cp = cp_set.contains(&node.name);
         let role = if is_cp {
             if single {
@@ -287,10 +317,8 @@ pub(crate) fn provision_assignments(
         } else {
             K0sRole::Worker
         };
-        // Prefer the node's real WireGuard address (adopt-from-host); the bootstrap is treated the
-        // same as any other node — `.1` results naturally when the operator gave the controller `.1`,
-        // and a divergent join order works instead of corrupting the mesh. Fall back to `.1` for a
-        // not-yet-meshed bootstrap, else the pool.
+        // Adopt the node's real WireGuard address; fall back to `.1` for a not-yet-meshed bootstrap,
+        // else the pool.
         let mesh_ip = if let Some(addr) = real_ip.get(&node.name) {
             *addr
         } else if node.name == bootstrap {
@@ -457,11 +485,9 @@ fn first_host(cidr: &str) -> anyhow::Result<Ipv4Addr> {
     Ok(Ipv4Addr::from(u32::from(cidr_base(cidr)?) + 1))
 }
 
-/// A node's real WireGuard mesh address: the `spur0` IP it advertises (`Node.address`) once it has
-/// joined the mesh (non-empty `wg_pubkey`), but only when that address falls within `mesh_cidr`.
-/// Returns Ok(None) for a node not on the mesh (no pubkey / unparseable address) OR one whose comm
-/// address is outside the mesh (e.g. a control plane advertising its routable underlay address) — in
-/// both cases the caller falls back to pool allocation. Errs only on a malformed `mesh_cidr`.
+/// A node's real WireGuard mesh address: the `spur0` IP it advertises (`Node.address`) once meshed
+/// (non-empty `wg_pubkey`), but only when it falls within `mesh_cidr`. Ok(None) for an unmeshed node
+/// or an out-of-mesh (underlay) address — both fall back to pool allocation. Errs on malformed CIDR.
 fn real_mesh_address(
     node: &spur_core::node::Node,
     mesh_cidr: &str,
