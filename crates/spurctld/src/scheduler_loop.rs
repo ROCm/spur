@@ -2661,7 +2661,6 @@ mod tests {
 
     #[test]
     fn qos_preempt_allow_list_permits_listed_qos() {
-        use spur_core::partition::PreemptType;
         let pending_qos = qos_with_preempt_list(&["low", "batch"]);
         let candidate_qos = spur_core::accounting::Qos {
             name: "low".into(),
