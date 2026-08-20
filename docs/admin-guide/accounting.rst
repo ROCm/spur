@@ -844,8 +844,8 @@ number of days:
    [accounting]
    txn_retention_days = 365
 
-Leaving it unset (the default) keeps records forever, matching Slurm's
-default purge-off behavior.
+Leaving it unset (the default) or ``0`` keeps records forever, matching Slurm's
+default purge-off behavior; a positive value enables the purge.
 
 Declarative management with Ansible
 -----------------------------------

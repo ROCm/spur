@@ -491,7 +491,8 @@ pub struct AccountingConfig {
     #[serde(default)]
     pub require_qos: bool,
     /// Delete `txn` audit-log rows older than this many days. `None` (default)
-    /// keeps them forever, matching Slurm's default-off purge behavior.
+    /// or `0` disables purging (rows kept forever, matching Slurm's default-off
+    /// behavior); a positive value enables the periodic purge.
     #[serde(default)]
     pub txn_retention_days: Option<u32>,
 }
