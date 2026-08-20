@@ -378,6 +378,12 @@ Endpoints
    * - ``/metrics/scheduler``
      - Planned
      - Route exists but currently returns an empty body.
+   * - ``/metrics/reconcile``
+     - Live
+     - Disagreement between what the controller charges each node and what that
+       node's job records account for (``spur_reconcile_*``). Counters are
+       recorded by whichever process installed the snapshot, so unlike the other
+       endpoints this one is served by followers as well as the leader.
    * - ``/metrics/k8s``
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
@@ -445,6 +451,85 @@ All gauges. Cluster-wide totals carry no labels; per-node gauges carry a
      - CPU load reported by the node agent.
    * - ``spur_node_free_memory_bytes``
      - Free memory (bytes) reported by the node agent.
+
+Allocation reconciliation — ``/metrics/reconcile``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The controller tracks each node's allocated resources two ways: on the job
+records that own them, and as a running per-node total. The job records are
+authoritative, and the total is checked against them whenever a process's view of
+the cluster is newly assembled — restoring a snapshot, or gaining leadership.
+
+The check runs once each time that view is assembled. There is no periodic pass,
+so on a cluster whose leader never changes it runs at startup and not again.
+
+Undercharges are corrected automatically. Overcharges are reported but never
+released, because a leaked charge and a release still in flight are
+indistinguishable. Clearing one takes operator action: once the node's jobs have
+finished, remove it with ``spur node remove <node>`` and let the agent register
+again — re-registration is the only path that rebuilds the node's record.
+Draining alone does not clear it, and a node carrying a phantom charge reports
+``Draining`` rather than ``Drain`` because nothing is left to release.
+
+Alert on growth in the ``undercharged``, ``overcharged`` and ``reclaims``
+counters, and on ``unaccounted_slices`` being non-zero at all — it is a gauge for
+the most recent pass, not a counter. Do **not** alert on ``rebuilds_total`` or the
+heartbeat counters; they increment in normal operation and are useful as
+denominators.
+
+Three caveats when building queries. These are process-lifetime counters that
+reset when ``spurctld`` restarts. Because this endpoint is not leader-gated, every
+controller in an HA set serves its own independent series — inspect them per
+instance rather than summing across the set, and note the heartbeat counters only
+advance on the leader. And a single node can be both undercharged and overcharged
+in one pass (short of one GPU while holding another it should not), so the two
+node counts can add up to more than ``nodes_checked``.
+
+``trigger`` is ``restore`` or ``leadership_gain``. "Device units" counts GPUs and
+other generic resources together, with countable resources contributing their
+count.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 52 48
+
+   * - Metric
+     - Description
+   * - ``spur_reconcile_rebuilds_total{trigger}``
+     - Reconciliation passes run.
+   * - ``spur_reconcile_nodes_checked{trigger}``
+     - Nodes examined on the most recent pass, as a denominator for the rest.
+   * - ``spur_reconcile_undercharged_nodes_total{trigger}``
+     - Nodes found short of their job records, and corrected.
+   * - ``spur_reconcile_overcharged_nodes_total{trigger}``
+     - Nodes found charged beyond their job records. Not corrected.
+   * - ``spur_reconcile_last_undercharged_nodes{trigger}``
+     - Nodes undercharged on the most recent pass.
+   * - ``spur_reconcile_undercharged_cpus_total{trigger}``,
+       ``spur_reconcile_undercharged_memory_mb_total{trigger}``,
+       ``spur_reconcile_undercharged_devices_total{trigger}``
+     - CPUs, memory (MB) and device units the totals were short by.
+   * - ``spur_reconcile_overcharged_cpus_total{trigger}``,
+       ``spur_reconcile_overcharged_memory_mb_total{trigger}``,
+       ``spur_reconcile_overcharged_devices_total{trigger}``
+     - CPUs, memory (MB) and device units held beyond the job records.
+   * - ``spur_reconcile_unaccounted_slices{trigger}``
+     - Active job/node pairs where the record names a node the controller no
+       longer tracks, or names one but carries no allocation for it. Nothing is
+       charged for that work and the check above cannot see it, so it is counted
+       directly. Worth reporting, except immediately after upgrading from a
+       release that predates per-node allocations, where jobs still running from
+       before the upgrade land here legitimately.
+   * - ``spur_reconcile_agent_job_reclaims_total{cause}``
+     - Jobs an agent reported holding that the controller told it to release.
+       ``cause`` is ``terminal`` (the run is over), ``active_elsewhere`` (the job
+       is running, but on other nodes), or ``unknown`` (the controller has no
+       record of an id it must once have issued).
+   * - ``spur_reconcile_heartbeats_total``
+     - Agent heartbeats examined for held-job disagreement.
+   * - ``spur_reconcile_empty_heartbeats_total``
+     - Heartbeats that reported no held jobs. Treat this as an upper bound on
+       "the node is idle" rather than a count of idle nodes.
 
 k0s metrics from spurctld — ``/metrics/k8s``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -24,6 +24,7 @@ use spur_proto::proto::*;
 use crate::cluster::{ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
+use crate::reconcile_stats::ReclaimCause;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
 use crate::sched_stats::SchedStatsCollector;
@@ -232,6 +233,7 @@ impl ControllerService {
     /// longer believes belongs to it there — job finished, job moved to
     /// another node, or an id older than any this controller issued. Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
+        self.cluster.record_agent_heartbeat(reported.len());
         let stale = stale_reported_jobs(&self.cluster, node, reported);
         if stale.is_empty() {
             return;
@@ -239,12 +241,14 @@ impl ControllerService {
         let cluster = self.cluster.clone();
         let node = node.to_string();
         tokio::spawn(async move {
-            for job_id in stale {
+            for (job_id, _) in stale {
                 // Re-check: a requeue since the snapshot above would otherwise
-                // send an unguarded cancel into the job's new run.
-                if !is_reclaimable(&cluster, &node, job_id) {
+                // send an unguarded cancel into the job's new run. Record the
+                // cause it returns now, which may differ from the snapshot's.
+                let Some(cause) = reclaim_cause(&cluster, &node, job_id) else {
                     continue;
-                }
+                };
+                cluster.record_reclaim(cause);
                 warn!(
                     job_id,
                     node = %node,
@@ -564,34 +568,34 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller == "root" || cache.is_admin(caller)
 }
 
-/// Whether `node` may release what it holds for `job_id`: the run is over, the
-/// job is active elsewhere, or the id is untracked but was issued by us.
-fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
+/// Why `node` may release what it holds for `job_id`, or `None` to spare it.
+/// The cause is carried rather than collapsed to a bool so a shift in the mix
+/// points at which fault is occurring.
+fn reclaim_cause(cluster: &ClusterManager, node: &str, job_id: u32) -> Option<ReclaimCause> {
     match cluster.get_job(job_id) {
-        Some(job) if job.state.is_terminal() => true,
+        Some(job) if job.state.is_terminal() => Some(ReclaimCause::Terminal),
         // An active job's nodelist is authoritative only once populated: state
         // and allocation commit as two separate WAL entries, so a job can be
         // observed as Running with `allocated_nodes` still empty. Spare it, same
         // as a job earlier than active that may be mid-dispatch to this node.
-        Some(job) => {
-            job.state.is_active()
-                && !job.allocated_nodes.is_empty()
-                && !job.allocated_nodes.iter().any(|n| n == node)
-        }
-        None => job_id < cluster.peek_next_job_id(),
+        Some(job) => (job.state.is_active()
+            && !job.allocated_nodes.is_empty()
+            && !job.allocated_nodes.iter().any(|n| n == node))
+        .then_some(ReclaimCause::ActiveElsewhere),
+        None => (job_id < cluster.peek_next_job_id()).then_some(ReclaimCause::Unknown),
     }
 }
 
-/// Reported ids `node` may release; ids still allocated here, not yet started,
-/// and never issued by this controller are spared.
+/// Reported ids `node` may release, with why; ids still allocated here, not yet
+/// started, and never issued by this controller are spared.
 fn stale_reported_jobs(
     cluster: &ClusterManager,
     node: &str,
     reported: &[RunningJobStatus],
-) -> Vec<u32> {
+) -> Vec<(u32, ReclaimCause)> {
     reported
         .iter()
-        .filter_map(|r| is_reclaimable(cluster, node, r.job_id).then_some(r.job_id))
+        .filter_map(|r| reclaim_cause(cluster, node, r.job_id).map(|cause| (r.job_id, cause)))
         .collect()
 }
 
@@ -4540,7 +4544,7 @@ mod tests {
         let stale = stale_reported_jobs(&cluster, "n1", &reported);
         assert_eq!(
             stale,
-            vec![12],
+            vec![(12, ReclaimCause::Terminal)],
             "terminal is reclaimed; Pending/Running/Completing/Suspended/Preempted spared, and 999 was never issued"
         );
     }
@@ -4596,7 +4600,7 @@ mod tests {
 
         assert_eq!(
             stale_reported_jobs(&cluster, "n1", &reported),
-            vec![20],
+            vec![(20, ReclaimCause::Unknown)],
             "the evicted id is reclaimed; ids at or above next_job_id were never issued here"
         );
     }
@@ -4635,7 +4639,7 @@ mod tests {
         assert_eq!(job_state(&cluster, 30), None, "parent id is never stored");
         assert!(30 < cluster.peek_next_job_id());
         assert!(
-            is_reclaimable(&cluster, "n1", 30),
+            reclaim_cause(&cluster, "n1", 30) == Some(ReclaimCause::Unknown),
             "an unstored id below the watermark is reclaimable — reachable only if an agent reports it"
         );
     }
@@ -4678,16 +4682,16 @@ mod tests {
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n2".to_string(), res.clone());
+        apply(&WalOperation::job_state_change(
+            40,
+            JobState::Pending,
+            JobState::Running,
+        ));
         apply(&WalOperation::job_start(
             40,
             vec!["n2".into()],
             res,
             per_node,
-        ));
-        apply(&WalOperation::job_state_change(
-            40,
-            JobState::Pending,
-            JobState::Running,
         ));
 
         let reported = vec![RunningJobStatus {
@@ -4696,7 +4700,7 @@ mod tests {
         }];
         assert_eq!(
             stale_reported_jobs(&cluster, "n1", &reported),
-            vec![40],
+            vec![(40, ReclaimCause::ActiveElsewhere)],
             "the node it no longer runs on may release it"
         );
         assert!(
@@ -4790,7 +4794,7 @@ mod tests {
     /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
     /// and the spawned loop's send must fail the re-check, not just the snapshot.
     #[tokio::test]
-    async fn is_reclaimable_false_after_requeue_race() {
+    async fn reclaim_cause_is_none_after_requeue_race() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
         use spur_core::wal::WalOperation;
@@ -4841,7 +4845,11 @@ mod tests {
             JobState::Running,
             JobState::Timeout,
         ));
-        assert!(is_reclaimable(&cluster, "n1", 77), "snapshot sees Timeout");
+        assert_eq!(
+            reclaim_cause(&cluster, "n1", 77),
+            Some(ReclaimCause::Terminal),
+            "snapshot sees Timeout"
+        );
 
         // Concurrent requeue lands before the reclaim loop's re-check.
         apply(&WalOperation::job_state_change(
@@ -4851,7 +4859,7 @@ mod tests {
         ));
 
         assert!(
-            !is_reclaimable(&cluster, "n1", 77),
+            reclaim_cause(&cluster, "n1", 77).is_none(),
             "re-check must skip a job requeued since the snapshot"
         );
     }

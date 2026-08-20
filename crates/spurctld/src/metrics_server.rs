@@ -13,12 +13,14 @@ use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
     encode_job_metrics, encode_jobs_users_accts_metrics, encode_k8s_metrics, encode_nodes_metrics,
-    encode_partitions_metrics, encode_rpc_metrics, encode_scheduler_metrics, CONTENT_TYPE,
+    encode_partitions_metrics, encode_reconcile_metrics, encode_rpc_metrics,
+    encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
 
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
+use crate::reconcile_stats::ReconcileStatsCollector;
 use crate::rpc_stats::RpcStatsCollector;
 use crate::sched_stats::SchedStatsCollector;
 
@@ -27,6 +29,7 @@ struct MetricsState {
     raft: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    reconcile_stats: Arc<ReconcileStatsCollector>,
 }
 
 /// Start the metrics HTTP server. Runs until the listener is closed.
@@ -36,12 +39,14 @@ pub async fn serve(
     raft: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    reconcile_stats: Arc<ReconcileStatsCollector>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(MetricsState {
         cluster,
         raft,
         rpc_stats,
         sched_stats,
+        reconcile_stats,
     });
 
     let app = Router::new()
@@ -50,6 +55,7 @@ pub async fn serve(
         .route("/metrics/nodes", get(metrics_nodes))
         .route("/metrics/partitions", get(metrics_partitions))
         .route("/metrics/rpc", get(metrics_rpc))
+        .route("/metrics/reconcile", get(metrics_reconcile))
         .route("/metrics/scheduler", get(metrics_scheduler))
         .route("/metrics/k8s", get(metrics_k8s))
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
@@ -90,6 +96,13 @@ async fn metrics_rpc(State(state): State<Arc<MetricsState>>) -> Response {
         return not_leader_response();
     }
     metrics_response(encode_rpc_metrics(&state.rpc_stats.snapshot()))
+}
+
+/// Deliberately not leader-gated. Drift installed with a snapshot is recorded on
+/// whichever process installed it, and a follower carrying drift into its next
+/// leadership term is exactly the case worth watching.
+async fn metrics_reconcile(State(state): State<Arc<MetricsState>>) -> Response {
+    metrics_response(encode_reconcile_metrics(&state.reconcile_stats.snapshot()))
 }
 
 async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
@@ -218,6 +231,7 @@ mod tests {
             raft: Arc::new(handle),
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            reconcile_stats: Arc::new(ReconcileStatsCollector::new()),
         });
         let app = Router::new()
             .route("/metrics/jobs", get(metrics_jobs))
@@ -411,11 +425,17 @@ mod tests {
             raft: follower,
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            reconcile_stats: Arc::new(ReconcileStatsCollector::new()),
         });
         let resp = metrics_rpc(State(state.clone())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let resp = metrics_scheduler(State(state)).await;
+        let resp = metrics_scheduler(State(state.clone())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Reconcile counters record what the local process saw, including drift
+        // installed with a snapshot, so a follower must still serve them.
+        let resp = metrics_reconcile(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -452,6 +472,7 @@ mod tests {
             raft: Arc::new(handle),
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            reconcile_stats: Arc::new(ReconcileStatsCollector::new()),
         });
         let resp = metrics_jobs_users_accts(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
