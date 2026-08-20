@@ -398,6 +398,7 @@ pub struct JobRecord {
 }
 
 /// Query job history.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_job_history(
     pool: &PgPool,
     user: Option<&str>,
@@ -405,6 +406,7 @@ pub async fn get_job_history(
     start_after: Option<DateTime<Utc>>,
     start_before: Option<DateTime<Utc>>,
     states: &[String],
+    job_ids: &[i32],
     limit: u32,
 ) -> anyhow::Result<Vec<JobRecord>> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
@@ -431,6 +433,14 @@ pub async fn get_job_history(
         let mut sep = qb.separated(", ");
         for s in states {
             sep.push_bind(s.clone());
+        }
+        sep.push_unseparated(")");
+    }
+    if !job_ids.is_empty() {
+        qb.push(" AND job_id IN (");
+        let mut sep = qb.separated(", ");
+        for id in job_ids {
+            sep.push_bind(*id);
         }
         sep.push_unseparated(")");
     }
@@ -1290,12 +1300,13 @@ mod job_history_tests {
         .await?;
         end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5), 0, 0).await?;
 
-        let by_user = get_job_history(&pool, Some(&user_a), None, None, None, &[], 100).await?;
+        let by_user =
+            get_job_history(&pool, Some(&user_a), None, None, None, &[], &[], 100).await?;
         assert_eq!(by_user.len(), 2);
         assert!(by_user.iter().all(|r| r.user_name == user_a));
 
         let by_account =
-            get_job_history(&pool, None, Some(&account_one), None, None, &[], 100).await?;
+            get_job_history(&pool, None, Some(&account_one), None, None, &[], &[], 100).await?;
         assert_eq!(
             by_account
                 .iter()
@@ -1311,6 +1322,7 @@ mod job_history_tests {
             None,
             None,
             &[String::from("COMPLETED")],
+            &[],
             100,
         )
         .await?;
@@ -1323,6 +1335,7 @@ mod job_history_tests {
             None,
             None,
             &[String::from("FAILED")],
+            &[],
             100,
         )
         .await?;
@@ -1331,13 +1344,48 @@ mod job_history_tests {
         assert_eq!(failed[0].exit_signal, 9);
         assert_eq!(failed[0].derived_exit_code, 137);
 
-        let after = get_job_history(&pool, Some(&user_a), None, Some(t2), None, &[], 100).await?;
+        let after =
+            get_job_history(&pool, Some(&user_a), None, Some(t2), None, &[], &[], 100).await?;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].job_id, id2);
 
-        let limited = get_job_history(&pool, Some(&user_a), None, None, None, &[], 1).await?;
+        let limited = get_job_history(&pool, Some(&user_a), None, None, None, &[], &[], 1).await?;
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].job_id, id2);
+
+        // -j/--jobs filter: a single ID returns only that job, a set returns
+        // exactly the matching rows, and a non-existent ID returns nothing.
+        let one = get_job_history(&pool, None, None, None, None, &[], &[id1], 100).await?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].job_id, id1);
+
+        let subset = get_job_history(&pool, None, None, None, None, &[], &[id0, id2], 100).await?;
+        let mut got: Vec<i32> = subset
+            .iter()
+            .map(|r| r.job_id)
+            .filter(|id| ids.contains(id))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![id0, id2]);
+
+        let missing =
+            get_job_history(&pool, None, None, None, None, &[], &[404_040_404], 100).await?;
+        assert!(missing.is_empty());
+
+        // Filters compose: job-ID set intersected with a user still scopes by user.
+        let scoped = get_job_history(
+            &pool,
+            Some(&user_a),
+            None,
+            None,
+            None,
+            &[],
+            &[id0, id1],
+            100,
+        )
+        .await?;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].job_id, id0);
 
         delete_jobs(&pool, &ids).await?;
         Ok(())
@@ -1374,7 +1422,7 @@ mod job_history_tests {
         )
         .await?;
 
-        let history = get_job_history(&pool, None, None, None, None, &[], 100)
+        let history = get_job_history(&pool, None, None, None, None, &[], &[], 100)
             .await?
             .into_iter()
             .find(|r| r.job_id == id)

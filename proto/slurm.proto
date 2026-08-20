@@ -1200,6 +1200,7 @@ message GetJobHistoryRequest {
   google.protobuf.Timestamp start_before = 4;
   repeated JobState states = 5;
   uint32 limit = 6;
+  repeated uint32 job_ids = 7;
 }
 
 message GetJobHistoryResponse {
