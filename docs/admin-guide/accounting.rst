@@ -411,13 +411,31 @@ QOS keys
        leaves the job at the scheduler default (1000).
    * - ``preemptmode``
      - ``off``
-     - Preemption behavior when this QOS's jobs are the victim:
-       ``cancel`` (job's terminal state is ``CANCELLED``; ``PREEMPTED`` is
-       recorded in accounting), ``requeue`` (returned to pending),
-       ``suspend``, or ``off`` (not preemptable).
-       A job from a higher-``priority`` QOS can preempt a running job from a
-       lower-``priority`` QOS when its effective priority exceeds twice the
-       victim's.
+     - What happens to a job in this QOS when it gets kicked out by a
+       higher-priority job. This setting overrides whatever the partition says,
+       but only for *how* the job is removed — it does not control *whether*
+       preemption happens (that depends on the partition's ``preempt_mode``
+       and the priority gap).
+
+       ``cancel`` — the job is stopped and removed from the queue. Its final
+       state is ``CANCELLED`` (``PREEMPTED`` in accounting records).
+       ``requeue`` — the job is stopped and put back in the queue. It will
+       start again automatically once a slot is free.
+       ``suspend`` — the job is paused, keeping its node allocation. It
+       resumes automatically once the higher-priority job finishes.
+       ``off`` (default) — no change from what the partition says. Setting
+       ``preemptmode=off`` on a QOS is the same as leaving it unset. It does
+       **not** protect the job from being preempted.
+
+       **Example of the override:** a partition is set to ``cancel`` but a
+       specific QOS is set to ``preemptmode=requeue``. When a job in that QOS
+       is kicked out, it goes back to the queue instead of being cancelled.
+
+       **How to actually protect a QOS from preemption:** simply do not add it
+       to any other QOS's ``preempt`` allow-list. When
+       ``preempt_type = "qos_priority"`` is enabled (see :doc:`configuration`),
+       a QOS that nobody has permission to preempt will never lose its running
+       jobs, no matter how large the priority gap is.
    * - ``preempt``
      - ``""`` (no restriction)
      - Comma-separated list of QOS names that jobs in this QOS are allowed to
@@ -628,7 +646,9 @@ With this setup:
 - A ``priority`` job cannot preempt ``reserved`` jobs (``reserved`` is not in
   ``priority``'s allow-list).
 - A ``burst`` job never preempts anyone (empty allow-list).
-- ``reserved`` jobs are never preempted (``preemptmode=off`` is the default).
+- ``reserved`` jobs are never kicked out because no other QOS lists
+  ``reserved`` in its ``preempt`` field. That is what provides the protection
+  — not ``preemptmode=off``, which simply means "use the partition default".
 
 **Minimum exempt time**
 
@@ -652,6 +672,43 @@ order: QOS > partition > global.
 
    # Clear a per-partition override (revert to global):
    scontrol update PartitionName=gpu ClearPreemptExemptTime=yes
+
+**Burst QOS pattern — overflow capacity**
+
+A common design is to give users two pools: a *normal* pool with guaranteed
+capacity, and a *burst* pool they can use for extra work when the cluster has
+free nodes. Burst jobs run opportunistically and are kicked out as soon as a
+normal job needs the slot.
+
+The burst QOS is not a special feature — it is just a QOS with a very low
+priority (so normal jobs always outrank it) that normal-pool QOSes list in
+their ``preempt`` allow-list (so they are allowed to kick it out).
+
+.. code-block:: bash
+
+   # In spur.conf:
+   [scheduler]
+   preempt_type = "qos_priority"
+
+   # Burst pool: very low priority; requeue so burst jobs go back to the
+   # queue instead of being lost when kicked out.
+   sacctmgr add qos name=burst priority=-5000 preemptmode=requeue
+
+   # Normal pool: allowed to kick out burst jobs when it needs a slot.
+   sacctmgr add qos name=normal priority=0 preempt=burst
+
+With this setup:
+
+- Users submit overflow work with ``--qos=burst``. Those jobs run on any
+  free nodes.
+- When a ``normal`` job arrives and a ``burst`` job holds the only available
+  node, the ``burst`` job is sent back to the queue and the ``normal`` job
+  starts. The burst job will restart automatically once a node is free again.
+- ``burst`` jobs can never kick out ``normal`` jobs — ``burst`` has no
+  entries in its ``preempt`` allow-list.
+- A QOS that no other QOS lists in its ``preempt`` field (for example, a
+  ``reserved`` tier) will never have its jobs kicked out, regardless of how
+  large a priority gap exists.
 
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
