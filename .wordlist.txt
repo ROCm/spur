@@ -254,3 +254,5 @@ artifactory
 TLS
 PDB
 unioned
+ANDed
+ServiceAccount
