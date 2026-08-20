@@ -570,17 +570,39 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
    * - ``priority_tier``
      - integer
      - ``0``
-     - Partition priority tier; a higher tier preempts a lower one.
+     - Priority ranking for this partition. Jobs on a higher-tier partition are
+       treated as more urgent than jobs on a lower-tier partition, even if their
+       raw submitted priority is the same. This allows a "premium" partition to
+       bump jobs off a "standard" partition without the admin manually adjusting
+       job priorities. A job that spans multiple partitions inherits the highest
+       tier among them.
    * - ``preempt_mode``
      - string
      - ``"off"``
-     - Preemption mode: ``cancel``, ``requeue``, ``suspend``; anything else is off.
+     - What the scheduler does to a running job when a higher-priority job needs
+       its node.
+
+       ``"cancel"`` — the running job is stopped and removed from the queue.
+       ``"requeue"`` — the running job is stopped and put back in the queue;
+       it will start again automatically once a node is free.
+       ``"suspend"`` — the running job is paused (not stopped). It keeps its
+       node allocation and continues automatically once the higher-priority job
+       finishes. Because the node stays occupied, any other job that also needs
+       that node exclusively will have to wait until the paused job either
+       finishes or is cancelled.
+       ``"off"`` (default) — running jobs in this partition are never kicked
+       out. The scheduler will wait for a free slot instead of preempting.
+
+       A job's QOS can change what happens to *that specific job* when it is
+       kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
+       field is the on/off switch: preemption is only attempted at all when
+       this is set to something other than ``"off"``.
    * - ``preempt_exempt_time``
      - integer or null
      - ``null`` (inherit global)
      - Per-partition override for the minimum seconds a job must have been running
        before it is eligible for preemption. Overrides ``scheduler.preempt_exempt_time``
-       for jobs in this partition. Can be further overridden per-job by the QOS's
+       for jobs in this partition. Can be further overridden per-QOS by the QOS's
        ``preemptexempttime`` field. Can also be set at runtime without restart via
        ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
        use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
