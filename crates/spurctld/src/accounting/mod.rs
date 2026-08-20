@@ -54,14 +54,33 @@ pub async fn fairshare_factors(
     ))
 }
 
-/// Fold one user-row's admin_level into the per-user map, keeping the highest: `Admin` wins over
+/// Canonicalize an `adminlevel` to Slurm's spelling, or `None` if it is not a level.
+///
+/// Slurm prints `Administrator` for the highest level and its parser also takes `Admin` and
+/// `SuperUser`, so all three must resolve to the same thing — recognising only one spelling would
+/// leave a stored level that looks like a privilege and confers nothing.
+pub fn canonical_admin_level(raw: &str) -> Option<&'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "none" => Some("None"),
+        "operator" => Some("Operator"),
+        "admin" | "administrator" | "superuser" => Some("Administrator"),
+        _ => None,
+    }
+}
+
+/// Whether a stored `admin_level` is the level that confers control-plane privilege.
+pub fn admin_level_is_admin(raw: &str) -> bool {
+    canonical_admin_level(raw) == Some("Administrator")
+}
+
+/// Fold one user-row's admin_level into the per-user map, keeping the highest: admin wins over
 /// any lower level so a later non-admin row for a multi-account user can't clobber it.
 fn merge_admin_level(map: &mut HashMap<String, String>, user: &str, level: &str) {
     if level.is_empty() || level.eq_ignore_ascii_case("none") {
         return;
     }
     let entry = map.entry(user.to_owned()).or_default();
-    if entry.is_empty() || level.eq_ignore_ascii_case("admin") {
+    if entry.is_empty() || admin_level_is_admin(level) {
         *entry = level.to_owned();
     }
 }

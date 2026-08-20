@@ -245,12 +245,27 @@ Add a user with a QOS allow-list
 Set an admin level
 ~~~~~~~~~~~~~~~~~~~
 
-``adminlevel`` is passed through as given (``Operator``, ``Administrator``, or
-``none``).
+``adminlevel`` takes Slurm's levels: ``None``, ``Operator``, or ``Admin``.
+``Administrator`` and ``SuperUser`` are accepted as Slurm spells them and stored
+as ``Administrator``, which is what ``sacctmgr show user`` displays. Anything
+else is rejected, so a level that would confer nothing cannot be stored.
 
 .. code-block:: bash
 
-   sacctmgr add user name=bob account=research adminlevel=Operator
+   sacctmgr add user name=bob account=research adminlevel=Admin
+
+.. warning::
+
+   The admin level is a control-plane privilege, not just an accounting label: it
+   admits the user to the admin-gated controller mutations (partitions, node
+   labels, tokens, reservations), so grant it as carefully as root. See
+   :ref:`privileged-operations`.
+
+.. note::
+
+   ``Operator`` is accepted and stored, but Spur does not yet act on it — unlike
+   Slurm, where it confers reservation management. Use the admin level for a user
+   who needs control-plane privileges today.
 
 Set per-association limits
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -314,7 +329,9 @@ User keys
        user's default account.
    * - ``adminlevel``
      - ``none``
-     - Admin level: ``none``, ``Operator``, or ``Administrator``.
+     - Admin level: ``None``, ``Operator``, or ``Admin`` (also spelled
+       ``Administrator``/``SuperUser``). Any other value is rejected. Only the
+       admin level currently confers privilege.
    * - ``defaultqos``
      - ``""``
      - QOS applied when the user does not request one.
