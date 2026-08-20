@@ -46,6 +46,10 @@ _PARTITION = {
     "default_time": "10:00",
 }
 
+# Required when the test runner SSHes in as root: spurd refuses to execute jobs
+# as uid 0 unless this is explicitly enabled.
+_AUTH_ROOT = {"auth": {"allow_root_jobs": True}}
+
 
 def _scontrol_state(cluster, job_id: int) -> str:
     """Return scontrol show job output for cross-verification."""
@@ -66,7 +70,7 @@ class TestCancelMode:
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"partitions": [{**_PARTITION, "preempt_mode": "cancel"}]}
+        return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "cancel"}]}
 
     def test_preempt_mode_cancel_removes_job_permanently(self, cluster):
         node = cluster.node_names[0]
@@ -120,7 +124,7 @@ class TestRequeueMode:
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"partitions": [{**_PARTITION, "preempt_mode": "requeue"}]}
+        return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "requeue"}]}
 
     def test_preempt_mode_requeue_returns_job_to_pending(self, cluster):
         node = cluster.node_names[0]
@@ -169,14 +173,15 @@ class TestRequeueMode:
 
 
 class TestSuspendMode:
-    """preempt_mode=suspend: the evicted job is frozen (not terminated) and resumes
-    automatically once the aggressor releases the node."""
+    """preempt_mode=suspend: the preempted job is frozen (SIGSTOP) but its node
+    allocation is NOT released — the node stays occupied. The pending aggressor must
+    remain pending for as long as the victim holds the node suspended."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"partitions": [{**_PARTITION, "preempt_mode": "suspend"}]}
+        return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "suspend"}]}
 
-    def test_preempt_mode_suspend_freezes_then_resumes_job(self, cluster):
+    def test_preempt_mode_suspend_freezes_job_and_retains_node(self, cluster):
         node = cluster.node_names[0]
 
         victim = cluster.write_file("victim.sh", _SLEEP_SCRIPT)
@@ -197,26 +202,22 @@ class TestSuspendMode:
         cluster.scontrol("update", f"JobId={aggressor_id}", "Priority=1000000")
 
         try:
-            # Victim must be suspended (S) — frozen, not terminated.
+            # Victim must be suspended (S) — frozen but NOT terminated.
             wait_job_state(cluster, victim_id, "S", timeout=_WAIT_PREEMPT)
             _assert_scontrol_state(cluster, victim_id, "SUSPENDED", "victim after suspend")
 
-            # Aggressor must take the slot and start running while victim is frozen.
-            wait_job_state(cluster, aggressor_id, "R", timeout=30)
-            _assert_scontrol_state(cluster, aggressor_id, "RUNNING", "aggressor while victim suspended")
-
-            # Victim must still be suspended while aggressor holds the node.
-            assert job_state(cluster.squeue_all(), victim_id) == "S", (
-                "victim must remain suspended (S) while the aggressor is running"
+            # Suspend retains the node allocation — aggressor must stay pending
+            # because the node is still held by the suspended victim.
+            time.sleep(_GUARD_SECS)
+            sq = cluster.squeue_all()
+            assert job_state(sq, victim_id) == "S", (
+                "suspended victim must remain frozen, not cancelled or requeued"
             )
             _assert_scontrol_state(cluster, victim_id, "SUSPENDED", "victim still suspended")
-
-            final = wait_job(cluster, aggressor_id, timeout=30)
-            assert final == "CD", f"aggressor must complete successfully; got {final!r}"
-
-            # Scheduler must unfreeze victim automatically once the node is free.
-            wait_job_state(cluster, victim_id, "R", timeout=_WAIT_RESUME)
-            _assert_scontrol_state(cluster, victim_id, "RUNNING", "victim after thaw")
+            assert job_state(sq, aggressor_id) == "PD", (
+                "aggressor must stay pending — suspend does not release the node allocation"
+            )
+            _assert_scontrol_state(cluster, aggressor_id, "PENDING", "aggressor while victim suspended")
         finally:
             cluster.cli_allow_fail(["scontrol", "resume", str(victim_id)])
             cluster.cli_allow_fail(["scancel", str(victim_id)])
@@ -229,7 +230,7 @@ class TestPreemptOff:
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"partitions": [{**_PARTITION, "preempt_mode": "off"}]}
+        return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "off"}]}
 
     def test_preempt_mode_off_blocks_preemption(self, cluster):
         node = cluster.node_names[0]
@@ -277,7 +278,7 @@ class TestPriorityThreshold:
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"partitions": [{**_PARTITION, "preempt_mode": "cancel"}]}
+        return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "cancel"}]}
 
     def test_equal_priority_does_not_trigger_preemption(self, cluster):
         node = cluster.node_names[0]
@@ -370,6 +371,7 @@ class TestPriorityTier:
     @pytest.fixture
     def cluster_config_overrides(self):
         return {
+            **_AUTH_ROOT,
             "partitions": [
                 {
                     "name": "standard",
