@@ -569,7 +569,7 @@ impl ClusterManager {
             config.scheduler.default_time_limit_minutes,
         );
         apply_default_account(&mut spec, &self.association_cache);
-        validate_user_account(&spec, &self.association_cache)?;
+        validate_user_account(&spec, &self.association_cache, &config.accounting)?;
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
         // an empty QoS and wrongly rejects a user's inherited default.
         apply_default_qos(
@@ -839,7 +839,11 @@ impl ClusterManager {
                     "job_submit hook modified spec"
                 );
                 if changes.partition.is_some() || changes.account.is_some() {
-                    validate_user_account(spec, &self.association_cache)?;
+                    validate_user_account(
+                        spec,
+                        &self.association_cache,
+                        &self.config().accounting,
+                    )?;
                     self.validate_partition_node_bounds(spec, partitions)?;
                 }
                 // Existence is enforced first: an unknown QOS silently resolves
@@ -7051,12 +7055,26 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     }
 }
 
-/// Reject a client-supplied account that is not a real user→account association.
+/// Reject a client-supplied account that is not a real user→account association,
+/// and, when `require_association` is set, a submit that resolved to no account
+/// at all (no `--account` and no default account on file for the user).
+/// Unconditional like `require_qos`'s final check, not gated on cache load state:
+/// an admin enabling this setting without accounting fully up is expected to see
+/// every submission rejected, the same way `require_qos` behaves today.
 fn validate_user_account(
     spec: &JobSpec,
     assoc_cache: &AssociationCache,
+    accounting: &spur_core::config::AccountingConfig,
 ) -> Result<(), SubmitError> {
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
+        if accounting.require_association {
+            return Err(SubmitError::invalid(format!(
+                "no account resolved for user '{}' (no --account given and no default account on file). \
+                 Specify --account explicitly, or contact your cluster admin to set a default: \
+                 sacctmgr modify user name={} set defaultaccount=<account>",
+                spec.user, spec.user
+            )));
+        }
         return Ok(());
     };
     match assoc_cache.account_membership(&spec.user, account) {
@@ -19115,6 +19133,106 @@ mod tests {
 
         super::apply_default_account(&mut spec, &assoc);
         assert_eq!(spec.account.as_deref(), Some("faculty"));
+    }
+
+    // --- validate_user_account / require_association tests ---
+
+    fn acct_cfg_with_require_association(
+        require_association: bool,
+    ) -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig {
+            require_association,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_user_account_allows_no_account_when_require_association_off() {
+        let assoc = AssociationCache::new();
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+
+        super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(false))
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_user_account_rejects_no_account_when_require_association_on() {
+        let assoc = AssociationCache::new();
+        assoc.insert_association("someone-else", "research"); // loads the cache
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no account resolved for user 'testuser'"));
+    }
+
+    #[test]
+    fn validate_user_account_rejects_no_account_even_when_user_has_associations_but_no_default() {
+        // A real reachable state: the user has an association, but no account is
+        // flagged as their default (e.g. an admin cleared it), and no --account
+        // was given. The message must not claim "no account associations" here,
+        // since one exists -- it just isn't resolvable without -A.
+        let assoc = AssociationCache::new();
+        assoc.insert_association("testuser", "research");
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no account resolved for user 'testuser'"));
+        assert!(!msg.contains("has no account associations"));
+    }
+
+    #[test]
+    fn validate_user_account_allows_resolved_default_account_when_require_association_on() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_account("testuser", "research");
+        assoc.insert_association("testuser", "research");
+        let mut spec = basic_spec("j");
+        super::apply_default_account(&mut spec, &assoc);
+        assert_eq!(spec.account.as_deref(), Some("research"));
+
+        super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_user_account_rejects_no_account_even_when_cache_unloaded() {
+        // Unconditional like `require_qos`'s final check: an admin who turns
+        // this on without accounting fully up should see submissions rejected,
+        // not silently pass through.
+        let assoc = AssociationCache::new();
+        let spec = basic_spec("j");
+        assert!(!assoc.is_loaded());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no account resolved for user 'testuser'"));
+    }
+
+    #[test]
+    fn validate_user_account_still_rejects_bad_explicit_account_when_require_association_on() {
+        let assoc = AssociationCache::new();
+        assoc.insert_association("testuser", "research");
+        let mut spec = basic_spec("j");
+        spec.account = Some("other".into());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("is not associated with account 'other'"));
     }
 
     #[test]

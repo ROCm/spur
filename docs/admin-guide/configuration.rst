@@ -318,6 +318,13 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Live
      - Reject at submit any job that still has no QOS after the resolution chain.
        Mirrors Slurm's ``AccountingStorageEnforce=qos``.
+   * - ``require_association``
+     - bool
+     - ``false``
+     - Live
+     - Reject at submit any job whose user resolves to no account: no
+       ``--account`` given and no default account on file. Unconditional, like
+       ``require_qos``. Mirrors Slurm's ``AccountingStorageEnforce=associations``.
    * - ``txn_retention_days``
      - integer
      - unset
@@ -327,7 +334,8 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
        default purge-off behavior); a positive value enables it. See :doc:`accounting`.
 
 See :doc:`accounting` for how ``default_qos`` and ``require_qos`` interact with the
-per-job QOS resolution chain.
+per-job QOS resolution chain, and how ``require_association`` interacts with the
+per-job account resolution chain.
 
 ``[scheduler]``
 ---------------

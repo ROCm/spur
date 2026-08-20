@@ -490,6 +490,11 @@ pub struct AccountingConfig {
     /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
     #[serde(default)]
     pub require_qos: bool,
+    /// Reject at submit any job whose user resolves to no account at all
+    /// (no `--account` given and no default account on file). Mirrors Slurm's
+    /// `AccountingStorageEnforce=associations`. Default false.
+    #[serde(default)]
+    pub require_association: bool,
     /// Delete `txn` audit-log rows older than this many days. `None` (default)
     /// or `0` disables purging (rows kept forever, matching Slurm's default-off
     /// behavior); a positive value enables the periodic purge.
@@ -513,6 +518,7 @@ impl Default for AccountingConfig {
             grp_wall_window_days: default_grp_wall_window_days(),
             default_qos: String::new(),
             require_qos: false,
+            require_association: false,
             txn_retention_days: None,
         }
     }
