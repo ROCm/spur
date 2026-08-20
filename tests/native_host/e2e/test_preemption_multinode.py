@@ -29,6 +29,11 @@ _WAIT_PREEMPT = 30
 _WAIT_RUN     = 60
 
 
+# Required when the test runner SSHes in as root: spurd refuses to execute jobs
+# as uid 0 unless this is explicitly enabled.
+_AUTH_ROOT = {"auth": {"allow_root_jobs": True}}
+
+
 def _assert_scontrol_state(cluster, job_id: int, expected: str, label: str = "") -> None:
     """Assert JobState=<expected> appears in scontrol show job output."""
     show = cluster.scontrol("show", "job", str(job_id))
@@ -55,7 +60,8 @@ class TestMultiNodePreemption:
                     "default_time": "10:00",
                     "preempt_mode": "cancel",
                 }
-            ]
+            ],
+            **_AUTH_ROOT,
         }
 
     def test_preempted_multinode_job_frees_all_nodes(self, multi_node_cluster):
