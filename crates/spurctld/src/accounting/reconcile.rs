@@ -258,6 +258,9 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
         end_time,
         job.exit_signal,
         job.derived_exit_code,
+        job.preempted_by.map(|id| id as i32),
+        job.preempt_mode.as_deref().unwrap_or(""),
+        job.preempt_qos.as_deref().unwrap_or(""),
     )
     .await
 }
@@ -480,6 +483,9 @@ mod tests {
             job.end_time.unwrap(),
             0,
             0,
+            None,
+            "",
+            "",
         )
         .await?;
         drop(conn);
@@ -619,6 +625,9 @@ mod tests {
                 job.end_time.unwrap(),
                 0,
                 0,
+                None,
+                "",
+                "",
             )
             .await?;
         }

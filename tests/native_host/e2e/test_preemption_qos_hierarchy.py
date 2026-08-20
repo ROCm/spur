@@ -168,6 +168,17 @@ class TestQosPreemptHierarchyAllowed:
 
             # low must be preempted (cancelled) and high must complete.
             wait_job_state(c, low_id, "CA", timeout=30)
+            # Verify preemption provenance on the cancelled job.
+            show = c.scontrol("show", "job", str(low_id))
+            assert f"PreemptedBy={high_id}" in show, (
+                f"PreemptedBy not set on cancel-preempted job:\n{show}"
+            )
+            assert "PreemptMode=Cancel" in show, (
+                f"PreemptMode not set on cancel-preempted job:\n{show}"
+            )
+            assert "PreemptQOS=high-allow" in show, (
+                f"PreemptQOS not set on cancel-preempted job:\n{show}"
+            )
             high_state = wait_job(c, high_id, timeout=30)
             assert high_state == "CD", (
                 f"high-allow job did not complete: {high_state}"

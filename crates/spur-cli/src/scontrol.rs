@@ -619,6 +619,26 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     format_exit(job.derived_exit_code, 0),
                     job.priority
                 );
+                if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
+                    println!(
+                        "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
+                        if job.preempted_by == 0 {
+                            "N/A".to_string()
+                        } else {
+                            job.preempted_by.to_string()
+                        },
+                        if job.preempt_mode.is_empty() {
+                            "N/A"
+                        } else {
+                            &job.preempt_mode
+                        },
+                        if job.preempt_qos.is_empty() {
+                            "N/A"
+                        } else {
+                            &job.preempt_qos
+                        },
+                    );
+                }
                 println!();
             }
         }

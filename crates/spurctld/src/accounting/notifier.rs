@@ -77,6 +77,7 @@ impl AccountingNotifier {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_job_end(
         &self,
         job_id: JobId,
@@ -85,6 +86,9 @@ impl AccountingNotifier {
         end_time: DateTime<Utc>,
         exit_signal: i32,
         derived_exit_code: i32,
+        preempted_by: Option<JobId>,
+        preempt_mode: Option<String>,
+        preempt_qos: Option<String>,
     ) {
         let pool = self.pool.clone();
         let state_str = state.display().to_owned();
@@ -99,6 +103,9 @@ impl AccountingNotifier {
                     end_time,
                     exit_signal,
                     derived_exit_code,
+                    preempted_by.map(|id| id as i32),
+                    preempt_mode.as_deref().unwrap_or(""),
+                    preempt_qos.as_deref().unwrap_or(""),
                 )
                 .await
             };

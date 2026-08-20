@@ -244,6 +244,16 @@ message JobInfo {
   // "gpu:2/task".
   uint32 req_gpus = 55;
   string req_gpus_detail = 56;
+
+  // Preemption provenance. Set when this job was preempted.
+  // `preempted_by` is the job ID of the higher-priority job that caused the
+  // preemption (0 when not preempted or unknown). `preempt_mode` is one of
+  // "Requeue", "Cancel", or "Suspend". `preempt_qos` is the QOS name that
+  // authorized the preemption under QosPriority type; empty for plain
+  // priority-based preemption.
+  uint32 preempted_by = 57;
+  string preempt_mode = 58;
+  string preempt_qos = 59;
 }
 
 message NodeInfo {

@@ -323,6 +323,11 @@ pub enum PendingReason {
     QosGrpSubmitJobsLimit,
     QosMaxSubmitJobPerAccountLimit,
     K8sReserved,
+
+    /// Job was preempted and is now pending (requeue mode) or terminal (cancel mode).
+    /// Replaces `BeginTime` as the pending reason for preempted-requeued jobs so the
+    /// reason string is unambiguous.
+    Preempted,
 }
 
 impl PendingReason {
@@ -338,7 +343,10 @@ impl PendingReason {
     /// Any other reason on a held job is unrelated to the hold, so recomputing
     /// it loses nothing.
     pub fn explains_begin_hold(&self) -> bool {
-        matches!(self, Self::BeginTime | Self::JobLaunchFailure)
+        matches!(
+            self,
+            Self::BeginTime | Self::JobLaunchFailure | Self::Preempted
+        )
     }
 
     pub fn display(&self) -> &'static str {
@@ -406,6 +414,7 @@ impl PendingReason {
             Self::QosGrpSubmitJobsLimit => "QOSGrpSubmitJobsLimit",
             Self::QosMaxSubmitJobPerAccountLimit => "MaxSubmitJobsPerAccount",
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
+            Self::Preempted => "Preempted",
         }
     }
 
@@ -836,6 +845,18 @@ pub struct Job {
     /// Set when a job is evicted during PMIx bootstrap or partial dispatch.
     #[serde(default)]
     pub launch_failure_detail: Option<String>,
+
+    /// Job ID of the higher-priority job that caused this preemption. Set on
+    /// both cancel and requeue preemption; `None` for jobs never preempted.
+    #[serde(default)]
+    pub preempted_by: Option<JobId>,
+    /// How the preemption was carried out: `"Requeue"`, `"Cancel"`, or `"Suspend"`.
+    #[serde(default)]
+    pub preempt_mode: Option<String>,
+    /// QOS name of the preempting job, when `preempt_type = QosPriority` authorized
+    /// the preemption. `None` for plain priority-based preemption.
+    #[serde(default)]
+    pub preempt_qos: Option<String>,
 }
 
 impl Job {
@@ -886,6 +907,9 @@ impl Job {
             actual_stdout_path: None,
             actual_stderr_path: None,
             launch_failure_detail: None,
+            preempted_by: None,
+            preempt_mode: None,
+            preempt_qos: None,
         }
     }
 
@@ -2256,6 +2280,15 @@ mod tests {
             let back: PendingReason = serde_json::from_str(&json).expect("deserialize reason");
             assert_eq!(&back, reason, "serde roundtrip for {reason:?}");
         }
+    }
+
+    #[test]
+    fn preempted_reason_displays_correctly_and_explains_begin_hold() {
+        assert_eq!(PendingReason::Preempted.display(), "Preempted");
+        assert!(
+            PendingReason::Preempted.explains_begin_hold(),
+            "Preempted must be treated as a begin-time hold so it is not clobbered"
+        );
     }
 
     #[test]
