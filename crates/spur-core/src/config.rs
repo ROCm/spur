@@ -490,9 +490,8 @@ pub struct AccountingConfig {
     /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
     #[serde(default)]
     pub require_qos: bool,
-    /// Reject at submit any job whose user resolves to no account at all
-    /// (no `--account` given and no default account on file). Mirrors Slurm's
-    /// `AccountingStorageEnforce=associations`. Default false.
+    /// Reject at submit any job whose user resolves to no account at all.
+    /// Mirrors Slurm's `AccountingStorageEnforce=associations`. Default false.
     #[serde(default)]
     pub require_association: bool,
     /// Delete `txn` audit-log rows older than this many days. `None` (default)

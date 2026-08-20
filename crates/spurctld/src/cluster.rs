@@ -7055,12 +7055,8 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     }
 }
 
-/// Reject a client-supplied account that is not a real user→account association,
-/// and, when `require_association` is set, a submit that resolved to no account
-/// at all (no `--account` and no default account on file for the user).
-/// Unconditional like `require_qos`'s final check, not gated on cache load state:
-/// an admin enabling this setting without accounting fully up is expected to see
-/// every submission rejected, the same way `require_qos` behaves today.
+/// Reject a client-supplied account that is not a real association, and, when
+/// `require_association` is set, a submit resolving to no account at all (unconditional, like `require_qos`'s final check).
 fn validate_user_account(
     spec: &JobSpec,
     assoc_cache: &AssociationCache,
@@ -7068,8 +7064,13 @@ fn validate_user_account(
 ) -> Result<(), SubmitError> {
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
         if accounting.require_association {
+            let hint = if assoc_cache.is_loaded() {
+                ""
+            } else {
+                QOS_ACCOUNTING_HINT
+            };
             return Err(SubmitError::invalid(format!(
-                "no account resolved for user '{}' (no --account given and no default account on file). \
+                "no account resolved for user '{}' (no --account given and no default account on file){hint}. \
                  Specify --account explicitly, or contact your cluster admin to set a default: \
                  sacctmgr modify user name={} set defaultaccount=<account>",
                 spec.user, spec.user
@@ -19173,10 +19174,7 @@ mod tests {
 
     #[test]
     fn validate_user_account_rejects_no_account_even_when_user_has_associations_but_no_default() {
-        // A real reachable state: the user has an association, but no account is
-        // flagged as their default (e.g. an admin cleared it), and no --account
-        // was given. The message must not claim "no account associations" here,
-        // since one exists -- it just isn't resolvable without -A.
+        // A real reachable state: an association exists but none is flagged default.
         let assoc = AssociationCache::new();
         assoc.insert_association("testuser", "research");
         let spec = basic_spec("j");
@@ -19205,9 +19203,7 @@ mod tests {
 
     #[test]
     fn validate_user_account_rejects_no_account_even_when_cache_unloaded() {
-        // Unconditional like `require_qos`'s final check: an admin who turns
-        // this on without accounting fully up should see submissions rejected,
-        // not silently pass through.
+        // Unconditional like `require_qos`'s final check, but hints at the cold cache.
         let assoc = AssociationCache::new();
         let spec = basic_spec("j");
         assert!(!assoc.is_loaded());
@@ -19215,9 +19211,9 @@ mod tests {
         let err =
             super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("no account resolved for user 'testuser'"));
+        let msg = err.to_string();
+        assert!(msg.contains("no account resolved for user 'testuser'"));
+        assert!(msg.contains("accounting may not be enabled"));
     }
 
     #[test]
