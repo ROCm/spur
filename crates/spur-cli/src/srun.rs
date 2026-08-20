@@ -2230,4 +2230,21 @@ mod tests {
             "expected --overlap error, got: {msg}"
         );
     }
+
+    /// The controller reports `nodelist` as a compressed hostlist, so streaming
+    /// has to expand it. Splitting `node[001-002]` on commas yields the whole
+    /// bracket literal, which is not a host, and the stream then goes nowhere.
+    #[tokio::test]
+    async fn try_stream_output_asks_the_controller_for_an_expanded_hostname() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let streamed = try_stream_output(&mut client, "node[001-002]", 42, "tester").await;
+
+        assert!(
+            !streamed,
+            "the mock reports every node missing, so streaming is unavailable"
+        );
+        assert_eq!(capture.get_node_requests(), vec!["node001".to_string()]);
+    }
 }
