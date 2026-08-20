@@ -373,6 +373,19 @@ The accounting database keeps the record permanently. In practice
 ``scontrol show job`` is the right first instinct; use ``sacct`` only if
 ``scontrol`` returns ``Invalid job id``.
 
+.. note::
+
+   **Suspend-mode preemption and accounting.** When ``PreemptMode=Suspend``,
+   the job receives SIGSTOP and stays running — no accounting end-record
+   is written. The provenance fields (``PreemptedBy``, ``PreemptMode``,
+   ``PreemptQOS``) are visible in ``scontrol show job`` while the job is
+   suspended, but are cleared when the job resumes so that a subsequent normal
+   completion is not miscounted as a preemption. As a result, ``sacct`` has
+   no record of the preemption for suspend-mode jobs: the accounting row for
+   that run will show the final completion state only. Requeue and cancel modes
+   are unaffected — both write an accounting end-record (``PREEMPTED``) at the
+   time of preemption.
+
 Cluster Metrics — ``/metrics``
 ------------------------------
 

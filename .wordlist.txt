@@ -198,6 +198,7 @@ runtimes
 RWO
 SHA
 SIGKILL
+SIGSTOP
 SPDX
 SpurJob
 SpurJobs
