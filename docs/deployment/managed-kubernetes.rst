@@ -97,7 +97,7 @@ download + control-plane bootstrap). ``spur k8s up`` requires cluster admin
 (``root``, or an accounting admin — see `Access control`_).
 
 Scope the cluster to a subset of nodes
-'''''''''''''''''''''''''''''''''''''
+''''''''''''''''''''''''''''''''''''''
 
 By default ``spur k8s up`` enrolls every registered node. To build a smaller
 cluster, scope it with ``--nodes`` (a hostlist), ``--partition``, and/or
@@ -114,7 +114,7 @@ A scoped cluster's membership is frozen until you grow or shrink it with
 ``add-nodes`` / ``remove-nodes`` (see `Adding and removing worker nodes`_).
 
 High-availability control plane
-''''''''''''''''''''''''''''''
+'''''''''''''''''''''''''''''''''
 
 By default the cluster runs a single control-plane node (``control_plane_node``
 in ``spur.conf``, or the first node). For HA, request 3 or 5 control planes:
