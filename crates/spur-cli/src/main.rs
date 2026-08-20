@@ -34,6 +34,7 @@ mod srun;
 mod sshare;
 mod sstat;
 mod strigger;
+mod timearg;
 mod token;
 
 use std::path::Path;

@@ -21,6 +21,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
+use crate::accounting::{txn, TxnAction, TxnEntity, TxnRecord, TxnSource};
 use crate::cluster::{ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
@@ -403,6 +404,88 @@ impl ControllerService {
         identity.is_some_and(|id| {
             id.is_admin || is_k0s_admin(self.cluster.association_cache(), &id.user)
         })
+    }
+
+    /// Fire a best-effort audit record and a structured log line for a reservation
+    /// admin action, so operators keep attribution even when the accounting DB is
+    /// down. Never alters the RPC result.
+    fn audit_reservation(
+        &self,
+        action: TxnAction,
+        entity_name: &str,
+        actor: &str,
+        identity: Option<&spur_core::auth::Identity>,
+        details_base: serde_json::Value,
+        result: &Result<(), Status>,
+    ) {
+        let record =
+            Self::build_reservation_txn(action, entity_name, actor, identity, details_base, result);
+        info!(
+            actor = %record.actor,
+            entity = %record.entity_name,
+            action = record.action.as_str(),
+            outcome = record.outcome.as_str(),
+            "reservation admin action"
+        );
+        self.cluster.record_txn(record);
+    }
+
+    /// Build the audit record from the resolved outcome and caller identity.
+    /// `verified` is true only for a verified JWT identity, and the actor uid is
+    /// taken from that identity — never the forgeable wire value.
+    fn build_reservation_txn(
+        action: TxnAction,
+        entity_name: &str,
+        actor: &str,
+        identity: Option<&spur_core::auth::Identity>,
+        details_base: serde_json::Value,
+        result: &Result<(), Status>,
+    ) -> TxnRecord {
+        TxnRecord {
+            ts: Utc::now(),
+            actor: actor.to_string(),
+            actor_uid: identity.map(|id| i64::from(id.uid)),
+            verified: identity.is_some(),
+            source: TxnSource::Api,
+            action,
+            entity_type: TxnEntity::Reservation,
+            entity_name: entity_name.to_string(),
+            outcome: txn::outcome_from_status(result),
+            details: txn::finalize_details(
+                details_base,
+                result.as_ref().err().map(|s| s.message()),
+            ),
+        }
+    }
+
+    /// Parse, validate, and submit a create-reservation request. Split out so the
+    /// handler audits the outcome uniformly, including `invalid_argument` parse
+    /// failures that occur before the cluster call.
+    fn build_and_create_reservation(&self, req: CreateReservationRequest) -> Result<(), Status> {
+        let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
+        {
+            Utc::now()
+        } else {
+            req.start_time
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
+        };
+        let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
+        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
+            .map_err(Status::invalid_argument)?;
+        let reservation = Reservation {
+            name: req.name,
+            start_time,
+            end_time,
+            nodes: req.nodes,
+            accounts: req.accounts,
+            users: req.users,
+            flags,
+            owner: req.user,
+        };
+        self.cluster
+            .create_reservation(reservation)
+            .map_err(reservation_rpc_status)
     }
 
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
@@ -2176,40 +2259,31 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let __identity = Self::verified_identity(&request).cloned();
+        let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_user(&mut req.user, identity.as_ref());
 
-        let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
-        {
-            chrono::Utc::now()
-        } else {
-            req.start_time
-                .parse::<chrono::DateTime<chrono::Utc>>()
-                .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
-        };
+        let details = txn::create_details(
+            &req.start_time,
+            req.duration_minutes,
+            &req.nodes,
+            &req.accounts,
+            &req.users,
+            &req.flags,
+        );
+        let entity_name = req.name.clone();
+        let actor = req.user.clone();
 
-        let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
-
-        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
-            .map_err(Status::invalid_argument)?;
-
-        let reservation = spur_core::reservation::Reservation {
-            name: req.name,
-            start_time,
-            end_time,
-            nodes: req.nodes,
-            accounts: req.accounts,
-            users: req.users,
-            flags,
-            owner: req.user,
-        };
-
-        self.cluster
-            .create_reservation(reservation)
-            .map_err(reservation_rpc_status)?;
-
-        Ok(Response::new(()))
+        let result = self.build_and_create_reservation(req);
+        self.audit_reservation(
+            TxnAction::Create,
+            &entity_name,
+            &actor,
+            identity.as_ref(),
+            details,
+            &result,
+        );
+        result.map(|()| Response::new(()))
     }
 
     async fn update_reservation(
@@ -2230,10 +2304,24 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let __identity = Self::verified_identity(&request).cloned();
+        let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
-        self.cluster
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        let details = txn::update_details(
+            req.duration_minutes,
+            &req.add_nodes,
+            &req.remove_nodes,
+            &req.add_users,
+            &req.remove_users,
+            &req.add_accounts,
+            &req.remove_accounts,
+        );
+        let entity_name = req.name.clone();
+        let actor = req.user.clone();
+
+        let result = self
+            .cluster
             .update_reservation(
                 &req.name,
                 req.duration_minutes,
@@ -2245,8 +2333,16 @@ impl SlurmController for ControllerService {
                 &req.remove_accounts,
                 &req.user,
             )
-            .map_err(reservation_rpc_status)?;
-        Ok(Response::new(()))
+            .map_err(reservation_rpc_status);
+        self.audit_reservation(
+            TxnAction::Update,
+            &entity_name,
+            &actor,
+            identity.as_ref(),
+            details,
+            &result,
+        );
+        result.map(|()| Response::new(()))
     }
 
     async fn delete_reservation(
@@ -2267,13 +2363,26 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let __identity = Self::verified_identity(&request).cloned();
+        let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
-        self.cluster
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        let entity_name = req.name.clone();
+        let actor = req.user.clone();
+
+        let result = self
+            .cluster
             .delete_reservation(&req.name, &req.user)
-            .map_err(reservation_rpc_status)?;
-        Ok(Response::new(()))
+            .map_err(reservation_rpc_status);
+        self.audit_reservation(
+            TxnAction::Delete,
+            &entity_name,
+            &actor,
+            identity.as_ref(),
+            txn::delete_details(None),
+            &result,
+        );
+        result.map(|()| Response::new(()))
     }
 
     async fn list_reservations(
@@ -6720,6 +6829,50 @@ mod tests {
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "carol");
+    }
+
+    // --- build_reservation_txn (audit attribution) ---
+
+    #[test]
+    fn build_reservation_txn_records_verified_identity_and_large_uid() {
+        let id = spur_core::auth::Identity {
+            user: "alice".to_string(),
+            uid: 4_000_000_000, // > i32::MAX: must survive as i64, not wrap negative
+            gid: 0,
+            is_admin: false,
+        };
+        let rec = ControllerService::build_reservation_txn(
+            TxnAction::Create,
+            "resv1",
+            "alice",
+            Some(&id),
+            serde_json::json!({}),
+            &Ok(()),
+        );
+        assert!(rec.verified);
+        assert_eq!(rec.actor_uid, Some(4_000_000_000));
+        assert_eq!(rec.actor, "alice");
+        assert_eq!(rec.source, TxnSource::Api);
+        assert_eq!(rec.entity_type, TxnEntity::Reservation);
+        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Success);
+    }
+
+    #[test]
+    fn build_reservation_txn_anonymous_is_unverified_and_captures_error() {
+        let rec = ControllerService::build_reservation_txn(
+            TxnAction::Delete,
+            "resv1",
+            "bob",
+            None,
+            serde_json::json!({}),
+            &Err(Status::permission_denied(
+                "user 'bob' cannot delete reservation",
+            )),
+        );
+        assert!(!rec.verified);
+        assert_eq!(rec.actor_uid, None);
+        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Denied);
+        assert!(rec.details.contains("cannot delete"));
     }
 
     // --- bind_spec_to_identity ---

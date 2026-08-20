@@ -49,6 +49,32 @@ pub fn spawn_loop(
     });
 }
 
+/// Periodically delete `txn` audit rows older than `retention_days`. Like
+/// reconcile, this write bypasses Raft (straight to Postgres), so it uses the
+/// consensus-backed leader check rather than the cached `is_leader()`.
+pub fn spawn_txn_purge_loop(
+    pool: PgPool,
+    raft: Arc<RaftHandle>,
+    retention_days: u32,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if !raft.ensure_leader().await {
+                continue;
+            }
+            let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
+            match db::purge_txn(&pool, cutoff).await {
+                Ok(n) if n > 0 => info!(removed = n, "purged expired txn audit rows"),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "txn audit purge failed"),
+            }
+        }
+    });
+}
+
 /// Only jobs that have actually started accrue an accounting record
 /// (`notify_job_start` fires from `start_job`), so jobs still pending are
 /// not candidates.

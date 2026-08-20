@@ -467,6 +467,9 @@ service SlurmAccounting {
 
   // Fairshare
   rpc GetFairshareFactors(GetFairshareFactorsRequest) returns (GetFairshareFactorsResponse);
+
+  // Transaction / audit log (reservation admin actions today; entity-agnostic)
+  rpc GetTransactions(GetTransactionsRequest) returns (GetTransactionsResponse);
 }
 
 // ============================================================
@@ -1205,6 +1208,37 @@ message GetJobHistoryRequest {
 
 message GetJobHistoryResponse {
   repeated JobInfo jobs = 1;
+}
+
+// Audit/transaction log query. All string filters are optional (empty = no
+// filter); time bounds are optional (unset = no time constraint).
+message GetTransactionsRequest {
+  string actor = 1;
+  string entity_type = 2;
+  string entity_name = 3;
+  string action = 4;
+  string outcome = 5;
+  google.protobuf.Timestamp start_after = 6;
+  google.protobuf.Timestamp start_before = 7;
+  uint32 limit = 8;
+}
+
+message TransactionRecord {
+  int64 id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string actor = 3;
+  uint32 actor_uid = 4;         // 0 when unknown (e.g. unauthenticated caller)
+  bool verified = 5;            // true only when a JWT identity was verified
+  string source = 6;            // "api" | "system"
+  string action = 7;            // "create" | "update" | "delete"
+  string entity_type = 8;       // "reservation"
+  string entity_name = 9;
+  string outcome = 10;          // "success" | "denied" | "error"
+  string details = 11;          // JSON: requested parameters (+ error on failure)
+}
+
+message GetTransactionsResponse {
+  repeated TransactionRecord transactions = 1;
 }
 
 message GetUsageRequest {

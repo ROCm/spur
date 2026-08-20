@@ -6,12 +6,15 @@ mod fairshare;
 mod grpc;
 mod notifier;
 mod reconcile;
+pub(crate) mod txn;
 
 pub use db::JobStartRecord;
 pub(crate) use grpc::{accounting_server, AccountingService};
 pub use notifier::AccountingNotifier;
 pub use reconcile::spawn_loop as spawn_reconcile_loop;
+pub use reconcile::spawn_txn_purge_loop;
 pub use reconcile::RECONCILE_INTERVAL_SECS;
+pub(crate) use txn::{TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource};
 
 use std::collections::{HashMap, HashSet};
 

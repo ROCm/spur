@@ -773,6 +773,80 @@ unrecognized state defaults to idle with a warning.
    reload the controller. See :doc:`/deployment/partitioning` and
    :doc:`configuration`.
 
+Auditing administrative actions
+-------------------------------
+
+Reservation admin commands (``scontrol create/update/delete-reservation``) are
+recorded in the accounting database's ``txn`` (transaction) log, capturing
+**who** ran the command, **when**, and the **outcome**. This closes a gap in
+stock Slurm, whose ``txn_table`` does not cover ``scontrol`` reservation
+operations and whose reservation records carry no actor. Recording is
+best-effort: a database outage never blocks the reservation operation itself.
+
+Each record captures:
+
+- **Time** — when the action was attempted.
+- **Actor** — the requesting user. Under ``auth.mode = required`` this is the
+  JWT-verified identity; under the default ``permissive`` mode an unauthenticated
+  caller's name is trusted on the wire (see ``Verified``).
+- **Verified** — ``yes`` only when a JWT identity was cryptographically verified;
+  ``no`` for permissive/disabled anonymous callers (asserted, trust-on-wire) and
+  for internal ``system`` actions such as the expired-reservation purge.
+- **Action** — ``create``, ``update``, or ``delete``.
+- **Where** — the target, rendered ``entity_type:entity_name`` (e.g.
+  ``reservation:daily``).
+- **Outcome** — ``success``, ``denied`` (permission/ownership rejected), or
+  ``error`` (validation or other failure). Unlike Slurm, which logs only
+  committed transactions, Spur also records denied and failed attempts.
+- **Info** — a JSON payload of the requested parameters (and the error message on
+  failure). These are the values as requested, before server-side normalization.
+- **Source** — ``api`` for external RPC/CLI callers, ``system`` for internal
+  maintenance.
+
+Viewing the log
+~~~~~~~~~~~~~~~~
+
+List records with ``sacctmgr show txn`` (aliases: ``transaction``,
+``transactions``), modeled on Slurm's ``sacctmgr show transaction``:
+
+.. code-block:: bash
+
+   sacctmgr show txn
+   sacctmgr show txn Actor=alice Action=delete
+   sacctmgr show txn Entity=reservation Name=daily Outcome=denied
+   sacctmgr show txn Start=2026-01-01 End=now-1hours
+   sacctmgr show txn format=Time,Actor,Action,Where,Outcome,Verified,Info
+
+Filters are ``Actor=``, ``Action=``, ``Entity=`` (entity type), ``Name=`` (entity
+name), ``Outcome=``, ``Start=``, ``End=``, and ``limit=``. ``Start``/``End``
+accept the same formats as ``sacct`` (``YYYY-MM-DD``, ISO datetime,
+``now-Ndays``/``now-Nhours``). ``limit=`` defaults to 1000 and is capped at
+10000 rows per query (larger requests are clamped). The default columns match
+Slurm (``Time,Action,Actor,Where,Info``); additional ``format=`` fields are
+``Outcome``, ``Verified``, ``Source``, ``ID``, and ``ActorUID``.
+
+.. note::
+
+   Reads are **not** access-gated — the same as ``sacct`` job history and the
+   rest of the accounting service. Confidentiality of the audit log therefore
+   requires ``auth.mode = required``; under the default ``permissive`` mode any
+   caller that can reach the controller can read it.
+
+Retention
+~~~~~~~~~
+
+The log grows without bound by default. Set ``accounting.txn_retention_days`` to
+have the controller (leader) periodically delete records older than the given
+number of days:
+
+.. code-block:: toml
+
+   [accounting]
+   txn_retention_days = 365
+
+Leaving it unset (the default) or ``0`` keeps records forever, matching Slurm's
+default purge-off behavior; a positive value enables the purge.
+
 Declarative management with Ansible
 -----------------------------------
 
