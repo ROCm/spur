@@ -6683,14 +6683,8 @@ fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
-    // Node TRES is the count of DISTINCT physical nodes the matching running
-    // jobs occupy (the union of their `allocated_nodes`), not the sum of each
-    // job's requested `num_nodes`. Slurm derives the association/QOS node usage
-    // from a per-assoc/QOS node bitmap, so a node shared by two of an
-    // account's/QOS's jobs counts once. Summing `num_nodes` double-counts a
-    // packed node and blocks work the node still has capacity for (ROCm/spur#709).
-    // CPU/Memory/GPU stay additive — those are consumed per job even on a
-    // shared node — so only Node is overridden below.
+    // Node TRES is the count of distinct nodes occupied (union of `allocated_nodes`), not summed
+    // `num_nodes` — a node packed by two jobs counts once. CPU/Memory/GPU stay additive.
     let mut distinct_nodes: HashSet<&str> = HashSet::new();
     let mut unplaced_nodes: u64 = 0;
     for j in jobs.values() {
@@ -15275,9 +15269,7 @@ mod tests {
 
     #[test]
     fn sum_running_tres_counts_distinct_nodes_not_summed_num_nodes() {
-        // ROCm/spur#709: two RUNNING jobs (num_nodes=2 each) that SHARE node n2
-        // (packing 1 GPU/node onto 8-GPU hosts). Summed num_nodes = 4, but the
-        // distinct-node union {n1,n2,n3} = 3. The node limit must charge 3.
+        // Two running jobs share node n2: summed num_nodes = 4, distinct union = 3.
         let mut a = make_running_job(1, &["n1", "n2"], 1);
         a.spec.num_nodes = 2;
         let mut b = make_running_job(2, &["n2", "n3"], 1);
@@ -15296,28 +15288,30 @@ mod tests {
 
     #[test]
     fn sum_running_tres_falls_back_to_num_nodes_when_placement_missing() {
-        // A running job with no recorded placement (transient/edge) must not
-        // under-count the limit — fall back to its requested num_nodes.
+        // An unplaced job (num_nodes=3, no recorded placement) must not under-count via the
+        // distinct-node union, so it still contributes its full requested count; the two placed
+        // jobs share n2, so their contribution is deduped to {n1,n2,n3}=3 rather than summed 2+2=4.
         let mut a = make_running_job(1, &[], 1);
-        a.spec.num_nodes = 2;
+        a.spec.num_nodes = 3;
         a.allocated_nodes.clear();
-        let mut b = make_running_job(2, &["n1"], 1);
-        b.spec.num_nodes = 1;
+        let mut b = make_running_job(2, &["n1", "n2"], 1);
+        b.spec.num_nodes = 2;
+        let mut c = make_running_job(3, &["n2", "n3"], 1);
+        c.spec.num_nodes = 2;
         let mut jobs = HashMap::new();
         jobs.insert(1, a);
         jobs.insert(2, b);
+        jobs.insert(3, c);
 
         let tres = sum_running_tres(&jobs, |_| true);
-        // Placed distinct {n1}=1 + unplaced fallback 2 = 3.
-        assert_eq!(tres.get(TresType::Node), 3);
+        // Unplaced fallback 3 + placed distinct {n1,n2,n3}=3 = 6, not summed 3+2+2=7.
+        assert_eq!(tres.get(TresType::Node), 6);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_uses_distinct_allocated_nodes_not_summed_num_nodes() {
-        // ROCm/spur#709: QOS grp node=4. The QOS's running jobs share a node
-        // (packing), so distinct occupancy is 3 but summed num_nodes is 4. A new
-        // 1-node job must pack into the real headroom (3+1=4 <= 4), not be blocked
-        // by the phantom double-count (4+1=5).
+        // QOS grp node=4, running jobs pack onto a shared node (distinct=3, summed=4); a new
+        // 1-node job must pack into the real headroom (3+1=4), not be blocked by the phantom 4+1=5.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 64, 128000);
