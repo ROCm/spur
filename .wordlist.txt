@@ -235,6 +235,7 @@ Slurm's
 Spur's
 repo's
 submitter's
+submitters
 QOS's
 QOSes
 linters
