@@ -474,6 +474,7 @@ mod tests {
     fn address_network_masks_host_bits() {
         assert_eq!(address_network("10.42.7.9", 24).unwrap(), "10.42.7.0");
         assert_eq!(address_network("10.42.7.9", 16).unwrap(), "10.42.0.0");
+        assert_eq!(address_network("10.42.7.9", 8).unwrap(), "10.0.0.0");
         assert_eq!(address_network("10.42.7.130", 25).unwrap(), "10.42.7.128");
         assert_eq!(address_network("10.42.7.9", 32).unwrap(), "10.42.7.9");
     }
@@ -496,6 +497,7 @@ mod tests {
     #[test]
     fn address_network_rejects_malformed_addresses() {
         assert!(address_network("not-an-ip", 24).is_err());
+        assert!(address_network("10.42.7", 24).is_err());
         assert!(address_network("::1", 24).is_err());
     }
 }

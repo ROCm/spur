@@ -194,6 +194,7 @@ mod tests {
         assert_eq!(parse_ttl("2h").unwrap(), 7_200);
         assert_eq!(parse_ttl("1d").unwrap(), 86_400);
         assert_eq!(parse_ttl("90").unwrap(), 90, "bare value is seconds");
+        assert_eq!(parse_ttl("  7h  ").unwrap(), 25_200, "padding is trimmed");
     }
 
     /// 50000d is 4.32e9 seconds, past u32, where the unchecked multiply wrapped
@@ -216,5 +217,6 @@ mod tests {
         assert!(parse_ttl("abc").is_err());
         assert!(parse_ttl("-1h").is_err());
         assert!(parse_ttl("1.5h").is_err());
+        assert!(parse_ttl("h").is_err());
     }
 }
