@@ -6976,6 +6976,16 @@ mod tests {
                 .any(|p| p.name == "team-a"),
             "the admin's partition must exist after the gated call succeeds"
         );
+
+        // A structurally different RPC (token issuance) also passes the admin gate.
+        let token_resp = svc
+            .create_token(admin_request(CreateTokenRequest::default()))
+            .await
+            .expect("an admin caller may create a token");
+        assert!(
+            !token_resp.into_inner().token_id.is_empty(),
+            "the admin's token must be issued"
+        );
     }
 
     // --- authoritative_user ---
