@@ -66,11 +66,9 @@ mod local_path_tests {
 /// `None` for any `cni` other than `"calico"` (the k0s default, kube-router, needs no config file).
 /// `sans` are extra API-server certificate SANs (e.g. the control-plane's mesh + underlay IPs).
 ///
-/// `cp_count` is the number of control planes. For a multi-CP (`cp_count > 1`) cluster there is no
-/// VIP that can float over WireGuard cryptokey routing, so each node needs a local balanced endpoint
-/// across all controllers: enabling node-local load balancing (EnvoyProxy) gives konnectivity a
-/// cluster-wide `:8132` endpoint instead of pinning every agent to one controller. Single-CP clusters
-/// do not need it.
+/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over WireGuard cryptokey routing, so
+/// node-local load balancing (EnvoyProxy) is enabled to give konnectivity a cluster-wide balanced
+/// endpoint instead of pinning every agent to one controller.
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,

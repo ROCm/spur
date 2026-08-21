@@ -776,9 +776,8 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
 }
 
 /// The mesh-native k0s controller config for `node` (api on its mesh IP + Calico bird), or None for
-/// the default kube-router mode (`cni != "calico"`) / a node without a mesh IP. `cp_count` is the
-/// number of control planes; a multi-CP cluster additionally enables node-local load balancing so
-/// konnectivity gets a cluster-wide endpoint over the mesh.
+/// the default kube-router mode (`cni != "calico"`) / a node without a mesh IP. `cp_count > 1` also
+/// enables node-local load balancing for konnectivity.
 fn controller_k0s_config(
     net: &ClusterNetworking,
     node: &spur_core::node::Node,

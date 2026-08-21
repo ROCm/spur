@@ -145,15 +145,19 @@ cannot follow WireGuard cryptokey routing — so ``spur k8s up`` enables k0s
 node-local load balancing (``nodeLocalLoadBalancing`` with ``EnvoyProxy``) on
 every control plane. This gives each node a local Envoy that round-robins across
 all controllers, so konnectivity has a cluster-wide ``:8132`` endpoint instead of
-pinning every agent to a single controller. It is on automatically for 3/5
-control planes and off for a single control plane (no balancing needed).
+pinning every agent to a single controller. It is on automatically for any
+multi-control-plane count (today 3 or 5) and off for a single control plane (no
+balancing needed).
 
 .. note::
 
-   k0s does not hot-reload node-local load balancing. A fresh
-   ``spur k8s up --replicas 3`` is unaffected (controllers render the setting
-   before any worker joins), but flipping an **existing** cluster onto the fix
-   requires restarting the workers before their local Envoy starts.
+   k0s does not hot-reload node-local load balancing, and Spur only writes a
+   controller's ``k0s.yaml`` while bringing that controller up — an
+   already-active control plane is never rewritten in place. A fresh
+   ``spur k8s up --replicas 3`` is therefore unaffected (controllers render the
+   setting before any worker joins), but an **existing** HA cluster cannot pick
+   up the fix by restarting workers alone: reprovision the control plane with
+   ``spur k8s down --reset`` followed by ``spur k8s up``.
 
 Check status
 ~~~~~~~~~~~~~
