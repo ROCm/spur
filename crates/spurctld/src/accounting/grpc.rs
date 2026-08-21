@@ -73,19 +73,8 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
-/// Reject an accounting mutation unless the request carries a verified administrator.
-///
-/// The accounting service is served behind the same auth layer as the controller, so a verified
-/// [`Identity`](spur_core::auth::Identity) rides in the request extensions when one was
-/// authenticated. These handlers mutate account/user/QOS records — `add_user` even sets
-/// `admin_level`, the self-promotion vector — so an *identified* non-admin is refused. A caller with
-/// no verified identity is allowed — like the controller's gate and the auth model, `disabled` or
-/// `permissive`-with-no-credential trusts the client, so refusing anonymous here would break no-auth
-/// deployments; in `required` mode every caller is authenticated and bound. The admin criterion is
-/// narrower than the controller's `caller_is_admin`: this uses only the token's `admin` claim
-/// ([`Identity::require_admin`](spur_core::auth::Identity::require_admin)), not the accounting `Admin`
-/// level, because the accounting service holds no association-cache handle. Read-only handlers
-/// (`list_*`, `get_*`) stay open.
+/// Rejects an identified non-admin from an account/user/QOS mutation; anonymous is allowed, same as
+/// the controller's gate. Narrower than `caller_is_admin`: token `admin` claim only, no cache handle here.
 fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
     let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
     match request.extensions().get::<spur_core::auth::Identity>() {
@@ -389,8 +378,8 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
-        let pool = self.pool()?;
         require_admin(&request, "create account")?;
+        let pool = self.pool()?;
         let req = request.into_inner();
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
@@ -413,8 +402,8 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
-        let pool = self.pool()?;
         require_admin(&request, "delete account")?;
+        let pool = self.pool()?;
         let req = request.into_inner();
         db::delete_account(pool, &req.name)
             .await
@@ -448,8 +437,8 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
-        let pool = self.pool()?;
         require_admin(&request, "add user")?;
+        let pool = self.pool()?;
         let req = request.into_inner();
         // QOS references are validated against the live DB, not QosCache: a QOS
         // created just now may not have reached the cache's next refresh yet,
@@ -531,8 +520,8 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
-        let pool = self.pool()?;
         require_admin(&request, "remove user")?;
+        let pool = self.pool()?;
         let req = request.into_inner();
         let deleted = db::remove_user(pool, &req.user, &req.account)
             .await
@@ -590,8 +579,8 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
-        let pool = self.pool()?;
         require_admin(&request, "create qos")?;
+        let pool = self.pool()?;
         let req = request.into_inner();
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
@@ -665,8 +654,8 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
-        let pool = self.pool()?;
         require_admin(&request, "delete qos")?;
+        let pool = self.pool()?;
         let req = request.into_inner();
         db::delete_qos(pool, &req.name)
             .await
@@ -948,6 +937,37 @@ mod tests {
         // enforces once callers are identified, not in the non-enforcing modes.
         let anon = Request::new(AddUserRequest::default());
         assert!(require_admin(&anon, "add user").is_ok());
+    }
+
+    /// Table test over every gated accounting RPC, enumerated so a handler that drops its
+    /// `require_admin` call is caught even though it never reaches the DB in this test: with the
+    /// pool unavailable, a non-admin's rejection can only come from the gate, not a query failure.
+    #[tokio::test]
+    async fn accounting_mutations_deny_identified_non_admin() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+
+        macro_rules! assert_admin_gated {
+            ($method:ident, $req:expr) => {{
+                let mut r = Request::new($req);
+                r.extensions_mut().insert(identity("mallory", false));
+                let err = service.$method(r).await.expect_err(concat!(
+                    stringify!($method),
+                    " must reject a non-admin caller"
+                ));
+                assert_eq!(
+                    err.code(),
+                    tonic::Code::PermissionDenied,
+                    concat!(stringify!($method), " (non-admin) must be PermissionDenied")
+                );
+            }};
+        }
+
+        assert_admin_gated!(create_account, CreateAccountRequest::default());
+        assert_admin_gated!(delete_account, DeleteAccountRequest::default());
+        assert_admin_gated!(add_user, AddUserRequest::default());
+        assert_admin_gated!(remove_user, RemoveUserRequest::default());
+        assert_admin_gated!(create_qos, CreateQosRequest::default());
+        assert_admin_gated!(delete_qos, DeleteQosRequest::default());
     }
 
     #[test]

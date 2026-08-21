@@ -488,18 +488,8 @@ impl ControllerService {
             .map_err(reservation_rpc_status)
     }
 
-    /// Reject a control-plane mutation unless the request carries a verified administrator identity.
-    ///
-    /// These RPCs define cluster tenancy — partition membership, node placement, admission tokens,
-    /// reservations. An *identified* non-admin is refused, so the partition/node-pool boundary cannot
-    /// be redrawn from an ordinary credential. A caller with no verified identity is allowed, keeping
-    /// the pre-auth behaviour: `disabled`, or `permissive` with no credential, trusts the client, and
-    /// refusing anonymous admin ops there would break no-auth deployments and outage-free adoption —
-    /// this is the same `caller_is_privileged` ruling the priority ceiling uses. In `required` mode
-    /// every caller is authenticated, so the gate binds every real user. Admin is the same ruling the
-    /// rest of the control plane uses (`caller_is_admin`): the token's `admin` claim, an accounting
-    /// `Admin` level, or the `root` user (via `is_k0s_admin`). Call it as a prologue, before
-    /// `into_inner`, so the verified identity decides.
+    /// Rejects an identified non-admin from a cluster-tenancy mutation (partitions, node placement,
+    /// tokens, reservations); anonymous is allowed, matching `caller_is_privileged`. Call as a prologue, before `into_inner`.
     #[allow(clippy::result_large_err)]
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
         if self.caller_is_privileged(Self::verified_identity(request)) {
@@ -1568,6 +1558,15 @@ impl SlurmController for ControllerService {
                 }
             })
             .unwrap_or_default();
+
+        // A node re-registering with different labels reaches the same NodeLabelsUpdate WAL op as
+        // the gated `update_node`; require the same admin bar there, but let first registration and
+        // unchanged re-registration through, so a node agent can self-register without one.
+        if let Some(existing) = self.cluster.get_node(&request.get_ref().hostname) {
+            if existing.labels != request.get_ref().labels {
+                self.require_admin(&request, "relabel an existing node on re-registration")?;
+            }
+        }
 
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
@@ -6985,6 +6984,74 @@ mod tests {
         assert!(
             !token_resp.into_inner().token_id.is_empty(),
             "the admin's token must be issued"
+        );
+    }
+
+    // --- register_agent relabeling gate ---
+    //
+    // A node re-registering with different labels reaches the same NodeLabelsUpdate WAL op as the
+    // gated `update_node`, so it must be admin-gated too; first registration and an unchanged
+    // re-registration must not be, so a node agent can still self-register with no identity.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_first_registration_needs_no_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "fresh-node".into(),
+            address: "127.0.0.1".into(),
+            labels: [("pool".to_string(), "a".to_string())].into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("first registration must not require an admin identity");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_relabel_of_existing_node_is_admin_gated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "victim-node", 6821).await;
+
+        let relabel = || RegisterAgentRequest {
+            hostname: "victim-node".into(),
+            address: "127.0.0.1".into(),
+            labels: [("pool".to_string(), "stolen".to_string())].into(),
+            ..Default::default()
+        };
+
+        let mut r = Request::new(relabel());
+        r.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(r)
+            .await
+            .expect_err("a non-admin caller must not be able to relabel an existing node");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(
+            svc.cluster
+                .get_node("victim-node")
+                .unwrap()
+                .labels
+                .is_empty(),
+            "the rejected relabel must not have applied"
+        );
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "victim-node".into(),
+            address: "127.0.0.1".into(),
+            labels: std::collections::HashMap::new(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an unchanged re-registration must not be admin-gated");
+
+        svc.register_agent(admin_request(relabel()))
+            .await
+            .expect("an admin caller may relabel an existing node");
+        assert_eq!(
+            svc.cluster.get_node("victim-node").unwrap().labels["pool"],
+            "stolen"
         );
     }
 
