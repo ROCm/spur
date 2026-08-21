@@ -83,6 +83,7 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
    database_url = "postgresql://spur:spur@localhost/spur"
    default_qos = "normal"
    require_qos = false
+   require_association = false
    fairshare_refresh_secs = 300
    grp_wall_window_days = 14
 
@@ -103,6 +104,18 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
 ``require_qos``
    Reject at submit any job that resolves to no QOS. Mirrors Slurm's
    ``AccountingStorageEnforce=qos``.
+
+   :Default: ``false``
+
+``require_association``
+   Reject at submit any job whose user resolves to no account — a submission
+   with no ``--account`` and no default account on file. This check is
+   unconditional, like ``require_qos``: it applies even before accounting has
+   finished loading, so enabling it without accounting fully configured
+   rejects every such submission. Mirrors Slurm's
+   ``AccountingStorageEnforce=associations``. A submission naming an account
+   the user is not associated with is rejected regardless of this setting,
+   once the association cache has loaded.
 
    :Default: ``false``
 
@@ -756,6 +769,27 @@ Limits resolve in two layers:
 
 Associations are managed via ``add user`` and inspected via ``sacctmgr show
 user`` (see `Managing users`_).
+
+How a job's account is resolved
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+At submit, Spur resolves the job's account in this order, matching Slurm.
+This validation is skipped (fail-open) while the association cache has not
+yet loaded, e.g. at controller startup or while the accounting database is
+unreachable:
+
+1. **Explicit** ``--account`` on the job. Once the association cache has
+   loaded, it must name an account the user is associated with, or the job
+   is rejected — with ``user 'X' is not associated with account 'Y'`` if the
+   user has other associations, or ``user 'X' has no account associations``
+   if the user has none at all.
+2. Otherwise the **user's default account**, if the user has one on file.
+3. Otherwise, if ``accounting.require_association`` is ``true``, the job is
+   **rejected** (``no account resolved for user 'X'``) — even if the user
+   does have associations, just none flagged as their default. This step is
+   unconditional, unlike step 1: it applies even before the association
+   cache has loaded. If ``require_association`` is ``false`` (the default),
+   the job runs with no account.
 
 TRES
 ----

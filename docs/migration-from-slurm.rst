@@ -84,6 +84,8 @@ Accounting entities map directly from Slurm:
   ordering.
 - The ``[accounting] require_qos`` setting is the equivalent of Slurm's
   ``AccountingStorageEnforce=qos``.
+- The ``[accounting] require_association`` setting is the equivalent of Slurm's
+  ``AccountingStorageEnforce=associations``.
 - The ``default_qos`` setting is the equivalent of Slurm's fallback QOS.
 
 See :doc:`/admin-guide/accounting` for the accounting concept guide.
