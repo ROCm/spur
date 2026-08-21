@@ -7055,15 +7055,9 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     }
 }
 
-/// Reject a client-supplied account that is not a real user→account association, and — when
-/// `accounting.require_association` is set — a submit resolving to no account at all (unconditional,
-/// like `require_qos`'s final check).
-///
-/// Fails closed on an unloaded association cache: when accounting is enabled the fence is real, so a
-/// cold cache (fresh start, restart, or a DB that was unreachable at boot) must deny rather than wave
-/// the account through — otherwise the cache-cold window silently clears every per-tenant partition
-/// ACL. When accounting is disabled there is no association database to consult, so an account is an
-/// unverified free label and the check stays permissive (matching prior behaviour).
+/// Reject a client-supplied account that isn't a real association, or — with `require_association`
+/// set — no account at all. Fails closed on a cold cache when accounting is enabled (an unverified
+/// free label otherwise), so a not-yet-loaded cache can't wave a spoofed account through.
 fn validate_user_account(
     spec: &JobSpec,
     assoc_cache: &AssociationCache,
@@ -7098,7 +7092,8 @@ fn validate_user_account(
             );
             Err(SubmitError::invalid(format!(
                 "account associations are temporarily unavailable (accounting cache not loaded); \
-                 cannot verify user '{}' is associated with account '{account}'. Retry shortly.",
+                 cannot verify user '{}' is associated with account '{account}'. Try again once \
+                 the accounting database is reachable.",
                 spec.user
             )))
         }
@@ -19337,6 +19332,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("is not associated with account 'other'"));
+    }
+
+    #[test]
+    fn validate_user_account_fails_closed_on_cold_cache_with_explicit_account_and_require_association(
+    ) {
+        // require_association=true doesn't bypass the cold-cache fence for an explicit account.
+        let assoc = AssociationCache::new(); // never loaded
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        let cfg = spur_core::config::AccountingConfig {
+            database_url: "postgresql://test".into(),
+            require_association: true,
+            ..Default::default()
+        };
+
+        let err = super::validate_user_account(&spec, &assoc, &cfg).unwrap_err();
+        assert!(err.to_string().contains("temporarily unavailable"));
     }
 
     #[test]

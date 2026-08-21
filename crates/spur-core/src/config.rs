@@ -697,12 +697,8 @@ pub struct AuthConfig {
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// HMAC signing secret, used verbatim as the HS256 key — the string's bytes are the key, this is
-    /// not a path to a key file. It is the cluster-wide authentication secret: it verifies both node
-    /// admission tokens and, under `auth.mode = permissive`/`required`, the user-identity credentials
-    /// callers present on the control-plane RPCs. Leave it unset only with `auth.mode =
-    /// disabled`/`permissive`; `required` refuses to start without it, because an unset key would
-    /// otherwise fall back to a well-known constant that anyone can forge against.
+    /// HMAC signing secret (raw bytes) for node admission and user-identity RPC auth; `required`
+    /// refuses to start without one. Captured at startup, not updated by `reconfigure`.
     pub jwt_key: Option<String>,
     /// Allow jobs to execute as uid 0 (root).
     ///
@@ -1485,10 +1481,8 @@ impl SlurmConfig {
                     .into(),
             });
         }
-        // `required` promises every caller is verified against the cluster signing key. Without a key
-        // the controller would fall back to a well-known constant that anyone can sign with, turning
-        // the hardened mode into universal forgeability (an attacker could mint an admin identity).
-        // Refuse to start rather than run in that strictly-worse-than-default posture.
+        // Without a key, `required` would fall back to a well-known signing constant —
+        // forgeable, so strictly worse than the default. Refuse to start instead.
         if self.auth.mode == AuthMode::Required
             && self.auth.jwt_key.as_deref().unwrap_or("").is_empty()
         {
