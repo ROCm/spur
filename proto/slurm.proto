@@ -556,7 +556,7 @@ message UpdateJobRequest {
   optional bool hold = 6;
   optional string comment = 7;
   optional string qos = 8;
-  string user = 9;   // For authorization (owner or root required).
+  string user = 9;   // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message RequeueJobRequest {
@@ -882,7 +882,7 @@ message RunStepRequest {
   uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
   bool label = 8;      // Prefix output lines with [rank] (srun -l)
   string mpi = 9;      // Step MPI type; when empty, inherit job.spec.mpi
-  string user = 10;    // For authorization (owner or root required).
+  string user = 10;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message RunStepResponse {

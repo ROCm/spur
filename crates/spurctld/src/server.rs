@@ -1144,10 +1144,13 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let caller_is_admin = self.caller_is_admin(__identity.as_ref());
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let outcome = self
             .cluster
-            .requeue_job_by_user(req.job_id, &req.user, req.hold)
+            .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
             .map_err(cluster_err_to_precondition_status)?;
 
         // Kill the old processes for jobs that were Running/Suspended; the
@@ -5238,6 +5241,59 @@ mod tests {
             .into_inner();
         assert_eq!(resp.requeued, 1);
         assert!(resp.skipped.is_empty());
+    }
+
+    // An authenticated non-admin cannot requeue another user's job by setting user="root" on
+    // the wire. authoritative_user overwrites the field before the owner check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_rejects_spoofed_root_from_authenticated_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(RequeueJobRequest {
+            job_id,
+            user: "root".into(), // spoof admin on the wire
+            hold: false,
+        });
+        req.extensions_mut().insert(viewer("mallory", false));
+
+        let err = svc
+            .requeue_job(req)
+            .await
+            .expect_err("a spoofed root claim must not bypass the ownership check");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    // A verified admin (whose username is not literally "root") can requeue any job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_admin_override_uses_verified_identity_not_wire_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        // A verified admin (name != "root") may requeue another user's job.
+        let mut admin_req = Request::new(RequeueJobRequest {
+            job_id,
+            hold: false,
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        assert!(
+            svc.requeue_job(admin_req).await.is_ok(),
+            "a verified admin (non-root) must be able to requeue any job"
+        );
+
+        // An unauthenticated caller cannot claim admin by putting user="root" on the wire.
+        let err = svc
+            .requeue_job(Request::new(RequeueJobRequest {
+                job_id,
+                user: "root".into(),
+                hold: false,
+            }))
+            .await
+            .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     // A step must NOT be created when the target node is allocated but unregistered: address
