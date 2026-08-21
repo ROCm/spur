@@ -3395,8 +3395,9 @@ pub async fn serve(
 
     let jwt_key = resolve_startup_jwt_key(&cluster.config());
     let auth_mode = cluster.config().auth.mode;
-    // Same key the node-admission path already uses; cloned because `jwt_key` moves into the service.
-    let jwt_key_for_auth = jwt_key.clone();
+    // Unlike node admission, an unset key here must reject every credential, never fall back
+    // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
+    let auth_verification_key = cluster.config().auth.jwt_key.clone().unwrap_or_default();
 
     let service = ControllerService {
         cluster,
@@ -3412,7 +3413,7 @@ pub async fn serve(
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
-    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &jwt_key_for_auth);
+    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &auth_verification_key);
 
     let mut builder = tonic::transport::Server::builder()
         .layer(stats_layer)
@@ -5936,6 +5937,26 @@ mod tests {
             }))
             .await
             .expect_err("a non-admin caller must not bring the cluster up");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    // Real RPC path, not just the raw cache method: a named caller must not become admin just
+    // because the association cache hasn't loaded yet (fail closed on a cold cache).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_denied_for_non_root_caller_on_cold_cache_with_accounting_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.accounting.database_url = "postgresql://unused-in-test".into();
+        let svc = test_service_with(&dir, config).await;
+        assert!(!svc.cluster.association_cache().is_loaded());
+
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a cold association cache must not grant admin");
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
