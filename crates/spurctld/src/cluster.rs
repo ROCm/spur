@@ -36,7 +36,9 @@ use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
-use crate::accounting::{AccountingNotifier, JobStartRecord};
+use crate::accounting::{
+    txn, AccountingNotifier, JobStartRecord, TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource,
+};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
@@ -567,7 +569,7 @@ impl ClusterManager {
             config.scheduler.default_time_limit_minutes,
         );
         apply_default_account(&mut spec, &self.association_cache);
-        validate_user_account(&spec, &self.association_cache)?;
+        validate_user_account(&spec, &self.association_cache, &config.accounting)?;
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
         // an empty QoS and wrongly rejects a user's inherited default.
         apply_default_qos(
@@ -837,7 +839,11 @@ impl ClusterManager {
                     "job_submit hook modified spec"
                 );
                 if changes.partition.is_some() || changes.account.is_some() {
-                    validate_user_account(spec, &self.association_cache)?;
+                    validate_user_account(
+                        spec,
+                        &self.association_cache,
+                        &self.config().accounting,
+                    )?;
                     self.validate_partition_node_bounds(spec, partitions)?;
                 }
                 // Existence is enforced first: an unknown QOS silently resolves
@@ -1184,9 +1190,14 @@ impl ClusterManager {
     }
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
-    /// Delegates to [`spur_core::auth::check_job_owner`]; see there for the bypass rules.
+    ///
+    /// These are control-plane paths where `user` has already been bound to the verified identity
+    /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller and
+    /// a literal `"root"` is the admin override, so both are treated as internal here; the raw
+    /// [`spur_core::auth::check_job_owner`] no longer infers that itself.
     fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
-        spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
+        let is_internal = user.is_empty() || user == "root";
+        spur_core::auth::check_job_owner(user, is_internal, owner, action).map_err(Into::into)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or
@@ -1223,6 +1234,7 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         user: &str,
+        caller_is_admin: bool,
         hold: bool,
     ) -> anyhow::Result<RequeueOutcome> {
         let (targets, is_array) = {
@@ -1247,7 +1259,7 @@ impl ClusterManager {
         // user sees exactly why (not owner, interactive, already pending, ...).
         if !is_array {
             let id = targets[0];
-            let (requeued, killed) = self.requeue_one_job(id, user, hold)?;
+            let (requeued, killed) = self.requeue_one_job(id, user, caller_is_admin, hold)?;
             return Ok(if requeued {
                 RequeueOutcome {
                     requeued: 1,
@@ -1270,7 +1282,7 @@ impl ClusterManager {
         let total = targets.len();
         let mut outcome = RequeueOutcome::default();
         for id in targets {
-            match self.requeue_one_job(id, user, hold) {
+            match self.requeue_one_job(id, user, caller_is_admin, hold) {
                 Ok((true, killed)) => {
                     outcome.requeued += 1;
                     outcome.killed.extend(killed);
@@ -1299,6 +1311,7 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         user: &str,
+        caller_is_admin: bool,
         hold: bool,
     ) -> anyhow::Result<(bool, Option<Job>)> {
         let snapshot = {
@@ -1306,7 +1319,8 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            Self::check_job_owner(user, &job.spec.user, "requeue")?;
+            spur_core::auth::check_job_owner(user, caller_is_admin, &job.spec.user, "requeue")
+                .map_err(anyhow::Error::from)?;
             // Interactive/srun allocations have no batch script to re-run.
             if job.spec.interactive || job.spec.srun_job || job.spec.pty {
                 anyhow::bail!("job {} is interactive and cannot be requeued", job_id);
@@ -1431,6 +1445,8 @@ impl ClusterManager {
         self.propose(WalOperation::JobSuspend {
             job_id,
             at: chrono::Utc::now(),
+            preempted_by: None,
+            preempt_qos: None,
         })?;
         info!(job_id, "job suspended");
         Ok(())
@@ -1697,7 +1713,17 @@ impl ClusterManager {
     /// Preempt a running job per its partition's PreemptMode. Does the
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
-    pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
+    ///
+    /// `preempted_by` is the job that triggered the preemption (recorded for
+    /// provenance). `preempt_qos` is the authorizing QOS name when
+    /// `preempt_type = QosPriority`; `None` for plain priority-based preemption.
+    pub fn preempt_job(
+        &self,
+        job_id: JobId,
+        mode: PreemptMode,
+        preempted_by: JobId,
+        preempt_qos: Option<String>,
+    ) -> anyhow::Result<PreemptOutcome> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1711,12 +1737,26 @@ impl ClusterManager {
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
             PreemptMode::Suspend => {
-                self.suspend_job(job_id, "")?;
+                // Propose JobSuspend directly (rather than suspend_job) so
+                // provenance fields are inside the WAL entry and survive Raft
+                // replication and leader failover. The job state was already
+                // validated at the top of preempt_job — no re-check needed.
+                let resp = self.propose(WalOperation::JobSuspend {
+                    job_id,
+                    at: chrono::Utc::now(),
+                    preempted_by: Some(preempted_by),
+                    preempt_qos: preempt_qos.clone(),
+                })?;
+                self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (suspend)");
                 Ok(PreemptOutcome::Suspended)
             }
             PreemptMode::Cancel => {
-                let resp = self.propose(WalOperation::JobPreemptCancel { job_id })?;
+                let resp = self.propose(WalOperation::JobPreemptCancel {
+                    job_id,
+                    preempted_by: Some(preempted_by),
+                    preempt_qos,
+                })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (cancel)");
                 Ok(PreemptOutcome::Killed)
@@ -1742,7 +1782,12 @@ impl ClusterManager {
                     .get(&job_id)
                     .and_then(|j| j.spec.begin_time)
                     .map_or(hold, |user_begin| user_begin.max(hold));
-                let resp = self.propose(WalOperation::JobPreemptRequeue { job_id, begin_time })?;
+                let resp = self.propose(WalOperation::JobPreemptRequeue {
+                    job_id,
+                    begin_time,
+                    preempted_by: Some(preempted_by),
+                    preempt_qos,
+                })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");
                 Ok(PreemptOutcome::Killed)
@@ -1817,12 +1862,20 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            let (exit_signal, derived_exit_code) = self
+            let (exit_signal, derived_exit_code, preempted_by, preempt_mode, preempt_qos) = self
                 .jobs
                 .read()
                 .get(&job_id)
-                .map(|j| (j.exit_signal, j.derived_exit_code))
-                .unwrap_or((0, 0));
+                .map(|j| {
+                    (
+                        j.exit_signal,
+                        j.derived_exit_code,
+                        j.preempted_by,
+                        j.preempt_mode.clone(),
+                        j.preempt_qos.clone(),
+                    )
+                })
+                .unwrap_or((0, 0, None, None, None));
             notifier.notify_job_end(
                 job_id,
                 state,
@@ -1830,6 +1883,9 @@ impl ClusterManager {
                 Utc::now(),
                 exit_signal,
                 derived_exit_code,
+                preempted_by,
+                preempt_mode,
+                preempt_qos,
             );
         }
 
@@ -2545,6 +2601,45 @@ impl ClusterManager {
             None => None,
         };
 
+        // Re-validate placement, account and wall-time against the resulting spec
+        // before mutating, exactly as submit_job does. An owner editing a job's
+        // partition/account/time_limit must still satisfy the same partition ACLs,
+        // account associations and MaxTime limits — otherwise a post-submit rewrite
+        // would slip a job onto nodes or into an account the user is not entitled to
+        // (the QOS arm above already re-validates for the same reason). Reject before
+        // mutating so a failed edit leaves the job untouched.
+        {
+            let partitions = self.partitions.read().clone();
+            let config = self.config();
+            let candidate = {
+                let jobs = self.jobs.read();
+                let job = jobs
+                    .get(&job_id)
+                    .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+                let mut spec = job.spec.clone();
+                if let Some(tl) = time_limit {
+                    spec.time_limit = Some(tl);
+                }
+                if let Some(part) = partition.as_ref() {
+                    spec.partition = Some(part.clone());
+                }
+                if let Some(acct) = account.as_ref() {
+                    spec.account = Some(acct.clone());
+                }
+                if let Some(q) = qos.as_ref() {
+                    spec.qos = Some(q.clone());
+                }
+                spec
+            };
+            validate_user_account(&candidate, &self.association_cache, &config.accounting)?;
+            self.validate_partition(&candidate, &partitions)?;
+            validate_partition_time_limit(
+                &candidate,
+                config.scheduler.enforce_part_limits,
+                &partitions,
+            )?;
+        }
+
         if let Some(p) = priority {
             let old = self
                 .jobs
@@ -3054,7 +3149,12 @@ impl ClusterManager {
             .filter(|job| !job.pending_reason.is_scheduling_hold())
             .filter_map(|job| {
                 let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
-                if before_begin_time && job.pending_reason == PendingReason::BeginTime {
+                if before_begin_time
+                    && matches!(
+                        job.pending_reason,
+                        PendingReason::BeginTime | PendingReason::Preempted
+                    )
+                {
                     return None;
                 }
                 Some(PendingJobCandidate {
@@ -3970,6 +4070,14 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Fire a best-effort audit write when accounting is configured; no-op
+    /// otherwise. Mirrors the job start/end notification path.
+    pub(crate) fn record_txn(&self, record: TxnRecord) {
+        if let Some(ref notifier) = *self.accounting.read() {
+            notifier.notify_txn(record);
+        }
+    }
+
     /// Remove reservations past their end time when no jobs still reference them.
     pub fn purge_expired_reservations(&self) {
         let now = Utc::now();
@@ -3990,9 +4098,35 @@ impl ClusterManager {
             if in_use {
                 continue;
             }
-            if let Err(e) = self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
-                warn!(name = %name, error = %e, "failed to purge expired reservation");
-            }
+            let error = match self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(name = %name, error = %e, "failed to purge expired reservation");
+                    Some(e.to_string())
+                }
+            };
+            // Audit both outcomes (like the RPC handlers) so a repeatedly-failing
+            // system purge leaves a trail, not just an ephemeral warn.
+            let outcome = if error.is_none() {
+                TxnOutcome::Success
+            } else {
+                TxnOutcome::Error
+            };
+            self.record_txn(TxnRecord {
+                ts: Utc::now(),
+                actor: "system".to_string(),
+                actor_uid: None,
+                verified: false,
+                source: TxnSource::System,
+                action: TxnAction::Delete,
+                entity_type: TxnEntity::Reservation,
+                entity_name: name.clone(),
+                outcome,
+                details: txn::finalize_details(
+                    txn::delete_details(Some("expired")),
+                    error.as_deref(),
+                ),
+            });
         }
     }
 
@@ -4901,7 +5035,12 @@ impl ClusterManager {
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
             }
-            WalOperation::JobPreemptRequeue { job_id, begin_time } => {
+            WalOperation::JobPreemptRequeue {
+                job_id,
+                begin_time,
+                preempted_by,
+                preempt_qos,
+            } => {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
                 let freed_nodes;
@@ -4937,7 +5076,19 @@ impl ClusterManager {
                     }
                     Self::reset_job_for_preempt_requeue(job);
                     job.spec.begin_time = Some(*begin_time);
-                    job.set_pending_reason(PendingReason::BeginTime);
+                    // Provenance fields are set after reset_job_for_preempt_requeue
+                    // clears run state so they survive into the pending phase.
+                    job.preempted_by = *preempted_by;
+                    job.preempt_mode = Some("Requeue".to_string());
+                    job.preempt_qos = preempt_qos.clone();
+                    let desc = match preempted_by {
+                        Some(by) => match preempt_qos.as_deref() {
+                            Some(qos) => format!("preempted by job {by} (QOS: {qos})"),
+                            None => format!("preempted by job {by}"),
+                        },
+                        None => "preempted".to_string(),
+                    };
+                    job.set_pending_reason_desc(PendingReason::Preempted, desc);
                 }
                 Self::deallocate_job_slices(
                     &mut nodes,
@@ -5053,7 +5204,11 @@ impl ClusterManager {
                 }
                 return ClientResponse::default();
             }
-            WalOperation::JobPreemptCancel { job_id } => {
+            WalOperation::JobPreemptCancel {
+                job_id,
+                preempted_by,
+                preempt_qos,
+            } => {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
@@ -5083,6 +5238,9 @@ impl ClusterManager {
                         warn!(job_id = *job_id, error = %e, "invalid preempt-cancel final transition in WAL apply");
                         return ClientResponse::default();
                     }
+                    job.preempted_by = *preempted_by;
+                    job.preempt_mode = Some("Cancel".to_string());
+                    job.preempt_qos = preempt_qos.clone();
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -5123,10 +5281,22 @@ impl ClusterManager {
                     ..Default::default()
                 };
             }
-            WalOperation::JobSuspend { job_id, at } => {
+            WalOperation::JobSuspend {
+                job_id,
+                at,
+                preempted_by,
+                preempt_qos,
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     match job.apply_transition(JobState::Suspended) {
-                        Ok(TransitionOutcome::Applied) => job.suspended_at = Some(*at),
+                        Ok(TransitionOutcome::Applied) => {
+                            job.suspended_at = Some(*at);
+                            if preempted_by.is_some() {
+                                job.preempted_by = *preempted_by;
+                                job.preempt_mode = Some("Suspend".to_string());
+                                job.preempt_qos = preempt_qos.clone();
+                            }
+                        }
                         Ok(TransitionOutcome::NoOp) => {}
                         Err(e) => {
                             warn!(job_id = *job_id, error = %e, "invalid suspend transition in WAL apply")
@@ -5141,6 +5311,12 @@ impl ClusterManager {
                             if let Some(since) = job.suspended_at.take() {
                                 job.suspended_secs += (*at - since).num_seconds().max(0);
                             }
+                            // Resuming clears preemption provenance: the job is
+                            // running again and a subsequent normal completion
+                            // must not report it as preempted in accounting.
+                            job.preempted_by = None;
+                            job.preempt_mode = None;
+                            job.preempt_qos = None;
                         }
                         Ok(TransitionOutcome::NoOp) => {}
                         Err(e) => {
@@ -5185,6 +5361,11 @@ impl ClusterManager {
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
                     job.launch_failure_detail = None;
+                    // A new run supersedes any prior preemption provenance; clear so
+                    // this run's accounting record does not inherit the previous one's.
+                    job.preempted_by = None;
+                    job.preempt_mode = None;
+                    job.preempt_qos = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -6921,16 +7102,48 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     }
 }
 
-/// Reject a client-supplied account that is not a real user→account association.
+/// Reject a client-supplied account that isn't a real association, or — with `require_association`
+/// set — no account at all. Fails closed on a cold cache when accounting is enabled (an unverified
+/// free label otherwise), so a not-yet-loaded cache can't wave a spoofed account through.
 fn validate_user_account(
     spec: &JobSpec,
     assoc_cache: &AssociationCache,
+    accounting: &spur_core::config::AccountingConfig,
 ) -> Result<(), SubmitError> {
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
+        if accounting.require_association {
+            let hint = if assoc_cache.is_loaded() {
+                ""
+            } else {
+                QOS_ACCOUNTING_HINT
+            };
+            return Err(SubmitError::invalid(format!(
+                "no account resolved for user '{}' (no --account given and no default account on file){hint}. \
+                 Specify --account explicitly, or contact your cluster admin to set a default: \
+                 sacctmgr modify user name={} set defaultaccount=<account>",
+                spec.user, spec.user
+            )));
+        }
         return Ok(());
     };
     match assoc_cache.account_membership(&spec.user, account) {
-        AccountMembership::CacheUnavailable | AccountMembership::Member => Ok(()),
+        AccountMembership::Member => Ok(()),
+        AccountMembership::CacheUnavailable if !accounting.enabled() => Ok(()),
+        AccountMembership::CacheUnavailable => {
+            // Operator-visible alarm: the fence is meant to hold but we cannot read associations.
+            warn!(
+                user = %spec.user,
+                account,
+                "association cache not loaded while accounting is enabled — denying account-scoped \
+                 submission (fail closed). Check the accounting database is reachable."
+            );
+            Err(SubmitError::invalid(format!(
+                "account associations are temporarily unavailable (accounting cache not loaded); \
+                 cannot verify user '{}' is associated with account '{account}'. Try again once \
+                 the accounting database is reachable.",
+                spec.user
+            )))
+        }
         AccountMembership::NotMember(valid_accounts) if valid_accounts.is_empty() => {
             Err(SubmitError::invalid(format!(
                 "user '{}' has no account associations. Contact your cluster admin to run: sacctmgr add user name={} account=<account>",
@@ -8487,7 +8700,12 @@ mod tests {
             JobState::Running,
         ));
         let t0 = chrono::Utc::now();
-        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: t0,
+            preempted_by: None,
+            preempt_qos: None,
+        });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Suspended);
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
@@ -8652,14 +8870,24 @@ mod tests {
         ));
         let t0 = chrono::Utc::now();
         // Cycle 1: 10s suspended.
-        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: t0,
+            preempted_by: None,
+            preempt_qos: None,
+        });
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
             at: t0 + chrono::Duration::seconds(10),
         });
         // Cycle 2: 15s suspended.
         let t1 = t0 + chrono::Duration::seconds(40);
-        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t1 });
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: t1,
+            preempted_by: None,
+            preempt_qos: None,
+        });
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
             at: t1 + chrono::Duration::seconds(15),
@@ -8692,6 +8920,8 @@ mod tests {
         cm.apply_operation(&WalOperation::JobSuspend {
             job_id: 1,
             at: since,
+            preempted_by: None,
+            preempt_qos: None,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -10063,7 +10293,9 @@ mod tests {
         let job_id = run_job_on(&cm, "requeue-me", "worker1");
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
-        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         assert_eq!(
             outcome.killed.len(),
             1,
@@ -10104,7 +10336,9 @@ mod tests {
         cm.suspend_job(job_id, "testuser").unwrap();
         settle(&cm, job_id, JobState::Suspended);
 
-        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         assert_eq!(outcome.killed.len(), 1);
         settle(&cm, job_id, JobState::Pending);
 
@@ -10125,7 +10359,9 @@ mod tests {
         settle(&cm, job_id, JobState::Completed);
 
         // An already-terminal job has no live processes to kill.
-        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         assert!(
             outcome.killed.is_empty(),
             "terminal job needs no agent kill"
@@ -10158,7 +10394,8 @@ mod tests {
             cm.complete_job(job_id, -1, state).unwrap();
             settle(&cm, job_id, state);
 
-            cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+            cm.requeue_job_by_user(job_id, "testuser", false, false)
+                .unwrap();
             settle(&cm, job_id, JobState::Pending);
             assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
         }
@@ -10184,7 +10421,7 @@ mod tests {
 
         // Requeuing already-terminal A must not free its slice a second time, or
         // B's accounting on the shared node would be corrupted.
-        cm.requeue_job_by_user(a, "testuser", false).unwrap();
+        cm.requeue_job_by_user(a, "testuser", false, false).unwrap();
         settle(&cm, a, JobState::Pending);
         assert_eq!(
             cm.node_metrics().alloc_cpus,
@@ -10231,7 +10468,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "requeue-hold", "worker1");
-        cm.requeue_job_by_user(job_id, "testuser", true).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, true)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -10264,7 +10502,7 @@ mod tests {
             apply(&mut spec);
             let job_id = submit_and_wait(&cm, spec);
             let err = cm
-                .requeue_job_by_user(job_id, "testuser", false)
+                .requeue_job_by_user(job_id, "testuser", false, false)
                 .expect_err("interactive jobs cannot be requeued");
             assert!(err.to_string().contains("interactive"), "{name}: {err}");
         }
@@ -10277,7 +10515,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-release", "worker1");
-        cm.requeue_job_by_user(job_id, "testuser", true).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, true)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert!(cm
             .get_job(job_id)
@@ -10318,7 +10557,8 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert_eq!(
             cm.get_job(job_id).unwrap().spec.begin_time,
@@ -10337,7 +10577,8 @@ mod tests {
         let job_id = run_job_on(&cm, "epoch", "worker1");
         assert_eq!(cm.get_job(job_id).unwrap().run_attempt, 1);
 
-        cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         // Re-dispatch bumps the epoch to 2 (requeue must not have reset it).
@@ -10366,7 +10607,7 @@ mod tests {
         let job_id = submit_and_wait(&cm, basic_spec("pending"));
 
         let err = cm
-            .requeue_job_by_user(job_id, "testuser", false)
+            .requeue_job_by_user(job_id, "testuser", false, false)
             .expect_err("a pending job cannot be requeued");
         assert!(err.to_string().contains("already pending"), "got: {err}");
     }
@@ -10379,14 +10620,14 @@ mod tests {
         let job_id = run_job_on(&cm, "owned-by-testuser", "worker1");
 
         let err = cm
-            .requeue_job_by_user(job_id, "bob", false)
-            .expect_err("a non-owner non-root user must be denied");
+            .requeue_job_by_user(job_id, "bob", false, false)
+            .expect_err("a non-owner non-admin must be denied");
         assert!(
             err.downcast_ref::<spur_core::auth::AuthError>().is_some(),
             "got: {err}"
         );
-        // root may requeue any job.
-        cm.requeue_job_by_user(job_id, "root", false).unwrap();
+        // an admin may requeue any job.
+        cm.requeue_job_by_user(job_id, "root", true, false).unwrap();
         settle(&cm, job_id, JobState::Pending);
     }
 
@@ -10429,7 +10670,9 @@ mod tests {
         }
 
         // Requeuing the bare array-parent id fans out to every task.
-        let outcome = cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(parent, "testuser", false, false)
+            .unwrap();
         assert_eq!(outcome.requeued, task_ids.len() as u32);
         assert!(outcome.skipped.is_empty());
         for &id in &task_ids {
@@ -10457,7 +10700,7 @@ mod tests {
         });
 
         let err = cm
-            .requeue_job_by_user(parent, "testuser", false)
+            .requeue_job_by_user(parent, "testuser", false, false)
             .expect_err("all-pending array requeue must error");
         assert!(err.to_string().contains("no tasks of array"), "got: {err}");
     }
@@ -10477,7 +10720,7 @@ mod tests {
         settle(&cm, job_id, JobState::Completing);
 
         let err = cm
-            .requeue_job_by_user(job_id, "testuser", false)
+            .requeue_job_by_user(job_id, "testuser", false, false)
             .expect_err("a completing job cannot be requeued");
         assert!(err.to_string().contains("completing"), "got: {err}");
     }
@@ -10518,7 +10761,9 @@ mod tests {
         .unwrap();
         settle(&cm, task_ids[0], JobState::Running);
 
-        let outcome = cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(parent, "testuser", false, false)
+            .unwrap();
         assert_eq!(outcome.requeued, 1, "only the running task is requeued");
         assert_eq!(
             outcome.skipped.len(),
@@ -10582,7 +10827,8 @@ mod tests {
                 .unwrap();
                 settle(&cm, job_id, JobState::Running);
             }
-            cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+            cm.requeue_job_by_user(job_id, "testuser", false, false)
+                .unwrap();
             settle(&cm, job_id, JobState::Pending);
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.user_requeue_count, n + 1);
@@ -10606,7 +10852,9 @@ mod tests {
         let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
-        let outcome = cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        let outcome = cm
+            .preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Pending);
 
@@ -10616,14 +10864,22 @@ mod tests {
         assert_eq!(cm.node_metrics().alloc_cpus, 0, "nodes must be freed");
 
         // The requeue must carry a future begin_time hold so the scheduler
-        // cannot re-dispatch the job into its own in-flight preemption cancel,
-        // and it must display BeginTime (Slurm parity).
+        // cannot re-dispatch the job into its own in-flight preemption cancel.
         let begin = job
             .spec
             .begin_time
             .expect("requeue must set a begin_time hold");
         assert!(begin > Utc::now(), "begin_time hold must be in the future");
-        assert_eq!(job.pending_reason, PendingReason::BeginTime);
+        assert_eq!(job.pending_reason, PendingReason::Preempted);
+        assert!(
+            job.pending_reason_desc
+                .as_deref()
+                .unwrap_or("")
+                .contains("preempted by job 99"),
+            "pending_reason_desc must name the preempting job"
+        );
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
 
         // While the hold is active the job is excluded from scheduling.
         assert!(
@@ -10654,7 +10910,8 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         assert_eq!(
@@ -10673,18 +10930,19 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-reason", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
-            PendingReason::BeginTime
+            PendingReason::Preempted
         );
 
         cm.tag_blocked_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
-            PendingReason::BeginTime,
-            "tag_blocked_pending_reasons must not clobber an active BeginTime hold"
+            PendingReason::Preempted,
+            "tag_blocked_pending_reasons must not clobber an active Preempted hold"
         );
     }
 
@@ -10697,7 +10955,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-expiry", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         // Simulate the hold having elapsed by moving begin_time into the past,
@@ -11159,7 +11418,9 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
-        let outcome = cm.preempt_job(job_id, PreemptMode::Cancel).unwrap();
+        let outcome = cm
+            .preempt_job(job_id, PreemptMode::Cancel, 99, None)
+            .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Cancelled);
 
@@ -11199,7 +11460,12 @@ mod tests {
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
-        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel { job_id: 1 });
+        // Apply with explicit provenance to verify field propagation.
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            job_id: 1,
+            preempted_by: Some(42),
+            preempt_qos: Some("highprio".into()),
+        });
 
         assert_eq!(resp.jobs_finalized.len(), 1);
         // Accounting sees Preempted; live state is Cancelled (terminal).
@@ -11208,12 +11474,19 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(job.exit_code, Some(-1));
+        assert_eq!(job.preempted_by, Some(42));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert_eq!(job.preempt_qos.as_deref(), Some("highprio"));
         // allocated_nodes preserved (epilog reads NodeList after finalize).
         assert!(!job.allocated_nodes.is_empty());
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
 
         // Replay: job is already Cancelled (not Running) → NoOp.
-        let replay = cm.apply_operation(&WalOperation::JobPreemptCancel { job_id: 1 });
+        let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            job_id: 1,
+            preempted_by: Some(42),
+            preempt_qos: Some("highprio".into()),
+        });
         assert!(
             replay.jobs_finalized.is_empty(),
             "replayed preempt-cancel must not re-finalize"
@@ -11396,12 +11669,20 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "preempt-suspend", "worker1");
-        let outcome = cm.preempt_job(job_id, PreemptMode::Suspend).unwrap();
+        let outcome = cm
+            .preempt_job(job_id, PreemptMode::Suspend, 42, Some("highprio".into()))
+            .unwrap();
         assert_eq!(outcome, PreemptOutcome::Suspended);
         settle(&cm, job_id, JobState::Suspended);
 
         // Suspend retains the allocation (the process is only SIGSTOP'd).
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
+
+        // Provenance is persisted via the WAL op and survives replication.
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.preempted_by, Some(42));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Suspend"));
+        assert_eq!(job.preempt_qos.as_deref(), Some("highprio"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11411,7 +11692,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "preempt-off", "worker1");
-        assert!(cm.preempt_job(job_id, PreemptMode::Off).is_err());
+        assert!(cm.preempt_job(job_id, PreemptMode::Off, 99, None).is_err());
         // Job keeps running; nothing was preempted.
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
     }
@@ -11422,7 +11703,9 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("still-pending"));
-        assert!(cm.preempt_job(job_id, PreemptMode::Requeue).is_err());
+        assert!(cm
+            .preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11551,9 +11834,13 @@ mod tests {
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
         let begin_time = Utc::now() + chrono::Duration::seconds(5);
+        // Apply without provenance fields — simulates a WAL entry written by an
+        // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             job_id: 1,
             begin_time,
+            preempted_by: None,
+            preempt_qos: None,
         });
         // One op finalizes the prior run as PREEMPTED (drives accounting) ...
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -11562,7 +11849,9 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.spec.begin_time, Some(begin_time));
-        assert_eq!(job.pending_reason, PendingReason::BeginTime);
+        assert_eq!(job.pending_reason, PendingReason::Preempted);
+        assert_eq!(job.preempted_by, None, "no preempted_by when field absent");
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
         assert_eq!(job.preempt_requeue_count, 1);
         assert_eq!(job.requeue_count, 0);
         assert!(job.allocated_nodes.is_empty());
@@ -11572,6 +11861,8 @@ mod tests {
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             job_id: 1,
             begin_time,
+            preempted_by: None,
+            preempt_qos: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -11588,6 +11879,56 @@ mod tests {
             "replayed preempt-requeue must not double-count"
         );
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_wal_apply_with_provenance_clears_on_restart() {
+        // After a preempt-requeue the provenance fields are set; when the job is
+        // re-dispatched (JobStart) they must be cleared so the new run's accounting
+        // row does not inherit the previous preemption's data.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "prov-clear", "worker1");
+        cm.preempt_job(job_id, PreemptMode::Requeue, 77, Some("burst".into()))
+            .unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let after_preempt = cm.get_job(job_id).unwrap();
+        assert_eq!(after_preempt.preempted_by, Some(77));
+        assert_eq!(after_preempt.preempt_mode.as_deref(), Some("Requeue"));
+
+        // Expire the hold and re-dispatch.
+        {
+            let mut jobs = cm.jobs.write();
+            if let Some(j) = jobs.get_mut(&job_id) {
+                j.spec.begin_time = Some(Utc::now() - chrono::Duration::seconds(1));
+            }
+        }
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let after_start = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            after_start.preempted_by, None,
+            "provenance must be cleared on re-dispatch"
+        );
+        assert_eq!(
+            after_start.preempt_mode, None,
+            "provenance must be cleared on re-dispatch"
+        );
+        assert_eq!(
+            after_start.preempt_qos, None,
+            "provenance must be cleared on re-dispatch"
+        );
     }
 
     /// Drive a job to RUNNING on `node` then finalize it as PREEMPTED via the
@@ -12820,6 +13161,92 @@ mod tests {
         );
     }
 
+    /// An `AccountingConfig` whose `enabled()` is `true`/`false` (accounting is enabled iff a
+    /// database URL is set), for the fail-closed-when-enabled account checks.
+    fn acct_cfg_enabled(enabled: bool) -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig {
+            database_url: if enabled {
+                "postgresql://test".into()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_user_account_fails_closed_on_cold_cache_when_accounting_enabled() {
+        // The inducible cache-cold window (fresh start / restart / DB unreachable at boot) must not
+        // wave an account-scoped submission through — that would clear every partition ACL at once.
+        let cache = AssociationCache::new(); // never loaded
+        let mut spec = basic_spec("cold");
+        spec.account = Some("tenant-b".into());
+        let err = validate_user_account(&spec, &cache, &acct_cfg_enabled(true)).unwrap_err();
+        assert!(
+            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("temporarily unavailable")),
+            "cold cache with accounting enabled must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_user_account_permits_cold_cache_when_accounting_disabled() {
+        // With accounting off there is no association database, so an account is an unverified free
+        // label and there is no fence to hold — stay permissive (matches prior behaviour).
+        let cache = AssociationCache::new();
+        let mut spec = basic_spec("cold-noacct");
+        spec.account = Some("tenant-b".into());
+        assert!(validate_user_account(&spec, &cache, &acct_cfg_enabled(false)).is_ok());
+    }
+
+    #[test]
+    fn validate_user_account_allows_real_member_on_loaded_cache() {
+        let cache = AssociationCache::new();
+        cache.insert_association("testuser", "research");
+        let mut spec = basic_spec("member");
+        spec.account = Some("research".into());
+        assert!(validate_user_account(&spec, &cache, &acct_cfg_enabled(true)).is_ok());
+    }
+
+    #[test]
+    fn validate_user_account_rejects_nonmember_on_loaded_cache() {
+        let cache = AssociationCache::new();
+        cache.insert_association("testuser", "research");
+        let mut spec = basic_spec("spoof");
+        spec.account = Some("tenant-b".into());
+        let err = validate_user_account(&spec, &cache, &acct_cfg_enabled(true)).unwrap_err();
+        assert!(
+            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("not associated with account 'tenant-b'")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_user_account_ignores_an_unset_account() {
+        // No account requested — nothing to verify — even accounting-enabled + cold cache is fine.
+        let cache = AssociationCache::new();
+        let spec = basic_spec("noacct");
+        assert!(validate_user_account(&spec, &cache, &acct_cfg_enabled(true)).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_fails_closed_on_cold_cache_when_accounting_enabled() {
+        // End-to-end: accounting configured (a DB URL is set) but the cache has not loaded — an
+        // account-scoped submit is denied rather than admitted across the cold-cache window.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.accounting.database_url = "postgres://unused-in-test".into();
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        // Deliberately do NOT load the association cache (mirrors a controller that never completed
+        // its first fetch).
+        let mut spec = basic_spec("coldsubmit");
+        spec.account = Some("tenant-b".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("temporarily unavailable")),
+            "cold cache must fail closed end-to-end, got {err:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_still_rejects_nonexistent_partition() {
         // Unknown partition must still be rejected at submit, not held pending.
@@ -13562,7 +13989,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let parent_id = run_job_on(&cm, "parent", "worker1");
-        cm.preempt_job(parent_id, PreemptMode::Cancel).unwrap();
+        cm.preempt_job(parent_id, PreemptMode::Cancel, 99, None)
+            .unwrap();
         settle(&cm, parent_id, JobState::Cancelled);
 
         // afterok: parent exited non-zero (preempted) → unsatisfiable; watcher cancels it.
@@ -14289,7 +14717,8 @@ mod tests {
 
         let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
         for _ in 0..(max + 3) {
-            cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+            cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+                .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
                 let mut jobs = cm.jobs.write();
@@ -14306,7 +14735,8 @@ mod tests {
             .unwrap();
             settle(&cm, job_id, JobState::Running);
         }
-        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -14348,7 +14778,8 @@ mod tests {
             )
             .unwrap();
             settle(&cm, job_id, JobState::Running);
-            cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+            cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+                .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
                 let mut jobs = cm.jobs.write();
@@ -18869,6 +19300,118 @@ mod tests {
 
         super::apply_default_account(&mut spec, &assoc);
         assert_eq!(spec.account.as_deref(), Some("faculty"));
+    }
+
+    // --- validate_user_account / require_association tests ---
+
+    fn acct_cfg_with_require_association(
+        require_association: bool,
+    ) -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig {
+            require_association,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_user_account_allows_no_account_when_require_association_off() {
+        let assoc = AssociationCache::new();
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+
+        super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(false))
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_user_account_rejects_no_account_when_require_association_on() {
+        let assoc = AssociationCache::new();
+        assoc.insert_association("someone-else", "research"); // loads the cache
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no account resolved for user 'testuser'"));
+    }
+
+    #[test]
+    fn validate_user_account_rejects_no_account_even_when_user_has_associations_but_no_default() {
+        // A real reachable state: an association exists but none is flagged default.
+        let assoc = AssociationCache::new();
+        assoc.insert_association("testuser", "research");
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no account resolved for user 'testuser'"));
+        assert!(!msg.contains("has no account associations"));
+    }
+
+    #[test]
+    fn validate_user_account_allows_resolved_default_account_when_require_association_on() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_account("testuser", "research");
+        assoc.insert_association("testuser", "research");
+        let mut spec = basic_spec("j");
+        super::apply_default_account(&mut spec, &assoc);
+        assert_eq!(spec.account.as_deref(), Some("research"));
+
+        super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_user_account_rejects_no_account_even_when_cache_unloaded() {
+        // Unconditional like `require_qos`'s final check, but hints at the cold cache.
+        let assoc = AssociationCache::new();
+        let spec = basic_spec("j");
+        assert!(!assoc.is_loaded());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no account resolved for user 'testuser'"));
+        assert!(msg.contains("accounting may not be enabled"));
+    }
+
+    #[test]
+    fn validate_user_account_still_rejects_bad_explicit_account_when_require_association_on() {
+        let assoc = AssociationCache::new();
+        assoc.insert_association("testuser", "research");
+        let mut spec = basic_spec("j");
+        spec.account = Some("other".into());
+
+        let err =
+            super::validate_user_account(&spec, &assoc, &acct_cfg_with_require_association(true))
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("is not associated with account 'other'"));
+    }
+
+    #[test]
+    fn validate_user_account_fails_closed_on_cold_cache_with_explicit_account_and_require_association(
+    ) {
+        // require_association=true doesn't bypass the cold-cache fence for an explicit account.
+        let assoc = AssociationCache::new(); // never loaded
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        let cfg = spur_core::config::AccountingConfig {
+            database_url: "postgresql://test".into(),
+            require_association: true,
+            ..Default::default()
+        };
+
+        let err = super::validate_user_account(&spec, &assoc, &cfg).unwrap_err();
+        assert!(err.to_string().contains("temporarily unavailable"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use tracing::error;
 use spur_core::job::{JobId, JobState};
 
 use super::db::JobStartRecord;
+use super::txn::{TxnOutcome, TxnRecord};
 
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
@@ -76,6 +77,7 @@ impl AccountingNotifier {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_job_end(
         &self,
         job_id: JobId,
@@ -84,6 +86,9 @@ impl AccountingNotifier {
         end_time: DateTime<Utc>,
         exit_signal: i32,
         derived_exit_code: i32,
+        preempted_by: Option<JobId>,
+        preempt_mode: Option<String>,
+        preempt_qos: Option<String>,
     ) {
         let pool = self.pool.clone();
         let state_str = state.display().to_owned();
@@ -98,11 +103,43 @@ impl AccountingNotifier {
                     end_time,
                     exit_signal,
                     derived_exit_code,
+                    preempted_by.map(|id| id as i32),
+                    preempt_mode.as_deref().unwrap_or(""),
+                    preempt_qos.as_deref().unwrap_or(""),
                 )
                 .await
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job end in accounting after retries");
+            }
+        });
+    }
+
+    /// Best-effort async write of an audit record. Only committed (`Success`)
+    /// rows retry; `Denied`/`Error` rows use a single attempt so a flood of
+    /// (cheaply-triggered, possibly unauthenticated) failed attempts cannot pin
+    /// the connection pool against real accounting writes.
+    pub fn notify_txn(&self, record: TxnRecord) {
+        let pool = self.pool.clone();
+        let attempts = if record.outcome == TxnOutcome::Success {
+            RETRY_ATTEMPTS
+        } else {
+            1
+        };
+        tokio::spawn(async move {
+            let write = || async {
+                let mut conn = pool.acquire().await?;
+                super::db::record_txn(&mut conn, &record).await
+            };
+            if let Err(e) = retry_with_backoff(write, attempts, RETRY_BACKOFF).await {
+                error!(
+                    actor = %record.actor,
+                    action = record.action.as_str(),
+                    entity = %record.entity_name,
+                    attempts,
+                    error = %e,
+                    "failed to record txn in accounting"
+                );
             }
         });
     }

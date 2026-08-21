@@ -331,6 +331,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 spur_proto::proto::UpdateJobRequest {
                     job_id,
                     hold: Some(true),
+                    user: crate::interactive::current_user()?,
                     ..Default::default()
                 },
             )
@@ -342,6 +343,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 spur_proto::proto::UpdateJobRequest {
                     job_id,
                     hold: Some(false),
+                    user: crate::interactive::current_user()?,
                     ..Default::default()
                 },
             )
@@ -619,6 +621,26 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     format_exit(job.derived_exit_code, 0),
                     job.priority
                 );
+                if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
+                    println!(
+                        "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
+                        if job.preempted_by == 0 {
+                            "N/A".to_string()
+                        } else {
+                            job.preempted_by.to_string()
+                        },
+                        if job.preempt_mode.is_empty() {
+                            "N/A"
+                        } else {
+                            &job.preempt_mode
+                        },
+                        if job.preempt_qos.is_empty() {
+                            "N/A"
+                        } else {
+                            &job.preempt_qos
+                        },
+                    );
+                }
                 println!();
             }
         }
@@ -1263,6 +1285,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
             account,
             comment,
             qos,
+            user: crate::interactive::current_user()?,
             ..Default::default()
         },
     )

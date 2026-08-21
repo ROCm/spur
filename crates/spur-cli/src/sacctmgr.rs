@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::format_engine;
+use crate::timearg::{datetime_to_proto, parse_time_arg};
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::*;
 
@@ -951,8 +952,29 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             println!("{:<5} {:<15} {:<10}", "1002", "billing", "");
             Ok(())
         }
+        "txn" | "transaction" | "transactions" => {
+            let fields = txn_format_fields(p.get("format").map(String::as_str))?;
+            let request = build_txn_request(&p);
+
+            let mut client = connect(addr).await?;
+            let txns = client
+                .get_transactions(request)
+                .await
+                .context("GetTransactions RPC failed")?
+                .into_inner()
+                .transactions;
+
+            format_engine::print_header(&fields);
+            for t in &txns {
+                println!(
+                    "{}",
+                    format_engine::format_row(&fields, &|spec| resolve_txn_field(t, spec))
+                );
+            }
+            Ok(())
+        }
         other => bail!(
-            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres",
+            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres, txn",
             other
         ),
     }
@@ -961,6 +983,128 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
     let names: Vec<&str> = filter.split(',').map(str::trim).collect();
     qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+}
+
+// Slurm's default `sacctmgr show transaction` columns: Time, Action, Actor,
+// Where, Info. Where renders entity_type:entity_name; Info renders details JSON.
+const TXN_DEFAULT_FORMAT: &str = "%-20t %-8a %-14A %-24w %-40i";
+const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-24w %-10o %-8u %-40i";
+
+fn txn_header(spec: char) -> &'static str {
+    match spec {
+        't' => "Time",
+        'a' => "Action",
+        'A' => "Actor",
+        'w' => "Where",
+        'i' => "Info",
+        'o' => "Outcome",
+        'v' => "Verified",
+        's' => "Source",
+        'd' => "ID",
+        'u' => "ActorUID",
+        _ => "?",
+    }
+}
+
+fn txn_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "time" | "timestamp" | "ts" => Some('t'),
+        "action" => Some('a'),
+        "actor" => Some('A'),
+        "where" | "entity" => Some('w'),
+        "info" | "details" => Some('i'),
+        "outcome" => Some('o'),
+        "verified" => Some('v'),
+        "source" => Some('s'),
+        "id" => Some('d'),
+        "actoruid" | "uid" => Some('u'),
+        _ => None,
+    }
+}
+
+fn txn_format_fields(
+    format_param: Option<&str>,
+) -> anyhow::Result<Vec<format_engine::FormatToken>> {
+    format_engine::resolve_format(
+        format_param,
+        TXN_DEFAULT_FORMAT,
+        TXN_ALL_FORMAT,
+        &txn_field_spec,
+        &txn_header,
+        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID",
+    )
+}
+
+/// Build a `GetTransactions` request from Slurm-style `key=value` filters
+/// (`Actor=`, `Action=`, `Entity=`, `Name=`, `Outcome=`, `Start=`, `End=`,
+/// `limit=`). `action`/`outcome` are lowercased to match the stored values.
+fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransactionsRequest {
+    GetTransactionsRequest {
+        actor: p.get("actor").cloned().unwrap_or_default(),
+        entity_type: p
+            .get("entity")
+            .or_else(|| p.get("entitytype"))
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        entity_name: p
+            .get("name")
+            .or_else(|| p.get("entityname"))
+            .cloned()
+            .unwrap_or_default(),
+        action: p
+            .get("action")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        outcome: p
+            .get("outcome")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        start_after: p
+            .get("start")
+            .and_then(|s| parse_time_arg(s))
+            .map(datetime_to_proto),
+        start_before: p
+            .get("end")
+            .and_then(|s| parse_time_arg(s))
+            .map(datetime_to_proto),
+        limit: p.get("limit").and_then(|s| s.parse().ok()).unwrap_or(0),
+    }
+}
+
+fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
+    match spec {
+        't' => t.timestamp.as_ref().map(fmt_txn_ts).unwrap_or_default(),
+        'a' => t.action.clone(),
+        'A' => t.actor.clone(),
+        'w' => format!("{}:{}", t.entity_type, t.entity_name),
+        'i' => t.details.clone(),
+        'o' => t.outcome.clone(),
+        'v' => if t.verified { "yes" } else { "no" }.to_string(),
+        's' => t.source.clone(),
+        'd' => t.id.to_string(),
+        // uid is recorded only for a verified identity; render blank otherwise so
+        // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
+        'u' => {
+            if t.verified {
+                t.actor_uid.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => "?".to_string(),
+    }
+}
+
+fn fmt_txn_ts(ts: &prost_types::Timestamp) -> String {
+    // Sanitize nanos (never displayed) so a negative/out-of-range value can't wrap
+    // via `as u32` and blank an otherwise-valid timestamp.
+    let nanos = u32::try_from(ts.nanos)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)
+        .unwrap_or(0);
+    chrono::DateTime::from_timestamp(ts.seconds, nanos)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_default()
 }
 
 const ACCOUNT_DEFAULT_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G";
@@ -1930,6 +2074,81 @@ mod tests {
 
         assert!(account.is_empty());
         assert_eq!(user, "testuser");
+    }
+
+    #[test]
+    fn build_txn_request_maps_filters_and_lowercases_action() {
+        let p = parse_params(&[
+            "actor=alice".into(),
+            "action=Delete".into(),
+            "entity=reservation".into(),
+            "name=maint".into(),
+            "outcome=Denied".into(),
+            "start=2024-01-01".into(),
+            "limit=50".into(),
+        ]);
+
+        let req = build_txn_request(&p);
+
+        assert_eq!(req.actor, "alice");
+        assert_eq!(req.action, "delete");
+        assert_eq!(req.entity_type, "reservation");
+        assert_eq!(req.entity_name, "maint");
+        assert_eq!(req.outcome, "denied");
+        assert_eq!(req.limit, 50);
+        assert!(req.start_after.is_some());
+        assert!(req.start_before.is_none());
+    }
+
+    #[test]
+    fn resolve_txn_field_renders_where_and_verified() {
+        let t = TransactionRecord {
+            id: 7,
+            timestamp: None,
+            actor: "bob".into(),
+            actor_uid: 1000,
+            verified: true,
+            source: "api".into(),
+            action: "create".into(),
+            entity_type: "reservation".into(),
+            entity_name: "daily".into(),
+            outcome: "success".into(),
+            details: "{}".into(),
+        };
+        assert_eq!(resolve_txn_field(&t, 'w'), "reservation:daily");
+        assert_eq!(resolve_txn_field(&t, 'v'), "yes");
+        assert_eq!(resolve_txn_field(&t, 'A'), "bob");
+        assert_eq!(resolve_txn_field(&t, 'd'), "7");
+        assert_eq!(resolve_txn_field(&t, 'u'), "1000");
+    }
+
+    #[test]
+    fn resolve_txn_field_blanks_uid_when_unverified() {
+        // Unverified rows carry an unknown uid (stored NULL, 0 on the wire); it
+        // must render blank so it can't be mistaken for root (uid 0).
+        let t = TransactionRecord {
+            actor: "vm".into(),
+            actor_uid: 0,
+            verified: false,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&t, 'u'), "");
+        assert_eq!(resolve_txn_field(&t, 'v'), "no");
+    }
+
+    #[test]
+    fn fmt_txn_ts_sanitizes_bad_nanos() {
+        let bad = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: -1,
+        };
+        let good = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        };
+        // A negative nanos must not wrap via `as u32` and blank the timestamp.
+        assert!(!fmt_txn_ts(&bad).is_empty());
+        assert_eq!(fmt_txn_ts(&bad), fmt_txn_ts(&good));
     }
 
     fn stub_account() -> AccountInfo {

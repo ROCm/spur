@@ -21,6 +21,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
+use crate::accounting::{txn, TxnAction, TxnEntity, TxnRecord, TxnSource};
 use crate::cluster::{ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
@@ -403,6 +404,88 @@ impl ControllerService {
         identity.is_some_and(|id| {
             id.is_admin || is_k0s_admin(self.cluster.association_cache(), &id.user)
         })
+    }
+
+    /// Fire a best-effort audit record and a structured log line for a reservation
+    /// admin action, so operators keep attribution even when the accounting DB is
+    /// down. Never alters the RPC result.
+    fn audit_reservation(
+        &self,
+        action: TxnAction,
+        entity_name: &str,
+        actor: &str,
+        identity: Option<&spur_core::auth::Identity>,
+        details_base: serde_json::Value,
+        result: &Result<(), Status>,
+    ) {
+        let record =
+            Self::build_reservation_txn(action, entity_name, actor, identity, details_base, result);
+        info!(
+            actor = %record.actor,
+            entity = %record.entity_name,
+            action = record.action.as_str(),
+            outcome = record.outcome.as_str(),
+            "reservation admin action"
+        );
+        self.cluster.record_txn(record);
+    }
+
+    /// Build the audit record from the resolved outcome and caller identity.
+    /// `verified` is true only for a verified JWT identity, and the actor uid is
+    /// taken from that identity — never the forgeable wire value.
+    fn build_reservation_txn(
+        action: TxnAction,
+        entity_name: &str,
+        actor: &str,
+        identity: Option<&spur_core::auth::Identity>,
+        details_base: serde_json::Value,
+        result: &Result<(), Status>,
+    ) -> TxnRecord {
+        TxnRecord {
+            ts: Utc::now(),
+            actor: actor.to_string(),
+            actor_uid: identity.map(|id| i64::from(id.uid)),
+            verified: identity.is_some(),
+            source: TxnSource::Api,
+            action,
+            entity_type: TxnEntity::Reservation,
+            entity_name: entity_name.to_string(),
+            outcome: txn::outcome_from_status(result),
+            details: txn::finalize_details(
+                details_base,
+                result.as_ref().err().map(|s| s.message()),
+            ),
+        }
+    }
+
+    /// Parse, validate, and submit a create-reservation request. Split out so the
+    /// handler audits the outcome uniformly, including `invalid_argument` parse
+    /// failures that occur before the cluster call.
+    fn build_and_create_reservation(&self, req: CreateReservationRequest) -> Result<(), Status> {
+        let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
+        {
+            Utc::now()
+        } else {
+            req.start_time
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
+        };
+        let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
+        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
+            .map_err(Status::invalid_argument)?;
+        let reservation = Reservation {
+            name: req.name,
+            start_time,
+            end_time,
+            nodes: req.nodes,
+            accounts: req.accounts,
+            users: req.users,
+            flags,
+            owner: req.user,
+        };
+        self.cluster
+            .create_reservation(reservation)
+            .map_err(reservation_rpc_status)
     }
 
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
@@ -873,8 +956,13 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "send keepalive for")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "send keepalive for",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Only interactive allocations are reaped, so only they need tracking.
         if !(job.spec.interactive || job.spec.srun_job) {
@@ -972,8 +1060,28 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let caller_is_privileged = self.caller_is_privileged(Self::verified_identity(&request));
+        let __identity = Self::verified_identity(&request).cloned();
+        let caller_is_privileged = self.caller_is_privileged(__identity.as_ref());
         let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
+
+        // Reject a caller who does not own the target job before any mutation —
+        // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
+        // update touches placement, account and time limit, so it must be gated the
+        // same way. `is_internal` is a verified admin only — derived from the
+        // verified identity, never the wire `user` string; an unauthenticated
+        // non-owner is still denied, ownership checked against the claimed user.
+        let job = self
+            .cluster
+            .get_job(req.job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "modify",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
@@ -1036,10 +1144,13 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let caller_is_admin = self.caller_is_admin(__identity.as_ref());
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let outcome = self
             .cluster
-            .requeue_job_by_user(req.job_id, &req.user, req.hold)
+            .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
             .map_err(cluster_err_to_precondition_status)?;
 
         // Kill the old processes for jobs that were Running/Suspended; the
@@ -1847,8 +1958,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "attach to")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "attach to",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -2176,40 +2292,31 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let __identity = Self::verified_identity(&request).cloned();
+        let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_user(&mut req.user, identity.as_ref());
 
-        let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
-        {
-            chrono::Utc::now()
-        } else {
-            req.start_time
-                .parse::<chrono::DateTime<chrono::Utc>>()
-                .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
-        };
+        let details = txn::create_details(
+            &req.start_time,
+            req.duration_minutes,
+            &req.nodes,
+            &req.accounts,
+            &req.users,
+            &req.flags,
+        );
+        let entity_name = req.name.clone();
+        let actor = req.user.clone();
 
-        let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
-
-        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
-            .map_err(Status::invalid_argument)?;
-
-        let reservation = spur_core::reservation::Reservation {
-            name: req.name,
-            start_time,
-            end_time,
-            nodes: req.nodes,
-            accounts: req.accounts,
-            users: req.users,
-            flags,
-            owner: req.user,
-        };
-
-        self.cluster
-            .create_reservation(reservation)
-            .map_err(reservation_rpc_status)?;
-
-        Ok(Response::new(()))
+        let result = self.build_and_create_reservation(req);
+        self.audit_reservation(
+            TxnAction::Create,
+            &entity_name,
+            &actor,
+            identity.as_ref(),
+            details,
+            &result,
+        );
+        result.map(|()| Response::new(()))
     }
 
     async fn update_reservation(
@@ -2230,10 +2337,24 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let __identity = Self::verified_identity(&request).cloned();
+        let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
-        self.cluster
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        let details = txn::update_details(
+            req.duration_minutes,
+            &req.add_nodes,
+            &req.remove_nodes,
+            &req.add_users,
+            &req.remove_users,
+            &req.add_accounts,
+            &req.remove_accounts,
+        );
+        let entity_name = req.name.clone();
+        let actor = req.user.clone();
+
+        let result = self
+            .cluster
             .update_reservation(
                 &req.name,
                 req.duration_minutes,
@@ -2245,8 +2366,16 @@ impl SlurmController for ControllerService {
                 &req.remove_accounts,
                 &req.user,
             )
-            .map_err(reservation_rpc_status)?;
-        Ok(Response::new(()))
+            .map_err(reservation_rpc_status);
+        self.audit_reservation(
+            TxnAction::Update,
+            &entity_name,
+            &actor,
+            identity.as_ref(),
+            details,
+            &result,
+        );
+        result.map(|()| Response::new(()))
     }
 
     async fn delete_reservation(
@@ -2267,13 +2396,26 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let __identity = Self::verified_identity(&request).cloned();
+        let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
-        self.cluster
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        let entity_name = req.name.clone();
+        let actor = req.user.clone();
+
+        let result = self
+            .cluster
             .delete_reservation(&req.name, &req.user)
-            .map_err(reservation_rpc_status)?;
-        Ok(Response::new(()))
+            .map_err(reservation_rpc_status);
+        self.audit_reservation(
+            TxnAction::Delete,
+            &entity_name,
+            &actor,
+            identity.as_ref(),
+            txn::delete_details(None),
+            &result,
+        );
+        result.map(|()| Response::new(()))
     }
 
     async fn list_reservations(
@@ -2340,8 +2482,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "exec into")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "exec into",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -2396,13 +2543,25 @@ impl SlurmController for ControllerService {
             return client.run_step(fwd).await;
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
             .cluster
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+
+        // A step executes arbitrary commands on the job's allocated nodes, so the
+        // caller must own the target job — same gate as create_job_step / exec_in_job.
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "run a step in",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.allocated_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(
@@ -3236,8 +3395,9 @@ pub async fn serve(
 
     let jwt_key = resolve_startup_jwt_key(&cluster.config());
     let auth_mode = cluster.config().auth.mode;
-    // Same key the node-admission path already uses; cloned because `jwt_key` moves into the service.
-    let jwt_key_for_auth = jwt_key.clone();
+    // Unlike node admission, an unset key here must reject every credential, never fall back
+    // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
+    let auth_verification_key = cluster.config().auth.jwt_key.clone().unwrap_or_default();
 
     let service = ControllerService {
         cluster,
@@ -3253,7 +3413,7 @@ pub async fn serve(
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
-    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &jwt_key_for_auth);
+    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &auth_verification_key);
 
     let mut builder = tonic::transport::Server::builder()
         .layer(stats_layer)
@@ -3663,6 +3823,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         srun_step_dispatch: job.srun_step_dispatch,
         req_gpus: spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32,
         req_gpus_detail: requested_gpus_detail(&job.spec),
+        preempted_by: job.preempted_by.unwrap_or(0),
+        preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
+        preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
     }
 }
 
@@ -5081,6 +5244,59 @@ mod tests {
         assert!(resp.skipped.is_empty());
     }
 
+    // An authenticated non-admin cannot requeue another user's job by setting user="root" on
+    // the wire. authoritative_user overwrites the field before the owner check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_rejects_spoofed_root_from_authenticated_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(RequeueJobRequest {
+            job_id,
+            user: "root".into(), // spoof admin on the wire
+            hold: false,
+        });
+        req.extensions_mut().insert(viewer("mallory", false));
+
+        let err = svc
+            .requeue_job(req)
+            .await
+            .expect_err("a spoofed root claim must not bypass the ownership check");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    // A verified admin (whose username is not literally "root") can requeue any job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_admin_override_uses_verified_identity_not_wire_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        // A verified admin (name != "root") may requeue another user's job.
+        let mut admin_req = Request::new(RequeueJobRequest {
+            job_id,
+            hold: false,
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        assert!(
+            svc.requeue_job(admin_req).await.is_ok(),
+            "a verified admin (non-root) must be able to requeue any job"
+        );
+
+        // An unauthenticated caller cannot claim admin by putting user="root" on the wire.
+        let err = svc
+            .requeue_job(Request::new(RequeueJobRequest {
+                job_id,
+                user: "root".into(),
+                hold: false,
+            }))
+            .await
+            .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
     // A step must NOT be created when the target node is allocated but unregistered: address
     // resolution runs first and returns a retryable Unavailable, so the client's retries can't
     // each leak a step.
@@ -5493,6 +5709,140 @@ mod tests {
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .update_job(Request::new(UpdateJobRequest {
+                job_id,
+                comment: Some("owned".into()),
+                user: "rsikande".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-owner must not modify another user's job");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.comment,
+            None,
+            "a denied update must not mutate the job"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_allows_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.update_job(Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("reviewed".into()),
+            user: "ubuntu".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner must be allowed to modify their job");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.comment,
+            Some("reviewed".into())
+        );
+    }
+
+    /// The owner check must key off the *authenticated* identity, not the
+    /// wire-asserted `user`: a caller cannot spoof the owner's name to slip past
+    /// the gate. `authoritative_user` overwrites the field before the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_rejects_spoofed_owner_when_authenticated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("owned".into()),
+            user: "ubuntu".into(), // spoof the owner's name on the wire
+            ..Default::default()
+        });
+        req.extensions_mut().insert(spur_core::auth::Identity {
+            user: "rsikande".into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+        });
+
+        let err = svc
+            .update_job(req)
+            .await
+            .expect_err("a spoofed owner name must not bypass the ownership check");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.comment,
+            None,
+            "a denied update must not mutate the job"
+        );
+    }
+
+    // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
+    // (a) an admin whose username is not literally "root" is still treated as internal, and (b) an
+    // unauthenticated caller cannot bypass ownership by claiming user = "root".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_admin_override_uses_verified_identity_not_wire_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        // A verified admin whose name is not "root" may modify another user's job.
+        let mut admin_req = Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("by-admin".into()),
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        assert!(
+            svc.update_job(admin_req).await.is_ok(),
+            "a verified admin (non-root) must be able to modify any job"
+        );
+
+        // An unauthenticated caller cannot spoof admin by putting user = "root" on the wire.
+        let err = svc
+            .update_job(Request::new(UpdateJobRequest {
+                job_id,
+                comment: Some("spoof".into()),
+                user: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["id".into()],
+                step_id: 0,
+                user: "rsikande".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-owner must not run a step in another user's allocation");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
     async fn assign_ha_control_plane(svc: &ControllerService) {
         use spur_core::k0s::{K0sPhase, K0sRole};
         use spur_core::node::NodeSource;
@@ -5587,6 +5937,26 @@ mod tests {
             }))
             .await
             .expect_err("a non-admin caller must not bring the cluster up");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    // Real RPC path, not just the raw cache method: a named caller must not become admin just
+    // because the association cache hasn't loaded yet (fail closed on a cold cache).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_denied_for_non_root_caller_on_cold_cache_with_accounting_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.accounting.database_url = "postgresql://unused-in-test".into();
+        let svc = test_service_with(&dir, config).await;
+        assert!(!svc.cluster.association_cache().is_loaded());
+
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a cold association cache must not grant admin");
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
@@ -6720,6 +7090,50 @@ mod tests {
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "carol");
+    }
+
+    // --- build_reservation_txn (audit attribution) ---
+
+    #[test]
+    fn build_reservation_txn_records_verified_identity_and_large_uid() {
+        let id = spur_core::auth::Identity {
+            user: "alice".to_string(),
+            uid: 4_000_000_000, // > i32::MAX: must survive as i64, not wrap negative
+            gid: 0,
+            is_admin: false,
+        };
+        let rec = ControllerService::build_reservation_txn(
+            TxnAction::Create,
+            "resv1",
+            "alice",
+            Some(&id),
+            serde_json::json!({}),
+            &Ok(()),
+        );
+        assert!(rec.verified);
+        assert_eq!(rec.actor_uid, Some(4_000_000_000));
+        assert_eq!(rec.actor, "alice");
+        assert_eq!(rec.source, TxnSource::Api);
+        assert_eq!(rec.entity_type, TxnEntity::Reservation);
+        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Success);
+    }
+
+    #[test]
+    fn build_reservation_txn_anonymous_is_unverified_and_captures_error() {
+        let rec = ControllerService::build_reservation_txn(
+            TxnAction::Delete,
+            "resv1",
+            "bob",
+            None,
+            serde_json::json!({}),
+            &Err(Status::permission_denied(
+                "user 'bob' cannot delete reservation",
+            )),
+        );
+        assert!(!rec.verified);
+        assert_eq!(rec.actor_uid, None);
+        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Denied);
+        assert!(rec.details.contains("cannot delete"));
     }
 
     // --- bind_spec_to_identity ---

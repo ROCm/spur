@@ -8,7 +8,9 @@ Cargo
 config
 cron
 crontab
+cryptographically
 daemonize
+datetime
 dbd
 deprovision
 dev
@@ -196,6 +198,7 @@ runtimes
 RWO
 SHA
 SIGKILL
+SIGSTOP
 SPDX
 SpurJob
 SpurJobs
@@ -230,6 +233,7 @@ Spur's
 repo's
 submitter's
 QOS's
+QOSes
 linters
 reStructuredText
 rocm
@@ -260,3 +264,4 @@ konnectivity
 cryptokey
 VRRP
 reprovision
+reconciler

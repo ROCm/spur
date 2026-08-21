@@ -83,6 +83,7 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
    database_url = "postgresql://spur:spur@localhost/spur"
    default_qos = "normal"
    require_qos = false
+   require_association = false
    fairshare_refresh_secs = 300
    grp_wall_window_days = 14
 
@@ -103,6 +104,18 @@ disabled until ``database_url`` names a reachable PostgreSQL database.
 ``require_qos``
    Reject at submit any job that resolves to no QOS. Mirrors Slurm's
    ``AccountingStorageEnforce=qos``.
+
+   :Default: ``false``
+
+``require_association``
+   Reject at submit any job whose user resolves to no account — a submission
+   with no ``--account`` and no default account on file. This check is
+   unconditional, like ``require_qos``: it applies even before accounting has
+   finished loading, so enabling it without accounting fully configured
+   rejects every such submission. Mirrors Slurm's
+   ``AccountingStorageEnforce=associations``. A submission naming an account
+   the user is not associated with is rejected regardless of this setting,
+   once the association cache has loaded.
 
    :Default: ``false``
 
@@ -411,13 +424,31 @@ QOS keys
        leaves the job at the scheduler default (1000).
    * - ``preemptmode``
      - ``off``
-     - Preemption behavior when this QOS's jobs are the victim:
-       ``cancel`` (job's terminal state is ``CANCELLED``; ``PREEMPTED`` is
-       recorded in accounting), ``requeue`` (returned to pending),
-       ``suspend``, or ``off`` (not preemptable).
-       A job from a higher-``priority`` QOS can preempt a running job from a
-       lower-``priority`` QOS when its effective priority exceeds twice the
-       victim's.
+     - What happens to a job in this QOS when it gets kicked out by a
+       higher-priority job. This setting overrides whatever the partition says,
+       but only for *how* the job is removed — it does not control *whether*
+       preemption happens (that depends on the partition's ``preempt_mode``
+       and the priority gap).
+
+       ``cancel`` — the job is stopped and removed from the queue. Its final
+       state is ``CANCELLED`` (``PREEMPTED`` in accounting records).
+       ``requeue`` — the job is stopped and put back in the queue. It will
+       start again automatically once a slot is free.
+       ``suspend`` — the job is paused, keeping its node allocation. It
+       resumes automatically once the higher-priority job finishes.
+       ``off`` (default) — no change from what the partition says. Setting
+       ``preemptmode=off`` on a QOS is the same as leaving it unset. It does
+       **not** protect the job from being preempted.
+
+       **Example of the override:** a partition is set to ``cancel`` but a
+       specific QOS is set to ``preemptmode=requeue``. When a job in that QOS
+       is kicked out, it goes back to the queue instead of being cancelled.
+
+       **How to actually protect a QOS from preemption:** simply do not add it
+       to any other QOS's ``preempt`` allow-list. When
+       ``preempt_type = "qos_priority"`` is enabled (see :doc:`configuration`),
+       a QOS that nobody has permission to preempt will never lose its running
+       jobs, no matter how large the priority gap is.
    * - ``preempt``
      - ``""`` (no restriction)
      - Comma-separated list of QOS names that jobs in this QOS are allowed to
@@ -628,7 +659,9 @@ With this setup:
 - A ``priority`` job cannot preempt ``reserved`` jobs (``reserved`` is not in
   ``priority``'s allow-list).
 - A ``burst`` job never preempts anyone (empty allow-list).
-- ``reserved`` jobs are never preempted (``preemptmode=off`` is the default).
+- ``reserved`` jobs are never kicked out because no other QOS lists
+  ``reserved`` in its ``preempt`` field. That is what provides the protection
+  — not ``preemptmode=off``, which simply means "use the partition default".
 
 **Minimum exempt time**
 
@@ -652,6 +685,43 @@ order: QOS > partition > global.
 
    # Clear a per-partition override (revert to global):
    scontrol update PartitionName=gpu ClearPreemptExemptTime=yes
+
+**Burst QOS pattern — overflow capacity**
+
+A common design is to give users two pools: a *normal* pool with guaranteed
+capacity, and a *burst* pool they can use for extra work when the cluster has
+free nodes. Burst jobs run opportunistically and are kicked out as soon as a
+normal job needs the slot.
+
+The burst QOS is not a special feature — it is just a QOS with a very low
+priority (so normal jobs always outrank it) that normal-pool QOSes list in
+their ``preempt`` allow-list (so they are allowed to kick it out).
+
+.. code-block:: bash
+
+   # In spur.conf:
+   [scheduler]
+   preempt_type = "qos_priority"
+
+   # Burst pool: very low priority; requeue so burst jobs go back to the
+   # queue instead of being lost when kicked out.
+   sacctmgr add qos name=burst priority=-5000 preemptmode=requeue
+
+   # Normal pool: allowed to kick out burst jobs when it needs a slot.
+   sacctmgr add qos name=normal priority=0 preempt=burst
+
+With this setup:
+
+- Users submit overflow work with ``--qos=burst``. Those jobs run on any
+  free nodes.
+- When a ``normal`` job arrives and a ``burst`` job holds the only available
+  node, the ``burst`` job is sent back to the queue and the ``normal`` job
+  starts. The burst job will restart automatically once a node is free again.
+- ``burst`` jobs can never kick out ``normal`` jobs — ``burst`` has no
+  entries in its ``preempt`` allow-list.
+- A QOS that no other QOS lists in its ``preempt`` field (for example, a
+  ``reserved`` tier) will never have its jobs kicked out, regardless of how
+  large a priority gap exists.
 
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -699,6 +769,27 @@ Limits resolve in two layers:
 
 Associations are managed via ``add user`` and inspected via ``sacctmgr show
 user`` (see `Managing users`_).
+
+How a job's account is resolved
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+At submit, Spur resolves the job's account in this order, matching Slurm.
+This validation is skipped (fail-open) while the association cache has not
+yet loaded, e.g. at controller startup or while the accounting database is
+unreachable:
+
+1. **Explicit** ``--account`` on the job. Once the association cache has
+   loaded, it must name an account the user is associated with, or the job
+   is rejected — with ``user 'X' is not associated with account 'Y'`` if the
+   user has other associations, or ``user 'X' has no account associations``
+   if the user has none at all.
+2. Otherwise the **user's default account**, if the user has one on file.
+3. Otherwise, if ``accounting.require_association`` is ``true``, the job is
+   **rejected** (``no account resolved for user 'X'``) — even if the user
+   does have associations, just none flagged as their default. This step is
+   unconditional, unlike step 1: it applies even before the association
+   cache has loaded. If ``require_association`` is ``false`` (the default),
+   the job runs with no account.
 
 TRES
 ----
@@ -772,6 +863,80 @@ unrecognized state defaults to idle with a warning.
    or modify. To change a partition, edit ``[[partitions]]`` in ``spur.conf`` and
    reload the controller. See :doc:`/deployment/partitioning` and
    :doc:`configuration`.
+
+Auditing administrative actions
+-------------------------------
+
+Reservation admin commands (``scontrol create/update/delete-reservation``) are
+recorded in the accounting database's ``txn`` (transaction) log, capturing
+**who** ran the command, **when**, and the **outcome**. This closes a gap in
+stock Slurm, whose ``txn_table`` does not cover ``scontrol`` reservation
+operations and whose reservation records carry no actor. Recording is
+best-effort: a database outage never blocks the reservation operation itself.
+
+Each record captures:
+
+- **Time** — when the action was attempted.
+- **Actor** — the requesting user. Under ``auth.mode = required`` this is the
+  JWT-verified identity; under the default ``permissive`` mode an unauthenticated
+  caller's name is trusted on the wire (see ``Verified``).
+- **Verified** — ``yes`` only when a JWT identity was cryptographically verified;
+  ``no`` for permissive/disabled anonymous callers (asserted, trust-on-wire) and
+  for internal ``system`` actions such as the expired-reservation purge.
+- **Action** — ``create``, ``update``, or ``delete``.
+- **Where** — the target, rendered ``entity_type:entity_name`` (e.g.
+  ``reservation:daily``).
+- **Outcome** — ``success``, ``denied`` (permission/ownership rejected), or
+  ``error`` (validation or other failure). Unlike Slurm, which logs only
+  committed transactions, Spur also records denied and failed attempts.
+- **Info** — a JSON payload of the requested parameters (and the error message on
+  failure). These are the values as requested, before server-side normalization.
+- **Source** — ``api`` for external RPC/CLI callers, ``system`` for internal
+  maintenance.
+
+Viewing the log
+~~~~~~~~~~~~~~~~
+
+List records with ``sacctmgr show txn`` (aliases: ``transaction``,
+``transactions``), modeled on Slurm's ``sacctmgr show transaction``:
+
+.. code-block:: bash
+
+   sacctmgr show txn
+   sacctmgr show txn Actor=alice Action=delete
+   sacctmgr show txn Entity=reservation Name=daily Outcome=denied
+   sacctmgr show txn Start=2026-01-01 End=now-1hours
+   sacctmgr show txn format=Time,Actor,Action,Where,Outcome,Verified,Info
+
+Filters are ``Actor=``, ``Action=``, ``Entity=`` (entity type), ``Name=`` (entity
+name), ``Outcome=``, ``Start=``, ``End=``, and ``limit=``. ``Start``/``End``
+accept the same formats as ``sacct`` (``YYYY-MM-DD``, ISO datetime,
+``now-Ndays``/``now-Nhours``). ``limit=`` defaults to 1000 and is capped at
+10000 rows per query (larger requests are clamped). The default columns match
+Slurm (``Time,Action,Actor,Where,Info``); additional ``format=`` fields are
+``Outcome``, ``Verified``, ``Source``, ``ID``, and ``ActorUID``.
+
+.. note::
+
+   Reads are **not** access-gated — the same as ``sacct`` job history and the
+   rest of the accounting service. Confidentiality of the audit log therefore
+   requires ``auth.mode = required``; under the default ``permissive`` mode any
+   caller that can reach the controller can read it.
+
+Retention
+~~~~~~~~~
+
+The log grows without bound by default. Set ``accounting.txn_retention_days`` to
+have the controller (leader) periodically delete records older than the given
+number of days:
+
+.. code-block:: toml
+
+   [accounting]
+   txn_retention_days = 365
+
+Leaving it unset (the default) or ``0`` keeps records forever, matching Slurm's
+default purge-off behavior; a positive value enables the purge.
 
 Declarative management with Ansible
 -----------------------------------

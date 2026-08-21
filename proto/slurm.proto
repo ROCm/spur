@@ -244,6 +244,16 @@ message JobInfo {
   // "gpu:2/task".
   uint32 req_gpus = 55;
   string req_gpus_detail = 56;
+
+  // Preemption provenance. Set when this job was preempted.
+  // `preempted_by` is the job ID of the higher-priority job that caused the
+  // preemption (0 when not preempted or unknown). `preempt_mode` is one of
+  // "Requeue", "Cancel", or "Suspend". `preempt_qos` is the QOS name that
+  // authorized the preemption under QosPriority type; empty for plain
+  // priority-based preemption.
+  uint32 preempted_by = 57;
+  string preempt_mode = 58;
+  string preempt_qos = 59;
 }
 
 message NodeInfo {
@@ -467,6 +477,9 @@ service SlurmAccounting {
 
   // Fairshare
   rpc GetFairshareFactors(GetFairshareFactorsRequest) returns (GetFairshareFactorsResponse);
+
+  // Transaction / audit log (reservation admin actions today; entity-agnostic)
+  rpc GetTransactions(GetTransactionsRequest) returns (GetTransactionsResponse);
 }
 
 // ============================================================
@@ -543,6 +556,7 @@ message UpdateJobRequest {
   optional bool hold = 6;
   optional string comment = 7;
   optional string qos = 8;
+  string user = 9;   // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message RequeueJobRequest {
@@ -845,7 +859,7 @@ message NodeResourcesResponse {
 message ExecInJobRequest {
   uint32 job_id = 1;
   repeated string command = 2;  // Command to exec inside the container
-  string user = 3;              // Requesting user; must own the job (empty/root bypasses)
+  string user = 3;              // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message ExecInJobResponse {
@@ -868,6 +882,7 @@ message RunStepRequest {
   uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
   bool label = 8;      // Prefix output lines with [rank] (srun -l)
   string mpi = 9;      // Step MPI type; when empty, inherit job.spec.mpi
+  string user = 10;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message RunStepResponse {
@@ -1126,7 +1141,7 @@ message CancelStepRequest {
 message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
-  string user = 3;    // Requesting user; must own the job (empty/root bypasses)
+  string user = 3;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message StreamJobOutputChunk {
@@ -1151,7 +1166,7 @@ message InitSession {
   WindowSize winsize = 5;    // Initial terminal dimensions
   repeated string argv = 6;  // Command to run (empty = default shell)
   map<string, string> env = 7;
-  string user = 8;           // Requesting user; must own the job (empty/root bypasses)
+  string user = 8;           // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message InteractiveInput {
@@ -1205,6 +1220,37 @@ message GetJobHistoryRequest {
 
 message GetJobHistoryResponse {
   repeated JobInfo jobs = 1;
+}
+
+// Audit/transaction log query. All string filters are optional (empty = no
+// filter); time bounds are optional (unset = no time constraint).
+message GetTransactionsRequest {
+  string actor = 1;
+  string entity_type = 2;
+  string entity_name = 3;
+  string action = 4;
+  string outcome = 5;
+  google.protobuf.Timestamp start_after = 6;
+  google.protobuf.Timestamp start_before = 7;
+  uint32 limit = 8;
+}
+
+message TransactionRecord {
+  int64 id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string actor = 3;
+  uint32 actor_uid = 4;         // 0 when unknown (e.g. unauthenticated caller)
+  bool verified = 5;            // true only when a JWT identity was verified
+  string source = 6;            // "api" | "system"
+  string action = 7;            // "create" | "update" | "delete"
+  string entity_type = 8;       // "reservation"
+  string entity_name = 9;
+  string outcome = 10;          // "success" | "denied" | "error"
+  string details = 11;          // JSON: requested parameters (+ error on failure)
+}
+
+message GetTransactionsResponse {
+  repeated TransactionRecord transactions = 1;
 }
 
 message GetUsageRequest {
@@ -1466,7 +1512,7 @@ message CreateJobStepRequest {
   bool pty = 6;               // Allocate a PTY for the step
   WindowSize winsize = 7;     // Initial terminal dimensions
   string node = 8;            // Target node (-w); empty = first allocated node
-  string user = 9;            // Requesting user; must own the job (empty/root bypasses)
+  string user = 9;            // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message CreateJobStepResponse {

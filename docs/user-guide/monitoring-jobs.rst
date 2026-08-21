@@ -170,8 +170,9 @@ SUSPENDED, COMPLETING**.
 For a pending job the ``NODELIST(REASON)`` column shows why it is waiting.
 Common reasons include ``Priority`` (waiting its turn), ``Resources`` (waiting
 for nodes to free up), ``Dependency`` (waiting on another job), ``Reservation``
-(waiting for a reservation window), and various QOS or association limit reasons
-(``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
+(waiting for a reservation window), ``Preempted`` (requeue-preempted and held
+until its eligibility window reopens), and various QOS or association limit
+reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
 
 View Nodes & Partitions — ``sinfo``
 -----------------------------------
@@ -265,7 +266,10 @@ Flags:
      - Latest time to include.
    * - ``--state``
      - ``-s``
-     - Filter by state (comma list).
+     - Filter by state (comma list). Accepted values (long or short code):
+       ``COMPLETED``/``CD``, ``FAILED``/``F``, ``CANCELLED``/``CA``,
+       ``TIMEOUT``/``TO``, ``NODE_FAIL``/``NF``, ``PREEMPTED``/``PR``,
+       ``DEADLINE``/``DL``, ``RUNNING``/``R``, ``PENDING``/``PD``.
    * - ``--format``
      - ``-o``
      - Comma-separated field names (see below).
@@ -286,8 +290,14 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``%`` letters. Available fields include ``JobID``, ``JobName``, ``User``,
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
-``NCPUS``, and ``QOS``. Set a per-field width with ``Field%N``, e.g.
-``JobName%20``.
+``NCPUS``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, and ``PreemptQOS``. Set a
+per-field width with ``Field%N``, e.g. ``JobName%20``.
+
+``PreemptedBy`` is the job ID of the higher-priority job that caused the
+preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
+``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS name that
+authorized the preemption under ``preempt_type = qos_priority``; ``N/A`` for
+plain priority-based preemption. All three appear in the long format (``-l``).
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.
@@ -299,6 +309,8 @@ Time arguments accept an absolute date (``YYYY-MM-DD`` or
 
    sacct -S 2026-07-01 -E 2026-07-25 -s FAILED --limit 500
    sacct --format=JobID,JobName,State,Elapsed,ExitCode
+   sacct -s PREEMPTED --format=JobID,JobName,State,ExitCode,PreemptedBy,PreemptMode,PreemptQOS
+   sacct -s PR,CA     # short codes also accepted
 
 Running-Job Stats — ``sstat``
 -----------------------------
@@ -332,6 +344,47 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
    scontrol show job 1024
    spur show node node01
    scontrol show partition gpu
+
+When a job has been preempted, ``scontrol show job`` includes three additional
+fields:
+
+* ``PreemptedBy=<job_id>`` — the ID of the higher-priority job that triggered
+  the preemption. Only shown when the job has been preempted.
+* ``PreemptMode=Requeue|Cancel|Suspend`` — how the preemption was carried out.
+* ``PreemptQOS=<name>`` — the QOS that authorized the preemption under
+  ``preempt_type = qos_priority``; ``N/A`` for plain priority-based preemption.
+
+**Quick reference — one command for any preempted job:**
+
+.. code-block:: bash
+
+   scontrol show job <id>
+
+This works regardless of preemption mode (requeue, cancel, or suspend) as long
+as the job is still known to the controller (running, pending, suspended, or
+recently terminal). For cancel-preempted jobs that have been evicted from
+memory, fall back to:
+
+.. code-block:: bash
+
+   sacct -j <id> --format=JobID,State,PreemptedBy,PreemptMode,PreemptQOS
+
+The accounting database keeps the record permanently. In practice
+``scontrol show job`` is the right first instinct; use ``sacct`` only if
+``scontrol`` returns ``Invalid job id``.
+
+.. note::
+
+   **Suspend-mode preemption and accounting.** When ``PreemptMode=Suspend``,
+   the job receives SIGSTOP and stays running — no accounting end-record
+   is written. The provenance fields (``PreemptedBy``, ``PreemptMode``,
+   ``PreemptQOS``) are visible in ``scontrol show job`` while the job is
+   suspended, but are cleared when the job resumes so that a subsequent normal
+   completion is not miscounted as a preemption. As a result, ``sacct`` has
+   no record of the preemption for suspend-mode jobs: the accounting row for
+   that run will show the final completion state only. Requeue and cancel modes
+   are unaffected — both write an accounting end-record (``PREEMPTED``) at the
+   time of preemption.
 
 Cluster Metrics — ``/metrics``
 ------------------------------

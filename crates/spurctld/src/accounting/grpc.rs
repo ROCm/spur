@@ -188,6 +188,9 @@ impl SlurmAccounting for AccountingService {
             end_time,
             req.exit_signal,
             req.derived_exit_code,
+            None,
+            "",
+            "",
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -202,12 +205,8 @@ impl SlurmAccounting for AccountingService {
         let pool = self.pool()?;
         let req = request.into_inner();
 
-        let start_after = req
-            .start_after
-            .map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default());
-        let start_before = req
-            .start_before
-            .map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default());
+        let start_after = timestamp_to_utc(req.start_after)?;
+        let start_before = timestamp_to_utc(req.start_before)?;
 
         let states: Vec<String> = req
             .states
@@ -217,6 +216,7 @@ impl SlurmAccounting for AccountingService {
                 4 => Some("FAILED".into()),
                 5 => Some("CANCELLED".into()),
                 6 => Some("TIMEOUT".into()),
+                8 => Some("PREEMPTED".into()),
                 10 => Some("DEADLINE".into()),
                 _ => None,
             })
@@ -259,6 +259,7 @@ impl SlurmAccounting for AccountingService {
                     "FAILED" => JobState::JobFailed as i32,
                     "CANCELLED" => JobState::JobCancelled as i32,
                     "TIMEOUT" => JobState::JobTimeout as i32,
+                    "PREEMPTED" => JobState::JobPreempted as i32,
                     "DEADLINE" => JobState::JobDeadline as i32,
                     "RUNNING" => JobState::JobRunning as i32,
                     "PENDING" => JobState::JobPending as i32,
@@ -298,6 +299,9 @@ impl SlurmAccounting for AccountingService {
                 srun_step_dispatch: false,
                 req_gpus: 0,
                 req_gpus_detail: String::new(),
+                preempted_by: r.preempted_by.unwrap_or(0) as u32,
+                preempt_mode: r.preempt_mode.clone(),
+                preempt_qos: r.preempt_qos.clone(),
             })
             .collect();
 
@@ -720,6 +724,69 @@ impl SlurmAccounting for AccountingService {
 
         Ok(Response::new(GetFairshareFactorsResponse { entries }))
     }
+
+    async fn get_transactions(
+        &self,
+        request: Request<GetTransactionsRequest>,
+    ) -> Result<Response<GetTransactionsResponse>, Status> {
+        // Ungated, consistent with get_job_history and the rest of this service.
+        // Confidentiality of the audit log requires auth.mode = required.
+        let pool = self.pool()?;
+        let req = request.into_inner();
+
+        let start_after = timestamp_to_utc(req.start_after)?;
+        let start_before = timestamp_to_utc(req.start_before)?;
+
+        let filter = db::TxnFilter {
+            actor: (!req.actor.is_empty()).then_some(req.actor.as_str()),
+            entity_type: (!req.entity_type.is_empty()).then_some(req.entity_type.as_str()),
+            entity_name: (!req.entity_name.is_empty()).then_some(req.entity_name.as_str()),
+            action: (!req.action.is_empty()).then_some(req.action.as_str()),
+            outcome: (!req.outcome.is_empty()).then_some(req.outcome.as_str()),
+            start_after,
+            start_before,
+            limit: req.limit,
+        };
+
+        let rows = db::get_transactions(pool, &filter)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let transactions = rows
+            .into_iter()
+            .map(|r| TransactionRecord {
+                id: r.id,
+                timestamp: Some(datetime_to_proto(r.ts)),
+                actor: r.actor,
+                actor_uid: r.actor_uid.and_then(|u| u32::try_from(u).ok()).unwrap_or(0),
+                verified: r.verified,
+                source: r.source,
+                action: r.action,
+                entity_type: r.entity_type,
+                entity_name: r.entity_name,
+                outcome: r.outcome,
+                details: r.details,
+            })
+            .collect();
+
+        Ok(Response::new(GetTransactionsResponse { transactions }))
+    }
+}
+
+/// Convert an optional proto timestamp to UTC, rejecting a present-but-invalid
+/// value with `invalid_argument` instead of silently coercing it to the epoch
+/// (which would widen a query window). Guards the nanos cast against negatives.
+fn timestamp_to_utc(ts: Option<prost_types::Timestamp>) -> Result<Option<DateTime<Utc>>, Status> {
+    let Some(t) = ts else { return Ok(None) };
+    let nanos = u32::try_from(t.nanos)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)
+        .ok_or_else(|| Status::invalid_argument(format!("invalid timestamp nanos: {}", t.nanos)))?;
+    DateTime::from_timestamp(t.seconds, nanos)
+        .map(Some)
+        .ok_or_else(|| {
+            Status::invalid_argument(format!("timestamp out of range (seconds={})", t.seconds))
+        })
 }
 
 fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
@@ -771,6 +838,7 @@ mod tests {
         assert_rpc_unavailable!(delete_qos, DeleteQosRequest);
         assert_rpc_unavailable!(list_qos, ListQosRequest);
         assert_rpc_unavailable!(get_fairshare_factors, GetFairshareFactorsRequest);
+        assert_rpc_unavailable!(get_transactions, GetTransactionsRequest);
     }
 
     #[tokio::test]
@@ -907,5 +975,42 @@ mod tests {
         let err = canonicalize_qos_flags("bogus").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("bogus"));
+    }
+
+    #[test]
+    fn timestamp_to_utc_passes_none_through() {
+        assert_eq!(timestamp_to_utc(None).unwrap(), None);
+    }
+
+    #[test]
+    fn timestamp_to_utc_accepts_valid() {
+        let ts = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 123,
+        };
+        let dt = timestamp_to_utc(Some(ts)).unwrap().unwrap();
+        assert_eq!(dt.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn timestamp_to_utc_rejects_negative_nanos_instead_of_coercing_to_epoch() {
+        let ts = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: -1,
+        };
+        let err = timestamp_to_utc(Some(ts)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn timestamp_to_utc_rejects_out_of_range_nanos() {
+        let ts = prost_types::Timestamp {
+            seconds: 0,
+            nanos: 1_000_000_000,
+        };
+        assert_eq!(
+            timestamp_to_utc(Some(ts)).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
     }
 }

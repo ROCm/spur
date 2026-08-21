@@ -221,11 +221,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_grp_tres_yields_uncapped_allocation() {
-        // An account with no allocation string -> empty TresRecord -> ResourceQuota with no caps.
+    fn empty_grp_tres_yields_closed_quota() {
+        // An account with no allocation string -> empty TresRecord -> a *closed* ResourceQuota
+        // (pods: 0), never an empty/uncapped one that would let it consume the cluster.
         let aq = build_account_quota(&account("open", ""), &[]).unwrap();
         assert_eq!(aq.grp_tres.get(TresType::Cpu), 0);
-        assert!(quota::quota_hard(&aq.grp_tres).is_empty());
+        assert_eq!(quota::quota_hard(&aq.grp_tres)["pods"].0, "0");
         assert!(aq.members.is_empty());
     }
 

@@ -158,6 +158,9 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
 
 -- users.default_account is the single source of truth for a user's default
 -- account (the scheduler reads it via the association cache). associations
@@ -178,6 +181,26 @@ WHERE default_account IS NOT NULL
   );
 CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
     ON users (name) WHERE default_account IS NOT NULL;
+
+-- Administrative action / audit log. Records who ran reservation admin commands
+-- (create/update/delete) and their outcome. Entity-agnostic so other admin ops
+-- can reuse it later. `details` is a JSON string (sqlx has no json feature).
+CREATE TABLE IF NOT EXISTS txn (
+    id           BIGSERIAL PRIMARY KEY,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor        TEXT NOT NULL DEFAULT '',
+    actor_uid    BIGINT,
+    verified     BOOLEAN NOT NULL DEFAULT FALSE,
+    source       TEXT NOT NULL DEFAULT 'api',
+    action       TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    entity_name  TEXT NOT NULL DEFAULT '',
+    outcome      TEXT NOT NULL DEFAULT 'success',
+    details      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_txn_ts ON txn(ts);
+CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
+CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
 "#;
 
 /// What accounting persists when a job starts. Named fields rather than positional
@@ -275,18 +298,25 @@ pub async fn record_job_end(
     end_time: DateTime<Utc>,
     exit_signal: i32,
     derived_exit_code: i32,
+    preempted_by: Option<i32>,
+    preempt_mode: &str,
+    preempt_qos: &str,
 ) -> anyhow::Result<()> {
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code)
-        VALUES ($1, '', $2, $3, $4, $5, $6)
+        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
+                          preempted_by, preempt_mode, preempt_qos)
+        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
             end_time = $4,
             exit_signal = $5,
-            derived_exit_code = $6
+            derived_exit_code = $6,
+            preempted_by = $7,
+            preempt_mode = $8,
+            preempt_qos = $9
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task
         "#,
     )
@@ -296,6 +326,9 @@ pub async fn record_job_end(
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
+    .bind(preempted_by)
+    .bind(preempt_mode)
+    .bind(preempt_qos)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -411,6 +444,9 @@ pub struct JobRecord {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub reservation: String,
+    pub preempted_by: Option<i32>,
+    pub preempt_mode: String,
+    pub preempt_qos: String,
 }
 
 /// Query job history.
@@ -426,7 +462,8 @@ pub async fn get_job_history(
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
-         submit_time, start_time, end_time, reservation \
+         submit_time, start_time, end_time, reservation, \
+         preempted_by, preempt_mode, preempt_qos \
          FROM jobs WHERE 1=1",
     );
 
@@ -451,9 +488,8 @@ pub async fn get_job_history(
         sep.push_unseparated(")");
     }
 
-    qb.push(" ORDER BY submit_time DESC");
-    let effective_limit: i64 = if limit > 0 { limit.into() } else { 1000 };
-    qb.push(" LIMIT ").push_bind(effective_limit);
+    qb.push(" ORDER BY submit_time DESC LIMIT ")
+        .push_bind(effective_query_limit(limit));
 
     let rows = qb.build().fetch_all(pool).await?;
 
@@ -476,10 +512,146 @@ pub async fn get_job_history(
             start_time: row.get("start_time"),
             end_time: row.get("end_time"),
             reservation: row.get("reservation"),
+            preempted_by: row.get("preempted_by"),
+            preempt_mode: row.get("preempt_mode"),
+            preempt_qos: row.get("preempt_qos"),
         })
         .collect();
 
     Ok(records)
+}
+
+/// A row from the `txn` audit log.
+pub struct TxnRow {
+    pub id: i64,
+    pub ts: DateTime<Utc>,
+    pub actor: String,
+    pub actor_uid: Option<i64>,
+    pub verified: bool,
+    pub source: String,
+    pub action: String,
+    pub entity_type: String,
+    pub entity_name: String,
+    pub outcome: String,
+    pub details: String,
+}
+
+/// Optional filters for `get_transactions`. Empty string filters are ignored.
+#[derive(Default)]
+pub struct TxnFilter<'a> {
+    pub actor: Option<&'a str>,
+    pub entity_type: Option<&'a str>,
+    pub entity_name: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub outcome: Option<&'a str>,
+    pub start_after: Option<DateTime<Utc>>,
+    pub start_before: Option<DateTime<Utc>>,
+    pub limit: u32,
+}
+
+/// Insert one audit record. Takes `&mut PgConnection` for the same reason as
+/// `record_job_start`: callers can acquire a standalone connection or borrow
+/// one from an open transaction.
+pub async fn record_txn(
+    conn: &mut PgConnection,
+    rec: &super::txn::TxnRecord,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO txn (ts, actor, actor_uid, verified, source, action, entity_type, entity_name, outcome, details)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#,
+    )
+    .bind(rec.ts)
+    .bind(&rec.actor)
+    .bind(rec.actor_uid)
+    .bind(rec.verified)
+    .bind(rec.source.as_str())
+    .bind(rec.action.as_str())
+    .bind(rec.entity_type.as_str())
+    .bind(&rec.entity_name)
+    .bind(rec.outcome.as_str())
+    .bind(&rec.details)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Default and hard cap on rows a single history/audit query returns, bounding
+/// DB load and response size; a larger request is clamped, not rejected.
+const DEFAULT_QUERY_LIMIT: u32 = 1_000;
+const MAX_QUERY_LIMIT: u32 = 10_000;
+
+fn effective_query_limit(requested: u32) -> i64 {
+    let n = if requested == 0 {
+        DEFAULT_QUERY_LIMIT
+    } else {
+        requested.min(MAX_QUERY_LIMIT)
+    };
+    i64::from(n)
+}
+
+/// Query the `txn` audit log, newest first.
+pub async fn get_transactions(
+    pool: &PgPool,
+    filter: &TxnFilter<'_>,
+) -> anyhow::Result<Vec<TxnRow>> {
+    let mut qb = QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT id, ts, actor, actor_uid, verified, source, action, entity_type, \
+         entity_name, outcome, details FROM txn WHERE 1=1",
+    );
+    if let Some(v) = filter.actor.filter(|s| !s.is_empty()) {
+        qb.push(" AND actor = ").push_bind(v);
+    }
+    if let Some(v) = filter.entity_type.filter(|s| !s.is_empty()) {
+        qb.push(" AND entity_type = ").push_bind(v);
+    }
+    if let Some(v) = filter.entity_name.filter(|s| !s.is_empty()) {
+        qb.push(" AND entity_name = ").push_bind(v);
+    }
+    if let Some(v) = filter.action.filter(|s| !s.is_empty()) {
+        qb.push(" AND action = ").push_bind(v);
+    }
+    if let Some(v) = filter.outcome.filter(|s| !s.is_empty()) {
+        qb.push(" AND outcome = ").push_bind(v);
+    }
+    if let Some(after) = filter.start_after {
+        qb.push(" AND ts >= ").push_bind(after);
+    }
+    if let Some(before) = filter.start_before {
+        qb.push(" AND ts <= ").push_bind(before);
+    }
+
+    qb.push(" ORDER BY ts DESC, id DESC LIMIT ")
+        .push_bind(effective_query_limit(filter.limit));
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let records = rows
+        .iter()
+        .map(|row| TxnRow {
+            id: row.get("id"),
+            ts: row.get("ts"),
+            actor: row.get("actor"),
+            actor_uid: row.get("actor_uid"),
+            verified: row.get("verified"),
+            source: row.get("source"),
+            action: row.get("action"),
+            entity_type: row.get("entity_type"),
+            entity_name: row.get("entity_name"),
+            outcome: row.get("outcome"),
+            details: row.get("details"),
+        })
+        .collect();
+    Ok(records)
+}
+
+/// Delete audit rows older than `older_than`, returning the number removed.
+pub async fn purge_txn(pool: &PgPool, older_than: DateTime<Utc>) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM txn WHERE ts < $1")
+        .bind(older_than)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 /// Get usage data for fair-share calculation.
@@ -1352,6 +1524,9 @@ mod job_history_tests {
             end_time,
             exit_signal,
             derived_exit_code,
+            None,
+            "",
+            "",
         )
         .await
     }
@@ -2958,6 +3133,176 @@ mod job_history_tests {
 
         sqlx::query("DELETE FROM accounts WHERE name = $1")
             .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod txn_tests {
+    use super::*;
+    use crate::accounting::txn::{TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource};
+    use chrono::Duration;
+
+    #[test]
+    fn effective_query_limit_defaults_and_caps() {
+        assert_eq!(effective_query_limit(0), i64::from(DEFAULT_QUERY_LIMIT));
+        assert_eq!(effective_query_limit(50), 50);
+        assert_eq!(
+            effective_query_limit(MAX_QUERY_LIMIT),
+            i64::from(MAX_QUERY_LIMIT)
+        );
+        assert_eq!(effective_query_limit(1_000_000), i64::from(MAX_QUERY_LIMIT));
+        assert_eq!(effective_query_limit(u32::MAX), i64::from(MAX_QUERY_LIMIT));
+    }
+
+    async fn test_pool() -> anyhow::Result<PgPool> {
+        let url = std::env::var("DATABASE_URL")?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
+        migrate(&pool).await?;
+        Ok(pool)
+    }
+
+    fn sample(
+        entity: &str,
+        action: TxnAction,
+        outcome: TxnOutcome,
+        ts: DateTime<Utc>,
+    ) -> TxnRecord {
+        TxnRecord {
+            ts,
+            actor: format!("actor_{}", std::process::id()),
+            actor_uid: Some(1000),
+            verified: true,
+            source: TxnSource::Api,
+            action,
+            entity_type: TxnEntity::Reservation,
+            entity_name: entity.to_string(),
+            outcome,
+            details: r#"{"k":"v"}"#.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn record_and_query_transactions() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let entity = format!("resv_txn_{}", std::process::id());
+        let actor = format!("actor_{}", std::process::id());
+
+        sqlx::query("DELETE FROM txn WHERE entity_name = $1")
+            .bind(&entity)
+            .execute(&pool)
+            .await?;
+
+        let now = Utc::now();
+        let mut conn = pool.acquire().await?;
+        record_txn(
+            &mut conn,
+            &sample(
+                &entity,
+                TxnAction::Create,
+                TxnOutcome::Success,
+                now - Duration::minutes(2),
+            ),
+        )
+        .await?;
+        record_txn(
+            &mut conn,
+            &sample(
+                &entity,
+                TxnAction::Delete,
+                TxnOutcome::Denied,
+                now - Duration::minutes(1),
+            ),
+        )
+        .await?;
+
+        // Filter by entity_name; expect newest-first ordering.
+        let rows = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].action, "delete");
+        assert_eq!(rows[0].outcome, "denied");
+        assert_eq!(rows[1].action, "create");
+        assert_eq!(rows[0].actor, actor);
+        assert_eq!(rows[0].actor_uid, Some(1000));
+        assert!(rows[0].verified);
+
+        let denied = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                outcome: Some("denied"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].action, "delete");
+
+        sqlx::query("DELETE FROM txn WHERE entity_name = $1")
+            .bind(&entity)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn purge_removes_old_rows() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let entity = format!("resv_purge_{}", std::process::id());
+
+        sqlx::query("DELETE FROM txn WHERE entity_name = $1")
+            .bind(&entity)
+            .execute(&pool)
+            .await?;
+
+        let now = Utc::now();
+        let mut conn = pool.acquire().await?;
+        record_txn(
+            &mut conn,
+            &sample(
+                &entity,
+                TxnAction::Create,
+                TxnOutcome::Success,
+                now - Duration::days(10),
+            ),
+        )
+        .await?;
+        record_txn(
+            &mut conn,
+            &sample(&entity, TxnAction::Update, TxnOutcome::Success, now),
+        )
+        .await?;
+
+        let removed = purge_txn(&pool, now - Duration::days(1)).await?;
+        assert!(removed >= 1);
+
+        let rows = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "update");
+
+        sqlx::query("DELETE FROM txn WHERE entity_name = $1")
+            .bind(&entity)
             .execute(&pool)
             .await?;
         Ok(())

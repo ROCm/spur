@@ -218,6 +218,15 @@ async fn main() -> anyhow::Result<()> {
                         std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
                     );
 
+                    if let Some(days) = config.accounting.txn_retention_days.filter(|d| *d > 0) {
+                        accounting::spawn_txn_purge_loop(
+                            pool.clone(),
+                            raft_handle.clone(),
+                            days,
+                            std::time::Duration::from_secs(3600),
+                        );
+                    }
+
                     cluster.fairshare_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.scheduler.fairshare_halflife_days,

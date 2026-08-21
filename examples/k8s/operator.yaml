@@ -37,7 +37,20 @@ spec:
             - --controller-addr=spurctld.spur.svc.cluster.local:6817
             - --listen=[::]:6818
             - --health-addr=[::]:8080
+            # Authenticate the virtual-agent surface (port 6818), which carries a cluster-wide
+            # pod-create privilege. "permissive" (default) verifies a credential when presented and
+            # otherwise logs+allows — the migration default. Move to "required" once the controller
+            # presents a credential, and set --jwt-key / SPUR_JWT_KEY (below) to the cluster
+            # [auth] jwt_key so credentials verify. required + no key refuses to start.
+            # - --auth-mode=required
           env:
+            # Cluster JWT signing key the operator verifies agent credentials against; must match the
+            # controllers' [auth] jwt_key. Source it from a Secret rather than inlining it.
+            # - name: SPUR_JWT_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: spur-auth
+            #       key: jwt_key
             - name: POD_IP
               valueFrom:
                 fieldRef:
