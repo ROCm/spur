@@ -127,6 +127,8 @@ The operator serves a virtual-agent gRPC surface on ``--listen`` (port 6818) tha
 cluster-wide pod-create privilege, so reaching it must not be enough to ask the operator to run
 work. Authentication mirrors the cluster ``[auth] mode``:
 
+- ``--auth-mode disabled`` does not authenticate callers at all; treat the port as an
+  administrative boundary if you use this.
 - ``--auth-mode permissive`` (default) verifies a credential when one is presented and otherwise
   logs and allows — the migration default.
 - ``--auth-mode required`` rejects every call that carries no credential. It refuses to start
@@ -137,6 +139,18 @@ work. Authentication mirrors the cluster ``[auth] mode``:
   controllers start sending one.
 
 See the commented ``--auth-mode`` / ``SPUR_JWT_KEY`` lines in ``examples/k8s/operator.yaml``.
+
+Enforcing account quotas
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--enable-quota`` turns on a reconciler that projects each SPUR account's ``GrpTRES`` allocation
+into a per-account ``ResourceQuota``/``LimitRange``. An account with no ``GrpTRES`` set gets a
+**closed** quota (``pods: 0``) rather than an uncapped one, so pods submitted under it are rejected
+until an allocation is granted:
+
+.. code-block:: bash
+
+   sacctmgr modify account name=myaccount set grptres=cpu=16,mem=32768,gres/gpu=8
 
 Verify
 ------

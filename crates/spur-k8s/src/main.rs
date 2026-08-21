@@ -56,9 +56,8 @@ struct Args {
     #[arg(long, default_value = "[::]:8080")]
     health_addr: String,
 
-    /// How strictly the virtual-agent gRPC surface authenticates callers: "disabled", "permissive"
-    /// (verify a credential when presented, else log and allow — the migration default), or
-    /// "required" (reject every uncredentialed call). Mirrors the cluster `[auth] mode`.
+    /// Agent-surface auth strictness: "disabled", "permissive" (default; verify if presented, else
+    /// allow), or "required" (reject uncredentialed calls). Mirrors the cluster `[auth] mode`.
     #[arg(long, default_value = "permissive")]
     auth_mode: String,
 

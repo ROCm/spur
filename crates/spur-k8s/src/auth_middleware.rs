@@ -1,18 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tower middleware that authenticates callers of the operator's virtual-agent gRPC surface.
-//!
-//! The operator's agent port is the registered agent address for every k8s-managed node and holds a
-//! cluster-wide pod-create privilege. Without this layer, anything that can reach the port can ask
-//! the operator to create a pod — stepping around the controller's authentication entirely. The
-//! layer verifies that a request carries a credential signed with the cluster's `[auth] jwt_key`,
-//! which the controller attaches to every agent call.
-//!
-//! This mirrors spurd's `AgentAuthLayer`; the shared ruling lives in
-//! `spur_core::auth::authenticate_bearer` so the operator, spurd, and spurctld cannot drift apart on
-//! a security decision. spurd's copy is in a binary crate and cannot be imported, hence the small
-//! duplication here.
+//! Authenticates callers of the operator's cluster-wide-pod-create agent surface via the shared
+//! `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`, duplicated since spurd is a binary crate).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -169,5 +159,45 @@ mod tests {
             decide(&cfg(AuthMode::Permissive, "cluster-key"), Some(&forged)),
             BearerOutcome::Reject(_)
         ));
+    }
+
+    // Exercises the real `Layer`/`Service` wiring (not just `decide()`), so a misplaced or
+    // no-op `.layer(...)` call in main.rs would fail this rather than only the unit tests above.
+    #[derive(Clone)]
+    struct StubInner;
+
+    impl Service<Request<()>> for StubInner {
+        type Response = Response<tonic::body::Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            std::future::ready(Ok(Response::new(tonic::body::Body::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn required_mode_rejects_an_uncredentialed_call_through_the_real_layer() {
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "k").layer(StubInner);
+        let resp = svc.call(Request::new(())).await.unwrap();
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    #[tokio::test]
+    async fn required_mode_forwards_a_valid_credential_through_the_real_layer() {
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key").layer(StubInner);
+        let req = Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", controller_token("cluster-key")),
+            )
+            .body(())
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        assert!(resp.headers().get("grpc-status").is_none());
     }
 }

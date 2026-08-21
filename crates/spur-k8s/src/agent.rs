@@ -33,14 +33,9 @@ struct ResolvedJob {
     assigned_nodes: Vec<String>,
 }
 
-/// Refuse a launch that pins a node the controller did not allocate to this job.
-///
-/// `target_node` becomes the pod's `spec.nodeName`, which bypasses the scheduler; honoring one
-/// outside the job's recorded allocation would let a caller place work on another tenant's node.
-/// The allocation is `status.assignedNodes`, projected from the controller. When it is not yet
-/// visible the pin cannot be checked, so it is allowed but logged — a legitimate launch can race
-/// the status projection; closing that residual window needs an authoritative controller lookup
-/// (deferred, see the advisory remediation).
+/// Refuses a `target_node` (which bypasses the scheduler) outside the job's allocation. Before the
+/// allocation is projected — the normal state for any not-yet-scheduled job, not a brief race — the
+/// pin is allowed but logged, unvalidated.
 fn validate_target_node(
     target_node: &str,
     assigned_nodes: &[String],
@@ -91,10 +86,8 @@ impl VirtualAgent {
                     .map_err(|_| Status::unavailable("k8s API timeout"))?
                     .map_err(|e| Status::internal(e.to_string()))?;
 
-                // Fail closed on ambiguity: a label is not unique in Kubernetes, so if more than one
-                // SpurJob carries this job-id, silently taking the first could launch pods into the
-                // wrong namespace. Zero is a not-yet-visible race (retried); two or more is a real
-                // conflict that must not be guessed.
+                // Fail closed on ambiguity: a non-unique label could match >1 SpurJob. Zero is a
+                // not-yet-visible race (retried); >1 is a real conflict, never guessed.
                 let mut items = list.items.into_iter();
                 match (items.next(), items.next()) {
                     (None, _) => Err(Status::not_found(format!(

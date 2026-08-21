@@ -1,13 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Projects a SPUR account's allocation into the native Kubernetes objects that ENFORCE it:
-//! a Namespace (tenancy, labeled for PodSecurity Admission so its pods can't run privileged or
-//! mount the host), a ResourceQuota (hard caps on requests AND limits from the account's `grp_tres`
-//! allocation — closed to zero pods when the account has no allocation), a LimitRange (default
-//! requests and limits so unset pods can't dodge the caps), and RBAC (a Role and a RoleBinding to
-//! the account's members). Pure — no I/O — so the whole mapping is unit-tested here; the quota
-//! controller applies what these return and drift-corrects.
+//! Projects a SPUR account's allocation into the Kubernetes objects that ENFORCE it: a PSA-labeled
+//! Namespace, a ResourceQuota/LimitRange, and RBAC. Pure — the quota controller applies these and drift-corrects.
 
 use std::collections::BTreeMap;
 
@@ -28,11 +23,8 @@ pub use spur_core::quota_names::{account_namespace, user_service_account};
 /// "SPUR-managed" contract (an admin hand-edit is reverted).
 pub const MANAGED_BY: &str = "spur-quota";
 
-/// PodSecurity Admission level enforced on every account namespace. `baseline` forbids the pod
-/// features that break the node-side tenancy boundary (privileged containers, host namespaces,
-/// hostPath mounts of the node filesystem). Without it a namespace admits `privileged: true` +
-/// `hostPath: /` pods that reach root on the node. `baseline` is the compatible floor; `restricted`
-/// is the stronger target but rejects many ordinary workloads, so it is left to operator opt-in.
+/// PodSecurity Admission level for account namespaces. `baseline` blocks privileged/host-namespace/
+/// hostPath pods; `restricted` is stronger but rejects ordinary workloads, so it's left to opt-in.
 const POD_SECURITY_LEVEL: &str = "baseline";
 
 /// Name of the (single) ResourceQuota / LimitRange / Role per account namespace.
@@ -47,8 +39,8 @@ const BINDING_NAME: &str = "spur-account-members";
 pub struct AccountQuota {
     /// SPUR account name (e.g. "physics").
     pub account: String,
-    /// The account's resource allocation. Only Cpu/Memory/Gpu map to a ResourceQuota; a 0/unset
-    /// dimension is left uncapped (a 0 cap would block every pod).
+    /// The account's resource allocation. Only Cpu/Memory/Gpu map to a ResourceQuota; an all-zero
+    /// allocation closes the namespace to zero pods instead of leaving it uncapped.
     pub grp_tres: TresRecord,
     /// Users associated with the account. Each becomes a RoleBinding subject via their per-namespace
     /// ServiceAccount (minted by `spur k8s kubeconfig --user`).
@@ -89,20 +81,8 @@ fn meta(name: &str, namespace: Option<&str>, account: &str) -> ObjectMeta {
     }
 }
 
-/// Map the account allocation to ResourceQuota `hard` entries. CPU (cores) and memory (MB) are
-/// capped on both `requests.*` and `limits.*`; GPUs go on `requests.amd.com/gpu` (an extended
-/// resource — limits must equal requests, so it is quota'd on requests only). A CPU/memory/GPU
-/// dimension left at 0 is omitted (uncapped in that dimension). Node/Energy/Billing have no
-/// pod-level quota analog.
-///
-/// `limits.*` is capped as well as `requests.*` so a pod cannot request a tiny amount (counting
-/// little against the quota) yet burst far past the account's allocation. Capping `limits.*` makes
-/// a container that names no limit fail admission, so [`limit_range`] supplies a default *limit*
-/// (alongside the default request) to fill one in.
-///
-/// An account with no cpu/memory/gpu allocation gets a *closed* quota (`pods: 0`), not an empty
-/// one: an empty `hard` map is an uncapped namespace, which would let an unallocated account
-/// consume the cluster. It fails closed — zero pods — until the account is given an allocation.
+/// Maps `grp_tres` to ResourceQuota `hard`: cpu/memory cap both `requests.*` and `limits.*` (GPU is
+/// requests-only); an all-zero allocation closes to `pods: 0` rather than an uncapped `hard` map.
 pub fn quota_hard(grp_tres: &TresRecord) -> BTreeMap<String, Quantity> {
     let mut hard = BTreeMap::new();
     let cpu = grp_tres.get(TresType::Cpu);
@@ -152,11 +132,8 @@ pub fn resource_quota(aq: &AccountQuota) -> ResourceQuota {
     }
 }
 
-/// A LimitRange giving every container a default *request* (so a pod that omits requests still
-/// counts against the ResourceQuota) and a default *limit* (so a pod that omits limits still admits
-/// under the `limits.*` cap that [`quota_hard`] now sets). The default limit equals the default
-/// request, so an unset-limit container is admitted as a small Guaranteed-QoS pod; a container that
-/// needs more declares its own limit, bounded by the account's ResourceQuota.
+/// Defaults every container's request AND limit (equal values, Guaranteed QoS) so an unset-limit
+/// container still admits under [`quota_hard`]'s `limits.*` cap instead of failing.
 pub fn limit_range(account: &str) -> LimitRange {
     let ns = account_namespace(account);
     let defaults = BTreeMap::from([
