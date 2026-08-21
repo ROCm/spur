@@ -1190,9 +1190,14 @@ impl ClusterManager {
     }
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
-    /// Delegates to [`spur_core::auth::check_job_owner`]; see there for the bypass rules.
+    ///
+    /// These are control-plane paths where `user` has already been bound to the verified identity
+    /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller and
+    /// a literal `"root"` is the admin override, so both are treated as internal here; the raw
+    /// [`spur_core::auth::check_job_owner`] no longer infers that itself.
     fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
-        spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
+        let is_internal = user.is_empty() || user == "root";
+        spur_core::auth::check_job_owner(user, is_internal, owner, action).map_err(Into::into)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or
@@ -1229,6 +1234,7 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         user: &str,
+        caller_is_admin: bool,
         hold: bool,
     ) -> anyhow::Result<RequeueOutcome> {
         let (targets, is_array) = {
@@ -1253,7 +1259,7 @@ impl ClusterManager {
         // user sees exactly why (not owner, interactive, already pending, ...).
         if !is_array {
             let id = targets[0];
-            let (requeued, killed) = self.requeue_one_job(id, user, hold)?;
+            let (requeued, killed) = self.requeue_one_job(id, user, caller_is_admin, hold)?;
             return Ok(if requeued {
                 RequeueOutcome {
                     requeued: 1,
@@ -1276,7 +1282,7 @@ impl ClusterManager {
         let total = targets.len();
         let mut outcome = RequeueOutcome::default();
         for id in targets {
-            match self.requeue_one_job(id, user, hold) {
+            match self.requeue_one_job(id, user, caller_is_admin, hold) {
                 Ok((true, killed)) => {
                     outcome.requeued += 1;
                     outcome.killed.extend(killed);
@@ -1305,6 +1311,7 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         user: &str,
+        caller_is_admin: bool,
         hold: bool,
     ) -> anyhow::Result<(bool, Option<Job>)> {
         let snapshot = {
@@ -1312,7 +1319,8 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            Self::check_job_owner(user, &job.spec.user, "requeue")?;
+            spur_core::auth::check_job_owner(user, caller_is_admin, &job.spec.user, "requeue")
+                .map_err(anyhow::Error::from)?;
             // Interactive/srun allocations have no batch script to re-run.
             if job.spec.interactive || job.spec.srun_job || job.spec.pty {
                 anyhow::bail!("job {} is interactive and cannot be requeued", job_id);
@@ -2592,6 +2600,45 @@ impl ClusterManager {
             }
             None => None,
         };
+
+        // Re-validate placement, account and wall-time against the resulting spec
+        // before mutating, exactly as submit_job does. An owner editing a job's
+        // partition/account/time_limit must still satisfy the same partition ACLs,
+        // account associations and MaxTime limits — otherwise a post-submit rewrite
+        // would slip a job onto nodes or into an account the user is not entitled to
+        // (the QOS arm above already re-validates for the same reason). Reject before
+        // mutating so a failed edit leaves the job untouched.
+        {
+            let partitions = self.partitions.read().clone();
+            let config = self.config();
+            let candidate = {
+                let jobs = self.jobs.read();
+                let job = jobs
+                    .get(&job_id)
+                    .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+                let mut spec = job.spec.clone();
+                if let Some(tl) = time_limit {
+                    spec.time_limit = Some(tl);
+                }
+                if let Some(part) = partition.as_ref() {
+                    spec.partition = Some(part.clone());
+                }
+                if let Some(acct) = account.as_ref() {
+                    spec.account = Some(acct.clone());
+                }
+                if let Some(q) = qos.as_ref() {
+                    spec.qos = Some(q.clone());
+                }
+                spec
+            };
+            validate_user_account(&candidate, &self.association_cache, &config.accounting)?;
+            self.validate_partition(&candidate, &partitions)?;
+            validate_partition_time_limit(
+                &candidate,
+                config.scheduler.enforce_part_limits,
+                &partitions,
+            )?;
+        }
 
         if let Some(p) = priority {
             let old = self
@@ -10229,7 +10276,9 @@ mod tests {
         let job_id = run_job_on(&cm, "requeue-me", "worker1");
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
-        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         assert_eq!(
             outcome.killed.len(),
             1,
@@ -10270,7 +10319,9 @@ mod tests {
         cm.suspend_job(job_id, "testuser").unwrap();
         settle(&cm, job_id, JobState::Suspended);
 
-        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         assert_eq!(outcome.killed.len(), 1);
         settle(&cm, job_id, JobState::Pending);
 
@@ -10291,7 +10342,9 @@ mod tests {
         settle(&cm, job_id, JobState::Completed);
 
         // An already-terminal job has no live processes to kill.
-        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         assert!(
             outcome.killed.is_empty(),
             "terminal job needs no agent kill"
@@ -10324,7 +10377,8 @@ mod tests {
             cm.complete_job(job_id, -1, state).unwrap();
             settle(&cm, job_id, state);
 
-            cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+            cm.requeue_job_by_user(job_id, "testuser", false, false)
+                .unwrap();
             settle(&cm, job_id, JobState::Pending);
             assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
         }
@@ -10350,7 +10404,7 @@ mod tests {
 
         // Requeuing already-terminal A must not free its slice a second time, or
         // B's accounting on the shared node would be corrupted.
-        cm.requeue_job_by_user(a, "testuser", false).unwrap();
+        cm.requeue_job_by_user(a, "testuser", false, false).unwrap();
         settle(&cm, a, JobState::Pending);
         assert_eq!(
             cm.node_metrics().alloc_cpus,
@@ -10397,7 +10451,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "requeue-hold", "worker1");
-        cm.requeue_job_by_user(job_id, "testuser", true).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, true)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -10430,7 +10485,7 @@ mod tests {
             apply(&mut spec);
             let job_id = submit_and_wait(&cm, spec);
             let err = cm
-                .requeue_job_by_user(job_id, "testuser", false)
+                .requeue_job_by_user(job_id, "testuser", false, false)
                 .expect_err("interactive jobs cannot be requeued");
             assert!(err.to_string().contains("interactive"), "{name}: {err}");
         }
@@ -10443,7 +10498,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-release", "worker1");
-        cm.requeue_job_by_user(job_id, "testuser", true).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, true)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert!(cm
             .get_job(job_id)
@@ -10484,7 +10540,8 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert_eq!(
             cm.get_job(job_id).unwrap().spec.begin_time,
@@ -10503,7 +10560,8 @@ mod tests {
         let job_id = run_job_on(&cm, "epoch", "worker1");
         assert_eq!(cm.get_job(job_id).unwrap().run_attempt, 1);
 
-        cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        cm.requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         // Re-dispatch bumps the epoch to 2 (requeue must not have reset it).
@@ -10532,7 +10590,7 @@ mod tests {
         let job_id = submit_and_wait(&cm, basic_spec("pending"));
 
         let err = cm
-            .requeue_job_by_user(job_id, "testuser", false)
+            .requeue_job_by_user(job_id, "testuser", false, false)
             .expect_err("a pending job cannot be requeued");
         assert!(err.to_string().contains("already pending"), "got: {err}");
     }
@@ -10545,14 +10603,14 @@ mod tests {
         let job_id = run_job_on(&cm, "owned-by-testuser", "worker1");
 
         let err = cm
-            .requeue_job_by_user(job_id, "bob", false)
-            .expect_err("a non-owner non-root user must be denied");
+            .requeue_job_by_user(job_id, "bob", false, false)
+            .expect_err("a non-owner non-admin must be denied");
         assert!(
             err.downcast_ref::<spur_core::auth::AuthError>().is_some(),
             "got: {err}"
         );
-        // root may requeue any job.
-        cm.requeue_job_by_user(job_id, "root", false).unwrap();
+        // an admin may requeue any job.
+        cm.requeue_job_by_user(job_id, "root", true, false).unwrap();
         settle(&cm, job_id, JobState::Pending);
     }
 
@@ -10595,7 +10653,9 @@ mod tests {
         }
 
         // Requeuing the bare array-parent id fans out to every task.
-        let outcome = cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(parent, "testuser", false, false)
+            .unwrap();
         assert_eq!(outcome.requeued, task_ids.len() as u32);
         assert!(outcome.skipped.is_empty());
         for &id in &task_ids {
@@ -10623,7 +10683,7 @@ mod tests {
         });
 
         let err = cm
-            .requeue_job_by_user(parent, "testuser", false)
+            .requeue_job_by_user(parent, "testuser", false, false)
             .expect_err("all-pending array requeue must error");
         assert!(err.to_string().contains("no tasks of array"), "got: {err}");
     }
@@ -10643,7 +10703,7 @@ mod tests {
         settle(&cm, job_id, JobState::Completing);
 
         let err = cm
-            .requeue_job_by_user(job_id, "testuser", false)
+            .requeue_job_by_user(job_id, "testuser", false, false)
             .expect_err("a completing job cannot be requeued");
         assert!(err.to_string().contains("completing"), "got: {err}");
     }
@@ -10684,7 +10744,9 @@ mod tests {
         .unwrap();
         settle(&cm, task_ids[0], JobState::Running);
 
-        let outcome = cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        let outcome = cm
+            .requeue_job_by_user(parent, "testuser", false, false)
+            .unwrap();
         assert_eq!(outcome.requeued, 1, "only the running task is requeued");
         assert_eq!(
             outcome.skipped.len(),
@@ -10748,7 +10810,8 @@ mod tests {
                 .unwrap();
                 settle(&cm, job_id, JobState::Running);
             }
-            cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+            cm.requeue_job_by_user(job_id, "testuser", false, false)
+                .unwrap();
             settle(&cm, job_id, JobState::Pending);
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.user_requeue_count, n + 1);

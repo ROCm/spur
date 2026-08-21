@@ -956,8 +956,13 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "send keepalive for")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "send keepalive for",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Only interactive allocations are reaped, so only they need tracking.
         if !(job.spec.interactive || job.spec.srun_job) {
@@ -1055,8 +1060,28 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let caller_is_privileged = self.caller_is_privileged(Self::verified_identity(&request));
+        let __identity = Self::verified_identity(&request).cloned();
+        let caller_is_privileged = self.caller_is_privileged(__identity.as_ref());
         let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
+
+        // Reject a caller who does not own the target job before any mutation —
+        // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
+        // update touches placement, account and time limit, so it must be gated the
+        // same way. `is_internal` is a verified admin only — derived from the
+        // verified identity, never the wire `user` string; an unauthenticated
+        // non-owner is still denied, ownership checked against the claimed user.
+        let job = self
+            .cluster
+            .get_job(req.job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "modify",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
@@ -1119,10 +1144,13 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let caller_is_admin = self.caller_is_admin(__identity.as_ref());
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let outcome = self
             .cluster
-            .requeue_job_by_user(req.job_id, &req.user, req.hold)
+            .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
             .map_err(cluster_err_to_precondition_status)?;
 
         // Kill the old processes for jobs that were Running/Suspended; the
@@ -1930,8 +1958,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "attach to")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "attach to",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -2449,8 +2482,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "exec into")
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "exec into",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
@@ -2505,13 +2543,25 @@ impl SlurmController for ControllerService {
             return client.run_step(fwd).await;
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
             .cluster
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+
+        // A step executes arbitrary commands on the job's allocated nodes, so the
+        // caller must own the target job — same gate as create_job_step / exec_in_job.
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "run a step in",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         if job.allocated_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(
@@ -5193,6 +5243,59 @@ mod tests {
         assert!(resp.skipped.is_empty());
     }
 
+    // An authenticated non-admin cannot requeue another user's job by setting user="root" on
+    // the wire. authoritative_user overwrites the field before the owner check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_rejects_spoofed_root_from_authenticated_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(RequeueJobRequest {
+            job_id,
+            user: "root".into(), // spoof admin on the wire
+            hold: false,
+        });
+        req.extensions_mut().insert(viewer("mallory", false));
+
+        let err = svc
+            .requeue_job(req)
+            .await
+            .expect_err("a spoofed root claim must not bypass the ownership check");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    // A verified admin (whose username is not literally "root") can requeue any job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_admin_override_uses_verified_identity_not_wire_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        // A verified admin (name != "root") may requeue another user's job.
+        let mut admin_req = Request::new(RequeueJobRequest {
+            job_id,
+            hold: false,
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        assert!(
+            svc.requeue_job(admin_req).await.is_ok(),
+            "a verified admin (non-root) must be able to requeue any job"
+        );
+
+        // An unauthenticated caller cannot claim admin by putting user="root" on the wire.
+        let err = svc
+            .requeue_job(Request::new(RequeueJobRequest {
+                job_id,
+                user: "root".into(),
+                hold: false,
+            }))
+            .await
+            .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
     // A step must NOT be created when the target node is allocated but unregistered: address
     // resolution runs first and returns a retryable Unavailable, so the client's retries can't
     // each leak a step.
@@ -5603,6 +5706,140 @@ mod tests {
             .expect("the owner must be allowed to attach");
 
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .update_job(Request::new(UpdateJobRequest {
+                job_id,
+                comment: Some("owned".into()),
+                user: "rsikande".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-owner must not modify another user's job");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.comment,
+            None,
+            "a denied update must not mutate the job"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_allows_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.update_job(Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("reviewed".into()),
+            user: "ubuntu".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner must be allowed to modify their job");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.comment,
+            Some("reviewed".into())
+        );
+    }
+
+    /// The owner check must key off the *authenticated* identity, not the
+    /// wire-asserted `user`: a caller cannot spoof the owner's name to slip past
+    /// the gate. `authoritative_user` overwrites the field before the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_rejects_spoofed_owner_when_authenticated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("owned".into()),
+            user: "ubuntu".into(), // spoof the owner's name on the wire
+            ..Default::default()
+        });
+        req.extensions_mut().insert(spur_core::auth::Identity {
+            user: "rsikande".into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+        });
+
+        let err = svc
+            .update_job(req)
+            .await
+            .expect_err("a spoofed owner name must not bypass the ownership check");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.comment,
+            None,
+            "a denied update must not mutate the job"
+        );
+    }
+
+    // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
+    // (a) an admin whose username is not literally "root" is still treated as internal, and (b) an
+    // unauthenticated caller cannot bypass ownership by claiming user = "root".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_admin_override_uses_verified_identity_not_wire_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        // A verified admin whose name is not "root" may modify another user's job.
+        let mut admin_req = Request::new(UpdateJobRequest {
+            job_id,
+            comment: Some("by-admin".into()),
+            ..Default::default()
+        });
+        admin_req.extensions_mut().insert(viewer("carol", true));
+        assert!(
+            svc.update_job(admin_req).await.is_ok(),
+            "a verified admin (non-root) must be able to modify any job"
+        );
+
+        // An unauthenticated caller cannot spoof admin by putting user = "root" on the wire.
+        let err = svc
+            .update_job(Request::new(UpdateJobRequest {
+                job_id,
+                comment: Some("spoof".into()),
+                user: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["id".into()],
+                step_id: 0,
+                user: "rsikande".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-owner must not run a step in another user's allocation");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     async fn assign_ha_control_plane(svc: &ControllerService) {

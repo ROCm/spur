@@ -331,6 +331,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 spur_proto::proto::UpdateJobRequest {
                     job_id,
                     hold: Some(true),
+                    user: crate::interactive::current_user()?,
                     ..Default::default()
                 },
             )
@@ -342,6 +343,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 spur_proto::proto::UpdateJobRequest {
                     job_id,
                     hold: Some(false),
+                    user: crate::interactive::current_user()?,
                     ..Default::default()
                 },
             )
@@ -1283,6 +1285,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
             account,
             comment,
             qos,
+            user: crate::interactive::current_user()?,
             ..Default::default()
         },
     )
