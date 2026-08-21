@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod agent;
+mod auth_middleware;
 mod crd;
 mod health;
 mod heartbeat;
@@ -55,9 +56,33 @@ struct Args {
     #[arg(long, default_value = "[::]:8080")]
     health_addr: String,
 
+    /// Agent-surface auth strictness: "disabled", "permissive" (default; verify if presented, else
+    /// allow), or "required" (reject uncredentialed calls). Mirrors the cluster `[auth] mode`.
+    #[arg(long, default_value = "permissive")]
+    auth_mode: String,
+
+    /// Cluster JWT signing key (`[auth] jwt_key`) the operator's agent surface verifies credentials
+    /// against. Required when `--auth-mode required`.
+    #[arg(long, env = "SPUR_JWT_KEY")]
+    jwt_key: Option<String>,
+
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+/// Parse the `--auth-mode` flag into an [`AuthMode`], failing loudly on an unknown value rather than
+/// silently downgrading the agent surface to a weaker mode.
+fn parse_auth_mode(s: &str) -> anyhow::Result<spur_core::config::AuthMode> {
+    use spur_core::config::AuthMode;
+    match s {
+        "disabled" => Ok(AuthMode::Disabled),
+        "permissive" => Ok(AuthMode::Permissive),
+        "required" => Ok(AuthMode::Required),
+        other => anyhow::bail!(
+            "invalid --auth-mode {other:?}: expected \"disabled\", \"permissive\", or \"required\""
+        ),
+    }
 }
 
 #[derive(Subcommand)]
@@ -191,11 +216,41 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Authenticate callers of the virtual-agent surface: this port carries a cluster-wide
+    // pod-create privilege, so reaching it must not be enough to ask the operator to run work.
+    let auth_mode = parse_auth_mode(&args.auth_mode)?;
+    let jwt_key = args.jwt_key.clone().unwrap_or_default();
+    match auth_mode {
+        spur_core::config::AuthMode::Required if jwt_key.is_empty() => anyhow::bail!(
+            "--auth-mode required but no --jwt-key / SPUR_JWT_KEY is set: the operator agent could \
+             never verify a credential and would refuse every launch"
+        ),
+        spur_core::config::AuthMode::Required => {
+            info!("operator agent requires a cluster credential on every RPC")
+        }
+        spur_core::config::AuthMode::Permissive if jwt_key.is_empty() => tracing::warn!(
+            "operator agent is permissive but has no --jwt-key / SPUR_JWT_KEY: uncredentialed calls \
+             are allowed, but a controller that DOES present a credential is REJECTED (no key to \
+             verify it against). Set the key so presented credentials verify, then move to \
+             --auth-mode required."
+        ),
+        spur_core::config::AuthMode::Permissive => tracing::warn!(
+            "operator agent accepts uncredentialed RPCs (auth.mode = permissive): any peer that can \
+             reach this port can ask the operator to create a pod. Set --auth-mode required once \
+             the controller presents a credential."
+        ),
+        spur_core::config::AuthMode::Disabled => tracing::warn!(
+            "operator agent does NOT authenticate callers (auth.mode = disabled): treat this port \
+             as an administrative boundary."
+        ),
+    }
+
     // Start virtual agent gRPC server
     let virtual_agent = agent::VirtualAgent::new(client);
     info!(%listen_addr, "virtual agent gRPC server listening");
 
     tonic::transport::Server::builder()
+        .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
         .add_service(spur_proto::agent_server(virtual_agent))
         .serve(listen_addr)
         .await?;
