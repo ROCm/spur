@@ -203,54 +203,57 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
 /// The tar contains a manifest.json listing layer tarballs.
 fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
     let dest = Path::new(rootfs);
-    let tmp = dest.join(".docker_save");
-    std::fs::create_dir_all(&tmp)?;
+    std::fs::create_dir_all(dest)?;
+    let staging_parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::Builder::new()
+        .prefix(".docker_save_")
+        .tempdir_in(staging_parent)
+        .context("failed to create docker save staging directory")?;
 
-    let result = (|| {
-        let mut archive = tar::Archive::new(tar_data);
-        archive.set_overwrite(true);
-        archive
-            .unpack(&tmp)
-            .context("failed to extract docker save archive")?;
+    let mut archive = tar::Archive::new(tar_data);
+    archive.set_overwrite(true);
+    archive
+        .unpack(staging.path())
+        .context("failed to extract docker save archive")?;
 
-        let archive_root = tmp
-            .canonicalize()
-            .context("failed to resolve docker save directory")?;
-        let manifest_path = resolve_docker_save_file(&archive_root, "manifest.json")
-            .context("no manifest.json in docker save")?;
-        let manifest_str =
-            std::fs::read_to_string(manifest_path).context("no manifest.json in docker save")?;
-        let manifest: Vec<serde_json::Value> =
-            serde_json::from_str(&manifest_str).context("invalid manifest.json")?;
+    let archive_root = staging
+        .path()
+        .canonicalize()
+        .context("failed to resolve docker save directory")?;
+    let manifest_path = resolve_docker_save_file(&archive_root, "manifest.json")
+        .context("no manifest.json in docker save")?;
+    let manifest_str =
+        std::fs::read_to_string(manifest_path).context("no manifest.json in docker save")?;
+    let manifest: Vec<serde_json::Value> =
+        serde_json::from_str(&manifest_str).context("invalid manifest.json")?;
 
-        let layers = manifest
-            .first()
-            .and_then(|manifest| manifest.get("Layers"))
-            .and_then(|layers| layers.as_array())
-            .ok_or_else(|| anyhow::anyhow!("no layers in manifest.json"))?;
+    let layers = manifest
+        .first()
+        .and_then(|manifest| manifest.get("Layers"))
+        .and_then(|layers| layers.as_array())
+        .ok_or_else(|| anyhow::anyhow!("no layers in manifest.json"))?;
 
-        for layer_path in layers {
-            let layer_file = layer_path
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("invalid layer path"))?;
-            let layer_path = resolve_docker_save_file(&archive_root, layer_file)?;
-            let data = std::fs::read(layer_path)
-                .with_context(|| format!("failed to read layer {}", layer_file))?;
+    for layer_path in layers {
+        let layer_file = layer_path
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid layer path"))?;
+        let layer_path = resolve_docker_save_file(&archive_root, layer_file)?;
+        let data = std::fs::read(layer_path)
+            .with_context(|| format!("failed to read layer {}", layer_file))?;
 
-            let reader = spur_net::image_layer::decode(&data, None)
-                .with_context(|| format!("failed to decode layer {}", layer_file))?;
-            let mut archive = tar::Archive::new(reader);
-            archive.set_overwrite(true);
-            archive
-                .unpack(dest)
-                .with_context(|| format!("failed to extract layer {}", layer_file))?;
-        }
+        spur_net::image_layer::extract(
+            &data,
+            None,
+            dest,
+            spur_net::image_layer::EntryUnpackPolicy::Strict,
+        )
+        .with_context(|| format!("failed to extract layer {}", layer_file))?;
+    }
 
-        Ok(())
-    })();
-
-    let _ = std::fs::remove_dir_all(&tmp);
-    result
+    Ok(())
 }
 
 fn resolve_docker_save_file(archive_root: &Path, entry: &str) -> Result<PathBuf> {
@@ -504,6 +507,18 @@ mod tests {
         docker_save_with_manifest(&layer_names, layers)
     }
 
+    fn docker_save_staging_paths(parent: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".docker_save_"))
+            })
+            .collect()
+    }
+
     #[cfg(unix)]
     fn docker_save_with_symlink_layer(layer_name: &str, target: &Path) -> Vec<u8> {
         let manifest = docker_manifest(&[layer_name]);
@@ -568,15 +583,70 @@ mod tests {
     }
 
     #[test]
+    fn docker_save_import_applies_regular_and_opaque_whiteouts_across_layers() {
+        let first = tar_files(&[
+            ("root-before.txt", b"before"),
+            (".wh..wh..opq", b""),
+            ("root-after.txt", b"after"),
+            ("replace-me/lower.txt", b"lower"),
+            ("nested/lower.txt", b"lower"),
+        ]);
+        let second = tar_files(&[
+            ("replace-me/current.txt", b"current"),
+            (".wh.replace-me", b""),
+            ("nested/before.txt", b"before"),
+            ("nested/.wh..wh..opq", b""),
+            ("nested/after.txt", b"after"),
+        ]);
+        let archive = docker_save(&[("first/layer.tar", first), ("second/layer.tar", second)]);
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(rootfs.join("preexisting.txt"), b"lower").unwrap();
+
+        extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap();
+
+        assert!(!rootfs.join("preexisting.txt").exists());
+        assert_eq!(
+            std::fs::read(rootfs.join("root-before.txt")).unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            std::fs::read(rootfs.join("root-after.txt")).unwrap(),
+            b"after"
+        );
+        assert!(!rootfs.join("replace-me/lower.txt").exists());
+        assert_eq!(
+            std::fs::read(rootfs.join("replace-me/current.txt")).unwrap(),
+            b"current"
+        );
+        assert!(!rootfs.join("nested/lower.txt").exists());
+        assert_eq!(
+            std::fs::read(rootfs.join("nested/before.txt")).unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            std::fs::read(rootfs.join("nested/after.txt")).unwrap(),
+            b"after"
+        );
+        assert!(!rootfs.join(".wh..wh..opq").exists());
+        assert!(!rootfs.join(".wh.replace-me").exists());
+        assert!(!rootfs.join("nested/.wh..wh..opq").exists());
+        assert!(docker_save_staging_paths(base.path()).is_empty());
+    }
+
+    #[test]
     fn docker_save_import_cleans_up_after_invalid_layer() {
         let archive =
             docker_save(&[("broken/layer.tar", vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0])]);
-        let rootfs = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
 
-        let error = extract_docker_save_tar(&archive, rootfs.path().to_str().unwrap()).unwrap_err();
+        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("broken/layer.tar"));
-        assert!(!rootfs.path().join(".docker_save").exists());
+        assert!(!rootfs.join(".docker_save").exists());
+        assert!(docker_save_staging_paths(base.path()).is_empty());
     }
 
     #[test]
