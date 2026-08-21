@@ -113,6 +113,68 @@ The two daemons are configured with command-line flags. The most common are belo
    ``[mpi]``. If the file is absent, the agent logs a warning and falls back to
    defaults for those sections, which is fine when none of them are in use.
 
+Quick Start: Two-Node Cluster
+-----------------------------
+
+The fastest way to get a two-node cluster running — one controller node and one
+compute node, no WireGuard, plain LAN.
+
+**On the controller node** (e.g. ``10.0.0.1``):
+
+.. code-block:: toml
+
+   # /etc/spur/spur.conf
+   cluster_name = "my-cluster"
+
+   [scheduler]
+   plugin = "backfill"
+   interval_secs = 1
+
+   [[partitions]]
+   name = "default"
+   default = true
+   nodes = "ALL"
+   max_time = "24:00:00"
+
+.. code-block:: bash
+
+   sudo mkdir -p /var/spool/spur
+   spurctld -D -f /etc/spur/spur.conf    # starts in the foreground; Ctrl-C to stop
+                                          # use systemd for production (see below)
+
+**On the compute node** (e.g. ``10.0.0.2``), the same ``spur.conf`` is fine or
+omit it entirely — identity and networking come from flags:
+
+.. code-block:: bash
+
+   spurd -D \
+       --controller http://10.0.0.1:6817 \
+       --hostname compute-1 \
+       --address 10.0.0.2
+
+**Verify both are up**:
+
+.. code-block:: bash
+
+   sinfo          # shows compute-1 in idle state
+   srun hostname  # runs on the compute node and prints its name
+
+.. note::
+
+   Ports to open between the two machines: **6817** (controller API) and **6818**
+   (agent). If you add more controllers for HA, also open **6821** (Raft).
+
+.. note::
+
+   By default ``spurd`` refuses to run jobs submitted as UID 0 (root). This is a
+   safety guard for shared clusters. On a private dev cluster where all submitters
+   are trusted, enable it in ``spur.conf``:
+
+   .. code-block:: toml
+
+      [auth]
+      allow_root_jobs = true
+
 Setting Up the Controller
 -------------------------
 
