@@ -2631,7 +2631,7 @@ impl ClusterManager {
                 }
                 spec
             };
-            validate_user_account(&candidate, &self.association_cache)?;
+            validate_user_account(&candidate, &self.association_cache, &config.accounting)?;
             self.validate_partition(&candidate, &partitions)?;
             validate_partition_time_limit(
                 &candidate,
