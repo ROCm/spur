@@ -6683,12 +6683,32 @@ fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
+    // Node TRES is the count of DISTINCT physical nodes the matching running
+    // jobs occupy (the union of their `allocated_nodes`), not the sum of each
+    // job's requested `num_nodes`. Slurm derives the association/QOS node usage
+    // from a per-assoc/QOS node bitmap, so a node shared by two of an
+    // account's/QOS's jobs counts once. Summing `num_nodes` double-counts a
+    // packed node and blocks work the node still has capacity for (ROCm/spur#709).
+    // CPU/Memory/GPU stay additive — those are consumed per job even on a
+    // shared node — so only Node is overridden below.
+    let mut distinct_nodes: HashSet<&str> = HashSet::new();
+    let mut unplaced_nodes: u64 = 0;
     for j in jobs.values() {
         if j.state != JobState::Running || !pred(j) {
             continue;
         }
         tres.add(&job_tres(j));
+        if j.allocated_nodes.is_empty() {
+            // Running job without recorded placement (transient/edge): fall back
+            // to its requested count so the limit is never under-counted.
+            unplaced_nodes += j.spec.num_nodes as u64;
+        } else {
+            distinct_nodes.extend(j.allocated_nodes.iter().map(String::as_str));
+        }
     }
+    // `job_tres` set Node to the summed `num_nodes` above; replace it with the
+    // real distinct-node occupancy.
+    tres.set(TresType::Node, distinct_nodes.len() as u64 + unplaced_nodes);
     tres
 }
 
@@ -15251,6 +15271,140 @@ mod tests {
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::AssocGrpNodeLimit
         );
+    }
+
+    #[test]
+    fn sum_running_tres_counts_distinct_nodes_not_summed_num_nodes() {
+        // ROCm/spur#709: two RUNNING jobs (num_nodes=2 each) that SHARE node n2
+        // (packing 1 GPU/node onto 8-GPU hosts). Summed num_nodes = 4, but the
+        // distinct-node union {n1,n2,n3} = 3. The node limit must charge 3.
+        let mut a = make_running_job(1, &["n1", "n2"], 1);
+        a.spec.num_nodes = 2;
+        let mut b = make_running_job(2, &["n2", "n3"], 1);
+        b.spec.num_nodes = 2;
+        let mut jobs = HashMap::new();
+        jobs.insert(1, a);
+        jobs.insert(2, b);
+
+        let tres = sum_running_tres(&jobs, |_| true);
+        assert_eq!(
+            tres.get(TresType::Node),
+            3,
+            "Node TRES must be distinct nodes {{n1,n2,n3}}=3, not summed num_nodes=4"
+        );
+    }
+
+    #[test]
+    fn sum_running_tres_falls_back_to_num_nodes_when_placement_missing() {
+        // A running job with no recorded placement (transient/edge) must not
+        // under-count the limit — fall back to its requested num_nodes.
+        let mut a = make_running_job(1, &[], 1);
+        a.spec.num_nodes = 2;
+        a.allocated_nodes.clear();
+        let mut b = make_running_job(2, &["n1"], 1);
+        b.spec.num_nodes = 1;
+        let mut jobs = HashMap::new();
+        jobs.insert(1, a);
+        jobs.insert(2, b);
+
+        let tres = sum_running_tres(&jobs, |_| true);
+        // Placed distinct {n1}=1 + unplaced fallback 2 = 3.
+        assert_eq!(tres.get(TresType::Node), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_uses_distinct_allocated_nodes_not_summed_num_nodes() {
+        // ROCm/spur#709: QOS grp node=4. The QOS's running jobs share a node
+        // (packing), so distinct occupancy is 3 but summed num_nodes is 4. A new
+        // 1-node job must pack into the real headroom (3+1=4 <= 4), not be blocked
+        // by the phantom double-count (4+1=5).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        register_node(&cm, "n2", 64, 128000);
+        register_node(&cm, "n3", 64, 128000);
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        // Two running QOS jobs sharing n2: A={n1,n2}, B={n2,n3} -> distinct=3,
+        // summed num_nodes=4.
+        {
+            let mut jobs = cm.jobs.write();
+            for (id, nodes) in [(101u32, ["n1", "n2"]), (102, ["n2", "n3"])] {
+                let mut j = make_running_job(id, &nodes, 1);
+                j.spec.num_nodes = 2;
+                j.spec.qos = Some("burst".into());
+                jobs.insert(id, j);
+            }
+        }
+
+        let mut newjob = basic_spec("pack-me");
+        newjob.qos = Some("burst".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            pending.contains(&new_id),
+            "1-node job must pack into distinct-node headroom (3+1=4 <= 4); \
+             summing num_nodes (4+1=5) wrongly blocks it on QOSGrpNodeLimit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_still_blocks_when_distinct_cap_reached() {
+        // The distinct-node fix must not over-admit: with grp node=3 already fully
+        // occupied by distinct nodes {n1,n2,n3}, a job needing a 4th distinct node
+        // (num_nodes=4) is still blocked on QOSGrpNodeLimit.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for n in ["n1", "n2", "n3", "n4"] {
+            register_node(&cm, n, 64, 128000);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 3);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            for (id, nodes) in [(101u32, ["n1", "n2"]), (102, ["n2", "n3"])] {
+                let mut j = make_running_job(id, &nodes, 1);
+                j.spec.num_nodes = 2;
+                j.spec.qos = Some("burst".into());
+                jobs.insert(id, j);
+            }
+        }
+
+        let mut newjob = basic_spec("too-big");
+        newjob.qos = Some("burst".into());
+        newjob.num_nodes = 4;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(new_id).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit,
+            "distinct occupancy 3 + requested 4 = 7 > grp cap 3 must still block"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&new_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
