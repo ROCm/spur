@@ -168,6 +168,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
+    // WireGuard interface for mesh address/key/peers. Resolution: SPUR_WG_INTERFACE env >
+    // [network] wg_interface in spur.conf > "spur0", so a non-default conf name is honored.
+    let wg_iface = std::env::var("SPUR_WG_INTERFACE").ok().unwrap_or_else(|| {
+        config
+            .as_ref()
+            .map(|c| c.network.wg_interface.clone())
+            .unwrap_or_else(|| "spur0".into())
+    });
+
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(
         "ROCm/spur",
@@ -226,9 +235,9 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         let detect_hostname = hostname.clone();
-        let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        let detect_iface = wg_iface.clone();
         tokio::task::spawn_blocking(move || {
-            spur_net::detect_node_address(&detect_hostname, listen_port, &wg_interface)
+            spur_net::detect_node_address(&detect_hostname, listen_port, &detect_iface)
         })
         .await
         .map_err(|e| anyhow::anyhow!("node address detection task failed: {e}"))?
@@ -266,9 +275,8 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // The WireGuard interface this node's mesh key is read from; the reporter re-reads the key on
-    // every register/heartbeat so the controller learns a key that appears/changes after startup.
-    let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+    // The reporter re-reads the mesh key from `wg_iface` (resolved above) each heartbeat, so a
+    // key that appears/changes after startup reaches the controller.
 
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.

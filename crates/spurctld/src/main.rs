@@ -277,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
         let k8s_raft = raft_handle.clone();
         let k8s_net = cluster_k8s::ClusterNetworking {
             mesh_cidr: config.network.wg_cidr.clone(),
+            mesh_interface: config.network.wg_interface.clone(),
             pod_cidr: config.cluster.pod_cidr.clone(),
             service_cidr: config.cluster.service_cidr.clone(),
             cni_mtu: config.cluster.cni_mtu,

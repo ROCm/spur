@@ -265,3 +265,8 @@ cryptokey
 VRRP
 reprovision
 reconciler
+CSV
+MTU
+drivable
+enablement
+AllowedIPs
