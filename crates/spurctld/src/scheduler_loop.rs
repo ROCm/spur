@@ -3208,6 +3208,7 @@ mod tests {
                 String::new(),
                 NodeSource::NativeHost,
                 HashMap::new(),
+                true,
             )
             .unwrap();
             let n = name.to_string();
@@ -4105,6 +4106,7 @@ mod tests {
                     namespace: "spur-test".into(),
                 },
                 HashMap::new(),
+                true,
             )
             .unwrap();
             let n = name.to_string();

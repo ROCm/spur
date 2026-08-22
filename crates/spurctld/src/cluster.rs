@@ -110,6 +110,23 @@ pub enum SubmitError {
     Internal(String),
 }
 
+/// Errors from a node (re-)registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterNodeError {
+    PermissionDenied(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for RegisterNodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PermissionDenied(m) | Self::Internal(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for RegisterNodeError {}
+
 /// Errors from completing a standalone srun allocation.
 #[derive(Debug)]
 pub enum SrunCompleteError {
@@ -401,6 +418,9 @@ pub struct ClusterManager {
     /// Serializes k0s phase-transition accounting so concurrent `set_k0s_phase` callers can't both
     /// read the same prior phase and double-count the edge.
     k0s_phase_accounting: parking_lot::Mutex<()>,
+    /// Per-node locks serializing (re-)registration, so unrelated nodes don't block each other
+    /// while a same-name racer can't act on a stale label diff (see `register_node`).
+    node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -498,6 +518,7 @@ impl ClusterManager {
             k8s_metrics: Arc::new(spur_metrics::K8sMetrics::new()),
             k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
+            node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -2112,7 +2133,17 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Register a node agent.
+    /// Gets (creating if absent) the per-node lock `register_node` serializes on.
+    fn node_registration_lock(&self, name: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.node_registration_locks
+            .lock()
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
+    /// Register a node agent. `caller_privileged` gates a labels change on an already-registered
+    /// node (see `sync_node_labels`); first registration never needs it.
     #[allow(clippy::too_many_arguments)]
     pub fn register_node(
         &self,
@@ -2125,12 +2156,19 @@ impl ClusterManager {
         version: String,
         source: NodeSource,
         labels: HashMap<String, String>,
-    ) -> anyhow::Result<()> {
+        caller_privileged: bool,
+    ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
             hostname
         };
+
+        // Held across decide-then-propose so concurrent registrations of THIS node can't each act on
+        // a pre-write read of the other's state and propose conflicting/duplicate WAL ops.
+        let node_lock = self.node_registration_lock(&name);
+        let _registration = node_lock.lock();
+
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
@@ -2139,7 +2177,7 @@ impl ClusterManager {
         match action {
             RegistrationAction::Skip => {
                 debug!(node = %name, "node unchanged, skipping");
-                self.sync_node_labels(&name, labels)?;
+                self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(existing) = self.get_node(&name) {
                     let needs_update = existing.address.as_deref() != Some(address.as_str())
                         || existing.hostname != hostname
@@ -2158,7 +2196,8 @@ impl ClusterManager {
                             wg_pubkey,
                             version,
                             source: source.clone(),
-                        })?;
+                        })
+                        .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         info!(node = %name, "node comm address or metadata updated");
                     }
                     if existing.source != source {
@@ -2178,8 +2217,9 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     source: source.clone(),
-                })?;
-                self.sync_node_labels(&name, labels)?;
+                })
+                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
+                self.sync_node_labels(&name, labels, caller_privileged)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                 }
@@ -2196,7 +2236,8 @@ impl ClusterManager {
                     version,
                     labels,
                     source: source.clone(),
-                })?;
+                })
+                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
@@ -2207,15 +2248,21 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Sync node labels if they differ from the expected set.
-    /// Proposes a `NodeLabelsUpdate` WAL operation when there's a mismatch.
+    /// Syncs node labels if they differ, rejecting the diff from an unprivileged caller instead of
+    /// applying it. Called under `register_node`'s per-node lock.
     fn sync_node_labels(
         &self,
         node_name: &str,
         new_labels: HashMap<String, String>,
-    ) -> anyhow::Result<()> {
+        caller_privileged: bool,
+    ) -> Result<(), RegisterNodeError> {
         if let Some(existing) = self.get_node(node_name) {
             if existing.labels != new_labels {
+                if !caller_privileged {
+                    return Err(RegisterNodeError::PermissionDenied(format!(
+                        "relabeling node {node_name} on re-registration requires cluster admin"
+                    )));
+                }
                 let remove: Vec<String> = existing
                     .labels
                     .keys()
@@ -2226,7 +2273,8 @@ impl ClusterManager {
                     name: node_name.to_string(),
                     set: new_labels,
                     remove,
-                })?;
+                })
+                .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 info!(node = %node_name, "node labels synced on re-registration");
             }
         }
@@ -7794,12 +7842,70 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            true,
         )
         .unwrap();
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
         });
+    }
+
+    // A `Barrier` forces both callers to start at the same instant, so this races for real on
+    // `node_registration_locks` instead of depending on tokio's task-scheduling luck.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_node_concurrent_non_admin_relabel_never_wins() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "racy-node", 4, 8000);
+
+        let relabel = |cm: Arc<ClusterManager>, pool: &'static str, privileged: bool| {
+            cm.register_node(
+                "racy-node".into(),
+                "racy-node".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::from([("pool".to_string(), pool.to_string())]),
+                privileged,
+            )
+        };
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (cm_a, barrier_a) = (cm.clone(), barrier.clone());
+        let admin = tokio::task::spawn_blocking(move || {
+            barrier_a.wait();
+            relabel(cm_a, "prod", true)
+        });
+        let (cm_b, barrier_b) = (cm.clone(), barrier.clone());
+        let non_admin = tokio::task::spawn_blocking(move || {
+            barrier_b.wait();
+            relabel(cm_b, "hacked", false)
+        });
+
+        let (admin_result, non_admin_result) = tokio::join!(admin, non_admin);
+        admin_result
+            .unwrap()
+            .expect("the admin's relabel must succeed regardless of scheduling order");
+        assert!(
+            matches!(
+                non_admin_result.unwrap(),
+                Err(RegisterNodeError::PermissionDenied(_))
+            ),
+            "the non-admin's concurrent relabel must never win the race"
+        );
+        assert_eq!(
+            cm.get_node("racy-node").unwrap().labels["pool"],
+            "prod",
+            "only the admin's labels may land, whichever task the scheduler ran first"
+        );
     }
 
     /// Register a node already on the WireGuard mesh: it advertises its real `spur0` address (what
@@ -7820,6 +7926,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            true,
         )
         .unwrap();
         let n = name.to_string();
@@ -18440,6 +18547,7 @@ mod tests {
             "1.0".into(),
             NodeSource::NativeHost,
             HashMap::new(),
+            true,
         )
         .unwrap();
         let node = cm.get_node("locked").unwrap();
@@ -20478,6 +20586,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("role".into(), "infer".into())]),
+            true,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("dyn-node").is_some());
@@ -20545,6 +20654,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
+            true,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -20568,6 +20678,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "infer".into()), ("tier".into(), "1".into())]),
+            true,
         )
         .unwrap();
         wait_for("labels synced", || {
@@ -20601,6 +20712,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            true,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -20615,6 +20727,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            true,
         )
         .unwrap();
         wait_for("comm address updated", || {
@@ -20652,6 +20765,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
+            true,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());

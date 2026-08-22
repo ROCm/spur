@@ -488,6 +488,19 @@ impl ControllerService {
             .map_err(reservation_rpc_status)
     }
 
+    /// Rejects an identified non-admin from a cluster-tenancy mutation (partitions, node placement,
+    /// tokens, reservations); anonymous is allowed, matching `caller_is_privileged`. Call as a prologue, before `into_inner`.
+    #[allow(clippy::result_large_err)]
+    fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
+        if self.caller_is_privileged(Self::verified_identity(request)) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "{op} requires cluster admin"
+            )))
+        }
+    }
+
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
     /// or a caller with no verified identity. The latter keeps the pre-auth behaviour — `disabled`,
     /// or `permissive` with no credential, trusts the client — so restricting it would break no-auth
@@ -1262,6 +1275,8 @@ impl SlurmController for ControllerService {
             }
         }
 
+        self.require_admin(&request, "update node")?;
+
         let req = request.into_inner();
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
@@ -1572,6 +1587,10 @@ impl SlurmController for ControllerService {
             })
             .unwrap_or_default();
 
+        // Decided here, enforced atomically inside `register_node` against the label diff — a
+        // pre-check here instead would race a concurrent registration for the same node.
+        let caller_privileged = self.caller_is_privileged(Self::verified_identity(&request));
+
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
@@ -1600,8 +1619,9 @@ impl SlurmController for ControllerService {
                 req.version,
                 source,
                 req.labels,
+                caller_privileged,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(register_node_rpc_status)?;
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -1798,14 +1818,16 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    fwd.metadata_mut()
-                        .insert("x-forwarded", "true".parse().unwrap());
+                    // Preserve the caller's credential (and set the forwarded marker) so the leader
+                    // authorizes the ORIGINAL caller, not an anonymous forwarded request.
+                    let fwd = Self::forward_request(request);
                     return client.create_token(fwd).await;
                 }
                 Err(_) => return Err(status),
             }
         }
+
+        self.require_admin(&request, "create token")?;
 
         let req = request.into_inner();
         let ttl_secs = req.ttl_secs.filter(|&v| v > 0);
@@ -1823,9 +1845,12 @@ impl SlurmController for ControllerService {
 
     async fn list_tokens(
         &self,
-        _request: Request<ListTokensRequest>,
+        request: Request<ListTokensRequest>,
     ) -> Result<Response<ListTokensResponse>, Status> {
         use spur_proto::proto::TokenInfo;
+
+        // Admission tokens are cluster secrets; only an admin may enumerate them.
+        self.require_admin(&request, "list tokens")?;
 
         let tokens = self.cluster.list_tokens();
         let infos = tokens
@@ -1849,14 +1874,16 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    fwd.metadata_mut()
-                        .insert("x-forwarded", "true".parse().unwrap());
+                    // Preserve the caller's credential (and set the forwarded marker) so the leader
+                    // authorizes the ORIGINAL caller, not an anonymous forwarded request.
+                    let fwd = Self::forward_request(request);
                     return client.revoke_token(fwd).await;
                 }
                 Err(_) => return Err(status),
             }
         }
+
+        self.require_admin(&request, "revoke token")?;
 
         let req = request.into_inner();
         self.cluster
@@ -2030,6 +2057,8 @@ impl SlurmController for ControllerService {
             }
         }
 
+        self.require_admin(&request, "create partition")?;
+
         let req = request.into_inner();
 
         if req.nodes.is_empty() && req.selector.is_empty() {
@@ -2134,6 +2163,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "update partition")?;
 
         let req = request.into_inner();
 
@@ -2244,6 +2275,8 @@ impl SlurmController for ControllerService {
             }
         }
 
+        self.require_admin(&request, "delete partition")?;
+
         let name = request.into_inner().name;
         self.cluster
             .delete_partition(&name)
@@ -2266,6 +2299,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "reconfigure")?;
 
         self.cluster
             .reconfigure()
@@ -2291,6 +2326,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "create reservation")?;
 
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -2336,6 +2373,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "update reservation")?;
 
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -2395,6 +2434,8 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        self.require_admin(&request, "delete reservation")?;
 
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -4070,6 +4111,13 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
     }
 }
 
+fn register_node_rpc_status(err: crate::cluster::RegisterNodeError) -> Status {
+    match err {
+        crate::cluster::RegisterNodeError::PermissionDenied(m) => Status::permission_denied(m),
+        crate::cluster::RegisterNodeError::Internal(m) => Status::internal(m),
+    }
+}
+
 fn partition_rpc_status(err: PartitionError) -> Status {
     match err {
         PartitionError::InvalidArgument(m) => Status::invalid_argument(m),
@@ -4385,6 +4433,14 @@ mod tests {
         if let Some(id) = id {
             req.extensions_mut().insert(id);
         }
+        req
+    }
+
+    /// Wrap a request body with a verified admin identity, as the auth layer would for an admin
+    /// token. Used to exercise the admin-gated control-plane mutation handlers.
+    fn admin_request<T>(inner: T) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.extensions_mut().insert(viewer("root", true));
         req
     }
 
@@ -5160,6 +5216,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         for _ in 0..200 {
@@ -5321,6 +5378,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         for _ in 0..200 {
@@ -5487,6 +5545,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         for _ in 0..200 {
@@ -5862,6 +5921,7 @@ mod tests {
                     String::new(),
                     NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    true,
                 )
                 .unwrap();
             svc.cluster
@@ -5996,6 +6056,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         svc.cluster
@@ -6029,6 +6090,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
     }
@@ -6991,6 +7053,7 @@ mod tests {
                     String::new(),
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    true,
                 )
                 .unwrap();
         }
@@ -7002,7 +7065,7 @@ mod tests {
         }
 
         for (name, node) in [("rocm_patch", "n1"), ("other_resv", "n2")] {
-            svc.create_reservation(Request::new(CreateReservationRequest {
+            svc.create_reservation(admin_request(CreateReservationRequest {
                 name: name.into(),
                 start_time: "now".into(),
                 duration_minutes: 60,
@@ -7055,6 +7118,319 @@ mod tests {
             .into_inner()
             .reservations;
         assert!(none.is_empty());
+    }
+
+    // --- control-plane mutation authorization ---
+    //
+    // Every RPC that defines cluster tenancy (partitions, node placement/labels, admission tokens,
+    // reservations) must reject an identified non-admin. An anonymous caller (no identity —
+    // `disabled`, or `permissive` with no credential) passes the gate, matching the auth model's
+    // non-enforcing modes; the gate binds real users in `required` mode. Enumerated as a table so the
+    // next handler added cannot quietly reopen the boundary to an identified non-admin.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_mutations_deny_identified_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        macro_rules! assert_admin_gated {
+            ($method:ident, $req:expr) => {{
+                // A verified but non-admin identity is rejected.
+                let mut r = Request::new($req);
+                r.extensions_mut().insert(viewer("mallory", false));
+                let err = svc.$method(r).await.expect_err(concat!(
+                    stringify!($method),
+                    " must reject a non-admin caller"
+                ));
+                assert_eq!(
+                    err.code(),
+                    Code::PermissionDenied,
+                    concat!(stringify!($method), " (non-admin) must be PermissionDenied")
+                );
+
+                // No verified identity (disabled, or permissive with no credential) passes the gate,
+                // keeping the non-enforcing modes working; the call then proceeds and may fail for
+                // unrelated reasons, but must never be rejected as PermissionDenied by the gate.
+                if let Err(e) = svc.$method(Request::new($req)).await {
+                    assert_ne!(
+                        e.code(),
+                        Code::PermissionDenied,
+                        concat!(stringify!($method), " (anonymous) must not be gate-rejected")
+                    );
+                }
+            }};
+        }
+
+        assert_admin_gated!(
+            create_partition,
+            CreatePartitionRequest {
+                name: "pwn".into(),
+                nodes: "ALL".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            update_partition,
+            UpdatePartitionRequest {
+                name: "tenant-b".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            delete_partition,
+            DeletePartitionRequest {
+                name: "tenant-b".into(),
+            }
+        );
+        assert_admin_gated!(
+            update_node,
+            UpdateNodeRequest {
+                name: "victim-node".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(reconfigure, ());
+        assert_admin_gated!(create_token, CreateTokenRequest::default());
+        assert_admin_gated!(list_tokens, ListTokensRequest::default());
+        assert_admin_gated!(
+            revoke_token,
+            RevokeTokenRequest {
+                token_id: "t".into(),
+            }
+        );
+        assert_admin_gated!(
+            create_reservation,
+            CreateReservationRequest {
+                name: "r".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            update_reservation,
+            UpdateReservationRequest {
+                name: "r".into(),
+                ..Default::default()
+            }
+        );
+        assert_admin_gated!(
+            delete_reservation,
+            DeleteReservationRequest {
+                name: "r".into(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_mutation_allows_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6820).await;
+
+        // An admin identity passes the gate and the partition is actually created.
+        svc.create_partition(admin_request(CreatePartitionRequest {
+            name: "team-a".into(),
+            nodes: "node-a".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an admin caller may create a partition");
+
+        assert!(
+            svc.cluster
+                .get_partitions()
+                .iter()
+                .any(|p| p.name == "team-a"),
+            "the admin's partition must exist after the gated call succeeds"
+        );
+
+        // A structurally different RPC (token issuance) also passes the admin gate.
+        let token_resp = svc
+            .create_token(admin_request(CreateTokenRequest::default()))
+            .await
+            .expect("an admin caller may create a token");
+        assert!(
+            !token_resp.into_inner().token_id.is_empty(),
+            "the admin's token must be issued"
+        );
+    }
+
+    // --- register_agent relabeling gate ---
+    //
+    // A node re-registering with different labels reaches the same NodeLabelsUpdate WAL op as the
+    // gated `update_node`, so it must be admin-gated too; first registration and an unchanged
+    // re-registration must not be, so a node agent can still self-register with no identity.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_first_registration_needs_no_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "fresh-node".into(),
+            address: "127.0.0.1".into(),
+            labels: [("pool".to_string(), "a".to_string())].into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("first registration must not require an admin identity");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_relabel_of_existing_node_is_admin_gated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "victim-node", 6821).await;
+
+        let relabel = || RegisterAgentRequest {
+            hostname: "victim-node".into(),
+            address: "127.0.0.1".into(),
+            labels: [("pool".to_string(), "stolen".to_string())].into(),
+            ..Default::default()
+        };
+
+        let mut r = Request::new(relabel());
+        r.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(r)
+            .await
+            .expect_err("a non-admin caller must not be able to relabel an existing node");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(
+            svc.cluster
+                .get_node("victim-node")
+                .unwrap()
+                .labels
+                .is_empty(),
+            "the rejected relabel must not have applied"
+        );
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "victim-node".into(),
+            address: "127.0.0.1".into(),
+            labels: std::collections::HashMap::new(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an unchanged re-registration must not be admin-gated");
+
+        svc.register_agent(admin_request(relabel()))
+            .await
+            .expect("an admin caller may relabel an existing node");
+        assert_eq!(
+            svc.cluster.get_node("victim-node").unwrap().labels["pool"],
+            "stolen"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_unchanged_non_empty_labels_needs_no_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "steady-node", 6822).await;
+
+        let labels: std::collections::HashMap<String, String> =
+            [("pool".to_string(), "prod".to_string())].into();
+        svc.register_agent(admin_request(RegisterAgentRequest {
+            hostname: "steady-node".into(),
+            address: "127.0.0.1".into(),
+            labels: labels.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an admin may set the initial labels");
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "steady-node".into(),
+            address: "127.0.0.1".into(),
+            labels,
+            ..Default::default()
+        }))
+        .await
+        .expect("re-registering with the same non-empty labels must not be admin-gated");
+    }
+
+    // The diff a non-admin's re-registration is checked against is read at write time, not decided
+    // ahead of it — so a non-admin can't revert a relabel that lands between their read and write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_non_admin_cannot_revert_a_privileged_relabel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "contended-node", 6823).await;
+
+        svc.register_agent(admin_request(RegisterAgentRequest {
+            hostname: "contended-node".into(),
+            address: "127.0.0.1".into(),
+            labels: [("pool".to_string(), "prod".to_string())].into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an admin may relabel the node");
+
+        let mut r = Request::new(RegisterAgentRequest {
+            hostname: "contended-node".into(),
+            address: "127.0.0.1".into(),
+            labels: std::collections::HashMap::new(),
+            ..Default::default()
+        });
+        r.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(r)
+            .await
+            .expect_err("a non-admin re-registration must not revert the privileged relabel");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_node("contended-node").unwrap().labels["pool"],
+            "prod",
+            "the privileged relabel must survive the non-admin's attempt"
+        );
+    }
+
+    // Runs the admin and non-admin relabel concurrently (not sequentially) so the gate's decision
+    // is genuinely raced against the write, not just checked against an already-settled state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_agent_concurrent_non_admin_relabel_never_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = std::sync::Arc::new(test_service(&dir).await);
+        register_plain_node(&svc, "racy-node", 6824).await;
+
+        let admin_svc = svc.clone();
+        let admin_task = tokio::spawn(async move {
+            admin_svc
+                .register_agent(admin_request(RegisterAgentRequest {
+                    hostname: "racy-node".into(),
+                    address: "127.0.0.1".into(),
+                    labels: [("pool".to_string(), "prod".to_string())].into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+
+        let non_admin_svc = svc.clone();
+        let non_admin_task = tokio::spawn(async move {
+            let mut r = Request::new(RegisterAgentRequest {
+                hostname: "racy-node".into(),
+                address: "127.0.0.1".into(),
+                labels: [("pool".to_string(), "hacked".to_string())].into(),
+                ..Default::default()
+            });
+            r.extensions_mut().insert(viewer("mallory", false));
+            non_admin_svc.register_agent(r).await
+        });
+
+        let (admin_result, non_admin_result) = tokio::join!(admin_task, non_admin_task);
+        admin_result
+            .unwrap()
+            .expect("the admin's relabel must succeed regardless of scheduling order");
+        let non_admin_err = non_admin_result
+            .unwrap()
+            .expect_err("the non-admin's concurrent relabel must never win the race");
+        assert_eq!(non_admin_err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_node("racy-node").unwrap().labels["pool"],
+            "prod",
+            "only the admin's labels may land, whichever task the scheduler ran first"
+        );
     }
 
     // --- authoritative_user ---
