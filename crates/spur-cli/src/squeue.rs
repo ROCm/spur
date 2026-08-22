@@ -57,6 +57,10 @@ pub struct SqueueArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
+    /// Accepted for Slurm compatibility; has no effect
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
@@ -458,6 +462,13 @@ mod tests {
         // -h is reclaimed for --noheader, but --help must still print help.
         let err = SqueueArgs::try_parse_from(["squeue", "--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = SqueueArgs::try_parse_from(["squeue", "--noconvert"]).unwrap();
+        assert!(args.noconvert);
     }
 
     #[test]
