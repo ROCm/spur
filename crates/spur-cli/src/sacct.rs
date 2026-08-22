@@ -159,6 +159,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_default();
 
+    let job_ids = args.jobs.as_deref().map(parse_job_ids).unwrap_or_default();
+
     let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to controller")?;
@@ -182,6 +184,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             start_after,
             start_before,
             states,
+            job_ids,
             limit: args.limit,
         })
         .await
@@ -267,6 +270,21 @@ fn parse_acct_state(s: &str) -> Option<i32> {
         "PD" | "PENDING" => Some(0),
         _ => None,
     }
+}
+
+/// Parse a Slurm-style `-j/--jobs` value into numeric job IDs.
+///
+/// Accepts a comma-separated list and tolerates step suffixes (`30.0`,
+/// `30.batch`) by matching the base job ID, since Spur accounting records whole
+/// jobs rather than individual steps. Unparseable entries are dropped, mirroring
+/// squeue's job-ID handling.
+fn parse_job_ids(s: &str) -> Vec<u32> {
+    s.split(',')
+        .filter_map(|tok| {
+            let base = tok.trim().split('.').next().unwrap_or_default();
+            base.parse::<u32>().ok()
+        })
+        .collect()
 }
 
 fn format_elapsed(job: &spur_proto::proto::JobInfo) -> String {
@@ -411,5 +429,20 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("no recognized fields"));
+    }
+
+    #[test]
+    fn parse_job_ids_handles_lists_steps_and_junk() {
+        assert_eq!(parse_job_ids("30"), vec![30]);
+        assert_eq!(parse_job_ids("30,31,32"), vec![30, 31, 32]);
+        // Surrounding whitespace is tolerated.
+        assert_eq!(parse_job_ids(" 30 , 31 "), vec![30, 31]);
+        // Step suffixes collapse to the base job ID (Spur records jobs, not steps).
+        assert_eq!(parse_job_ids("30.0"), vec![30]);
+        assert_eq!(parse_job_ids("30.batch,31.0"), vec![30, 31]);
+        // Unparseable tokens are dropped, not turned into a bogus filter.
+        assert_eq!(parse_job_ids("30,abc,31"), vec![30, 31]);
+        assert!(parse_job_ids("").is_empty());
+        assert!(parse_job_ids("abc").is_empty());
     }
 }
