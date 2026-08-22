@@ -62,9 +62,12 @@ impl AddressPool {
         let prefix_len: u8 = prefix_str
             .parse()
             .map_err(|_| AddressError::InvalidCidr(cidr.into()))?;
-        if prefix_len > 30 {
+        // A /0 would shift the mask below by a full 32 bits, and would do the
+        // same to `allocate`'s host_bits; the pool also needs host bits to hand
+        // out, which is what bounds the other end.
+        if prefix_len == 0 || prefix_len > 30 {
             return Err(AddressError::InvalidCidr(
-                "prefix length must be <= 30".into(),
+                "prefix length must be between 1 and 30".into(),
             ));
         }
         let base = u32::from(addr);
@@ -169,5 +172,19 @@ mod tests {
         assert!(AddressPool::new("not-a-cidr").is_err());
         assert!(AddressPool::new("10.0.0.0/33").is_err());
         assert!(AddressPool::new("10.0.0.0").is_err());
+    }
+
+    /// The prefix guard only bounded the top end, so a /0 reached an unchecked
+    /// 32-bit shift instead of being rejected.
+    #[test]
+    fn test_zero_prefix_rejected() {
+        assert!(AddressPool::new("0.0.0.0/0").is_err());
+        assert!(AddressPool::new("10.0.0.0/0").is_err());
+    }
+
+    #[test]
+    fn test_widest_accepted_prefix_allocates() {
+        let mut pool = AddressPool::new("10.0.0.0/1").unwrap();
+        assert!(pool.allocate().is_ok());
     }
 }
