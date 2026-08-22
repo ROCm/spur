@@ -46,10 +46,18 @@ fn job_tres(spec: &JobSpec) -> (u64, u64, u64, u64) {
 /// `account_running_tres` (empty for the submit-time standalone evaluation),
 /// exceed the per-job or account-group cap? Wall is handled separately because
 /// the association wall cap denies unconditionally at submission.
+///
+/// `grp_node_charge` is the node count charged against `grp_tres` specifically
+/// — distinct from `job_node` below because a caller that knows the job could
+/// pack onto nodes the account already occupies may pass a smaller number than
+/// `spec.num_nodes`. The per-job node cap always uses the job's real requested
+/// node count, since it bounds a single job's own footprint rather than
+/// account-wide reuse.
 fn account_resource_breach(
     spec: &JobSpec,
     limits: &AccountLimits,
     account_running_tres: &TresRecord,
+    grp_node_charge: u64,
 ) -> Option<PendingReason> {
     let (job_cpu, job_node, job_mem, job_gpu) = job_tres(spec);
 
@@ -75,7 +83,7 @@ fn account_resource_breach(
             return Some(PendingReason::AssocGrpCpuLimit);
         }
         if grp.get(TresType::Node) > 0
-            && account_running_tres.get(TresType::Node) + job_node > grp.get(TresType::Node)
+            && account_running_tres.get(TresType::Node) + grp_node_charge > grp.get(TresType::Node)
         {
             return Some(PendingReason::AssocGrpNodeLimit);
         }
@@ -106,6 +114,27 @@ pub fn check_account_limits(
     user_submitted_count: u32,
     account_running_tres: &TresRecord,
 ) -> AccountCheckResult {
+    check_account_limits_with_grp_node_charge(
+        job,
+        limits,
+        user_running_count,
+        user_submitted_count,
+        account_running_tres,
+        job.spec.num_nodes as u64,
+    )
+}
+
+/// Like `check_account_limits`, but the node count charged against `grp_tres`
+/// is `grp_node_charge` rather than `job.spec.num_nodes` — see
+/// `account_resource_breach`.
+pub fn check_account_limits_with_grp_node_charge(
+    job: &Job,
+    limits: &AccountLimits,
+    user_running_count: u32,
+    user_submitted_count: u32,
+    account_running_tres: &TresRecord,
+    grp_node_charge: u64,
+) -> AccountCheckResult {
     if let Some(max) = limits.max_running_jobs {
         if user_running_count >= max {
             return AccountCheckResult::Blocked(PendingReason::AssocMaxJobsLimit);
@@ -124,7 +153,7 @@ pub fn check_account_limits(
         }
     }
 
-    match account_resource_breach(&job.spec, limits, account_running_tres) {
+    match account_resource_breach(&job.spec, limits, account_running_tres, grp_node_charge) {
         Some(reason) => AccountCheckResult::Blocked(reason),
         None => AccountCheckResult::Allowed,
     }
@@ -170,7 +199,7 @@ pub fn check_account_standalone_limits(
     spec: &JobSpec,
     limits: &AccountLimits,
 ) -> Option<PendingReason> {
-    account_resource_breach(spec, limits, &TresRecord::new())
+    account_resource_breach(spec, limits, &TresRecord::new(), spec.num_nodes as u64)
 }
 
 #[cfg(test)]
@@ -422,6 +451,46 @@ mod tests {
         assert_eq!(
             result,
             AccountCheckResult::Blocked(PendingReason::AssocGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn test_grp_node_charge_overrides_only_grp_branch() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        let limits = AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut running = TresRecord::new();
+        running.set(TresType::Node, 2); // raw request (2+3>4) would block
+
+        // A caller that knows the job can pack onto already-occupied nodes
+        // charges only 1 new node: 2 + 1 = 4 <= 4, so it's allowed.
+        let result = check_account_limits_with_grp_node_charge(&job, &limits, 0, 0, &running, 1);
+        assert_eq!(result, AccountCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_grp_node_charge_does_not_affect_max_tres_per_job() {
+        let mut max_tres = TresRecord::new();
+        max_tres.set(TresType::Node, 2);
+        let limits = AccountLimits {
+            max_tres_per_job: Some(max_tres),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3; // breaches the per-job cap of 2 regardless of packing
+
+        // Even a grp_node_charge of 0 must not rescue the per-job cap: it only
+        // overrides the grp_tres branch, not max_tres_per_job.
+        let result =
+            check_account_limits_with_grp_node_charge(&job, &limits, 0, 0, &TresRecord::new(), 0);
+        assert_eq!(
+            result,
+            AccountCheckResult::Blocked(PendingReason::AssocMaxNodePerJobLimit)
         );
     }
 
