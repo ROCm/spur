@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.9.0](https://github.com/ROCm/spur/compare/v0.8.0...v0.9.0) (2026-08-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurctld:** enforce QOS and association submit-time limits ([#670](https://github.com/ROCm/spur/issues/670))
+
+### Features
+
+* **auth:** authenticate callers of the agent (spurd) surface ([#641](https://github.com/ROCm/spur/issues/641)) ([54f3763](https://github.com/ROCm/spur/commit/54f3763b9bc9ca8bdf3d094364f225bbf282bd2a))
+* **auth:** authenticate control-plane callers (identity spine) ([#640](https://github.com/ROCm/spur/issues/640)) ([4a5201c](https://github.com/ROCm/spur/commit/4a5201ca9218ad5ba5f06860a917ca313c27c990))
+* **spur-cli:** filter squeue by node with -w/--nodelist ([#628](https://github.com/ROCm/spur/issues/628)) ([42a1519](https://github.com/ROCm/spur/commit/42a15193052305a53bec9612d0942638d3ed503d))
+* **spurctld:** add job submission validation hook (shell + lua) ([#565](https://github.com/ROCm/spur/issues/565)) ([18e5653](https://github.com/ROCm/spur/commit/18e565325bab0d91670eb89930b3f5f5e46d3e8a))
+* **spurctld:** enforce QOS and association submit-time limits ([#670](https://github.com/ROCm/spur/issues/670)) ([21017b6](https://github.com/ROCm/spur/commit/21017b6d0b12cc98477474b54dcd9f6f4ae53c28))
+* **spurctld:** implement scontrol requeue and requeuehold ([#629](https://github.com/ROCm/spur/issues/629)) ([b3c9b0f](https://github.com/ROCm/spur/commit/b3c9b0f5245ebe47eb2931300c5bbfa2f65fedb4))
+* **spurctld:** k0s partial-Ready and online worker add/remove ([#655](https://github.com/ROCm/spur/issues/655)) ([174fa20](https://github.com/ROCm/spur/commit/174fa206707fde228b72f4c2b90b60009d9f58d5))
+* **spurctld:** QOS preemption hierarchy and minimum exempt time ([#683](https://github.com/ROCm/spur/issues/683)) ([30333b6](https://github.com/ROCm/spur/commit/30333b6e94458164dd1574b73de69fa3d59e62fe))
+* **spurctld:** reap abandoned interactive allocations via client keepalive ([#594](https://github.com/ROCm/spur/issues/594)) ([6a0568b](https://github.com/ROCm/spur/commit/6a0568b2c88c9a3fda3b44a3995692cf41716eec))
+* **spurctld:** record preemption provenance on job state ([#700](https://github.com/ROCm/spur/issues/700)) ([513d319](https://github.com/ROCm/spur/commit/513d319cbaf5af7b2f8a46272c152457fb200821))
+* **spurctld:** record reservation admin actions in accounting txn log ([#698](https://github.com/ROCm/spur/issues/698)) ([d0909e5](https://github.com/ROCm/spur/commit/d0909e57dcb45eae27c8815d3800d75700d5cea1))
+
+
+### Bug Fixes
+
+* **deps:** bump h2 to 0.4.16 to resolve RUSTSEC-2026-0258 ([#671](https://github.com/ROCm/spur/issues/671)) ([c6e8e7b](https://github.com/ROCm/spur/commit/c6e8e7b21a3d1e9a78053236a6fd8c23da0e16a9))
+* **security:** enforce caller identity on job-mutation and agent RPCs ([#686](https://github.com/ROCm/spur/issues/686)) ([3c0e7af](https://github.com/ROCm/spur/commit/3c0e7af1d909e33b2b3c301e3df43538c356fd85))
+* **security:** fail closed on account ACLs and the required-mode signing key ([#688](https://github.com/ROCm/spur/issues/688)) ([7bddd79](https://github.com/ROCm/spur/commit/7bddd79f8f1d8806eb04a6ad18c71c2e8778b9da))
+* **security:** gate control-plane mutation RPCs on verified admin ([#685](https://github.com/ROCm/spur/issues/685)) ([d500bad](https://github.com/ROCm/spur/commit/d500badd37d75d8b5552d2dd1bb25db664325352))
+* **security:** harden the k8s operator plane tenancy boundary ([#687](https://github.com/ROCm/spur/issues/687)) ([87e1135](https://github.com/ROCm/spur/commit/87e1135d94511fa8edb4de5d91b7612ba99decec))
+* **security:** refuse root execution, default the REST API off, gate the admin kubeconfig ([#637](https://github.com/ROCm/spur/issues/637)) ([ab802e4](https://github.com/ROCm/spur/commit/ab802e4260ab73866c77f24457f48219661d771e))
+* **spur-cli:** accept slurm-format reservation durations ([#626](https://github.com/ROCm/spur/issues/626)) ([9697ed6](https://github.com/ROCm/spur/commit/9697ed6a191250ffd49fd30bbe4949e9c38cad6b))
+* **spur-cli:** accept Slurm's full time grammar for --begin and --deadline ([#556](https://github.com/ROCm/spur/issues/556)) ([10971ec](https://github.com/ROCm/spur/commit/10971ec1dc640356f8bf0870cedd46d56b346968))
+* **spur-cli:** resolve first allocated node from compressed hostlist ([#589](https://github.com/ROCm/spur/issues/589)) ([eee669e](https://github.com/ROCm/spur/commit/eee669e69b81047e34124efffab9bcfea6fda526))
+* **spur-cli:** support ALL in node subcommands ([#568](https://github.com/ROCm/spur/issues/568)) ([4ad42c9](https://github.com/ROCm/spur/commit/4ad42c9df12e69d069a67b33ad62f5140c2cff56))
+* **spur-core:** deny GPU visibility when zero devices are allocated ([#648](https://github.com/ROCm/spur/issues/648)) ([323ea7e](https://github.com/ROCm/spur/commit/323ea7ee2f66f15d95ed8a76035bab7250ae3b66))
+* **spur-core:** emit node-local load balancing for HA mesh k0s clusters ([#708](https://github.com/ROCm/spur/issues/708)) ([36213a1](https://github.com/ROCm/spur/commit/36213a19c8932e1fc9b8c3746ac1c4eb09eabc58))
+* **spur-core:** ignore quoted srun tokens in batch step detection ([#627](https://github.com/ROCm/spur/issues/627)) ([1765105](https://github.com/ROCm/spur/commit/17651055ea7e988f7429587beb7ac915806768c7))
+* **spur-core:** prevent stray ']' from merging hosts in split_top_level ([#643](https://github.com/ROCm/spur/issues/643)) ([5ac18f0](https://github.com/ROCm/spur/commit/5ac18f01dbe2705e2e0092c032dae0176523caa6))
+* **spur-core:** reject hostlist patterns with ']' before '[' ([#639](https://github.com/ROCm/spur/issues/639)) ([bdd2528](https://github.com/ROCm/spur/commit/bdd252880ce7b061cbf535e89287f6787f0460c8))
+* **spur-core:** use checked arithmetic in time parsers to prevent overflow ([#680](https://github.com/ROCm/spur/issues/680)) ([4cc3da8](https://github.com/ROCm/spur/commit/4cc3da843d7782774b616b2cdf7fc1e0d2cde777))
+* **spurctld:** adopt each node's real WireGuard address as its k0s mesh IP ([#699](https://github.com/ROCm/spur/issues/699)) ([a2fe221](https://github.com/ROCm/spur/commit/a2fe22100783af54d3f8420961353888a85b2789))
+* **spurctld:** cool down a node that rejects a dispatch as resources-unavailable ([#584](https://github.com/ROCm/spur/issues/584)) ([e19a7a1](https://github.com/ROCm/spur/commit/e19a7a17f31f8829bd7f49da94a25cbb426dd6f7))
+* **spurctld:** count distinct nodes for the QoS group node limit ([#709](https://github.com/ROCm/spur/issues/709)) ([#714](https://github.com/ROCm/spur/issues/714)) ([a3da921](https://github.com/ROCm/spur/commit/a3da92103b3c56cb82002d7dedef4f7ee11bcda8))
+* **spurctld:** enforce partition walltime limits and validate time config ([#593](https://github.com/ROCm/spur/issues/593)) ([172bf8f](https://github.com/ROCm/spur/commit/172bf8f90aea309a90b8bf17bad2ff530ea23cb9))
+* **spurctld:** enforce QOS GrpWall at scheduling admission ([#675](https://github.com/ROCm/spur/issues/675)) ([5a648bd](https://github.com/ROCm/spur/commit/5a648bd24efea7d126e510ed4f2f50959d3f6d0d))
+* **spurctld:** hold off marking nodes down right after leadership change ([#624](https://github.com/ROCm/spur/issues/624)) ([33b65f6](https://github.com/ROCm/spur/commit/33b65f60f4cfcc7895b8dd9836e3d9123676360f))
+* **spurctld:** preserve node allocations during recovery ([#613](https://github.com/ROCm/spur/issues/613)) ([42cfe92](https://github.com/ROCm/spur/commit/42cfe92bd8383f343fa39d9668dab37720d0b43a))
+* **spurctld:** QOS priority not applied to job priority; preemption never triggers ([#652](https://github.com/ROCm/spur/issues/652)) ([48d28bb](https://github.com/ROCm/spur/commit/48d28bb18c8d4cacdec6a041ee2145afebe1c8aa))
+* **spurctld:** reclaim agent allocations the controller no longer tracks on that node ([#623](https://github.com/ROCm/spur/issues/623)) ([0d8b8cb](https://github.com/ROCm/spur/commit/0d8b8cb0756e024a2615adf5381a014f67bc80e4))
+* **spurctld:** reject submits from users with no account association ([#706](https://github.com/ROCm/spur/issues/706)) ([d6001b4](https://github.com/ROCm/spur/commit/d6001b473747ea18883b0b4336959c951ace6865))
+* **spurctld:** report BeginTime while --begin defers a job ([#555](https://github.com/ROCm/spur/issues/555)) ([c20a051](https://github.com/ROCm/spur/commit/c20a05127b2f225876cf8445ac5a53dbb4be03b0))
+* **spurctld:** tag in-pass-blocked jobs so pending reason is never None ([#620](https://github.com/ROCm/spur/issues/620)) ([831390d](https://github.com/ROCm/spur/commit/831390dc6922bde598600c082755bfa8caf00b15))
+* **spurd:** purge k0s join token on teardown even when reset fails ([#674](https://github.com/ROCm/spur/issues/674)) ([620070a](https://github.com/ROCm/spur/commit/620070ac2cbc37917ff7e0f94b742ec31a68f31c))
+* **spurd:** restore supplementary groups on nsenter exec/overlap paths ([#633](https://github.com/ROCm/spur/issues/633)) ([cd24487](https://github.com/ROCm/spur/commit/cd24487639589d8f027628364ae80ec8f57309a1))
+* **tenancy:** clamp non-admin priority and redact cross-tenant job info ([#663](https://github.com/ROCm/spur/issues/663), [#664](https://github.com/ROCm/spur/issues/664)) ([#666](https://github.com/ROCm/spur/issues/666)) ([1e535f2](https://github.com/ROCm/spur/commit/1e535f2cea5891dea17c20fe8171cd022ee0ac08))
+* use checked arithmetic for CIDR prefixes and token TTLs ([#716](https://github.com/ROCm/spur/issues/716)) ([fa629e8](https://github.com/ROCm/spur/commit/fa629e86568f9b95eb2a23f4aaecbe5b5b1eda1e))
+
 ## [0.8.0](https://github.com/ROCm/spur/compare/v0.7.0...v0.8.0) (2026-08-11)
 
 
