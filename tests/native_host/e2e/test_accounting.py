@@ -396,6 +396,51 @@ class TestQosLimitReasons:
             f"blocked job {blocked[0]} reason: {_reason(c, blocked[0])!r}"
         )
 
+    def test_grp_node_cap_admits_job_packable_onto_already_used_nodes(self, accounting_cluster):
+        # A QOS grp node=2 cap is fully occupied by two 1-cpu jobs pinned to
+        # two of the three available nodes, each with plenty of spare CPU. A
+        # third, unconstrained job under the same QOS must be admitted by
+        # packing onto one of the two occupied nodes — not pend on
+        # QOSGrpNodeLimit, and not spread onto the untouched third node
+        # (which would silently exceed the cap once running).
+        c = accounting_cluster
+        if len(c.node_names) < 3:
+            pytest.skip("requires 3 nodes: 2 to occupy the grp node cap, 1 left idle")
+        n0, n1 = c.node_names[0], c.node_names[1]
+
+        c.sacctmgr(["add", "qos", "name=packcap", "grptres=node=2"])
+        time.sleep(15)
+
+        hold_script = c.write_file("qos-pack-hold.sh", "#!/bin/bash\nsleep 60\n")
+        hold_ids = []
+        for node in (n0, n1):
+            job_id = parse_job_id(
+                c.sbatch(
+                    ["-J", "pack-hold", "-N", "1", "-c", "1", "-w", node,
+                     "-q", "packcap", hold_script]
+                )
+            )
+            assert job_id is not None
+            hold_ids.append(job_id)
+        for jid in hold_ids:
+            wait_job_state(c, jid, "R", timeout=30)
+
+        pack_script = c.write_file("qos-pack-new.sh", "#!/bin/bash\nsleep 20\n")
+        new_id = parse_job_id(
+            c.sbatch(["-J", "pack-new", "-N", "1", "-c", "1", "-q", "packcap", pack_script])
+        )
+        assert new_id is not None
+
+        wait_job_state(c, new_id, "R", timeout=30)
+        show = c.scontrol("show", "job", str(new_id))
+        node_match = re.search(r"NodeList=(\S+)", show)
+        assert node_match, f"missing NodeList in scontrol output:\n{show}"
+        landed_on = node_match.group(1)
+        assert landed_on in (n0, n1), (
+            f"expected the packable job to land on an already-occupied node "
+            f"({n0} or {n1}), not spread to the idle third node; got {landed_on!r}"
+        )
+
 
 class TestSacctmgrUserAssociationLimits:
     def test_maxjobs_set_via_add_user_blocks_a_second_job(self, accounting_cluster):

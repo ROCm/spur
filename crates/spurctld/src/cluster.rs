@@ -6418,13 +6418,13 @@ enum GateOutcome {
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
     blocked: &mut Vec<(JobId, PendingReason)>,
-    mut gate: impl FnMut(&Job) -> GateOutcome,
+    mut gate: impl FnMut(&mut Job) -> GateOutcome,
 ) {
-    candidates.retain(|candidate| {
+    candidates.retain_mut(|candidate| {
         if !candidate.scheduling_eligible {
             return true;
         }
-        match gate(&candidate.job) {
+        match gate(&mut candidate.job) {
             GateOutcome::Keep => true,
             GateOutcome::Block(reason) => {
                 record_blocked(blocked, candidate, reason);
@@ -6493,9 +6493,11 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
 }
 
 /// `Some(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
-/// folds in headroom claimed earlier this pass so it can't over-subscribe.
+/// folds in headroom claimed earlier this pass so it can't over-subscribe. On
+/// success, extends `job.preferred_nodes` with any nodes credited toward the
+/// grp-node cap so placement actually lands on one of them.
 fn qos_block_with(
-    job: &Job,
+    job: &mut Job,
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
     nodes: &HashMap<String, Node>,
@@ -6539,7 +6541,7 @@ fn qos_block_with(
     }
 
     let qos_occupied = occupied_nodes(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
-    let grp_node_charge = new_distinct_nodes_needed(job, &qos_occupied, nodes);
+    let (grp_node_charge, reusable_nodes) = new_distinct_nodes_needed(job, &qos_occupied, nodes);
 
     match check_qos_limits_with_grp_node_charge(
         job,
@@ -6551,15 +6553,20 @@ fn qos_block_with(
         consumed_wall_minutes,
         grp_node_charge,
     ) {
-        QosCheckResult::Allowed => None,
+        QosCheckResult::Allowed => {
+            job.preferred_nodes.extend(reusable_nodes);
+            None
+        }
         QosCheckResult::Blocked(reason) => Some(reason),
     }
 }
 
 /// `Some(reason)` if the job would exceed its (user, account) association cap (no
 /// account means unconstrained). `reserved` folds in this pass's claimed headroom.
+/// On success, extends `job.preferred_nodes` with any nodes credited toward the
+/// grp-node cap so placement actually lands on one of them.
 fn account_block_with(
-    job: &Job,
+    job: &mut Job,
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
     nodes: &HashMap<String, Node>,
@@ -6601,7 +6608,8 @@ fn account_block_with(
     }
 
     let account_occupied = occupied_nodes(jobs, |j| j.spec.account.as_deref() == Some(account));
-    let grp_node_charge = new_distinct_nodes_needed(job, &account_occupied, nodes);
+    let (grp_node_charge, reusable_nodes) =
+        new_distinct_nodes_needed(job, &account_occupied, nodes);
 
     match check_account_limits_with_grp_node_charge(
         job,
@@ -6611,7 +6619,10 @@ fn account_block_with(
         &account_running_tres,
         grp_node_charge,
     ) {
-        AccountCheckResult::Allowed => None,
+        AccountCheckResult::Allowed => {
+            job.preferred_nodes.extend(reusable_nodes);
+            None
+        }
         AccountCheckResult::Blocked(reason) => Some(reason),
     }
 }
@@ -6777,8 +6788,11 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
 }
 
 /// Distinct NEW nodes `job` would need beyond `occupied`, given each occupied
-/// node's live spare capacity and scheduling eligibility. A job that fits
-/// entirely on already-occupied nodes needs 0 new nodes.
+/// node's live spare capacity and scheduling eligibility, plus the specific
+/// occupied node names that qualified as reusable (for the caller to feed to
+/// `Job::preferred_nodes`, so placement actually lands on one of them instead
+/// of the admission credit going unenforced). A job that fits entirely on
+/// already-occupied nodes needs 0 new nodes.
 ///
 /// Reservation-fencing is intentionally not checked here (matching
 /// `job_candidate_node_names`'s scope): worst case a reserved node is
@@ -6791,25 +6805,30 @@ fn new_distinct_nodes_needed(
     job: &Job,
     occupied: &HashSet<String>,
     nodes: &HashMap<String, Node>,
-) -> u64 {
+) -> (u64, HashSet<String>) {
     if job.spec.exclusive {
-        return job.spec.num_nodes as u64;
+        return (job.spec.num_nodes as u64, HashSet::new());
     }
     let placement = spur_sched::node_match::NodePlacement::new(job);
     let required = spur_sched::backfill::job_resource_request(job);
-    let reusable = occupied
+    let reusable: HashSet<String> = occupied
         .iter()
-        .filter_map(|name| nodes.get(name))
-        .filter(|node| {
-            placement.allows_name(&node.name)
-                && placement.in_partition(node)
-                && placement.has_features(node)
-                && node.can_satisfy_request(&required)
+        .filter(|name| {
+            nodes.get(*name).is_some_and(|node| {
+                placement.allows_name(&node.name)
+                    && placement.in_partition(node)
+                    && placement.has_features(node)
+                    && node.can_satisfy_request(&required)
+            })
         })
-        .count() as u32;
-    job.spec
+        .cloned()
+        .collect();
+    let reusable_count = reusable.len() as u32;
+    let charge = job
+        .spec
         .num_nodes
-        .saturating_sub(reusable.min(job.spec.num_nodes)) as u64
+        .saturating_sub(reusable_count.min(job.spec.num_nodes)) as u64;
+    (charge, reusable)
 }
 
 /// The TRES a single job occupies (its scheduling footprint). Shared by the
@@ -15599,6 +15618,80 @@ mod tests {
             PendingReason::QosGrpNodeLimit,
             "only n1 has spare capacity to reuse, so the job still needs 1 new \
              distinct node beyond the 2 already occupying the grp cap of 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_packing_credit_actually_places_on_occupied_node() {
+        // A 3rd, fully idle node sits alongside the 2 occupied ones the grp
+        // node=2 cap counts. Without preferred_nodes, the scheduler's default
+        // least-loaded tiebreaker would place the admitted job on the idle
+        // node instead of packing onto n1/n2, silently exceeding the true
+        // grp cap once running. Assert both the admission credit and the
+        // real scheduler's placement land on n1/n2, never n3.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for n in ["n1", "n2", "n3"] {
+            register_node(&cm, n, 8, 128000);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "cvs".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            for (id, nodes) in [(101u32, ["n1"]), (102, ["n2"])] {
+                let mut j = make_running_job(id, &nodes, 1);
+                j.spec.num_nodes = 1;
+                j.spec.qos = Some("cvs".into());
+                jobs.insert(id, j);
+            }
+        }
+
+        let mut newjob = basic_spec("pack-me");
+        newjob.qos = Some("cvs".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        let pending = cm.pending_jobs();
+        let job = pending
+            .iter()
+            .find(|j| j.job_id == new_id)
+            .expect("job must be admitted past the grp node cap via packing credit");
+        assert_eq!(
+            job.preferred_nodes,
+            HashSet::from(["n1".to_string(), "n2".to_string()]),
+            "admission must credit exactly the occupied nodes with spare capacity"
+        );
+
+        let nodes = cm.get_nodes();
+        let partitions = cm.get_partitions();
+        let reservations = cm.get_reservations();
+        let cluster_state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+        use spur_sched::traits::Scheduler as _;
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
+        let assignments = scheduler.schedule(&pending, &cluster_state);
+        let assignment = assignments
+            .iter()
+            .find(|a| a.job_id == new_id)
+            .expect("scheduler must actually place the admitted job");
+        assert!(
+            assignment.nodes.iter().all(|n| n == "n1" || n == "n2"),
+            "placement must land on an already-occupied node (n1/n2), not the idle n3: {:?}",
+            assignment.nodes
         );
     }
 

@@ -19,6 +19,9 @@ pub struct NodePlacement<'a> {
     job: &'a Job,
     /// Expanded, deduplicated `--nodelist`, whose cardinality determines
     /// whether the request is a candidate pool or an additive requirement.
+    /// Falls back to `job.preferred_nodes` (a QOS/account grp-node admission
+    /// credit) when the job didn't request one explicitly, so placement
+    /// honors the same reuse assumption admission made.
     nodelist: Option<HashSet<String>>,
     /// `--exclude` deny-list (expanded from hostlist).
     exclude: HashSet<String>,
@@ -36,7 +39,8 @@ impl<'a> NodePlacement<'a> {
             .nodelist
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)));
+            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
+            .or_else(|| (!job.preferred_nodes.is_empty()).then(|| job.preferred_nodes.clone()));
 
         let exclude = job
             .spec
@@ -316,6 +320,54 @@ mod tests {
         assert!(p.allows_name("node001"));
         assert!(p.allows_name("node003"));
         assert!(!p.allows_name("node004"));
+    }
+
+    #[test]
+    fn preferred_nodes_restricts_when_it_fully_covers_num_nodes() {
+        let mut job = job_with(JobSpec {
+            num_nodes: 1,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string(), "node002".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(!p.nodelist_is_additive());
+        assert!(p.allows_name("node001"));
+        assert!(p.allows_name("node002"));
+        assert!(!p.allows_name("node003"));
+    }
+
+    #[test]
+    fn preferred_nodes_is_additive_when_it_falls_short_of_num_nodes() {
+        let mut job = job_with(JobSpec {
+            num_nodes: 3,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(p.nodelist_is_additive());
+        assert!(p.allows_name("node001"));
+        assert!(
+            p.allows_name("node002"),
+            "additive: nodes outside the credited set are still allowed"
+        );
+        assert!(p.is_listed("node001"));
+        assert!(!p.is_listed("node002"));
+    }
+
+    #[test]
+    fn explicit_nodelist_takes_priority_over_preferred_nodes() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node001".into()),
+            num_nodes: 1,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node002".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(p.allows_name("node001"), "user's own nodelist must win");
+        assert!(
+            !p.allows_name("node002"),
+            "preferred_nodes must not override an explicit nodelist"
+        );
     }
 
     #[test]

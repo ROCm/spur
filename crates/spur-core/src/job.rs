@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use crate::burst_buffer::BbStageState;
@@ -857,6 +857,14 @@ pub struct Job {
     /// the preemption. `None` for plain priority-based preemption.
     #[serde(default)]
     pub preempt_qos: Option<String>,
+
+    /// Nodes the QOS/account grp-node admission check credited this job for
+    /// reusing (they had spare capacity), recomputed fresh every scheduling
+    /// pass. Consulted by `NodePlacement` as a nodelist fallback so placement
+    /// honors the assumption admission made. Never persisted: a same-pass hint
+    /// only, meaningless once the pass that computed it ends.
+    #[serde(skip)]
+    pub preferred_nodes: HashSet<String>,
 }
 
 impl Job {
@@ -910,6 +918,7 @@ impl Job {
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
+            preferred_nodes: HashSet::new(),
         }
     }
 
