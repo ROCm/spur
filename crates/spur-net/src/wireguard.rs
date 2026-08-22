@@ -258,6 +258,36 @@ pub fn list_peers(interface: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Map each peer's pubkey to its known underlay endpoint (`wg show <iface> endpoints`); peers with
+/// `(none)` are skipped. Lets the controller re-advertise worker↔worker endpoints in membership.
+pub fn peer_endpoints(
+    interface: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let output = Command::new("wg")
+        .args(["show", interface, "endpoints"])
+        .output()
+        .context("failed to run `wg show endpoints`")?;
+    if !output.status.success() {
+        bail!(
+            "wg show {interface} endpoints failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut map = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\t');
+        let (Some(key), Some(endpoint)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (key, endpoint) = (key.trim(), endpoint.trim());
+        if key.is_empty() || endpoint.is_empty() || endpoint == "(none)" {
+            continue;
+        }
+        map.insert(key.to_string(), endpoint.to_string());
+    }
+    Ok(map)
+}
+
 /// The public key of an existing WireGuard interface (`wg show <iface> public-key`).
 pub fn interface_public_key(interface: &str) -> anyhow::Result<String> {
     let output = Command::new("wg")

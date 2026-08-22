@@ -2579,7 +2579,9 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<MeshMembership>,
     ) -> Result<Response<ApplyMeshResponse>, Status> {
-        let iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        // Use the interface spurd resolved at startup (via the reporter), not a fresh env read
+        // that would ignore spur.conf and could diverge from the rest of spurd.
+        let iface = self.reporter.wg_iface.clone();
         // proto -> spur-net mesh types.
         let members: Vec<spur_net::mesh::MeshNode> = request
             .into_inner()
