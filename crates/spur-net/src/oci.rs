@@ -15,6 +15,7 @@
 //! 5. Extract layers in order to build rootfs
 //! 6. Pack rootfs into squashfs via mksquashfs
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,7 +45,15 @@ struct TokenResponse {
 struct Manifest {
     #[serde(default)]
     layers: Vec<LayerDescriptor>,
+    /// Image config blob, which carries `config.Env`.
+    #[serde(default)]
+    config: Option<ConfigDescriptor>,
     // v1 compat: some registries return "fsLayers" instead
+}
+
+#[derive(Deserialize)]
+struct ConfigDescriptor {
+    digest: String,
 }
 
 #[derive(Deserialize)]
@@ -354,6 +363,26 @@ async fn pull_and_extract(
         let media_type = &manifest.layers[i].media_type;
         extract_layer(data, Some(media_type), rootfs_dir)
             .with_context(|| format!("failed to extract layer {}", i + 1))?;
+    }
+
+    // Best effort: a registry that will not serve the config blob still yields
+    // a usable image, and jobs using it fall back to the host environment.
+    match manifest.config.as_ref() {
+        Some(config) => {
+            if let Err(e) = fetch_and_record_config(
+                &client,
+                image_ref,
+                &registry_url,
+                &config.digest,
+                token.as_deref(),
+                rootfs_dir,
+            )
+            .await
+            {
+                warn!(error = %e, digest = %config.digest, "image environment not captured");
+            }
+        }
+        None => debug!("manifest has no config descriptor; image environment not captured"),
     }
 
     Ok(())
@@ -721,12 +750,261 @@ pub fn sanitize_name(name: &str) -> String {
     name.replace("docker://", "").replace(['/', ':'], "+")
 }
 
+/// Where an image's OCI config is recorded inside the rootfs, so the node agent
+/// can seed container jobs with the environment the image ships.
+pub const IMAGE_CONFIG_PATH: &str = "etc/spur/image-config.json";
+
+/// Variables that accumulate instead of replacing: the image's entries come
+/// first so its executables and libraries stay reachable, and the job's are
+/// appended so host additions still apply.
+const UNIONED_VARS: [&str; 2] = ["PATH", "LD_LIBRARY_PATH"];
+
+/// Cap on the recorded config a job launch will read. `--container-image`
+/// accepts an arbitrary squashfs path, so this file is user-supplied content
+/// and the node agent reads it as root.
+const MAX_IMAGE_CONFIG_BYTES: u64 = 1 << 20;
+
+/// Resolve the recorded-config path inside `rootfs`, refusing to traverse a
+/// symlink. The rootfs is unpacked from an image spur does not control, so an
+/// image shipping `etc` as a symlink would otherwise redirect the write out of
+/// the tree at import, and the read out of the tree at launch.
+fn image_config_path(rootfs: &Path) -> anyhow::Result<PathBuf> {
+    let mut path = rootfs.to_path_buf();
+    for component in Path::new(IMAGE_CONFIG_PATH).iter() {
+        path.push(component);
+        if path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            bail!("{} is a symlink", path.display());
+        }
+    }
+    Ok(path)
+}
+
+/// Record an image's OCI config inside the rootfs, before it is packed into
+/// squashfs, for `container_base_env` to read back at launch.
+pub fn record_image_config(rootfs: &Path, config_json: &[u8]) -> anyhow::Result<()> {
+    serde_json::from_slice::<serde_json::Value>(config_json)
+        .context("invalid image config JSON")?;
+    let dest = image_config_path(rootfs)?;
+    let dir = dest.parent().expect("IMAGE_CONFIG_PATH is not the root");
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::write(&dest, config_json).with_context(|| format!("write {}", dest.display()))
+}
+
+/// Base environment for a container job: the image's own `config.Env` with the
+/// job environment layered on top, as `docker run` would apply it.
+///
+/// `PATH` and `LD_LIBRARY_PATH` are unioned, image entries first, rather than
+/// replaced. That is what keeps executables shipped in the image resolvable
+/// when the job exports a host `PATH`, which it does by default under
+/// `--export ALL`.
+///
+/// Images imported before spur recorded the config have nothing to read, so the
+/// job environment is returned unchanged and they keep behaving as they did.
+pub fn container_base_env(
+    rootfs: &Path,
+    job_env: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let Ok(path) = image_config_path(rootfs) else {
+        return job_env;
+    };
+    // Opening a FIFO blocks until a writer appears, which would stall the
+    // launch, so read the path only when it is a regular file.
+    if !path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_file())
+    {
+        return job_env;
+    }
+    let Ok(file) = std::fs::File::open(&path) else {
+        return job_env;
+    };
+    let mut config_json = Vec::new();
+    if file
+        .take(MAX_IMAGE_CONFIG_BYTES)
+        .read_to_end(&mut config_json)
+        .is_err()
+    {
+        return job_env;
+    }
+    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&config_json) else {
+        return job_env;
+    };
+
+    let mut env: HashMap<String, String> = config
+        .get("config")
+        .and_then(|config| config.get("Env"))
+        .and_then(|env| env.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str()?.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (key, value) in job_env {
+        let value = match env.get(&key) {
+            Some(image_value) if UNIONED_VARS.contains(&key.as_str()) => {
+                union_paths(image_value, &value)
+            }
+            _ => value,
+        };
+        env.insert(key, value);
+    }
+    env
+}
+
+/// Join two `PATH`-style lists, keeping the order of `first` and dropping
+/// duplicate and empty entries.
+fn union_paths(first: &str, second: &str) -> String {
+    let mut entries: Vec<&str> = Vec::new();
+    for entry in first.split(':').chain(second.split(':')) {
+        if !entry.is_empty() && !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries.join(":")
+}
+
+/// Download the image config blob and record it inside the rootfs.
+async fn fetch_and_record_config(
+    client: &reqwest::Client,
+    image_ref: &ImageRef,
+    registry_url: &str,
+    digest: &str,
+    token: Option<&str>,
+    rootfs_dir: &Path,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "{}/v2/{}/blobs/{}",
+        registry_url, image_ref.repository, digest
+    );
+    let mut req = client.get(&url);
+    if let Some(token) = token {
+        req = req.header(AUTHORIZATION, format!("Bearer {}", token));
+    }
+
+    let resp = req.send().await.context("failed to download config blob")?;
+    if !resp.status().is_success() {
+        bail!("registry returned {} for config blob", resp.status());
+    }
+    let config_json = resp.bytes().await.context("failed to read config blob")?;
+    record_image_config(rootfs_dir, &config_json)
+}
+
 #[cfg(test)]
 mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use flate2::{write::GzEncoder, Compression};
 
     use super::*;
+
+    fn image_config(env: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "config": { "Env": env } })).unwrap()
+    }
+
+    #[test]
+    fn image_env_seeds_the_container_and_search_paths_are_unioned() {
+        let rootfs = tempfile::tempdir().unwrap();
+        record_image_config(
+            rootfs.path(),
+            &image_config(&[
+                "PATH=/opt/venv/bin:/usr/bin",
+                "LD_LIBRARY_PATH=/opt/rocm/lib",
+                "IMG_MARKER=from_image",
+            ]),
+        )
+        .unwrap();
+        let job_env: HashMap<String, String> = [
+            ("PATH", "/usr/bin:/host/only"),
+            ("LD_LIBRARY_PATH", "/host/lib"),
+            ("IMG_MARKER", "from_job"),
+        ]
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+        let env = container_base_env(rootfs.path(), job_env);
+
+        // Image entries first, host entries appended, no duplicate /usr/bin.
+        assert_eq!(env["PATH"], "/opt/venv/bin:/usr/bin:/host/only");
+        assert_eq!(env["LD_LIBRARY_PATH"], "/opt/rocm/lib:/host/lib");
+        // Everything else: the job's value replaces the image's.
+        assert_eq!(env["IMG_MARKER"], "from_job");
+    }
+
+    #[test]
+    fn oversized_recorded_config_is_not_read_into_memory() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let dest = rootfs.path().join(IMAGE_CONFIG_PATH);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        // A string value that runs past the cap: the capped read cannot parse,
+        // so the job environment stands rather than the whole file being loaded.
+        let mut oversized = br#"{"config":{"Env":["PATH="#.to_vec();
+        oversized.resize(MAX_IMAGE_CONFIG_BYTES as usize + 4096, b'x');
+        oversized.extend_from_slice(br#""]}}"#);
+        std::fs::write(&dest, &oversized).unwrap();
+        let job_env: HashMap<String, String> =
+            std::iter::once(("PATH".to_string(), "/usr/bin".to_string())).collect();
+
+        assert_eq!(container_base_env(rootfs.path(), job_env.clone()), job_env);
+    }
+
+    #[test]
+    fn symlinked_path_component_is_refused_in_both_directions() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), rootfs.path().join("etc")).unwrap();
+
+        // An image shipping etc as a symlink must not redirect the write out of
+        // the rootfs at import...
+        assert!(record_image_config(rootfs.path(), &image_config(&["A=1"])).is_err());
+        assert!(!outside.path().join("spur/image-config.json").exists());
+
+        // ...nor the read at launch.
+        let job_env: HashMap<String, String> =
+            std::iter::once(("PATH".to_string(), "/usr/bin".to_string())).collect();
+        assert_eq!(container_base_env(rootfs.path(), job_env.clone()), job_env);
+    }
+
+    #[test]
+    fn a_fifo_at_the_config_path_cannot_stall_a_launch() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let dest = rootfs.path().join(IMAGE_CONFIG_PATH);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&dest)
+            .status()
+            .unwrap()
+            .success());
+        let job_env: HashMap<String, String> =
+            std::iter::once(("PATH".to_string(), "/usr/bin".to_string())).collect();
+
+        // Opening a FIFO blocks until a writer appears, so a regression here
+        // hangs the launch: fail on a timeout rather than hang with it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = rootfs.path().to_path_buf();
+        let sent = job_env.clone();
+        std::thread::spawn(move || tx.send(container_base_env(&path, sent)));
+        let env = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("container_base_env blocked on a FIFO");
+
+        assert_eq!(env, job_env);
+    }
+
+    #[test]
+    fn image_without_recorded_config_keeps_job_env() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let job_env: HashMap<String, String> =
+            std::iter::once(("PATH".to_string(), "/usr/bin".to_string())).collect();
+
+        assert_eq!(container_base_env(rootfs.path(), job_env.clone()), job_env);
+    }
 
     fn tar_layer(path: &str, contents: &[u8]) -> Vec<u8> {
         let mut data = Vec::new();
