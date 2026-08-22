@@ -331,3 +331,40 @@ fn print_usage() {
     eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
     eprintln!("  sprio sshare sstat sdiag sreport strigger sattach scrontab smd");
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    // Every command owns its own parser, so nothing builds them all until a user runs
+    // one. A malformed definition (a short option claimed twice, say) is caught only
+    // when its parser is constructed, so each one is listed here by hand and a new
+    // command must be added alongside it.
+    #[test]
+    fn every_command_parser_is_well_formed() {
+        crate::exec::ExecArgs::command().debug_assert();
+        crate::image::ImageArgs::command().debug_assert();
+        crate::k8s::K8sArgs::command().debug_assert();
+        crate::net::NetArgs::command().debug_assert();
+        crate::node::NodeArgs::command().debug_assert();
+        crate::sacct::SacctArgs::command().debug_assert();
+        crate::sacctmgr::SacctmgrArgs::command().debug_assert();
+        crate::salloc::SallocArgs::command().debug_assert();
+        crate::sattach::SattachArgs::command().debug_assert();
+        crate::sbatch::SbatchArgs::command().debug_assert();
+        crate::scancel::ScancelArgs::command().debug_assert();
+        crate::scontrol::ScontrolArgs::command().debug_assert();
+        crate::scrontab::ScrontabArgs::command().debug_assert();
+        crate::sdiag::SdiagArgs::command().debug_assert();
+        crate::sinfo::SinfoArgs::command().debug_assert();
+        crate::smd::SmdArgs::command().debug_assert();
+        crate::sprio::SprioArgs::command().debug_assert();
+        crate::squeue::SqueueArgs::command().debug_assert();
+        crate::sreport::SreportArgs::command().debug_assert();
+        crate::srun::SrunArgs::command().debug_assert();
+        crate::sshare::SshareArgs::command().debug_assert();
+        crate::sstat::SstatArgs::command().debug_assert();
+        crate::strigger::StriggerArgs::command().debug_assert();
+        crate::token::TokenArgs::command().debug_assert();
+    }
+}
