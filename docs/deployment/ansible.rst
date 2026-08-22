@@ -300,7 +300,11 @@ only lasts until reboot).
 
 .. note::
 
-   WireGuard is **single-controller only**; HA requires the ``direct`` transport.
+   HA (multiple controllers) is supported over WireGuard: the first controller
+   bootstraps the mesh (``spur net init``, ``.1``), every other controller and agent
+   joins, and a full-mesh pass (``spur net mesh``) wires the remaining node↔node
+   tunnels — including controller↔controller, which Raft needs for elections when the
+   bootstrap controller is down.
 
 SPUR-managed k0s cluster
 ------------------------

@@ -636,15 +636,25 @@ pub fn build_mesh_membership(
 ) -> MeshMembership {
     // Snapshot the controller's own peer→endpoint table so worker↔worker peers get an endpoint
     // (net join only wires worker→controller; without this the full mesh has no worker path).
-    let endpoints = spur_net::wireguard::peer_endpoints(mesh_interface).unwrap_or_default();
+    // Log on failure instead of swallowing it: an empty table silently regresses the mesh to
+    // hub-and-spoke, so operators need the reason (wrong interface name, `wg` unavailable, etc.).
+    let endpoints = spur_net::wireguard::peer_endpoints(mesh_interface).unwrap_or_else(|e| {
+        warn!(
+            interface = %mesh_interface, error = %e,
+            "could not read WireGuard peer endpoints; mesh membership will omit them, so \
+             worker↔worker tunnels may fall back to hub-and-spoke"
+        );
+        std::collections::HashMap::new()
+    });
     mesh_from_nodes(cluster.get_nodes(), mesh_cidr, &endpoints)
 }
 
 /// Pure core of [`build_mesh_membership`] (testable without a `ClusterManager`).
 ///
 /// Includes any meshed node (non-empty `wg_pubkey`) with a known mesh IP — `k0s_mesh_ip` if it has
-/// a role, else its advertised `spur0` address — so the controller/login nodes stay in membership
-/// and aren't pruned. `endpoints` supplies each peer's underlay endpoint for worker↔worker tunnels.
+/// a role, else its advertised mesh-interface address (the configured `network.wg_interface`,
+/// `spur0` by default) — so the controller/login nodes stay in membership and aren't pruned.
+/// `endpoints` supplies each peer's underlay endpoint for worker↔worker tunnels.
 fn mesh_from_nodes(
     nodes: Vec<spur_core::node::Node>,
     mesh_cidr: &str,
