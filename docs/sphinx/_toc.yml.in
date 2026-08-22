@@ -25,6 +25,7 @@ subtrees:
           - entries:
               - file: deployment/ansible
               - file: deployment/native-host
+              - file: deployment/wireguard
               - file: deployment/kubernetes
               - file: deployment/managed-kubernetes
               - file: deployment/partitioning

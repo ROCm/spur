@@ -40,6 +40,9 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 pub struct ClusterNetworking {
     /// WireGuard mesh CIDR (network.wg_cidr) — node mesh IPs are allocated from here.
     pub mesh_cidr: String,
+    /// WireGuard interface name (network.wg_interface) — the controller reads its peer endpoints
+    /// from this to re-advertise worker↔worker underlay endpoints in the mesh membership.
+    pub mesh_interface: String,
     /// Pod CIDR (cluster.pod_cidr) — per-node /24s are carved from here.
     pub pod_cidr: String,
     /// Service CIDR (cluster.service_cidr) — for the generated k0s config.
@@ -89,7 +92,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         // reconcile_mesh is idempotent + prunes) so node-local drift (reboot, wg restart), a failed
         // push, and controller failover all self-heal. Only meaningful with ≥2 meshed nodes; the
         // membership diff gates only the log line, not the push.
-        let mesh = build_mesh_membership(&cluster);
+        let mesh = build_mesh_membership(&cluster, &net.mesh_cidr, &net.mesh_interface);
         if mesh.nodes.len() >= 2 {
             if mesh.nodes != last_mesh {
                 info!(
@@ -626,27 +629,51 @@ pub fn node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStatus> {
 /// the mesh — the controller is the source of truth for `MeshNode.public_key`/`pod_cidr`, which an
 /// operator feeds to `apply_mesh` on each node via `spur net mesh --config`. Nodes not yet on the
 /// mesh (no pubkey) are skipped rather than fabricated, so an incomplete membership is never emitted.
-pub fn build_mesh_membership(cluster: &ClusterManager) -> MeshMembership {
-    mesh_from_nodes(cluster.get_nodes())
+pub fn build_mesh_membership(
+    cluster: &ClusterManager,
+    mesh_cidr: &str,
+    mesh_interface: &str,
+) -> MeshMembership {
+    // Snapshot the controller's own peer→endpoint table so worker↔worker peers get an endpoint
+    // (net join only wires worker→controller; without this the full mesh has no worker path).
+    // Log on failure instead of swallowing it: an empty table silently regresses the mesh to
+    // hub-and-spoke, so operators need the reason (wrong interface name, `wg` unavailable, etc.).
+    let endpoints = spur_net::wireguard::peer_endpoints(mesh_interface).unwrap_or_else(|e| {
+        warn!(
+            interface = %mesh_interface, error = %e,
+            "could not read WireGuard peer endpoints; mesh membership will omit them, so \
+             worker↔worker tunnels may fall back to hub-and-spoke"
+        );
+        std::collections::HashMap::new()
+    });
+    mesh_from_nodes(cluster.get_nodes(), mesh_cidr, &endpoints)
 }
 
 /// Pure core of [`build_mesh_membership`] (testable without a `ClusterManager`).
-fn mesh_from_nodes(nodes: Vec<spur_core::node::Node>) -> MeshMembership {
+///
+/// Includes any meshed node (non-empty `wg_pubkey`) with a known mesh IP — `k0s_mesh_ip` if it has
+/// a role, else its advertised mesh-interface address (the configured `network.wg_interface`,
+/// `spur0` by default) — so the controller/login nodes stay in membership and aren't pruned.
+/// `endpoints` supplies each peer's underlay endpoint for worker↔worker tunnels.
+fn mesh_from_nodes(
+    nodes: Vec<spur_core::node::Node>,
+    mesh_cidr: &str,
+    endpoints: &std::collections::HashMap<String, String>,
+) -> MeshMembership {
     let mut nodes: Vec<MeshNode> = nodes
         .into_iter()
         .filter_map(|n| {
-            let mesh_ip = n.k0s_mesh_ip.clone()?;
             let public_key = n.wg_pubkey.clone().filter(|k| !k.is_empty())?;
+            let mesh_ip = match n.k0s_mesh_ip.clone() {
+                Some(ip) => ip,
+                None => real_mesh_address(&n, mesh_cidr).ok().flatten()?.to_string(),
+            };
+            let endpoint = endpoints.get(&public_key).cloned().unwrap_or_default();
             Some(MeshNode {
                 hostname: n.name,
                 public_key,
                 mesh_ip,
-                // No endpoint: Node.address is the agent's advertised address, which
-                // `detect_node_address` makes the *mesh* IP when WireGuard is up — not a valid WG
-                // underlay endpoint (using it would clobber the working tunnel). Empty makes
-                // apply_mesh preserve the endpoint `spur net join` already established; membership
-                // reconciliation only maintains peers + AllowedIPs, not the underlay tunnel.
-                endpoint: String::new(),
+                endpoint,
                 pod_cidr: n.k0s_pod_cidr.clone(),
             })
         })
@@ -1770,15 +1797,15 @@ mod tests {
                 Some("198.51.100.4"),
                 None,
             ),
-            // no mesh IP (not assigned) -> skip
+            // no k0s mesh IP and an out-of-mesh (underlay) address -> skip
             mesh_node("w5", None, Some("pk-w5"), Some("198.51.100.5"), None),
         ];
-        let m = mesh_from_nodes(nodes);
+        let m = mesh_from_nodes(nodes, "10.44.0.0/16", &std::collections::HashMap::new());
         assert_eq!(m.nodes.len(), 2, "only fully-meshed nodes included");
         // sorted by mesh_ip
         assert_eq!(m.nodes[0].mesh_ip, "10.44.0.1");
         assert_eq!(m.nodes[0].public_key, "pk-cp");
-        // endpoint is left empty on purpose — apply_mesh preserves the tunnel `spur net join` set.
+        // no endpoint known for this peer -> left empty; apply_mesh preserves the existing tunnel.
         assert_eq!(m.nodes[0].endpoint, "");
         assert_eq!(m.nodes[0].pod_cidr.as_deref(), Some("10.42.0.0/24"));
         assert_eq!(m.nodes[1].mesh_ip, "10.44.0.2");
@@ -1786,6 +1813,48 @@ mod tests {
         assert_eq!(
             spur_net::mesh::peer_allowed_ips(&m.nodes[1]),
             "10.44.0.2/32,10.42.1.0/24"
+        );
+    }
+
+    #[test]
+    fn mesh_membership_includes_meshed_node_without_k0s_role() {
+        // The controller/head (and login nodes) join the mesh via `net join` but never get a
+        // k0s role, so `k0s_mesh_ip`/`k0s_pod_cidr` are None. They must still be in the
+        // membership — derived from the mesh-range address they advertise — or the agent's
+        // reconcile prunes them and severs the control-plane path.
+        let nodes = vec![
+            // controller: meshed (pubkey + spur0 address in mesh range), no k0s role
+            mesh_node("cp", None, Some("pk-cp"), Some("10.44.0.1"), None),
+            // worker: assigned a k0s role
+            mesh_node(
+                "w2",
+                Some("10.44.0.2"),
+                Some("pk-w2"),
+                Some("10.44.0.2"),
+                Some("10.42.1.0/24"),
+            ),
+        ];
+        // Controller knows w2's underlay endpoint from its own peer table; it must be folded in.
+        let endpoints = std::collections::HashMap::from([(
+            "pk-w2".to_string(),
+            "198.51.100.2:51820".to_string(),
+        )]);
+        let m = mesh_from_nodes(nodes, "10.44.0.0/16", &endpoints);
+        assert_eq!(
+            m.nodes.len(),
+            2,
+            "controller kept despite having no k0s role"
+        );
+        assert_eq!(m.nodes[0].mesh_ip, "10.44.0.1");
+        assert_eq!(m.nodes[0].public_key, "pk-cp");
+        assert_eq!(m.nodes[0].pod_cidr, None);
+        // cp has no endpoint in the map -> empty; w2's underlay endpoint is carried through.
+        assert_eq!(m.nodes[0].endpoint, "");
+        assert_eq!(m.nodes[1].endpoint, "198.51.100.2:51820");
+        // /32-only peer: no pod CIDR folded in.
+        assert_eq!(
+            spur_net::mesh::peer_allowed_ips(&m.nodes[0]),
+            "10.44.0.1/32"
         );
     }
 }
