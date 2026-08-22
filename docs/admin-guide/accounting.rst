@@ -547,6 +547,8 @@ Set ``DenyOnLimit`` through the QOS ``flags`` key:
 
    sacctmgr modify qos name=highprio set flags=DenyOnLimit
 
+.. _grpwall-budgets:
+
 Group wall-clock budgets (GrpWall)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -555,6 +557,11 @@ reaches the cap, jobs in that QOS stop being scheduled and wait with reason
 ``QOSGrpWallLimit`` (visible in ``squeue``); they become eligible again once
 consumption has fallen back below the cap *and* the next refresh has read it, not
 at the moment the older usage ages out of the window.
+
+Unlike the per-job QOS limits, ``grpwall`` is enforced only while scheduling,
+never at the submit gate: a breach never rejects a submission — not even under
+``DenyOnLimit`` (see :ref:`deny-on-limit`) — so the job is always accepted and
+simply pends as above.
 
 Consumption is summed from job history over a trailing window, set by
 ``grp_wall_window_days`` under ``[accounting]`` (default ``14``). Running jobs
@@ -605,6 +612,12 @@ one in place rather than discarding it, exactly as the QOS cache retains its
 definitions, so a budget keeps applying across an outage — but on the last figure
 read, however old that now is, and consumption accrued during the outage is
 invisible until the database returns.
+
+The same gap governs the ``0`` sentinel. Under :ref:`limit-values`, ``grpwall=0``
+is a literal budget of zero — it blocks every job in the QOS rather than meaning
+"no limit"; use ``-1`` to lift the cap. But because enforcement needs a figure
+first, ``grpwall=0`` too blocks nothing until one has been read: with no
+consumption known, no budget applies.
 
 If the database is unreachable when the controller *starts*, the refresh loop is
 never started at all: the budget is not applied for the life of that process and
