@@ -300,11 +300,9 @@ only lasts until reboot).
 
 .. note::
 
-   HA (multiple controllers) is supported over WireGuard: the first controller
-   bootstraps the mesh (``spur net init``, ``.1``), every other controller and agent
-   joins, and a full-mesh pass (``spur net mesh``) wires the remaining node↔node
-   tunnels — including controller↔controller, which Raft needs for elections when the
-   bootstrap controller is down.
+   HA (multiple controllers) is supported over WireGuard. For the full mesh story —
+   bring-up, why peer endpoints matter for worker↔worker connectivity, node removal,
+   HA, and k0s over the mesh — see :doc:`wireguard`.
 
 SPUR-managed k0s cluster
 ------------------------

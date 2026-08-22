@@ -126,6 +126,13 @@ LAN deployment):
 This sets up a WireGuard mesh, prints the server public key, and outputs a join command
 template for workers.
 
+.. note::
+
+   The steps below cover a single-controller mesh by hand. For the full mesh reference —
+   why ``net add-peer --endpoint`` is required for worker↔worker connectivity, node
+   removal with ``net remove-peer``, HA over the mesh, and k0s inside the mesh — see
+   :doc:`wireguard`.
+
 Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf`` with the
 full annotated set of fields. A minimal example:
 
