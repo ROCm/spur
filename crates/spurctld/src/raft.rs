@@ -9,7 +9,8 @@
 //! `ClusterManager::propose()` and applied through `StateMachineApply`.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::fs;
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -275,59 +276,56 @@ impl SpurStore {
         })
     }
 
-    fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), std::io::Error> {
-        let path = self.raft_dir.join("purged.json");
-        let tmp = self.raft_dir.join("purged.json.tmp");
-        let data = serde_json::to_vec(log_id)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Write-then-rename: a crash mid-write must never corrupt purged.json.
-        std::fs::write(&tmp, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+    fn log_dir(&self) -> PathBuf {
+        self.raft_dir.join("log")
     }
 
-    fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), std::io::Error> {
-        let path = self.raft_dir.join("vote.json");
-        let data = serde_json::to_vec(vote)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+    /// Flushes the log dir once per append/truncate/purge rather than once per
+    /// entry file.
+    // The error type is openraft's, and every caller is a `RaftStorage` method
+    // that must return it anyway; boxing it here would only unbox at the call.
+    #[allow(clippy::result_large_err)]
+    fn sync_log_dir(&self) -> Result<(), StorageError<NodeId>> {
+        sync_dir(&self.log_dir()).map_err(|e| {
+            StorageError::from_io_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+        })
     }
 
-    fn persist_log_entry(&self, entry: &Entry<SpurTypeConfig>) -> Result<(), std::io::Error> {
+    fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), io::Error> {
+        atomic_write_json(&self.raft_dir.join("purged.json"), log_id)?;
+        sync_dir(&self.raft_dir)
+    }
+
+    fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), io::Error> {
+        atomic_write_json(&self.raft_dir.join("vote.json"), vote)?;
+        sync_dir(&self.raft_dir)
+    }
+
+    fn persist_log_entry(&self, entry: &Entry<SpurTypeConfig>) -> Result<(), io::Error> {
+        // Contents only: the caller flushes the log directory once per append
+        // batch rather than once per entry.
         let path = self
-            .raft_dir
-            .join("log")
+            .log_dir()
             .join(format!("{:020}.json", entry.log_id.index));
-        let data = serde_json::to_vec(entry)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        atomic_write_json(&path, entry)
     }
 
     fn remove_log_entry(&self, index: u64) {
-        let path = self
-            .raft_dir
-            .join("log")
-            .join(format!("{:020}.json", index));
-        let _ = std::fs::remove_file(&path);
+        let path = self.log_dir().join(format!("{:020}.json", index));
+        let _ = fs::remove_file(&path);
     }
 
     fn persist_snapshot(
         &self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
         data: &[u8],
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), io::Error> {
         let ps = PersistedSnapshot {
             meta: meta.clone(),
             data: data.to_vec(),
         };
-        let path = self.raft_dir.join("snapshot.json");
-        let json = serde_json::to_vec(&ps)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &json)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        atomic_write_json(&self.raft_dir.join("snapshot.json"), &ps)?;
+        sync_dir(&self.raft_dir)
     }
 
     fn load_persisted_snapshot(&self) -> Option<PersistedSnapshot> {
@@ -339,6 +337,44 @@ impl SpurStore {
             .ok()
             .and_then(|data| serde_json::from_str(&data).ok())
     }
+}
+
+/// Leaves either the previous file or the complete new one after a crash, and
+/// returns only once the contents are on disk.
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
+    let data =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let tmp = path.with_extension("json.tmp");
+    // A failed attempt must not leave its temp file behind: a sustained
+    // disk-full condition would otherwise accumulate one per failed index.
+    let failed = |e: io::Error, at: &Path| {
+        let _ = fs::remove_file(&tmp);
+        io::Error::new(e.kind(), format!("{at:?}: {e}"))
+    };
+
+    let mut file = fs::File::create(&tmp).map_err(|e| failed(e, &tmp))?;
+    file.write_all(&data).map_err(|e| failed(e, &tmp))?;
+    file.sync_all().map_err(|e| failed(e, &tmp))?;
+    drop(file);
+
+    fs::rename(&tmp, path).map_err(|e| failed(e, path))
+}
+
+/// Flush a directory so that files created or renamed inside it survive a crash:
+/// flushing a file's own contents leaves its directory entry unflushed.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), io::Error> {
+    fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| io::Error::new(e.kind(), format!("{dir:?}: {e}")))
+}
+
+/// Windows has no directory handle to fsync, so a rename there is best-effort;
+/// spurctld is built and tested on unix only.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), io::Error> {
+    Ok(())
 }
 
 impl RaftLogReader<SpurTypeConfig> for Arc<SpurStore> {
@@ -434,6 +470,8 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             })?;
             inner.log.insert(entry.log_id.index, entry);
         }
+        // A newly created file is not durable until its directory is flushed.
+        self.sync_log_dir()?;
         Ok(())
     }
 
@@ -447,6 +485,8 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
+        // A crash that loses these deletions resurrects the conflicting tail.
+        self.sync_log_dir()?;
         Ok(())
     }
 
@@ -460,6 +500,7 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
+        self.sync_log_dir()?;
         inner.last_purged = Some(log_id);
         Ok(())
     }
@@ -1498,6 +1539,100 @@ mod tests {
 
         let store = SpurStore::new_with_recovery_mode(dir.path(), noop_applier(), false).unwrap();
         assert!(store.inner.read().vote.is_none());
+    }
+
+    /// A crash between `File::create` and `rename` leaves a `<name>.json.tmp`
+    /// on disk. Recovery must skip those rather than parse them as records.
+    #[test]
+    fn store_recovery_ignores_stale_tmp_files() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+
+        let leader_id = openraft::LeaderId {
+            term: 4,
+            node_id: 1,
+        };
+        let vote = Vote {
+            leader_id,
+            committed: true,
+        };
+        store.persist_vote(&vote).unwrap();
+
+        let entry = Entry {
+            log_id: LogId {
+                leader_id,
+                index: 7,
+            },
+            payload: EntryPayload::Blank,
+        };
+        store.persist_log_entry(&entry).unwrap();
+
+        let raft_dir = dir.path().join("raft");
+        let stale = [
+            raft_dir.join("vote.json.tmp"),
+            raft_dir.join("snapshot.json.tmp"),
+            raft_dir.join("purged.json.tmp"),
+            raft_dir.join("log").join("00000000000000000008.json.tmp"),
+        ];
+        for path in stale {
+            fs::write(&path, "{\"log_id\":{\"lead").unwrap();
+        }
+
+        let store2 = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        let inner = store2.inner.read();
+        assert_eq!(inner.vote, Some(vote));
+        let indexes: Vec<u64> = inner.log.keys().copied().collect();
+        assert_eq!(indexes, vec![7]);
+        assert_eq!(inner.log[&7].log_id, entry.log_id);
+        assert_eq!(inner.last_purged, None);
+        assert_eq!(inner.last_applied, None);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp_sibling() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+
+        let leader_id = openraft::LeaderId {
+            term: 2,
+            node_id: 1,
+        };
+        let log_id = LogId {
+            leader_id,
+            index: 42,
+        };
+        let vote = Vote {
+            leader_id,
+            committed: true,
+        };
+        store.persist_vote(&vote).unwrap();
+        store.persist_last_purged(&log_id).unwrap();
+
+        let entry = Entry {
+            log_id,
+            payload: EntryPayload::Blank,
+        };
+        store.persist_log_entry(&entry).unwrap();
+
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-42".into(),
+        };
+        store.persist_snapshot(&meta, b"payload").unwrap();
+
+        let raft_dir = dir.path().join("raft");
+        let written = [
+            raft_dir.join("vote.json"),
+            raft_dir.join("purged.json"),
+            raft_dir.join("snapshot.json"),
+            raft_dir.join("log").join("00000000000000000042.json"),
+        ];
+        for path in written {
+            assert!(path.exists(), "{path:?} was not created");
+            let tmp = path.with_extension("json.tmp");
+            assert!(!tmp.exists(), "{tmp:?} was left behind");
+        }
     }
 
     struct FailingRestoreApplier;
