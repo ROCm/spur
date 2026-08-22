@@ -840,6 +840,28 @@ The three TRES caps differ by scope:
 - **MaxTRESPerUser** (``maxtresperuser``) caps a **single user's** total across
   their jobs.
 
+.. _grptres-node-packing:
+
+GrpTRES node= counts distinct nodes, not per-job node requests
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``grptres=node=N`` caps the number of **distinct physical nodes** a QOS or
+account may occupy at once — not the sum of each running job's requested node
+count. Two running jobs that share a node count that node once; jobs on
+disjoint nodes each count their own. A new job is admitted if it can be
+satisfied without pushing the group's distinct-node count over the cap,
+whether by using brand-new nodes or by packing onto nodes the group already
+occupies that still have free CPU/memory/GPU capacity — so a group is never
+blocked from all further scheduling just because its existing jobs happen to
+use only part of each node's resources. Placement honors this: when a job is
+admitted on the basis that it can pack onto specific already-occupied nodes,
+scheduling actually places it there (as if those nodes had been given as an
+additive ``--nodelist``), rather than spreading it to an idle node elsewhere
+in the cluster and silently exceeding the cap. ``MaxTRESPerJob``'s and
+``MaxTRESPerUser``'s own ``node=`` caps are unaffected by this and always use
+a job's actual requested node count, since they bound a single job's or
+user's own footprint rather than group-wide capacity reuse.
+
 Managing nodes at runtime
 -------------------------
 
