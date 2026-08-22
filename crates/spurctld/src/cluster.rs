@@ -6825,6 +6825,17 @@ fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> Ha
 /// oversubscription risk, just a possible extra pending cycle. Exclusive jobs
 /// never reuse an already-occupied node, since they require the whole node to
 /// themselves.
+///
+/// Known soft-cap limitation: when a job only partially reuses (charge > 0),
+/// its `preferred_nodes` bias is additive, not restrictive (see
+/// `NodePlacement`), so backfill is free to place its remaining new node(s)
+/// anywhere. If the specific occupied node credited here becomes unavailable
+/// between this admission check and actual placement — e.g. claimed by a job
+/// admitted in a later pass — the job can end up needing one more genuinely
+/// new distinct node than it was charged for. `qos_claimed_nodes`/
+/// `account_claimed_nodes` on `PassReservations` close this gap within a
+/// single pass; across passes it remains a best-effort accounting, bounded
+/// in practice by real placement being the final authority on node choice.
 fn new_distinct_nodes_needed(
     job: &Job,
     occupied: &HashSet<String>,
