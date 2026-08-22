@@ -15401,6 +15401,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_blocks_job_packable_onto_already_used_nodes() {
+        // QOS grp node=4 is fully occupied by two running jobs on disjoint node
+        // pairs, each node far below its capacity. A new job needing only 1 more
+        // node is blocked, even though it could pack onto an already-used node
+        // instead of requiring a fifth distinct node.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for n in ["n1", "n2", "n3", "n4"] {
+            register_node(&cm, n, 8, 128000);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        cm.qos_cache().insert(Qos {
+            name: "cvs".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            for (id, nodes) in [(101u32, ["n1", "n2"]), (102, ["n3", "n4"])] {
+                let mut j = make_running_job(id, &nodes, 1);
+                j.spec.num_nodes = 2;
+                j.spec.qos = Some("cvs".into());
+                jobs.insert(id, j);
+            }
+        }
+
+        let mut newjob = basic_spec("pack-me");
+        newjob.qos = Some("cvs".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            pending.contains(&new_id),
+            "job requesting 1 node, packable onto an already-used node with idle \
+             capacity, must not be blocked on QOSGrpNodeLimit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_pass_account_grp_node_block_tags_reason_not_none() {
         // Account grp_tres node=1: the second job is blocked only by the first's
         // in-pass reservation. Expect AssocGrpNodeLimit, not None.
