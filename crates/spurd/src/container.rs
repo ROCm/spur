@@ -216,7 +216,7 @@ pub fn resolve_image(
 }
 
 /// How the rootfs was set up — determines cleanup strategy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RootfsMode {
     /// Extracted via unsquashfs — cleanup by removing the directory.
     Extracted,
@@ -224,41 +224,91 @@ pub enum RootfsMode {
     Overlay,
 }
 
+/// A rootfs this job owns and must tear down. Carries the directory because
+/// [`container_dir`] reads live environment a restarted agent may not share.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JobRootfs {
+    pub base_dir: PathBuf,
+    pub mode: RootfsMode,
+}
+
+/// Where a job's rootfs goes and whether the job owns it.
+#[derive(Debug, PartialEq)]
+struct RootfsPlan {
+    base_dir: PathBuf,
+    /// Named containers persist across jobs, so a job never owns one.
+    owned: bool,
+}
+
+/// Decide the rootfs location without touching the filesystem. Unnamed dirs are
+/// keyed by run attempt so a same-node redispatch can't land on a live run.
+fn plan_rootfs(cdir: &Path, job_id: u32, run_attempt: u32, name: Option<&str>) -> RootfsPlan {
+    match name {
+        Some(name) => RootfsPlan {
+            base_dir: cdir.join(sanitize_name(name)),
+            owned: false,
+        },
+        None => RootfsPlan {
+            base_dir: cdir.join(format!("job_{}_{}", job_id, run_attempt)),
+            owned: true,
+        },
+    }
+}
+
 /// Create a container rootfs from a squashfs image.
 ///
-/// Tries overlayfs mount first (fast, no disk copy) and falls back to
-/// unsquashfs extraction if not root or mount fails.
+/// An unnamed rootfs tries overlayfs first and falls back to unsquashfs
+/// extraction if not root or the mount fails; named containers are extracted.
 ///
-/// Named containers always use extraction (they persist across jobs).
+/// Returns the path to run in, and the teardown record — `None` for named
+/// containers, which persist across jobs and are never the job's to remove.
 pub fn setup_rootfs(
     image_path: &Path,
     job_id: u32,
+    run_attempt: u32,
     name: Option<&str>,
-) -> anyhow::Result<(PathBuf, RootfsMode)> {
-    let cdir = container_dir();
-    let base_dir = if let Some(name) = name {
-        cdir.join(sanitize_name(name))
-    } else {
-        cdir.join(format!("job_{}", job_id))
-    };
+) -> anyhow::Result<(PathBuf, Option<JobRootfs>)> {
+    setup_rootfs_in(&container_dir(), image_path, job_id, run_attempt, name)
+}
 
-    // If named container already exists, reuse it
-    if base_dir.exists() && name.is_some() {
-        debug!(path = %base_dir.display(), "reusing named container");
-        return Ok((base_dir, RootfsMode::Extracted));
+fn setup_rootfs_in(
+    cdir: &Path,
+    image_path: &Path,
+    job_id: u32,
+    run_attempt: u32,
+    name: Option<&str>,
+) -> anyhow::Result<(PathBuf, Option<JobRootfs>)> {
+    let plan = plan_rootfs(cdir, job_id, run_attempt, name);
+    if !plan.owned {
+        if plan.base_dir.exists() {
+            debug!(path = %plan.base_dir.display(), "reusing named container");
+            return Ok((plan.base_dir, None));
+        }
+        setup_rootfs_extract(image_path, &plan.base_dir)?;
+        return Ok((plan.base_dir, None));
     }
 
-    // Try overlayfs mount first (unnamed containers only, requires root)
-    if name.is_none() && nix::unistd::geteuid().is_root() {
-        if let Ok(merged) = setup_rootfs_overlay(image_path, &base_dir) {
-            return Ok((merged, RootfsMode::Overlay));
+    if nix::unistd::geteuid().is_root() {
+        if let Ok(merged) = setup_rootfs_overlay(image_path, &plan.base_dir) {
+            return Ok((merged, Some(plan.into_owned(RootfsMode::Overlay))));
         }
         debug!("overlayfs mount failed, falling back to extraction");
     }
 
-    // Fallback: extract with unsquashfs
-    setup_rootfs_extract(image_path, &base_dir)?;
-    Ok((base_dir, RootfsMode::Extracted))
+    setup_rootfs_extract(image_path, &plan.base_dir)?;
+    Ok((
+        plan.base_dir.clone(),
+        Some(plan.into_owned(RootfsMode::Extracted)),
+    ))
+}
+
+impl RootfsPlan {
+    fn into_owned(self, mode: RootfsMode) -> JobRootfs {
+        JobRootfs {
+            base_dir: self.base_dir,
+            mode,
+        }
+    }
 }
 
 /// Mount squashfs image read-only, then layer a tmpfs overlay on top.
@@ -397,16 +447,16 @@ pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
     }
 }
 
-/// Clean up an unnamed container rootfs.
+/// Clean up a rootfs the job owns.
 ///
 /// Handles both overlay (unmount) and extracted (rm -rf) modes.
-pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
-    let base_dir = container_dir().join(format!("job_{}", job_id));
+pub fn cleanup_rootfs(rootfs: &JobRootfs) {
+    let base_dir = &rootfs.base_dir;
     if !base_dir.exists() {
         return;
     }
 
-    if *mode == RootfsMode::Overlay {
+    if rootfs.mode == RootfsMode::Overlay {
         // Unmount in reverse order: overlay, upper tmpfs, lower squashfs
         let merged = base_dir.join("merged");
         let upper = base_dir.join("upper");
@@ -418,7 +468,7 @@ pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
         }
     }
 
-    if let Err(e) = std::fs::remove_dir_all(&base_dir) {
+    if let Err(e) = std::fs::remove_dir_all(base_dir) {
         warn!(
             path = %base_dir.display(),
             error = %e,
@@ -1748,8 +1798,79 @@ mod tests {
     #[test]
     fn test_cleanup_rootfs_nonexistent() {
         // Should not panic when cleaning up a rootfs that doesn't exist
-        cleanup_rootfs(999999, &RootfsMode::Extracted);
-        cleanup_rootfs(999998, &RootfsMode::Overlay);
+        for mode in [RootfsMode::Extracted, RootfsMode::Overlay] {
+            cleanup_rootfs(&JobRootfs {
+                base_dir: PathBuf::from("/nonexistent/spur-test/job_999999_0"),
+                mode,
+            });
+        }
+    }
+
+    #[test]
+    fn unnamed_rootfs_is_owned_and_scoped_to_one_run_attempt() {
+        let cdir = Path::new("/containers");
+
+        let first = plan_rootfs(cdir, 7, 0, None);
+        let second = plan_rootfs(cdir, 7, 1, None);
+
+        assert_eq!(first.base_dir, cdir.join("job_7_0"));
+        assert_ne!(first.base_dir, second.base_dir);
+        assert!(first.owned && second.owned);
+    }
+
+    /// A named container outlives the job whether or not it already exists, so
+    /// neither branch may hand the job a record that would delete it.
+    #[test]
+    fn named_container_is_never_owned_by_the_job() {
+        let cdir = Path::new("/containers");
+
+        let plan = plan_rootfs(cdir, 7, 3, Some("shared-env"));
+
+        assert_eq!(plan.base_dir, cdir.join("shared-env"));
+        assert!(!plan.owned);
+        assert_eq!(plan, plan_rootfs(cdir, 99, 0, Some("shared-env")));
+    }
+
+    /// Tearing down one attempt must not remove a redispatched attempt's rootfs.
+    #[test]
+    fn cleanup_removes_only_the_recorded_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let first = plan_rootfs(root.path(), 42, 0, None).base_dir;
+        let second = plan_rootfs(root.path(), 42, 1, None).base_dir;
+        std::fs::create_dir_all(first.join("tmp")).unwrap();
+        std::fs::create_dir_all(second.join("tmp")).unwrap();
+
+        cleanup_rootfs(&JobRootfs {
+            base_dir: first.clone(),
+            mode: RootfsMode::Extracted,
+        });
+
+        assert!(!first.exists(), "recorded attempt should be removed");
+        assert!(second.exists(), "redispatched attempt must survive");
+    }
+
+    /// A named container outlives the job, so the job must not be handed a
+    /// teardown record that would delete it.
+    #[test]
+    fn named_container_yields_no_teardown_record() {
+        let cdir = tempfile::tempdir().unwrap();
+        let existing = cdir.path().join("shared-env");
+        std::fs::create_dir_all(&existing).unwrap();
+
+        let (path, owned) = setup_rootfs_in(
+            cdir.path(),
+            Path::new("/nonexistent.sqsh"),
+            5,
+            0,
+            Some("shared-env"),
+        )
+        .unwrap();
+
+        assert_eq!(path, existing);
+        assert!(
+            owned.is_none(),
+            "named container is not the job's to remove"
+        );
     }
 
     // --- run_hooks ---

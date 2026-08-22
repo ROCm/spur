@@ -67,7 +67,7 @@ mod gpu_deny_tests {
 
 pub(crate) struct TrackedJob {
     job: executor::RunningJob,
-    rootfs_mode: crate::container::RootfsMode,
+    rootfs: Option<crate::container::JobRootfs>,
     stdout_path: String,
     stderr_path: String,
     has_pid_namespace: bool,
@@ -95,7 +95,7 @@ struct CompletedJob {
     exit_code: i32,
     signal: i32,
     run_attempt: u32,
-    rootfs_mode: crate::container::RootfsMode,
+    rootfs: Option<crate::container::JobRootfs>,
     cgroup: Option<std::path::PathBuf>,
     work_dir: String,
     uid: u32,
@@ -222,6 +222,56 @@ async fn step_cancel_requested(
         .await
         .get(&key)
         .is_some_and(|step| step.cancel_requested)
+}
+
+/// The inputs one job's epilog + SPANK teardown hooks need. Built from either a
+/// live `CompletedJob` (monitor path) or an adopted `JobManifest` (restart path)
+/// so both run identical teardown.
+struct CompletionContext {
+    job_id: u32,
+    work_dir: String,
+    uid: u32,
+    gid: u32,
+    partition: String,
+    nodelist: String,
+    gpu_devices: Vec<u32>,
+    cpus: u32,
+    memory_mb: u64,
+}
+
+/// Cloneable handle exposing only whether any jobs are active, for use after
+/// `AgentService` itself has moved into the gRPC server (see main's SIGTERM
+/// handler).
+#[derive(Clone)]
+pub struct RunningJobsHandle {
+    running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
+    allocation: Arc<Mutex<NodeAllocation>>,
+}
+
+impl RunningJobsHandle {
+    /// True when no job with a live process is tracked AND none is mid-launch. A
+    /// job spawned but not yet inserted into `running` still holds a `launching`
+    /// reservation, so checking both closes the window where a SIGTERM would
+    /// deregister (and force-evict) an in-flight launch.
+    ///
+    /// `AllocationOnly` reservations (srun/salloc) are excluded: they have no
+    /// process and are never written to a manifest, so a restarted spurd can't
+    /// re-adopt them. Keeping the node registered on their behalf would strand
+    /// the reservation (the controller still holds the resources while the agent
+    /// forgets them, then first-fits the same ids to the next dispatch).
+    /// Deregistering lets the controller reclaim them, matching the pre-manifest
+    /// behavior of an unconditional deregister.
+    pub async fn has_no_active_jobs(&self) -> bool {
+        // Hold `running` across both checks. Releasing it between them would
+        // reopen the very window this closes: a launch could insert into
+        // `running` after the first check and drop its `launching` reservation
+        // before the second. Lock order is running -> allocation, as elsewhere.
+        let running = self.running.lock().await;
+        if running.values().any(|t| !t.job.is_allocation_only()) {
+            return false;
+        }
+        !self.allocation.lock().await.has_launching()
+    }
 }
 
 pub struct AgentService {
@@ -365,6 +415,176 @@ impl AgentService {
         self.k0s.clone()
     }
 
+    pub fn running_jobs_handle(&self) -> RunningJobsHandle {
+        RunningJobsHandle {
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+        }
+    }
+
+    /// Re-adopt jobs whose process survived a spurd restart, restoring their
+    /// resource allocation before this agent starts accepting new launches.
+    /// Must run before the gRPC server starts serving.
+    pub async fn reconcile_running_jobs(&self) {
+        // Discharge teardown inline so a completion isn't lost, but bounded so an
+        // unreachable controller can't block serving (heartbeat is the backstop).
+        let dead = self.adopt_manifests().await;
+        let discharge_all = async {
+            for (spool_dir, manifest) in dead {
+                self.discharge_obligations(&spool_dir, manifest).await;
+            }
+        };
+        if tokio::time::timeout(RECONCILE_REPORT_BUDGET, discharge_all)
+            .await
+            .is_err()
+        {
+            warn!("obligation discharge during reconcile timed out; continuing to serve");
+        }
+    }
+
+    /// Discharge the still-owed teardown obligations for a job that finished
+    /// while spurd was down, driving the manifest's ledger to empty. Each step
+    /// is skipped if already done (recorded in `manifest.pending`) and the
+    /// manifest is rewritten after each so an interrupted discharge resumes
+    /// rather than repeating a non-idempotent step (notably the epilog). The
+    /// spool/manifest is removed only once everything is discharged; otherwise
+    /// it is left for the next startup to retry — the node is heartbeating, so
+    /// the controller never times the job out on its own.
+    async fn discharge_obligations(
+        &self,
+        spool_dir: &std::path::Path,
+        mut manifest: executor::JobManifest,
+    ) {
+        let job_id = manifest.job_id;
+        let (exit_code, signal) = manifest.exit.unwrap_or((-1, 0));
+
+        if manifest.pending.epilog {
+            let ctx = CompletionContext {
+                job_id,
+                work_dir: manifest.work_dir.clone(),
+                uid: manifest.uid,
+                gid: manifest.gid,
+                partition: manifest.partition.clone(),
+                nodelist: manifest.nodelist.clone(),
+                gpu_devices: manifest.gpu_devices.clone(),
+                cpus: manifest.cpus,
+                memory_mb: manifest.memory_mb,
+            };
+            manifest.pending.drain = run_teardown_hooks(&self.hooks, &self.spank, &ctx).await;
+            manifest.pending.epilog = false;
+            executor::write_job_manifest(spool_dir, &manifest);
+        }
+
+        if manifest.pending.report_completion {
+            let drain = manifest.pending.drain.then(|| DrainRequest {
+                reason: "epilog script failed".into(),
+            });
+            let reported = report_completion(
+                &self.reporter.controller_addr,
+                job_id,
+                exit_code,
+                signal,
+                manifest.run_attempt,
+                &self.reporter.hostname,
+                drain.as_ref(),
+            )
+            .await;
+            if !reported {
+                // Report lost; leave the manifest (epilog already marked done, so
+                // the retry won't re-run it) for the next startup to resend.
+                return;
+            }
+            manifest.pending.report_completion = false;
+        }
+
+        if manifest.pending.all_discharged() {
+            executor::cleanup_job_spool(job_id, manifest.run_attempt);
+            cleanup_completed_job_mpi(job_id, &manifest.mpi, &self.mpi_host).await;
+        }
+    }
+
+    /// Scan manifests, re-adopt still-alive jobs into local state, and return
+    /// the dead jobs (spool dir + manifest) whose teardown obligations still
+    /// need discharging. Split from the discharge so it is testable without a
+    /// live controller.
+    async fn adopt_manifests(&self) -> Vec<(std::path::PathBuf, executor::JobManifest)> {
+        let mut dead = Vec::new();
+        for (spool_dir, manifest) in executor::scan_job_manifests() {
+            let job_id = manifest.job_id;
+            match executor::reconcile_manifest(&spool_dir, manifest) {
+                executor::ReconcileOutcome::Alive { job, manifest } => {
+                    let alloc = AllocationResult {
+                        cpu_ids: manifest.cpu_ids.clone(),
+                        gpu_ids: manifest.gpu_devices.clone(),
+                        memory_mb: manifest.memory_mb,
+                    };
+                    if let Err(e) = self
+                        .allocation
+                        .lock()
+                        .await
+                        .restore_committed(job_id, alloc)
+                    {
+                        // A device this manifest claims is already held by an
+                        // adopted job: adopting anyway would double-book it. Leave
+                        // the process running and its manifest in place, and skip
+                        // re-adoption so this node's accounting stays consistent.
+                        error!(job_id, error = ?e, "refusing to adopt job with conflicting resources");
+                        continue;
+                    }
+                    // A PTY master fd can't survive a restart, so an adopted job
+                    // never has one.
+                    self.running.lock().await.insert(
+                        job_id,
+                        TrackedJob {
+                            job,
+                            rootfs: manifest.rootfs.clone(),
+                            stdout_path: manifest.stdout_path,
+                            stderr_path: manifest.stderr_path,
+                            has_pid_namespace: manifest.has_pid_namespace,
+                            has_user_namespace: manifest.has_user_namespace,
+                            has_mount_namespace: manifest.has_mount_namespace,
+                            _pty_master: None,
+                            work_dir: manifest.work_dir,
+                            uid: manifest.uid,
+                            gid: manifest.gid,
+                            user: manifest.user,
+                            partition: manifest.partition,
+                            gpu_devices: manifest.gpu_devices,
+                            cpus: manifest.cpus,
+                            memory_mb: manifest.memory_mb,
+                            nodelist: manifest.nodelist,
+                            mpi: manifest.mpi,
+                            run_attempt: manifest.run_attempt,
+                        },
+                    );
+                    info!(job_id, "re-adopted job that survived a spurd restart");
+                }
+                executor::ReconcileOutcome::Dead { manifest } => {
+                    let (exit_code, signal) = manifest.exit.unwrap_or((-1, 0));
+                    warn!(
+                        job_id,
+                        exit_code, signal, "job finished while spurd was down"
+                    );
+                    // The process is gone, so its rootfs and cgroup can be torn
+                    // down now. Persist the manifest with the resolved exit
+                    // recorded, so a report that only lands on a later restart
+                    // stays accurate after the sentinel/rootfs are gone. The
+                    // spool (and manifest) is kept until every obligation is
+                    // discharged (see reconcile_running_jobs).
+                    if let Some(ref rootfs) = manifest.rootfs {
+                        crate::container::cleanup_rootfs(rootfs);
+                    }
+                    if let Some(ref cgroup) = manifest.cgroup_path {
+                        executor::cleanup_cgroup(cgroup);
+                    }
+                    executor::write_job_manifest(&spool_dir, &manifest);
+                    dead.push((spool_dir, manifest));
+                }
+            }
+        }
+        dead
+    }
+
     /// Spawn a background task to monitor running jobs and report completions.
     pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
@@ -398,7 +618,7 @@ impl AgentService {
                                 exit_code,
                                 signal,
                                 run_attempt: tracked.run_attempt,
-                                rootfs_mode: tracked.rootfs_mode.clone(),
+                                rootfs: tracked.rootfs.clone(),
                                 cgroup,
                                 work_dir: tracked.work_dir.clone(),
                                 uid: tracked.uid,
@@ -420,8 +640,9 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
-                    crate::executor::cleanup_job_spool(c.job_id);
+                    if let Some(ref rootfs) = c.rootfs {
+                        crate::container::cleanup_rootfs(rootfs);
+                    }
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
@@ -444,72 +665,48 @@ impl AgentService {
                     .map(|h| h.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "localhost".into());
 
-                let mut drain_jobs: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-
-                // Run epilog hook for completed jobs
-                if let Some(ref epilog_script) = hooks.epilog {
-                    for c in &completed {
-                        let ctx = spur_core::hooks::HookContext {
-                            job_id: c.job_id,
-                            work_dir: c.work_dir.clone(),
-                            uid: c.uid,
-                            gid: c.gid,
-                            partition: c.partition.clone(),
-                            nodelist: c.nodelist.clone(),
-                            script_context: "epilog_slurmd".into(),
-                            gpu_devices: c.gpu_devices.clone(),
-                            cpus: c.cpus,
-                            memory_mb: c.memory_mb,
-                        };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
-                            error!(
-                                job_id = c.job_id,
-                                error = %e,
-                                "epilog hook failed — requesting node drain"
-                            );
-                            drain_jobs.insert(c.job_id);
-                        }
-                    }
-                }
-
-                // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
-                if let Some(ref spank_host) = *spank {
-                    for c in &completed {
-                        let context = SpankContext {
-                            job_id: c.job_id,
-                            uid: c.uid,
-                            gid: c.gid,
-                            ..Default::default()
-                        };
-                        let mut handle = SpankHandle::new(context, HashMap::new());
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
-                        }
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
-                        }
-                    }
-                }
-
                 for c in &completed {
-                    let drain = if drain_jobs.contains(&c.job_id) {
-                        Some(DrainRequest {
-                            reason: "epilog script failed".into(),
-                        })
-                    } else {
-                        None
+                    let ctx = CompletionContext {
+                        job_id: c.job_id,
+                        work_dir: c.work_dir.clone(),
+                        uid: c.uid,
+                        gid: c.gid,
+                        partition: c.partition.clone(),
+                        nodelist: c.nodelist.clone(),
+                        gpu_devices: c.gpu_devices.clone(),
+                        cpus: c.cpus,
+                        memory_mb: c.memory_mb,
                     };
-                    report_completion(
+                    let drain = run_teardown_hooks(&hooks, &spank, &ctx).await;
+                    let drain_req = drain.then(|| DrainRequest {
+                        reason: "epilog script failed".into(),
+                    });
+                    let reported = report_completion(
                         &controller_addr,
                         c.job_id,
                         c.exit_code,
                         c.signal,
                         c.run_attempt,
                         &local_hostname,
-                        drain.as_ref(),
+                        drain_req.as_ref(),
                     )
                     .await;
+                    // Keep the spool (and its manifest) until the controller has
+                    // the completion: if the report was lost, a restarted spurd
+                    // re-adopts the manifest and retries rather than stranding the
+                    // job in Running forever. Record that the epilog is already
+                    // done so the restart retries only the report, not the
+                    // (possibly non-idempotent) epilog.
+                    if reported {
+                        crate::executor::cleanup_job_spool(c.job_id, c.run_attempt);
+                    } else {
+                        crate::executor::mark_manifest_epilog_discharged(
+                            c.job_id,
+                            c.run_attempt,
+                            (c.exit_code, c.signal),
+                            drain,
+                        );
+                    }
                 }
             }
         });
@@ -524,6 +721,13 @@ struct DrainRequest {
 /// above a typical image pull + fork so a normal launch is spared; one stalled
 /// past this bound is reclaimed.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// In-container path where a job records its exit code; host-visible in the rootfs.
+const CONTAINER_EXIT_STATUS_PATH: &str = "/tmp/spur_exit_status";
+
+/// Cap on completion reporting during startup reconcile, so an unreachable
+/// controller can't keep spurd from serving.
+const RECONCILE_REPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
 /// using the running set as ground truth. Callers hold the `running` lock
@@ -579,6 +783,32 @@ impl Drop for LaunchReservationGuard {
             handle.spawn(async move {
                 allocation.lock().await.release_job(job_id);
             });
+        }
+    }
+}
+
+/// Tears down a rootfs created by a launch that exits before commit, including
+/// on cancellation. Attempt-keyed dirs are never reused, so a leak is permanent.
+struct LaunchRootfsGuard {
+    rootfs: Option<crate::container::JobRootfs>,
+}
+
+impl LaunchRootfsGuard {
+    fn new(rootfs: Option<crate::container::JobRootfs>) -> Self {
+        Self { rootfs }
+    }
+
+    /// Hand ownership back once the job is committed and teardown belongs to
+    /// the normal completion path.
+    fn disarm(&mut self) -> Option<crate::container::JobRootfs> {
+        self.rootfs.take()
+    }
+}
+
+impl Drop for LaunchRootfsGuard {
+    fn drop(&mut self) {
+        if let Some(rootfs) = self.rootfs.take() {
+            crate::container::cleanup_rootfs(&rootfs);
         }
     }
 }
@@ -894,6 +1124,62 @@ fn inject_script_args(script: &str, args: &[String]) -> Result<String, Status> {
     Ok(format!("{set_line}\n{script}"))
 }
 
+/// Run the epilog + SPANK TaskExit/JobEpilog teardown hooks for a completed job.
+/// Returns true if the epilog failed and the node should be drained. Shared by
+/// the live monitor and the restart-adoption path so an adopted job gets the
+/// same epilog (GPU reset, scratch purge), SPANK hooks, and epilog-failure drain
+/// as a live one — none of which the adoption path used to run.
+async fn run_teardown_hooks(
+    hooks: &HooksConfig,
+    spank: &Option<SpankHost>,
+    ctx: &CompletionContext,
+) -> bool {
+    let mut drain = false;
+    if let Some(ref epilog_script) = hooks.epilog {
+        let hook_ctx = spur_core::hooks::HookContext {
+            job_id: ctx.job_id,
+            work_dir: ctx.work_dir.clone(),
+            uid: ctx.uid,
+            gid: ctx.gid,
+            partition: ctx.partition.clone(),
+            nodelist: ctx.nodelist.clone(),
+            script_context: "epilog_slurmd".into(),
+            gpu_devices: ctx.gpu_devices.clone(),
+            cpus: ctx.cpus,
+            memory_mb: ctx.memory_mb,
+        };
+        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &hook_ctx).await {
+            error!(
+                job_id = ctx.job_id,
+                error = %e,
+                "epilog hook failed — requesting node drain"
+            );
+            drain = true;
+        }
+    }
+
+    if let Some(spank_host) = spank {
+        let context = SpankContext {
+            job_id: ctx.job_id,
+            uid: ctx.uid,
+            gid: ctx.gid,
+            ..Default::default()
+        };
+        let mut handle = SpankHandle::new(context, HashMap::new());
+        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
+            warn!(ctx.job_id, error = %e, "SPANK TaskExit hook failed");
+        }
+        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
+            warn!(ctx.job_id, error = %e, "SPANK JobEpilog hook failed");
+        }
+    }
+    drain
+}
+
+/// Report a job completion to the controller. Returns true only if the
+/// controller acknowledged it, so the caller can keep the job's manifest for a
+/// restart-time retry when the report was lost (transient failure exhausted its
+/// retries, or a non-retryable rejection).
 async fn report_completion(
     controller_addr: &str,
     job_id: u32,
@@ -902,7 +1188,7 @@ async fn report_completion(
     run_attempt: u32,
     reporting_node: &str,
     drain: Option<&DrainRequest>,
-) {
+) -> bool {
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
@@ -947,26 +1233,39 @@ async fn report_completion(
     })
     .await;
 
+    // Return whether the controller acknowledged the completion, so the caller
+    // can keep the job's manifest for a restart-time retry when the report was
+    // lost (transient failure exhausted its retries, or a non-retryable
+    // rejection) rather than deleting it and stranding the job in Running.
     match result {
-        Ok(_) => info!(
-            job_id,
-            exit_code,
-            controller = %controller_addr,
-            "reported completion to controller"
-        ),
-        Err(e) if e.retryable() => error!(
-            job_id,
-            exit_code,
-            attempts = CONTROLLER_RPC_ATTEMPTS,
-            error = %e,
-            "gave up reporting completion to controller"
-        ),
-        Err(e) => error!(
-            job_id,
-            exit_code,
-            error = %e,
-            "ReportJobStatus failed with non-retryable error"
-        ),
+        Ok(_) => {
+            info!(
+                job_id,
+                exit_code,
+                controller = %controller_addr,
+                "reported completion to controller"
+            );
+            true
+        }
+        Err(e) if e.retryable() => {
+            error!(
+                job_id,
+                exit_code,
+                attempts = CONTROLLER_RPC_ATTEMPTS,
+                error = %e,
+                "gave up reporting completion to controller"
+            );
+            false
+        }
+        Err(e) => {
+            error!(
+                job_id,
+                exit_code,
+                error = %e,
+                "ReportJobStatus failed with non-retryable error"
+            );
+            false
+        }
     }
 }
 
@@ -1227,8 +1526,9 @@ impl SlurmAgent for AgentService {
         // the Rust container runtime (fork + container_init + pivot_root).
         let mut container_config: Option<crate::container::ContainerConfig> = None;
         let mut rootfs_path: Option<std::path::PathBuf> = None;
+        let mut container_exit_status_path: Option<String> = None;
 
-        let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
+        let (launch_script, owned_rootfs) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
             let mounts: Vec<crate::container::BindMount> = spec
@@ -1284,13 +1584,28 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            let (rootfs, rootfs_mode) =
-                crate::container::setup_rootfs(&image_path, job_id, cfg.name.as_deref())
-                    .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
+            let (rootfs, owned_rootfs) = crate::container::setup_rootfs(
+                &image_path,
+                job_id,
+                run_attempt,
+                cfg.name.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
-            // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
+            // Copy user script into rootfs/tmp/ so it's accessible after pivot_root.
+            // Wrap it to record the exit code at an in-container path, so a
+            // restarted spurd can read the real code back (host-visible in rootfs).
             let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
-            std::fs::write(&container_script, &script).map_err(|e| {
+            let wrapped = executor::wrap_with_exit_sentinel(
+                &script,
+                std::path::Path::new(CONTAINER_EXIT_STATUS_PATH),
+            );
+            container_exit_status_path = Some(format!(
+                "{}{}",
+                rootfs.display(),
+                CONTAINER_EXIT_STATUS_PATH
+            ));
+            std::fs::write(&container_script, &wrapped).map_err(|e| {
                 Status::internal(format!("failed to write container script: {}", e))
             })?;
             #[cfg(unix)]
@@ -1308,9 +1623,9 @@ impl SlurmAgent for AgentService {
             // The launch_script passed to executor is the user's script
             // (used as fallback for non-container path; for container path,
             // the executor reads from rootfs/tmp/ directly).
-            (script, rootfs_mode)
+            (script, owned_rootfs)
         } else {
-            (script, crate::container::RootfsMode::Extracted)
+            (script, None)
         };
 
         let mut pmix_guard = None;
@@ -1375,6 +1690,9 @@ impl SlurmAgent for AgentService {
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
+        // Armed before any fallible step so every early return, and future
+        // cancellation, tears the rootfs down.
+        let mut rootfs_guard = LaunchRootfsGuard::new(owned_rootfs);
         let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
 
         let injection = {
@@ -1464,6 +1782,7 @@ impl SlurmAgent for AgentService {
 
         let launch_cfg = executor::JobLaunchConfig {
             job_id,
+            run_attempt,
             script: launch_script,
             work_dir: work_dir.clone(),
             name: spec.name.clone(),
@@ -1503,6 +1822,66 @@ impl SlurmAgent for AgentService {
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(mut result) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
+                // Written before this job is tracked anywhere else, so a spurd
+                // restart can re-adopt it (see reconcile_running_jobs) instead
+                // of losing track of a job whose process survives the restart.
+                if let Some(pid) = result.job.pid() {
+                    // Captured here, at launch, so the manifest records the
+                    // namespace layout this job actually got rather than what a
+                    // future agent would infer from its own privilege.
+                    let launch_is_root = nix::unistd::geteuid().is_root();
+                    let launch_is_container = launch_cfg.container.is_some();
+                    let sentinel = container_exit_status_path.clone().unwrap_or_else(|| {
+                        executor::exit_status_path(&result.spool_dir)
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    // No start time means no defence against PID reuse, and a
+                    // placeholder would be worse than nothing: `proc_alive`
+                    // compares for equality, so a live process can never match
+                    // it and the next startup would report a still-running job
+                    // as finished. Skip the manifest instead.
+                    match executor::proc_start_time(pid as i32) {
+                        None => warn!(
+                            job_id,
+                            pid,
+                            "could not read process start time; job will not survive a restart"
+                        ),
+                        Some(start_time) => executor::write_job_manifest(
+                            &result.spool_dir,
+                            &executor::JobManifest {
+                                schema_version: executor::MANIFEST_SCHEMA_VERSION,
+                                job_id,
+                                run_attempt,
+                                pid: pid as i32,
+                                start_time,
+                                cgroup_path: result.job.cgroup_path().map(|p| p.to_path_buf()),
+                                forked: matches!(result.job, executor::RunningJob::Forked { .. }),
+                                has_pid_namespace: launch_is_root || launch_is_container,
+                                has_user_namespace: launch_is_container && !launch_is_root,
+                                has_mount_namespace: launch_is_root || launch_is_container,
+                                cpu_ids: launch_cfg.cpu_ids.clone(),
+                                gpu_devices: launch_cfg.gpu_devices.clone(),
+                                cpus: launch_cfg.cpus,
+                                memory_mb: launch_cfg.memory_mb,
+                                uid: launch_cfg.uid,
+                                gid: launch_cfg.gid,
+                                user: launch_cfg.user.clone(),
+                                stdout_path: result.stdout_path.clone(),
+                                stderr_path: result.stderr_path.clone(),
+                                work_dir: launch_cfg.work_dir.clone(),
+                                partition: launch_cfg.partition.clone(),
+                                nodelist: launch_cfg.nodelist.clone(),
+                                mpi: spec.mpi.clone(),
+                                rootfs: rootfs_guard.rootfs.clone(),
+                                exit_status_path: Some(sentinel),
+                                pending: executor::PendingObligations::default(),
+                                exit: None,
+                            },
+                        ),
+                    }
+                }
+
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
@@ -1527,18 +1906,12 @@ impl SlurmAgent for AgentService {
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
-                    let running = self.running.clone();
+                    let aborted_rootfs = rootfs_guard.disarm();
                     tokio::spawn(async move {
                         reap_killed_job(result.job).await;
-                        // rootfs/spool paths are derived from job_id, so the
-                        // controller re-dispatching the same id to this node
-                        // would reuse them. Skip that cleanup if a live run for
-                        // job_id reappeared, or this reap would delete its files.
-                        // The cgroup handle is this launch's own, so it is always
-                        // safe to release.
-                        if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
-                            crate::executor::cleanup_job_spool(job_id);
+                        crate::executor::cleanup_job_spool(job_id, run_attempt);
+                        if let Some(ref rootfs) = aborted_rootfs {
+                            crate::container::cleanup_rootfs(rootfs);
                         }
                         if let Some(ref cg) = cgroup {
                             crate::executor::cleanup_cgroup(cg);
@@ -1564,7 +1937,7 @@ impl SlurmAgent for AgentService {
                     job_id,
                     TrackedJob {
                         job: result.job,
-                        rootfs_mode: rootfs_mode.clone(),
+                        rootfs: rootfs_guard.disarm(),
                         stdout_path: result.stdout_path,
                         stderr_path: result.stderr_path,
                         has_pid_namespace: is_root || is_container,
@@ -1592,7 +1965,17 @@ impl SlurmAgent for AgentService {
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                        tokio::spawn(reap_killed_job(old.job));
+                        let old_rootfs = old.rootfs;
+                        let old_attempt = old.run_attempt;
+                        tokio::spawn(async move {
+                            reap_killed_job(old.job).await;
+                            // Attempt-keyed, so this is the displaced run's own
+                            // rootfs and spool, not the one just launched.
+                            crate::executor::cleanup_job_spool(job_id, old_attempt);
+                            if let Some(ref rootfs) = old_rootfs {
+                                crate::container::cleanup_rootfs(rootfs);
+                            }
+                        });
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
@@ -1869,6 +2252,15 @@ impl SlurmAgent for AgentService {
                         "job {} already registered on this node",
                         req.job_id
                     )),
+                    // Only reachable from restore_committed, which this path
+                    // never calls; map rather than panic so a future caller
+                    // can't turn a resource conflict into an abort.
+                    AllocError::CpusUnavailable => Status::resource_exhausted(
+                        "controller-allocated CPUs unavailable on this node",
+                    ),
+                    AllocError::MemoryUnavailable => Status::resource_exhausted(
+                        "controller-allocated memory unavailable on this node",
+                    ),
                 })?;
             let _ = alloc.commit_job(req.job_id);
         }
@@ -1885,7 +2277,7 @@ impl SlurmAgent for AgentService {
             req.job_id,
             TrackedJob {
                 job: executor::RunningJob::AllocationOnly,
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 has_pid_namespace: false,
@@ -2761,6 +3153,15 @@ impl AgentService {
                     "job {job_id} already has a launch in flight on this node"
                 )));
             }
+            // Produced only by restore_committed on the restart-adoption path,
+            // which allocate_for_job never reaches. Reject rather than panic so
+            // a future caller can't turn a resource conflict into an abort.
+            Err(e @ (AllocError::CpusUnavailable | AllocError::MemoryUnavailable)) => {
+                warn!(job_id, error = ?e, "rejecting dispatch: node resources unavailable");
+                return Err(Status::resource_exhausted(
+                    "controller-allocated resources unavailable on this node",
+                ));
+            }
         };
 
         let gpu_ids = controller_gpu_ids;
@@ -3275,7 +3676,7 @@ impl TrackedJob {
                 child,
                 cgroup_path: None,
             },
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -3286,6 +3687,32 @@ impl TrackedJob {
             uid: 0,
             gid: 0,
             user: "testuser".into(),
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
+            mpi: String::new(),
+            run_attempt: 0,
+        }
+    }
+
+    /// A tracked srun/salloc reservation with no process, matching what
+    /// `register_job_allocation` inserts.
+    fn dummy_allocation_only() -> Self {
+        Self {
+            job: executor::RunningJob::AllocationOnly,
+            rootfs: None,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            _pty_master: None,
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            user: String::new(),
             partition: String::new(),
             gpu_devices: Vec::new(),
             cpus: 1,
@@ -3818,6 +4245,36 @@ mod tests {
             resp.error.contains("No such file or directory"),
             "the cause chain must survive into the reported error, got {:?}",
             resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn has_no_active_jobs_ignores_allocation_only_reservations() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let handle = svc.running_jobs_handle();
+        assert!(handle.has_no_active_jobs().await, "idle node has no jobs");
+
+        // A reservation with no process must not keep the node registered on
+        // SIGTERM: it isn't persisted to a manifest, so it can't be re-adopted,
+        // and holding the node would strand it (double-book on next dispatch).
+        svc.insert_test_job(1, TrackedJob::dummy_allocation_only())
+            .await;
+        assert!(
+            handle.has_no_active_jobs().await,
+            "reservation-only node deregisters so the controller reclaims it"
+        );
+
+        // A real running process, by contrast, must keep the node registered so
+        // a restart can re-adopt it.
+        svc.insert_test_job(2, TrackedJob::dummy(0)).await;
+        assert!(
+            !handle.has_no_active_jobs().await,
+            "a live job keeps the node registered"
         );
     }
 
@@ -5281,6 +5738,472 @@ mod tests {
         );
     }
 
+    // Simulates a spurd restart: a job manifest on disk for a still-running
+    // process must be re-adopted into `running` with its allocation restored,
+    // before this agent would start accepting new LaunchJob calls.
+    #[tokio::test]
+    async fn reconcile_running_jobs_resumes_live_job_and_restores_allocation() {
+        // Serialize against other tests that scan the shared spool-root
+        // manifest tree — see MANIFEST_SCAN_TEST_LOCK.
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
+        let job_id = 987_654_326;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}_1"));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = executor::proc_start_time(pid).unwrap();
+
+        executor::write_job_manifest(
+            &spool_dir,
+            &executor::JobManifest {
+                schema_version: 1,
+                job_id,
+                run_attempt: 3,
+                pid,
+                start_time,
+                cgroup_path: None,
+                forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                cpu_ids: vec![0],
+                gpu_devices: vec![],
+                cpus: 1,
+                memory_mb: 512,
+                uid,
+                gid,
+                user: String::new(),
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "test-node".into(),
+                mpi: String::new(),
+                rootfs: None,
+                exit_status_path: None,
+                pending: executor::PendingObligations::default(),
+                exit: None,
+            },
+        );
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let free_cpus_before = svc.allocation.lock().await.free_cpus();
+
+        svc.reconcile_running_jobs().await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "resumed job must be tracked in `running`"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            free_cpus_before - 1,
+            "resumed job's cpu must be reflected in NodeAllocation before new launches are admitted"
+        );
+
+        child.kill().unwrap();
+        let _ = child.wait();
+        executor::cleanup_job_spool(job_id, 1);
+    }
+
+    // A job that finished entirely while spurd was restarting must still be
+    // reported to the controller — it must not be left "Running" forever.
+    #[tokio::test]
+    async fn reconcile_running_jobs_reports_completion_for_job_finished_while_down() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
+        let job_id = 987_654_327;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}_1"));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        std::fs::write(spool_dir.join("exit_status"), "5\n").unwrap();
+
+        executor::write_job_manifest(
+            &spool_dir,
+            &executor::JobManifest {
+                schema_version: 1,
+                job_id,
+                run_attempt: 1,
+                pid,
+                start_time: 0,
+                cgroup_path: None,
+                forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                cpu_ids: vec![],
+                gpu_devices: vec![],
+                cpus: 1,
+                memory_mb: 0,
+                uid,
+                gid,
+                user: String::new(),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "test-node".into(),
+                mpi: String::new(),
+                rootfs: None,
+                exit_status_path: None,
+                pending: executor::PendingObligations::default(),
+                exit: None,
+            },
+        );
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // adopt_manifests returns the dead jobs' (spool, manifest); the
+        // obligation discharge (report) is separate and needs no controller here.
+        let dead = svc.adopt_manifests().await;
+
+        // Filter to this test's id: scan reads the shared spool root, so a
+        // manifest a concurrent launch test left behind must not fail this.
+        let mine: Vec<&(std::path::PathBuf, executor::JobManifest)> =
+            dead.iter().filter(|(_, m)| m.job_id == job_id).collect();
+        assert_eq!(mine.len(), 1, "the finished job yields one completion");
+        let manifest = &mine[0].1;
+        assert_eq!(manifest.job_id, job_id);
+        assert_eq!(
+            (manifest.exit, manifest.run_attempt),
+            (Some((5, 0)), 1),
+            "a job finished while down must record its real exit code to report"
+        );
+        assert!(
+            manifest.pending.epilog && manifest.pending.report_completion,
+            "adopt_manifests records obligations but discharges none itself"
+        );
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a job that already finished must not be tracked as running"
+        );
+        // The spool (and manifest) is kept until obligations are discharged, so
+        // a lost report can be retried on the next restart. adopt_manifests does
+        // not report, so the spool must still be present here.
+        assert!(spool_dir.exists());
+        executor::cleanup_job_spool(job_id, 1);
+    }
+
+    // If the completion report can't reach the controller, the spool (and its
+    // manifest) must survive so the next spurd startup re-adopts it and retries —
+    // otherwise the job is stranded in Running (the node heartbeats, so the
+    // controller never times it out).
+    #[tokio::test]
+    async fn reconcile_keeps_spool_when_completion_report_fails() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
+        let job_id = 987_654_328;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}_1"));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        std::fs::write(spool_dir.join("exit_status"), "0\n").unwrap();
+
+        executor::write_job_manifest(
+            &spool_dir,
+            &executor::JobManifest {
+                schema_version: 1,
+                job_id,
+                run_attempt: 1,
+                pid,
+                start_time: 0,
+                cgroup_path: None,
+                forked: false,
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                cpu_ids: vec![],
+                gpu_devices: vec![],
+                cpus: 1,
+                memory_mb: 0,
+                uid,
+                gid,
+                user: String::new(),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "test-node".into(),
+                mpi: String::new(),
+                rootfs: None,
+                exit_status_path: None,
+                pending: executor::PendingObligations::default(),
+                exit: None,
+            },
+        );
+
+        // Controller address that refuses connections, so every report attempt
+        // fails and the completion report returns false.
+        let svc = AgentService::new(
+            dead_controller_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.reconcile_running_jobs().await;
+
+        assert!(
+            spool_dir.exists() && spool_dir.join("manifest.json").exists(),
+            "an unreported completion keeps its spool + manifest for a restart retry"
+        );
+        executor::cleanup_job_spool(job_id, 1);
+    }
+
+    fn dead_controller_reporter() -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://127.0.0.1:1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            new_running_jobs(),
+        ))
+    }
+
+    // The obligation ledger's core guarantee: when the completion report keeps
+    // failing, the epilog must run exactly ONCE across repeated restart-retries,
+    // not once per retry — the manifest records epilog-discharged before the
+    // report is attempted, so a retry resumes at the still-owed report only.
+    #[tokio::test]
+    async fn discharge_runs_epilog_once_across_report_retries() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
+        let job_id = 987_654_329;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}_1"));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        // Epilog appends a line each time it runs; counting lines counts runs.
+        let epilog_marker = std::env::temp_dir().join(format!("spur_epilog_ran_{job_id}"));
+        let _ = std::fs::remove_file(&epilog_marker);
+        let epilog_script = std::env::temp_dir().join(format!("spur_epilog_{job_id}.sh"));
+        std::fs::write(
+            &epilog_script,
+            format!("#!/bin/bash\necho ran >> {}\n", epilog_marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&epilog_script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&epilog_script, perms).unwrap();
+
+        let dead = executor::JobManifest {
+            schema_version: 1,
+            job_id,
+            run_attempt: 1,
+            pid: 999_999_999, // a pid that isn't alive, so reconcile sees it dead
+            start_time: 0,
+            cgroup_path: None,
+            forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            cpu_ids: vec![],
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid,
+            gid,
+            user: String::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: "/tmp".into(),
+            partition: "default".into(),
+            nodelist: "test-node".into(),
+            mpi: String::new(),
+            rootfs: None,
+            exit_status_path: None,
+            pending: executor::PendingObligations::default(),
+            exit: Some((3, 0)),
+        };
+        executor::write_job_manifest(&spool_dir, &dead);
+
+        let hooks = HooksConfig {
+            epilog: Some(epilog_script.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let svc = AgentService::new(
+            dead_controller_reporter(),
+            hooks,
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Two restart-retries, both with the controller unreachable. Discharge
+        // this job's manifest directly (rather than the global scan, which would
+        // also pick up other concurrent tests' manifests in the shared spool
+        // root) so the assertion is about this job alone.
+        let read_manifest = || {
+            let bytes = std::fs::read(spool_dir.join("manifest.json")).unwrap();
+            serde_json::from_slice::<executor::JobManifest>(&bytes).unwrap()
+        };
+        svc.discharge_obligations(&spool_dir, read_manifest()).await;
+        assert!(
+            !read_manifest().pending.epilog,
+            "epilog marked discharged after the first pass"
+        );
+        svc.discharge_obligations(&spool_dir, read_manifest()).await;
+
+        let runs = std::fs::read_to_string(&epilog_marker)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            runs, 1,
+            "epilog runs once across retries, not once per retry"
+        );
+        assert!(
+            spool_dir.join("manifest.json").exists(),
+            "manifest kept while the report is still owed"
+        );
+
+        executor::cleanup_job_spool(job_id, 1);
+        let _ = std::fs::remove_file(&epilog_marker);
+        let _ = std::fs::remove_file(&epilog_script);
+    }
+
+    // One reconcile pass with both a surviving job and a finished job: the live
+    // one is re-adopted into `running`, only the dead one yields a completion.
+    #[tokio::test]
+    async fn adopt_manifests_adopts_live_and_reports_only_dead() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let base = std::env::temp_dir().join("spur");
+
+        let live_id = 987_654_340;
+        let live_dir = base.join(format!("job{live_id}_1"));
+        std::fs::create_dir_all(&live_dir).unwrap();
+        // Long-lived so it is unambiguously alive when reconcile scans it.
+        let mut live_child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let live_pid = live_child.id() as i32;
+        let live_start = executor::proc_start_time(live_pid).unwrap();
+
+        let dead_id = 987_654_341;
+        let dead_dir = base.join(format!("job{dead_id}_1"));
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        let mut dead_child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead_child.id() as i32;
+        dead_child.wait().unwrap();
+        std::fs::write(dead_dir.join("exit_status"), "9\n").unwrap();
+
+        let manifest = |job_id, pid, start_time, cpu_ids: Vec<u32>| executor::JobManifest {
+            schema_version: 1,
+            job_id,
+            run_attempt: 1,
+            pid,
+            start_time,
+            cgroup_path: None,
+            forked: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            cpu_ids,
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid,
+            gid,
+            user: String::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: "/tmp".into(),
+            partition: "default".into(),
+            nodelist: "test-node".into(),
+            mpi: String::new(),
+            rootfs: None,
+            exit_status_path: None,
+            pending: executor::PendingObligations::default(),
+            exit: None,
+        };
+        executor::write_job_manifest(&live_dir, &manifest(live_id, live_pid, live_start, vec![0]));
+        executor::write_job_manifest(&dead_dir, &manifest(dead_id, dead_pid, 0, vec![]));
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let dead = svc.adopt_manifests().await;
+
+        // Filter to this test's ids: scan reads the shared spool root, so an
+        // unrelated leftover manifest must not fail the assertion.
+        let mine: Vec<&(std::path::PathBuf, executor::JobManifest)> = dead
+            .iter()
+            .filter(|(_, m)| m.job_id == live_id || m.job_id == dead_id)
+            .collect();
+        assert_eq!(mine.len(), 1, "only the finished job yields a completion");
+        let manifest = &mine[0].1;
+        assert_eq!(manifest.job_id, dead_id);
+        assert_eq!(
+            (manifest.exit, manifest.run_attempt),
+            (Some((9, 0)), 1),
+            "only the finished job yields a completion to report"
+        );
+        let running = svc.running.lock().await;
+        assert!(
+            running.contains_key(&live_id),
+            "the surviving job is adopted"
+        );
+        assert!(
+            !running.contains_key(&dead_id),
+            "the finished job is not adopted"
+        );
+        drop(running);
+
+        live_child.kill().unwrap();
+        let _ = live_child.wait();
+        executor::cleanup_job_spool(live_id, 1);
+        executor::cleanup_job_spool(dead_id, 1);
+    }
+
     #[tokio::test]
     async fn run_command_injects_gpu_env_from_tracked_job() {
         let svc = AgentService::new(
@@ -5384,7 +6307,7 @@ mod tests {
                 child,
                 cgroup_path: None,
             },
-            rootfs_mode: crate::container::RootfsMode::Extracted,
+            rootfs: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -5444,7 +6367,7 @@ mod tests {
                     child,
                     cgroup_path: None,
                 },
-                rootfs_mode: crate::container::RootfsMode::Extracted,
+                rootfs: None,
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
                 has_pid_namespace: false,
@@ -5712,5 +6635,43 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    fn owned_rootfs_at(base: &std::path::Path) -> crate::container::JobRootfs {
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+        crate::container::JobRootfs {
+            base_dir: base.to_path_buf(),
+            mode: crate::container::RootfsMode::Extracted,
+        }
+    }
+
+    /// A launch that fails after creating the rootfs must not leak it — the dir
+    /// is attempt-keyed, so no later attempt reuses or reclaims it.
+    #[test]
+    fn launch_rootfs_guard_tears_down_an_uncommitted_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("job_1_0");
+
+        drop(LaunchRootfsGuard::new(Some(owned_rootfs_at(&base))));
+
+        assert!(!base.exists(), "uncommitted rootfs should be removed");
+    }
+
+    #[test]
+    fn launch_rootfs_guard_leaves_a_committed_rootfs_to_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("job_1_0");
+        let mut guard = LaunchRootfsGuard::new(Some(owned_rootfs_at(&base)));
+
+        let handed_over = guard.disarm();
+        drop(guard);
+
+        assert_eq!(handed_over.map(|r| r.base_dir), Some(base.clone()));
+        assert!(base.exists(), "committed rootfs is the job's to keep");
+    }
+
+    #[test]
+    fn launch_rootfs_guard_is_inert_for_non_container_jobs() {
+        drop(LaunchRootfsGuard::new(None));
     }
 }

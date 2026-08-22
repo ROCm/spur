@@ -22,6 +22,11 @@ pub enum AllocError {
     /// still mid-launch, not yet committed or released). A second concurrent
     /// launch would double-count resources, so it is rejected.
     DuplicateJob,
+    /// A CPU named by a restored allocation is unknown to this node, already
+    /// held by another job, or repeated within the same allocation.
+    CpusUnavailable,
+    /// A restored allocation's memory would exceed the node's total.
+    MemoryUnavailable,
 }
 
 /// Per-node resource allocation state.
@@ -64,6 +69,11 @@ impl NodeAllocation {
             owners: HashMap::new(),
             launching: HashMap::new(),
         }
+    }
+
+    /// Whether any job is mid-launch (reserved, not yet committed to `running`).
+    pub fn has_launching(&self) -> bool {
+        !self.launching.is_empty()
     }
 
     /// Available (unallocated) CPU count.
@@ -184,7 +194,7 @@ impl NodeAllocation {
             }
         }
 
-        self.allocated_memory_mb += memory_mb;
+        self.allocated_memory_mb = self.allocated_memory_mb.saturating_add(memory_mb);
         for &idx in &gpu_indices {
             self.gpu_allocated[idx] = true;
         }
@@ -206,6 +216,66 @@ impl NodeAllocation {
     pub fn commit_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
         self.owners.contains_key(&job_id)
+    }
+
+    /// Re-adopt an already-committed allocation (e.g. after an agent restart),
+    /// pinning the exact ids rather than re-picking via first-fit. Idempotent:
+    /// a second call for the same job_id is a no-op, so a duplicate manifest
+    /// can't double-count memory (the cpu/gpu bitmaps are naturally
+    /// idempotent, but the memory counter isn't).
+    ///
+    /// GPUs are validated all-or-nothing before any mutation: a manifest naming
+    /// a device already held by another job is rejected with `GpusUnavailable`
+    /// so the caller can refuse the adoption rather than double-book the device
+    /// (releasing one owner would then free a GPU the other still holds).
+    /// Re-charge an allocation recovered from a durable record. Validates CPUs,
+    /// memory and GPUs before mutating anything, so a record that conflicts with
+    /// what this node already holds is refused outright rather than partially
+    /// applied — a partial restore is precisely the double-book this exists to
+    /// prevent.
+    pub fn restore_committed(
+        &mut self,
+        job_id: u32,
+        alloc: AllocationResult,
+    ) -> Result<(), AllocError> {
+        if self.owners.contains_key(&job_id) {
+            return Ok(());
+        }
+        let mut gpu_indices = Vec::with_capacity(alloc.gpu_ids.len());
+        for &device_id in &alloc.gpu_ids {
+            let idx = self
+                .gpus
+                .iter()
+                .position(|g| g.device_id == device_id)
+                .ok_or(AllocError::GpusUnavailable)?;
+            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+                return Err(AllocError::GpusUnavailable);
+            }
+            gpu_indices.push(idx);
+        }
+        let mut cpu_indices = Vec::with_capacity(alloc.cpu_ids.len());
+        for &cpu in &alloc.cpu_ids {
+            let idx = cpu as usize;
+            match self.allocated_cpus.get(idx) {
+                Some(false) if !cpu_indices.contains(&idx) => cpu_indices.push(idx),
+                _ => return Err(AllocError::CpusUnavailable),
+            }
+        }
+        if self.allocated_memory_mb.saturating_add(alloc.memory_mb) > self.total_memory_mb {
+            return Err(AllocError::MemoryUnavailable);
+        }
+
+        // Every check has passed, so the mutations below cannot leave the
+        // bitmaps disagreeing with `owners`.
+        for idx in cpu_indices {
+            self.allocated_cpus[idx] = true;
+        }
+        self.allocated_memory_mb += alloc.memory_mb;
+        for idx in gpu_indices {
+            self.gpu_allocated[idx] = true;
+        }
+        self.owners.insert(job_id, alloc);
+        Ok(())
     }
 
     /// Release a job's allocation by id. Idempotent: releasing an unknown or
@@ -554,6 +624,174 @@ mod tests {
             1,
             "reclaimed GPU stays free after the no-op commit"
         );
+    }
+
+    #[test]
+    fn test_restore_committed_pins_exact_ids_not_first_fit() {
+        let mut node = make_node_with_ids(4, 8_000, vec![0, 1], "mi300x");
+        // Simulate a spurd restart: nothing allocated yet in this fresh
+        // NodeAllocation, but a manifested job actually holds cpu 3 and gpu 1
+        // (not the first-fit picks allocate_for_job would make).
+        let alloc = AllocationResult {
+            cpu_ids: vec![3],
+            gpu_ids: vec![1],
+            memory_mb: 2_000,
+        };
+        node.restore_committed(42, alloc.clone()).unwrap();
+
+        assert_eq!(node.free_cpus(), 3);
+        assert_eq!(node.free_gpus(None), 1);
+        assert_eq!(node.free_memory_mb(), 6_000);
+        assert_eq!(node.allocated_gpu_ids(), vec![1]);
+
+        // A subsequent allocation must not double-book cpu 3 / gpu 1.
+        let next = node.allocate_for_job(43, 1, 0, &[0]).unwrap();
+        assert_eq!(next.cpu_ids, vec![0]);
+        assert!(!next.cpu_ids.contains(&3));
+
+        // Committed (not launching), so reconcile treats it like any other
+        // live job rather than sparing it as mid-launch.
+        let live: HashSet<u32> = [42, 43].into_iter().collect();
+        assert!(node
+            .reconcile(&live, Instant::now(), Duration::from_secs(120))
+            .is_empty());
+        assert!(node.release_job(42));
+        assert_eq!(node.free_memory_mb(), 8_000);
+    }
+
+    #[test]
+    fn test_has_launching_tracks_in_flight_launch() {
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        assert!(!node.has_launching());
+        node.allocate_for_job(1, 1, 0, &[0]).unwrap();
+        assert!(
+            node.has_launching(),
+            "reserved-but-not-committed job is launching"
+        );
+        node.commit_job(1);
+        assert!(
+            !node.has_launching(),
+            "committed job is no longer launching"
+        );
+    }
+
+    #[test]
+    fn test_restore_committed_rejects_memory_beyond_node_total() {
+        // A corrupt or tampered record claiming more memory than the node has
+        // must be refused, not absorbed. Accepting it would leave the node
+        // advertising zero free memory forever with no owner to release it.
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        let bad = node.restore_committed(
+            1,
+            AllocationResult {
+                cpu_ids: vec![],
+                gpu_ids: vec![],
+                memory_mb: u64::MAX,
+            },
+        );
+        assert_eq!(bad, Err(AllocError::MemoryUnavailable));
+        assert_eq!(node.free_memory_mb(), 8_000);
+        assert!(!node.owners.contains_key(&1));
+    }
+
+    #[test]
+    fn test_restore_committed_rejects_cpu_double_book() {
+        // Two records claiming the same cores is the CPU-side equivalent of the
+        // GPU double-book below, and was previously accepted silently.
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        node.restore_committed(
+            1,
+            AllocationResult {
+                cpu_ids: vec![0, 1],
+                gpu_ids: vec![],
+                memory_mb: 1_000,
+            },
+        )
+        .unwrap();
+        let conflict = node.restore_committed(
+            2,
+            AllocationResult {
+                cpu_ids: vec![1, 2],
+                gpu_ids: vec![],
+                memory_mb: 1_000,
+            },
+        );
+        assert_eq!(conflict, Err(AllocError::CpusUnavailable));
+        // Rejected cleanly: core 2 was not charged on the way out.
+        assert!(!node.allocated_cpus[2]);
+        assert!(!node.owners.contains_key(&2));
+    }
+
+    #[test]
+    fn test_restore_committed_rejects_unknown_and_repeated_cpu() {
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        let out_of_range = node.restore_committed(
+            1,
+            AllocationResult {
+                cpu_ids: vec![99],
+                gpu_ids: vec![],
+                memory_mb: 0,
+            },
+        );
+        assert_eq!(out_of_range, Err(AllocError::CpusUnavailable));
+        let repeated = node.restore_committed(
+            2,
+            AllocationResult {
+                cpu_ids: vec![1, 1],
+                gpu_ids: vec![],
+                memory_mb: 0,
+            },
+        );
+        assert_eq!(repeated, Err(AllocError::CpusUnavailable));
+        assert!(!node.allocated_cpus[1]);
+    }
+
+    #[test]
+    fn test_restore_committed_rejects_gpu_double_book() {
+        // Two manifests naming the same device: the second adoption must be
+        // rejected, not silently double-book the GPU — otherwise releasing the
+        // first frees a device the second still holds.
+        let mut node = make_node_with_ids(4, 8_000, vec![0, 1], "mi300x");
+        node.restore_committed(
+            1,
+            AllocationResult {
+                cpu_ids: vec![0],
+                gpu_ids: vec![0],
+                memory_mb: 1_000,
+            },
+        )
+        .unwrap();
+        let conflict = node.restore_committed(
+            2,
+            AllocationResult {
+                cpu_ids: vec![1],
+                gpu_ids: vec![0],
+                memory_mb: 1_000,
+            },
+        );
+        assert_eq!(conflict, Err(AllocError::GpusUnavailable));
+        // The rejected adoption left nothing behind: gpu 0 still belongs only to
+        // job 1, and its cpu/memory were not partially applied.
+        assert_eq!(node.allocated_gpu_ids(), vec![0]);
+        assert_eq!(node.free_memory_mb(), 7_000);
+        assert!(!node.release_job(2));
+    }
+
+    #[test]
+    fn test_restore_committed_rejects_unknown_gpu() {
+        // A manifest naming a device this node doesn't have is rejected rather
+        // than silently dropped, so the caller can refuse the adoption.
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        let bad = node.restore_committed(
+            1,
+            AllocationResult {
+                cpu_ids: vec![0],
+                gpu_ids: vec![99],
+                memory_mb: 1_000,
+            },
+        );
+        assert_eq!(bad, Err(AllocError::GpusUnavailable));
+        assert_eq!(node.free_memory_mb(), 8_000);
     }
 
     #[test]
