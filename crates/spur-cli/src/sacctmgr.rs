@@ -28,6 +28,34 @@ pub struct SacctmgrArgs {
     /// Immediate mode (no confirmation)
     #[arg(short = 'i', long, global = true)]
     pub immediate: bool,
+
+    /// Omit the header line
+    #[arg(short = 'n', long, global = true)]
+    pub noheader: bool,
+
+    /// Output '|' delimited with a trailing '|'
+    #[arg(short = 'p', long, global = true)]
+    pub parsable: bool,
+
+    /// Output '|' delimited without a trailing '|'
+    #[arg(short = 'P', long, global = true)]
+    pub parsable2: bool,
+}
+
+impl SacctmgrArgs {
+    /// Slurm takes whichever delimiter flag came last; clap's derive cannot see flag order,
+    /// so `-P` wins when both are given rather than rejecting input Slurm accepts.
+    fn output_style(&self) -> format_engine::OutputStyle {
+        let layout = if self.parsable2 {
+            format_engine::RowLayout::Delimited
+        } else if self.parsable {
+            format_engine::RowLayout::DelimitedTrailing
+        } else {
+            format_engine::RowLayout::Aligned
+        };
+
+        format_engine::OutputStyle::new(self.noheader, layout)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -79,13 +107,14 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SacctmgrArgs::try_parse_from(&args)?;
     let addr = args.controller.clone();
+    let style = args.output_style();
 
     match args.command {
         SacctmgrCommand::Add { entity, params } => add(&entity, &params, &addr).await,
         SacctmgrCommand::Delete { entity, params } => delete(&entity, &params, &addr).await,
         SacctmgrCommand::Modify { entity, params } => modify(&entity, &params, &addr).await,
         SacctmgrCommand::Show { entity, params } | SacctmgrCommand::List { entity, params } => {
-            show(&entity, &params, &addr).await
+            show(&entity, &params, &addr, style).await
         }
     }
 }
@@ -837,10 +866,34 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
-async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
-    let p = parse_params(params);
+/// Entities whose columns come from `format_engine`, and so can be delimited.
+const DELIMITABLE_ENTITIES: [&str; 3] = ["account", "accounts", "qos"];
 
-    match entity.to_lowercase().as_str() {
+/// The remaining entities print fixed-width tables with no field-spec table behind them.
+/// Accepting `-p`/`-P` there would hand a script padded text where it expects delimited
+/// fields, so refuse loudly instead of returning output that silently will not parse.
+fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle) -> Result<()> {
+    if !style.is_delimited() || DELIMITABLE_ENTITIES.contains(&entity) {
+        return Ok(());
+    }
+
+    bail!(
+        "sacctmgr: delimited output (-p/-P) is not supported for '{entity}'. \
+         Supported entities: account, qos"
+    )
+}
+
+async fn show(
+    entity: &str,
+    params: &[String],
+    addr: &str,
+    style: format_engine::OutputStyle,
+) -> Result<()> {
+    let p = parse_params(params);
+    let entity = entity.to_lowercase();
+    reject_unsupported_delimiter(&entity, style)?;
+
+    match entity.as_str() {
         "account" | "accounts" => {
             let fields = account_format_fields(p.get("format").map(String::as_str))?;
 
@@ -852,12 +905,12 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let accounts = resp.into_inner().accounts;
 
-            format_engine::print_header(&fields);
+            style.print_header(&fields);
 
             for a in &accounts {
                 println!(
                     "{}",
-                    format_engine::format_row(&fields, &|spec| resolve_account_field(a, spec))
+                    style.row(&fields, &|spec| resolve_account_field(a, spec))
                 );
             }
             Ok(())
@@ -876,8 +929,11 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let users = resp.into_inner().users;
 
-            println!("{}", user_header_row());
-            println!("{}", "-".repeat(180));
+            if style.shows_header() {
+                println!("{}", user_header_row());
+                println!("{}", "-".repeat(180));
+            }
+
             for u in &users {
                 println!("{}", format_user_row(u));
             }
@@ -907,7 +963,7 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 filter_qos_by_name(&mut qos_list, name_filter);
             }
 
-            format_engine::print_header(&fields);
+            style.print_header(&fields);
 
             if qos_list.is_empty() && !has_name_filter {
                 let default_qos = QosInfo {
@@ -918,32 +974,30 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 };
                 println!(
                     "{}",
-                    format_engine::format_row(&fields, &|spec| resolve_qos_field(
-                        &default_qos,
-                        spec
-                    ))
+                    style.row(&fields, &|spec| resolve_qos_field(&default_qos, spec))
                 );
             } else {
                 for q in &qos_list {
-                    println!(
-                        "{}",
-                        format_engine::format_row(&fields, &|spec| resolve_qos_field(q, spec))
-                    );
+                    println!("{}", style.row(&fields, &|spec| resolve_qos_field(q, spec)));
                 }
             }
             Ok(())
         }
         "association" | "associations" => {
-            println!(
-                "{:<15} {:<20} {:<15} {:<10} {:<10}",
-                "User", "Account", "Partition", "Share", "Default"
-            );
-            println!("{}", "-".repeat(70));
+            if style.shows_header() {
+                println!(
+                    "{:<15} {:<20} {:<15} {:<10} {:<10}",
+                    "User", "Account", "Partition", "Share", "Default"
+                );
+                println!("{}", "-".repeat(70));
+            }
             Ok(())
         }
         "tres" => {
-            println!("{:<5} {:<15} {:<10}", "ID", "Type", "Name");
-            println!("{}", "-".repeat(30));
+            if style.shows_header() {
+                println!("{:<5} {:<15} {:<10}", "ID", "Type", "Name");
+                println!("{}", "-".repeat(30));
+            }
             println!("{:<5} {:<15} {:<10}", "1", "cpu", "");
             println!("{:<5} {:<15} {:<10}", "2", "mem", "");
             println!("{:<5} {:<15} {:<10}", "3", "energy", "");
@@ -2375,6 +2429,164 @@ mod tests {
         assert!(
             build_modify_qos_request(&p).is_err(),
             "malformed preemptexempttime should error"
+        );
+    }
+
+    #[test]
+    fn scripted_query_with_header_and_delimiter_flags_parses() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "-n",
+            "-P",
+            "show",
+            "qos",
+            "format=Name,Priority,MaxWall",
+        ])
+        .expect("-n -P must parse");
+
+        assert!(args.noheader);
+        assert!(args.parsable2);
+        assert!(!args.parsable);
+    }
+
+    #[test]
+    fn delimiter_flag_long_names_match_slurm() {
+        let trailing =
+            SacctmgrArgs::try_parse_from(["sacctmgr", "--noheader", "--parsable", "show", "qos"])
+                .expect("--parsable must parse");
+        assert!(trailing.noheader);
+        assert!(trailing.parsable);
+        assert!(!trailing.parsable2);
+
+        let no_trailing = SacctmgrArgs::try_parse_from(["sacctmgr", "--parsable2", "show", "qos"])
+            .expect("--parsable2 must parse");
+        assert!(no_trailing.parsable2);
+        assert!(!no_trailing.parsable);
+    }
+
+    #[test]
+    fn header_and_delimiter_flags_leave_other_arguments_alone() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "-i",
+            "-n",
+            "-P",
+            "show",
+            "qos",
+            "format=Name,Priority",
+        ])
+        .expect("flags must compose with existing globals");
+
+        assert!(args.immediate);
+        assert_eq!(args.controller, "http://localhost:6817");
+
+        let SacctmgrCommand::Show { entity, params } = args.command else {
+            panic!("expected a show command");
+        };
+        assert_eq!(entity, "qos");
+        assert_eq!(params, vec!["format=Name,Priority".to_string()]);
+    }
+
+    fn style_from(flags: &[&str]) -> format_engine::OutputStyle {
+        let mut argv = vec!["sacctmgr"];
+        argv.extend_from_slice(flags);
+        argv.extend_from_slice(&["show", "qos"]);
+
+        SacctmgrArgs::try_parse_from(argv)
+            .expect("flags must parse")
+            .output_style()
+    }
+
+    /// A `show qos` row for the given flags, rendered through the real QOS resolver.
+    fn qos_row(flags: &[&str], format: &str) -> String {
+        let fields = format_engine::parse_named_format(format, &qos_field_spec, &qos_header);
+        style_from(flags).row(&fields, &|spec| resolve_qos_field(&stub_qos(), spec))
+    }
+
+    #[test]
+    fn parsable2_row_has_no_trailing_delimiter() {
+        assert_eq!(qos_row(&["-P"], "Name,Priority"), "gpuqos|100");
+    }
+
+    #[test]
+    fn parsable_row_has_a_trailing_delimiter() {
+        assert_eq!(qos_row(&["-p"], "Name,Priority"), "gpuqos|100|");
+    }
+
+    #[test]
+    fn delimited_values_containing_commas_stay_unambiguous() {
+        // TRES values are comma-separated internally, which is why Slurm's parsable output
+        // uses '|' rather than ','.
+        assert_eq!(qos_row(&["-P"], "Name,GrpTRES"), "gpuqos|node=4,cpu=256");
+    }
+
+    #[test]
+    fn format_ordering_is_preserved_in_delimited_output() {
+        assert_eq!(qos_row(&["-P"], "Priority,Name"), "100|gpuqos");
+    }
+
+    #[test]
+    fn both_delimiter_flags_resolve_to_parsable2() {
+        assert_eq!(qos_row(&["-p", "-P"], "Name,Priority"), "gpuqos|100");
+    }
+
+    #[test]
+    fn without_a_delimiter_flag_rows_are_byte_identical_to_today() {
+        let fields =
+            format_engine::parse_named_format(QOS_DEFAULT_FORMAT, &qos_field_spec, &qos_header);
+        let q = stub_qos();
+        let expected = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+
+        assert_eq!(
+            style_from(&[]).row(&fields, &|spec| resolve_qos_field(&q, spec)),
+            expected
+        );
+        assert_eq!(
+            style_from(&["-n"]).row(&fields, &|spec| resolve_qos_field(&q, spec)),
+            expected
+        );
+    }
+
+    #[test]
+    fn header_suppression_applies_to_fixed_width_entities_too() {
+        assert!(style_from(&[]).shows_header());
+        assert!(!style_from(&["-n"]).shows_header());
+    }
+
+    #[test]
+    fn delimited_output_is_refused_only_where_columns_are_not_modelled() {
+        let delimited = style_from(&["-P"]);
+        for entity in ["account", "accounts", "qos"] {
+            assert!(
+                reject_unsupported_delimiter(entity, delimited).is_ok(),
+                "{entity} should support delimited output"
+            );
+        }
+        for entity in ["user", "users", "association", "tres"] {
+            assert!(
+                reject_unsupported_delimiter(entity, delimited).is_err(),
+                "{entity} should refuse delimited output"
+            );
+        }
+
+        // Padded output stays available for every entity.
+        let padded = style_from(&[]);
+        for entity in ["user", "association", "tres"] {
+            assert!(reject_unsupported_delimiter(entity, padded).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_delimiter_fails_before_contacting_the_controller() {
+        // Port 1 is unroutable: reaching the network at all would surface a connect error
+        // instead, so this also pins that the check runs first.
+        let err = show("user", &[], "http://127.0.0.1:1", style_from(&["-P"]))
+            .await
+            .expect_err("delimited show user must fail");
+
+        assert!(
+            err.to_string().contains("not supported for 'user'"),
+            "unexpected error: {err}"
         );
     }
 }
