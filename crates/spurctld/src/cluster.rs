@@ -15914,6 +15914,191 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_credit_does_not_poison_qos_reuse_computation_for_dual_membership_job() {
+        // A job with BOTH an account and a QOS runs account_block_with first,
+        // then qos_block_with, on the SAME `&mut Job`. account_block_with
+        // credits n1 (a node occupied only by an account-only running job)
+        // with a *full* charge=0 for this 1-node job, which immediately makes
+        // `job.preferred_nodes = {n1}` fully cover `num_nodes` (1) -- i.e.
+        // RESTRICTIVE per `NodePlacement::nodelist_is_additive()`.
+        //
+        // qos_block_with runs next and internally calls
+        // `new_distinct_nodes_needed`, which builds a FRESH
+        // `NodePlacement::new(job)` from the job's CURRENT state -- which by
+        // now already has `preferred_nodes = {n1}` from the account check.
+        // Since that's restrictive, `allows_name` rejects any node not in
+        // {n1}, so qos's own occupied node n2 (occupied only by a qos-only
+        // running job, with spare capacity, utterly unrelated to the
+        // account) gets incorrectly filtered OUT of qos's reusable-node
+        // candidates -- even though n2 has nothing to do with the account's
+        // credit and QOS's own occupied-node view never included n1.
+        //
+        // The account's cap is generous (node=5, real=1: crediting an
+        // unrelated new node is cheap for it). The QOS cap is tight
+        // (node=1, real=1: it has zero headroom for anything except
+        // reusing its own already-occupied node n2 with charge=0). The
+        // mathematically correct outcome is ADMIT: place the job on n2,
+        // giving QOS charge=0 (stays at cap 1) and the account a fresh
+        // node (real becomes 2, well under its cap of 5). Instead, the
+        // account's irrelevant credit poisons the QOS's own computation,
+        // charging it 1 new node it doesn't need, and the job is wrongly
+        // blocked on QosGrpNodeLimit -- the exact under-utilization bug
+        // class issue #709 (and this whole PR) was meant to fix, now
+        // reintroduced via the interaction between the two gates.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+
+        let mut acct_grp = TresRecord::new();
+        acct_grp.set(TresType::Node, 5);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "acct1",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(acct_grp),
+                ..Default::default()
+            },
+        );
+        let mut qos_grp = TresRecord::new();
+        qos_grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "qos1".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(qos_grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            let mut r1 = make_running_job(401, &["n1"], 1);
+            r1.spec.num_nodes = 1;
+            r1.spec.account = Some("acct1".into());
+            jobs.insert(401, r1);
+            let mut r2 = make_running_job(402, &["n2"], 1);
+            r2.spec.num_nodes = 1;
+            r2.spec.qos = Some("qos1".into());
+            jobs.insert(402, r2);
+        }
+
+        let mut newjob = basic_spec("dual-cap");
+        newjob.account = Some("acct1".into());
+        newjob.qos = Some("qos1".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(new_id).unwrap().pending_reason,
+            PendingReason::None,
+            "the job can be admitted by placing on n2 (QOS reuses it with 0 new \
+             nodes, staying at its cap of 1; the account merely gains a new node \
+             well within its generous cap of 5) -- it must not be blocked just \
+             because the unrelated account credit for n1 happened to run first \
+             and made job.preferred_nodes restrictive to {{n1}} before the QOS \
+             check ran"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_distinct_nodes_needed_does_not_credit_an_unschedulable_node() {
+        // n1 is Down (e.g. hardware fault) but still hosts a running QOS job
+        // with spare capacity on paper -- this is realistic: taking a node
+        // Down/Drain does not kill jobs already running on it. n2 and n3 are
+        // healthy idle nodes with plenty of room. QOS grp_tres node=2,
+        // already at 1 real distinct node (n1, via the running job).
+        //
+        // `new_distinct_nodes_needed` filters candidate reusable nodes via
+        // `allows_name && in_partition && has_features && can_satisfy_request`
+        // -- it never checks `Node::is_schedulable()` (unlike the real
+        // scheduler's `NodePlacement::matches`, which backfill actually uses
+        // to filter real candidates). So a 2-node pending job gets credited
+        // for reusing n1 (charge=1, assuming only 1 genuinely new node is
+        // needed) and is admitted (real 1 + charge 1 = 2 <= cap 2), with
+        // `job.preferred_nodes = {"n1"}` -- additive, since num_nodes(2) >
+        // preferred_nodes.len()(1).
+        //
+        // n1 can never actually be placed on (Down), and
+        // `BackfillScheduler::find_suitable_nodes`'s additive-nodelist guard
+        // (backfill.rs) treats a resource-capable-but-currently-unsuitable
+        // listed node as "wait for it, don't skip to unlisted nodes" and
+        // returns zero candidates entirely -- so this job can NEVER be
+        // scheduled again (n1 stays Down forever in this scenario) even
+        // though n2 and n3 sit idle and could satisfy it right now. This is
+        // an indefinite starvation bug caused by admission crediting a node
+        // real placement will never accept, reintroducing the same
+        // under-utilization problem class issue #709 was about, just via a
+        // different mechanism (livelock instead of an outright block).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        register_node(&cm, "n3", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = spur_core::node::NodeState::Down;
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "cvs".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            let mut r = make_running_job(501, &["n1"], 1);
+            r.spec.num_nodes = 1;
+            r.spec.qos = Some("cvs".into());
+            jobs.insert(501, r);
+        }
+
+        let mut newjob = basic_spec("needs-two");
+        newjob.qos = Some("cvs".into());
+        newjob.num_nodes = 2;
+        newjob.num_tasks = 2;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        let pending = cm.pending_jobs();
+        let job = pending
+            .iter()
+            .find(|j| j.job_id == new_id)
+            .expect("admitted on the assumption it can reuse (down) n1 for 1 of its 2 nodes");
+        assert_eq!(
+            job.preferred_nodes,
+            HashSet::from(["n1".to_string()]),
+            "admission credited the Down node n1 without checking is_schedulable()"
+        );
+
+        let nodes = cm.get_nodes();
+        let partitions = cm.get_partitions();
+        let reservations = cm.get_reservations();
+        let cluster_state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+        use spur_sched::traits::Scheduler as _;
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
+        let assignments = scheduler.schedule(std::slice::from_ref(job), &cluster_state);
+        assert!(
+            assignments.iter().any(|a| a.job_id == new_id),
+            "the job must still be schedulable on the two healthy idle nodes n2/n3, \
+             but real placement finds zero candidates: admission's credit toward the \
+             Down node n1 becomes an additive nodelist bias that backfill's \
+             find_suitable_nodes() guard interprets as \"wait for n1\", starving the \
+             job indefinitely even though n2/n3 could satisfy it right now"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_pass_account_grp_node_block_tags_reason_not_none() {
         // Account grp_tres node=1: the second job is blocked only by the first's
         // in-pass reservation. Expect AssocGrpNodeLimit, not None.
