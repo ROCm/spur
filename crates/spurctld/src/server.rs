@@ -1559,14 +1559,9 @@ impl SlurmController for ControllerService {
             })
             .unwrap_or_default();
 
-        // A node re-registering with different labels reaches the same NodeLabelsUpdate WAL op as
-        // the gated `update_node`; require the same admin bar there, but let first registration and
-        // unchanged re-registration through, so a node agent can self-register without one.
-        if let Some(existing) = self.cluster.get_node(&request.get_ref().hostname) {
-            if existing.labels != request.get_ref().labels {
-                self.require_admin(&request, "relabel an existing node on re-registration")?;
-            }
-        }
+        // Decided here, enforced atomically inside `register_node` against the label diff — a
+        // pre-check here instead would race a concurrent registration for the same node.
+        let caller_privileged = self.caller_is_privileged(Self::verified_identity(&request));
 
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
@@ -1596,8 +1591,9 @@ impl SlurmController for ControllerService {
                 req.version,
                 source,
                 req.labels,
+                caller_privileged,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(register_node_rpc_status)?;
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -4064,6 +4060,13 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
     }
 }
 
+fn register_node_rpc_status(err: crate::cluster::RegisterNodeError) -> Status {
+    match err {
+        crate::cluster::RegisterNodeError::PermissionDenied(m) => Status::permission_denied(m),
+        crate::cluster::RegisterNodeError::Internal(m) => Status::internal(m),
+    }
+}
+
 fn partition_rpc_status(err: PartitionError) -> Status {
     match err {
         PartitionError::InvalidArgument(m) => Status::invalid_argument(m),
@@ -5162,6 +5165,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         for _ in 0..200 {
@@ -5270,6 +5274,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         for _ in 0..200 {
@@ -5436,6 +5441,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         for _ in 0..200 {
@@ -5677,6 +5683,7 @@ mod tests {
                     String::new(),
                     NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    true,
                 )
                 .unwrap();
             svc.cluster
@@ -5791,6 +5798,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
         svc.cluster
@@ -5824,6 +5832,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                true,
             )
             .unwrap();
     }
@@ -6786,6 +6795,7 @@ mod tests {
                     String::new(),
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    true,
                 )
                 .unwrap();
         }
@@ -7052,6 +7062,116 @@ mod tests {
         assert_eq!(
             svc.cluster.get_node("victim-node").unwrap().labels["pool"],
             "stolen"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_unchanged_non_empty_labels_needs_no_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "steady-node", 6822).await;
+
+        let labels: std::collections::HashMap<String, String> =
+            [("pool".to_string(), "prod".to_string())].into();
+        svc.register_agent(admin_request(RegisterAgentRequest {
+            hostname: "steady-node".into(),
+            address: "127.0.0.1".into(),
+            labels: labels.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an admin may set the initial labels");
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "steady-node".into(),
+            address: "127.0.0.1".into(),
+            labels,
+            ..Default::default()
+        }))
+        .await
+        .expect("re-registering with the same non-empty labels must not be admin-gated");
+    }
+
+    // The diff a non-admin's re-registration is checked against is read at write time, not decided
+    // ahead of it — so a non-admin can't revert a relabel that lands between their read and write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_agent_non_admin_cannot_revert_a_privileged_relabel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "contended-node", 6823).await;
+
+        svc.register_agent(admin_request(RegisterAgentRequest {
+            hostname: "contended-node".into(),
+            address: "127.0.0.1".into(),
+            labels: [("pool".to_string(), "prod".to_string())].into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("an admin may relabel the node");
+
+        let mut r = Request::new(RegisterAgentRequest {
+            hostname: "contended-node".into(),
+            address: "127.0.0.1".into(),
+            labels: std::collections::HashMap::new(),
+            ..Default::default()
+        });
+        r.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(r)
+            .await
+            .expect_err("a non-admin re-registration must not revert the privileged relabel");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_node("contended-node").unwrap().labels["pool"],
+            "prod",
+            "the privileged relabel must survive the non-admin's attempt"
+        );
+    }
+
+    // Runs the admin and non-admin relabel concurrently (not sequentially) so the gate's decision
+    // is genuinely raced against the write, not just checked against an already-settled state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_agent_concurrent_non_admin_relabel_never_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = std::sync::Arc::new(test_service(&dir).await);
+        register_plain_node(&svc, "racy-node", 6824).await;
+
+        let admin_svc = svc.clone();
+        let admin_task = tokio::spawn(async move {
+            admin_svc
+                .register_agent(admin_request(RegisterAgentRequest {
+                    hostname: "racy-node".into(),
+                    address: "127.0.0.1".into(),
+                    labels: [("pool".to_string(), "prod".to_string())].into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+
+        let non_admin_svc = svc.clone();
+        let non_admin_task = tokio::spawn(async move {
+            let mut r = Request::new(RegisterAgentRequest {
+                hostname: "racy-node".into(),
+                address: "127.0.0.1".into(),
+                labels: [("pool".to_string(), "hacked".to_string())].into(),
+                ..Default::default()
+            });
+            r.extensions_mut().insert(viewer("mallory", false));
+            non_admin_svc.register_agent(r).await
+        });
+
+        let (admin_result, non_admin_result) = tokio::join!(admin_task, non_admin_task);
+        admin_result
+            .unwrap()
+            .expect("the admin's relabel must succeed regardless of scheduling order");
+        let non_admin_err = non_admin_result
+            .unwrap()
+            .expect_err("the non-admin's concurrent relabel must never win the race");
+        assert_eq!(non_admin_err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_node("racy-node").unwrap().labels["pool"],
+            "prod",
+            "only the admin's labels may land, whichever task the scheduler ran first"
         );
     }
 
