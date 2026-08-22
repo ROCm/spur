@@ -12,8 +12,8 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use spur_core::account_limits::{
-    check_account_limits, check_account_standalone_limits, check_account_submit_limits,
-    check_account_wall_limit, AccountCheckResult,
+    check_account_limits_with_grp_node_charge, check_account_standalone_limits,
+    check_account_submit_limits, check_account_wall_limit, AccountCheckResult,
 };
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
@@ -25,7 +25,8 @@ use spur_core::job::{
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::qos::{
-    check_qos_limits, check_qos_standalone_limits, check_qos_submit_limits, QosCheckResult,
+    check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
+    QosCheckResult,
 };
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
@@ -3257,9 +3258,10 @@ impl ClusterManager {
         {
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
+            let nodes = self.nodes.read();
             retain_eligible(&mut candidates, &mut blocked, |job| {
                 if let Some(reason) =
-                    account_block_with(job, &self.association_cache, &jobs, &reserved)
+                    account_block_with(job, &self.association_cache, &jobs, &nodes, &reserved)
                 {
                     return GateOutcome::Block(reason);
                 }
@@ -3272,6 +3274,7 @@ impl ClusterManager {
                     job,
                     &qos_by_job[&job.job_id],
                     &jobs,
+                    &nodes,
                     &reserved,
                     consumed_wall,
                 ) {
@@ -6495,6 +6498,7 @@ fn qos_block_with(
     job: &Job,
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
+    nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
 ) -> Option<spur_core::job::PendingReason> {
@@ -6534,7 +6538,10 @@ fn qos_block_with(
         qos_running_tres.add(t);
     }
 
-    match check_qos_limits(
+    let qos_occupied = occupied_nodes(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
+    let grp_node_charge = new_distinct_nodes_needed(job, &qos_occupied, nodes);
+
+    match check_qos_limits_with_grp_node_charge(
         job,
         qos,
         running_count,
@@ -6542,6 +6549,7 @@ fn qos_block_with(
         &user_running_tres,
         &qos_running_tres,
         consumed_wall_minutes,
+        grp_node_charge,
     ) {
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
@@ -6554,6 +6562,7 @@ fn account_block_with(
     job: &Job,
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
+    nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
 ) -> Option<spur_core::job::PendingReason> {
     let account = job.spec.account.as_deref().filter(|a| !a.is_empty())?;
@@ -6591,12 +6600,16 @@ fn account_block_with(
         account_running_tres.add(t);
     }
 
-    match check_account_limits(
+    let account_occupied = occupied_nodes(jobs, |j| j.spec.account.as_deref() == Some(account));
+    let grp_node_charge = new_distinct_nodes_needed(job, &account_occupied, nodes);
+
+    match check_account_limits_with_grp_node_charge(
         job,
         &limits,
         running_count,
         submitted_count,
         &account_running_tres,
+        grp_node_charge,
     ) {
         AccountCheckResult::Allowed => None,
         AccountCheckResult::Blocked(reason) => Some(reason),
@@ -6751,6 +6764,52 @@ fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> 
     // real distinct-node occupancy.
     tres.set(TresType::Node, distinct_nodes.len() as u64 + unplaced_nodes);
     tres
+}
+
+/// Distinct nodes currently occupied by running jobs matching `pred`, so the
+/// group-node check can let a pending job of the same group pack onto them
+/// instead of always requiring brand-new distinct nodes.
+fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> HashSet<String> {
+    jobs.values()
+        .filter(|j| j.state == JobState::Running && pred(j))
+        .flat_map(|j| j.allocated_nodes.iter().cloned())
+        .collect()
+}
+
+/// Distinct NEW nodes `job` would need beyond `occupied`, given each occupied
+/// node's live spare capacity and scheduling eligibility. A job that fits
+/// entirely on already-occupied nodes needs 0 new nodes.
+///
+/// Reservation-fencing is intentionally not checked here (matching
+/// `job_candidate_node_names`'s scope): worst case a reserved node is
+/// optimistically counted as reusable, the job clears this gate, and the real
+/// backfill placement step still refuses to place it there — no
+/// oversubscription risk, just a possible extra pending cycle. Exclusive jobs
+/// never reuse an already-occupied node, since they require the whole node to
+/// themselves.
+fn new_distinct_nodes_needed(
+    job: &Job,
+    occupied: &HashSet<String>,
+    nodes: &HashMap<String, Node>,
+) -> u64 {
+    if job.spec.exclusive {
+        return job.spec.num_nodes as u64;
+    }
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let required = spur_sched::backfill::job_resource_request(job);
+    let reusable = occupied
+        .iter()
+        .filter_map(|name| nodes.get(name))
+        .filter(|node| {
+            placement.allows_name(&node.name)
+                && placement.in_partition(node)
+                && placement.has_features(node)
+                && node.can_satisfy_request(&required)
+        })
+        .count() as u32;
+    job.spec
+        .num_nodes
+        .saturating_sub(reusable.min(job.spec.num_nodes)) as u64
 }
 
 /// The TRES a single job occupies (its scheduling footprint). Shared by the
@@ -15401,10 +15460,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn qos_grp_node_blocks_job_packable_onto_already_used_nodes() {
+    async fn qos_grp_node_admits_job_packable_onto_already_used_nodes() {
         // QOS grp node=4 is fully occupied by two running jobs on disjoint node
         // pairs, each node far below its capacity. A new job needing only 1 more
-        // node is blocked, even though it could pack onto an already-used node
+        // node is admitted by packing onto an already-used node's spare capacity
         // instead of requiring a fifth distinct node.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -15443,6 +15502,103 @@ mod tests {
             pending.contains(&new_id),
             "job requesting 1 node, packable onto an already-used node with idle \
              capacity, must not be blocked on QOSGrpNodeLimit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_still_blocks_when_occupied_nodes_have_no_spare_capacity() {
+        // Same grp node=4 shape as the packable case above, but each occupied
+        // node is registered with zero capacity — this test harness inserts
+        // running jobs directly into the job map without updating node-side
+        // allocation, so a genuinely "no headroom" node must be modeled via
+        // zero total capacity rather than an exact-fit allocation. The new job
+        // must still block on QOSGrpNodeLimit, proving the packing credit only
+        // applies when real spare capacity exists.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for n in ["n1", "n2", "n3", "n4"] {
+            register_node(&cm, n, 0, 0);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        cm.qos_cache().insert(Qos {
+            name: "cvs".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            for (id, nodes) in [(101u32, ["n1", "n2"]), (102, ["n3", "n4"])] {
+                let mut j = make_running_job(id, &nodes, 1);
+                j.spec.num_nodes = 2;
+                j.spec.qos = Some("cvs".into());
+                jobs.insert(id, j);
+            }
+        }
+
+        let mut newjob = basic_spec("no-room");
+        newjob.qos = Some("cvs".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(new_id).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit,
+            "no occupied node has spare capacity, so the job must still need a \
+             5th distinct node and block on the grp cap of 4"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_partial_reuse_counts_only_the_shortfall() {
+        // n1 has spare capacity, n2 has none (zero total capacity — this
+        // harness doesn't track node-side allocation for directly-inserted
+        // running jobs, so "no room" must be modeled structurally). A job
+        // needing 2 nodes can reuse only n1, so it still needs exactly 1 new
+        // distinct node — not 0 (crediting both occupied nodes) and not 2
+        // (crediting neither).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 0, 0);
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "cvs".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            let mut j = make_running_job(201, &["n1", "n2"], 1);
+            j.spec.num_nodes = 2;
+            j.spec.qos = Some("cvs".into());
+            jobs.insert(201, j);
+        }
+
+        let mut newjob = basic_spec("partial-pack");
+        newjob.qos = Some("cvs".into());
+        newjob.num_nodes = 2;
+        newjob.num_tasks = 2; // avoid effective_num_nodes() clamping to num_tasks
+        let new_id = submit_and_wait(&cm, newjob);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(new_id).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit,
+            "only n1 has spare capacity to reuse, so the job still needs 1 new \
+             distinct node beyond the 2 already occupying the grp cap of 2"
         );
     }
 
@@ -15601,6 +15757,7 @@ mod tests {
         let mut newjob = basic_spec("too-big");
         newjob.qos = Some("burst".into());
         newjob.num_nodes = 4;
+        newjob.num_tasks = 4; // avoid effective_num_nodes() clamping to num_tasks
         let new_id = submit_and_wait(&cm, newjob);
 
         cm.tag_blocked_pending_reasons();
