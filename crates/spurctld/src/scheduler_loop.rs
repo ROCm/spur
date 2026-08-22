@@ -936,7 +936,27 @@ enum DispatchError {
     /// The agent rejected the dispatch because the controller-allocated resources
     /// are already in use locally — the controller's view of this node is stale.
     ResourcesUnavailable,
+    /// Connect failed, or the RPC timed out without a response, as opposed to
+    /// the agent responding with an explicit rejection.
+    Unreachable(anyhow::Error),
+    /// The agent explicitly rejected the launch for a reason it does not have
+    /// a `LaunchFailureKind` for yet.
+    AgentRejected(String),
     Other(anyhow::Error),
+}
+
+impl DispatchError {
+    /// A short, stable label for grouping failures across nodes into one
+    /// job-level reason instead of a raw per-node error dump.
+    fn category(&self) -> &'static str {
+        match self {
+            Self::PrologFailed(_) => "prolog failure",
+            Self::ResourcesUnavailable => "gpu/resource allocation mismatch",
+            Self::Unreachable(_) => "agent unreachable",
+            Self::AgentRejected(_) => "agent rejected launch",
+            Self::Other(_) => "dispatch error",
+        }
+    }
 }
 
 impl std::fmt::Display for DispatchError {
@@ -946,6 +966,8 @@ impl std::fmt::Display for DispatchError {
             Self::ResourcesUnavailable => {
                 write!(f, "agent rejected job: allocated resources unavailable")
             }
+            Self::Unreachable(e) => write!(f, "agent unreachable: {e:#}"),
+            Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -963,7 +985,8 @@ async fn dispatch_to_agent(
     params: &AgentDispatchParams<'_>,
 ) -> Result<LaunchOutcome, DispatchError> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
-        .await?
+        .await
+        .map_err(|e| DispatchError::Unreachable(e.into()))?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
@@ -1101,6 +1124,9 @@ async fn dispatch_to_agent(
         .await
         .map_err(|s| match s.code() {
             tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+                DispatchError::Unreachable(s.into())
+            }
             _ => DispatchError::Other(s.into()),
         })?;
 
@@ -1114,7 +1140,7 @@ async fn dispatch_to_agent(
             {
                 DispatchError::PrologFailed(inner.error)
             } else {
-                DispatchError::Other(anyhow::anyhow!("agent rejected job: {}", inner.error))
+                DispatchError::AgentRejected(inner.error)
             },
         );
     }
@@ -1407,6 +1433,7 @@ async fn confirm_dispatch_on_nodes(
     let mut failures = 0u32;
     let mut succeeded_nodes: Vec<String> = Vec::new();
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
+    let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
 
     // Batch stdout/stderr live on the primary node (task_offset == 0). Capture
@@ -1439,6 +1466,7 @@ async fn confirm_dispatch_on_nodes(
                         "no comm address for node, skipping dispatch confirmation"
                     );
                     failures += 1;
+                    *failure_categories.entry("no agent address").or_insert(0) += 1;
                     continue;
                 }
             },
@@ -1449,6 +1477,7 @@ async fn confirm_dispatch_on_nodes(
                     "no agent address for node, skipping dispatch confirmation"
                 );
                 failures += 1;
+                *failure_categories.entry("no agent address").or_insert(0) += 1;
                 continue;
             }
         };
@@ -1600,17 +1629,23 @@ async fn confirm_dispatch_on_nodes(
             Ok((node_name, _, Err(e))) => {
                 error!(job_id, node = %node_name, error = %e, "dispatch confirmation failed");
                 failures += 1;
+                *failure_categories.entry(e.category()).or_insert(0) += 1;
                 match e {
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
                     }
                     DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
-                    DispatchError::Other(_) => {}
+                    DispatchError::Unreachable(_)
+                    | DispatchError::AgentRejected(_)
+                    | DispatchError::Other(_) => {}
                 }
             }
             Err(e) => {
                 error!(job_id, error = %e, "dispatch confirmation task panicked");
                 failures += 1;
+                *failure_categories
+                    .entry("dispatch task panicked")
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -1639,10 +1674,17 @@ async fn confirm_dispatch_on_nodes(
         pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
     }
 
+    let category_summary = failure_categories
+        .iter()
+        .map(|(category, count)| format!("{count} {category}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let confirmation_detail = if needs_pmix_prepare {
-        format!("PMIx dispatch confirmation failed: {successes} of {total} nodes confirmed")
+        format!(
+            "PMIx dispatch confirmation failed ({successes}/{total} confirmed): {category_summary}"
+        )
     } else {
-        format!("dispatch confirmation failed: {successes} of {total} nodes confirmed")
+        format!("dispatch confirmation failed ({successes}/{total} confirmed): {category_summary}")
     };
     let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
@@ -3736,6 +3778,87 @@ mod tests {
             let job_id = submit_and_wait(&cm, batch_spec("no-comm-addr", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(
+                cm.get_job(job_id)
+                    .unwrap()
+                    .state_reason()
+                    .contains("no agent address"),
+                "a node skipped before dispatch even starts must still get a category, \
+                 not an empty summary"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dispatch_to_an_unreachable_agent_reports_that_category() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("unreachable-agent", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(
+                cm.get_job(job_id)
+                    .unwrap()
+                    .state_reason()
+                    .contains("agent unreachable"),
+                "a connect failure must be reported as its own category"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn mixed_failure_categories_are_all_reported() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (prolog_addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            let resources_addr = spawn_mock_agent_rejecting_resources().await;
+            register_node_at(&cm, "n1", prolog_addr);
+            register_node_at(&cm, "n2", resources_addr);
+
+            let spec = JobSpec {
+                name: "mixed-categories".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+                1,
+                false,
+            )
+            .await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            let reason = cm.get_job(job_id).unwrap().state_reason();
+            assert!(
+                reason.contains("1 prolog failure")
+                    && reason.contains("1 gpu/resource allocation mismatch"),
+                "both failure categories from the two nodes must show up, not just one: {reason}"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3781,11 +3904,11 @@ mod tests {
             assert_eq!(job.priority, 0);
             assert_eq!(
                 job.state_reason_display(),
-                "dispatch confirmation failed: 0 of 1 nodes confirmed"
+                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
             );
             assert_eq!(
                 job.state_reason(),
-                "dispatch confirmation failed: 0 of 1 nodes confirmed"
+                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
             );
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
@@ -3916,6 +4039,11 @@ mod tests {
             assert!(
                 !cm.get_node("n1").unwrap().state.is_admin_hold(),
                 "an unclassified rejection is not grounds to drain"
+            );
+            assert!(
+                job.state_reason().contains("agent rejected launch"),
+                "an explicit non-prolog rejection must get its own category, got {:?}",
+                job.state_reason()
             );
         }
 
@@ -4593,6 +4721,13 @@ mod tests {
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n1"),
                 "a resources-unavailable reject must put the node on cooldown"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.state_reason(),
+                "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
+                 1 gpu/resource allocation mismatch)",
+                "operators need the specific failure category, not a generic count"
             );
         }
     }
