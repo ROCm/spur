@@ -93,7 +93,71 @@ From the head node (or any host that can reach ``spurctld``):
 This is idempotent and asynchronous — spurctld reconciles toward ``Ready``:
 control plane first, then workers join with freshly minted tokens. A fresh
 cluster typically reaches ``Ready`` in one to two minutes (mostly the k0s
-download + control-plane bootstrap).
+download + control-plane bootstrap). ``spur k8s up`` requires cluster admin
+(``root``, or an accounting admin — see `Access control`_).
+
+Scope the cluster to a subset of nodes
+''''''''''''''''''''''''''''''''''''''
+
+By default ``spur k8s up`` enrolls every registered node. To build a smaller
+cluster, scope it with ``--nodes`` (a hostlist), ``--partition``, and/or
+``--selector`` (repeatable ``key=value``, ANDed) — the three are unioned
+together and resolved once, at up-time:
+
+.. code-block:: bash
+
+   spur k8s up --nodes "gpu[01-08]"
+   spur k8s up --partition batch
+   spur k8s up --selector zone=z1 --selector gpu=mi300
+
+A scoped cluster's membership is frozen until you grow or shrink it with
+``add-nodes`` / ``remove-nodes`` (see `Adding and removing worker nodes`_).
+
+High-availability control plane
+'''''''''''''''''''''''''''''''''
+
+By default the cluster runs a single control-plane node (``control_plane_node``
+in ``spur.conf``, or the first node). For HA, request 3 or 5 control planes:
+
+.. code-block:: bash
+
+   spur k8s up --replicas 3                                    # lowest-named 3 nodes
+   spur k8s up --control-plane-nodes cp-1,cp-2,cp-3             # explicit set; overrides --replicas
+
+``--control-plane-nodes`` (or a single ``--control-plane-node``) always wins
+over ``--replicas``. The first control-plane node is the etcd bootstrap.
+
+.. important::
+
+   Every control-plane node — whether picked automatically, named with
+   ``--control-plane-node``, or listed in ``--control-plane-nodes`` — **must be
+   part of the cluster's node scope**. If you also pass ``--nodes``,
+   ``--partition``, or ``--selector``, make sure the control-plane node(s) are
+   included in that selection; otherwise ``spur k8s up`` is rejected with
+   ``control-plane node <name> is not a registered node`` (explicit list) or
+   ``control-plane node <name> is not among the selected cluster nodes``
+   (auto-picked). Leave ``--nodes``/``--partition``/``--selector`` unset to
+   scope the cluster to the whole inventory, which trivially satisfies this —
+   any registered node is then a valid control-plane choice.
+
+On a multi-control-plane mesh cluster there is no floating VIP — a VRRP address
+cannot follow WireGuard cryptokey routing — so ``spur k8s up`` enables k0s
+node-local load balancing (``nodeLocalLoadBalancing`` with ``EnvoyProxy``) on
+every control plane. This gives each node a local Envoy that round-robins across
+all controllers, so konnectivity has a cluster-wide ``:8132`` endpoint instead of
+pinning every agent to a single controller. It is on automatically for any
+multi-control-plane count (today 3 or 5) and off for a single control plane (no
+balancing needed).
+
+.. note::
+
+   k0s does not hot-reload node-local load balancing, and Spur only writes a
+   controller's ``k0s.yaml`` while bringing that controller up — an
+   already-active control plane is never rewritten in place. A fresh
+   ``spur k8s up --replicas 3`` is therefore unaffected (controllers render the
+   setting before any worker joins), but an **existing** HA cluster cannot pick
+   up the fix by restarting workers alone: reprovision the control plane with
+   ``spur k8s down --reset`` followed by ``spur k8s up``.
 
 Check status
 ~~~~~~~~~~~~~
@@ -211,9 +275,12 @@ Tear down
    spur k8s down            # stop + disable the k0s unit on every node
    spur k8s down --reset    # also `k0s reset` (destructive: wipes cluster state)
 
-``--reset`` removes ``/var/lib/k0s`` on every node but leaves the WireGuard mesh
-(``spur0``) intact. To switch the CNI, tear down with ``--reset`` and bring the
-cluster back up with the new ``cni`` setting.
+``--reset`` removes ``/var/lib/k0s`` on every node, along with the spurd-owned
+systemd unit and cached join token, but leaves the WireGuard mesh (``spur0``)
+intact. Purging the join token matters: a token minted against the torn-down
+cluster's CA would fail the next join with a ``kubernetes-ca`` verification
+error. To switch the CNI, tear down with ``--reset`` and bring the cluster back
+up with the new ``cni`` setting.
 
 For Users
 ---------
@@ -224,16 +291,42 @@ standard Kubernetes tooling.
 Get a kubeconfig
 ~~~~~~~~~~~~~~~~~
 
-Ask an administrator (or run, if you have controller access):
-
 .. code-block:: bash
 
-   spur k8s kubeconfig > admin.conf
-   export KUBECONFIG=$PWD/admin.conf
+   spur k8s kubeconfig > mine.conf
+   export KUBECONFIG=$PWD/mine.conf
    kubectl get nodes
 
-``spur k8s kubeconfig`` prints the admin kubeconfig to stdout so it can be
-redirected to a file.
+A bare ``spur k8s kubeconfig`` mints a ServiceAccount kubeconfig scoped to
+**your own** SPUR user/account namespace — no admin access required. It prints
+to stdout so it can be redirected to a file.
+
+Access control
+'''''''''''''''
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 50
+
+   * - Command
+     - Who
+     - Result
+   * - ``spur k8s kubeconfig``
+     - anyone
+     - Own scoped kubeconfig (namespace = own SPUR account).
+   * - ``spur k8s kubeconfig --user <name>``
+     - cluster admin
+     - ``<name>``'s scoped kubeconfig. Requesting anyone but yourself needs admin.
+   * - ``spur k8s kubeconfig --admin``
+     - cluster admin
+     - The k0s cluster-admin kubeconfig (full access). Mutually exclusive with ``--user``.
+
+"Cluster admin" is ``root``, or a user the accounting layer marks as an admin
+association (see :doc:`../admin-guide/accounting`). ``--admin`` additionally
+requires ``[cluster] allow_admin_kubeconfig = true`` in ``spur.conf`` — it is
+``false`` by default, since the admin check on ``caller`` is not yet backed by
+authenticated identity. With it off, get the cluster-admin kubeconfig directly
+on the control-plane node instead: ``k0s kubeconfig admin``.
 
 Run a workload
 ~~~~~~~~~~~~~~~
@@ -277,18 +370,20 @@ Command reference
 
    * - Command
      - Purpose
-   * - ``spur k8s up [--control-plane-node <h>]``
-     - Provision + start the cluster (idempotent).
+   * - ``spur k8s up [--nodes <hostlist>] [--partition <p>] [--selector k=v] [--control-plane-node <h> | --control-plane-nodes <h1,h2,h3>] [--replicas 1|3|5]``
+     - Provision + start the cluster (idempotent). Admin only. Control-plane
+       node(s) must lie within the ``--nodes``/``--partition``/``--selector``
+       scope (or leave that scope empty for the whole inventory).
    * - ``spur k8s add-nodes --nodes <hostlist> | --partition <p> | --selector k=v``
-     - Add worker nodes to a running scoped cluster (no down/reset).
+     - Add worker nodes to a running scoped cluster (no down/reset). Admin only.
    * - ``spur k8s remove-nodes --nodes <hostlist> [--drain-timeout <secs>] [--force]``
-     - Drain + ``k0s reset`` + remove a worker (destructive; re-add re-seeds state).
+     - Drain + ``k0s reset`` + remove a worker (destructive; re-add re-seeds state). Admin only.
    * - ``spur k8s status``
      - Cluster phase + per-node component state.
-   * - ``spur k8s kubeconfig``
-     - Print the admin kubeconfig (redirect to a file).
+   * - ``spur k8s kubeconfig [--user <name>] [--admin]``
+     - Print a kubeconfig (redirect to a file). Bare = own scope; ``--user``/``--admin`` need admin.
    * - ``spur k8s down [--reset]``
-     - Stop the cluster; ``--reset`` also wipes k0s state.
+     - Stop the cluster; ``--reset`` also wipes k0s state. Admin only.
    * - ``spur k8s install-k0s [--version <tag>|latest] [--path <p>] [--force]``
      - Install the k0s binary on this node (local; run as root).
 
@@ -305,9 +400,15 @@ Configuration reference (``[cluster]``)
    * - ``enabled``
      - ``false``
      - Enable Spur-managed k0s. When off, spurd never touches systemd/k0s.
+   * - ``distro``
+     - ``k0s``
+     - Kubernetes distribution SPUR manages. Only ``k0s`` is supported today.
    * - ``control_plane_node``
      - (first node)
      - Hostname of the k0s control plane.
+   * - ``control_plane_replicas``
+     - ``1``
+     - HA control-plane count (1, 3, or 5). Overridden per-invocation by ``spur k8s up --replicas``.
    * - ``pod_cidr``
      - ``10.42.0.0/16``
      - Pod network; per-node /24s are carved from it.
@@ -332,3 +433,9 @@ Configuration reference (``[cluster]``)
    * - ``k0s_binary``
      - ``/usr/local/bin/k0s``
      - Install path for the k0s binary.
+   * - ``k8s_provisioning_timeout_secs``
+     - ``600``
+     - Seconds a node may stay non-``active`` during provisioning before the cluster is marked ``degraded``.
+   * - ``allow_admin_kubeconfig``
+     - ``false``
+     - Allow ``spur k8s kubeconfig --admin`` to serve the cluster-admin kubeconfig over RPC.

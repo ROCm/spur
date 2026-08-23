@@ -1,5 +1,6 @@
 Ansible
 backfill
+backfilled
 backfilling
 CDI
 CIDR
@@ -7,7 +8,9 @@ Cargo
 config
 cron
 crontab
+cryptographically
 daemonize
+datetime
 dbd
 deprovision
 dev
@@ -139,6 +142,7 @@ gapped
 GiB
 GPUs
 GrpTRES
+GrpWall
 Healthcheck
 Hostlists
 hostname
@@ -194,6 +198,7 @@ runtimes
 RWO
 SHA
 SIGKILL
+SIGSTOP
 SPDX
 SpurJob
 SpurJobs
@@ -227,6 +232,8 @@ Slurm's
 Spur's
 repo's
 submitter's
+QOS's
+QOSes
 linters
 reStructuredText
 rocm
@@ -251,3 +258,10 @@ artifactory
 TLS
 PDB
 unioned
+ANDed
+ServiceAccount
+konnectivity
+cryptokey
+VRRP
+reprovision
+reconciler

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
-use crate::partition::{Partition, PartitionState, PreemptMode};
+use crate::partition::{Partition, PartitionState, PreemptMode, PreemptType};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -398,6 +398,12 @@ pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
 /// guardrail: retaining terminal jobs longer defeats the memory bound.
 pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 
+/// Upper bound for `grp_wall_window_days` (ten years). The window is bound into
+/// the consumption query as an `i32`, so anything that could wrap there must be
+/// rejected first: a negative interval moves the cutoff into the future and the
+/// query matches nothing, leaving every `GrpWall` budget unenforced.
+pub const MAX_GRP_WALL_WINDOW_DAYS: u32 = 3650;
+
 fn default_listen_addr() -> String {
     "[::]:6817".into()
 }
@@ -469,6 +475,12 @@ pub struct AccountingConfig {
     /// How often to refresh fairshare/QoS caches from the accounting database.
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
+    /// Trailing window over which a QOS's wall-clock consumption is measured for
+    /// `GrpWall`. Independent of `scheduler.fairshare_halflife_days`: that fades
+    /// old usage for priority scoring, while this is a hard cutoff on a budget, so
+    /// the two are tuned for different reasons and are expected to diverge.
+    #[serde(default = "default_grp_wall_window_days")]
+    pub grp_wall_window_days: u32,
     /// Cluster-wide fallback QOS, applied at submit when a job resolves to no
     /// QOS. The last link in the resolution chain (Slurm's stock `normal`
     /// analogue). Empty (default) = no fallback.
@@ -478,10 +490,31 @@ pub struct AccountingConfig {
     /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
     #[serde(default)]
     pub require_qos: bool,
+    /// Reject at submit any job whose user resolves to no account at all.
+    /// Mirrors Slurm's `AccountingStorageEnforce=associations`. Default false.
+    #[serde(default)]
+    pub require_association: bool,
+    /// Delete `txn` audit-log rows older than this many days. `None` (default)
+    /// or `0` disables purging (rows kept forever, matching Slurm's default-off
+    /// behavior); a positive value enables the periodic purge.
+    #[serde(default)]
+    pub txn_retention_days: Option<u32>,
+}
+
+impl AccountingConfig {
+    /// True when accounting is configured (a database URL is set). When false there is no
+    /// association database to consult, so account/association checks have nothing to enforce.
+    pub fn enabled(&self) -> bool {
+        !self.database_url.is_empty()
+    }
 }
 
 fn default_fairshare_refresh_secs() -> u32 {
     300
+}
+
+fn default_grp_wall_window_days() -> u32 {
+    14
 }
 
 impl Default for AccountingConfig {
@@ -489,8 +522,11 @@ impl Default for AccountingConfig {
         Self {
             database_url: String::new(),
             fairshare_refresh_secs: 300,
+            grp_wall_window_days: default_grp_wall_window_days(),
             default_qos: String::new(),
             require_qos: false,
+            require_association: false,
+            txn_retention_days: None,
         }
     }
 }
@@ -566,6 +602,19 @@ pub struct SchedulerConfig {
     /// operator-only. Raise it to grant users a band above the baseline.
     #[serde(default = "default_max_user_priority")]
     pub max_user_priority: u32,
+    /// Controls which jobs are eligible to preempt which. `None` (default)
+    /// enforces no cross-QOS restrictions — any job with sufficient priority gap
+    /// may preempt any other. `QosPriority` requires the pending job's QOS to
+    /// list the running job's QOS in its `preempt` allow-list. Mirrors Slurm's
+    /// `PreemptType`.
+    #[serde(default)]
+    pub preempt_type: PreemptType,
+    /// Cluster-wide minimum number of seconds a job must have been running before
+    /// it becomes eligible for preemption. Can be overridden per-partition and
+    /// per-QOS. `0` (default) means immediately eligible. Mirrors Slurm's
+    /// `PreemptExemptTime`.
+    #[serde(default)]
+    pub preempt_exempt_time: u32,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -605,6 +654,8 @@ impl Default for SchedulerConfig {
             resv_overrun_minutes: 0,
             inactive_limit_secs: 0,
             max_user_priority: default_max_user_priority(),
+            preempt_type: PreemptType::None,
+            preempt_exempt_time: 0,
         }
     }
 }
@@ -646,8 +697,8 @@ pub struct AuthConfig {
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// JWT secret key (file path or inline). Currently used only to sign/verify NODE admission
-    /// tokens, not user identity.
+    /// HMAC signing secret (raw bytes) for node admission and user-identity RPC auth; `required`
+    /// refuses to start without one. Captured at startup, not updated by `reconfigure`.
     pub jwt_key: Option<String>,
     /// Allow jobs to execute as uid 0 (root).
     ///
@@ -700,6 +751,11 @@ pub struct PartitionConfig {
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
+    /// Minimum seconds a job must have been running before it is eligible for
+    /// preemption from this partition. Overrides the cluster-wide default.
+    /// `None` defers to `scheduler.preempt_exempt_time`.
+    #[serde(default)]
+    pub preempt_exempt_time: Option<u32>,
 }
 
 fn default_partition_state() -> String {
@@ -1372,6 +1428,21 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Zero collapses the consumption window, so every QOS reads zero consumed
+        // and every GrpWall budget silently stops applying while `sacctmgr show
+        // qos` still displays the cap — the exact failure the limit exists to
+        // prevent, one layer up.
+        if self.accounting.grp_wall_window_days == 0
+            || self.accounting.grp_wall_window_days > MAX_GRP_WALL_WINDOW_DAYS
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "accounting.grp_wall_window_days".into(),
+                value: format!(
+                    "{} (must be between 1 and {})",
+                    self.accounting.grp_wall_window_days, MAX_GRP_WALL_WINDOW_DAYS
+                ),
+            });
+        }
         // A limit below the client's ping interval would reap a live client
         // between its own keepalives. Require at least two intervals of slack.
         let inactive = self.scheduler.inactive_limit_secs;
@@ -1408,6 +1479,19 @@ impl SlurmConfig {
                 field: "auth.mode".into(),
                 value: "required with auth.plugin = \"none\" (no credential can be verified)"
                     .into(),
+            });
+        }
+        // Without a key, `required` would fall back to a well-known signing constant —
+        // forgeable, so strictly worse than the default. Refuse to start instead.
+        if self.auth.mode == AuthMode::Required
+            && self.auth.jwt_key.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.jwt_key".into(),
+                value:
+                    "unset with auth.mode = \"required\" (set a secret signing key; the hardened \
+                        mode cannot verify credentials without one)"
+                        .into(),
             });
         }
 
@@ -1582,6 +1666,7 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
+                preempt_exempt_time: pc.preempt_exempt_time,
                 ..Default::default()
             })
             .collect()
@@ -1625,7 +1710,7 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
     if let Some((days, rest)) = s.split_once('-') {
         let days: u32 = days.parse().ok()?;
         let hms = parse_hms(rest)?;
-        return Some(days * 24 * 60 + hms);
+        return days.checked_mul(24 * 60)?.checked_add(hms);
     }
 
     // hours:minutes:seconds or hours:minutes or just minutes
@@ -1635,7 +1720,7 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
         2 => {
             let h: u32 = parts[0].parse().ok()?;
             let m: u32 = parts[1].parse().ok()?;
-            Some(h * 60 + m)
+            h.checked_mul(60)?.checked_add(m)
         }
         3 => parse_hms(s),
         _ => None,
@@ -1659,7 +1744,9 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
     // days-hours:minutes:seconds
     if let Some((days, rest)) = s.split_once('-') {
         let days: u64 = days.parse().ok()?;
-        return Some(days * 86400 + parse_hms_seconds(rest)?);
+        return days
+            .checked_mul(86400)?
+            .checked_add(parse_hms_seconds(rest)?);
     }
 
     let parts: Vec<&str> = s.split(':').collect();
@@ -1667,20 +1754,22 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
         1 => {
             // Just minutes → convert to seconds
             let mins: u64 = parts[0].parse().ok()?;
-            Some(mins * 60)
+            mins.checked_mul(60)
         }
         2 => {
             // HH:MM → hours and minutes (no seconds)
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
-            Some(h * 3600 + m * 60)
+            h.checked_mul(3600)?.checked_add(m.checked_mul(60)?)
         }
         3 => {
             // HH:MM:SS
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
             let sec: u64 = parts[2].parse().ok()?;
-            Some(h * 3600 + m * 60 + sec)
+            h.checked_mul(3600)?
+                .checked_add(m.checked_mul(60)?)?
+                .checked_add(sec)
         }
         _ => None,
     }
@@ -1726,13 +1815,15 @@ fn parse_hms_seconds(s: &str) -> Option<u64> {
         2 => {
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
-            Some(h * 3600 + m * 60)
+            h.checked_mul(3600)?.checked_add(m.checked_mul(60)?)
         }
         3 => {
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
             let sec: u64 = parts[2].parse().ok()?;
-            Some(h * 3600 + m * 60 + sec)
+            h.checked_mul(3600)?
+                .checked_add(m.checked_mul(60)?)?
+                .checked_add(sec)
         }
         _ => None,
     }
@@ -1750,7 +1841,10 @@ fn parse_hms(s: &str) -> Option<u32> {
     } else {
         0
     };
-    Some(h * 60 + m + if s > 0 { 1 } else { 0 }) // Round up seconds
+    // Round up seconds
+    h.checked_mul(60)?
+        .checked_add(m)?
+        .checked_add(if s > 0 { 1 } else { 0 })
 }
 
 /// Format minutes as D-HH:MM:SS or HH:MM:SS.
@@ -2026,6 +2120,63 @@ high_cardinality = true
         );
     }
 
+    /// A budget window and a priority-decay half-life are tuned for different
+    /// reasons, so retuning one must never move the other.
+    #[test]
+    fn grp_wall_window_is_independent_of_the_fairshare_halflife() {
+        let toml = r#"
+cluster_name = "x"
+
+[scheduler]
+fairshare_halflife_days = 7
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.scheduler.fairshare_halflife_days, 7);
+        assert_eq!(config.accounting.grp_wall_window_days, 14);
+
+        let toml = r#"
+cluster_name = "x"
+
+[accounting]
+grp_wall_window_days = 30
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.accounting.grp_wall_window_days, 30);
+        assert_eq!(config.scheduler.fairshare_halflife_days, 14);
+    }
+
+    /// A zero window makes the consumption query match nothing, so every budget
+    /// reads zero consumed and stops applying while `show qos` still displays the
+    /// cap. An out-of-range value wraps negative through the `i32` bind and lands
+    /// in the same place, so both are rejected at load.
+    #[test]
+    fn grp_wall_window_rejects_values_that_would_disable_enforcement() {
+        let with_window = |days: &str| {
+            format!(
+                r#"
+cluster_name = "x"
+
+[accounting]
+grp_wall_window_days = {days}
+"#
+            )
+        };
+
+        for bad in ["0", "3651", "4294967295"] {
+            let err = SlurmConfig::load_from_str(&with_window(bad))
+                .expect_err("a window that disables enforcement must not load");
+            assert!(
+                err.to_string().contains("accounting.grp_wall_window_days"),
+                "error must name the offending field, got: {err}"
+            );
+        }
+
+        for good in ["1", "3650"] {
+            SlurmConfig::load_from_str(&with_window(good))
+                .expect("a window inside the range must load");
+        }
+    }
+
     #[test]
     fn test_metrics_defaults() {
         let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
@@ -2282,6 +2433,31 @@ memory_mb = 1024000
     }
 
     #[test]
+    fn parse_time_rejects_overflowing_slurm_durations() {
+        // u32 minutes overflow: 2982617 days * 1440 is u32::MAX + 1185.
+        assert_eq!(parse_time_minutes("2982617-00:00:00"), None);
+        // Overflow on the `+ hms`, not the multiply: 2982616 days leaves only
+        // 255 minutes of headroom and "05:00:00" is 300.
+        assert_eq!(parse_time_minutes("2982616-05:00:00"), None);
+        // HH:MM arm.
+        assert_eq!(parse_time_minutes("71582789:00"), None);
+        // u64 seconds overflow.
+        assert_eq!(parse_time_seconds("213503982334602-00:00:00"), None);
+        // The largest non-overflowing value is still accepted unchanged.
+        assert_eq!(parse_time_minutes("2982616-00:00:00"), Some(4_294_967_040));
+    }
+
+    #[test]
+    fn parse_partition_time_rejects_overflowing_duration() {
+        // validate() promises a bad partition time fails loudly rather than
+        // silently enforcing a different cap.
+        assert!(matches!(
+            parse_partition_time("partitions.gpu.max_time", "2982617-00:00:00"),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
     fn load_accepts_suffixed_partition_max_time() {
         // "1h" is honored as a 60-minute cap rather than failing or silently
         // becoming UNLIMITED.
@@ -2479,6 +2655,71 @@ max_batch_requeue = 0
             err.to_string().contains("max_batch_requeue"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn auth_required_without_jwt_key_is_refused() {
+        // `required` with no signing key would fall back to a public constant that anyone can forge
+        // an admin identity against — strictly worse than the default. Startup must refuse it.
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "required"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("jwt_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_required_with_empty_jwt_key_is_refused() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "required"
+jwt_key = ""
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("jwt_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_required_with_jwt_key_is_accepted() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "required"
+jwt_key = "a-real-secret"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("required + a key must be accepted");
+        assert_eq!(config.auth.mode, AuthMode::Required);
+        assert_eq!(config.auth.jwt_key.as_deref(), Some("a-real-secret"));
+    }
+
+    #[test]
+    fn auth_permissive_without_jwt_key_is_accepted() {
+        // Only `required` is refused key-less; permissive must still come up so a cluster can adopt
+        // authentication incrementally.
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "jwt"
+mode = "permissive"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("permissive must not require a key");
+        assert_eq!(config.auth.mode, AuthMode::Permissive);
     }
 
     #[test]

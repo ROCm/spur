@@ -147,6 +147,10 @@ pub enum ScontrolCommand {
         /// Preemption mode: OFF (default), CANCEL, REQUEUE, SUSPEND
         #[arg(long, default_value = "OFF")]
         preempt_mode: String,
+        /// Minimum seconds a job must run before it is eligible for preemption
+        /// (0 = immediately preemptable; omit to use the global default)
+        #[arg(long)]
+        preempt_exempt_time: Option<u32>,
     },
     /// Update a partition
     #[command(name = "update-partition")]
@@ -220,6 +224,14 @@ pub enum ScontrolCommand {
         /// New preemption mode: OFF, CANCEL, REQUEUE, SUSPEND
         #[arg(long)]
         preempt_mode: Option<String>,
+        /// Minimum seconds a job must have been running before it is eligible for
+        /// preemption. 0 is a valid value (immediately preemptable).
+        #[arg(long)]
+        preempt_exempt_time: Option<u32>,
+        /// Clear the partition's preempt_exempt_time override, reverting to the
+        /// global scheduler.preempt_exempt_time default.
+        #[arg(long)]
+        clear_preempt_exempt_time: bool,
     },
     /// Delete a partition
     #[command(name = "delete-partition")]
@@ -319,6 +331,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 spur_proto::proto::UpdateJobRequest {
                     job_id,
                     hold: Some(true),
+                    user: crate::interactive::current_user()?,
                     ..Default::default()
                 },
             )
@@ -330,6 +343,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 spur_proto::proto::UpdateJobRequest {
                     job_id,
                     hold: Some(false),
+                    user: crate::interactive::current_user()?,
                     ..Default::default()
                 },
             )
@@ -387,6 +401,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             allow_qos,
             priority_tier,
             preempt_mode,
+            preempt_exempt_time,
         } => {
             create_partition(
                 &args.controller,
@@ -406,6 +421,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 &allow_qos,
                 priority_tier,
                 &preempt_mode,
+                preempt_exempt_time,
             )
             .await
         }
@@ -433,6 +449,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             set_allow_qos,
             priority_tier,
             preempt_mode,
+            preempt_exempt_time,
+            clear_preempt_exempt_time,
         } => {
             let selector_map = match selector {
                 Some(ref s) => parse_selector(s)?,
@@ -462,6 +480,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 set_allow_qos,
                 priority_tier,
                 preempt_mode,
+                preempt_exempt_time,
+                clear_preempt_exempt_time,
             };
             update_partition(&args.controller, req).await
         }
@@ -601,6 +621,26 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     format_exit(job.derived_exit_code, 0),
                     job.priority
                 );
+                if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
+                    println!(
+                        "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
+                        if job.preempted_by == 0 {
+                            "N/A".to_string()
+                        } else {
+                            job.preempted_by.to_string()
+                        },
+                        if job.preempt_mode.is_empty() {
+                            "N/A"
+                        } else {
+                            &job.preempt_mode
+                        },
+                        if job.preempt_qos.is_empty() {
+                            "N/A"
+                        } else {
+                            &job.preempt_qos
+                        },
+                    );
+                }
                 println!();
             }
         }
@@ -723,11 +763,17 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         part.max_nodes.to_string()
                     },
                 );
-                println!(
+                print!(
                     "   PreemptMode={} PriorityTier={}",
                     part.preempt_mode.to_uppercase(),
                     part.priority_tier
                 );
+                if let Some(t) = part.preempt_exempt_time {
+                    if t > 0 {
+                        print!(" PreemptExemptTime={t}");
+                    }
+                }
+                println!();
                 println!();
             }
         }
@@ -985,6 +1031,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
     let mut deny_qos = String::new();
     let mut priority_tier: u32 = 1;
     let mut preempt_mode = "OFF".to_string();
+    let mut preempt_exempt_time: Option<u32> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1004,6 +1051,11 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                 "denyqos" => deny_qos = value.into(),
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
                 "preemptmode" => preempt_mode = value.to_uppercase(),
+                "preemptexempttime" => {
+                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
+                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
+                    })?);
+                }
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
@@ -1036,6 +1088,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         &allow_qos,
         priority_tier,
         &preempt_mode,
+        preempt_exempt_time,
     )
     .await?;
 
@@ -1232,21 +1285,26 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
             account,
             comment,
             qos,
+            user: crate::interactive::current_user()?,
             ..Default::default()
         },
     )
     .await
 }
 
+pub(crate) fn is_all_node_pattern(pattern: &str) -> bool {
+    pattern.eq_ignore_ascii_case("ALL")
+}
+
 /// Resolve a node name pattern to a list of individual node names.
 ///
 /// Supports Slurm-compatible hostlist expressions (`node[1-3]`),
 /// comma-separated lists (`node1,node2`), and the `ALL` keyword.
-async fn resolve_node_names(
+pub(crate) async fn resolve_node_names(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     pattern: &str,
 ) -> Result<Vec<String>> {
-    if pattern.eq_ignore_ascii_case("ALL") {
+    if is_all_node_pattern(pattern) {
         let resp = client
             .get_nodes(spur_proto::proto::GetNodesRequest {
                 nodelist: String::new(),
@@ -1304,6 +1362,8 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut allow_qos: Option<String> = None;
     let mut priority_tier: Option<u32> = None;
     let mut preempt_mode: Option<String> = None;
+    let mut preempt_exempt_time: Option<u32> = None;
+    let mut clear_preempt_exempt_time = false;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1332,6 +1392,16 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 "allowqos" => allow_qos = Some(value.into()),
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().ok(),
                 "preemptmode" => preempt_mode = Some(value.to_uppercase()),
+                "preemptexempttime" => {
+                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
+                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
+                    })?);
+                }
+                "clearpreemptexempttime" => {
+                    clear_preempt_exempt_time = value.eq_ignore_ascii_case("yes")
+                        || value == "1"
+                        || value.eq_ignore_ascii_case("true");
+                }
                 // silently ignore Slurm-only keys
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
@@ -1371,6 +1441,8 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         allow_qos: allow_qos.as_deref().map(split_csv).unwrap_or_default(),
         priority_tier,
         preempt_mode,
+        preempt_exempt_time,
+        clear_preempt_exempt_time,
     };
 
     update_partition(controller, req).await
@@ -1447,6 +1519,7 @@ async fn create_partition(
     allow_qos: &str,
     priority_tier: u32,
     preempt_mode: &str,
+    preempt_exempt_time: Option<u32>,
 ) -> Result<()> {
     let channel = crate::authclient::connect(controller)
         .await
@@ -1471,6 +1544,7 @@ async fn create_partition(
             allow_qos: split_csv(allow_qos),
             priority_tier,
             preempt_mode: preempt_mode.to_string(),
+            preempt_exempt_time,
         })
         .await
         .context("failed to create partition")?;

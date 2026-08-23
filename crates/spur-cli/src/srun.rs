@@ -760,6 +760,7 @@ async fn dispatch_step(
             step_id,
             label: args.label,
             mpi: step_mpi.to_string(),
+            user: params.user.to_string(),
         })
         .await
         .context("RunStep dispatch failed")?
@@ -995,14 +996,13 @@ async fn try_stream_output(
     job_id: u32,
     user: &str,
 ) -> bool {
-    let first_node = nodelist.split(',').next().unwrap_or_default().trim();
-    if first_node.is_empty() {
+    let Some(first_node) = crate::nodelist::first_allocated_node(nodelist) else {
         return false;
-    }
+    };
 
     if controller
         .get_node(GetNodeRequest {
-            name: first_node.to_string(),
+            name: first_node.clone(),
         })
         .await
         .is_err()
@@ -2230,5 +2230,22 @@ mod tests {
             msg.contains("--overlap"),
             "expected --overlap error, got: {msg}"
         );
+    }
+
+    /// The controller reports `nodelist` as a compressed hostlist, so streaming
+    /// has to expand it. Splitting `node[001-002]` on commas yields the whole
+    /// bracket literal, which is not a host, and the stream then goes nowhere.
+    #[tokio::test]
+    async fn try_stream_output_asks_the_controller_for_an_expanded_hostname() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let streamed = try_stream_output(&mut client, "node[001-002]", 42, "tester").await;
+
+        assert!(
+            !streamed,
+            "the mock reports every node missing, so streaming is unavailable"
+        );
+        assert_eq!(capture.get_node_requests(), vec!["node001".to_string()]);
     }
 }

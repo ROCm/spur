@@ -32,6 +32,21 @@ pub fn expand(pattern: &str) -> Result<Vec<String>, HostlistError> {
     Ok(results)
 }
 
+/// Expand a hostlist pattern only far enough to yield its first hostname.
+///
+/// Equivalent to `expand(pattern)?.into_iter().next()`, but stops after the
+/// first name instead of materializing every host. Useful when only the first
+/// allocated node is needed (e.g. connecting to a job's primary node) and the
+/// allocation may span thousands of nodes.
+pub fn expand_first(pattern: &str) -> Result<Option<String>, HostlistError> {
+    for part in split_top_level(pattern) {
+        if let Some(host) = first_single(part.trim())? {
+            return Ok(Some(host));
+        }
+    }
+    Ok(None)
+}
+
 /// Compress a list of hostnames into a compact hostlist pattern.
 ///
 /// Example: `["node001", "node002", "node003", "node005"]` → `"node[001-003,005]"`
@@ -284,6 +299,31 @@ fn split_top_level(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Parse one bracket term (`start-end`, or a bare value) into numeric bounds.
+///
+/// Returns `Some((start, end, width))` for a range, where `width` is the
+/// zero-pad width taken from the start token; returns `None` for a non-range
+/// term, which the caller emits verbatim. Shared by `expand_single` and
+/// `first_single` so the range grammar and its error handling live in one place.
+fn parse_range_bounds(part: &str) -> Result<Option<(u64, u64, usize)>, HostlistError> {
+    let Some(dash) = part.find('-') else {
+        return Ok(None);
+    };
+    let start_str = &part[..dash];
+    let end_str = &part[dash + 1..];
+    let width = start_str.len();
+    let start: u64 = start_str
+        .parse()
+        .map_err(|_| HostlistError::InvalidRange(part.into()))?;
+    let end: u64 = end_str
+        .parse()
+        .map_err(|_| HostlistError::InvalidRange(part.into()))?;
+    if start > end {
+        return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
+    }
+    Ok(Some((start, end, width)))
+}
+
 /// Expand a single hostlist term (no top-level commas).
 fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), HostlistError> {
     if let Some(bracket_start) = pattern.find('[') {
@@ -303,21 +343,7 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
         let suffix = &pattern[bracket_end + 1..];
 
         for range_part in range_str.split(',') {
-            if let Some(dash) = range_part.find('-') {
-                let start_str = &range_part[..dash];
-                let end_str = &range_part[dash + 1..];
-                let width = start_str.len();
-                let start: u64 = start_str
-                    .parse()
-                    .map_err(|_| HostlistError::InvalidRange(range_part.into()))?;
-                let end: u64 = end_str
-                    .parse()
-                    .map_err(|_| HostlistError::InvalidRange(range_part.into()))?;
-
-                if start > end {
-                    return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
-                }
-
+            if let Some((start, end, width)) = parse_range_bounds(range_part)? {
                 // Bound element count BEFORE materializing. Saturating so the count
                 // arithmetic itself can't overflow on a u64::MAX range.
                 let range_count = (end - start).saturating_add(1);
@@ -357,6 +383,39 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
         results.push(pattern.to_string());
     }
     Ok(())
+}
+
+/// First hostname of a single term (no top-level commas), or `None` when the
+/// term expands to nothing (e.g. an empty string). Mirrors [`expand_single`]'s
+/// parsing but only resolves the first element of the leading range.
+fn first_single(pattern: &str) -> Result<Option<String>, HostlistError> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(bracket_start) = pattern.find('[') else {
+        return Ok(Some(pattern.to_string()));
+    };
+    let bracket_end = pattern
+        .find(']')
+        .ok_or_else(|| HostlistError::InvalidPattern("unmatched [".into()))?;
+
+    let prefix = &pattern[..bracket_start];
+    let range_str = &pattern[bracket_start + 1..bracket_end];
+    let suffix = &pattern[bracket_end + 1..];
+
+    let first_part = range_str.split(',').next().unwrap_or_default();
+    let first_value = match parse_range_bounds(first_part)? {
+        Some((start, _end, width)) => format!("{:0>width$}", start, width = width),
+        None => first_part.to_string(),
+    };
+
+    let name = format!("{prefix}{first_value}{suffix}");
+    if suffix.contains('[') {
+        first_single(&name)
+    } else {
+        Ok(Some(name))
+    }
 }
 
 /// Count the number of hosts in a hostlist pattern without expanding.
@@ -601,6 +660,97 @@ mod tests {
         // Names that are entirely digits have no prefix; kept verbatim, deduped.
         assert_eq!(compress(&strings(&["12345"])), "12345");
         assert_eq!(compress(&strings(&["7", "7"])), "7");
+    }
+
+    #[test]
+    fn test_expand_first_range() {
+        assert_eq!(
+            expand_first("node[001-002]").unwrap().as_deref(),
+            Some("node001")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_gap() {
+        assert_eq!(
+            expand_first("node[001,003]").unwrap().as_deref(),
+            Some("node001")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_multi_prefix() {
+        assert_eq!(
+            expand_first("gpu[001-004],cpu[001-002]")
+                .unwrap()
+                .as_deref(),
+            Some("gpu001")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_mixed_padding() {
+        assert_eq!(
+            expand_first("node[9,010-011]").unwrap().as_deref(),
+            Some("node9")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_plain_list() {
+        assert_eq!(
+            expand_first("node001,node002").unwrap().as_deref(),
+            Some("node001")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_single_host() {
+        assert_eq!(expand_first("node007").unwrap().as_deref(), Some("node007"));
+    }
+
+    #[test]
+    fn test_expand_first_empty_is_none() {
+        assert_eq!(expand_first("").unwrap(), None);
+        assert_eq!(expand_first(",,").unwrap(), None);
+    }
+
+    #[test]
+    fn test_expand_first_skips_leading_empty_terms() {
+        assert_eq!(
+            expand_first(",node1,node2").unwrap().as_deref(),
+            Some("node1")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_suffix_bracket() {
+        assert_eq!(
+            expand_first("rack[1-2]-node[3-4]").unwrap().as_deref(),
+            Some("rack1-node3")
+        );
+    }
+
+    #[test]
+    fn test_expand_first_unmatched_bracket_errors() {
+        assert!(expand_first("node[1-2").is_err());
+    }
+
+    #[test]
+    fn test_expand_first_matches_expand() {
+        for pattern in [
+            "node[001-003,005,010-012]",
+            "rack[1-2]-node[1-2]",
+            "gpu[01-04],cpu[01-02]",
+            "node9,node010,node011",
+            "login01",
+        ] {
+            assert_eq!(
+                expand_first(pattern).unwrap(),
+                expand(pattern).unwrap().into_iter().next(),
+                "expand_first disagreed with expand for {pattern}"
+            );
+        }
     }
 
     #[test]

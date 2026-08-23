@@ -218,6 +218,15 @@ async fn main() -> anyhow::Result<()> {
                         std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
                     );
 
+                    if let Some(days) = config.accounting.txn_retention_days.filter(|d| *d > 0) {
+                        accounting::spawn_txn_purge_loop(
+                            pool.clone(),
+                            raft_handle.clone(),
+                            days,
+                            std::time::Duration::from_secs(3600),
+                        );
+                    }
+
                     cluster.fairshare_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.scheduler.fairshare_halflife_days,
@@ -232,6 +241,12 @@ async fn main() -> anyhow::Result<()> {
                     cluster.association_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.accounting.fairshare_refresh_secs as u64,
+                    );
+
+                    cluster.grp_wall_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.accounting.fairshare_refresh_secs as u64,
+                        config.accounting.grp_wall_window_days,
                     );
 
                     Some(accounting::AccountingService::available(pool))
@@ -430,6 +445,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
+            preempt_exempt_time: None,
         }],
         nodes: Vec::new(),
         network: Default::default(),

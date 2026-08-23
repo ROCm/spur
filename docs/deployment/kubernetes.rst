@@ -120,6 +120,38 @@ Apply with ``kubectl``:
 
 The operator watches SpurJob resources, submits them to the controller, and updates status fields as the job progresses.
 
+Authenticating the operator agent surface
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The operator serves a virtual-agent gRPC surface on ``--listen`` (port 6818) that carries a
+cluster-wide pod-create privilege, so reaching it must not be enough to ask the operator to run
+work. Authentication mirrors the cluster ``[auth] mode``:
+
+- ``--auth-mode disabled`` does not authenticate callers at all; treat the port as an
+  administrative boundary if you use this.
+- ``--auth-mode permissive`` (default) verifies a credential when one is presented and otherwise
+  logs and allows — the migration default.
+- ``--auth-mode required`` rejects every call that carries no credential. It refuses to start
+  without a key.
+- ``--jwt-key`` / ``SPUR_JWT_KEY`` is the cluster ``[auth] jwt_key`` the operator verifies
+  credentials against; source it from a Secret. In ``permissive`` mode with no key, a controller
+  that *does* present a credential is rejected (there is no key to verify it), so set the key before
+  controllers start sending one.
+
+See the commented ``--auth-mode`` / ``SPUR_JWT_KEY`` lines in ``examples/k8s/operator.yaml``.
+
+Enforcing account quotas
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--enable-quota`` turns on a reconciler that projects each SPUR account's ``GrpTRES`` allocation
+into a per-account ``ResourceQuota``/``LimitRange``. An account with no ``GrpTRES`` set gets a
+**closed** quota (``pods: 0``) rather than an uncapped one, so pods submitted under it are rejected
+until an allocation is granted:
+
+.. code-block:: bash
+
+   sacctmgr modify account name=myaccount set grptres=cpu=16,mem=32768,gres/gpu=8
+
 Verify
 ------
 

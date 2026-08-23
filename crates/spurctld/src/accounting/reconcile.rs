@@ -49,6 +49,32 @@ pub fn spawn_loop(
     });
 }
 
+/// Periodically delete `txn` audit rows older than `retention_days`. Like
+/// reconcile, this write bypasses Raft (straight to Postgres), so it uses the
+/// consensus-backed leader check rather than the cached `is_leader()`.
+pub fn spawn_txn_purge_loop(
+    pool: PgPool,
+    raft: Arc<RaftHandle>,
+    retention_days: u32,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if !raft.ensure_leader().await {
+                continue;
+            }
+            let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
+            match db::purge_txn(&pool, cutoff).await {
+                Ok(n) if n > 0 => info!(removed = n, "purged expired txn audit rows"),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "txn audit purge failed"),
+            }
+        }
+    });
+}
+
 /// Only jobs that have actually started accrue an accounting record
 /// (`notify_job_start` fires from `start_job`), so jobs still pending are
 /// not candidates.
@@ -203,18 +229,21 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
     let start_time = job.start_time.unwrap_or(job.submit_time);
     db::record_job_start(
         conn,
-        job.job_id as i32,
-        &spec.name,
-        &spec.user,
-        spec.account.as_deref().unwrap_or_default(),
-        spec.partition.as_deref().unwrap_or_default(),
-        spec.num_nodes as i32,
-        spec.num_tasks as i32,
-        spec.cpus_per_task as i32,
-        memory_mb as i64,
-        job.submit_time,
-        start_time,
-        spec.reservation.as_deref().unwrap_or_default(),
+        &db::JobStartRecord {
+            job_id: job.job_id,
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            account: spec.account.clone().unwrap_or_default(),
+            partition: spec.partition.clone().unwrap_or_default(),
+            qos: spec.qos.clone().unwrap_or_default(),
+            num_nodes: spec.num_nodes,
+            num_tasks: spec.num_tasks,
+            cpus_per_task: spec.cpus_per_task,
+            memory_mb,
+            submit_time: job.submit_time,
+            start_time,
+            reservation: spec.reservation.clone(),
+        },
     )
     .await
 }
@@ -229,6 +258,9 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
         end_time,
         job.exit_signal,
         job.derived_exit_code,
+        job.preempted_by.map(|id| id as i32),
+        job.preempt_mode.as_deref().unwrap_or(""),
+        job.preempt_qos.as_deref().unwrap_or(""),
     )
     .await
 }
@@ -451,6 +483,9 @@ mod tests {
             job.end_time.unwrap(),
             0,
             0,
+            None,
+            "",
+            "",
         )
         .await?;
         drop(conn);
@@ -565,18 +600,21 @@ mod tests {
             let mut conn = pool.acquire().await?;
             db::record_job_start(
                 &mut conn,
-                job_id as i32,
-                &job.spec.name,
-                &job.spec.user,
-                "",
-                "",
-                job.spec.num_nodes as i32,
-                job.spec.num_tasks as i32,
-                job.spec.cpus_per_task as i32,
-                0,
-                job.submit_time,
-                job.start_time.unwrap(),
-                "",
+                &db::JobStartRecord {
+                    job_id,
+                    name: job.spec.name.clone(),
+                    user: job.spec.user.clone(),
+                    account: String::new(),
+                    partition: String::new(),
+                    qos: String::new(),
+                    num_nodes: job.spec.num_nodes,
+                    num_tasks: job.spec.num_tasks,
+                    cpus_per_task: job.spec.cpus_per_task,
+                    memory_mb: 0,
+                    submit_time: job.submit_time,
+                    start_time: job.start_time.unwrap(),
+                    reservation: None,
+                },
             )
             .await?;
             db::record_job_end(
@@ -587,6 +625,9 @@ mod tests {
                 job.end_time.unwrap(),
                 0,
                 0,
+                None,
+                "",
+                "",
             )
             .await?;
         }

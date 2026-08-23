@@ -1,26 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tower middleware that authenticates callers of the agent's gRPC surface.
-//!
-//! Without this, reaching a node's agent port is enough to ask it to run work — the controller's
-//! authentication can simply be stepped around. The agent therefore verifies that a request carries
-//! a credential signed with the cluster's `[auth] jwt_key`, which the controller attaches to every
-//! agent call.
-//!
-//! The signing key is a cluster-wide shared secret, like Slurm's `munge.key`: any holder can mint a
-//! credential, so a compromised node can present itself to another node as the controller. That is
-//! the accepted HPC model and a large improvement on "any peer at all", but it is not the same as
-//! asymmetric signing, where only the controller could ever mint. Moving to an asymmetric key so
-//! nodes can verify but not sign is the natural hardening step.
-//!
-//! The ruling itself is `spur_core::auth::authenticate_bearer`, shared with the controller so the
-//! two daemons cannot drift apart on a security decision.
-//!
-//! On success the verified [`spur_core::auth::Identity`] is inserted into the request extensions so
-//! handlers can gate on *who* the caller is — the controller's subject for controller-only RPCs, or
-//! the tracked job owner for user-facing ones. Only this layer inserts an `Identity`, so a handler
-//! that finds one knows it was verified here.
+//! Authenticates callers of the operator's cluster-wide-pod-create agent surface via the shared
+//! `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`, duplicated since spurd is a binary crate).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -77,7 +59,7 @@ fn decide(config: &AgentAuthConfig, header: Option<&str>) -> BearerOutcome {
         config.mode,
         &config.jwt_key,
         header,
-        "this agent only accepts calls carrying the cluster credential",
+        "the k8s operator only accepts agent calls carrying the cluster credential",
     )
 }
 
@@ -97,7 +79,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+    fn call(&mut self, req: Request<B>) -> Self::Future {
         let header = req
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -105,19 +87,15 @@ where
             .map(str::to_owned);
 
         match decide(&self.config, header.as_deref()) {
-            // Carry the verified identity into the handlers so they can enforce caller scope: the
-            // controller's subject for controller-only RPCs, and the tracked job owner for
-            // user-facing ones. Verifying the credential is necessary but not sufficient — a valid
-            // *user* token must not be able to drive a controller-only RPC.
-            BearerOutcome::Authenticated(identity) => {
-                req.extensions_mut().insert(*identity);
-            }
+            // The operator does not act *as* the caller — it creates what the controller allocated —
+            // so the identity is not carried into handlers; verifying the credential is the point.
+            BearerOutcome::Authenticated(_) => {}
             BearerOutcome::Anonymous => {
                 if self.config.mode == AuthMode::Permissive {
                     warn!(
                         path = %req.uri().path(),
-                        "unauthenticated agent request accepted (auth.mode = permissive): any peer \
-                         that can reach this port can ask this node to run work"
+                        "unauthenticated operator agent request accepted (auth.mode = permissive): \
+                         any peer that can reach this port can ask the operator to create a pod"
                     );
                 }
             }
@@ -158,7 +136,7 @@ mod tests {
 
     #[test]
     fn permissive_still_accepts_an_uncredentialed_caller() {
-        // The migration window: controllers start presenting a credential before agents demand one.
+        // Migration window: controllers start presenting a credential before agents demand one.
         assert!(matches!(
             decide(&cfg(AuthMode::Permissive, "k"), None),
             BearerOutcome::Anonymous
@@ -181,5 +159,45 @@ mod tests {
             decide(&cfg(AuthMode::Permissive, "cluster-key"), Some(&forged)),
             BearerOutcome::Reject(_)
         ));
+    }
+
+    // Exercises the real `Layer`/`Service` wiring (not just `decide()`), so a misplaced or
+    // no-op `.layer(...)` call in main.rs would fail this rather than only the unit tests above.
+    #[derive(Clone)]
+    struct StubInner;
+
+    impl Service<Request<()>> for StubInner {
+        type Response = Response<tonic::body::Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            std::future::ready(Ok(Response::new(tonic::body::Body::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn required_mode_rejects_an_uncredentialed_call_through_the_real_layer() {
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "k").layer(StubInner);
+        let resp = svc.call(Request::new(())).await.unwrap();
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    #[tokio::test]
+    async fn required_mode_forwards_a_valid_credential_through_the_real_layer() {
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key").layer(StubInner);
+        let req = Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", controller_token("cluster-key")),
+            )
+            .body(())
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        assert!(resp.headers().get("grpc-status").is_none());
     }
 }

@@ -72,8 +72,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         anyhow::bail!("sattach: job {} has no allocated nodes", job_id);
     }
 
-    // Connect to the first node's agent
-    let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
+    // Connect to the first node's agent. The controller reports a compressed
+    // hostlist (e.g. `node[001-002]`), so expand it rather than comma-splitting.
+    let first_node = crate::nodelist::first_allocated_node(nodelist).with_context(|| {
+        format!("sattach: could not resolve a node from allocation '{nodelist}'")
+    })?;
     let agent_addr = format!("http://{}:6818", first_node);
     let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 

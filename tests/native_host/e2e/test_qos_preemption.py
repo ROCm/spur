@@ -38,6 +38,7 @@ class TestQosPriorityPreemption:
         # the final assertion (low comes back as R, not cancelled) actually
         # exercises the QOS override rather than just the partition default.
         return {
+            "scheduler": {"preempt_type": "qos_priority"},
             "partitions": [
                 {
                     "name": "default",
@@ -60,7 +61,9 @@ class TestQosPriorityPreemption:
         # action from the partition's `cancel` to `requeue` (see
         # cluster_config_overrides above for the partition-level opt-in).
         c.sacctmgr(["add", "qos", "name=low", "priority=-1000", "preemptmode=requeue"])
-        c.sacctmgr(["add", "qos", "name=high", "priority=100000"])
+        # high's preempt list names "low" so preempt_type=qos_priority lets it
+        # preempt the low-QOS job and PreemptQOS is recorded on the victim.
+        c.sacctmgr(["add", "qos", "name=high", "priority=100000", "preempt=low"])
         # Wait past the QoS cache refresh floor (10s) before submitting.
         time.sleep(15)
 
@@ -86,6 +89,18 @@ class TestQosPriorityPreemption:
             # The node is fully allocated to `low`, so `high` can only start
             # once the scheduler's preemption pass evicts it.
             wait_job_state(c, low_id, "PD", timeout=30)
+            show = c.scontrol("show", "job", str(low_id))
+            assert f"PreemptedBy={high_id}" in show, (
+                f"PreemptedBy not set on low-priority job:\n{show}"
+            )
+            assert "PreemptMode=Requeue" in show, (
+                f"PreemptMode not set on low-priority job:\n{show}"
+            )
+            # QOS-driven preemption: PreemptQOS must name the pending job's QOS.
+            assert "PreemptQOS=high" in show, (
+                f"PreemptQOS not set on low-priority job:\n{show}"
+            )
+
             high_state = wait_job(c, high_id, timeout=30)
             assert high_state == "CD", f"high-QoS job did not complete: {high_state}"
 

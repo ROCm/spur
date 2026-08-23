@@ -73,6 +73,8 @@ impl AssociationCache {
                 .is_some_and(|lvl| lvl.eq_ignore_ascii_case("admin"))
     }
 
+    /// Whether `user` is associated with `account`. An unloaded cache reports `CacheUnavailable`
+    /// rather than guessing; see `validate_user_account` in `cluster.rs` for how callers must treat that.
     pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {
         let snapshot = self.snapshot.read();
         if !snapshot.loaded {

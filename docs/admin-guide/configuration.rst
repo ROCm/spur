@@ -295,6 +295,16 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Restart
      - How often (seconds) to refresh fairshare and QOS caches from the database.
        The interval is baked into the refresh loops when they are spawned.
+   * - ``grp_wall_window_days``
+     - integer
+     - ``14``
+     - Restart
+     - Trailing window over which a QOS's wall-clock consumption is measured for
+       the ``grpwall`` limit. Must be between ``1`` and ``3650``; a zero window
+       would measure nothing and silently stop every ``grpwall`` budget applying,
+       so it is rejected at startup. Independent of
+       ``scheduler.fairshare_halflife_days``: that fades usage for priority
+       scoring, this is a hard budget cutoff.
    * - ``default_qos``
      - string
      - ``""``
@@ -308,9 +318,24 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Live
      - Reject at submit any job that still has no QOS after the resolution chain.
        Mirrors Slurm's ``AccountingStorageEnforce=qos``.
+   * - ``require_association``
+     - bool
+     - ``false``
+     - Live
+     - Reject at submit any job whose user resolves to no account: no
+       ``--account`` given and no default account on file. Unconditional, like
+       ``require_qos``. Mirrors Slurm's ``AccountingStorageEnforce=associations``.
+   * - ``txn_retention_days``
+     - integer
+     - unset
+     - Restart
+     - Delete admin audit-log (``txn``) rows older than this many days. Unset (the
+       default) or ``0`` disables purging (rows kept forever, matching Slurm's
+       default purge-off behavior); a positive value enables it. See :doc:`accounting`.
 
 See :doc:`accounting` for how ``default_qos`` and ``require_qos`` interact with the
-per-job QOS resolution chain.
+per-job QOS resolution chain, and how ``require_association`` interacts with the
+per-job account resolution chain.
 
 ``[scheduler]``
 ---------------
@@ -410,6 +435,28 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Grace minutes after a reservation ends before its still-running jobs are
        cancelled.
+   * - ``preempt_type``
+     - string
+     - ``"none"``
+     - Live
+     - Controls cross-QOS preemption eligibility. ``"none"`` (default) applies no
+       QOS-level restrictions — any job with a sufficient priority gap may preempt
+       any other. ``"qos_priority"`` enforces the per-QOS ``preempt`` allow-list:
+       a pending job may only preempt a running job when the pending job's QOS
+       explicitly lists the running job's QOS name in its ``preempt`` field. An
+       empty allow-list means the QOS may not preempt anything. Mirrors Slurm's
+       ``PreemptType=preempt/qos``. See :doc:`accounting` for the QOS
+       ``preempt`` field.
+   * - ``preempt_exempt_time``
+     - integer
+     - ``0``
+     - Live
+     - Cluster-wide minimum number of seconds a job must have been running before
+       it becomes eligible for preemption. ``0`` (default) means a job is
+       immediately eligible. Can be overridden per-partition (``preempt_exempt_time``
+       in ``[[partitions]]``) and per-QOS (``preemptexempttime`` via
+       ``sacctmgr``); the most specific value wins (QOS > partition > global).
+       Mirrors Slurm's ``PreemptExemptTime``.
 
 ``[auth]``
 ----------
@@ -531,11 +578,43 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
    * - ``priority_tier``
      - integer
      - ``0``
-     - Partition priority tier; a higher tier preempts a lower one.
+     - Priority ranking for this partition. Jobs on a higher-tier partition are
+       treated as more urgent than jobs on a lower-tier partition, even if their
+       raw submitted priority is the same. This allows a "premium" partition to
+       bump jobs off a "standard" partition without the admin manually adjusting
+       job priorities. A job that spans multiple partitions inherits the highest
+       tier among them.
    * - ``preempt_mode``
      - string
      - ``"off"``
-     - Preemption mode: ``cancel``, ``requeue``, ``suspend``; anything else is off.
+     - What the scheduler does to a running job when a higher-priority job needs
+       its node.
+
+       ``"cancel"`` — the running job is stopped and removed from the queue.
+       ``"requeue"`` — the running job is stopped and put back in the queue;
+       it will start again automatically once a node is free.
+       ``"suspend"`` — the running job is paused (not stopped). It keeps its
+       node allocation and continues automatically once the higher-priority job
+       finishes. Because the node stays occupied, any other job that also needs
+       that node exclusively will have to wait until the paused job either
+       finishes or is cancelled.
+       ``"off"`` (default) — running jobs in this partition are never kicked
+       out. The scheduler will wait for a free slot instead of preempting.
+
+       A job's QOS can change what happens to *that specific job* when it is
+       kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
+       field is the on/off switch: preemption is only attempted at all when
+       this is set to something other than ``"off"``.
+   * - ``preempt_exempt_time``
+     - integer or null
+     - ``null`` (inherit global)
+     - Per-partition override for the minimum seconds a job must have been running
+       before it is eligible for preemption. Overrides ``scheduler.preempt_exempt_time``
+       for jobs in this partition. Can be further overridden per-QOS by the QOS's
+       ``preemptexempttime`` field. Can also be set at runtime without restart via
+       ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
+       use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
+       to revert to the global default.
 
 ``[[nodes]]``
 -------------

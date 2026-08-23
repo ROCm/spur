@@ -29,6 +29,13 @@ pub enum AuthError {
     UnknownUser(String),
 }
 
+/// Subject under which the controller signs the credentials it presents to node agents.
+///
+/// An agent that verifies a credential carrying this subject knows the caller is the control plane,
+/// not an end user, and gates controller-only RPCs on it. Kept here so the controller (which mints
+/// the credential) and the agent (which checks it) cannot drift apart on the value.
+pub const CONTROLLER_SUBJECT: &str = "spurctld";
+
 /// Resolve a username to its UNIX credentials through NSS.
 ///
 /// The controller derives uid/gid from the *authenticated* username rather than accepting them from
@@ -92,6 +99,14 @@ impl Identity {
         }
     }
 
+    /// Whether this identity is the cluster controller (its credential's subject).
+    ///
+    /// Node agents use this to gate controller-only RPCs: a job launch or cancel must arrive from
+    /// the control plane, which allocates and accounts for it, not straight from a user's token.
+    pub fn is_controller(&self) -> bool {
+        self.user == CONTROLLER_SUBJECT
+    }
+
     /// Check if this identity can perform admin operations.
     pub fn require_admin(&self) -> Result<(), AuthError> {
         if self.is_admin {
@@ -105,14 +120,21 @@ impl Identity {
     }
 }
 
-/// Check that `user` is allowed to perform `action` on a job owned by `owner`.
+/// Check that a caller is allowed to perform `action` on a job owned by `owner`.
 ///
-/// Allows the owner, root, or an empty `user` (daemon calls and clients
-/// predating the identity field). Jobs with an empty owner are restricted to
-/// root only, since they run as root and granting access to any caller would
-/// be a privilege escalation.
-pub fn check_job_owner(user: &str, owner: &str, action: &str) -> Result<(), AuthError> {
-    if user.is_empty() || user == "root" || user == owner {
+/// Access is granted to the job's owner and to an explicitly identified internal/daemon caller
+/// (`is_internal` — the controller, or a verified admin). There is deliberately no bypass for an
+/// empty `user` or a literal `"root"` string: an internal caller must be named by `is_internal`,
+/// which the caller derives from a *verified* identity and never infers from a wire-supplied string
+/// an attacker can set. An empty `user` therefore matches no owner and is denied unless
+/// `is_internal`, so a job that runs as root (empty owner) stays reachable only by internal callers.
+pub fn check_job_owner(
+    user: &str,
+    is_internal: bool,
+    owner: &str,
+    action: &str,
+) -> Result<(), AuthError> {
+    if is_internal || (!user.is_empty() && user == owner) {
         return Ok(());
     }
     Err(AuthError::NotJobOwner {
@@ -315,15 +337,30 @@ mod tests {
     }
 
     #[test]
-    fn test_check_job_owner_allows_owner_root_and_daemon() {
-        assert!(check_job_owner("alice", "alice", "exec").is_ok());
-        assert!(check_job_owner("root", "alice", "exec").is_ok());
-        assert!(check_job_owner("", "alice", "exec").is_ok());
+    fn test_check_job_owner_allows_owner_and_internal() {
+        // The owner reaches their own job; an explicitly internal caller reaches any job.
+        assert!(check_job_owner("alice", false, "alice", "exec").is_ok());
+        assert!(check_job_owner("", true, "alice", "exec").is_ok());
+        assert!(check_job_owner("spurctld", true, "alice", "exec").is_ok());
+    }
+
+    /// The empty-user and literal-"root" bypasses are gone: only `is_internal` grants a non-owner,
+    /// and it is never inferred from the (attacker-controllable) `user` string.
+    #[test]
+    fn test_check_job_owner_no_empty_or_root_string_bypass() {
+        assert!(
+            check_job_owner("", false, "alice", "exec").is_err(),
+            "an empty user must not be treated as a daemon caller"
+        );
+        assert!(
+            check_job_owner("root", false, "alice", "exec").is_err(),
+            "a literal \"root\" username must not bypass the ownership check"
+        );
     }
 
     #[test]
     fn test_check_job_owner_rejects_other_user() {
-        let err = check_job_owner("bob", "alice", "exec").expect_err("bob must be denied");
+        let err = check_job_owner("bob", false, "alice", "exec").expect_err("bob must be denied");
         assert!(matches!(err, AuthError::NotJobOwner { .. }));
         assert_eq!(
             err.to_string(),
@@ -332,29 +369,50 @@ mod tests {
         );
     }
 
-    /// Jobs with an empty owner run as root, so only root and daemon (empty
-    /// user) are allowed. A regular user must be denied.
+    /// Jobs with an empty owner run as root, so only an internal caller is allowed — a named user is
+    /// denied, and an empty user no longer slips through as a daemon.
     #[test]
-    fn test_check_job_owner_empty_owner_restricts_to_root() {
-        assert!(check_job_owner("root", "", "exec").is_ok());
-        assert!(check_job_owner("", "", "exec").is_ok());
+    fn test_check_job_owner_empty_owner_restricts_to_internal() {
+        assert!(check_job_owner("", true, "", "exec").is_ok());
         assert!(
-            check_job_owner("alice", "", "exec").is_err(),
+            check_job_owner("", false, "", "exec").is_err(),
+            "an empty non-internal caller must not match an empty owner"
+        );
+        assert!(
+            check_job_owner("alice", false, "", "exec").is_err(),
             "empty-owner jobs run as root; granting access is a privilege escalation"
         );
     }
 
     /// A non-empty placeholder owner matches no caller, so it restricts the job
-    /// to root. Asserted so that introducing such a placeholder cannot silently
-    /// lock users out of their own jobs.
+    /// to internal callers. Asserted so that introducing such a placeholder
+    /// cannot silently lock users out of their own jobs.
     #[test]
-    fn test_check_job_owner_placeholder_owner_restricts_to_root() {
-        assert!(check_job_owner("root", "k8s", "exec").is_ok());
+    fn test_check_job_owner_placeholder_owner_restricts_to_internal() {
+        assert!(check_job_owner("", true, "k8s", "exec").is_ok());
         assert!(
-            check_job_owner("alice", "k8s", "exec").is_err(),
+            check_job_owner("alice", false, "k8s", "exec").is_err(),
             "a placeholder owner denies every named user; record the real \
              submitter or leave the owner empty instead"
         );
+    }
+
+    #[test]
+    fn test_is_controller_only_matches_the_controller_subject() {
+        let controller = Identity {
+            user: CONTROLLER_SUBJECT.into(),
+            uid: 0,
+            gid: 0,
+            is_admin: true,
+        };
+        assert!(controller.is_controller());
+        let user = Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
+        assert!(!user.is_controller());
     }
 
     #[test]

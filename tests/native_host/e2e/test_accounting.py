@@ -10,6 +10,8 @@ when Docker is unavailable).
 import re
 import time
 
+import pytest
+
 from cluster import deep_merge, parse_job_id, wait_job, wait_job_state, wait_sacct_row
 
 
@@ -392,6 +394,51 @@ class TestQosLimitReasons:
         assert len(blocked) == 1, f"expected exactly one blocked job, got {blocked}"
         assert _reason(c, blocked[0]) == "QOSGrpCpuLimit", (
             f"blocked job {blocked[0]} reason: {_reason(c, blocked[0])!r}"
+        )
+
+    def test_grp_node_cap_admits_job_packable_onto_already_used_nodes(self, accounting_cluster):
+        # A QOS grp node=2 cap is fully occupied by two 1-cpu jobs pinned to
+        # two of the three available nodes, each with plenty of spare CPU. A
+        # third, unconstrained job under the same QOS must be admitted by
+        # packing onto one of the two occupied nodes — not pend on
+        # QOSGrpNodeLimit, and not spread onto the untouched third node
+        # (which would silently exceed the cap once running).
+        c = accounting_cluster
+        if len(c.node_names) < 3:
+            pytest.skip("requires 3 nodes: 2 to occupy the grp node cap, 1 left idle")
+        n0, n1 = c.node_names[0], c.node_names[1]
+
+        c.sacctmgr(["add", "qos", "name=packcap", "grptres=node=2"])
+        time.sleep(15)
+
+        hold_script = c.write_file("qos-pack-hold.sh", "#!/bin/bash\nsleep 60\n")
+        hold_ids = []
+        for node in (n0, n1):
+            job_id = parse_job_id(
+                c.sbatch(
+                    ["-J", "pack-hold", "-N", "1", "-c", "1", "-w", node,
+                     "-q", "packcap", hold_script]
+                )
+            )
+            assert job_id is not None
+            hold_ids.append(job_id)
+        for jid in hold_ids:
+            wait_job_state(c, jid, "R", timeout=30)
+
+        pack_script = c.write_file("qos-pack-new.sh", "#!/bin/bash\nsleep 20\n")
+        new_id = parse_job_id(
+            c.sbatch(["-J", "pack-new", "-N", "1", "-c", "1", "-q", "packcap", pack_script])
+        )
+        assert new_id is not None
+
+        wait_job_state(c, new_id, "R", timeout=30)
+        show = c.scontrol("show", "job", str(new_id))
+        node_match = re.search(r"NodeList=(\S+)", show)
+        assert node_match, f"missing NodeList in scontrol output:\n{show}"
+        landed_on = node_match.group(1)
+        assert landed_on in (n0, n1), (
+            f"expected the packable job to land on an already-occupied node "
+            f"({n0} or {n1}), not spread to the idle third node; got {landed_on!r}"
         )
 
 
@@ -862,3 +909,150 @@ class TestSacctmgrInvalidInput:
 
         show_out = c.sacctmgr(["show", "qos"])
         assert "badtres" not in show_out, "QOS should not have been created"
+
+
+def _parse_txn_rows(out: str, where: str) -> list[dict]:
+    """Parse `sacctmgr show txn` rows into column dicts for `where`. Exact
+    column matching (anchored on the Action verb, which also skips the
+    header/separator) avoids the substring false positives of naive `in` checks."""
+    rows = []
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 6 and f[1] in ("create", "update", "delete") and f[3] == where:
+            rows.append(
+                {
+                    "id": f[0],
+                    "action": f[1],
+                    "actor": f[2],
+                    "where": f[3],
+                    "outcome": f[4],
+                    "verified": f[5],
+                }
+            )
+    return rows
+
+
+def _wait_txn_rows(c, res_name: str, predicate, timeout: int = 60) -> list[dict]:
+    """Poll the audit log until some row for `res_name` satisfies `predicate`
+    (audit writes are async), then return all parsed rows for the reservation."""
+    fmt = "format=ID,Action,Actor,Where,Outcome,Verified"
+    where = f"reservation:{res_name}"
+    deadline = time.time() + timeout
+    last: list[dict] = []
+    while time.time() < deadline:
+        rows = _parse_txn_rows(c.sacctmgr(["show", "txn", f"Name={res_name}", fmt]), where)
+        if any(predicate(r) for r in rows):
+            return rows
+        last = rows
+        time.sleep(2)
+    raise TimeoutError(f"txn rows for {res_name} never matched within {timeout}s (last: {last!r})")
+
+
+class TestReservationAudit:
+    """scontrol reservation admin actions are recorded in the accounting txn
+    log with the acting user and outcome (create/update/delete + failures)."""
+
+    def test_reservation_actions_recorded_in_txn_log(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        res_name = f"res-audit-{int(time.time())}"
+
+        create_args = [
+            "scontrol",
+            "create-reservation",
+            f"--name={res_name}",
+            "--start-time=now",
+            "--duration=60",
+            f"--nodes={node}",
+            "--flags=ignore_jobs",
+        ]
+        try:
+            assert "created" in c.cli_as_user("root", create_args).lower()
+
+            # Duplicate create -> server rejects (AlreadyExists) -> outcome=error,
+            # still audited (Spur logs failed attempts, unlike Slurm's txn_table).
+            dup = c.cli_as_user("root", create_args)
+            assert "created" not in dup.lower(), f"duplicate should fail: {dup}"
+
+            assert "updated" in c.cli_as_user(
+                "root",
+                ["scontrol", "update-reservation", f"--name={res_name}", "--duration=120"],
+            ).lower()
+
+            assert "deleted" in c.cli_as_user(
+                "root", ["scontrol", "delete-reservation", res_name]
+            ).lower()
+
+            # Delete is the last write, so waiting for it guarantees the earlier
+            # create/update rows have landed too.
+            rows = _wait_txn_rows(
+                c, res_name, lambda r: r["action"] == "delete" and r["outcome"] == "success"
+            )
+
+            def has(action, outcome, actor=None):
+                return any(
+                    r["action"] == action
+                    and r["outcome"] == outcome
+                    and (actor is None or r["actor"] == actor)
+                    for r in rows
+                )
+
+            assert has("create", "success", actor="root"), rows
+            assert has("create", "error"), rows  # the rejected duplicate
+            assert has("update", "success", actor="root"), rows
+            assert has("delete", "success", actor="root"), rows
+        finally:
+            # A leaked reservation fences a node; best-effort cleanup.
+            c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+    def test_denied_reservation_action_recorded(self, accounting_cluster):
+        """A non-owner delete is rejected server-side and recorded as
+        outcome=denied. Skips unless a privileged non-root identity (one that
+        passes the CLI gate yet isn't the owner) can reach the server here."""
+        c = accounting_cluster
+        submit_user = c.nodes[0].user
+        if submit_user == "root":
+            pytest.skip("need a non-root SSH user to test a denied action")
+
+        probe = c.cli_as_user("root", ["scontrol", "show", "reservation"])
+        if "sudo" in probe.lower() and (
+            "password" in probe.lower() or "not allowed" in probe.lower()
+        ):
+            pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
+
+        node = c.node_names[0]
+        res_name = f"res-audit-denied-{int(time.time())}"
+        try:
+            assert "created" in c.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create-reservation",
+                    f"--name={res_name}",
+                    "--start-time=now",
+                    "--duration=60",
+                    f"--nodes={node}",
+                    "--flags=ignore_jobs",
+                    "--users=testuser",
+                ],
+            ).lower()
+
+            # Only a server-side ownership denial is audited. If the delete never
+            # reaches the server (the CLI privilege gate blocks a non-sudo/wheel
+            # user, or sudo -u is unavailable), nothing is written -- so skip.
+            del_out = c.cli_as_user(
+                submit_user, ["scontrol", "delete-reservation", res_name]
+            ).lower()
+            if "cannot delete" not in del_out:
+                pytest.skip(
+                    f"server-side reservation denial not reproducible here: {del_out.strip()}"
+                )
+
+            rows = _wait_txn_rows(
+                c, res_name, lambda r: r["action"] == "delete" and r["outcome"] == "denied"
+            )
+            denied = [r for r in rows if r["action"] == "delete" and r["outcome"] == "denied"]
+            assert denied, rows
+            assert denied[0]["actor"] == submit_user, denied
+        finally:
+            c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])

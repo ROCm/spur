@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::format_engine;
+use crate::timearg::{datetime_to_proto, parse_time_arg};
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::*;
 
@@ -116,15 +117,24 @@ const QOS_KEYS: &[&str] = &[
     "description",
     "priority",
     "preemptmode",
+    "preempt",
+    "preemptexempttime",
+    "clearpreemptexempttime",
     "usagefactor",
     "maxjobsperuser",
     "maxjobspu",
     "maxwall",
     "maxtresperjob",
     "maxsubmitjobsperuser",
+    "maxsubmitjobsperaccount",
+    "maxsubmitpa",
+    "maxsubmitjobspa",
+    "grpsubmit",
+    "grpsubmitjobs",
     "maxtresperuser",
     "grptres",
     "grpwall",
+    "flags",
 ];
 
 /// Input keys the `add`/`modify user` handlers read (names + aliases). Gates
@@ -140,6 +150,8 @@ const USER_KEYS: &[&str] = &[
     "maxrunningjobs",
     "maxjobs",
     "maxsubmitjobs",
+    "grpsubmit",
+    "grpsubmitjobs",
     "maxtresperjob",
     "grptres",
     "maxwall",
@@ -184,18 +196,37 @@ async fn connect(addr: &str) -> Result<SlurmAccountingClient<crate::authclient::
     Ok(spur_proto::accounting_client(channel))
 }
 
-/// Parse a numeric limit value where `0` is a keyword meaning "no limit".
-/// Fails loudly instead of silently defaulting to `0` so a typo or
-/// out-of-range value never accidentally lifts a limit.
+/// Parse a numeric limit value. `-1` is Slurm's keyword for "no limit" and maps
+/// to the INFINITE sentinel (clears the stored limit); `0` is a literal value
+/// meaning "block all". Any other negative, or a value at/above INFINITE, is
+/// rejected. Fails loudly instead of silently defaulting so a typo never
+/// accidentally lifts or sets a limit.
 fn parse_limit(key: &str, val: &str) -> Result<u32> {
-    val.parse()
-        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+    let n: i64 = val
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))?;
+    if n == -1 {
+        return Ok(spur_core::accounting::INFINITE);
+    }
+    if n < 0 || n >= spur_core::accounting::INFINITE as i64 {
+        bail!("invalid value for {key}=: '{val}'");
+    }
+    Ok(n as u32)
 }
 
 /// Same as `parse_limit`, but for wall-time fields that also accept Slurm's
-/// `d-hh:mm:ss`/`hh:mm:ss` duration syntax (see `parse_wall_time`).
+/// `d-hh:mm:ss`/`hh:mm:ss` duration syntax (see `parse_wall_time`). `-1` clears
+/// the limit (INFINITE sentinel).
 fn parse_wall_limit(key: &str, val: &str) -> Result<u32> {
-    parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+    if val == "-1" {
+        return Ok(spur_core::accounting::INFINITE);
+    }
+    let minutes =
+        parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))?;
+    if minutes == spur_core::accounting::INFINITE {
+        bail!("invalid value for {key}=: '{val}'");
+    }
+    Ok(minutes)
 }
 
 /// Parse a floating-point field (e.g. `fairshare=`/`usagefactor=`), failing
@@ -211,6 +242,20 @@ fn parse_f64(key: &str, val: &str) -> Result<f64> {
 fn parse_i32(key: &str, val: &str) -> Result<i32> {
     val.parse()
         .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Parse an unsigned integer field, failing loudly rather than silently
+/// defaulting so a typo never quietly changes a limit on a partial `modify`.
+fn parse_u32(key: &str, val: &str) -> Result<u32> {
+    val.parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Return true when a key=value pair explicitly opts in to a boolean action
+/// (value is "1", "yes", or "true", case-insensitive). Bare keys (no `=value`)
+/// never match because `parse_params` maps them to an empty string.
+fn is_truthy(val: &str) -> bool {
+    matches!(val.to_lowercase().as_str(), "1" | "yes" | "true")
 }
 
 /// Look up a field by its accepted aliases in priority order, returning the key
@@ -237,6 +282,7 @@ struct UserUpsertFields {
     allowed_qos: String,
     max_running_jobs: u32,
     max_submit_jobs: u32,
+    grp_submit_jobs: u32,
     max_tres_per_job: String,
     grp_tres: String,
     max_wall_minutes: u32,
@@ -291,21 +337,28 @@ fn build_add_user_request(
     {
         bail!("defaultqos={default_qos} must be included in qos={allowed_qos}");
     }
+    // An unset numeric limit sends INFINITE (clear/no-limit) on `add`; a literal
+    // 0 would mean "block all" under the sentinel semantics.
+    let no_limit = spur_core::accounting::INFINITE;
     let max_running_jobs: u32 = find_alias(p, &["maxrunningjobs", "maxjobs"])
         .map(|(k, v)| parse_limit(k, v))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(no_limit);
     let max_submit_jobs: u32 = p
         .get("maxsubmitjobs")
         .map(|v| parse_limit("maxsubmitjobs", v))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(no_limit);
+    let grp_submit_jobs: u32 = find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+        .map(|(k, v)| parse_limit(k, v))
+        .transpose()?
+        .unwrap_or(no_limit);
     let max_tres_per_job = p.get("maxtresperjob").cloned().unwrap_or_default();
     let grp_tres = p.get("grptres").cloned().unwrap_or_default();
     let max_wall_minutes: u32 = find_alias(p, &["maxwall", "maxwallduration"])
         .map(|(k, v)| parse_wall_limit(k, v))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(no_limit);
 
     Ok(UserUpsertFields {
         name,
@@ -315,6 +368,7 @@ fn build_add_user_request(
         allowed_qos,
         max_running_jobs,
         max_submit_jobs,
+        grp_submit_jobs,
         max_tres_per_job,
         grp_tres,
         max_wall_minutes,
@@ -351,7 +405,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let max_jobs: u32 = find_alias(&p, &["maxrunningjobs", "maxjobs"])
                 .map(|(k, v)| parse_limit(k, v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(spur_core::accounting::INFINITE);
             let grp_tres = p.get("grptres").cloned().unwrap_or_default();
 
             let mut client = connect(addr).await?;
@@ -395,6 +449,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     allowed_qos: Some(fields.allowed_qos.clone()),
                     max_running_jobs: Some(fields.max_running_jobs),
                     max_submit_jobs: Some(fields.max_submit_jobs),
+                    grp_submit_jobs: Some(fields.grp_submit_jobs),
                     max_tres_per_job: Some(fields.max_tres_per_job.clone()),
                     grp_tres: Some(fields.grp_tres.clone()),
                     max_wall_minutes: Some(fields.max_wall_minutes),
@@ -412,13 +467,17 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             if !fields.default_qos.is_empty() {
                 println!("  DefQOS     = {}", fields.default_qos);
             }
-            if fields.max_running_jobs > 0 {
+            let unset = spur_core::accounting::INFINITE;
+            if fields.max_running_jobs != unset {
                 println!("  MaxJobs    = {}", fields.max_running_jobs);
             }
-            if fields.max_submit_jobs > 0 {
+            if fields.max_submit_jobs != unset {
                 println!("  MaxSubmit  = {}", fields.max_submit_jobs);
             }
-            if fields.max_wall_minutes > 0 {
+            if fields.grp_submit_jobs != unset {
+                println!("  GrpSubmit  = {}", fields.grp_submit_jobs);
+            }
+            if fields.max_wall_minutes != unset {
                 println!("  MaxWall    = {} min", fields.max_wall_minutes);
             }
             if !fields.max_tres_per_job.is_empty() {
@@ -446,21 +505,22 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .get("usagefactor")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0);
+            let no_limit = spur_core::accounting::INFINITE;
             let max_jobs: u32 = find_alias(&p, &["maxjobsperuser", "maxjobspu"])
                 .map(|(k, v)| parse_limit(k, v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(no_limit);
             let max_wall: u32 = p
                 .get("maxwall")
                 .map(|v| parse_wall_limit("maxwall", v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(no_limit);
             let max_tres = p.get("maxtresperjob").cloned().unwrap_or_default();
             let grp_wall: u32 = p
                 .get("grpwall")
                 .map(|v| parse_wall_limit("grpwall", v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(no_limit);
 
             let mut client = connect(addr).await?;
             client
@@ -469,6 +529,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     description: Some(desc),
                     priority: Some(priority),
                     preempt_mode: Some(preempt.clone()),
+                    preempt: p.get("preempt").cloned(),
                     usage_factor: Some(usage_factor),
                     max_jobs_per_user: Some(max_jobs),
                     max_wall_minutes: Some(max_wall),
@@ -477,11 +538,32 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         p.get("maxsubmitjobsperuser")
                             .map(|v| parse_limit("maxsubmitjobsperuser", v))
                             .transpose()?
-                            .unwrap_or(0),
+                            .unwrap_or(no_limit),
                     ),
                     max_tres_per_user: Some(p.get("maxtresperuser").cloned().unwrap_or_default()),
                     grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
                     grp_wall_minutes: Some(grp_wall),
+                    preempt_exempt_time: p
+                        .get("preemptexempttime")
+                        .map(|v| parse_u32("preemptexempttime", v))
+                        .transpose()?,
+                    clear_preempt_exempt_time: false,
+                    max_submit_jobs_per_account: Some(
+                        find_alias(
+                            &p,
+                            &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
+                        )
+                        .map(|(k, v)| parse_limit(k, v))
+                        .transpose()?
+                        .unwrap_or(no_limit),
+                    ),
+                    grp_submit_jobs: Some(
+                        find_alias(&p, &["grpsubmit", "grpsubmitjobs"])
+                            .map(|(k, v)| parse_limit(k, v))
+                            .transpose()?
+                            .unwrap_or(no_limit),
+                    ),
+                    flags: Some(p.get("flags").cloned().unwrap_or_default()),
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -490,10 +572,10 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 " Adding QOS(s)\n  Name       = {}\n  Priority   = {}\n  Preempt    = {}",
                 name, priority, preempt
             );
-            if max_wall > 0 {
+            if max_wall != no_limit {
                 println!("  MaxWall    = {} min", max_wall);
             }
-            if max_jobs > 0 {
+            if max_jobs != no_limit {
                 println!("  MaxJobsPU  = {}", max_jobs);
             }
             println!(" QOS added.");
@@ -622,6 +704,7 @@ fn build_modify_qos_request(
             .map(|v| parse_i32("priority", v))
             .transpose()?,
         preempt_mode: p.get("preemptmode").cloned(),
+        preempt: p.get("preempt").cloned(),
         usage_factor: p
             .get("usagefactor")
             .map(|v| parse_f64("usagefactor", v))
@@ -644,6 +727,24 @@ fn build_modify_qos_request(
             .get("grpwall")
             .map(|v| parse_wall_limit("grpwall", v))
             .transpose()?,
+        preempt_exempt_time: p
+            .get("preemptexempttime")
+            .map(|v| parse_u32("preemptexempttime", v))
+            .transpose()?,
+        clear_preempt_exempt_time: p
+            .get("clearpreemptexempttime")
+            .map(|v| is_truthy(v))
+            .unwrap_or(false),
+        max_submit_jobs_per_account: find_alias(
+            p,
+            &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
+        )
+        .map(|(k, v)| parse_limit(k, v))
+        .transpose()?,
+        grp_submit_jobs: find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+            .map(|(k, v)| parse_limit(k, v))
+            .transpose()?,
+        flags: p.get("flags").cloned(),
     })
 }
 
@@ -681,6 +782,9 @@ fn build_modify_user_request(
         max_submit_jobs: p
             .get("maxsubmitjobs")
             .map(|v| parse_limit("maxsubmitjobs", v))
+            .transpose()?,
+        grp_submit_jobs: find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+            .map(|(k, v)| parse_limit(k, v))
             .transpose()?,
         max_tres_per_job: p.get("maxtresperjob").cloned(),
         grp_tres: p.get("grptres").cloned(),
@@ -772,22 +876,10 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let users = resp.into_inner().users;
 
-            println!(
-                "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15}",
-                "User", "Account", "Admin", "Default Acct", "QOS", "Def QOS"
-            );
-            println!("{}", "-".repeat(95));
-
+            println!("{}", user_header_row());
+            println!("{}", "-".repeat(180));
             for u in &users {
-                println!(
-                    "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15}",
-                    u.name,
-                    u.account,
-                    u.admin_level,
-                    u.default_account,
-                    u.allowed_qos,
-                    u.default_qos,
-                );
+                println!("{}", format_user_row(u));
             }
             Ok(())
         }
@@ -860,8 +952,29 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             println!("{:<5} {:<15} {:<10}", "1002", "billing", "");
             Ok(())
         }
+        "txn" | "transaction" | "transactions" => {
+            let fields = txn_format_fields(p.get("format").map(String::as_str))?;
+            let request = build_txn_request(&p);
+
+            let mut client = connect(addr).await?;
+            let txns = client
+                .get_transactions(request)
+                .await
+                .context("GetTransactions RPC failed")?
+                .into_inner()
+                .transactions;
+
+            format_engine::print_header(&fields);
+            for t in &txns {
+                println!(
+                    "{}",
+                    format_engine::format_row(&fields, &|spec| resolve_txn_field(t, spec))
+                );
+            }
+            Ok(())
+        }
         other => bail!(
-            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres",
+            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres, txn",
             other
         ),
     }
@@ -870,6 +983,128 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
     let names: Vec<&str> = filter.split(',').map(str::trim).collect();
     qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+}
+
+// Slurm's default `sacctmgr show transaction` columns: Time, Action, Actor,
+// Where, Info. Where renders entity_type:entity_name; Info renders details JSON.
+const TXN_DEFAULT_FORMAT: &str = "%-20t %-8a %-14A %-24w %-40i";
+const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-24w %-10o %-8u %-40i";
+
+fn txn_header(spec: char) -> &'static str {
+    match spec {
+        't' => "Time",
+        'a' => "Action",
+        'A' => "Actor",
+        'w' => "Where",
+        'i' => "Info",
+        'o' => "Outcome",
+        'v' => "Verified",
+        's' => "Source",
+        'd' => "ID",
+        'u' => "ActorUID",
+        _ => "?",
+    }
+}
+
+fn txn_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "time" | "timestamp" | "ts" => Some('t'),
+        "action" => Some('a'),
+        "actor" => Some('A'),
+        "where" | "entity" => Some('w'),
+        "info" | "details" => Some('i'),
+        "outcome" => Some('o'),
+        "verified" => Some('v'),
+        "source" => Some('s'),
+        "id" => Some('d'),
+        "actoruid" | "uid" => Some('u'),
+        _ => None,
+    }
+}
+
+fn txn_format_fields(
+    format_param: Option<&str>,
+) -> anyhow::Result<Vec<format_engine::FormatToken>> {
+    format_engine::resolve_format(
+        format_param,
+        TXN_DEFAULT_FORMAT,
+        TXN_ALL_FORMAT,
+        &txn_field_spec,
+        &txn_header,
+        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID",
+    )
+}
+
+/// Build a `GetTransactions` request from Slurm-style `key=value` filters
+/// (`Actor=`, `Action=`, `Entity=`, `Name=`, `Outcome=`, `Start=`, `End=`,
+/// `limit=`). `action`/`outcome` are lowercased to match the stored values.
+fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransactionsRequest {
+    GetTransactionsRequest {
+        actor: p.get("actor").cloned().unwrap_or_default(),
+        entity_type: p
+            .get("entity")
+            .or_else(|| p.get("entitytype"))
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        entity_name: p
+            .get("name")
+            .or_else(|| p.get("entityname"))
+            .cloned()
+            .unwrap_or_default(),
+        action: p
+            .get("action")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        outcome: p
+            .get("outcome")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        start_after: p
+            .get("start")
+            .and_then(|s| parse_time_arg(s))
+            .map(datetime_to_proto),
+        start_before: p
+            .get("end")
+            .and_then(|s| parse_time_arg(s))
+            .map(datetime_to_proto),
+        limit: p.get("limit").and_then(|s| s.parse().ok()).unwrap_or(0),
+    }
+}
+
+fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
+    match spec {
+        't' => t.timestamp.as_ref().map(fmt_txn_ts).unwrap_or_default(),
+        'a' => t.action.clone(),
+        'A' => t.actor.clone(),
+        'w' => format!("{}:{}", t.entity_type, t.entity_name),
+        'i' => t.details.clone(),
+        'o' => t.outcome.clone(),
+        'v' => if t.verified { "yes" } else { "no" }.to_string(),
+        's' => t.source.clone(),
+        'd' => t.id.to_string(),
+        // uid is recorded only for a verified identity; render blank otherwise so
+        // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
+        'u' => {
+            if t.verified {
+                t.actor_uid.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => "?".to_string(),
+    }
+}
+
+fn fmt_txn_ts(ts: &prost_types::Timestamp) -> String {
+    // Sanitize nanos (never displayed) so a negative/out-of-range value can't wrap
+    // via `as u32` and blank an otherwise-valid timestamp.
+    let nanos = u32::try_from(ts.nanos)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)
+        .unwrap_or(0);
+    chrono::DateTime::from_timestamp(ts.seconds, nanos)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_default()
 }
 
 const ACCOUNT_DEFAULT_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G";
@@ -917,13 +1152,60 @@ fn account_format_fields(
     )
 }
 
-/// Render a numeric limit, blank when zero (Slurm shows "unlimited" as an empty cell).
+/// Render a numeric limit, blank when unset/unlimited (the INFINITE sentinel);
+/// Slurm shows "no limit" as an empty cell. A literal 0 renders as "0".
+fn blank_if_unset(v: u32) -> String {
+    if v == spur_core::accounting::INFINITE {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Render a numeric value, blank when zero. Used for `preempt_exempt_time`,
+/// whose absence is carried as `None` (not the `INFINITE` sentinel).
 fn blank_if_zero(v: u32) -> String {
     if v == 0 {
         String::new()
     } else {
         v.to_string()
     }
+}
+
+fn user_header_row() -> String {
+    format!(
+        "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15} {:<10} {:<10} {:<10} {:<10} {:<16} {:<16}",
+        "User",
+        "Account",
+        "Admin",
+        "Default Acct",
+        "QOS",
+        "Def QOS",
+        "MaxJobs",
+        "MaxSubmit",
+        "GrpSubmit",
+        "MaxWall",
+        "MaxTRES",
+        "GrpTRES",
+    )
+}
+
+fn format_user_row(u: &UserInfo) -> String {
+    format!(
+        "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15} {:<10} {:<10} {:<10} {:<10} {:<16} {:<16}",
+        u.name,
+        u.account,
+        u.admin_level,
+        u.default_account,
+        u.allowed_qos,
+        u.default_qos,
+        blank_if_unset(u.max_running_jobs),
+        blank_if_unset(u.max_submit_jobs),
+        blank_if_unset(u.grp_submit_jobs),
+        blank_if_unset(u.max_wall_minutes),
+        u.max_tres_per_job,
+        u.grp_tres,
+    )
 }
 
 fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
@@ -934,30 +1216,36 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
         'P' => a.parent_account.clone(),
         'S' => (a.fairshare_weight as u32).to_string(),
         'G' => a.grp_tres.clone(),
-        'J' => blank_if_zero(a.max_running_jobs),
+        'J' => blank_if_unset(a.max_running_jobs),
         _ => "?".into(),
     }
 }
 
-const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+const QOS_DEFAULT_FORMAT: &str =
+    "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
 const QOS_ALL_FORMAT: &str =
-    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
         'N' => "Name",
         'D' => "Descr",
         'p' => "Priority",
-        'P' => "Preempt",
+        'P' => "PreemptMode",
+        'Q' => "Preempt",
+        'E' => "PreemptExemptTime",
         'U' => "UsageFactor",
         'G' => "GrpTRES",
         'T' => "MaxTRES",
         'V' => "MaxTRESPU",
         'J' => "MaxJobsPU",
         'S' => "MaxSubmitPU",
+        'A' => "MaxSubmitPA",
+        'B' => "GrpSubmit",
         'W' => "MaxWall",
         'w' => "GrpWall",
+        'F' => "Flags",
         _ => "?",
     }
 }
@@ -967,15 +1255,20 @@ fn qos_field_spec(name: &str) -> Option<char> {
         "name" => Some('N'),
         "description" | "descr" => Some('D'),
         "priority" | "prio" => Some('p'),
-        "preempt" | "preemptmode" => Some('P'),
+        "preemptmode" => Some('P'),
+        "preempt" => Some('Q'),
+        "preemptexempttime" => Some('E'),
         "usagefactor" => Some('U'),
         "grptres" => Some('G'),
         "maxtres" | "maxtrespj" | "maxtresperjob" => Some('T'),
         "maxtrespu" | "maxtresperuser" => Some('V'),
         "maxjobspu" | "maxjobsperuser" => Some('J'),
         "maxsubmitpu" | "maxsubmitjobspu" | "maxsubmitjobsperuser" => Some('S'),
+        "maxsubmitpa" | "maxsubmitjobspa" | "maxsubmitjobsperaccount" => Some('A'),
+        "grpsubmit" | "grpsubmitjobs" => Some('B'),
         "maxwall" | "maxwalldurationperjob" => Some('W'),
         "grpwall" => Some('w'),
+        "flags" => Some('F'),
         _ => None,
     }
 }
@@ -986,14 +1279,19 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'D' => q.description.clone(),
         'p' => q.priority.to_string(),
         'P' => q.preempt_mode.clone(),
+        'Q' => q.preempt.clone(),
+        'E' => q.preempt_exempt_time.map(blank_if_zero).unwrap_or_default(),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
         'V' => q.max_tres_per_user.clone(),
-        'J' => blank_if_zero(q.max_jobs_per_user),
-        'S' => blank_if_zero(q.max_submit_jobs_per_user),
-        'W' => blank_if_zero(q.max_wall_minutes),
-        'w' => blank_if_zero(q.grp_wall_minutes),
+        'J' => blank_if_unset(q.max_jobs_per_user),
+        'S' => blank_if_unset(q.max_submit_jobs_per_user),
+        'A' => blank_if_unset(q.max_submit_jobs_per_account),
+        'B' => blank_if_unset(q.grp_submit_jobs),
+        'W' => blank_if_unset(q.max_wall_minutes),
+        'w' => blank_if_unset(q.grp_wall_minutes),
+        'F' => q.flags.clone(),
         _ => "?".into(),
     }
 }
@@ -1121,9 +1419,12 @@ mod tests {
             "maxwall",
             "maxtresperjob",
             "maxsubmitjobsperuser",
+            "maxsubmitjobsperaccount",
+            "grpsubmit",
             "maxtresperuser",
             "grptres",
             "grpwall",
+            "flags",
         ];
         for field in parsed_fields {
             let p = parse_params(&["name=normal".into(), format!("{field}=1")]);
@@ -1147,6 +1448,7 @@ mod tests {
             "maxrunningjobs",
             "maxjobs",
             "maxsubmitjobs",
+            "grpsubmit",
             "maxtresperjob",
             "grptres",
             "maxwall",
@@ -1279,14 +1581,17 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_account_limits_absent_are_zero() {
+    fn build_add_user_request_account_limits_absent_are_unset() {
+        // Absent numeric limits default to the INFINITE sentinel (leave
+        // unchanged / no limit), not a literal 0 which would block all.
+        let unset = spur_core::accounting::INFINITE;
         let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
         let fields = build_add_user_request(&p).unwrap();
-        assert_eq!(fields.max_running_jobs, 0);
-        assert_eq!(fields.max_submit_jobs, 0);
+        assert_eq!(fields.max_running_jobs, unset);
+        assert_eq!(fields.max_submit_jobs, unset);
         assert_eq!(fields.max_tres_per_job, "");
         assert_eq!(fields.grp_tres, "");
-        assert_eq!(fields.max_wall_minutes, 0);
+        assert_eq!(fields.max_wall_minutes, unset);
     }
 
     #[test]
@@ -1345,11 +1650,23 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_rejects_negative_maxsubmitjobs() {
+    fn build_add_user_request_maxsubmitjobs_minus_one_clears() {
+        // -1 is the clear sentinel (INFINITE), not an error.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),
             "maxsubmitjobs=-1".into(),
+        ]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.max_submit_jobs, spur_core::accounting::INFINITE);
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_other_negative_maxsubmitjobs() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxsubmitjobs=-5".into(),
         ]);
         assert!(build_add_user_request(&p).is_err());
     }
@@ -1613,17 +1930,95 @@ mod tests {
     }
 
     #[test]
-    fn qos_resolve_zero_fields_are_blank() {
+    fn qos_resolve_unset_fields_are_blank_and_zero_is_shown() {
+        // Post sentinel-flip: the INFINITE sentinel renders blank (no limit);
+        // a literal 0 renders as "0" (block all).
+        let unset = spur_core::accounting::INFINITE;
         let q = QosInfo {
             name: "normal".into(),
             preempt_mode: "off".into(),
             usage_factor: 1.0,
+            max_jobs_per_user: unset,
+            max_submit_jobs_per_user: unset,
+            max_wall_minutes: unset,
+            grp_wall_minutes: unset,
+            max_submit_jobs_per_account: unset,
+            grp_submit_jobs: unset,
             ..Default::default()
         };
         assert_eq!(resolve_qos_field(&q, 'J'), "");
         assert_eq!(resolve_qos_field(&q, 'S'), "");
         assert_eq!(resolve_qos_field(&q, 'W'), "");
         assert_eq!(resolve_qos_field(&q, 'w'), "");
+        assert_eq!(resolve_qos_field(&q, 'A'), "");
+        assert_eq!(resolve_qos_field(&q, 'B'), "");
+
+        let blocking = QosInfo {
+            max_jobs_per_user: 0,
+            ..q
+        };
+        assert_eq!(resolve_qos_field(&blocking, 'J'), "0");
+    }
+
+    #[test]
+    fn format_user_row_renders_limits_and_blanks_unset() {
+        let unset = spur_core::accounting::INFINITE;
+        let header = user_header_row();
+        for column in [
+            "User",
+            "Account",
+            "MaxJobs",
+            "MaxSubmit",
+            "GrpSubmit",
+            "MaxWall",
+            "MaxTRES",
+            "GrpTRES",
+        ] {
+            assert!(header.contains(column), "header missing {column}: {header}");
+        }
+
+        let u = UserInfo {
+            name: "carol".into(),
+            account: "ml".into(),
+            admin_level: "None".into(),
+            max_running_jobs: 4,
+            max_submit_jobs: 8,
+            grp_submit_jobs: unset,
+            max_wall_minutes: 1440,
+            max_tres_per_job: "cpu=64".into(),
+            grp_tres: String::new(),
+            ..Default::default()
+        };
+        let row = format_user_row(&u);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert!(cols.contains(&"carol"));
+        assert!(cols.contains(&"4"));
+        assert!(cols.contains(&"8"));
+        assert!(cols.contains(&"1440"));
+        assert!(cols.contains(&"cpu=64"));
+        // grp_submit_jobs is the INFINITE sentinel: it must render as a blank
+        // cell. The header and row share the same fixed-width layout, so the
+        // GrpSubmit column occupies the same byte range in both; assert that
+        // slice of the row is all whitespace.
+        let start = header.find("GrpSubmit").expect("header has GrpSubmit");
+        let cell = &row[start..start + "GrpSubmit".len()];
+        assert!(
+            cell.trim().is_empty(),
+            "GrpSubmit cell should be blank, got {cell:?}"
+        );
+    }
+
+    #[test]
+    fn parse_limit_minus_one_clears_to_infinite() {
+        assert_eq!(
+            parse_limit("maxjobs", "-1").unwrap(),
+            spur_core::accounting::INFINITE
+        );
+    }
+
+    #[test]
+    fn parse_limit_zero_is_literal_block_all() {
+        assert_eq!(parse_limit("maxjobs", "0").unwrap(), 0);
     }
 
     #[test]
@@ -1679,6 +2074,81 @@ mod tests {
 
         assert!(account.is_empty());
         assert_eq!(user, "testuser");
+    }
+
+    #[test]
+    fn build_txn_request_maps_filters_and_lowercases_action() {
+        let p = parse_params(&[
+            "actor=alice".into(),
+            "action=Delete".into(),
+            "entity=reservation".into(),
+            "name=maint".into(),
+            "outcome=Denied".into(),
+            "start=2024-01-01".into(),
+            "limit=50".into(),
+        ]);
+
+        let req = build_txn_request(&p);
+
+        assert_eq!(req.actor, "alice");
+        assert_eq!(req.action, "delete");
+        assert_eq!(req.entity_type, "reservation");
+        assert_eq!(req.entity_name, "maint");
+        assert_eq!(req.outcome, "denied");
+        assert_eq!(req.limit, 50);
+        assert!(req.start_after.is_some());
+        assert!(req.start_before.is_none());
+    }
+
+    #[test]
+    fn resolve_txn_field_renders_where_and_verified() {
+        let t = TransactionRecord {
+            id: 7,
+            timestamp: None,
+            actor: "bob".into(),
+            actor_uid: 1000,
+            verified: true,
+            source: "api".into(),
+            action: "create".into(),
+            entity_type: "reservation".into(),
+            entity_name: "daily".into(),
+            outcome: "success".into(),
+            details: "{}".into(),
+        };
+        assert_eq!(resolve_txn_field(&t, 'w'), "reservation:daily");
+        assert_eq!(resolve_txn_field(&t, 'v'), "yes");
+        assert_eq!(resolve_txn_field(&t, 'A'), "bob");
+        assert_eq!(resolve_txn_field(&t, 'd'), "7");
+        assert_eq!(resolve_txn_field(&t, 'u'), "1000");
+    }
+
+    #[test]
+    fn resolve_txn_field_blanks_uid_when_unverified() {
+        // Unverified rows carry an unknown uid (stored NULL, 0 on the wire); it
+        // must render blank so it can't be mistaken for root (uid 0).
+        let t = TransactionRecord {
+            actor: "vm".into(),
+            actor_uid: 0,
+            verified: false,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&t, 'u'), "");
+        assert_eq!(resolve_txn_field(&t, 'v'), "no");
+    }
+
+    #[test]
+    fn fmt_txn_ts_sanitizes_bad_nanos() {
+        let bad = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: -1,
+        };
+        let good = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        };
+        // A negative nanos must not wrap via `as u32` and blank the timestamp.
+        assert!(!fmt_txn_ts(&bad).is_empty());
+        assert_eq!(fmt_txn_ts(&bad), fmt_txn_ts(&good));
     }
 
     fn stub_account() -> AccountInfo {
@@ -1772,12 +2242,20 @@ mod tests {
     }
 
     #[test]
-    fn account_resolve_zero_maxjobs_is_blank() {
-        let a = AccountInfo {
+    fn account_resolve_unset_maxjobs_is_blank_and_zero_is_shown() {
+        // Post sentinel-flip: INFINITE renders blank (no limit); a literal 0
+        // renders "0" (block all).
+        let unset = AccountInfo {
+            max_running_jobs: spur_core::accounting::INFINITE,
+            ..stub_account()
+        };
+        assert_eq!(resolve_account_field(&unset, 'J'), "");
+
+        let blocking = AccountInfo {
             max_running_jobs: 0,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&a, 'J'), "");
+        assert_eq!(resolve_account_field(&blocking, 'J'), "0");
     }
 
     #[test]
@@ -1816,6 +2294,87 @@ mod tests {
         assert!(
             !header.contains("MaxJobs"),
             "default should omit MaxJobs: {header}"
+        );
+    }
+
+    // --- parse_u32 / is_truthy ---
+
+    #[test]
+    fn parse_u32_accepts_valid_integer() {
+        assert_eq!(parse_u32("preemptexempttime", "120").unwrap(), 120);
+        assert_eq!(parse_u32("preemptexempttime", "0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_u32_rejects_non_integer() {
+        let err = parse_u32("preemptexempttime", "abc").unwrap_err();
+        assert!(
+            err.to_string().contains("preemptexempttime"),
+            "error names the field: {err}"
+        );
+        assert!(
+            err.to_string().contains("abc"),
+            "error names the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_u32_rejects_negative() {
+        assert!(parse_u32("preemptexempttime", "-1").is_err());
+    }
+
+    #[test]
+    fn is_truthy_accepts_canonical_values() {
+        for v in &["1", "yes", "YES", "true", "True", "TRUE"] {
+            assert!(is_truthy(v), "{v} should be truthy");
+        }
+    }
+
+    #[test]
+    fn is_truthy_rejects_other_values() {
+        for v in &["0", "no", "false", "", "maybe"] {
+            assert!(!is_truthy(v), "{v} should not be truthy");
+        }
+    }
+
+    // --- clearpreemptexempttime must require explicit value ---
+
+    #[test]
+    fn clear_preempt_exempt_time_requires_truthy_value() {
+        // A bare key (parse_params maps it to "") must NOT trigger the clear.
+        let p: std::collections::HashMap<String, String> = [
+            ("name".into(), "q".into()),
+            ("clearpreemptexempttime".into(), "".into()),
+        ]
+        .into_iter()
+        .collect();
+        let req = build_modify_qos_request(&p).unwrap();
+        assert!(!req.clear_preempt_exempt_time, "bare key must not clear");
+    }
+
+    #[test]
+    fn clear_preempt_exempt_time_fires_on_explicit_one() {
+        let p: std::collections::HashMap<String, String> = [
+            ("name".into(), "q".into()),
+            ("clearpreemptexempttime".into(), "1".into()),
+        ]
+        .into_iter()
+        .collect();
+        let req = build_modify_qos_request(&p).unwrap();
+        assert!(req.clear_preempt_exempt_time);
+    }
+
+    #[test]
+    fn preempt_exempt_time_bad_value_errors() {
+        let p: std::collections::HashMap<String, String> = [
+            ("name".into(), "q".into()),
+            ("preemptexempttime".into(), "not-a-number".into()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            build_modify_qos_request(&p).is_err(),
+            "malformed preemptexempttime should error"
         );
     }
 }

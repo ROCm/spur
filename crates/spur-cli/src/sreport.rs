@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand};
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::{GetUsageRequest, ListAccountsRequest, ListUsersRequest};
 
+use crate::timearg::{datetime_to_proto, parse_time_arg};
+
 /// Generate usage reports from accounting data.
 #[derive(Parser, Debug)]
 #[command(name = "sreport", about = "Generate usage reports")]
@@ -428,47 +430,4 @@ async fn report_job_sizes_by_user(
     }
 
     Ok(())
-}
-
-/// Parse a time argument string into a DateTime.
-fn parse_time_arg(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::{NaiveDate, NaiveDateTime, Utc};
-    let s = s.trim();
-
-    // Relative: "now-Ndays", "now-Nhours"
-    if let Some(rest) = s.strip_prefix("now-") {
-        if let Some(days) = rest
-            .strip_suffix("days")
-            .or_else(|| rest.strip_suffix("day"))
-        {
-            let n: i64 = days.trim().parse().ok()?;
-            return Some(Utc::now() - chrono::Duration::days(n));
-        }
-        if let Some(hours) = rest
-            .strip_suffix("hours")
-            .or_else(|| rest.strip_suffix("hour"))
-        {
-            let n: i64 = hours.trim().parse().ok()?;
-            return Some(Utc::now() - chrono::Duration::hours(n));
-        }
-    }
-
-    // ISO datetime
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Some(ndt.and_utc());
-    }
-
-    // Date only
-    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return nd.and_hms_opt(0, 0, 0).map(|ndt| ndt.and_utc());
-    }
-
-    None
-}
-
-fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
-    prost_types::Timestamp {
-        seconds: dt.timestamp(),
-        nanos: dt.timestamp_subsec_nanos() as i32,
-    }
 }
