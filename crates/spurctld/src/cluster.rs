@@ -442,7 +442,7 @@ pub struct ClusterManager {
 
 struct PendingJobClassification {
     jobs: Vec<Job>,
-    blocked: Vec<(JobId, PendingReason)>,
+    reason_updates: Vec<(JobId, PendingReason)>,
     bb_stage_candidates: Vec<JobId>,
 }
 
@@ -3172,11 +3172,11 @@ impl ClusterManager {
         self.classify_pending_jobs().jobs
     }
 
-    /// Classify pending jobs once, apply displayed block reasons, advance burst-buffer
+    /// Classify pending jobs once, apply pending-reason updates, advance burst-buffer
     /// stage-in for selected candidates, and return the jobs eligible for scheduling.
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
         let classification = self.classify_pending_jobs();
-        self.apply_blocked_pending_reasons(classification.blocked);
+        self.apply_pending_reason_updates(classification.reason_updates);
         self.advance_bb_staging_for(&classification.bb_stage_candidates);
         classification.jobs
     }
@@ -3213,13 +3213,13 @@ impl ClusterManager {
                 })
             })
             .collect();
-        let mut blocked = Vec::new();
+        let mut reason_updates = Vec::new();
 
         // Structural blockers retain their precedence before begin-time eligibility;
         // unlike consumables, they do not reserve capacity while the job waits.
         {
             let partitions = self.partitions.read();
-            retain_unblocked(&mut candidates, &mut blocked, |job| {
+            retain_unblocked(&mut candidates, &mut reason_updates, |job| {
                 partition_block(job, &partitions)
             });
         }
@@ -3238,7 +3238,7 @@ impl ClusterManager {
                 .collect()
         };
 
-        retain_unblocked(&mut candidates, &mut blocked, |job| {
+        retain_unblocked(&mut candidates, &mut reason_updates, |job| {
             if job.spec.dependency.is_empty() {
                 return None;
             }
@@ -3257,7 +3257,7 @@ impl ClusterManager {
             .collect();
 
         let reservations = self.get_reservations();
-        retain_unblocked(&mut candidates, &mut blocked, |job| {
+        retain_unblocked(&mut candidates, &mut reason_updates, |job| {
             reservation_block(job, &reservations, now)
         });
 
@@ -3297,8 +3297,21 @@ impl ClusterManager {
             };
             let count = array_counts.entry(array_id).or_insert(0);
             if *count >= max {
+                record_pending_reason_update(
+                    &mut reason_updates,
+                    candidate,
+                    PendingReason::JobArrayTaskLimit,
+                );
                 candidate.scheduling_eligible = false;
             } else {
+                if candidate.job.pending_reason == PendingReason::JobArrayTaskLimit {
+                    record_pending_reason_update(
+                        &mut reason_updates,
+                        candidate,
+                        PendingReason::None,
+                    );
+                    candidate.job.set_pending_reason(PendingReason::None);
+                }
                 *count += 1;
             }
         }
@@ -3307,7 +3320,7 @@ impl ClusterManager {
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
-            retain_eligible(&mut candidates, &mut blocked, |job| {
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 let account_charge = match account_block_with(
                     job,
                     &self.association_cache,
@@ -3342,7 +3355,7 @@ impl ClusterManager {
         {
             let available = self.available_licenses_with(&jobs);
             let mut remaining = available.clone();
-            retain_eligible(&mut candidates, &mut blocked, |job| {
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 if let Some(reason) = license_block(job, &available) {
                     return GateOutcome::Block(reason);
                 }
@@ -3367,7 +3380,7 @@ impl ClusterManager {
         {
             let available = self.available_bb_with(&jobs);
             let mut remaining = available;
-            retain_eligible(&mut candidates, &mut blocked, |job| {
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 if job.bb_stage_state == BbStageState::Staging {
                     return GateOutcome::Block(PendingReason::BurstBufferStageIn);
                 }
@@ -3401,7 +3414,11 @@ impl ClusterManager {
                 return true;
             }
             if candidate.job.is_begin_held(now) {
-                record_blocked(&mut blocked, candidate, PendingReason::BeginTime);
+                record_pending_reason_update(
+                    &mut reason_updates,
+                    candidate,
+                    PendingReason::BeginTime,
+                );
             }
             false
         });
@@ -3411,7 +3428,7 @@ impl ClusterManager {
                 .into_iter()
                 .map(|candidate| candidate.job)
                 .collect(),
-            blocked,
+            reason_updates,
             bb_stage_candidates,
         }
     }
@@ -3671,23 +3688,23 @@ impl ClusterManager {
         cancelled
     }
 
-    /// Reclassify pending jobs and apply their displayed block reasons.
+    /// Reclassify pending jobs and apply their pending-reason updates.
     /// Leader-only; enforced by the scheduler-loop caller, not this function
     /// itself (mirrors `cancel_unsatisfiable_dependency_jobs()`).
     #[cfg(test)]
     fn tag_blocked_pending_reasons(&self) {
-        let blocked = self.classify_pending_jobs().blocked;
-        self.apply_blocked_pending_reasons(blocked);
+        let reason_updates = self.classify_pending_jobs().reason_updates;
+        self.apply_pending_reason_updates(reason_updates);
     }
 
-    fn apply_blocked_pending_reasons(&self, blocked: Vec<(JobId, PendingReason)>) {
-        if blocked.is_empty() {
+    fn apply_pending_reason_updates(&self, reason_updates: Vec<(JobId, PendingReason)>) {
+        if reason_updates.is_empty() {
             return;
         }
 
         let mut jobs = self.jobs.write();
         let now = Utc::now();
-        for (id, reason) in blocked {
+        for (id, reason) in reason_updates {
             if let Some(j) = jobs.get_mut(&id) {
                 // Re-check under the write lock: the read snapshot was released,
                 // so the job may have started or been held/deadlined since.
@@ -3696,6 +3713,13 @@ impl ClusterManager {
                     && j.pending_reason != PendingReason::DeadLine
                     && !j.reason_explains_begin_hold(now)
                 {
+                    // A clear derived from an older read snapshot must not erase
+                    // a different reason written before this lock was acquired.
+                    if reason == PendingReason::None
+                        && j.pending_reason != PendingReason::JobArrayTaskLimit
+                    {
+                        continue;
+                    }
                     j.set_pending_reason(reason);
                 }
             }
@@ -6439,14 +6463,14 @@ fn reservation_fence_reason(
 
 fn retain_unblocked(
     candidates: &mut Vec<PendingJobCandidate>,
-    blocked: &mut Vec<(JobId, PendingReason)>,
+    reason_updates: &mut Vec<(JobId, PendingReason)>,
     mut block: impl FnMut(&Job) -> Option<PendingReason>,
 ) {
     candidates.retain(|candidate| {
         let Some(reason) = block(&candidate.job) else {
             return true;
         };
-        record_blocked(blocked, candidate, reason);
+        record_pending_reason_update(reason_updates, candidate, reason);
         false
     });
 }
@@ -6467,11 +6491,11 @@ enum GateOutcome {
 
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
 /// `gate` reserve in-pass headroom on the keep path. A [`GateOutcome::Block`]
-/// drop is recorded via `record_blocked` (a no-op for already-tagged
+/// drop is recorded via `record_pending_reason_update` (a no-op for already-tagged
 /// candidates); [`GateOutcome::DropUntagged`] drops without a reason.
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
-    blocked: &mut Vec<(JobId, PendingReason)>,
+    reason_updates: &mut Vec<(JobId, PendingReason)>,
     mut gate: impl FnMut(&mut Job) -> GateOutcome,
 ) {
     candidates.retain_mut(|candidate| {
@@ -6481,7 +6505,7 @@ fn retain_eligible(
         match gate(&mut candidate.job) {
             GateOutcome::Keep => true,
             GateOutcome::Block(reason) => {
-                record_blocked(blocked, candidate, reason);
+                record_pending_reason_update(reason_updates, candidate, reason);
                 false
             }
             GateOutcome::DropUntagged => false,
@@ -6489,13 +6513,13 @@ fn retain_eligible(
     });
 }
 
-fn record_blocked(
-    blocked: &mut Vec<(JobId, PendingReason)>,
+fn record_pending_reason_update(
+    reason_updates: &mut Vec<(JobId, PendingReason)>,
     candidate: &PendingJobCandidate,
     reason: PendingReason,
 ) {
     if candidate.tag_reason {
-        blocked.push((candidate.job.job_id, reason));
+        reason_updates.push((candidate.job.job_id, reason));
     }
 }
 
@@ -16629,6 +16653,12 @@ mod tests {
             .collect();
         let admitted = task_ids.iter().filter(|id| pending.contains(id)).count();
         assert_eq!(admitted, 1);
+        for id in task_ids.iter().filter(|id| !pending.contains(id)) {
+            assert_eq!(
+                cm.get_job(*id).unwrap().pending_reason,
+                PendingReason::JobArrayTaskLimit
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16658,7 +16688,40 @@ mod tests {
                 !pending.contains(id),
                 "array-throttled task {id} must be excluded from scheduling"
             );
+            assert_eq!(
+                cm.get_job(*id).unwrap().pending_reason,
+                PendingReason::JobArrayTaskLimit
+            );
         }
+
+        cm.cancel_job(task_ids[0], "testuser").unwrap();
+        settle(&cm, task_ids[0], JobState::Cancelled);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+        let admitted: Vec<JobId> = task_ids[1..]
+            .iter()
+            .copied()
+            .filter(|id| pending.contains(id))
+            .collect();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            cm.get_job(admitted[0]).unwrap().pending_reason,
+            PendingReason::None
+        );
+
+        let still_throttled = task_ids[1..]
+            .iter()
+            .copied()
+            .find(|id| *id != admitted[0])
+            .unwrap();
+        assert_eq!(
+            cm.get_job(still_throttled).unwrap().pending_reason,
+            PendingReason::JobArrayTaskLimit
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16707,9 +16770,9 @@ mod tests {
             pending.contains(&solo),
             "the eligible job must still receive the remaining license slot"
         );
-        assert_ne!(
+        assert_eq!(
             cm.get_job(t2).unwrap().pending_reason,
-            PendingReason::Licenses
+            PendingReason::JobArrayTaskLimit
         );
     }
 
@@ -16754,6 +16817,10 @@ mod tests {
             "only the running task and eligible solo job may reserve capacity"
         );
         assert_eq!(cm.get_job(t2).unwrap().bb_stage_state, BbStageState::None);
+        assert_eq!(
+            cm.get_job(t2).unwrap().pending_reason,
+            PendingReason::JobArrayTaskLimit
+        );
         assert_eq!(
             cm.get_job(solo).unwrap().bb_stage_state,
             BbStageState::Staging
