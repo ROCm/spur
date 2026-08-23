@@ -776,8 +776,13 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
 }
 
 /// The mesh-native k0s controller config for `node` (api on its mesh IP + Calico bird), or None for
-/// the default kube-router mode (`cni != "calico"`) / a node without a mesh IP.
-fn controller_k0s_config(net: &ClusterNetworking, node: &spur_core::node::Node) -> Option<String> {
+/// the default kube-router mode (`cni != "calico"`) / a node without a mesh IP. `cp_count > 1` also
+/// enables node-local load balancing for konnectivity.
+fn controller_k0s_config(
+    net: &ClusterNetworking,
+    node: &spur_core::node::Node,
+    cp_count: usize,
+) -> Option<String> {
     let api = node.k0s_mesh_ip.as_deref()?;
     // SANs: the mesh IP (advertised) + the underlay address (so `kubectl` over either works).
     let mut sans = vec![api.to_string()];
@@ -793,6 +798,7 @@ fn controller_k0s_config(net: &ClusterNetworking, node: &spur_core::node::Node) 
         net.cni_mtu,
         api,
         &sans,
+        cp_count,
     )
 }
 
@@ -818,6 +824,7 @@ async fn converge_provisioning(
         return (errors, HashSet::new());
     }
     let bootstrap = cluster.k0s_state().bootstrap();
+    let cp_count = cluster.k0s_state().controllers().len();
     let mut bootstrap_active = false;
     // Active control-plane nodes this tick: Ready is gated on their quorum (partial-Ready), not on
     // every worker being up.
@@ -841,7 +848,7 @@ async fn converge_provisioning(
         }
         // Mesh-native cluster: generate the k0s config (api on the mesh IP + Calico bird) when
         // cni=calico; None keeps the default kube-router. The bootstrap seeds etcd — no join token.
-        let k0s_config = controller_k0s_config(net, node);
+        let k0s_config = controller_k0s_config(net, node, cp_count);
         spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
     }
     // Don't mint join tokens for secondary CPs / workers until the bootstrap's etcd is seeded and its
@@ -881,7 +888,7 @@ async fn converge_provisioning(
         };
         // A secondary control-plane also needs its own generated k0s config (API SANs on its mesh IP).
         let k0s_config = if role == K0sRole::Controller {
-            controller_k0s_config(net, node)
+            controller_k0s_config(net, node, cp_count)
         } else {
             None
         };

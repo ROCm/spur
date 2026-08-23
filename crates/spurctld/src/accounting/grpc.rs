@@ -73,6 +73,16 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
+/// Rejects an identified non-admin from an account/user/QOS mutation; anonymous is allowed, same as
+/// the controller's gate. Narrower than `caller_is_admin`: token `admin` claim only, no cache handle here.
+fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
+    let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
+    match request.extensions().get::<spur_core::auth::Identity>() {
+        Some(id) => id.require_admin().map_err(|_| denied()),
+        None => Ok(()),
+    }
+}
+
 pub(crate) enum AccountingService {
     Available(PgPool),
     Unavailable { reason: &'static str },
@@ -368,6 +378,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
+        require_admin(&request, "create account")?;
         let pool = self.pool()?;
         let req = request.into_inner();
         if let Some(g) = &req.grp_tres {
@@ -391,6 +402,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
+        require_admin(&request, "delete account")?;
         let pool = self.pool()?;
         let req = request.into_inner();
         db::delete_account(pool, &req.name)
@@ -425,6 +437,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
+        require_admin(&request, "add user")?;
         let pool = self.pool()?;
         let req = request.into_inner();
         // QOS references are validated against the live DB, not QosCache: a QOS
@@ -507,6 +520,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
+        require_admin(&request, "remove user")?;
         let pool = self.pool()?;
         let req = request.into_inner();
         let deleted = db::remove_user(pool, &req.user, &req.account)
@@ -565,6 +579,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
+        require_admin(&request, "create qos")?;
         let pool = self.pool()?;
         let req = request.into_inner();
         if let Some(t) = &req.max_tres_per_job {
@@ -639,6 +654,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
+        require_admin(&request, "delete qos")?;
         let pool = self.pool()?;
         let req = request.into_inner();
         db::delete_qos(pool, &req.name)
@@ -888,6 +904,70 @@ mod tests {
             status.message(),
             "accounting service is not available (database migration failed at startup)"
         );
+    }
+
+    fn identity(user: &str, is_admin: bool) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: user.into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin,
+        }
+    }
+
+    /// The account/user/QOS mutations are admin-only for an identified caller: a verified admin
+    /// passes, a verified non-admin is rejected — this closes the self-promotion path where
+    /// `add_user(admin_level = Admin)` had no authorization. An unauthenticated caller is allowed,
+    /// matching the auth model: `disabled`/`permissive`-with-no-credential trust the client, so the
+    /// gate binds real users only in `required` mode.
+    #[test]
+    fn require_admin_gates_accounting_mutations() {
+        let mut admin = Request::new(AddUserRequest::default());
+        admin.extensions_mut().insert(identity("root", true));
+        assert!(require_admin(&admin, "add user").is_ok());
+
+        let mut non_admin = Request::new(AddUserRequest::default());
+        non_admin
+            .extensions_mut()
+            .insert(identity("mallory", false));
+        let err = require_admin(&non_admin, "add user").expect_err("non-admin must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // No verified identity (disabled, or permissive with no credential) is allowed — the gate
+        // enforces once callers are identified, not in the non-enforcing modes.
+        let anon = Request::new(AddUserRequest::default());
+        assert!(require_admin(&anon, "add user").is_ok());
+    }
+
+    /// Table test over every gated accounting RPC, enumerated so a handler that drops its
+    /// `require_admin` call is caught even though it never reaches the DB in this test: with the
+    /// pool unavailable, a non-admin's rejection can only come from the gate, not a query failure.
+    #[tokio::test]
+    async fn accounting_mutations_deny_identified_non_admin() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+
+        macro_rules! assert_admin_gated {
+            ($method:ident, $req:expr) => {{
+                let mut r = Request::new($req);
+                r.extensions_mut().insert(identity("mallory", false));
+                let err = service.$method(r).await.expect_err(concat!(
+                    stringify!($method),
+                    " must reject a non-admin caller"
+                ));
+                assert_eq!(
+                    err.code(),
+                    tonic::Code::PermissionDenied,
+                    concat!(stringify!($method), " (non-admin) must be PermissionDenied")
+                );
+            }};
+        }
+
+        assert_admin_gated!(create_account, CreateAccountRequest::default());
+        assert_admin_gated!(delete_account, DeleteAccountRequest::default());
+        assert_admin_gated!(add_user, AddUserRequest::default());
+        assert_admin_gated!(remove_user, RemoveUserRequest::default());
+        assert_admin_gated!(create_qos, CreateQosRequest::default());
+        assert_admin_gated!(delete_qos, DeleteQosRequest::default());
     }
 
     #[test]

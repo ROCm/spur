@@ -760,6 +760,7 @@ async fn dispatch_step(
             step_id,
             label: args.label,
             mpi: step_mpi.to_string(),
+            user: params.user.to_string(),
         })
         .await
         .context("RunStep dispatch failed")?

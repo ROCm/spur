@@ -89,11 +89,19 @@ fn tres_cap_breach(
 /// converts into a submission denial, and what the scheduler also re-checks
 /// with real aggregates folded in. `running_*` fold in existing load; pass
 /// empty records for the standalone (submit-time) evaluation.
+///
+/// `grp_node_charge` is the node count charged against `grp_tres` specifically
+/// — distinct from `job_node` below because a caller that knows the job could
+/// pack onto nodes the QOS already occupies may pass a smaller number than
+/// `spec.num_nodes`. Per-job/per-user node caps always use the job's real
+/// requested node count, since they bound a single job's/user's own footprint
+/// rather than group-wide reuse.
 fn qos_resource_breach(
     spec: &JobSpec,
     qos: &Qos,
     user_running_tres: &TresRecord,
     qos_running_tres: &TresRecord,
+    grp_node_charge: u64,
 ) -> Option<PendingReason> {
     let limits = &qos.limits;
     let (job_cpu, job_node, job_mem, job_gpu) = job_tres(spec);
@@ -143,7 +151,7 @@ fn qos_resource_breach(
     if let Some(ref grp) = limits.grp_tres {
         if let Some(reason) = tres_cap_breach(
             qos_running_tres.get(TresType::Cpu) + job_cpu,
-            qos_running_tres.get(TresType::Node) + job_node,
+            qos_running_tres.get(TresType::Node) + grp_node_charge,
             qos_running_tres.get(TresType::Memory) + job_mem,
             qos_running_tres.get(TresType::Gpu) + job_gpu,
             grp,
@@ -178,6 +186,31 @@ pub fn check_qos_limits(
     qos_running_tres: &TresRecord,
     consumed_wall_minutes: Option<u64>,
 ) -> QosCheckResult {
+    check_qos_limits_with_grp_node_charge(
+        job,
+        qos,
+        user_running_count,
+        user_submitted_count,
+        user_running_tres,
+        qos_running_tres,
+        consumed_wall_minutes,
+        job.spec.num_nodes as u64,
+    )
+}
+
+/// Like `check_qos_limits`, but the node count charged against `grp_tres` is
+/// `grp_node_charge` rather than `job.spec.num_nodes` — see `qos_resource_breach`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_qos_limits_with_grp_node_charge(
+    job: &Job,
+    qos: &Qos,
+    user_running_count: u32,
+    user_submitted_count: u32,
+    user_running_tres: &TresRecord,
+    qos_running_tres: &TresRecord,
+    consumed_wall_minutes: Option<u64>,
+    grp_node_charge: u64,
+) -> QosCheckResult {
     let limits = &qos.limits;
 
     // Max jobs per user (running count).
@@ -205,7 +238,13 @@ pub fn check_qos_limits(
         }
     }
 
-    match qos_resource_breach(&job.spec, qos, user_running_tres, qos_running_tres) {
+    match qos_resource_breach(
+        &job.spec,
+        qos,
+        user_running_tres,
+        qos_running_tres,
+        grp_node_charge,
+    ) {
         Some(reason) => QosCheckResult::Blocked(reason),
         None => QosCheckResult::Allowed,
     }
@@ -246,7 +285,13 @@ pub fn check_qos_submit_limits(
 /// job on its own (no other load). Denied at submit only when the QOS has
 /// `DenyOnLimit`; otherwise the scheduler pends it.
 pub fn check_qos_standalone_limits(spec: &JobSpec, qos: &Qos) -> Option<PendingReason> {
-    qos_resource_breach(spec, qos, &TresRecord::new(), &TresRecord::new())
+    qos_resource_breach(
+        spec,
+        qos,
+        &TresRecord::new(),
+        &TresRecord::new(),
+        spec.num_nodes as u64,
+    )
 }
 
 #[cfg(test)]
@@ -846,6 +891,71 @@ mod tests {
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn test_grp_node_charge_overrides_only_grp_branch() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2); // raw request (2+3>4) would block
+
+        // A caller that knows the job can pack onto already-occupied nodes
+        // charges only 1 new node: 2 + 1 = 4 <= 4, so it's allowed.
+        let result = check_qos_limits_with_grp_node_charge(
+            &job,
+            &qos,
+            0,
+            0,
+            &TresRecord::new(),
+            &qos_running,
+            None,
+            1,
+        );
+        assert_eq!(result, QosCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_grp_node_charge_does_not_affect_max_tres_per_job() {
+        let mut max_tres = TresRecord::new();
+        max_tres.set(TresType::Node, 2);
+        let qos = Qos {
+            name: "capped".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(max_tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3; // breaches the per-job cap of 2 regardless of packing
+
+        // Even a grp_node_charge of 0 must not rescue the per-job cap: it only
+        // overrides the grp_tres branch, not max_tres_per_job.
+        let result = check_qos_limits_with_grp_node_charge(
+            &job,
+            &qos,
+            0,
+            0,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+            0,
+        );
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit)
         );
     }
 
