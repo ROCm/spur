@@ -38,6 +38,10 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Network CIDRs the reconcile loop needs (from `[network]` + `[cluster]` config).
 #[derive(Clone, Debug)]
 pub struct ClusterNetworking {
+    /// Whether the WireGuard mesh is enabled (network.wg_enabled). Independent of `[cluster].enabled`:
+    /// a k0s cluster can run without the mesh, in which case the reconcile skips reading peer
+    /// endpoints from `wg` (nothing to advertise, and `wg show` would just error every tick).
+    pub wg_enabled: bool,
     /// WireGuard mesh CIDR (network.wg_cidr) — node mesh IPs are allocated from here.
     pub mesh_cidr: String,
     /// WireGuard interface name (network.wg_interface) — the controller reads its peer endpoints
@@ -92,7 +96,27 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         // reconcile_mesh is idempotent + prunes) so node-local drift (reboot, wg restart), a failed
         // push, and controller failover all self-heal. Only meaningful with ≥2 meshed nodes; the
         // membership diff gates only the log line, not the push.
-        let mesh = build_mesh_membership(&cluster, &net.mesh_cidr, &net.mesh_interface);
+        // build_mesh_membership shells out to `wg` (peer_endpoints); keep that off the async
+        // runtime with spawn_blocking, matching the agent side's apply_mesh handler.
+        let mesh = {
+            let cluster = cluster.clone();
+            let (wg_enabled, mesh_cidr, mesh_interface) = (
+                net.wg_enabled,
+                net.mesh_cidr.clone(),
+                net.mesh_interface.clone(),
+            );
+            match tokio::task::spawn_blocking(move || {
+                build_mesh_membership(&cluster, wg_enabled, &mesh_cidr, &mesh_interface)
+            })
+            .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "build_mesh_membership task panicked; skipping mesh push this tick");
+                    MeshMembership::default()
+                }
+            }
+        };
         if mesh.nodes.len() >= 2 {
             if mesh.nodes != last_mesh {
                 info!(
@@ -631,30 +655,34 @@ pub fn node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStatus> {
 /// mesh (no pubkey) are skipped rather than fabricated, so an incomplete membership is never emitted.
 pub fn build_mesh_membership(
     cluster: &ClusterManager,
+    wg_enabled: bool,
     mesh_cidr: &str,
     mesh_interface: &str,
 ) -> MeshMembership {
-    // Snapshot the controller's own peer→endpoint table so worker↔worker peers get an endpoint
-    // (net join only wires worker→controller; without this the full mesh has no worker path).
-    // Log on failure instead of swallowing it: an empty table silently regresses the mesh to
-    // hub-and-spoke, so operators need the reason (wrong interface name, `wg` unavailable, etc.).
-    let endpoints = spur_net::wireguard::peer_endpoints(mesh_interface).unwrap_or_else(|e| {
-        warn!(
-            interface = %mesh_interface, error = %e,
-            "could not read WireGuard peer endpoints; mesh membership will omit them, so \
-             worker↔worker tunnels may fall back to hub-and-spoke"
-        );
+    // Peer endpoints only matter under WireGuard; when the mesh is off, skip the `wg` shell-out
+    // entirely (it would just error every reconcile tick). Otherwise snapshot the controller's
+    // peer→endpoint table so worker↔worker peers get an endpoint (net join only wires
+    // worker→controller). Log on failure — an empty table silently regresses to hub-and-spoke.
+    let endpoints = if wg_enabled {
+        spur_net::wireguard::peer_endpoints(mesh_interface).unwrap_or_else(|e| {
+            warn!(
+                interface = %mesh_interface, error = %e,
+                "could not read WireGuard peer endpoints; mesh membership will omit them, so \
+                 worker↔worker tunnels may fall back to hub-and-spoke"
+            );
+            std::collections::HashMap::new()
+        })
+    } else {
         std::collections::HashMap::new()
-    });
+    };
     mesh_from_nodes(cluster.get_nodes(), mesh_cidr, &endpoints)
 }
 
 /// Pure core of [`build_mesh_membership`] (testable without a `ClusterManager`).
 ///
-/// Includes any meshed node (non-empty `wg_pubkey`) with a known mesh IP — `k0s_mesh_ip` if it has
-/// a role, else its advertised mesh-interface address (the configured `network.wg_interface`,
-/// `spur0` by default) — so the controller/login nodes stay in membership and aren't pruned.
-/// `endpoints` supplies each peer's underlay endpoint for worker↔worker tunnels.
+/// Includes any meshed node (non-empty `wg_pubkey`) with a known mesh IP — its `k0s_mesh_ip` if it
+/// has a role, else its advertised address when that falls inside `mesh_cidr` — so controller/login
+/// nodes stay in membership. `endpoints` supplies each peer's underlay endpoint for worker↔worker.
 fn mesh_from_nodes(
     nodes: Vec<spur_core::node::Node>,
     mesh_cidr: &str,

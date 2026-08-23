@@ -270,3 +270,4 @@ MTU
 drivable
 enablement
 AllowedIPs
+Deregister

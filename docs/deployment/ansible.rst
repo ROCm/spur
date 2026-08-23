@@ -99,14 +99,14 @@ Deployment shape is determined entirely by the inventory groups and the
      - One host in ``spur_controllers``, all compute in ``spur_agents``
      - LAN IP, unencrypted
    * - Multi-node, WireGuard mesh
-     - As above, plus ``spur_transport=wireguard`` (single controller only)
+     - As above, plus ``spur_transport=wireguard``
      - encrypted mesh on ``spur0``
    * - HA — multi-controller Raft
      - Odd N ≥ 3 hosts in ``spur_controllers``; auto-enabled
-     - direct
+     - direct, or wireguard (multi-controller mesh via spur-toolkit#23)
    * - HA — separate compute
      - ``spur_controllers`` and ``spur_agents`` are disjoint sets
-     - direct
+     - direct, or wireguard (via spur-toolkit#23)
 
 Single-node
 ~~~~~~~~~~~
@@ -162,8 +162,12 @@ WireGuard mesh. See :ref:`ansible-wireguard`.
 
 .. note::
 
-   WireGuard is **single-controller only** — the mesh has no multi-controller
-   command. HA therefore requires the ``direct`` transport.
+   The Ansible WireGuard role currently supports a **single controller** — for
+   multi-controller HA today, use the ``direct`` transport. Multi-controller HA
+   *over* WireGuard is added by `spur-toolkit#23
+   <https://github.com/ROCm/spur-toolkit/pull/23>`_ (not yet merged); see
+   :doc:`wireguard` for how that mesh forms (bootstrap ``net init`` + a full-mesh
+   ``net mesh`` pass wiring controller↔controller tunnels for Raft).
 
 HA — multi-controller Raft
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -300,9 +304,18 @@ only lasts until reboot).
 
 .. note::
 
-   HA (multiple controllers) is supported over WireGuard. For the full mesh story —
-   bring-up, why peer endpoints matter for worker↔worker connectivity, node removal,
-   HA, and k0s over the mesh — see :doc:`wireguard`.
+   The full WireGuard mesh story — bring-up, why peer endpoints matter for
+   worker↔worker connectivity, node removal, HA, and k0s over the mesh — is in
+   :doc:`wireguard`.
+
+.. note::
+
+   ``spur_wg_persist`` and the ``spur_k8s_*`` variables / k0s playbooks documented
+   in this and the following section ship in `spur-toolkit#23
+   <https://github.com/ROCm/spur-toolkit/pull/23>`_, which is not yet merged. On the
+   current toolkit ``main`` these variables are unconsumed and ``k8s_up.yml`` /
+   ``k8s_add_nodes.yml`` do not exist; drive ``spur k8s up`` / ``add-nodes``
+   directly (see :doc:`wireguard`) until #23 lands.
 
 SPUR-managed k0s cluster
 ------------------------

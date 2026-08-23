@@ -17598,6 +17598,7 @@ mod tests {
             cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
         });
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -17645,6 +17646,7 @@ mod tests {
 
     fn provision_net_calico() -> crate::cluster_k8s::ClusterNetworking {
         crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -17905,6 +17907,7 @@ mod tests {
         assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
 
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -17925,6 +17928,7 @@ mod tests {
 
     fn k0s_test_net() -> crate::cluster_k8s::ClusterNetworking {
         crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -18020,6 +18024,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -18199,6 +18204,7 @@ mod tests {
         });
 
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -18252,6 +18258,7 @@ mod tests {
         wait_for("scope recorded", || cm.k0s_state().member_nodes.len() == 2);
 
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -18378,6 +18385,7 @@ mod tests {
         });
 
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),
@@ -18444,6 +18452,7 @@ mod tests {
         });
 
         let net = crate::cluster_k8s::ClusterNetworking {
+            wg_enabled: true,
             mesh_cidr: "10.44.0.0/16".into(),
             mesh_interface: "spur0".into(),
             pod_cidr: "10.42.0.0/16".into(),

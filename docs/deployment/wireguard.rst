@@ -99,23 +99,50 @@ default).
 Removing a node from the mesh
 =============================
 
+.. important::
+
+   **Deregister the node from the cluster first, then drop its mesh peer** — not
+   the other way around. ``spur net remove-peer`` is a purely local ``wg``
+   mutation; it does not touch cluster state. Under a SPUR-managed k0s cluster the
+   controller's reconcile loop rebuilds mesh membership from live node inventory
+   every ~30s, so if the node is still registered it will simply re-push the peer
+   you just removed. Run ``spur node remove <node>`` (or the equivalent) first, so
+   the reconcile no longer includes it, then remove the peer.
+
 When a node leaves, drop its peer entry so it does not linger as a "ghost" peer
 (and, on the node itself, tear the interface down so it does not rejoin on
 reboot):
 
 .. code-block:: bash
 
-   # On the controller — drop the departed node's peer (idempotent):
+   # 1. Deregister from the cluster so the reconcile stops advertising it:
+   sudo spur node remove <departed-node>
+
+   # 2. On the controller — drop the departed node's peer (idempotent):
    sudo spur net remove-peer --key <departed-node-pubkey> --interface spur0
 
-   # On the departed node — stop and de-persist the interface:
+   # 3. On the departed node — stop and de-persist the interface:
    sudo systemctl disable --now wg-quick@spur0
    sudo rm -f /etc/wireguard/spur0.conf
 
 In an HA mesh, remove the peer on **every** controller, not just the bootstrap —
-otherwise the others keep a stale peer. The Ansible ``remove_nodes.yml`` playbook
-handles both the controller-side ``remove-peer`` (on all controllers) and the
-node-side teardown.
+otherwise the others keep a stale peer.
+
+.. note::
+
+   ``spur net add-peer --program-routes`` (used only on the no-CNI bare-mesh test
+   path) installs a kernel route for the peer's pod CIDR. ``remove-peer`` does not
+   remove that route, so on a bare-mesh setup drop it by hand
+   (``ip route del <pod-cidr> dev spur0``). With a CNI (the normal case) the CNI
+   owns the routes and this does not apply.
+
+.. note::
+
+   The Ansible ``remove_nodes.yml`` playbook automates all of the above — the
+   controller-side ``remove-peer`` (on all controllers) and the node-side teardown
+   — but that WireGuard cleanup ships in `spur-toolkit#23
+   <https://github.com/ROCm/spur-toolkit/pull/23>`_, which is not yet merged. Until
+   it lands, perform these steps manually.
 
 High availability over the mesh
 ===============================
@@ -142,8 +169,10 @@ position):
 
 Raft elects a leader automatically; clients and agents may target any controller
 and are redirected to the current leader. See :doc:`native-host` for the full
-per-node controller/agent setup and :doc:`ansible` for the inventory-driven
-equivalent.
+per-node controller/agent setup. An inventory-driven, multi-controller
+WireGuard-mesh flow is added by `spur-toolkit#23
+<https://github.com/ROCm/spur-toolkit/pull/23>`_ (not yet merged — until it lands
+the Ansible role supports a single controller under WireGuard only).
 
 k0s cluster inside the mesh
 ===========================
@@ -159,5 +188,13 @@ Once the mesh is up, a SPUR-managed k0s cluster can run pod traffic over it. Set
 
 The controller reconcile converges the full mesh (endpoints included) as part of
 ``spur k8s up``, so a k0s-over-mesh cluster does not need the manual ``net mesh``
-pass. See :doc:`ansible` for the ``k8s_up.yml`` / ``k8s_add_nodes.yml`` flow and
-:doc:`managed-kubernetes` for running Spur inside an existing Kubernetes cluster.
+pass. See :doc:`managed-kubernetes` for running Spur inside an existing Kubernetes
+cluster.
+
+.. note::
+
+   The Ansible ``spur_k8s_*`` variables and the ``k8s_up.yml`` /
+   ``k8s_add_nodes.yml`` playbooks referenced for this flow ship in `spur-toolkit#23
+   <https://github.com/ROCm/spur-toolkit/pull/23>`_, which is not yet merged. Until
+   it lands, drive ``spur k8s up`` / ``add-nodes`` directly (as shown above) rather
+   than via those playbooks.
