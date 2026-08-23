@@ -241,9 +241,10 @@ class TestContainerSingleNode:
             'echo "CONTAINER_PATH=$PATH"\n'
             'echo "MARKER=$IMAGE_MARKER"\n',
         )
+        # The import ran on node 0, so the .sqsh exists only there.
         sb = cluster.sbatch([
-            "-J", "c10-image-env", "-N", "1", "-o", out_path,
-            f"--container-image={img}", script,
+            "-J", "c10-image-env", "-N", "1", "-w", cluster.node_names[0],
+            "-o", out_path, f"--container-image={img}", script,
         ])
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -312,9 +313,10 @@ class TestContainerSingleNode:
             'echo "CONTAINER_PATH=$PATH"\n'
             'echo "PY=$PYTHON_VERSION"\n',
         )
+        # The import ran on node 0, so the .sqsh exists only there.
         sb = cluster.sbatch([
-            "-J", "c12-pulled", "-N", "1", "-o", out_path,
-            f"--container-image={img}", script,
+            "-J", "c12-pulled", "-N", "1", "-w", cluster.node_names[0],
+            "-o", out_path, f"--container-image={img}", script,
         ])
         job_id = parse_job_id(sb)
         assert job_id is not None

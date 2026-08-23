@@ -1029,6 +1029,9 @@ tar -C "$R" -czf '{local_tar}' .
         Run the real `spur image import` on node 0. Each import gets its own
         image directory, so the .sqsh it produced is the only one there and
         this does not have to reproduce spur's image naming rules.
+
+        Unlike build_container_image, the result lands on node 0 alone, so a
+        job using it has to be pinned there with `-w`.
         """
         node = self.nodes[0]
         if "ok" not in node.exec_allow_fail("command -v mksquashfs >/dev/null && echo ok"):
