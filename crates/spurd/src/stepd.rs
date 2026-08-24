@@ -20,6 +20,10 @@ pub struct StepdLaunchSpec {
     pub job_id: u32,
     #[serde(default = "spur_core::step::default_step_id")]
     pub step_id: spur_core::step::StepId,
+    /// The supervisor is a separate process and cannot read the agent's config,
+    /// so [cgroup] enforcement settings travel with the launch spec.
+    #[serde(default)]
+    pub cgroup: spur_core::config::CgroupConfig,
     pub script: String,
     pub work_dir: String,
     pub name: String,
@@ -129,6 +133,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: config.run_attempt,
+            cgroup: config.cgroup.clone(),
             capability: String::new(),
             allocation_only: false,
             pmix_multi_task: config.pmix_multi_task,
@@ -141,6 +146,7 @@ impl StepdLaunchSpec {
         crate::executor::JobLaunchConfig {
             job_id: self.job_id,
             run_attempt: self.run_attempt,
+            cgroup: self.cgroup,
             script: self.script,
             work_dir: self.work_dir,
             name: self.name,
