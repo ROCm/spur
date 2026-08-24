@@ -18,6 +18,11 @@ from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_d
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+# Requesting any of these fixtures (directly or transitively) makes a test a GPU
+# test; conftest auto-marks it `gpu` so CI can route it without a manual tag.
+_GPU_FIXTURES = frozenset({"gpu_cluster", "gpu_container_cluster"})
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
@@ -27,6 +32,18 @@ def pytest_configure(config):
         "markers",
         "k0s: native spur-managed k0s cluster tests (rootful spurd + systemd + etcd; slow)",
     )
+    config.addinivalue_line(
+        "markers",
+        "gpu: requires GPU hardware on the nodes (auto-applied to tests using GPU fixtures)",
+    )
+
+
+# tryfirst so the marker lands before pytest's built-in `-m` deselection runs.
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if _GPU_FIXTURES.intersection(getattr(item, "fixturenames", ())):
+            item.add_marker("gpu")
 
 
 def _get_nodes_config() -> list[str]:
