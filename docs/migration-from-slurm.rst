@@ -74,7 +74,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - ``scontrol show``
      - Output is always the multi-line ``Key=Value`` block; there is no ``--oneliner``.
    * - QOS ``GrpWall``
-     - Enforced at scheduling admission only: an over-budget QOS stops admitting jobs, and running jobs are never killed where Slurm cancels them. Consumption is a trailing window (``accounting.grp_wall_window_days``) rather than decayed usage, and the cap exists on a QOS only, not on an association. See :ref:`grpwall-budgets`.
+     - Enforced at scheduling admission only: an over-budget QOS stops admitting jobs, and running jobs are never killed where Slurm cancels them. Consumption is a trailing window (``grp_wall_window_days`` under ``[accounting]``) rather than decayed usage, and the cap exists on a QOS only, not on an association. See :ref:`grpwall-budgets`.
 
 Accounting and QOS Mapping
 --------------------------

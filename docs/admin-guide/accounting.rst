@@ -528,9 +528,10 @@ consumption has fallen back below the cap *and* the next refresh has read it, no
 at the moment the older usage ages out of the window.
 
 Unlike the per-job QOS limits, ``grpwall`` is enforced only while scheduling,
-never at the submit gate: a breach never rejects a submission — not even under
-``DenyOnLimit`` (see :ref:`deny-on-limit`) — so the job is always accepted and
-simply pends as above.
+never at the submit gate: an exhausted budget never rejects a submission — not
+even under ``DenyOnLimit`` (see :ref:`deny-on-limit`) — so a job held back by it
+is still accepted, and pends as above. The limits that do gate at submit still
+reject there; only ``grpwall`` is exempt.
 
 Consumption is summed from job history over a trailing window, set by
 ``grp_wall_window_days`` under ``[accounting]`` (default ``14``). Running jobs
