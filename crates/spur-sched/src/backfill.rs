@@ -117,14 +117,14 @@ impl BackfillScheduler {
 
     /// Resolve concrete per-node CPU and GPU allocations for non-uniform demand.
     /// CPU counts are positional (aligned to task launch order); a GPU total is
-    /// packed greedily onto the most-available nodes. `None` if it cannot fit now.
+    /// packed greedily onto the most-available nodes. `None` if it cannot fit at `at_time`.
     fn plan_per_node_alloc(
         &self,
         job: &Job,
         demand: &GpuDemand,
         assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
         nodes: &[Node],
-        now: chrono::DateTime<Utc>,
+        at_time: chrono::DateTime<Utc>,
     ) -> Option<HashMap<String, ResourceAllocations>> {
         let base = base_node_request(job);
         let cpu_counts = cpu_per_node_counts(job);
@@ -147,7 +147,7 @@ impl BackfillScheduler {
                 // Capacity-sorted greedy: pack GPUs onto most-available nodes.
                 let mut caps: Vec<(usize, u32)> = assigned_nodes
                     .iter()
-                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, now)))
+                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, at_time)))
                     .collect();
                 caps.sort_by_key(|(_, cap)| std::cmp::Reverse(*cap));
                 let cap_values: Vec<u32> = caps.iter().map(|(_, c)| *c).collect();
@@ -162,7 +162,7 @@ impl BackfillScheduler {
         let mut per_node_alloc = HashMap::new();
         for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
             let node = &nodes[*ni];
-            let current = self.timelines[*ni].accumulated_at(now);
+            let current = self.timelines[*ni].accumulated_at(at_time);
 
             let mut req = base.clone();
             let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
@@ -418,16 +418,17 @@ impl Scheduler for BackfillScheduler {
             let mut per_node_alloc = HashMap::new();
             if heterogeneous {
                 // Non-uniform per-node CPU or GPU counts: resolve concrete
-                // per-node allocations against current free capacity. We only
-                // place these when the job can start now (no heterogeneous
-                // future shadow reservation yet); otherwise leave it pending for
-                // a later cycle.
-                if earliest > now {
-                    continue;
-                }
-                match self.plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, now) {
+                // per-node allocations against free capacity at the job's
+                // actual (possibly future) start time, same as the uniform path.
+                match self.plan_per_node_alloc(
+                    job,
+                    &demand,
+                    &assigned_nodes,
+                    cluster.nodes,
+                    earliest,
+                ) {
                     Some(allocs) => per_node_alloc = allocs,
-                    None => continue, // not enough free capacity right now
+                    None => continue, // not enough free capacity at that time
                 }
             } else {
                 for (ni, _) in &assigned_nodes {
@@ -1326,6 +1327,105 @@ mod tests {
         big.spec.exclusive = true;
         let mut small = make_job(2, 1, 1);
         small.spec.time_limit = Some(Duration::seconds(5));
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, 2);
+        assert_eq!(assignments[0].nodes, vec!["node001".to_string()]);
+    }
+
+    // Heterogeneous (uneven per-node CPU split) jobs get the same future
+    // reservation protection as exclusive/uniform jobs, not just the ones
+    // that can start immediately. node001 is sized to exactly match big's
+    // real per-node share (4 cpus) so this is sensitive to reservation size,
+    // not just reservation existence: an under-counted reservation would
+    // leave spare capacity a non-exclusive small job could wrongly claim.
+    #[test]
+    fn heterogeneous_job_reservation_blocks_an_overlapping_smaller_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 4;
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let big = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        // Non-exclusive: only conflicts if the reservation correctly claims
+        // all 4 of node001's cpus, not merely if *some* reservation exists.
+        let small = make_job(2, 1, 1);
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert!(
+            assignments.is_empty(),
+            "the uneven-split job's 4-cpu reservation on node001 must hold, {assignments:?}"
+        );
+    }
+
+    // Complement: a heterogeneous job's own future reservation must not block
+    // a smaller job that genuinely finishes first, even on the same
+    // exactly-sized node.
+    #[test]
+    fn heterogeneous_job_reservation_does_not_block_a_non_overlapping_smaller_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 4;
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let big = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let mut small = make_job(2, 1, 1);
+        small.spec.time_limit = Some(Duration::seconds(5)); // finishes before node002's 20s window.
 
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
