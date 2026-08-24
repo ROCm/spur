@@ -1388,6 +1388,10 @@ impl AgentService {
         self.stepds.clone()
     }
 
+    async fn is_stepd_backed(&self, job_id: u32) -> bool {
+        self.stepds.lock().await.contains_key(&job_id)
+    }
+
     pub(crate) fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
         StepdRecoveryCleanup {
             running: self.running.clone(),
@@ -2986,7 +2990,7 @@ impl SlurmAgent for AgentService {
 
         // Logical steps inside a Stepd land in a follow-up PR; a
         // runtime-backed job has no directly-tracked pid for the nsenter path below.
-        if self.stepds.lock().await.contains_key(&req.job_id) {
+        if self.is_stepd_backed(req.job_id).await {
             return Err(Status::unimplemented(
                 "exec is not yet supported for a stepd-backed job",
             ));
@@ -3746,7 +3750,7 @@ impl SlurmAgent for AgentService {
 
         // Interactive PTY sessions inside a Stepd land in a follow-up
         // PR; a runtime-backed job has no directly-tracked pid to attach to below.
-        if self.stepds.lock().await.contains_key(&init.job_id) {
+        if self.is_stepd_backed(init.job_id).await {
             return Err(Status::unimplemented(
                 "interactive attach is not yet supported for a stepd-backed job",
             ));
@@ -5576,9 +5580,18 @@ mod tests {
             .expect("write notification");
         writer.write_all(b"\n").await.expect("write newline");
 
-        // Give the push a moment to claim the session and enter its (slow,
-        // unreachable-controller) report before the watchdog races it.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for the push to actually claim the session (removing it from
+        // `sessions`) before the watchdog races it, instead of guessing a delay.
+        for _ in 0..1000 {
+            if !sessions.lock().await.contains_key(&42) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !sessions.lock().await.contains_key(&42),
+            "push must claim the session before the watchdog races it"
+        );
         let running = new_running_jobs();
         let allocation = Arc::new(Mutex::new(NodeAllocation::new(
             "test-node".into(),
