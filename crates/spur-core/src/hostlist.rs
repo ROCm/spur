@@ -12,8 +12,8 @@ pub enum HostlistError {
     InvalidPattern(String),
     #[error("invalid range: {0}")]
     InvalidRange(String),
-    #[error("hostlist too large: {count} hosts exceeds maximum {max}")]
-    TooLarge { count: u64, max: usize },
+    #[error("hostlist too large: exceeds maximum {max} hosts")]
+    TooLarge { max: usize },
 }
 
 /// Expand a Slurm hostlist pattern into individual hostnames.
@@ -349,25 +349,22 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
                 let range_count = (end - start).saturating_add(1);
                 if (results.len() as u64).saturating_add(range_count) > MAX_HOSTLIST_SIZE as u64 {
                     return Err(HostlistError::TooLarge {
-                        count: (results.len() as u64).saturating_add(range_count),
                         max: MAX_HOSTLIST_SIZE,
                     });
                 }
 
                 for i in start..=end {
+                    // Backstop nested products that multiply past the cap.
+                    if results.len() >= MAX_HOSTLIST_SIZE {
+                        return Err(HostlistError::TooLarge {
+                            max: MAX_HOSTLIST_SIZE,
+                        });
+                    }
                     let name = format!("{}{:0>width$}{}", prefix, i, suffix, width = width);
                     if suffix.contains('[') {
                         expand_single(&name, results)?;
                     } else {
                         results.push(name);
-                    }
-                    // Incremental backstop: nested products like rack[0-9999]-node[0-9999]
-                    // can exceed the cap even when each single range is under it.
-                    if results.len() > MAX_HOSTLIST_SIZE {
-                        return Err(HostlistError::TooLarge {
-                            count: results.len() as u64,
-                            max: MAX_HOSTLIST_SIZE,
-                        });
                     }
                 }
             } else {

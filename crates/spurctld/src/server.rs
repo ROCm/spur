@@ -3500,6 +3500,15 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
 
+    // Reject an unexpandable --nodelist/--exclude here, else it matches no node and hangs the job.
+    for (flag, pattern) in [("nodelist", &spec.nodelist), ("exclude", &spec.exclude)] {
+        if !pattern.is_empty() {
+            spur_core::hostlist::expand(pattern).map_err(|e| {
+                Status::invalid_argument(format!("invalid --{flag} '{pattern}': {e}"))
+            })?;
+        }
+    }
+
     let job_spec = spur_core::job::JobSpec {
         name: spec.name,
         partition: if spec.partition.is_empty() {
@@ -7013,6 +7022,38 @@ mod tests {
         let core = proto_to_job_spec(spec).unwrap();
         assert_eq!(core.num_tasks, 1);
         assert_eq!(core.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn proto_to_job_spec_rejects_unexpandable_node_patterns() {
+        let over_cap = spur_proto::proto::JobSpec {
+            nodelist: "node[0-2000000]".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_to_job_spec(over_cap).unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "an over-cap nodelist is rejected at submission"
+        );
+
+        let malformed = spur_proto::proto::JobSpec {
+            exclude: "node]1-2[".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_to_job_spec(malformed).unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "a malformed exclude pattern is rejected too"
+        );
+
+        let valid = spur_proto::proto::JobSpec {
+            nodelist: "node[1-4],other5".into(),
+            ..Default::default()
+        };
+        assert!(
+            proto_to_job_spec(valid).is_ok(),
+            "a valid pattern still passes"
+        );
     }
 
     #[test]
