@@ -30,7 +30,8 @@ fn normalize_admin_level(raw: &str) -> Result<&str, Status> {
     }
     super::canonical_admin_level(raw).ok_or_else(|| {
         Status::invalid_argument(format!(
-            "invalid adminlevel '{raw}': expected None, Operator, or Admin"
+            "invalid adminlevel '{raw}': expected None, Operator, or Admin \
+             (also spelled Administrator or SuperUser)"
         ))
     })
 }

@@ -519,8 +519,8 @@ impl ControllerService {
         user: &str,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Result<(), Status> {
-        // Returning before the lookup keeps a credential working on a controller that shares no
-        // user directory with the login nodes, and keeps NSS off an unauthenticated caller's path.
+        // Skipping the lookup for a verified admin keeps a credential working on a controller that
+        // shares no user directory with the login nodes and cannot resolve the name at all.
         if self.caller_is_admin(identity) {
             return Ok(());
         }
@@ -7246,17 +7246,27 @@ mod tests {
     }
 
     /// Reservations also reject an anonymous caller, unlike the generic gate: the asserted name is
-    /// still checkable, and a client skipping the CLI is the gap being closed. Host-independent —
-    /// `mallory` and the empty user are unprivileged or unresolvable, and both deny.
+    /// still checkable, and a client skipping the CLI is the gap being closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reservation_mutations_deny_non_operators() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
 
+        // A name no host resolves, so the outcome cannot turn on the runner's user database.
+        const UNKNOWN: &str = "no_such_user_in_nss_7f3a";
+
         macro_rules! assert_operator_gated {
             ($method:ident, $req:expr) => {{
-                for identity in [Some(viewer("mallory", false)), None] {
-                    let mut r = Request::new($req);
+                // Verified non-admin, anonymous asserting a name, and anonymous asserting nothing —
+                // the last being what the retired ownership rule took for a trusted internal call.
+                for (identity, user) in [
+                    (Some(viewer(UNKNOWN, false)), UNKNOWN),
+                    (None, UNKNOWN),
+                    (None, ""),
+                ] {
+                    let mut msg = $req;
+                    msg.user = user.to_string();
+                    let mut r = Request::new(msg);
                     if let Some(id) = identity {
                         r.extensions_mut().insert(id);
                     }
@@ -7267,7 +7277,8 @@ mod tests {
                     assert_eq!(
                         err.code(),
                         Code::PermissionDenied,
-                        concat!(stringify!($method), " must be PermissionDenied")
+                        "{} must be PermissionDenied for user {user:?}",
+                        stringify!($method)
                     );
                 }
             }};

@@ -490,7 +490,7 @@ class TestReservations:
         """Managing a reservation takes operator privilege, not ownership: an
         operator may update or delete a reservation somebody else created, while
         an unprivileged user is refused even for one it could see. Exercises the
-        full CLI -> gRPC -> controller path (SPUR-69)."""
+        full CLI -> gRPC -> controller path."""
         submit_user = cluster.nodes[0].user
         if submit_user == "root":
             pytest.skip("need a non-root SSH user to test a non-owner operator")
@@ -578,3 +578,78 @@ class TestReservations:
         finally:
             # A leaked reservation fences a node for an hour; best-effort cleanup.
             cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+
+class TestReservationServerGate:
+    """The controller's operator rule, proven independently of the CLI's own check.
+
+    Every other path here is refused client-side before a request is sent, so none
+    of them show the controller enforcing anything. A credential splits the two:
+    the CLI runs as root and passes locally, while the gate judges the token's
+    identity."""
+
+    AUTH_CONFIG = {"auth": {"plugin": "jwt", "jwt_key": "e2e-reservation-key"}}
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return self.AUTH_CONFIG
+
+    def _token_for(self, cluster, user: str) -> str:
+        out = cluster.cli(
+            [
+                "spur",
+                "token",
+                "user",
+                f"--user={user}",
+                f"--config={cluster.etc_dir}/spur.conf",
+            ]
+        )
+        token = out.strip().split("\n")[0]
+        assert token.count(".") == 2, f"unexpected token format: {out}"
+        return token
+
+    def _create_as(self, cluster, token: str, name: str) -> str:
+        return cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={cluster.node_names[0]}",
+                "--flags=ignore_jobs",
+            ],
+            extra_env={"SPUR_AUTH_TOKEN": token},
+        )
+
+    def test_credential_the_controller_cannot_resolve_is_denied(self, cluster):
+        """A verified non-admin whose name resolves nowhere is refused, even though
+        the CLI ran as root. Fails closed: an unresolvable caller is not an allow."""
+        name = f"res-gate-{int(time.time())}"
+        try:
+            out = self._create_as(
+                cluster, self._token_for(cluster, "no_such_user_in_nss_7f3a"), name
+            ).lower()
+
+            # The CLI's own refusal would prove nothing, so require the server's wording.
+            assert "insufficient privileges" not in out, (
+                f"the client pre-check fired, so the controller was never asked: {out}"
+            )
+            assert "cannot verify" in out and "may manage reservations" in out, (
+                f"expected the controller's unresolvable-caller denial: {out}"
+            )
+            assert name not in cluster.scontrol("show", "reservation")
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", name])
+
+    def test_operator_credential_is_allowed(self, cluster):
+        """The counterpart, so the denial above cannot be explained by credentials
+        being broken: the same path with a token for root creates the reservation."""
+        name = f"res-gate-ok-{int(time.time())}"
+        try:
+            out = self._create_as(cluster, self._token_for(cluster, "root"), name)
+            assert "created" in out.lower(), f"an operator credential must be accepted: {out}"
+            assert name in cluster.scontrol("show", "reservation")
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", name])

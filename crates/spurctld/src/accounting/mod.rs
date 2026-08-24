@@ -74,14 +74,16 @@ pub fn admin_level_is_admin(raw: &str) -> bool {
 }
 
 /// Fold one user-row's admin_level into the per-user map, keeping the highest: admin wins over
-/// any lower level so a later non-admin row for a multi-account user can't clobber it.
+/// any lower level so a later non-admin row for a multi-account user can't clobber it. Stored
+/// canonical, so rows predating the column's normalization cannot leave several spellings of one
+/// level in the cache; a value that is no level at all is kept verbatim, to stay visible.
 fn merge_admin_level(map: &mut HashMap<String, String>, user: &str, level: &str) {
     if level.is_empty() || level.eq_ignore_ascii_case("none") {
         return;
     }
     let entry = map.entry(user.to_owned()).or_default();
     if entry.is_empty() || admin_level_is_admin(level) {
-        *entry = level.to_owned();
+        *entry = canonical_admin_level(level).unwrap_or(level).to_owned();
     }
 }
 
@@ -182,13 +184,32 @@ mod tests {
         let mut m = HashMap::new();
         merge_admin_level(&mut m, "carol", "Admin");
         merge_admin_level(&mut m, "carol", "Operator");
-        assert_eq!(m.get("carol").map(String::as_str), Some("Admin"));
+        assert_eq!(m.get("carol").map(String::as_str), Some("Administrator"));
 
         // Operator then Admin: Admin must still win.
         let mut m = HashMap::new();
         merge_admin_level(&mut m, "carol", "Operator");
         merge_admin_level(&mut m, "carol", "Admin");
-        assert_eq!(m.get("carol").map(String::as_str), Some("Admin"));
+        assert_eq!(m.get("carol").map(String::as_str), Some("Administrator"));
+    }
+
+    /// Rows written before the column was normalized must not leave several spellings of one level
+    /// in the cache.
+    #[test]
+    fn legacy_spellings_fold_to_one_canonical_level() {
+        for raw in ["admin", "Admin", "Administrator", "SuperUser"] {
+            let mut m = HashMap::new();
+            merge_admin_level(&mut m, "carol", raw);
+            assert_eq!(
+                m.get("carol").map(String::as_str),
+                Some("Administrator"),
+                "raw {raw:?}"
+            );
+        }
+
+        let mut m = HashMap::new();
+        merge_admin_level(&mut m, "dave", "operator");
+        assert_eq!(m.get("dave").map(String::as_str), Some("Operator"));
     }
 
     #[test]

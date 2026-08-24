@@ -367,7 +367,11 @@ class SpurCluster:
         return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
 
     def cli_as_user(
-        self, run_as: str, args: list[str], controller_addr: str | None = None
+        self,
+        run_as: str,
+        args: list[str],
+        controller_addr: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """Run a spur CLI command as a specific UNIX user via sudo, returning
         stdout+stderr regardless of exit code.
@@ -375,12 +379,17 @@ class SpurCluster:
         Commands that carry an identity (reservation create/update/delete,
         job cancel, ...) derive it from the invoking account (``whoami``), so
         this is how a test exercises owner-vs-non-owner behavior end to end.
+
+        *extra_env* adds variables to the environment. Pass ``SPUR_AUTH_TOKEN`` to
+        separate the identity the controller verifies from the invoking account.
         """
         inner = [
             f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
             f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
         ]
+        for key, value in (extra_env or {}).items():
+            inner.append(f"{key}='{value}'")
+        inner.append(f"'{self.bin_dir}/{args[0]}'")
         inner.extend(f"'{a}'" for a in args[1:])
         cmd = f"{self._sudo_prefix()}-u '{run_as}' env {' '.join(inner)}"
         return self.nodes[0].exec_allow_fail(cmd)
