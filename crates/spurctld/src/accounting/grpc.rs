@@ -22,6 +22,20 @@ fn validate_tres(field: &str, raw: &str) -> Result<(), Status> {
         .map_err(|e| Status::invalid_argument(format!("invalid {field}: {e}")))
 }
 
+/// Canonicalize an `adminlevel` for storage, rejecting anything that is not a level. The column is
+/// free text, so an unrecognised value would otherwise store and display as if it were a privilege.
+fn normalize_admin_level(raw: &str) -> Result<&str, Status> {
+    if raw.is_empty() {
+        return Ok(raw);
+    }
+    super::canonical_admin_level(raw).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "invalid adminlevel '{raw}': expected None, Operator, or Admin \
+             (also spelled Administrator or SuperUser)"
+        ))
+    })
+}
+
 /// Map an optional TRES/text proto field to a nullable-column patch: unset ->
 /// keep, empty -> clear (SQL NULL), otherwise -> set.
 fn nullable_str(field: &Option<String>) -> Option<Option<&str>> {
@@ -440,6 +454,11 @@ impl SlurmAccounting for AccountingService {
         require_admin(&request, "add user")?;
         let pool = self.pool()?;
         let req = request.into_inner();
+        let admin_level = req
+            .admin_level
+            .as_deref()
+            .map(normalize_admin_level)
+            .transpose()?;
         // QOS references are validated against the live DB, not QosCache: a QOS
         // created just now may not have reached the cache's next refresh yet,
         // the same lag job submission already accepts for QosCache reads. Each
@@ -493,7 +512,7 @@ impl SlurmAccounting for AccountingService {
             validate_tres("grptres", t)?;
         }
         let update = db::UserUpdate {
-            admin_level: req.admin_level.as_deref(),
+            admin_level,
             is_default: req.is_default,
             default_qos: nullable_str(&req.default_qos),
             allowed_qos: allowed_qos_normalized.as_deref().map(|s| {
@@ -968,6 +987,42 @@ mod tests {
         assert_admin_gated!(remove_user, RemoveUserRequest::default());
         assert_admin_gated!(create_qos, CreateQosRequest::default());
         assert_admin_gated!(delete_qos, DeleteQosRequest::default());
+    }
+
+    /// Every spelling Slurm accepts must survive, and the admin ones must converge: `sacctmgr show
+    /// user` prints `Administrator`, so rejecting it would break round-tripping Slurm's own output.
+    #[test]
+    fn normalize_admin_level_canonicalizes_slurm_spellings() {
+        for (input, want) in [
+            ("", ""),
+            ("none", "None"),
+            ("None", "None"),
+            ("operator", "Operator"),
+            ("Operator", "Operator"),
+            ("admin", "Administrator"),
+            ("Admin", "Administrator"),
+            ("Administrator", "Administrator"),
+            ("SuperUser", "Administrator"),
+        ] {
+            assert_eq!(
+                normalize_admin_level(input).unwrap(),
+                want,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_admin_level_rejects_non_levels() {
+        for level in ["adminn", "root", "yes"] {
+            let err = normalize_admin_level(level).expect_err("level must be rejected");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains("Admin"),
+                "denial must name the accepted levels: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]

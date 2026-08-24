@@ -489,7 +489,8 @@ impl ControllerService {
     }
 
     /// Rejects an identified non-admin from a cluster-tenancy mutation (partitions, node placement,
-    /// tokens, reservations); anonymous is allowed, matching `caller_is_privileged`. Call as a prologue, before `into_inner`.
+    /// tokens); anonymous is allowed, matching `caller_is_privileged`. Call as a prologue, before
+    /// `into_inner`. Reservations use the stricter [`Self::require_reservation_manager`].
     #[allow(clippy::result_large_err)]
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
         if self.caller_is_privileged(Self::verified_identity(request)) {
@@ -507,6 +508,30 @@ impl ControllerService {
     /// deployments. `required` never reaches here without an identity, so real users are still bound.
     fn caller_is_privileged(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
         identity.is_none() || self.caller_is_admin(identity)
+    }
+
+    /// Stricter form of [`Self::require_admin`] for reservations: the admin bar, or the
+    /// root-or-`sudo`/`wheel` rule the CLI states, resolved from the caller's name on this host.
+    /// `require_admin` alone would be inert under the default `permissive` mode, since it waves an
+    /// unidentified caller through, and would deny a `sudo`/`wheel` operator under `required`.
+    async fn require_reservation_manager(
+        &self,
+        user: &str,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<(), Status> {
+        // Skipping the lookup for a verified admin keeps a credential working on a controller that
+        // shares no user directory with the login nodes and cannot resolve the name at all.
+        if self.caller_is_admin(identity) {
+            return Ok(());
+        }
+        // NSS can reach sssd/LDAP over the network, so it must not run on a runtime worker.
+        let owned = user.to_string();
+        let privileged = tokio::task::spawn_blocking(move || {
+            spur_core::privilege::named_user_is_privileged(&owned)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("privilege lookup failed: {e}")))?;
+        reservation_manager_ruling(user, privileged)
     }
 
     /// Clamp a non-privileged caller's base priority to `[scheduler] max_user_priority`, mirroring
@@ -658,6 +683,26 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     // reports no admins at all, and removing it would strand `spur k8s up` on every cluster that
     // does not run accounting.
     caller == "root" || cache.is_admin(caller)
+}
+
+/// Ruling for a non-admin caller, split from the lookup so the policy is testable without the
+/// host's user database. An error denies: a name the controller cannot resolve is a name it cannot
+/// vouch for.
+fn reservation_manager_ruling(
+    user: &str,
+    privileged: Result<bool, spur_core::auth::AuthError>,
+) -> Result<(), Status> {
+    match privileged {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Status::permission_denied(format!(
+            "user '{user}' may not manage reservations: {}",
+            spur_core::privilege::PRIVILEGE_REQUIREMENT
+        ))),
+        Err(e) => Err(Status::permission_denied(format!(
+            "cannot verify that '{user}' may manage reservations ({e}); reservation management {}",
+            spur_core::privilege::PRIVILEGE_REQUIREMENT
+        ))),
+    }
 }
 
 /// Whether `node` may release what it holds for `job_id`: the run is over, the
@@ -2327,11 +2372,11 @@ impl SlurmController for ControllerService {
             }
         }
 
-        self.require_admin(&request, "create reservation")?;
-
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+        self.require_reservation_manager(&req.user, identity.as_ref())
+            .await?;
 
         let details = txn::create_details(
             &req.start_time,
@@ -2374,11 +2419,11 @@ impl SlurmController for ControllerService {
             }
         }
 
-        self.require_admin(&request, "update reservation")?;
-
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+        self.require_reservation_manager(&req.user, identity.as_ref())
+            .await?;
 
         let details = txn::update_details(
             req.duration_minutes,
@@ -2403,7 +2448,6 @@ impl SlurmController for ControllerService {
                 &req.remove_users,
                 &req.add_accounts,
                 &req.remove_accounts,
-                &req.user,
             )
             .map_err(reservation_rpc_status);
         self.audit_reservation(
@@ -2435,18 +2479,18 @@ impl SlurmController for ControllerService {
             }
         }
 
-        self.require_admin(&request, "delete reservation")?;
-
         let identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+        self.require_reservation_manager(&req.user, identity.as_ref())
+            .await?;
 
         let entity_name = req.name.clone();
         let actor = req.user.clone();
 
         let result = self
             .cluster
-            .delete_reservation(&req.name, &req.user)
+            .delete_reservation(&req.name)
             .map_err(reservation_rpc_status);
         self.audit_reservation(
             TxnAction::Delete,
@@ -4099,7 +4143,6 @@ fn reservation_rpc_status(err: ReservationError) -> Status {
         ReservationError::InvalidArgument(m) => Status::invalid_argument(m),
         ReservationError::NotFound(m) => Status::not_found(m),
         ReservationError::AlreadyExists(m) => Status::already_exists(m),
-        ReservationError::PermissionDenied(m) => Status::permission_denied(m),
         ReservationError::Raft(m) => Status::internal(m),
     }
 }
@@ -7198,27 +7241,127 @@ mod tests {
                 token_id: "t".into(),
             }
         );
-        assert_admin_gated!(
+        // Reservations use the stricter `require_reservation_manager` instead — see
+        // `reservation_mutations_deny_non_operators`.
+    }
+
+    /// Reservations also reject an anonymous caller, unlike the generic gate: the asserted name is
+    /// still checkable, and a client skipping the CLI is the gap being closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_mutations_deny_non_operators() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        // A name no host resolves, so the outcome cannot turn on the runner's user database.
+        const UNKNOWN: &str = "no_such_user_in_nss_7f3a";
+
+        macro_rules! assert_operator_gated {
+            ($method:ident, $req:expr) => {{
+                // Verified non-admin, anonymous asserting a name, and anonymous asserting nothing —
+                // the last being what the retired ownership rule took for a trusted internal call.
+                for (identity, user) in [
+                    (Some(viewer(UNKNOWN, false)), UNKNOWN),
+                    (None, UNKNOWN),
+                    (None, ""),
+                ] {
+                    let mut msg = $req;
+                    msg.user = user.to_string();
+                    let mut r = Request::new(msg);
+                    if let Some(id) = identity {
+                        r.extensions_mut().insert(id);
+                    }
+                    let err = svc.$method(r).await.expect_err(concat!(
+                        stringify!($method),
+                        " must reject a non-operator caller"
+                    ));
+                    assert_eq!(
+                        err.code(),
+                        Code::PermissionDenied,
+                        "{} must be PermissionDenied for user {user:?}",
+                        stringify!($method)
+                    );
+                }
+            }};
+        }
+
+        assert_operator_gated!(
             create_reservation,
             CreateReservationRequest {
                 name: "r".into(),
                 ..Default::default()
             }
         );
-        assert_admin_gated!(
+        assert_operator_gated!(
             update_reservation,
             UpdateReservationRequest {
                 name: "r".into(),
                 ..Default::default()
             }
         );
-        assert_admin_gated!(
+        assert_operator_gated!(
             delete_reservation,
             DeleteReservationRequest {
                 name: "r".into(),
                 ..Default::default()
             }
         );
+
+        assert!(
+            svc.cluster.get_reservations().is_empty(),
+            "a denied create must not reach the state machine"
+        );
+    }
+
+    /// An admin credential must work on a controller that shares no user directory with the login
+    /// nodes. The name here resolves nowhere, so only the pre-lookup admin return can allow it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_manages_reservations_without_a_resolvable_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6822).await;
+
+        let mut req = Request::new(CreateReservationRequest {
+            name: "maint".into(),
+            start_time: "now".into(),
+            duration_minutes: 60,
+            nodes: vec!["node-a".into()],
+            ..Default::default()
+        });
+        req.extensions_mut()
+            .insert(viewer("no_such_user_in_nss_7f3a", true));
+
+        svc.create_reservation(req)
+            .await
+            .expect("an admin credential must not depend on an NSS lookup");
+        assert_eq!(svc.cluster.get_reservations().len(), 1);
+    }
+
+    #[test]
+    fn privileged_user_manages_reservations() {
+        assert!(reservation_manager_ruling("alice", Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn unprivileged_user_may_not_manage_reservations() {
+        let err = reservation_manager_ruling("alice", Ok(false))
+            .expect_err("an unprivileged user must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(
+            err.message().contains("alice") && err.message().contains("sudo"),
+            "denial must name the user and the requirement: {}",
+            err.message()
+        );
+    }
+
+    /// An unresolvable name must deny rather than fall through to an allow.
+    #[test]
+    fn unresolvable_user_is_denied() {
+        let err = reservation_manager_ruling(
+            "ghost",
+            Err(spur_core::auth::AuthError::UnknownUser("ghost".into())),
+        )
+        .expect_err("an unresolvable user must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

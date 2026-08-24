@@ -697,8 +697,8 @@ pub struct AuthConfig {
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// HMAC signing secret (raw bytes) for node admission and user-identity RPC auth; `required`
-    /// refuses to start without one. Captured at startup, not updated by `reconfigure`.
+    /// JWT secret key (file path or inline), signing and verifying both user credentials
+    /// (`spur token user`) and node admission tokens.
     pub jwt_key: Option<String>,
     /// Allow jobs to execute as uid 0 (root).
     ///

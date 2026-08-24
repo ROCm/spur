@@ -461,7 +461,7 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 ``[auth]``
 ----------
 
-Authentication plugin for client requests.
+How client requests are authenticated.
 
 .. list-table::
    :header-rows: 1
@@ -475,16 +475,28 @@ Authentication plugin for client requests.
    * - ``plugin``
      - string
      - ``"jwt"``
-     - Not implemented
-     - Intended to select an authentication plugin. No code reads it, and no
-       plugin is enforced regardless of its value — see the warning below.
+     - Restart
+     - Constrains startup only: ``"munge"`` and any unrecognised value are
+       rejected rather than silently ignored, and ``"none"`` with
+       ``mode = "required"`` is refused as contradictory. Nothing reads it
+       afterwards — whether a presented credential is verified is decided by
+       ``mode`` and ``jwt_key`` alone, so ``plugin = "none"`` does **not** turn
+       verification off.
+   * - ``mode``
+     - string
+     - ``"permissive"``
+     - Restart
+     - ``"disabled"`` ignores credentials entirely, even valid ones.
+       ``"permissive"`` verifies a credential that is presented — an invalid or
+       malformed one is always refused — but allows a request that carries none.
+       ``"required"`` refuses every request without a valid credential.
    * - ``jwt_key``
      - string
      - none
      - Restart
-     - Signing key for node admission tokens, given as a file path or inline
-       value. Deliberately not reloadable: swapping it live would immediately
-       invalidate every outstanding node token.
+     - Signing key for user credentials (``spur token user``) and node admission
+       tokens, given as a file path or inline value. Deliberately not reloadable:
+       swapping it live would immediately invalidate every outstanding token.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -493,19 +505,72 @@ Authentication plugin for client requests.
 
 .. warning::
 
-   ``[auth] plugin`` is inert. Setting it to ``"jwt"`` does **not** authenticate
-   RPCs — the controller accepts requests from anyone who can reach its gRPC port,
-   and ``spurctld`` warns about this at startup whenever it binds a non-loopback
-   address. Restrict access to the controller port at the network layer. See
-   :doc:`accounting` for how identity maps to accounts and admin rights.
+   Under the default ``mode = "permissive"``, a caller that presents no
+   credential is unauthenticated, and the username it asserts in the request is
+   taken at face value. Identity-dependent decisions — job ownership, reservation
+   management, job-info visibility — are then only as trustworthy as the network.
+   Set ``mode = "required"`` (with a ``jwt_key``) to make them enforceable, and
+   restrict the controller port at the network layer either way. ``spurctld``
+   warns at startup whenever it binds a non-loopback address without
+   ``required``.
 
 .. note::
 
-   ``jwt_key`` is used for node admission tokens (``[admission] mode = "token"``),
-   which is a separate mechanism from the unimplemented ``plugin`` field. When
-   ``jwt_key`` is unset, admission tokens are signed with a well-known built-in
-   key and are therefore forgeable; set an explicit key before enabling token
-   admission.
+   When ``jwt_key`` is unset, admission tokens are signed with a well-known
+   built-in key and are therefore forgeable; set an explicit key before enabling
+   token admission (``[admission] mode = "token"``).
+
+.. _privileged-operations:
+
+Privileged operations
+~~~~~~~~~~~~~~~~~~~~~
+
+The control-plane mutations that define cluster tenancy — partitions, node
+placement and labels, ``reconfigure``, admission tokens, reservations, and the
+accounting account/user/QOS records — require a **cluster admin**. A caller with
+a verified non-admin identity is refused with ``PermissionDenied``. A caller with
+*no* verified identity is allowed, so that ``disabled`` and credential-less
+``permissive`` deployments keep working; under ``mode = "required"`` every caller
+is authenticated, so the bar binds everyone.
+
+Admin means one of the following:
+
+* a credential minted with ``spur token user --admin``;
+* a credential for the user ``root``;
+* an accounting admin level of ``Admin`` (see :doc:`accounting`).
+
+Only the first counts for the accounting service's own mutations: it holds no
+association cache and does not special-case ``root``, so it accepts the token
+claim alone. The controller RPCs honour all three.
+
+Reservations are the one exception, and are stricter in two ways. An
+unidentified caller is **not** waved through, and membership of ``sudo`` or
+``wheel`` also qualifies. Creating, updating, or deleting a reservation is
+allowed when any of these holds:
+
+* the caller is a cluster admin, as above;
+* the caller resolves to UID 0 on the controller;
+* the caller is a member of the ``sudo`` or ``wheel`` group, as the controller's
+  own NSS resolves the name — so a site using LDAP or SSSD grants this by group
+  membership, and a controller with no shared user directory can only resolve
+  local accounts.
+
+Anyone else is refused, as is a name the controller cannot resolve at all — a
+caller it cannot vouch for is denied, not allowed. The rule mirrors the one the
+CLI applies locally before it ever connects, which is the point — a client that
+does not go through the CLI cannot skip it. The cost is that a ``sudo``/``wheel``
+operator must be resolvable *on the controller*, not only on the login node.
+
+Ownership is not part of this decision. The creator is recorded as ``Owner`` for
+attribution and shown by ``scontrol show reservation``, but any operator may
+update or delete any reservation, matching Slurm's operator semantics.
+
+.. warning::
+
+   Without a credential the controller can only check the username the client
+   asserted, so under ``permissive`` this stops an unprivileged client but not a
+   deliberately crafted request. ``mode = "required"`` is what makes it a
+   boundary, because there the name comes from the verified credential.
 
 ``[[partitions]]``
 ------------------

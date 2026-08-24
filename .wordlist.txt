@@ -28,6 +28,7 @@ Kubernetes
 kubeconfig
 kubelet
 Landlock
+LDAP
 LIF
 localhost
 Loopback
@@ -36,6 +37,7 @@ MyST
 namespace
 namespaces
 NCCL
+NSS
 openraft
 OCI
 PBS
@@ -92,6 +94,7 @@ sreport
 srun
 SCP
 sshare
+SSSD
 sstat
 strigger
 subcommand

@@ -80,9 +80,8 @@ pub struct Reservation {
     pub users: Vec<String>,
     #[serde(default)]
     pub flags: ReservationFlags,
-    /// User who created the reservation. Empty for reservations created before
-    /// ownership tracking existed (and for trusted internal callers), which are
-    /// treated as unowned and mutable by any authenticated user.
+    /// Who created the reservation, recorded for attribution only — not an authorization input, as
+    /// an operator may manage any reservation. Empty for reservations predating the field.
     #[serde(default)]
     pub owner: String,
 }
@@ -112,14 +111,6 @@ impl Reservation {
 
     pub fn covers_node(&self, node: &str) -> bool {
         self.nodes.iter().any(|n| n == node)
-    }
-
-    /// Whether `user` may modify or delete this reservation. Root and trusted
-    /// internal callers (empty user) are always allowed, as is the recorded
-    /// owner. Reservations with no recorded owner (created before ownership
-    /// tracking) stay mutable by any authenticated user.
-    pub fn can_be_managed_by(&self, user: &str) -> bool {
-        user.is_empty() || user == "root" || self.owner.is_empty() || self.owner == user
     }
 
     pub fn allows_user(&self, user: &str, account: Option<&str>) -> bool {
@@ -344,26 +335,6 @@ mod tests {
         assert!(res.allows_user("bob", Some("research")));
         assert!(!res.allows_user("bob", Some("other")));
         assert!(!res.allows_user("bob", None));
-    }
-
-    #[test]
-    fn owner_can_manage_and_others_cannot() {
-        let mut res = make_reservation();
-        res.owner = "alice".into();
-        assert!(res.can_be_managed_by("alice"), "owner may manage");
-        assert!(res.can_be_managed_by("root"), "root may manage");
-        assert!(res.can_be_managed_by(""), "internal calls may manage");
-        assert!(!res.can_be_managed_by("bob"), "non-owner may not manage");
-    }
-
-    #[test]
-    fn unowned_reservation_is_manageable_by_anyone() {
-        let res = make_reservation();
-        assert_eq!(res.owner, "");
-        assert!(
-            res.can_be_managed_by("bob"),
-            "reservations without a recorded owner stay mutable"
-        );
     }
 
     #[test]

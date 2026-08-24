@@ -1585,6 +1585,10 @@ message DeletePartitionRequest {
 
 // ============================================================
 // Reservation Management
+//
+// Create, update, and delete require an operator: a cluster admin, or a caller the controller
+// resolves to uid 0 or a `sudo`/`wheel` member. The `user` fields below are overwritten with the
+// authenticated name when a credential is presented, so they are only trusted without one.
 // ============================================================
 
 message CreateReservationRequest {
@@ -1595,7 +1599,7 @@ message CreateReservationRequest {
   repeated string accounts = 5;
   repeated string users = 6;
   repeated string flags = 7;
-  string user = 8;            // requesting user; recorded as reservation owner
+  string user = 8;            // requesting user; must be an operator, and is recorded as the owner
 }
 
 message UpdateReservationRequest {
@@ -1607,12 +1611,12 @@ message UpdateReservationRequest {
   repeated string remove_users = 6;
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
-  string user = 9;              // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
+  string user = 9;              // requesting user; must be an operator, who may update any reservation
 }
 
 message DeleteReservationRequest {
   string name = 1;
-  string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
+  string user = 2;             // requesting user; must be an operator, who may delete any reservation
 }
 
 message ListReservationsRequest {
