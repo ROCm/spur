@@ -2,6 +2,20 @@
 # runners and the workflow YAML are never exposed to untrusted fork code.
 # Untrusted code (binaries + pytest) runs ONLY inside disposable driver VMs.
 #
+# Tests are routed to two runner pools by an auto-applied `gpu` marker
+# (see tests/native_host/e2e/conftest.py): GPU tests to `gpu` runners, the rest
+# to `non-gpu` runners. Each pool is fanned out into deterministic hash shards
+# (tests/conftest.py --shard-count/--shard-id). The per-shard native-host jobs
+# aggregate into the single `E2E / native-host` status; k8s into `E2E / k8s`.
+#
+# Commit-status lifecycle for the two contexts (`E2E / native-host`, `E2E / k8s`):
+#   1. pending "Waiting for CI to complete..."  -> set-e2e-pending.yml, on PRs.
+#   2. pending "Running E2E tests..."           -> mark-running (this file, CI ok).
+#   3. success/failure                          -> report-* (this file, per pool).
+#   If CI does not succeed, mark-skipped sets a terminal state instead of (2)/(3):
+#   failure for a real CI failure, error for cancelled/other (e.g. superseded).
+# For direct pushes to main (no PR), the first status appears at step 2/skip.
+#
 # Trigger migration to pull_request_target is deferred to a follow-up PR.
 name: E2E
 
@@ -45,50 +59,79 @@ jobs:
 
             const sha = '${{ github.event.workflow_run.head_sha }}';
             const conclusion = '${{ github.event.workflow_run.conclusion }}';
+            // error (not failure) when CI didn't genuinely fail, so a
+            // cancelled/superseded run is distinguishable from a real failure.
+            const state = conclusion === 'failure' ? 'failure' : 'error';
             const desc = conclusion === 'failure'
-              ? 'Skipped: CI did not pass'
-              : `Skipped: CI ${conclusion}`;
+              ? 'E2E skipped: CI failed'
+              : `E2E skipped: CI ${conclusion}`;
 
             for (const ctx of contexts) {
               await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner, repo: context.repo.repo, sha,
-                state: 'failure',
+                state,
                 context: ctx,
                 description: desc,
                 target_url: '${{ github.event.workflow_run.html_url }}'
               });
             }
 
-  e2e:
-    name: ${{ matrix.STATUS_CONTEXT }}
-    runs-on: [self-hosted, spur-e2e, gpu]
+  mark-running:
+    name: Mark E2E running
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/workflows/e2e.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Mark contexts running
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const text = fs.readFileSync('.github/workflows/e2e.yml', 'utf8');
+            const matches = [...text.matchAll(/^\s*STATUS_CONTEXT:\s*["']([^"']+)["']\s*$/gm)];
+            const contexts = [...new Set(matches.map((m) => m[1]))];
+            for (const ctx of contexts) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo,
+                sha: '${{ github.event.workflow_run.head_sha }}',
+                state: 'pending',
+                target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+                context: ctx,
+                description: 'Running E2E tests...'
+              });
+            }
+
+  native-host:
+    name: native-host (${{ matrix.pool }} ${{ matrix.shard_id }}/${{ matrix.shard_count }})
+    runs-on: [self-hosted, spur-e2e, "${{ matrix.pool }}"]
     if: github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - cluster_type: native-host
-            STATUS_CONTEXT: "E2E / native-host"
-          - cluster_type: k8s
-            STATUS_CONTEXT: "E2E / k8s"
+          - { pool: gpu, selector: "gpu", shard_id: 0, shard_count: 2 }
+          - { pool: gpu, selector: "gpu", shard_id: 1, shard_count: 2 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 0, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 1, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 2, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 3, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 4, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 5, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 6, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 7, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 8, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 9, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 10, shard_count: 12 }
+          - { pool: non-gpu, selector: "not gpu", shard_id: 11, shard_count: 12 }
     env:
-      STATUS_CONTEXT: ${{ matrix.STATUS_CONTEXT }}
       # LogLevel=ERROR silences the known-hosts warning from UserKnownHostsFile=/dev/null.
       SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-      RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}
+      RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-${{ matrix.pool }}-${{ matrix.shard_id }}
     steps:
-      - name: Set pending status
-        uses: actions/github-script@v9
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: 'pending',
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: '${{ env.STATUS_CONTEXT }}'
-            });
-
       - name: Download release binaries
         uses: actions/download-artifact@v8
         with:
@@ -105,17 +148,6 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download container image (k8s only)
-        if: matrix.cluster_type == 'k8s'
-        uses: actions/download-artifact@v8
-        with:
-          name: spur-image
-          path: ${{ env.RUN_DIR }}
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      # --- Host-side: ONLY /opt/spur-ci/bin scripts from here ---
-
       - name: Generate ephemeral SSH keypair
         id: ssh
         run: |
@@ -125,15 +157,6 @@ jobs:
           echo "pubkey=$KEY_DIR/id_ed25519.pub" >> "$GITHUB_OUTPUT"
           echo "privkey=$KEY_DIR/id_ed25519" >> "$GITHUB_OUTPUT"
 
-      - name: Select image for cluster type
-        id: image
-        run: |
-          if [[ "${{ matrix.cluster_type }}" == "k8s" ]]; then
-            echo "path=${SPUR_CI_IMAGE_DIR}/spur-ci-k8s.qcow2" >> "$GITHUB_OUTPUT"
-          else
-            echo "path=${SPUR_CI_IMAGE_DIR}/spur-ci-base.qcow2" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Bring up ephemeral VM cluster
         id: cluster
         run: |
@@ -141,17 +164,16 @@ jobs:
           echo "cluster_env=$CLUSTER_ENV" >> "$GITHUB_OUTPUT"
           /opt/spur-ci/bin/cluster-up.sh \
             --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
-            --count 4 \
-            --image "${{ steps.image.outputs.path }}" \
-            --gpus-per-vm 1 \
-            --skip-gpu-for 0 \
+            --count "${SPUR_CI_CLUSTER_COUNT:-4}" \
+            --image "${SPUR_CI_IMAGE_DIR}/spur-ci-base.qcow2" \
+            --gpus-per-vm "${SPUR_CI_GPUS_PER_VM:-0}" \
             --ssh-pubkey "${{ steps.ssh.outputs.pubkey }}" \
             --network "${SPUR_CI_NETWORK}" \
-            --gpu-vfs "${SPUR_CI_GPU_VFS}" \
+            --gpu-vfs "${SPUR_CI_GPU_VFS:-}" \
             > "$CLUSTER_ENV"
           source "$CLUSTER_ENV"
           echo "driver_ip=${VM_0_IP}" >> "$GITHUB_OUTPUT"
-          echo "gpu_ips=${VM_1_IP},${VM_2_IP},${VM_3_IP}" >> "$GITHUB_OUTPUT"
+          echo "node_ips=${VM_1_IP},${VM_2_IP},${VM_3_IP}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for VMs to be reachable
         run: |
@@ -175,8 +197,168 @@ jobs:
             fi
           done
 
-      - name: Bootstrap k8s cluster (k8s only)
-        if: matrix.cluster_type == 'k8s'
+      - name: Push artifacts into driver VM
+        run: |
+          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "mkdir -p ${{ env.RUN_DIR }}"
+          scp $SSH_OPTS -i "$KEY" -r "${{ env.RUN_DIR }}/release-binaries" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/"
+          scp $SSH_OPTS -i "$KEY" -r "${{ env.RUN_DIR }}/e2e-assets" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/"
+          scp $SSH_OPTS -i "$KEY" "$KEY" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/ci-ssh-key"
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "chmod 600 ${{ env.RUN_DIR }}/ci-ssh-key"
+
+      - name: Load AppArmor profile for rootless containers
+        run: |
+          NODE_IPS="${{ steps.cluster.outputs.node_ips }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+          SPURD="/tmp/spur-ci-bin-${{ github.run_id }}/spurd"
+          PROF="abi <abi/4.0>,
+          profile spur-ci ${SPURD} flags=(unconfined) {
+            userns,
+          }"
+          IFS=',' read -ra NODES <<< "$NODE_IPS"
+          for node in "${NODES[@]}"; do
+            ssh $SSH_OPTS -i "$KEY" ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
+          done
+
+      - name: Run tests inside driver VM
+        run: |
+          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+          NODE_IPS="${{ steps.cluster.outputs.node_ips }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
+          set -euo pipefail
+          export SPUR_TEST_NODES="$NODE_IPS"
+          export SPUR_TEST_SSH_USER=ci
+          export SPUR_TEST_SSH_KEY=${{ env.RUN_DIR }}/ci-ssh-key
+          export SPUR_TEST_BINARIES_DIR=${{ env.RUN_DIR }}/release-binaries
+          export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin-${{ github.run_id }}
+          export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
+          chmod +x ${{ env.RUN_DIR }}/release-binaries/*
+          source /opt/spur-ci/test-venv/bin/activate
+          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v \
+            -m "${{ matrix.selector }}" \
+            --shard-count ${{ matrix.shard_count }} --shard-id ${{ matrix.shard_id }} \
+            --durations=25 \
+            --junitxml=${{ env.RUN_DIR }}/results.xml
+          REMOTE
+
+      - name: Collect results from driver VM
+        if: always()
+        run: |
+          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+          mkdir -p "${{ env.RUN_DIR }}/e2e-results"
+          scp $SSH_OPTS -i "$KEY" \
+            ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/results.xml" "${{ env.RUN_DIR }}/e2e-results/" 2>/dev/null || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-results-native-${{ matrix.pool }}-${{ matrix.shard_id }}
+          path: ${{ env.RUN_DIR }}/e2e-results/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Tear down ephemeral VM cluster
+        if: always()
+        run: |
+          /opt/spur-ci/bin/cluster-down.sh \
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
+            --count "${SPUR_CI_CLUSTER_COUNT:-4}"
+
+      - name: Cleanup ephemeral keys
+        if: always()
+        run: rm -rf "${{ steps.ssh.outputs.key_dir }}"
+
+      - name: Cleanup run directory
+        if: always()
+        run: rm -rf "${{ env.RUN_DIR }}"
+
+  k8s:
+    name: k8s
+    runs-on: [self-hosted, spur-e2e, non-gpu]
+    if: github.event.workflow_run.conclusion == 'success'
+    env:
+      SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+      RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-k8s
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: release-binaries
+          path: ${{ env.RUN_DIR }}/release-binaries
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download E2E assets
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-assets
+          path: ${{ env.RUN_DIR }}/e2e-assets
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download container image
+        uses: actions/download-artifact@v8
+        with:
+          name: spur-image
+          path: ${{ env.RUN_DIR }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate ephemeral SSH keypair
+        id: ssh
+        run: |
+          KEY_DIR=$(mktemp -d /tmp/spur-ci-keys-XXXXXX)
+          ssh-keygen -t ed25519 -f "$KEY_DIR/id_ed25519" -N "" -q
+          echo "key_dir=$KEY_DIR" >> "$GITHUB_OUTPUT"
+          echo "pubkey=$KEY_DIR/id_ed25519.pub" >> "$GITHUB_OUTPUT"
+          echo "privkey=$KEY_DIR/id_ed25519" >> "$GITHUB_OUTPUT"
+
+      - name: Bring up ephemeral VM cluster
+        id: cluster
+        run: |
+          CLUSTER_ENV=$(mktemp /tmp/cluster-env-XXXXXX.sh)
+          echo "cluster_env=$CLUSTER_ENV" >> "$GITHUB_OUTPUT"
+          /opt/spur-ci/bin/cluster-up.sh \
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}-k8s" \
+            --count "${SPUR_CI_CLUSTER_COUNT:-4}" \
+            --image "${SPUR_CI_IMAGE_DIR}/spur-ci-k8s.qcow2" \
+            --gpus-per-vm 0 \
+            --ssh-pubkey "${{ steps.ssh.outputs.pubkey }}" \
+            --network "${SPUR_CI_NETWORK}" \
+            > "$CLUSTER_ENV"
+          source "$CLUSTER_ENV"
+          echo "driver_ip=${VM_0_IP}" >> "$GITHUB_OUTPUT"
+          echo "node_ips=${VM_1_IP},${VM_2_IP},${VM_3_IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for VMs to be reachable
+        run: |
+          source "${{ steps.cluster.outputs.cluster_env }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+          for ip in $VM_0_IP $VM_1_IP $VM_2_IP $VM_3_IP; do
+            echo "Waiting for $ip..."
+            ok=false
+            for i in $(seq 1 90); do
+              if ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes \
+                -i "$KEY" ci@"$ip" true 2>/dev/null; then
+                echo "  $ip ready"
+                ok=true
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$ok" != "true" ]]; then
+              echo "ERROR: $ip not reachable after 180s" >&2
+              exit 1
+            fi
+          done
+
+      - name: Bootstrap k8s cluster
         id: k8s-bootstrap
         run: |
           source "${{ steps.cluster.outputs.cluster_env }}"
@@ -201,43 +383,7 @@ jobs:
           scp $SSH_OPTS -i "$KEY" "$KEY" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/ci-ssh-key"
           ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "chmod 600 ${{ env.RUN_DIR }}/ci-ssh-key"
 
-      - name: Load AppArmor profile for rootless containers
-        if: matrix.cluster_type == 'native-host'
-        run: |
-          GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
-          KEY="${{ steps.ssh.outputs.privkey }}"
-          SPURD="/tmp/spur-ci-bin-${{ github.run_id }}/spurd"
-          PROF="abi <abi/4.0>,
-          profile spur-ci ${SPURD} flags=(unconfined) {
-            userns,
-          }"
-          IFS=',' read -ra NODES <<< "$GPU_IPS"
-          for node in "${NODES[@]}"; do
-            ssh $SSH_OPTS -i "$KEY" ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
-          done
-
-      - name: Run tests inside driver VM (native-host)
-        if: matrix.cluster_type == 'native-host'
-        run: |
-          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
-          GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
-          KEY="${{ steps.ssh.outputs.privkey }}"
-
-          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
-          set -euo pipefail
-          export SPUR_TEST_NODES="$GPU_IPS"
-          export SPUR_TEST_SSH_USER=ci
-          export SPUR_TEST_SSH_KEY=${{ env.RUN_DIR }}/ci-ssh-key
-          export SPUR_TEST_BINARIES_DIR=${{ env.RUN_DIR }}/release-binaries
-          export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin-${{ github.run_id }}
-          export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
-          chmod +x ${{ env.RUN_DIR }}/release-binaries/*
-          source /opt/spur-ci/test-venv/bin/activate
-          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v --junitxml=${{ env.RUN_DIR }}/results.xml
-          REMOTE
-
-      - name: Apply RBAC and verify cluster state (k8s)
-        if: matrix.cluster_type == 'k8s'
+      - name: Apply RBAC and verify cluster state
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
@@ -259,8 +405,7 @@ jobs:
           kubectl get nodes -l spur.amd.com/managed=true -o wide
           REMOTE
 
-      - name: Run tests inside driver VM (k8s)
-        if: matrix.cluster_type == 'k8s'
+      - name: Run tests inside driver VM
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
@@ -275,8 +420,8 @@ jobs:
           pytest ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/ -v --junitxml=${{ env.RUN_DIR }}/results.xml
           REMOTE
 
-      - name: Dump cluster diagnostics (k8s)
-        if: failure() && matrix.cluster_type == 'k8s'
+      - name: Dump cluster diagnostics
+        if: failure()
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
@@ -313,7 +458,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-results-${{ matrix.cluster_type }}
+          name: e2e-results-k8s
           path: ${{ env.RUN_DIR }}/e2e-results/
           retention-days: 3
           if-no-files-found: ignore
@@ -322,8 +467,8 @@ jobs:
         if: always()
         run: |
           /opt/spur-ci/bin/cluster-down.sh \
-            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
-            --count 4
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}-k8s" \
+            --count "${SPUR_CI_CLUSTER_COUNT:-4}"
 
       - name: Cleanup ephemeral keys
         if: always()
@@ -333,16 +478,52 @@ jobs:
         if: always()
         run: rm -rf "${{ env.RUN_DIR }}"
 
-      - name: Report status
-        if: always()
+  report-native-host:
+    name: Report native-host status
+    needs: [native-host]
+    if: always() && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      STATUS_CONTEXT: "E2E / native-host"
+    steps:
+      - name: Report aggregated status
         uses: actions/github-script@v9
         with:
           script: |
+            const result = '${{ needs.native-host.result }}';
+            const state = result === 'success'
+              ? 'success'
+              : (result === 'cancelled' ? 'error' : 'failure');
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
               sha: '${{ github.event.workflow_run.head_sha }}',
-              state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
+              state,
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
               context: '${{ env.STATUS_CONTEXT }}',
-              description: '${{ job.status }}'
+              description: result === 'success' ? 'passed' : result
+            });
+
+  report-k8s:
+    name: Report k8s status
+    needs: [k8s]
+    if: always() && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      STATUS_CONTEXT: "E2E / k8s"
+    steps:
+      - name: Report aggregated status
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const result = '${{ needs.k8s.result }}';
+            const state = result === 'success'
+              ? 'success'
+              : (result === 'cancelled' ? 'error' : 'failure');
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: '${{ github.event.workflow_run.head_sha }}',
+              state,
+              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+              context: '${{ env.STATUS_CONTEXT }}',
+              description: result === 'success' ? 'passed' : result
             });
