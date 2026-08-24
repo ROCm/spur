@@ -3,7 +3,7 @@
 
 //! `spur token` subcommands for admission token management.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use spur_proto::proto::{CreateTokenRequest, ListTokensRequest, RevokeTokenRequest};
@@ -118,9 +118,9 @@ fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &st
 fn parse_ttl(s: &str) -> Result<u32> {
     let s = s.trim();
     let (value, unit_secs) = if let Some(days) = s.strip_suffix('d') {
-        (days, 86400)
+        (days, 86_400u64)
     } else if let Some(hours) = s.strip_suffix('h') {
-        (hours, 3600)
+        (hours, 3_600)
     } else if let Some(mins) = s.strip_suffix('m') {
         (mins, 60)
     } else if let Some(secs) = s.strip_suffix('s') {
@@ -128,10 +128,18 @@ fn parse_ttl(s: &str) -> Result<u32> {
     } else {
         (s, 1)
     };
-    value
-        .parse::<u32>()?
-        .checked_mul(unit_secs)
-        .with_context(|| format!("TTL {} exceeds {} seconds", s, u32::MAX))
+    // u64 can't overflow here (max is u32::MAX * 86_400), so the message reports seconds vs seconds.
+    let secs = value.parse::<u32>()? as u64 * unit_secs;
+    if secs == 0 {
+        anyhow::bail!("TTL {s} must be a positive duration");
+    }
+    if secs > u32::MAX as u64 {
+        anyhow::bail!(
+            "TTL {s} is {secs} seconds, over the {} second maximum",
+            u32::MAX
+        );
+    }
+    Ok(secs as u32)
 }
 
 async fn cmd_create(controller: &str, ttl: Option<String>) -> Result<()> {
@@ -209,6 +217,15 @@ mod tests {
             u32::MAX,
             "the ceiling still parses"
         );
+    }
+
+    #[test]
+    fn parse_ttl_rejects_zero() {
+        // A zero TTL used to collapse to a never-expiring token at the server.
+        assert!(parse_ttl("0").is_err());
+        assert!(parse_ttl("0d").is_err());
+        assert!(parse_ttl("0h").is_err());
+        assert!(parse_ttl("0s").is_err());
     }
 
     #[test]
