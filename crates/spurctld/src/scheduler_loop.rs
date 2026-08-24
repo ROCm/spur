@@ -2448,6 +2448,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn busy_until_accounts_for_currently_suspended_time() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.suspended_at = Some(now - chrono::Duration::minutes(5));
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let expected = now
+            + chrono::Duration::minutes(10)
+            + chrono::Duration::minutes(5)
+            + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let got = busy_until["node001"];
+        assert!(
+            (got - expected).num_seconds().abs() < 2,
+            "expected suspended time folded in, got {got}, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn busy_until_falls_back_to_now_when_start_time_is_missing() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.start_time = None;
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let expected =
+            now + chrono::Duration::minutes(10) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let got = busy_until["node001"];
+        assert!(
+            (got - expected).num_seconds().abs() < 2,
+            "expected now-based fallback, got {got}, expected ~{expected}"
+        );
+    }
+
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
         ResourceSet {
             cpus,

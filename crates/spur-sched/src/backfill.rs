@@ -1508,6 +1508,71 @@ mod tests {
         assert!(!planned.contains_key("node002"));
     }
 
+    #[test]
+    fn planned_starts_is_empty_when_nothing_is_reserved() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let busy_until = std::collections::HashMap::new();
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        // Every node is idle and unclaimed with nothing pending.
+        sched.schedule(&[], &cluster);
+        assert!(sched.planned_starts().is_empty());
+    }
+
+    #[test]
+    fn planned_starts_picks_the_earliest_of_several_reservations_on_one_node() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut earlier = make_job(7, 2, 1);
+        earlier.spec.exclusive = true;
+        earlier.spec.time_limit = Some(Duration::minutes(5));
+        let mut later = make_job(8, 2, 1);
+        later.spec.exclusive = true;
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        // Both need node001+node002; job 8 is queued behind job 7's reservation
+        // on node002, so it lands on a later slot on node001 too.
+        let assignments = sched.schedule(&[earlier, later], &cluster);
+        assert!(assignments.is_empty(), "neither job can start yet");
+
+        let (job_id, _start) = sched
+            .planned_starts()
+            .get("node001")
+            .copied()
+            .expect("node001 is idle now but reserved");
+        assert_eq!(
+            job_id, 7,
+            "must report the earlier reservation, not the later one"
+        );
+    }
+
     fn make_job_with_nodelist(
         id: u32,
         nodes: u32,
