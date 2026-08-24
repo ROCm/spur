@@ -899,10 +899,10 @@ in full rather than clipped to fit a column.
 .. note::
 
    ``-p`` and ``-P`` work for ``show account`` and ``show qos``.
-   For ``show user``, ``show association``, and ``show tres``, Spur does not
-   model the columns, so it refuses the flag with an error naming the entity
-   rather than printing padded text a script cannot parse. ``-n`` works for
-   every entity.
+   For ``show user``, ``show association``, ``show tres``, and ``show txn``,
+   Spur does not model the columns, so it refuses the flag with an error naming
+   the entity rather than printing padded text a script cannot parse. ``-n``
+   works for every entity.
 
    Passing both ``-p`` and ``-P`` gives ``-P``. Slurm applies whichever came
    last; the flag order is not visible here, so the no-trailing form wins.

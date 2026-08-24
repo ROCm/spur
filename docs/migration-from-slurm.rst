@@ -70,7 +70,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - ``sprio``
      - The ``FAIRSHARE`` column is a placeholder and does not yet reflect usage.
    * - ``sacctmgr`` ``-p``/``-P``
-     - Delimited output covers ``show account`` and ``show qos``; for ``show user``, ``show association``, and ``show tres`` it errors instead of printing a table no script can parse. ``-n`` works for every entity.
+     - Delimited output covers ``show account`` and ``show qos``; for ``show user``, ``show association``, ``show tres``, and ``show txn`` it errors instead of printing a table no script can parse. ``-n`` works for every entity.
    * - ``scancel`` arrays
      - Array-element syntax (``123_4``) is not yet supported client-side; cancel by plain job id.
    * - ``scontrol show``

@@ -866,14 +866,25 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
-/// Entities whose columns come from `format_engine`, and so can be delimited.
-const DELIMITABLE_ENTITIES: [&str; 3] = ["account", "accounts", "qos"];
+/// Entities `show` prints as fixed-width tables, with no field-spec table behind them.
+/// A new entity rendered that way belongs here.
+const FIXED_WIDTH_ENTITIES: [&str; 8] = [
+    "user",
+    "users",
+    "association",
+    "associations",
+    "tres",
+    "txn",
+    "transaction",
+    "transactions",
+];
 
-/// The remaining entities print fixed-width tables with no field-spec table behind them.
-/// Accepting `-p`/`-P` there would hand a script padded text where it expects delimited
-/// fields, so refuse loudly instead of returning output that silently will not parse.
+/// Accepting `-p`/`-P` for a fixed-width entity would hand a script padded text where it
+/// expects delimited fields, so refuse loudly instead of returning output that silently
+/// will not parse. Unrecognized entities are left to `show`, so they still report the
+/// unknown entity rather than a delimiter complaint.
 fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle) -> Result<()> {
-    if !style.is_delimited() || DELIMITABLE_ENTITIES.contains(&entity) {
+    if !style.is_delimited() || !FIXED_WIDTH_ENTITIES.contains(&entity) {
         return Ok(());
     }
 
@@ -2562,7 +2573,14 @@ mod tests {
                 "{entity} should support delimited output"
             );
         }
-        for entity in ["user", "users", "association", "tres"] {
+        for entity in [
+            "user",
+            "users",
+            "association",
+            "tres",
+            "txn",
+            "transactions",
+        ] {
             assert!(
                 reject_unsupported_delimiter(entity, delimited).is_err(),
                 "{entity} should refuse delimited output"
@@ -2586,6 +2604,18 @@ mod tests {
 
         assert!(
             err.to_string().contains("not supported for 'user'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_entity_reports_itself_rather_than_the_delimiter() {
+        let err = show("wombat", &[], "http://127.0.0.1:1", style_from(&["-P"]))
+            .await
+            .expect_err("unknown entity must fail");
+
+        assert!(
+            err.to_string().contains("unknown entity 'wombat'"),
             "unexpected error: {err}"
         );
     }
