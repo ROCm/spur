@@ -12,6 +12,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -113,6 +114,7 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
 const SPOOL_ROOT: &str = "/var/spool/spur";
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
@@ -135,6 +137,7 @@ pub enum LaunchIo {
 
 pub struct JobLaunchConfig {
     pub job_id: JobId,
+    pub run_attempt: u32,
     pub script: String,
     pub work_dir: String,
     /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
@@ -363,6 +366,13 @@ fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
 }
 
 impl RunningJob {
+    pub fn managed(child: tokio::process::Child) -> Self {
+        Self::Managed {
+            child,
+            cgroup_path: None,
+        }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
@@ -446,6 +456,14 @@ impl RunningJob {
             RunningJob::AllocationOnly => None,
         }
     }
+
+    pub fn cgroup_path(&self) -> Option<&Path> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::AllocationOnly => None,
+        }
+    }
 }
 
 /// Launch a job script on this node.
@@ -486,6 +504,7 @@ async fn spawn_job_process(
 ) -> Result<LaunchResult, LaunchError> {
     let JobLaunchConfig {
         job_id,
+        run_attempt,
         ref script,
         ref work_dir,
         ref environment,
@@ -505,7 +524,14 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = CgroupGuard(setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?);
+    let cgroup_path = CgroupGuard(setup_cgroup(
+        job_id,
+        &cfg.cgroup,
+        run_attempt,
+        cpus,
+        memory_mb,
+        cpu_ids,
+    )?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -710,10 +736,13 @@ async fn spawn_job_process(
     // Launch the process
     let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
     let mut cmd = Command::new(&launch_cmd);
-    cmd.args(&launch_args).current_dir(work_dir).envs(&env);
-    if !cfg.pmix_multi_task {
-        cmd.process_group(0);
-    }
+    // Always its own process group (run_command does the same for pmix step
+    // launches) so signal()/kill_signal's group-kill reaches the whole job
+    // regardless of PMIx — only namespace isolation is pmix-conditional above.
+    cmd.args(&launch_args)
+        .current_dir(work_dir)
+        .envs(&env)
+        .process_group(0);
     if piped_mpi_stdio {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -939,9 +968,22 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
+// Keyed by attempt, not just job_id: a redispatch must never land in a
+// still-occupied cgroup left by a not-yet-reaped prior attempt.
+fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathBuf {
+    cgroup_root.join(format!("job_{}_{}", job_id, run_attempt))
+}
+
+/// Reconstructs a job's cgroup path from its identity alone — usable even
+/// when the session descriptor that would normally carry it is unreadable.
+pub(crate) fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
+    cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt)
+}
+
 fn setup_cgroup(
     job_id: JobId,
     cgroup: &CgroupConfig,
+    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
@@ -952,7 +994,7 @@ fn setup_cgroup(
     };
 
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
+    let cgroup_path = cgroup_path_for(&cgroup_root, job_id, run_attempt);
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -1159,6 +1201,12 @@ fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
     procs.lines().any(|line| line.trim() == pid.to_string())
 }
 
+/// Atomically SIGKILLs every process in the cgroup (cgroup-v2 `cgroup.kill`),
+/// reaching descendants that detached from the signaled process group.
+pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
+    std::fs::write(cgroup_path.join("cgroup.kill"), b"1")
+}
+
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
 /// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
 pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
@@ -1195,20 +1243,34 @@ impl Drop for CgroupGuard {
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
-pub fn cleanup_cgroup(cgroup_path: &Path) {
-    // Kill any remaining processes
-    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+/// Returns whether the cgroup was confirmed empty and removed — callers that
+/// need to know the job's process is actually gone (not just signaled)
+/// should gate on this rather than assuming the kill took effect.
+pub async fn cleanup_cgroup(cgroup_path: &Path) -> bool {
+    if cgroup_kill(cgroup_path).is_err() {
+        // No cgroup.kill (e.g. cgroup v1): fall back to a manual per-pid sweep.
+        if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+            for pid_str in pids.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+                }
             }
         }
     }
 
-    // Remove cgroup directory
-    if let Err(e) = std::fs::remove_dir(cgroup_path) {
-        warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
+    // SIGKILL delivery/reaping is async; a v2 rmdir fails until the cgroup is
+    // empty, so retry briefly instead of leaking the directory on one miss.
+    const REMOVE_ATTEMPTS: u32 = 5;
+    for attempt in 1..=REMOVE_ATTEMPTS {
+        match std::fs::remove_dir(cgroup_path) {
+            Ok(()) => return true,
+            Err(_) if attempt < REMOVE_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup"),
+        }
     }
+    false
 }
 
 /// Recursively signal a process and all its descendants (children first).
@@ -1620,6 +1682,7 @@ async fn launch_container_job(
     let job_id = cfg.job_id;
 
     // Sync pipe: child writes status, parent reads.
+    // Convert OwnedFd to raw fds for manual lifecycle management across fork.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
     // Prevent read end from leaking into exec'd process
     nix::fcntl::fcntl(
@@ -1629,6 +1692,9 @@ async fn launch_container_job(
     .ok();
     let ready_r = pipe_r.as_raw_fd();
     let ready_w = pipe_w.as_raw_fd();
+    // Keep OwnedFd alive so the fds aren't closed prematurely
+    let _pipe_r_owner = pipe_r;
+    let _pipe_w_owner = pipe_w;
 
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
@@ -1658,7 +1724,9 @@ async fn launch_container_job(
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
             // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
-            drop(pipe_r);
+            unsafe {
+                libc::close(ready_r);
+            }
 
             // Reset signal handlers
             unsafe {
@@ -1700,8 +1768,8 @@ async fn launch_container_job(
             // Signal parent: setup complete
             unsafe {
                 libc::write(ready_w, b"OK".as_ptr() as *const _, 2);
+                libc::close(ready_w);
             }
-            drop(pipe_w);
 
             // Build final environment: base + container_env + hook environ.d
             let mut final_env = env_snapshot;
@@ -1746,7 +1814,6 @@ async fn launch_container_job(
         }
 
         nix::unistd::ForkResult::Parent { child } => {
-            drop(pipe_w);
             unsafe {
                 libc::close(ready_w);
                 if cgroup_log_fd >= 0 {
@@ -1768,7 +1835,9 @@ async fn launch_container_job(
             let mut buf = [0u8; 512];
             let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
             let n = n.max(0) as usize;
-            drop(pipe_r);
+            unsafe {
+                libc::close(ready_r);
+            }
 
             if n < 2 || &buf[..2] != b"OK" {
                 let msg = String::from_utf8_lossy(&buf[..n]);
@@ -2074,6 +2143,40 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_path_is_scoped_to_the_attempt_not_just_the_job() {
+        let root = Path::new("/sys/fs/cgroup/spur");
+        let first = cgroup_path_for(root, 4, 1);
+        let second = cgroup_path_for(root, 4, 2);
+        assert_ne!(
+            first, second,
+            "a redispatch must never share a cgroup with a not-yet-reaped prior attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_cgroup_retries_past_a_transient_removal_failure() {
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        // A directory (not a plain file) at the cgroup.kill path makes the
+        // write fail, so cleanup_cgroup falls back to the per-pid sweep and
+        // this blocker is the only thing standing in remove_dir's way.
+        let blocker = cgroup.path().join("cgroup.kill");
+        std::fs::create_dir(&blocker).expect("seed blocker directory");
+
+        let blocker_removed = blocker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
+        });
+
+        cleanup_cgroup(cgroup.path()).await;
+
+        assert!(
+            !cgroup.path().exists(),
+            "cleanup_cgroup must retry past a transient removal failure"
+        );
+    }
 
     #[test]
     fn decode_wait_status_splits_exit_and_signal() {
@@ -2519,6 +2622,7 @@ mod tests {
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
             job_id,
+            run_attempt: 1,
             script: String::new(),
             work_dir: String::new(),
             name: name.to_string(),
