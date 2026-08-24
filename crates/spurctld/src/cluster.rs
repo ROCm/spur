@@ -583,11 +583,6 @@ impl ClusterManager {
             }
         }
 
-        apply_default_time_limit(
-            &mut spec,
-            &partitions,
-            config.scheduler.default_time_limit_minutes,
-        );
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache, &config.accounting)?;
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
@@ -598,6 +593,14 @@ impl ClusterManager {
             &self.qos_cache,
             &config.accounting,
         )?;
+        // Wall-time defaulting reads the governing QOS, so it follows QOS defaulting.
+        let wall_caps = self.wall_caps(&spec);
+        apply_default_time_limit(
+            &mut spec,
+            &partitions,
+            config.scheduler.default_time_limit_minutes,
+            wall_caps,
+        );
         self.validate_partition(&spec, &partitions)?;
 
         // Fewer tasks than nodes cannot use the surplus nodes; cap at the task
@@ -4664,6 +4667,33 @@ impl ClusterManager {
     /// limits and the association per-job wall deny unconditionally; stand-alone
     /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
     /// (treated as on when the job has no QOS). `incoming` is the task count added.
+    /// The wall-clock ceilings that already govern this submission, for defaulting.
+    /// An unloaded cache reports nothing rather than holding the job, matching how
+    /// `enforce_submit_limits` treats limits it cannot read yet.
+    fn wall_caps(&self, spec: &JobSpec) -> WallCaps {
+        let qos_minutes = spec
+            .qos
+            .as_deref()
+            .filter(|n| !n.is_empty() && self.qos_cache.is_loaded())
+            .and_then(|name| self.qos_cache.get(name))
+            .and_then(|qos| qos.limits.max_wall_minutes);
+
+        let account_minutes = spec
+            .account
+            .as_deref()
+            .filter(|a| !a.is_empty() && self.association_cache.is_loaded())
+            .and_then(|account| {
+                self.association_cache
+                    .limits(&spec.user, account)
+                    .max_wall_minutes
+            });
+
+        WallCaps {
+            qos_minutes,
+            account_minutes,
+        }
+    }
+
     fn enforce_submit_limits(&self, spec: &JobSpec, incoming: u32) -> Result<(), SubmitError> {
         let jobs = self.jobs.read();
         let user = spec.user.as_str();
@@ -7263,37 +7293,64 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
     }
 }
 
-/// Fill in a job's wall-time when none was requested. Each requested partition
-/// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
-/// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
-/// so the default fits every requested partition; if any requested partition
-/// resolves to no bound the job stays unbounded (unchanged upgrade behavior).
-fn apply_default_time_limit(
-    spec: &mut JobSpec,
-    partitions: &[Partition],
-    cluster_default_minutes: u32,
-) {
-    if spec.time_limit.is_some() {
-        return;
-    }
-
-    // A job may list several partitions (e.g. "gpu,cpu"); fall back to the
-    // default/first partition when the field is unset or names nothing known.
+/// The partitions a job's wall-time defaulting has to satisfy. A job may list
+/// several (e.g. "gpu,cpu"); fall back to the default/first partition when the
+/// field is unset or names nothing known.
+fn partitions_for_defaulting<'a>(
+    spec: &JobSpec,
+    partitions: &'a [Partition],
+) -> Vec<&'a Partition> {
     let matched = spec
         .partition
         .as_deref()
         .map(|p| spur_core::partition::matched_partitions(Some(p), partitions))
         .unwrap_or_default();
-    let requested: Vec<&Partition> = if matched.is_empty() {
-        partitions
-            .iter()
-            .find(|p| p.is_default)
-            .or_else(|| partitions.first())
-            .into_iter()
-            .collect()
-    } else {
-        matched
-    };
+    if !matched.is_empty() {
+        return matched;
+    }
+    partitions
+        .iter()
+        .find(|p| p.is_default)
+        .or_else(|| partitions.first())
+        .into_iter()
+        .collect()
+}
+
+/// The per-job wall-clock ceilings a submission is already subject to, in minutes.
+/// `None` means no figure applies — the limit is unset, or its cache has not loaded
+/// yet, in which case defaulting proceeds as if the limit did not exist rather than
+/// holding the submission. A ceiling of `0` is the "block all" sentinel, not a
+/// zero-length budget, so it is never a value to default to.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WallCaps {
+    qos_minutes: Option<u32>,
+    account_minutes: Option<u32>,
+}
+
+impl WallCaps {
+    fn usable(minutes: Option<u32>) -> Option<u32> {
+        minutes.filter(|m| *m > 0)
+    }
+}
+
+/// Fill in a job's wall-time when none was requested. Each requested partition
+/// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
+/// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
+/// so the default fits every requested partition; if any requested partition
+/// resolves to no bound the governing QOS's or account's `MaxWall` supplies the
+/// limit instead, and a job with neither stays unbounded (unchanged upgrade
+/// behavior).
+fn apply_default_time_limit(
+    spec: &mut JobSpec,
+    partitions: &[Partition],
+    cluster_default_minutes: u32,
+    caps: WallCaps,
+) {
+    if spec.time_limit.is_some() {
+        return;
+    }
+
+    let requested = partitions_for_defaulting(spec, partitions);
     if requested.is_empty() {
         return;
     }
@@ -7312,15 +7369,41 @@ fn apply_default_time_limit(
     let mut chosen: Option<u32> = None;
     for part in &requested {
         match resolve(part) {
-            // An unbounded requested partition means the job may run unlimited
-            // there, so don't impose a default.
-            None => return,
+            // A requested partition that imposes no default leaves the job's wall
+            // ceiling as the only source of one.
+            None => {
+                chosen = wall_cap_default(&requested, caps);
+                break;
+            }
             Some(minutes) => chosen = Some(chosen.map_or(minutes, |c| c.min(minutes))),
         }
     }
     if let Some(minutes) = chosen {
         spec.time_limit = Some(chrono::Duration::minutes(i64::from(minutes)));
     }
+}
+
+/// The per-job wall ceiling as a default. A job has to satisfy the QOS's and the
+/// account's `MaxWall` both, so the smaller of the two is the limit it is really
+/// held to. That value is then kept under the requested partitions' `MaxTime`,
+/// above which the job would pend forever on a limit it never asked for — where
+/// today it simply runs unbounded.
+fn wall_cap_default(requested: &[&Partition], caps: WallCaps) -> Option<u32> {
+    let cap = [
+        WallCaps::usable(caps.qos_minutes),
+        WallCaps::usable(caps.account_minutes),
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
+
+    // The limit has to stay schedulable somewhere: a requested partition with no
+    // `MaxTime` takes any, otherwise the most permissive one is the ceiling.
+    let partition_ceiling = requested
+        .iter()
+        .try_fold(0, |acc: u32, p| p.max_time_minutes.map(|m| acc.max(m)));
+
+    [Some(cap), partition_ceiling].into_iter().flatten().min()
 }
 
 /// Resolve the submitting user's default account from the association cache
@@ -13138,6 +13221,35 @@ mod tests {
         spec.array_spec = Some("0-9".into()); // 10 tasks > 5
         let err = cm.submit_job(spec).unwrap_err();
         assert_submit_denied(&err, "AssocMaxSubmitJobLimit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_gives_a_job_that_asked_for_no_wall_time_the_qos_max_wall() {
+        // Without this the job runs unbounded and shows UNLIMITED, since the
+        // time-limit watchdog has no deadline to enforce.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["burst"]);
+        cm.qos_cache().insert(qos_with_limits(
+            "burst",
+            spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(720),
+                ..Default::default()
+            },
+            false,
+        ));
+
+        let mut spec = basic_spec("nolimit");
+        spec.account = Some("research".into());
+        spec.qos = Some("burst".into());
+        spec.time_limit = None;
+
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(720))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19949,6 +20061,11 @@ mod tests {
         assert_eq!(spec.partition.as_deref(), Some("gpu"));
     }
 
+    /// Defaulting with no QOS or account wall ceiling in play.
+    fn default_time_limit(spec: &mut JobSpec, partitions: &[Partition], cluster_minutes: u32) {
+        super::apply_default_time_limit(spec, partitions, cluster_minutes, WallCaps::default());
+    }
+
     #[test]
     fn apply_default_time_limit_uses_partition_default() {
         let mut spec = basic_spec("j");
@@ -19959,7 +20076,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
     }
 
@@ -19972,7 +20089,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
     }
 
@@ -19986,7 +20103,7 @@ mod tests {
             default_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
@@ -20002,7 +20119,7 @@ mod tests {
             max_time_minutes: Some(120),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(120)));
     }
 
@@ -20019,7 +20136,7 @@ mod tests {
             max_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
     }
 
@@ -20036,7 +20153,7 @@ mod tests {
             max_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
@@ -20061,7 +20178,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
     }
 
@@ -20085,7 +20202,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
@@ -20102,7 +20219,7 @@ mod tests {
             max_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(45)));
     }
 
@@ -20125,8 +20242,181 @@ mod tests {
                 ..Default::default()
             },
         ];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(20)));
+    }
+
+    /// A job that asked for no wall-time, in a partition that imposes no default.
+    fn unbounded_spec_and_partition() -> (JobSpec, Vec<Partition>) {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            ..Default::default()
+        }];
+        (spec, partitions)
+    }
+
+    fn qos_wall(minutes: u32) -> WallCaps {
+        WallCaps {
+            qos_minutes: Some(minutes),
+            account_minutes: None,
+        }
+    }
+
+    #[test]
+    fn apply_default_time_limit_uses_qos_max_wall_when_partitions_impose_none() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_leaves_a_requested_limit_below_max_wall_alone() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        spec.time_limit = Some(chrono::Duration::minutes(30));
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_prefers_the_partition_default_over_max_wall() {
+        // MaxWall is a ceiling, not a default: a partition that supplies one keeps it.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_stays_unbounded_without_any_wall_cap() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        super::apply_default_time_limit(&mut spec, &partitions, 0, WallCaps::default());
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_ignores_a_zero_max_wall() {
+        // `0` is the block-all sentinel; defaulting to it would submit a job that
+        // its own limit kills on the first watchdog tick.
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(0));
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_holds_max_wall_under_the_account_wall() {
+        // An account MaxWall rejects the submission outright, so a default above it
+        // would turn a job that runs today into one that cannot be submitted.
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        let caps = WallCaps {
+            qos_minutes: Some(720),
+            account_minutes: Some(360),
+        };
+        super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(360)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_uses_the_account_wall_when_the_qos_has_none() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        let caps = WallCaps {
+            qos_minutes: None,
+            account_minutes: Some(90),
+        };
+        super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(90)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_ignores_a_zero_account_wall() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        let caps = WallCaps {
+            qos_minutes: Some(720),
+            account_minutes: Some(0),
+        };
+        super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_holds_max_wall_under_the_partition_max_time() {
+        // Above MaxTime the job would pend forever on PartitionTimeLimit, for a
+        // limit it never asked for.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            max_time_minutes: Some(240),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(240)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_takes_the_most_permissive_partition_max_time() {
+        // The job only has to be schedulable somewhere, so the widest requested
+        // MaxTime is the ceiling — not the narrowest.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("small,big".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "small".into(),
+                max_time_minutes: Some(60),
+                ..Default::default()
+            },
+            Partition {
+                name: "big".into(),
+                max_time_minutes: Some(240),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(240)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_ignores_partition_max_time_when_one_is_unlimited() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("capped,unlimited".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "capped".into(),
+                max_time_minutes: Some(60),
+                ..Default::default()
+            },
+            Partition {
+                name: "unlimited".into(),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
+    }
+
+    #[test]
+    fn wall_caps_reports_nothing_until_the_caches_load() {
+        // Fail-open: an unread limit must not decide a job's deadline.
+        let dir = TempDir::new().unwrap();
+        let cluster = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut spec = basic_spec("j");
+        spec.qos = Some("burst".into());
+        spec.account = Some("eng".into());
+
+        let caps = cluster.wall_caps(&spec);
+        assert!(caps.qos_minutes.is_none());
+        assert!(caps.account_minutes.is_none());
     }
 
     #[test]

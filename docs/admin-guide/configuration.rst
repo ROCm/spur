@@ -388,7 +388,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        flat value. Prior to this release the setting was inert (never applied);
        it now takes effect, and its default changed from ``60`` to ``0`` so
        ``-t``-less jobs stay unbounded exactly as before. A site that had set it
-       expecting an effect will now see that effect.
+       expecting an effect will now see that effect. A job the partitions leave
+       unbounded still takes its QOS or association ``MaxWall`` when one is set —
+       see :ref:`maxwall-default`.
    * - ``enforce_part_limits``
      - string
      - ``NO``
