@@ -230,10 +230,10 @@ PARTITION STATE CPUS MEMORY GRES``.
 Node states are shown as short abbreviations: ``idle`` (free), ``alloc`` (fully
 allocated), ``mix`` (partly allocated), ``down``, ``drain`` (offline, not
 accepting jobs), ``drng`` (draining), ``err`` (error), ``unk``
-(unknown/unreachable), ``susp`` (suspended), ``resv`` or ``maint`` for a node
-held by an admin reservation, and — when no reservation applies — ``plnd`` for
-a node that was idle as of the last scheduling cycle but held by the scheduler
-for a specific pending job's upcoming start.
+(unknown/unreachable), ``susp`` (suspended), and — all three only shown while
+the node is currently idle — ``resv`` or ``maint`` for a node held by an admin
+reservation, else ``plnd`` for a node currently held by the scheduler for a
+specific pending job's upcoming start.
 
 Accounting History — ``sacct``
 -------------------------------

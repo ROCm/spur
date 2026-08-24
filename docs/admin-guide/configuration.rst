@@ -489,6 +489,22 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    will preempt a lower-priority running job holding the capacity it needs,
    rather than waiting for it to finish on its own.
 
+.. note::
+
+   Backfill protection for a large multi-node job (holding a node against
+   smaller jobs until the job it's waiting on can start) is only as good as
+   the wall-time information available for the jobs already running. A job
+   with no wall-time is assumed to run for up to a year, but that number is
+   only a placeholder used to size the *reservation itself*; it is not
+   compared against how long an incoming job actually needs the node, so a
+   fully unbounded cluster gets little practical protection from this
+   mechanism — a large job can still be starved by a continuous stream of
+   equally unbounded smaller jobs. Setting ``default_time_limit_minutes``
+   (or a per-partition ``DefaultTime``/``MaxTime``) so jobs carry real
+   wall-time information makes backfill reservations meaningful. For a job
+   that must not be starved by anything wall-time can't bound, use
+   preemption (``preempt_type``, above) instead.
+
 ``[auth]``
 ----------
 

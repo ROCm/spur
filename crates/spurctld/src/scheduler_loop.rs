@@ -2427,7 +2427,7 @@ mod tests {
     fn busy_until_saturates_instead_of_panicking_on_an_extreme_suspended_secs() {
         let now = Utc::now();
         let mut job = running_job_on("node001", now, 60);
-        job.suspended_secs = i64::MAX / 1000;
+        job.suspended_secs = i64::MAX;
 
         let busy_until = busy_until_from_running_jobs(&[job]);
         let got = busy_until["node001"];
