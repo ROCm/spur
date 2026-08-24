@@ -40,7 +40,10 @@ pub fn job_to_json(job: &Job) -> serde_json::Value {
     })
 }
 
-pub fn node_to_json(node: &Node) -> serde_json::Value {
+pub fn node_to_json(
+    node: &Node,
+    planned: Option<(spur_core::job::JobId, chrono::DateTime<chrono::Utc>)>,
+) -> serde_json::Value {
     serde_json::json!({
         "name": node.name,
         "state": node.state.display(),
@@ -53,6 +56,8 @@ pub fn node_to_json(node: &Node) -> serde_json::Value {
         "cpu_load": node.cpu_load,
         "architecture": node.arch,
         "operating_system": node.os,
+        "planned_job_id": planned.map(|(id, _)| id),
+        "planned_start": planned.map(|(_, start)| start.timestamp()),
     })
 }
 

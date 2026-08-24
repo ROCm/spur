@@ -122,6 +122,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         if !raft.is_leader() {
+            // A former leader must not keep serving planned-reservation info
+            // from before it lost leadership.
+            cluster.set_planned_reservations(HashMap::new());
             continue;
         }
 
@@ -142,6 +145,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // even with nothing schedulable.
         let pending = cluster.pending_jobs_and_tag_reasons();
         if pending.is_empty() {
+            // Nothing pending means nothing can be planned either.
+            cluster.set_planned_reservations(HashMap::new());
             continue;
         }
         let hit_depth_limit = pending.len() > max_jobs;
@@ -152,6 +157,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         if nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
+            cluster.set_planned_reservations(HashMap::new());
             continue;
         }
 
@@ -186,10 +192,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 let schedule_time_us =
                     schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
+                // Fail safe: a scheduler that just panicked can't be trusted
+                // to have produced a valid plan, planned or otherwise.
+                cluster.set_planned_reservations(HashMap::new());
                 continue;
             }
         };
         let schedule_time_us = schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        cluster.set_planned_reservations(sched_ref.planned_starts());
 
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.

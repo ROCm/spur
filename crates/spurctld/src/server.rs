@@ -1265,6 +1265,7 @@ impl SlurmController for ControllerService {
 
         let reservations = self.cluster.get_reservations();
         annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
+        annotate_nodes_with_planned_reservations(&mut proto_nodes, &self.cluster);
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
@@ -1298,6 +1299,10 @@ impl SlurmController for ControllerService {
             std::slice::from_mut(&mut proto_node),
             &reservations,
             Utc::now(),
+        );
+        annotate_nodes_with_planned_reservations(
+            std::slice::from_mut(&mut proto_node),
+            &self.cluster,
         );
         Ok(Response::new(proto_node))
     }
@@ -3966,6 +3971,8 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         labels: node.labels.clone(),
         reservation_maint: false,
         features: node.features.clone(),
+        planned_job_id: 0,
+        planned_start: None,
     }
 }
 
@@ -4134,6 +4141,21 @@ fn annotate_nodes_with_reservations(
                     node_info.reservation_maint = true;
                 }
             }
+        }
+    }
+}
+
+fn annotate_nodes_with_planned_reservations(nodes: &mut [NodeInfo], cluster: &ClusterManager) {
+    for node_info in nodes.iter_mut() {
+        // Only meaningful while idle, matching how sinfo displays "plnd" —
+        // a node that has since gone Allocated/Down must not report a
+        // planned reservation left over from an earlier, staler read.
+        if node_info.state != spur_core::node::NodeState::Idle.to_proto_i32() {
+            continue;
+        }
+        if let Some((job_id, start)) = cluster.planned_reservation(&node_info.name) {
+            node_info.planned_job_id = job_id;
+            node_info.planned_start = Some(datetime_to_proto(start));
         }
     }
 }

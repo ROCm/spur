@@ -24,6 +24,9 @@ pub struct Interval {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub resources: ResourceAllocations,
+    /// The job this reservation belongs to, if attributable to exactly one
+    /// (e.g. `None` for the aggregate "current allocation" seed interval).
+    pub job_id: Option<u32>,
 }
 
 /// Incremental sweep over sorted interval start/end events.
@@ -186,10 +189,23 @@ impl NodeTimeline {
         end: DateTime<Utc>,
         resources: ResourceAllocations,
     ) {
+        self.reserve_for_job(start, end, resources, None);
+    }
+
+    /// Like [`reserve`](Self::reserve), attributing the interval to a job so
+    /// callers can later report which pending job a future reservation is for.
+    pub fn reserve_for_job(
+        &mut self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        resources: ResourceAllocations,
+        job_id: Option<u32>,
+    ) {
         self.intervals.push(Interval {
             start,
             end,
             resources,
+            job_id,
         });
         self.intervals.sort_by_key(|i| i.start);
     }

@@ -41,6 +41,25 @@ impl BackfillScheduler {
         }
     }
 
+    /// Nodes that are idle right now but hold a future reservation for a
+    /// specific pending job, as of the last `schedule()` call. Call
+    /// immediately after `schedule()`; the timelines are rebuilt every cycle.
+    pub fn planned_starts(&self) -> HashMap<String, (JobId, chrono::DateTime<Utc>)> {
+        let now = Utc::now();
+        self.timelines
+            .iter()
+            .filter(|tl| tl.accumulated_at(now).is_empty())
+            .filter_map(|tl| {
+                tl.intervals
+                    .iter()
+                    .filter(|iv| iv.start > now)
+                    .filter_map(|iv| iv.job_id.map(|id| (id, iv.start)))
+                    .min_by_key(|(_, start)| *start)
+                    .map(|(job_id, start)| (tl.node_name.clone(), (job_id, start)))
+            })
+            .collect()
+    }
+
     /// Initialize or reset timelines from current cluster state.
     fn init_timelines(&mut self, nodes: &[Node]) {
         self.timelines = nodes
@@ -456,7 +475,12 @@ impl Scheduler for BackfillScheduler {
                         .get(&cluster.nodes[*ni].name)
                         .cloned()
                         .unwrap_or_default();
-                    self.timelines[*ni].reserve(now, now + duration, node_alloc);
+                    self.timelines[*ni].reserve_for_job(
+                        now,
+                        now + duration,
+                        node_alloc,
+                        Some(job.job_id),
+                    );
                 }
 
                 debug!(
@@ -476,7 +500,12 @@ impl Scheduler for BackfillScheduler {
                         .get(&cluster.nodes[*ni].name)
                         .cloned()
                         .unwrap_or_default();
-                    self.timelines[*ni].reserve(earliest, earliest + duration, node_alloc);
+                    self.timelines[*ni].reserve_for_job(
+                        earliest,
+                        earliest + duration,
+                        node_alloc,
+                        Some(job.job_id),
+                    );
                 }
             }
         }
@@ -1443,6 +1472,44 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].job_id, 2);
         assert_eq!(assignments[0].nodes, vec!["node001".to_string()]);
+    }
+
+    #[test]
+    fn planned_starts_reports_the_job_holding_an_idle_nodes_future_reservation() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut big = make_job(7, 2, 1);
+        big.spec.exclusive = true;
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big], &cluster);
+        assert!(assignments.is_empty(), "big job can't start yet");
+
+        let planned = sched.planned_starts();
+        let (job_id, start) = planned
+            .get("node001")
+            .copied()
+            .expect("node001 is idle now but reserved for the pending job");
+        assert_eq!(job_id, 7);
+        assert!(start > Utc::now());
+        // node002 is not idle right now, so it must not show up as "planned".
+        assert!(!planned.contains_key("node002"));
     }
 
     fn make_job_with_nodelist(

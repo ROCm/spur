@@ -425,6 +425,11 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
+    /// Node -> (job_id, start_time) for a node that's idle right now but
+    /// holds a future backfill reservation, refreshed every scheduling cycle.
+    /// Ephemeral like the scheduler's own timelines: never persisted, cheap
+    /// to lose and recompute on restart/failover.
+    planned_reservations: RwLock<HashMap<String, (JobId, DateTime<Utc>)>>,
     /// Last keepalive time per interactive allocation, used by the InactiveLimit
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
@@ -522,6 +527,7 @@ impl ClusterManager {
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
+            planned_reservations: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
         };
@@ -4600,6 +4606,19 @@ impl ClusterManager {
 
     pub fn set_sched_stats(&self, stats: Arc<SchedStatsCollector>) {
         let _ = self.sched_stats.set(stats);
+    }
+
+    pub(crate) fn set_planned_reservations(
+        &self,
+        planned: HashMap<String, (JobId, DateTime<Utc>)>,
+    ) {
+        *self.planned_reservations.write() = planned;
+    }
+
+    /// `(job_id, start_time)` if `node` is idle right now but the scheduler
+    /// holds a future reservation for a specific pending job on it.
+    pub fn planned_reservation(&self, node: &str) -> Option<(JobId, DateTime<Utc>)> {
+        self.planned_reservations.read().get(node).copied()
     }
 
     pub(crate) fn record_sched_cycle(
@@ -9560,6 +9579,26 @@ mod tests {
 
         let node = cm.get_node("worker1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planned_reservation_round_trips_and_defaults_to_none() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert_eq!(cm.planned_reservation("node001"), None);
+
+        let now = Utc::now();
+        let mut planned = HashMap::new();
+        planned.insert("node001".to_string(), (7u32, now));
+        cm.set_planned_reservations(planned);
+
+        assert_eq!(cm.planned_reservation("node001"), Some((7, now)));
+        assert_eq!(cm.planned_reservation("node002"), None);
+
+        // A later cycle with nothing planned clears the stale entry.
+        cm.set_planned_reservations(HashMap::new());
+        assert_eq!(cm.planned_reservation("node001"), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
