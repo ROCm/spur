@@ -402,9 +402,7 @@ mod tests {
 
     #[test]
     fn memory_columns_render_as_raw_megabytes_with_and_without_noconvert() {
-        // The flag is inert only because these cells are already raw MB. Driving the
-        // real render path pins that: humanizing memory_mb or free_memory_mb later
-        // turns this red, which a parse-only test would not.
+        // Pins that %m/%e are raw MB today; humanizing them later turns this red.
         let mut node = make_node("gpu001", NodeState::NodeIdle, "gpu");
         node.total_resources = Some(ResourceSet {
             memory_mb: 2_321_924,
