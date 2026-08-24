@@ -1348,17 +1348,7 @@ async fn run_as_step(
     .await;
 }
 
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else {
-        Ok(s.parse().context("invalid memory value")?)
-    }
-}
+use spur_core::resource::parse_memory_mb;
 
 fn load_hooks_config() -> HooksConfig {
     crate::spur_config::load_spur_config().hooks

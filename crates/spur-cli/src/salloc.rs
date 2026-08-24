@@ -395,17 +395,7 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
     );
 }
 
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else {
-        Ok(s.parse().context("invalid memory value")?)
-    }
-}
+use spur_core::resource::parse_memory_mb;
 
 #[cfg(test)]
 mod tests {

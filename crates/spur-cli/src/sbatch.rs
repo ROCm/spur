@@ -637,21 +637,7 @@ fn parse_datetime_arg(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Parse memory string (e.g., "4G", "4096M", "4096") into MB.
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else if let Some(kb) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
-        let val: u64 = kb.parse().context("invalid memory value")?;
-        Ok(val / 1024)
-    } else {
-        // Default: MB
-        Ok(s.parse().context("invalid memory value")?)
-    }
-}
+use spur_core::resource::parse_memory_mb;
 
 /// Parse a GPU flag value ("4" or "mi300x:4") into a proto GpuRequest.
 pub(crate) fn parse_gpu_flag(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest>> {
