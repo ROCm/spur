@@ -357,8 +357,32 @@ impl BackfillScheduler {
 
             per_node_alloc.insert(
                 node.name.clone(),
-                build_node_allocation(&node.total_resources, &current, &req),
+                build_node_allocation(&node.total_resources, &current, &req)?,
             );
+        }
+        Some(per_node_alloc)
+    }
+
+    /// Resolve per-node allocations for a uniform request against free capacity
+    /// at `at_time`. `None` if any assigned node cannot hold its share then.
+    fn plan_uniform_alloc(
+        &self,
+        job: &Job,
+        required: &ResourceSet,
+        assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
+        nodes: &[Node],
+        at_time: chrono::DateTime<Utc>,
+    ) -> Option<HashMap<String, ResourceAllocations>> {
+        let mut per_node_alloc = HashMap::new();
+        for (ni, _) in assigned_nodes {
+            let node = &nodes[*ni];
+            let node_alloc = if job.spec.exclusive {
+                build_exclusive_allocation(&node.total_resources, required.memory_mb)
+            } else {
+                let current = self.timelines[*ni].accumulated_at(at_time);
+                build_node_allocation(&node.total_resources, &current, required)?
+            };
+            per_node_alloc.insert(node.name.clone(), node_alloc);
         }
         Some(per_node_alloc)
     }
@@ -641,36 +665,23 @@ impl Scheduler for BackfillScheduler {
                 }
             }
 
-            let mut per_node_alloc = HashMap::new();
-            if heterogeneous {
-                // Non-uniform per-node CPU or GPU counts: resolve concrete
-                // per-node allocations against free capacity at the job's
-                // actual (possibly future) start time, same as the uniform path.
-                match self.plan_per_node_alloc(
-                    job,
-                    &demand,
-                    &assigned_nodes,
-                    cluster.nodes,
-                    earliest,
-                ) {
-                    Some(allocs) => per_node_alloc = allocs,
-                    None => {
-                        note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
-                        continue;
-                    }
-                }
+            // Both paths resolve concrete per-node allocations against free
+            // capacity at the job's actual (possibly future) start time. Neither
+            // may book a node it cannot fill: `earliest` is a best effort and
+            // falls back to a fixed horizon when no feasible slot is found.
+            let planned = if heterogeneous {
+                // Non-uniform per-node CPU or GPU counts.
+                self.plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, earliest)
             } else {
-                for (ni, _) in &assigned_nodes {
-                    let node = &cluster.nodes[*ni];
-                    let node_alloc = if job.spec.exclusive {
-                        build_exclusive_allocation(&node.total_resources, required.memory_mb)
-                    } else {
-                        let current = self.timelines[*ni].accumulated_at(earliest);
-                        build_node_allocation(&node.total_resources, &current, &required)
-                    };
-                    per_node_alloc.insert(node.name.clone(), node_alloc);
+                self.plan_uniform_alloc(job, &required, &assigned_nodes, cluster.nodes, earliest)
+            };
+            let per_node_alloc = match planned {
+                Some(allocs) => allocs,
+                None => {
+                    note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
+                    continue;
                 }
-            }
+            };
 
             if earliest <= now {
                 let node_names: Vec<String> = assigned_nodes
@@ -885,6 +896,120 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    // A job deferred to a future start must book the GPUs it will occupy. Resolving the
+    // picks against `now` booked none of them, so another job could take the same window.
+    #[test]
+    fn future_gpu_reservation_holds_the_requested_devices() {
+        let mut sched = BackfillScheduler::new(100);
+
+        // One 8-GPU node with every GPU held by a running job.
+        let mut nodes = vec![make_gpu_node(8)];
+        let mut busy = ResourceAllocations::with_scalar(8, 1024);
+        busy.devices.insert(
+            "gpu".into(),
+            (0..8)
+                .map(spur_core::resource::AllocatedDevice::injectable)
+                .collect(),
+        );
+        nodes[0].alloc_resources = busy;
+
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "waiter".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                gres: vec!["gpu:8".into()],
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let now = Utc::now();
+        assert!(
+            sched.schedule(&[job], &cluster).is_empty(),
+            "every GPU is busy, so nothing starts now"
+        );
+
+        // The running allocation is held for 24h, so the deferred job books the hour after.
+        let booked = sched.timelines[0].accumulated_at(now + Duration::minutes(24 * 60 + 1));
+        assert_eq!(
+            booked.total_device_count("gpu"),
+            8,
+            "the deferred job must book all 8 GPUs it needs"
+        );
+    }
+
+    /// Planning must decline a node it cannot fill at the chosen start rather
+    /// than book the GPUs that happen to be free: a short booking holds part of
+    /// the node while the job still cannot run, and leaves the remainder for
+    /// another job to take inside the same window.
+    #[test]
+    fn plan_uniform_alloc_declines_a_node_it_cannot_fill() {
+        let nodes = vec![make_gpu_node(8)];
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "waiter".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                gres: vec!["gpu:8".into()],
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let required = job_resource_request(&job);
+        let at_time = Utc::now() + Duration::hours(1);
+
+        let mut sched = BackfillScheduler::new(100);
+        sched.init_timelines(&nodes);
+        let assigned = vec![(0usize, at_time)];
+
+        // A free node covers the whole request.
+        let full = sched
+            .plan_uniform_alloc(&job, &required, &assigned, &nodes, at_time)
+            .expect("an idle 8-GPU node can hold a gpu:8 job");
+        assert_eq!(full["gpu-node"].total_device_count("gpu"), 8);
+
+        // Hold five of the eight across `at_time`; three free cannot cover eight.
+        let mut held = ResourceAllocations::with_scalar(8, 1024);
+        held.devices.insert(
+            "gpu".into(),
+            (0..5)
+                .map(spur_core::resource::AllocatedDevice::injectable)
+                .collect(),
+        );
+        sched.timelines[0].reserve(
+            at_time - Duration::hours(1),
+            at_time + Duration::hours(2),
+            held,
+        );
+
+        assert!(
+            sched
+                .plan_uniform_alloc(&job, &required, &assigned, &nodes, at_time)
+                .is_none(),
+            "a node with three free GPUs must not be booked for a gpu:8 job"
+        );
     }
 
     #[test]
