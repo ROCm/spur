@@ -278,22 +278,6 @@ impl Scheduler for BackfillScheduler {
             let heterogeneous = !job.spec.exclusive
                 && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
 
-            // Free GPUs of the requested type per candidate, used to pack the
-            // job onto the most-available nodes.
-            let free_gpu: HashMap<usize, u32> = if demand.is_none() {
-                HashMap::new()
-            } else {
-                suitable
-                    .iter()
-                    .map(|&ni| {
-                        (
-                            ni,
-                            self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), now),
-                        )
-                    })
-                    .collect()
-            };
-
             // Find earliest start across needed_nodes. Exclusive jobs time
             // against the node's full capacity, not their own modest share.
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
@@ -315,6 +299,24 @@ impl Scheduler for BackfillScheduler {
                     (ni, start)
                 })
                 .collect();
+
+            // Free GPUs of the requested type per candidate, used to pack the
+            // job onto the most-available nodes. Evaluated at each node's own
+            // earliest_start, not `now` — a node's present-moment GPU count
+            // can be stale by the time this job would actually land there.
+            let free_gpu: HashMap<usize, u32> = if demand.is_none() {
+                HashMap::new()
+            } else {
+                node_starts
+                    .iter()
+                    .map(|&(ni, start)| {
+                        (
+                            ni,
+                            self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), start),
+                        )
+                    })
+                    .collect()
+            };
 
             node_starts.retain(|(ni, start)| {
                 !Self::start_overlaps_reservation(
