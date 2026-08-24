@@ -123,11 +123,11 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
                 return Err(ArrayError::InvalidSpec(format!("{} > {}", start, end)));
             }
 
-            // Bound element count BEFORE materializing (u64 avoids overflow in the count itself).
+            // Reject an over-cap range before the loop allocates it; u64 avoids count overflow.
             let count = (end as u64 - start as u64) / step as u64 + 1;
-            if task_ids.len() as u64 + count > MAX_ARRAY_SIZE as u64 {
+            if count > MAX_ARRAY_SIZE as u64 {
                 return Err(ArrayError::TooLarge {
-                    count: (task_ids.len() as u64 + count) as usize,
+                    count: count as usize,
                     max: MAX_ARRAY_SIZE,
                 });
             }
@@ -146,13 +146,18 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
                 .map_err(|_| ArrayError::InvalidSpec(format!("invalid id: {}", range_str)))?;
             task_ids.push(id);
         }
-    }
 
-    if task_ids.len() > MAX_ARRAY_SIZE {
-        return Err(ArrayError::TooLarge {
-            count: task_ids.len(),
-            max: MAX_ARRAY_SIZE,
-        });
+        // Compact overlapping ranges to keep peak memory bounded; oversized sets still fail.
+        if task_ids.len() > MAX_ARRAY_SIZE {
+            task_ids.sort_unstable();
+            task_ids.dedup();
+            if task_ids.len() > MAX_ARRAY_SIZE {
+                return Err(ArrayError::TooLarge {
+                    count: task_ids.len(),
+                    max: MAX_ARRAY_SIZE,
+                });
+            }
+        }
     }
 
     task_ids.sort();
@@ -320,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_range_overflow_at_u32_max() {
+    fn parses_range_at_u32_boundary() {
         let spec = parse_array_spec("4294967293-4294967295:2").unwrap();
         assert_eq!(spec.task_ids, vec![4294967293, 4294967295]);
     }
@@ -337,5 +342,20 @@ mod tests {
     fn max_size_boundary_unchanged() {
         assert!(parse_array_spec("0-99999").is_ok());
         assert!(parse_array_spec("0-100000").is_err());
+    }
+
+    #[test]
+    fn overlapping_ranges_dedup_within_cap() {
+        // Regression: pre-dedup counting wrongly rejected identical ranges at the cap.
+        let spec = parse_array_spec("0-99999,0-99999").unwrap();
+        assert_eq!(spec.task_ids.len(), 100_000);
+    }
+
+    #[test]
+    fn distinct_ranges_over_cap_still_rejected() {
+        assert!(matches!(
+            parse_array_spec("0-99999,100000-199999"),
+            Err(ArrayError::TooLarge { .. })
+        ));
     }
 }
