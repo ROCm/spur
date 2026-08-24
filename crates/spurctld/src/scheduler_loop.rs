@@ -157,11 +157,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         let cycle_start = Instant::now();
 
+        let busy_until = running_jobs_busy_until(&cluster);
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
             topology: topology.as_ref(),
+            busy_until: &busy_until,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -518,6 +520,54 @@ pub(crate) fn compute_job_allocation(
                 .filter_map(|name| per_node_alloc.get(name).cloned()),
         )
     }
+}
+
+/// Real per-node "free again at" times, computed once per cycle from actual
+/// running jobs (falls back to a flat placeholder in the caller for nodes
+/// with no entry) instead of guessing at every busy node's remaining time.
+/// Folds in suspended time and the kill grace period so the estimate isn't
+/// optimistic; saturates on overflow instead of panicking on a bad time_limit.
+fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
+    let running = cluster.get_jobs(&JobFilter {
+        states: &[spur_core::job::JobState::Running],
+        ..Default::default()
+    });
+    busy_until_from_running_jobs(&running)
+}
+
+/// Pure core of [`running_jobs_busy_until`], split out so it's testable
+/// without a full `ClusterManager` harness.
+fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<String, DateTime<Utc>> {
+    const UNLIMITED_FALLBACK: chrono::Duration = chrono::Duration::days(365);
+
+    let now = Utc::now();
+    let far_future = now + UNLIMITED_FALLBACK;
+    let mut busy_until: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for job in running {
+        let start = job.start_time.unwrap_or(now);
+        let mut suspended = job.suspended_secs;
+        if let Some(since) = job.suspended_at {
+            suspended += (now - since).num_seconds().max(0);
+        }
+        // Clamp first: an oversized time_limit would overflow the Duration
+        // arithmetic below before checked_add_signed ever gets a chance to guard it.
+        let time_limit = job
+            .spec
+            .time_limit
+            .unwrap_or(UNLIMITED_FALLBACK)
+            .min(UNLIMITED_FALLBACK);
+        let slack = time_limit
+            + chrono::Duration::seconds(suspended)
+            + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let end = start.checked_add_signed(slack).unwrap_or(far_future);
+        for node in &job.allocated_nodes {
+            busy_until
+                .entry(node.clone())
+                .and_modify(|e| *e = (*e).max(end))
+                .or_insert(end);
+        }
+    }
+    busy_until
 }
 
 /// Resolve the effective PreemptMode for a job: QoS override wins if set
@@ -2328,6 +2378,46 @@ mod tests {
         spec.num_tasks = spec.num_tasks.max(1);
         spec.num_nodes = spec.num_nodes.max(1);
         Job::new(1, spec)
+    }
+
+    fn running_job_on(node: &str, start: DateTime<Utc>, minutes: i64) -> Job {
+        let mut job = job_with_spec(JobSpec {
+            time_limit: Some(chrono::Duration::minutes(minutes)),
+            ..Default::default()
+        });
+        job.state = spur_core::job::JobState::Running;
+        job.start_time = Some(start);
+        job.allocated_nodes = vec![node.to_string()];
+        job
+    }
+
+    #[test]
+    fn busy_until_takes_the_max_across_jobs_sharing_a_node() {
+        let now = Utc::now();
+        let sooner = running_job_on("node001", now, 10);
+        let later = running_job_on("node001", now, 60);
+
+        // Larger-ending job processed first: a "last wins" bug (instead of a
+        // true max) would incorrectly keep the smaller value here.
+        let busy_until = busy_until_from_running_jobs(&[later, sooner]);
+
+        let expected =
+            now + chrono::Duration::minutes(60) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let got = busy_until["node001"];
+        assert!(
+            (got - expected).num_seconds().abs() < 2,
+            "expected the later job's end time to win, got {got}, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn busy_until_saturates_instead_of_panicking_on_an_extreme_time_limit() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 0);
+        job.spec.time_limit = Some(chrono::Duration::MAX);
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        assert!(busy_until.contains_key("node001"));
     }
 
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {

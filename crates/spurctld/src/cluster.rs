@@ -4424,8 +4424,7 @@ impl ClusterManager {
                 && eligible.iter().any(|node| {
                     placement.is_listed(&node.name)
                         && node.total_resources.can_satisfy(&required)
-                        && (!placement.matches(node, cluster_state.reservations, now)
-                            || !node.can_satisfy_request(&required))
+                        && !placement.matches_for_reservation(node, cluster_state.reservations, now)
                 })
             {
                 job_entry.set_pending_reason(PendingReason::ReqNodeNotAvail);
@@ -11548,6 +11547,7 @@ mod tests {
         // The guard site in update_pending_reasons. An empty cluster_state would
         // otherwise force Resources/NodeDown.
         let empty_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -11585,6 +11585,7 @@ mod tests {
         assert!(cm.get_job(job_id).unwrap().is_begin_held(Utc::now()));
 
         let empty_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -12321,6 +12322,7 @@ mod tests {
             jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::DeadLine;
         }
         let empty_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -12351,6 +12353,7 @@ mod tests {
         node.alloc_resources = scalar_alloc(4, 8000);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12367,6 +12370,7 @@ mod tests {
         down.state = NodeState::Down;
         let nodes = vec![down];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12395,6 +12399,7 @@ mod tests {
         node.k0s_role = Some(K0sRole::Worker);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12414,6 +12419,7 @@ mod tests {
         busy.state = NodeState::Mixed;
         let nodes = vec![busy];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12451,6 +12457,7 @@ mod tests {
         let n2 = cm.get_node("n2").unwrap();
         let nodes = vec![n1, n2];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12485,6 +12492,7 @@ mod tests {
             cm.get_node("n3").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12523,6 +12531,7 @@ mod tests {
             cm.get_node("n4").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12572,6 +12581,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &reservations,
@@ -12621,6 +12631,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &reservations,
@@ -12651,6 +12662,7 @@ mod tests {
 
         let nodes = vec![cm.get_node("n1").unwrap(), cm.get_node("n2").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12678,6 +12690,7 @@ mod tests {
         // Node has no features.
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -12854,6 +12867,7 @@ mod tests {
 
         // An empty cluster forces a real wait reason, which must win.
         let empty_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -15796,6 +15810,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -16129,6 +16144,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -16207,6 +16223,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -17481,6 +17498,7 @@ mod tests {
         let job = submit_and_wait(&cm, basic_spec("post-teardown"));
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
