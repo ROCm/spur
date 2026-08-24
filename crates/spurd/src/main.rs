@@ -1,20 +1,6 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-mod agent_server;
-mod auth_middleware;
-mod cluster;
-pub mod container;
-mod executor;
-pub(crate) mod job_entry;
-mod landlock;
-mod mpi_plugin;
-pub(crate) mod privdrop;
-pub(crate) mod pty;
-mod reporter;
-mod seccomp;
-pub mod stepd;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,7 +13,8 @@ use spur_core::config::{ConfigError, SlurmConfig};
 use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
-use reporter::NodeReporter;
+use spurd::reporter::NodeReporter;
+use spurd::{agent_server, auth_middleware, executor, reporter, stepd};
 
 fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
     use spur_core::config::MemlockLimit;
@@ -190,17 +177,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let runtime_args: Vec<String> = std::env::args().skip(1).collect();
-    if runtime_args.first().is_some_and(|arg| arg == "__stepd") {
-        let exit_code = stepd::run_process(&runtime_args[1..])
-            .await
-            .map_err(|error| {
-                eprintln!("stepd failed: {error:#}");
-                error
-            })?;
-        std::process::exit(exit_code);
-    }
-
     let matches = Args::command().get_matches();
     // Any source but the built-in default means the operator named this path themselves.
     let explicit_config = matches.value_source("config") != Some(ValueSource::DefaultValue);
@@ -286,17 +262,13 @@ async fn main() -> anyhow::Result<()> {
     // orphan. Reap it locally instead of leaving it running indefinitely.
     for descriptor in &stale_stepds {
         if !descriptor.cgroup_path.as_os_str().is_empty() {
-            crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
+            executor::cleanup_cgroup(&descriptor.cgroup_path).await;
         }
     }
     // A corrupted descriptor has no cgroup_path to read, but the path is
     // reconstructable from identity alone — reap it the same way.
     for &(job_id, run_attempt) in &corrupted_stepds {
-        crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
-            job_id,
-            run_attempt,
-        ))
-        .await;
+        executor::cleanup_cgroup(&executor::expected_cgroup_path(job_id, run_attempt)).await;
     }
     if !recovered_stepds.is_empty() {
         warn!(
@@ -598,9 +570,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server_future = tonic::transport::Server::builder()
-        .layer(crate::auth_middleware::AgentAuthLayer::new(
-            auth_mode, &jwt_key,
-        ))
+        .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
     let server_task = tokio::spawn(server_future);

@@ -51,6 +51,22 @@ struct StepdLaunchOptions {
     plugstack_path: String,
 }
 
+/// `spurstepd` is a separate binary from `spurd` (not a subcommand of it) —
+/// deliberately: the per-job supervisor sits beside untrusted job execution
+/// for a job's whole lifetime, while spurd terminates network RPCs and does
+/// cluster-admin work (k0s); a shared binary would give either role's
+/// compromise the other's dependency surface. It's expected to be installed
+/// alongside spurd, so look there first before falling back to PATH.
+fn resolve_stepd_executable() -> std::path::PathBuf {
+    let co_located = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("spurstepd")));
+    match co_located {
+        Some(path) if path.exists() => path,
+        _ => std::path::PathBuf::from("spurstepd"),
+    }
+}
+
 async fn launch_stepd(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
@@ -106,9 +122,7 @@ async fn launch_stepd(
             anyhow::Error::from(error).context("write runtime launch specification"),
         )
     })?;
-    let executable = std::env::current_exe().map_err(|error| {
-        executor::LaunchError::Other(anyhow::Error::from(error).context("resolve stepd executable"))
-    })?;
+    let executable = resolve_stepd_executable();
     let unit = stepd_unit(config.job_id, run_attempt);
     info!(job_id = config.job_id, run_attempt, unit, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd unit");
     let mut command = tokio::process::Command::new("systemd-run");
@@ -121,7 +135,6 @@ async fn launch_stepd(
         .arg("--no-block")
         .arg("--service-type=exec")
         .arg(executable)
-        .arg("__stepd")
         .arg(state_dir)
         .arg(config.job_id.to_string())
         .arg(run_attempt.to_string())
@@ -351,7 +364,7 @@ mod gpu_deny_tests {
     }
 }
 
-pub(crate) struct TrackedJob {
+pub struct TrackedJob {
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
     stdout_path: String,
@@ -433,14 +446,14 @@ fn resolve_cgroup_budget(
 pub(crate) type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
 
 #[derive(Clone)]
-pub(crate) struct StepdRecoveryCleanup {
+pub struct StepdRecoveryCleanup {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>>,
 }
 
 #[derive(Clone)]
-pub(crate) struct CompletionListenerContext {
+pub struct CompletionListenerContext {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>>,
@@ -449,7 +462,7 @@ pub(crate) struct CompletionListenerContext {
 }
 
 impl StepdRecoveryCleanup {
-    pub(crate) async fn reject(&self, descriptor: &crate::stepd::StepdDescriptor) {
+    pub async fn reject(&self, descriptor: &crate::stepd::StepdDescriptor) {
         self.finish_rejection(
             descriptor,
             stop_stepd_unit(descriptor.job_id, descriptor.run_attempt).await,
@@ -554,11 +567,11 @@ fn cleanup_stepd_files(descriptor: &crate::stepd::StepdDescriptor) {
 }
 
 /// Build an empty running-jobs map to share between the reporter and the agent.
-pub(crate) fn new_running_jobs() -> RunningJobs {
+pub fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-pub(crate) async fn recover_stepds(
+pub async fn recover_stepds(
     running: &RunningJobs,
     descriptors: Vec<crate::stepd::StepdDescriptor>,
 ) {
@@ -839,7 +852,7 @@ const COMPLETION_NOTIFICATION_READ_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 const COMPLETION_ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
-pub(crate) async fn serve_completion_notifications(
+pub async fn serve_completion_notifications(
     listener: tokio::net::UnixListener,
     context: CompletionListenerContext,
 ) {
@@ -979,7 +992,7 @@ fn durable_runtime_exit(
     )
 }
 
-pub(crate) async fn replay_unacknowledged_stepd_completions(
+pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
     controller_addr: &str,
     reporting_node: &str,
@@ -1004,7 +1017,7 @@ pub(crate) async fn replay_unacknowledged_stepd_completions(
     Ok(reconciled)
 }
 
-pub(crate) fn retry_unacknowledged_stepd_completions(
+pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
     controller_addr: String,
     reporting_node: String,
@@ -1362,7 +1375,7 @@ impl AgentService {
         }
     }
 
-    pub(crate) fn monitor_recovered_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
+    pub fn monitor_recovered_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         monitor_recovered_stepds(
             self.running.clone(),
             self.allocation.clone(),
@@ -1373,7 +1386,7 @@ impl AgentService {
         );
     }
 
-    pub(crate) fn monitor_stepd_liveness(&self) {
+    pub fn monitor_stepd_liveness(&self) {
         monitor_stepd_liveness(
             self.running.clone(),
             self.allocation.clone(),
@@ -1384,7 +1397,7 @@ impl AgentService {
 
     /// A handle to the tracked-Stepd map — the only jobs that survive
     /// this process exiting.
-    pub(crate) fn stepds_handle(&self) -> Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>> {
+    pub fn stepds_handle(&self) -> Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>> {
         self.stepds.clone()
     }
 
@@ -1392,7 +1405,7 @@ impl AgentService {
         self.stepds.lock().await.contains_key(&job_id)
     }
 
-    pub(crate) fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
+    pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
         StepdRecoveryCleanup {
             running: self.running.clone(),
             allocation: self.allocation.clone(),
@@ -1400,7 +1413,7 @@ impl AgentService {
         }
     }
 
-    pub(crate) fn completion_listener_context(&self) -> CompletionListenerContext {
+    pub fn completion_listener_context(&self) -> CompletionListenerContext {
         CompletionListenerContext {
             running: self.running.clone(),
             allocation: self.allocation.clone(),
@@ -3781,7 +3794,7 @@ impl SlurmAgent for AgentService {
         request: Request<StartClusterComponentRequest>,
     ) -> Result<Response<StartClusterComponentResponse>, Status> {
         let req = request.into_inner();
-        let role = crate::cluster::ClusterRole::from_str(&req.role)
+        let role = crate::cluster::ClusterRole::parse_role(&req.role)
             .ok_or_else(|| Status::invalid_argument(format!("unknown role: {}", req.role)))?;
         match self
             .k0s
