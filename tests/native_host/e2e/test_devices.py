@@ -572,10 +572,11 @@ class TestMultiNodeSpread:
 
 
 
+# Every case asserts a real GPU device registry but uses the generic
+# unstarted_cluster fixture, so fixture-based auto-marking misses them; mark
+# the whole class explicitly.
+@pytest.mark.gpu
 class TestConfigModes:
-    # Needs a real GPU but uses the generic unstarted_cluster fixture, so
-    # fixture-based auto-marking misses it; mark explicitly.
-    @pytest.mark.gpu
     def test_config_autodetect_default(self, unstarted_cluster):
         cluster = unstarted_cluster
         cluster.gpu_preflight(1)

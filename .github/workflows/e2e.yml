@@ -163,7 +163,7 @@ jobs:
           CLUSTER_ENV=$(mktemp /tmp/cluster-env-XXXXXX.sh)
           echo "cluster_env=$CLUSTER_ENV" >> "$GITHUB_OUTPUT"
           /opt/spur-ci/bin/cluster-up.sh \
-            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}-${{ matrix.shard_id }}" \
             --count "${SPUR_CI_CLUSTER_COUNT:-4}" \
             --image "${SPUR_CI_IMAGE_DIR}/spur-ci-base.qcow2" \
             --gpus-per-vm "${SPUR_CI_GPUS_PER_VM:-0}" \
@@ -238,11 +238,18 @@ jobs:
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
           chmod +x ${{ env.RUN_DIR }}/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
+          rc=0
           pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v \
             -m "${{ matrix.selector }}" \
             --shard-count ${{ matrix.shard_count }} --shard-id ${{ matrix.shard_id }} \
             --durations=25 \
-            --junitxml=${{ env.RUN_DIR }}/results.xml
+            --junitxml=${{ env.RUN_DIR }}/results.xml || rc=\$?
+          # Exit code 5 = no tests collected for this shard; not a failure.
+          if [ "\$rc" -eq 5 ]; then
+            echo "No tests collected for this shard; treating as success."
+            rc=0
+          fi
+          exit \$rc
           REMOTE
 
       - name: Collect results from driver VM
@@ -267,7 +274,7 @@ jobs:
         if: always()
         run: |
           /opt/spur-ci/bin/cluster-down.sh \
-            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}-${{ matrix.shard_id }}" \
             --count "${SPUR_CI_CLUSTER_COUNT:-4}"
 
       - name: Cleanup ephemeral keys
@@ -480,7 +487,7 @@ jobs:
 
   report-native-host:
     name: Report native-host status
-    needs: [native-host]
+    needs: [native-host, mark-running]
     if: always() && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     env:
@@ -505,7 +512,7 @@ jobs:
 
   report-k8s:
     name: Report k8s status
-    needs: [k8s]
+    needs: [k8s, mark-running]
     if: always() && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     env:
