@@ -532,11 +532,8 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-/// Real per-node "free again at" times, computed once per cycle from actual
-/// running jobs (falls back to a flat placeholder in the caller for nodes
-/// with no entry) instead of guessing at every busy node's remaining time.
-/// Folds in suspended time and the kill grace period so the estimate isn't
-/// optimistic; saturates on overflow instead of panicking on a bad time_limit.
+/// Real per-node "free again at" times derived from running jobs, so backfill
+/// doesn't fall back to a flat placeholder for every busy node.
 fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
     let running = cluster.get_jobs(&JobFilter {
         states: &[spur_core::job::JobState::Running],
@@ -557,19 +554,25 @@ fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<Stri
         let start = job.start_time.unwrap_or(now);
         let mut suspended = job.suspended_secs;
         if let Some(since) = job.suspended_at {
-            suspended += (now - since).num_seconds().max(0);
+            suspended = suspended.saturating_add((now - since).num_seconds().max(0));
         }
-        // Clamp first: an oversized time_limit would overflow the Duration
-        // arithmetic below before checked_add_signed ever gets a chance to guard it.
-        let time_limit = job
+        // Saturating i64 math, clamped once at the end: avoids the panicking
+        // Duration + Duration path (a huge suspended_secs alone can overflow it).
+        let time_limit_secs = job
             .spec
             .time_limit
-            .unwrap_or(UNLIMITED_FALLBACK)
-            .min(UNLIMITED_FALLBACK);
-        let slack = time_limit
-            + chrono::Duration::seconds(suspended)
-            + chrono::Duration::seconds(GRACE_PERIOD_SECS);
-        let end = start.checked_add_signed(slack).unwrap_or(far_future);
+            .map(|d| d.num_seconds())
+            .unwrap_or(UNLIMITED_FALLBACK.num_seconds());
+        let slack_secs = time_limit_secs
+            .saturating_add(suspended)
+            .saturating_add(GRACE_PERIOD_SECS)
+            .min(UNLIMITED_FALLBACK.num_seconds());
+        // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
+        // compute an `end` already in the past, producing a backwards interval.
+        let end = start
+            .checked_add_signed(chrono::Duration::seconds(slack_secs))
+            .unwrap_or(far_future)
+            .max(now);
         for node in &job.allocated_nodes {
             busy_until
                 .entry(node.clone())
@@ -2421,13 +2424,28 @@ mod tests {
     }
 
     #[test]
-    fn busy_until_saturates_instead_of_panicking_on_an_extreme_time_limit() {
+    fn busy_until_saturates_instead_of_panicking_on_an_extreme_suspended_secs() {
         let now = Utc::now();
-        let mut job = running_job_on("node001", now, 0);
-        job.spec.time_limit = Some(chrono::Duration::MAX);
+        let mut job = running_job_on("node001", now, 60);
+        job.suspended_secs = i64::MAX / 1000;
 
         let busy_until = busy_until_from_running_jobs(&[job]);
-        assert!(busy_until.contains_key("node001"));
+        let got = busy_until["node001"];
+        assert!(got > now, "expected a sane future timestamp, got {got}");
+    }
+
+    #[test]
+    fn busy_until_does_not_go_backwards_for_a_long_unbounded_job() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now - chrono::Duration::days(400), 0);
+        job.spec.time_limit = None;
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let got = busy_until["node001"];
+        assert!(
+            got >= now,
+            "busy_until must never be in the past relative to now, got {got}, now {now}"
+        );
     }
 
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {

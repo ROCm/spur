@@ -1375,12 +1375,8 @@ mod tests {
         assert_eq!(assignments[0].nodes, vec!["node001".to_string()]);
     }
 
-    // Heterogeneous (uneven per-node CPU split) jobs get the same future
-    // reservation protection as exclusive/uniform jobs, not just the ones
-    // that can start immediately. node001 is sized to exactly match big's
-    // real per-node share (4 cpus) so this is sensitive to reservation size,
-    // not just reservation existence: an under-counted reservation would
-    // leave spare capacity a non-exclusive small job could wrongly claim.
+    // node001 is sized to exactly match big's real per-node share (4 cpus),
+    // so this is sensitive to reservation size, not just existence.
     #[test]
     fn heterogeneous_job_reservation_blocks_an_overlapping_smaller_job() {
         let mut sched = BackfillScheduler::new(100);

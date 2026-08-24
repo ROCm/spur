@@ -9,7 +9,7 @@ The multi_node_cluster fixture validates this and skips if insufficient.
 
 import time
 
-from cluster import parse_job_id, job_state, wait_job
+from cluster import parse_job_id, job_state, wait_job, wait_job_state
 
 
 def _wait_node_state(cluster, node_name, target_states, timeout=60):
@@ -176,6 +176,67 @@ class TestMultiNodeScheduling:
         c2 = cluster.read_output_on_any_node(out2)
         assert "CONCURRENT_DONE" in c1, f"job1 missing CONCURRENT_DONE:\n{c1}"
         assert "CONCURRENT_DONE" in c2, f"job2 missing CONCURRENT_DONE:\n{c2}"
+
+
+class TestBackfillReservation:
+    """A pending 2-node job must reserve its second node instead of letting
+    a smaller job dispatch onto it once the node frees up."""
+
+    def test_large_multinode_job_is_not_starved_by_a_smaller_job(
+        self, multi_node_cluster
+    ):
+        cluster = multi_node_cluster
+        n0, n1 = cluster.node_names[0], cluster.node_names[1]
+
+        filler_script = cluster.write_file(
+            "backfill-filler.sh", "#!/bin/bash\nsleep 8\n"
+        )
+        filler_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "filler", "-N", "1", f"--nodelist={n0}",
+                 "--exclusive", "--time=00:01:00", filler_script]
+            )
+        )
+        assert filler_id is not None
+        wait_job_state(cluster, filler_id, "R", timeout=30)
+
+        big_out = f"{cluster.remote_dir}/backfill-big.out"
+        big_script = cluster.write_file(
+            "backfill-big.sh", "#!/bin/bash\necho BIG_RAN\n"
+        )
+        big_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "backfill-big", "-N", "2", "-o", big_out, big_script]
+            )
+        )
+        assert big_id is not None
+        wait_job_state(cluster, big_id, "PD", timeout=15)
+
+        # small requests a duration long enough to still be occupying n1 when
+        # big's reservation (~90s out, from filler's 1-min time_limit + grace)
+        # would need it — a short-lived small job wouldn't overlap at all and
+        # SHOULD be free to backfill into the gap, so this must outlast it.
+        small_script = cluster.write_file(
+            "backfill-small.sh", "#!/bin/bash\nsleep 200\necho SMALL_RAN\n"
+        )
+        small_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "backfill-small", "-N", "1", f"--nodelist={n1}",
+                 "--exclusive", "--time=00:05:00", small_script]
+            )
+        )
+        assert small_id is not None
+
+        time.sleep(10)
+        sq = cluster.squeue_all()
+        assert job_state(sq, small_id) == "PD", (
+            f"small job should stay pending, reserved capacity was taken:\n{sq}"
+        )
+        cluster.scancel(str(small_id))
+
+        wait_job(cluster, big_id, timeout=90)
+        big_content = cluster.read_output_on_any_node(big_out)
+        assert "BIG_RAN" in big_content, f"big job missing BIG_RAN:\n{big_content}"
 
 
 class TestMultiNodeStateUpdate:
