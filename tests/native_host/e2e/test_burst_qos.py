@@ -296,30 +296,26 @@ class TestBurstQosFullWorkflow:
             _assert_scontrol_state(c, blocked_id, "PENDING", "blocked by cap")
             c.cli_allow_fail(["scancel", str(blocked_id)])
 
-            # [3] User submits under burst-flow QoS — no node cap there, runs normally.
-            # (In a real cluster this would run on a different node; here we use a
-            #  second sbatch without --nodelist so the scheduler picks any free slot.
-            #  If the cluster is single-node, this will pend until a slot opens.
-            #  The assertion below confirms burst-flow admission works at all.)
+            # [3] User submits under burst-flow QoS — no per-user node cap applies.
+            # Pin it to node0 so it contends for the exact slot the normal
+            # preemptor targets in [5]. Without this pin, a multi-node cluster
+            # places burst on a different free node, the freed node0 satisfies the
+            # preemptor directly, and no preemption ever fires. node0 is still held
+            # exclusively by the cap job, so burst pends until [4] frees it.
             burst_script = c.write_file("burst-flow-job.sh", _SLEEP_SCRIPT)
             burst_id = parse_job_id(
-                c.sbatch(["-N1", "--exclusive", "-q", "burst-flow", burst_script])
+                c.sbatch(["-N1", "--exclusive", f"--nodelist={node0}",
+                          "-q", "burst-flow", burst_script])
             )
             assert burst_id is not None, "burst-flow job submit failed"
-            # On a single-node cluster burst must wait for cap job — that's expected
-            # because the node is exclusively held. The key assertion is that it
-            # is not rejected (it is in PD, not immediately CA/F).
-            time.sleep(4)
-            burst_state_after = job_state(c.squeue_all(), burst_id)
-            assert burst_state_after in ("PD", "R"), (
-                f"burst-flow job must be admitted (PD or R), not rejected; got {burst_state_after!r}"
-            )
+            wait_job_state(c, burst_id, "PD", timeout=30)
+            _assert_scontrol_state(c, burst_id, "PENDING", "burst-flow waiting for node0")
 
-            # [4] Cancel the cap job to free the node, then submit a fresh normal job.
+            # [4] Cancel the cap job to free node0 so burst can overflow onto it.
             c.cli_allow_fail(["scancel", str(cap_id)])
             cap_id = None
 
-            # Now burst-flow can run (node is free).
+            # Now burst-flow runs on the freed node0.
             wait_job_state(c, burst_id, "R", timeout=30)
             _assert_scontrol_state(c, burst_id, "RUNNING", "burst-flow running")
 
@@ -330,10 +326,9 @@ class TestBurstQosFullWorkflow:
                           "-q", "normal-cap", normal_script])
             )
             assert normal_id is not None, "normal preemptor submit failed"
-            # On a fast single-node scheduler, preemption may fire before the
-            # 2-second squeue poll sees PD — the normal job goes directly to R.
-            # We verify admission (not rejected) and let the rest of the test
-            # confirm the actual preemption outcome.
+            # A fast scheduler may fire preemption before this poll sees PD — the
+            # normal job then goes directly to R. We verify admission (not
+            # rejected) and let the rest of the test confirm the eviction outcome.
             time.sleep(4)
             sq = c.squeue_all()
             normal_state = job_state(sq, normal_id)
