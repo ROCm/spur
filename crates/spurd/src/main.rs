@@ -17,11 +17,12 @@ mod seccomp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use spur_core::config::SlurmConfig;
+use spur_core::config::{ConfigError, SlurmConfig};
 use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
@@ -53,6 +54,16 @@ fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
              jobs will get at most the hard limit unless spurd runs as root"
         );
     }
+}
+
+/// Whether a best-effort config load failed only because no file exists at the default
+/// path, which is the expected shape for an agent configured entirely by flags.
+///
+/// Anything else — an explicitly requested path, or a file that is present but malformed,
+/// invalid, or unreadable — means settings the operator intended are being ignored, and
+/// has to stay visible.
+fn absent_optional_config(explicit_path: bool, err: &ConfigError) -> bool {
+    !explicit_path && matches!(err, ConfigError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Parse a "key=value" string into a validated label.
@@ -120,7 +131,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    // Any source but the built-in default means the operator named this path themselves.
+    let explicit_config = matches.value_source("config") != Some(ValueSource::DefaultValue);
+    let args = Args::from_arg_matches(&matches)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -156,6 +170,10 @@ async fn main() -> anyhow::Result<()> {
         Ok(config) => {
             info!(path = %args.config.display(), "loaded spur.conf");
             Some(config)
+        }
+        Err(e) if absent_optional_config(explicit_config, &e) => {
+            info!(path = %args.config.display(), "no spur.conf found, using default config");
+            None
         }
         Err(e) => {
             warn!(
@@ -483,5 +501,38 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    #[test]
+    fn absent_config_at_default_path_is_expected() {
+        let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(absent_optional_config(false, &err));
+    }
+
+    #[test]
+    fn absent_config_at_explicit_path_is_reported() {
+        // A typo'd --config must not be silently ignored.
+        let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!absent_optional_config(true, &err));
+    }
+
+    #[test]
+    fn unreadable_config_is_reported_even_at_default_path() {
+        // Present but unreadable is a misconfiguration, not an absent file.
+        let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!absent_optional_config(false, &err));
+    }
+
+    #[test]
+    fn malformed_config_is_reported_even_at_default_path() {
+        let err = SlurmConfig::load_from_str("this is not toml").expect_err("must not parse");
+        assert!(!absent_optional_config(false, &err));
+    }
+
+    #[test]
+    fn invalid_config_is_reported_even_at_default_path() {
+        // Parses, then fails validation — settings the operator wrote are ignored.
+        let err = SlurmConfig::load_from_str("cluster_name = \"\"").expect_err("must not validate");
+        assert!(!absent_optional_config(false, &err));
     }
 }
