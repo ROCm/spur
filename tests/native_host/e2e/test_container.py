@@ -257,8 +257,8 @@ class TestContainerMultiNode:
         assert "RANK=0" in all_output, f"missing RANK=0:\n{all_output}"
         assert "RANK=1" in all_output, f"missing RANK=1:\n{all_output}"
         assert any(
-            l.startswith("MASTER_ADDR=") and l != "MASTER_ADDR="
-            for l in all_output.splitlines()
+            line.startswith("MASTER_ADDR=") and line != "MASTER_ADDR="
+            for line in all_output.splitlines()
         ), f"MASTER_ADDR should be non-empty:\n{all_output}"
 
     def test_two_node_container_dns(self, multi_container_cluster):

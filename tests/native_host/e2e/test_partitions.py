@@ -868,7 +868,6 @@ class TestSlurmsyntax:
         """Full lifecycle using only Slurm-compatible scontrol syntax."""
         name = _unique("slurm-rt")
         nodes_list = ",".join(cluster.node_names)
-        node = cluster.node_names[0]
 
         # Create
         cluster.scontrol(

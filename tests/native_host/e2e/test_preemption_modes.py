@@ -33,9 +33,9 @@ from cluster import job_state, parse_job_id, wait_job, wait_job_state
 _SLEEP_SCRIPT = "#!/bin/bash\nsleep 600\n"
 _QUICK_SCRIPT = "#!/bin/bash\nsleep 5\n"
 
-_WAIT_PREEMPT = 30   # seconds to wait for preemption to fire
-_WAIT_RESUME  = 60   # seconds to wait for a suspended/requeued job to come back up
-_GUARD_SECS   = 10   # seconds to hold before asserting "nothing happened"
+_WAIT_PREEMPT = 30  # seconds to wait for preemption to fire
+_WAIT_RESUME = 60  # seconds to wait for a suspended/requeued job to come back up
+_GUARD_SECS = 10  # seconds to hold before asserting "nothing happened"
 
 _PARTITION = {
     "name": "default",

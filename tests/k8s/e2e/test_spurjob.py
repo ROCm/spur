@@ -42,7 +42,7 @@ class TestSpurJobLifecycle:
         assert "custom=spur-ci-test" in logs, f"expected CUSTOM_VAR in logs:\n{logs}"
         job_idx = logs.find("job=")
         assert job_idx >= 0, f"expected SPUR_JOB_ID in logs:\n{logs}"
-        job_val = logs[job_idx + 4 :].split()[0] if logs[job_idx + 4 :] else ""
+        job_val = logs[job_idx + 4:].split()[0] if logs[job_idx + 4:] else ""
         assert job_val, f"expected non-empty SPUR_JOB_ID in logs:\n{logs}"
 
     def test_multinode_job_assigns_nodes(self, cluster):

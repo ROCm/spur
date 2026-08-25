@@ -60,7 +60,7 @@ class TestSacctmgrShowQos:
     def test_default_output_shows_tres_columns(self, accounting_cluster):
         c = accounting_cluster
         c.sacctmgr(["add", "qos", "name=nodeqos", "priority=50",
-                     "grptres=node=4,cpu=16", "maxtresperjob=node=2"])
+                    "grptres=node=4,cpu=16", "maxtresperjob=node=2"])
         time.sleep(15)
         out = c.sacctmgr(["show", "qos"])
         assert "nodeqos" in out
@@ -70,14 +70,14 @@ class TestSacctmgrShowQos:
     def test_format_selects_specific_fields(self, accounting_cluster):
         c = accounting_cluster
         c.sacctmgr(["add", "qos", "name=fmtqos", "priority=10",
-                     "grptres=cpu=32", "maxtresperjob=cpu=8"])
+                    "grptres=cpu=32", "maxtresperjob=cpu=8"])
         time.sleep(15)
         out = c.sacctmgr(["show", "qos", "format=Name,GrpTRES,MaxTRES"])
         assert "fmtqos" in out
         assert "cpu=32" in out, f"GrpTRES missing: {out!r}"
         assert "cpu=8" in out, f"MaxTRES missing: {out!r}"
         # Priority should NOT appear since it was not in the format list.
-        lines = [l for l in out.splitlines() if "fmtqos" in l]
+        lines = [line for line in out.splitlines() if "fmtqos" in line]
         assert lines, f"no fmtqos row in output: {out!r}"
         assert "Priority" not in out.splitlines()[0], (
             f"Priority column should not appear: {out!r}")
@@ -141,7 +141,7 @@ class TestSacctmgrShowAccount:
     def test_default_output_shows_legacy_columns(self, accounting_cluster):
         c = accounting_cluster
         c.sacctmgr(["add", "account", "name=physics", "description=Physics",
-                     "organization=sciences", "grptres=cpu=16"])
+                    "organization=sciences", "grptres=cpu=16"])
         out = c.sacctmgr(["show", "account"])
         header = next(line for line in out.splitlines() if line.strip())
         for column in ("Account", "Descr", "Org", "Parent", "Share", "GrpTRES"):
@@ -151,7 +151,7 @@ class TestSacctmgrShowAccount:
     def test_format_selects_specific_fields(self, accounting_cluster):
         c = accounting_cluster
         c.sacctmgr(["add", "account", "name=fmtacct", "description=Formatted",
-                     "grptres=cpu=32"])
+                    "grptres=cpu=32"])
         out = c.sacctmgr(["show", "account", "format=Account,GrpTRES"])
         assert "fmtacct" in out
         assert "cpu=32" in out, f"GrpTRES missing: {out!r}"

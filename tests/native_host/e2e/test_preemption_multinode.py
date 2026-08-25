@@ -26,7 +26,7 @@ _SLEEP_SCRIPT = "#!/bin/bash\nsleep 600\n"
 _QUICK_SCRIPT = "#!/bin/bash\nsleep 5\n"
 
 _WAIT_PREEMPT = 30
-_WAIT_RUN     = 60
+_WAIT_RUN = 60
 
 
 # Required when the test runner SSHes in as root: spurd refuses to execute jobs
