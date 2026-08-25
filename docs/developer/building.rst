@@ -69,6 +69,13 @@ All tests are self-contained. No external services needed (no database, no netwo
 
    The E2E suites do not support parallel test execution. Do not use ``pytest-xdist``.
 
+The E2E suites are linted with `flake8 <https://flake8.pycqa.org/>`_, enforced in CI. Run it locally before opening a PR:
+
+.. code-block:: bash
+
+   pip install flake8
+   cd tests && flake8 .
+
 End-to-End Tests (Native-Host)
 ------------------------------
 
