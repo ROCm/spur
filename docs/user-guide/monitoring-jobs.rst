@@ -372,7 +372,8 @@ Detailed Records — ``scontrol show``
 ------------------------------------
 
 ``spur show`` (Slurm ``scontrol show``) prints the full ``Key=Value`` record for
-an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
+an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
+``assoc_mgr``.
 
 .. note::
 
@@ -530,6 +531,54 @@ The accounting database keeps the record permanently. In practice
    that run will show the final completion state only. Requeue and cancel modes
    are unaffected — both write an accounting end-record (``PREEMPTED``) at the
    time of preemption.
+
+Limits Against Usage — ``scontrol show assoc_mgr``
+--------------------------------------------------
+
+``scontrol show assoc_mgr`` answers the question ``squeue`` cannot: how much of a
+QOS or an association each user is holding *right now*, next to the caps that
+govern them. Without it an operator has to infer per-user totals by counting
+``squeue`` rows.
+
+.. code-block:: bash
+
+   scontrol show assoc_mgr
+   scontrol show assoc_mgr alice
+   scontrol show assoc_mgr users=alice
+
+Output is two sections of ``Key=Value`` blocks — QOS records, then association
+records — one block per user per scope:
+
+.. code-block:: text
+
+   QOS Records
+   QOS=highprio User=alice
+      RunningJobs=6 SubmittedJobs=7 RunningTRES=cpu=24,node=6
+      MaxJobsPU=2 MaxSubmitJobsPU= MaxTRESPU=node=4 MaxWall=01:00:00
+      GrpRunningJobs=9 GrpSubmittedJobs=11 GrpRunningTRES=cpu=36,node=9
+      GrpTRES=node=16 GrpSubmitJobs=
+      OverLimit=MaxJobsPU,MaxTRESPU
+
+Reading it:
+
+* ``Running*``/``Submitted*`` and the ``TRES`` figures are live, measured exactly
+  as the scheduler measures them when it admits a job. Node counts are distinct
+  occupied nodes, so two jobs sharing a node hold one node, not two.
+* The ``Grp*`` figures are the whole scope's, summed across every user, and
+  repeat on each of that scope's blocks — a group cap cannot be judged from one
+  user's share alone.
+* ``Max*`` are the caps in force. An empty value means no cap, matching Slurm;
+  a literal ``0`` is a real cap that blocks every job it governs.
+* ``OverLimit`` lists caps the record is **already over**, and is absent when
+  everything is within its cap. Usage over a cap is not a contradiction: caps
+  are applied when a job is admitted and running jobs are never re-checked, so
+  tightening a cap under running work leaves exactly this state.
+
+Two things it deliberately does not do. A QOS or account with no jobs does not
+appear, since records are derived from the queue rather than from the accounting
+definitions — use ``sacctmgr show qos`` to list definitions. And a
+``LimitsReadable=NO`` line above the sections means the accounting caches held no
+snapshot, so no cap could be read; the usage figures are still current.
 
 Cluster Metrics — ``/metrics``
 ------------------------------

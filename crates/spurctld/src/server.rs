@@ -1624,6 +1624,38 @@ impl SlurmController for ControllerService {
         )))
     }
 
+    async fn get_assoc_mgr_info(
+        &self,
+        request: Request<GetAssocMgrInfoRequest>,
+    ) -> Result<Response<GetAssocMgrInfoResponse>, Status> {
+        // Usage is read from the leader's job table, the same one admission reads.
+        if self.check_leader(&request).is_err() {
+            let proxy = &self.leader_proxy;
+            let mut client = proxy.get_leader_client().await?;
+            let fwd = Self::forward_request(request);
+            return client.get_assoc_mgr_info(fwd).await;
+        }
+
+        let user = request.into_inner().user;
+        let info = self
+            .cluster
+            .assoc_mgr_info(Some(user.as_str()).filter(|u| !u.is_empty()));
+
+        Ok(Response::new(GetAssocMgrInfoResponse {
+            qos_records: info
+                .qos_records
+                .iter()
+                .map(|u| assoc_mgr_to_proto(u, AssocMgrScope::Qos))
+                .collect(),
+            assoc_records: info
+                .assoc_records
+                .iter()
+                .map(|u| assoc_mgr_to_proto(u, AssocMgrScope::Association))
+                .collect(),
+            limits_readable: info.limits_readable,
+        }))
+    }
+
     async fn reset_diag_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
         if self.check_leader(&request).is_err() {
             {
@@ -4131,6 +4163,67 @@ fn requested_gpus_detail(spec: &spur_core::job::JobSpec) -> String {
                 format!("gpu:{}[{}]/node", ty(gpu_type.as_deref()), list)
             }
         }
+    }
+}
+
+/// Which side of the hierarchy a usage record came from. A QOS names its
+/// per-user caps `MaxJobsPU`/`MaxTRESPU`, an association names its own
+/// `MaxJobs`/`MaxSubmitJobs`, so the same breach reads differently.
+#[derive(Clone, Copy)]
+enum AssocMgrScope {
+    Qos,
+    Association,
+}
+
+impl AssocMgrScope {
+    fn cap_name(self, cap: spur_core::accounting::Cap) -> &'static str {
+        use spur_core::accounting::Cap;
+        match (self, cap) {
+            (Self::Qos, Cap::MaxJobs) => "MaxJobsPU",
+            (Self::Qos, Cap::MaxSubmitJobs) => "MaxSubmitJobsPU",
+            (Self::Qos, Cap::MaxTres) => "MaxTRESPU",
+            (Self::Association, Cap::MaxJobs) => "MaxJobs",
+            (Self::Association, Cap::MaxSubmitJobs) => "MaxSubmitJobs",
+            (Self::Association, Cap::MaxTres) => "MaxTRES",
+            (_, Cap::GrpTres) => "GrpTRES",
+            (_, Cap::GrpSubmitJobs) => "GrpSubmitJobs",
+        }
+    }
+}
+
+/// One usage record onto the wire. An unset cap carries the `INFINITE` sentinel,
+/// keeping it distinguishable from a literal `0` cap, as `sacctmgr` already does;
+/// TRES becomes its `cpu=N,mem=N` rendering, empty when nothing is held. Caps
+/// already exceeded are named here rather than in the client, so every consumer
+/// reads the same verdict.
+fn assoc_mgr_to_proto(
+    usage: &spur_core::accounting::LimitUsage,
+    scope: AssocMgrScope,
+) -> AssocMgrRecord {
+    let cap = |v: Option<u32>| v.unwrap_or(spur_core::accounting::INFINITE);
+    let tres = |t: &Option<spur_core::accounting::TresRecord>| {
+        t.as_ref().map(|t| t.format()).unwrap_or_default()
+    };
+    AssocMgrRecord {
+        over_limit: usage
+            .exceeded_caps()
+            .into_iter()
+            .map(|c| scope.cap_name(c).to_string())
+            .collect(),
+        user: usage.user.clone(),
+        scope: usage.scope.clone(),
+        running_jobs: usage.running_jobs,
+        submitted_jobs: usage.submitted_jobs,
+        running_tres: usage.running_tres.format(),
+        max_jobs: cap(usage.max_jobs),
+        max_submit_jobs: cap(usage.max_submit_jobs),
+        max_tres: tres(&usage.max_tres),
+        max_wall_minutes: cap(usage.max_wall_minutes),
+        grp_running_jobs: usage.grp_running_jobs,
+        grp_submitted_jobs: usage.grp_submitted_jobs,
+        grp_running_tres: usage.grp_running_tres.format(),
+        grp_tres: tres(&usage.grp_tres),
+        grp_submit_jobs: cap(usage.grp_submit_jobs),
     }
 }
 

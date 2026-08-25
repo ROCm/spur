@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -15,7 +15,7 @@ use spur_core::account_limits::{
     check_account_limits_with_grp_node_charge, check_account_standalone_limits,
     check_account_submit_limits, check_account_wall_limit, AccountCheckResult,
 };
-use spur_core::accounting::{Qos, TresRecord, TresType};
+use spur_core::accounting::{LimitUsage, Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, SlurmConfig};
 use spur_core::job::{
@@ -4753,6 +4753,48 @@ impl ClusterManager {
         &self.association_cache
     }
 
+    /// Limits beside live usage, per user and scope, for `scontrol show assoc_mgr`.
+    /// Usage always reflects the job table; caps appear only where a cache holds a
+    /// snapshot, which `limits_readable` reports so an operator can tell an
+    /// uncapped scope from an unreadable one.
+    pub(crate) fn assoc_mgr_info(&self, only_user: Option<&str>) -> AssocMgrInfo {
+        let (mut qos_records, mut assoc_records) = {
+            let jobs = self.jobs.read();
+            (
+                usage_records(&jobs, |j| named(j.spec.qos.as_deref()), only_user),
+                usage_records(&jobs, |j| named(j.spec.account.as_deref()), only_user),
+            )
+        };
+
+        for record in &mut qos_records {
+            let Some(qos) = self.qos_cache.get(&record.scope) else {
+                continue;
+            };
+            record.max_jobs = qos.limits.max_jobs_per_user;
+            record.max_submit_jobs = qos.limits.max_submit_jobs_per_user;
+            record.max_tres = qos.limits.max_tres_per_user;
+            record.max_wall_minutes = qos.limits.max_wall_minutes;
+            record.grp_tres = qos.limits.grp_tres;
+            record.grp_submit_jobs = qos.limits.grp_submit_jobs;
+        }
+
+        for record in &mut assoc_records {
+            // An association carries no per-user TRES cap, so `max_tres` stays unset.
+            let limits = self.association_cache.limits(&record.user, &record.scope);
+            record.max_jobs = limits.max_running_jobs;
+            record.max_submit_jobs = limits.max_submit_jobs;
+            record.max_wall_minutes = limits.max_wall_minutes;
+            record.grp_tres = limits.grp_tres;
+            record.grp_submit_jobs = limits.grp_submit_jobs;
+        }
+
+        AssocMgrInfo {
+            qos_records,
+            assoc_records,
+            limits_readable: self.qos_cache.is_loaded() && self.association_cache.is_loaded(),
+        }
+    }
+
     /// Resolve a job's QoS from the cache; unknown/absent name → limitless default.
     pub(crate) fn resolve_qos(&self, job: &Job) -> Qos {
         match job.spec.qos.as_deref() {
@@ -6968,6 +7010,72 @@ fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> 
     // real distinct-node occupancy.
     tres.set(TresType::Node, distinct_nodes.len() as u64 + unplaced_nodes);
     tres
+}
+
+/// The limits-versus-usage snapshot behind `scontrol show assoc_mgr`. Usage is
+/// measured the way the admission gate measures it, so a record reads as the
+/// scheduler sees it rather than as a second opinion.
+pub(crate) struct AssocMgrInfo {
+    pub qos_records: Vec<LimitUsage>,
+    pub assoc_records: Vec<LimitUsage>,
+    pub limits_readable: bool,
+}
+
+/// A scope name only counts when it is actually set: an empty QOS or account
+/// string is the same as none.
+fn named(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// Per-(user, scope) holdings for every scope that currently has work, with the
+/// scope's own totals repeated on each of its records. Scopes come from the job
+/// table rather than from the accounting definitions, so a QOS nobody is using
+/// does not appear — `sacctmgr show qos` is where definitions are listed.
+fn usage_records(
+    jobs: &HashMap<JobId, Job>,
+    scope_of: impl Fn(&Job) -> Option<&str>,
+    only_user: Option<&str>,
+) -> Vec<LimitUsage> {
+    let submitted = |j: &Job| matches!(j.state, JobState::Pending | JobState::Running);
+
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    for job in jobs.values().filter(|j| submitted(j)) {
+        let Some(scope) = scope_of(job) else {
+            continue;
+        };
+        if only_user.is_some_and(|u| u != job.spec.user) {
+            continue;
+        }
+        pairs.insert((scope.to_owned(), job.spec.user.clone()));
+    }
+
+    pairs
+        .into_iter()
+        .map(|(scope, user)| {
+            let in_scope = |j: &Job| scope_of(j) == Some(scope.as_str());
+            let mine = |j: &Job| in_scope(j) && j.spec.user == user;
+            LimitUsage {
+                running_jobs: jobs
+                    .values()
+                    .filter(|j| j.state == JobState::Running && mine(j))
+                    .count() as u32,
+                submitted_jobs: jobs.values().filter(|j| submitted(j) && mine(j)).count() as u32,
+                running_tres: sum_running_tres(jobs, mine),
+                grp_running_jobs: jobs
+                    .values()
+                    .filter(|j| j.state == JobState::Running && in_scope(j))
+                    .count() as u32,
+                grp_submitted_jobs: jobs
+                    .values()
+                    .filter(|j| submitted(j) && in_scope(j))
+                    .count() as u32,
+                grp_running_tres: sum_running_tres(jobs, in_scope),
+                user,
+                scope,
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Distinct nodes currently occupied by running jobs matching `pred`, so the
@@ -10911,6 +11019,202 @@ mod tests {
         .unwrap();
         settle(cm, job_id, JobState::Running);
         job_id
+    }
+
+    /// Drive a job in `qos` from `user` to RUNNING on `node`.
+    fn run_qos_job_for(cm: &ClusterManager, user: &str, qos: &str, node: &str) -> JobId {
+        let mut spec = basic_spec("held");
+        spec.user = user.into();
+        spec.qos = Some(qos.into());
+        let job_id = submit_and_wait(cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec![node.into()],
+            resources.clone(),
+            per_node_for(&[node], resources),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_reports_each_user_against_the_qos_cap() {
+        // The SPUR-205 shape: a user over MaxJobsPU with the cap in force. The
+        // record has to name the breach, since nothing else surfaces it once the
+        // jobs are running.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        run_qos_job_for(&cm, "alice", "cnt", "n1");
+        run_qos_job_for(&cm, "alice", "cnt", "n1");
+        run_qos_job_for(&cm, "bob", "cnt", "n1");
+
+        let info = cm.assoc_mgr_info(None);
+        assert_eq!(info.qos_records.len(), 2, "one record per user in the QOS");
+
+        let alice = &info.qos_records[0];
+        assert_eq!(
+            (alice.user.as_str(), alice.scope.as_str()),
+            ("alice", "cnt")
+        );
+        assert_eq!(alice.running_jobs, 2);
+        assert_eq!(alice.max_jobs, Some(1));
+        assert_eq!(
+            alice.exceeded_caps(),
+            vec![spur_core::accounting::Cap::MaxJobs]
+        );
+
+        // The group figures are the scope's, so they are the same on both records
+        // while each user's own count differs.
+        let bob = &info.qos_records[1];
+        assert_eq!(bob.running_jobs, 1);
+        assert!(bob.exceeded_caps().is_empty());
+        assert_eq!(alice.grp_running_jobs, 3);
+        assert_eq!(bob.grp_running_jobs, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_counts_distinct_nodes_like_the_gate() {
+        // Node TRES is distinct-node occupancy, not a sum of per-job node counts:
+        // two jobs sharing one node hold one node, which is what the gate charges.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            ..Default::default()
+        });
+        run_qos_job_for(&cm, "alice", "cnt", "n1");
+        run_qos_job_for(&cm, "alice", "cnt", "n1");
+
+        let info = cm.assoc_mgr_info(None);
+        let alice = &info.qos_records[0];
+        assert_eq!(alice.running_tres.get(TresType::Node), 1);
+        // CPU follows each job's request rather than its allocation, which is the
+        // figure the gate charges; two one-CPU jobs hold two.
+        assert_eq!(alice.running_tres.get(TresType::Cpu), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_filters_to_one_user_without_distorting_group_totals() {
+        // An operator asking about one user still needs the scope's totals, or a
+        // group cap cannot be judged from the filtered view.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            ..Default::default()
+        });
+        run_qos_job_for(&cm, "alice", "cnt", "n1");
+        run_qos_job_for(&cm, "bob", "cnt", "n1");
+
+        let info = cm.assoc_mgr_info(Some("bob"));
+        assert_eq!(info.qos_records.len(), 1);
+        assert_eq!(info.qos_records[0].user, "bob");
+        assert_eq!(info.qos_records[0].running_jobs, 1);
+        assert_eq!(info.qos_records[0].grp_running_jobs, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_reports_usage_with_caps_it_could_not_read() {
+        // With no cache snapshot the usage still stands; only the caps are missing,
+        // and `limits_readable` is what says so rather than the scope looking
+        // uncapped. Shown through the association cache, which starts cold.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut spec = basic_spec("cold");
+        spec.user = "alice".into();
+        spec.account = Some("tenant-a".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            resources.clone(),
+            per_node_for(&["n1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let info = cm.assoc_mgr_info(None);
+        assert!(!info.limits_readable);
+        assert_eq!(info.assoc_records[0].running_jobs, 1);
+        assert_eq!(info.assoc_records[0].max_jobs, None);
+        assert!(info.assoc_records[0].exceeded_caps().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_keeps_qos_and_account_records_apart() {
+        // A job with both lands in both sections, each carrying that hierarchy's
+        // own caps: the account row shows the association's MaxJobs, not the QOS's.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(9),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        cm.association_cache().insert_limits(
+            "alice",
+            "tenant-a",
+            AccountLimits {
+                max_running_jobs: Some(4),
+                ..Default::default()
+            },
+        );
+        let mut spec = basic_spec("both");
+        spec.user = "alice".into();
+        spec.qos = Some("cnt".into());
+        spec.account = Some("tenant-a".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            resources.clone(),
+            per_node_for(&["n1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let info = cm.assoc_mgr_info(None);
+        assert_eq!(info.qos_records.len(), 1);
+        assert_eq!(info.assoc_records.len(), 1);
+        assert_eq!(info.qos_records[0].max_jobs, Some(9));
+        assert_eq!(info.assoc_records[0].scope, "tenant-a");
+        assert_eq!(info.assoc_records[0].max_jobs, Some(4));
+        // Associations carry no per-user TRES cap, so that field stays unset.
+        assert_eq!(info.assoc_records[0].max_tres, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_is_empty_without_any_scoped_work() {
+        // Jobs with neither a QOS nor an account produce no records at all: there
+        // is no scope to report them under.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        run_job_on(&cm, "plain", "n1");
+
+        let info = cm.assoc_mgr_info(None);
+        assert!(info.qos_records.is_empty());
+        assert!(info.assoc_records.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

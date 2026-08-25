@@ -822,9 +822,30 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 }
             }
         }
+        "assoc_mgr" | "assocmgr" => {
+            // Slurm's filter syntax is `users=<name>`; a bare name means the same.
+            let user = name
+                .map(|n| n.strip_prefix("users=").unwrap_or(n).to_string())
+                .unwrap_or_default();
+            let resp = client
+                .get_assoc_mgr_info(spur_proto::proto::GetAssocMgrInfoRequest { user })
+                .await
+                .context("failed to get association manager info")?
+                .into_inner();
+
+            if !resp.limits_readable {
+                println!(
+                    "LimitsReadable=NO (the accounting caches hold no snapshot, so no limit \
+                     below could be read; usage is still current)"
+                );
+                println!();
+            }
+            print!("{}", render_assoc_mgr(QOS_SECTION, &resp.qos_records));
+            print!("{}", render_assoc_mgr(ASSOC_SECTION, &resp.assoc_records));
+        }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, federation, config",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config",
                 other
             );
         }
@@ -848,6 +869,78 @@ async fn ping(controller: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// How one section of `scontrol show assoc_mgr` is labelled. A QOS caps each
+/// user with `MaxJobsPU`, an association caps with plain `MaxJobs`, so the two
+/// sections name the same figures differently.
+struct AssocMgrSection {
+    title: &'static str,
+    scope: &'static str,
+    per_user: &'static str,
+}
+
+const QOS_SECTION: AssocMgrSection = AssocMgrSection {
+    title: "QOS Records",
+    scope: "QOS",
+    per_user: "PU",
+};
+
+const ASSOC_SECTION: AssocMgrSection = AssocMgrSection {
+    title: "Association Records",
+    scope: "Account",
+    per_user: "",
+};
+
+/// Render one section as `Key=Value` blocks, reusing `sacctmgr`'s limit-rendering
+/// vocabulary so a cap reads identically in both commands. Unset caps print as an empty value,
+/// as Slurm's own `assoc_mgr` output does, so the field is always present and a
+/// literal `0` cap stays distinguishable from no cap. Returns a string rather
+/// than printing so the layout is testable without a controller.
+fn render_assoc_mgr(
+    section: AssocMgrSection,
+    records: &[spur_proto::proto::AssocMgrRecord],
+) -> String {
+    let mut out = format!("{}\n", section.title);
+    if records.is_empty() {
+        out.push_str("   (none)\n\n");
+        return out;
+    }
+
+    let pu = section.per_user;
+    for r in records {
+        out.push_str(&format!("{}={} User={}\n", section.scope, r.scope, r.user));
+        out.push_str(&format!(
+            "   RunningJobs={} SubmittedJobs={} RunningTRES={}\n",
+            r.running_jobs, r.submitted_jobs, r.running_tres
+        ));
+        let max_wall = if r.max_wall_minutes == spur_core::accounting::INFINITE {
+            String::new()
+        } else {
+            spur_core::config::format_time(Some(r.max_wall_minutes))
+        };
+        out.push_str(&format!(
+            "   MaxJobs{pu}={} MaxSubmitJobs{pu}={} MaxTRES{pu}={} MaxWall={}\n",
+            crate::sacctmgr::blank_if_unset(r.max_jobs),
+            crate::sacctmgr::blank_if_unset(r.max_submit_jobs),
+            r.max_tres,
+            max_wall,
+        ));
+        out.push_str(&format!(
+            "   GrpRunningJobs={} GrpSubmittedJobs={} GrpRunningTRES={}\n",
+            r.grp_running_jobs, r.grp_submitted_jobs, r.grp_running_tres
+        ));
+        out.push_str(&format!(
+            "   GrpTRES={} GrpSubmitJobs={}\n",
+            r.grp_tres,
+            crate::sacctmgr::blank_if_unset(r.grp_submit_jobs)
+        ));
+        if !r.over_limit.is_empty() {
+            out.push_str(&format!("   OverLimit={}\n", r.over_limit.join(",")));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn state_name(state: i32) -> &'static str {
@@ -2034,6 +2127,76 @@ mod tests {
     fn gpu_tres_label_per_node() {
         assert_eq!(gpu_tres_label("gpu:4/node"), "TresPerNode");
         assert_eq!(gpu_tres_label("gpu:mi300x:2/node"), "TresPerNode");
+    }
+
+    fn assoc_mgr_record() -> spur_proto::proto::AssocMgrRecord {
+        spur_proto::proto::AssocMgrRecord {
+            user: "alice".into(),
+            scope: "highprio".into(),
+            running_jobs: 6,
+            submitted_jobs: 7,
+            running_tres: "cpu=24,node=6".into(),
+            max_jobs: 2,
+            max_submit_jobs: spur_core::accounting::INFINITE,
+            max_tres: "node=4".into(),
+            max_wall_minutes: 60,
+            grp_running_jobs: 9,
+            grp_submitted_jobs: 11,
+            grp_running_tres: "cpu=36,node=9".into(),
+            grp_tres: "node=16".into(),
+            grp_submit_jobs: spur_core::accounting::INFINITE,
+            over_limit: vec!["MaxJobsPU".into(), "MaxTRESPU".into()],
+        }
+    }
+
+    #[test]
+    fn assoc_mgr_qos_section_names_the_per_user_caps() {
+        let out = render_assoc_mgr(QOS_SECTION, &[assoc_mgr_record()]);
+        assert!(out.starts_with("QOS Records\nQOS=highprio User=alice\n"));
+        assert!(out.contains("   RunningJobs=6 SubmittedJobs=7 RunningTRES=cpu=24,node=6\n"));
+        // A QOS caps each user, so its labels carry the PU suffix, and an unset cap
+        // prints as an empty value the way Slurm's own assoc_mgr output does.
+        assert!(out.contains("   MaxJobsPU=2 MaxSubmitJobsPU= MaxTRESPU=node=4 MaxWall=01:00:00\n"));
+        assert!(out.contains("   GrpTRES=node=16 GrpSubmitJobs=\n"));
+        assert!(out.contains("   OverLimit=MaxJobsPU,MaxTRESPU\n"));
+    }
+
+    #[test]
+    fn assoc_mgr_association_section_drops_the_per_user_suffix() {
+        // The same figures under an association are that association's own caps,
+        // not per-user ones, so the PU suffix would misname them.
+        let out = render_assoc_mgr(ASSOC_SECTION, &[assoc_mgr_record()]);
+        assert!(out.starts_with("Association Records\nAccount=highprio User=alice\n"));
+        assert!(out.contains("   MaxJobs=2 MaxSubmitJobs= MaxTRES=node=4 MaxWall=01:00:00\n"));
+    }
+
+    #[test]
+    fn assoc_mgr_omits_the_over_limit_line_when_within_every_cap() {
+        // Absence is the signal that everything is in bounds; an empty OverLimit=
+        // on every compliant record would bury the ones that matter.
+        let record = spur_proto::proto::AssocMgrRecord {
+            over_limit: Vec::new(),
+            ..assoc_mgr_record()
+        };
+        let out = render_assoc_mgr(QOS_SECTION, &[record]);
+        assert!(!out.contains("OverLimit"));
+    }
+
+    #[test]
+    fn assoc_mgr_marks_an_empty_section_rather_than_printing_a_bare_header() {
+        let out = render_assoc_mgr(QOS_SECTION, &[]);
+        assert_eq!(out, "QOS Records\n   (none)\n\n");
+    }
+
+    #[test]
+    fn assoc_mgr_renders_a_zero_cap_as_zero() {
+        // A zero cap blocks every job it governs, so it must not read as "no cap".
+        let record = spur_proto::proto::AssocMgrRecord {
+            max_jobs: 0,
+            ..assoc_mgr_record()
+        };
+        let out = render_assoc_mgr(QOS_SECTION, &[record]);
+        assert!(out.contains("MaxJobsPU=0 "));
     }
 
     #[test]

@@ -130,6 +130,84 @@ impl TresRecord {
     }
 }
 
+/// A cap an operator view can report as already exceeded. Deliberately spelled
+/// neutrally: a QOS names its per-user caps `MaxJobsPU`/`MaxTRESPU` while an
+/// association names its own `MaxJobs`, so the wording is the caller's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cap {
+    MaxJobs,
+    MaxSubmitJobs,
+    MaxTres,
+    GrpTres,
+    GrpSubmitJobs,
+}
+
+/// One user's holdings in a scope — a QOS or an association — beside the caps
+/// governing them and the scope's own totals. `None` caps are unset.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LimitUsage {
+    pub user: String,
+    pub scope: String,
+    pub running_jobs: u32,
+    pub submitted_jobs: u32,
+    pub running_tres: TresRecord,
+    pub grp_running_jobs: u32,
+    pub grp_submitted_jobs: u32,
+    pub grp_running_tres: TresRecord,
+    pub max_jobs: Option<u32>,
+    pub max_submit_jobs: Option<u32>,
+    pub max_tres: Option<TresRecord>,
+    pub max_wall_minutes: Option<u32>,
+    pub grp_tres: Option<TresRecord>,
+    pub grp_submit_jobs: Option<u32>,
+}
+
+impl LimitUsage {
+    /// The caps this usage is already over. A different question from the
+    /// admission checks in `qos`, which project a candidate job onto current
+    /// usage: this reports what stands over a cap *right now*, the state a
+    /// cluster is left in when caps are tightened under running work — running
+    /// jobs are never re-checked, so nothing else surfaces it.
+    pub fn exceeded_caps(&self) -> Vec<Cap> {
+        let over = |used: u32, cap: Option<u32>| cap.is_some_and(|c| used > c);
+        let tres_over = |used: &TresRecord, cap: &Option<TresRecord>| {
+            cap.as_ref().is_some_and(|c| tres_exceeds(used, c))
+        };
+
+        let mut exceeded = Vec::new();
+        if over(self.running_jobs, self.max_jobs) {
+            exceeded.push(Cap::MaxJobs);
+        }
+        if over(self.submitted_jobs, self.max_submit_jobs) {
+            exceeded.push(Cap::MaxSubmitJobs);
+        }
+        if tres_over(&self.running_tres, &self.max_tres) {
+            exceeded.push(Cap::MaxTres);
+        }
+        if tres_over(&self.grp_running_tres, &self.grp_tres) {
+            exceeded.push(Cap::GrpTres);
+        }
+        if over(self.grp_submitted_jobs, self.grp_submit_jobs) {
+            exceeded.push(Cap::GrpSubmitJobs);
+        }
+        exceeded
+    }
+}
+
+/// True when `usage` is over any dimension `cap` actually sets, following the
+/// same rule the QOS gate applies: a dimension capped at 0 is not a cap, and
+/// only the four dimensions the gate checks are compared.
+fn tres_exceeds(usage: &TresRecord, cap: &TresRecord) -> bool {
+    [
+        TresType::Cpu,
+        TresType::Node,
+        TresType::Memory,
+        TresType::Gpu,
+    ]
+    .into_iter()
+    .any(|t| cap.get(t) > 0 && usage.get(t) > cap.get(t))
+}
+
 /// An account in the accounting hierarchy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -281,6 +359,84 @@ mod tests {
     #[test]
     fn test_tres_parse_rejects_unknown_type() {
         assert!(TresRecord::parse("bogus=5").is_err());
+    }
+
+    fn tres(spec: &str) -> TresRecord {
+        TresRecord::parse(spec).unwrap()
+    }
+
+    #[test]
+    fn exceeded_caps_reports_a_user_over_the_job_count_cap() {
+        // The shape a cluster is left in when MaxJobsPU is tightened under
+        // running work, or when the cap went unenforced.
+        let usage = LimitUsage {
+            running_jobs: 6,
+            max_jobs: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(usage.exceeded_caps(), vec![Cap::MaxJobs]);
+    }
+
+    #[test]
+    fn exceeded_caps_is_empty_at_the_cap() {
+        // The cap is a ceiling, not a threshold: sitting exactly on it is legal.
+        let usage = LimitUsage {
+            running_jobs: 2,
+            max_jobs: Some(2),
+            submitted_jobs: 2,
+            max_submit_jobs: Some(2),
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn exceeded_caps_ignores_unset_caps() {
+        let usage = LimitUsage {
+            running_jobs: 99,
+            grp_running_tres: tres("cpu=512"),
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn exceeded_caps_compares_each_tres_dimension_the_gate_compares() {
+        // node is over, cpu is under: the record is over its per-user TRES cap on
+        // the strength of the node dimension alone.
+        let usage = LimitUsage {
+            running_tres: tres("cpu=4,node=6"),
+            max_tres: Some(tres("cpu=64,node=4")),
+            ..Default::default()
+        };
+        assert_eq!(usage.exceeded_caps(), vec![Cap::MaxTres]);
+    }
+
+    #[test]
+    fn exceeded_caps_treats_a_zero_tres_dimension_as_uncapped() {
+        // Matches the gate: a dimension capped at 0 is no cap, so a formatted
+        // record that simply omits a dimension cannot read as a breach.
+        let usage = LimitUsage {
+            running_tres: tres("cpu=8"),
+            max_tres: Some(tres("node=4")),
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn exceeded_caps_reports_group_caps_independently() {
+        let usage = LimitUsage {
+            grp_running_tres: tres("node=9"),
+            grp_tres: Some(tres("node=8")),
+            grp_submitted_jobs: 12,
+            grp_submit_jobs: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(
+            usage.exceeded_caps(),
+            vec![Cap::GrpTres, Cap::GrpSubmitJobs]
+        );
     }
 
     #[test]
