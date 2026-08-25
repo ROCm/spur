@@ -203,11 +203,28 @@ jobs:
   build-docker-image:
     name: Build Docker Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Registry cache avoids the 10 GB Actions cache budget shared with the cargo jobs; writes are gated to main so PRs read-only.
+      - name: Compute build cache ref
+        id: cacheref
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "ref=ghcr.io/${owner}/spur-build-cache:ci" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         uses: docker/build-push-action@v7
@@ -218,8 +235,8 @@ jobs:
           push: false
           tags: spur:ci
           outputs: type=docker,dest=/tmp/spur-image.tar
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ steps.cacheref.outputs.ref }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0},mode=max,ignore-error=true', steps.cacheref.outputs.ref) || '' }}
 
       - name: Upload Docker image
         uses: actions/upload-artifact@v7
