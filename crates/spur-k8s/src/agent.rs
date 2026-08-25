@@ -691,6 +691,17 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
+    async fn receive_file(
+        &self,
+        _request: Request<ReceiveFileRequest>,
+    ) -> Result<Response<ReceiveFileResponse>, Status> {
+        // sbcast fan-out target. The K8s virtual agent has no node-local
+        // filesystem to stage into; pods share storage via volumes instead.
+        Err(Status::unimplemented(
+            "ReceiveFile (sbcast) is not supported by the K8s virtual agent",
+        ))
+    }
+
     async fn cancel_step(
         &self,
         _request: Request<CancelStepRequest>,
