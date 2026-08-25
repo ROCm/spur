@@ -72,6 +72,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --exclude spur-ffi --all-targets --locked
 
+  flake8:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install flake8 and test dependencies
+        run: pip install flake8 -r tests/requirements.txt
+
+      - name: Lint pytest e2e suite
+        run: flake8 --config tests/.flake8 tests/
+
   build:
     runs-on: ubuntu-latest
     steps:
