@@ -545,7 +545,7 @@ fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
 /// without a full `ClusterManager` harness.
 fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<String, DateTime<Utc>> {
-    const UNLIMITED_FALLBACK: chrono::Duration = chrono::Duration::days(365);
+    use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
 
     let now = Utc::now();
     let far_future = now + UNLIMITED_FALLBACK;

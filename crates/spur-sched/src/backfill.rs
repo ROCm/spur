@@ -15,7 +15,7 @@ use spur_core::resource::{
 };
 
 use crate::node_match::NodePlacement;
-use crate::timeline::NodeTimeline;
+use crate::timeline::{NodeTimeline, UNLIMITED_JOB_DURATION};
 use crate::traits::{Assignment, ClusterState, Scheduler};
 
 /// Backfill scheduler.
@@ -31,6 +31,15 @@ pub struct BackfillScheduler {
     timelines: Vec<NodeTimeline>,
     /// Max jobs to consider per cycle.
     max_jobs: usize,
+}
+
+/// Bundles the reservation-authorization inputs shared by every candidate
+/// node check for one job, to keep `earliest_valid_start` under clippy's arg limit.
+#[derive(Clone, Copy)]
+struct ReservationCheck<'a> {
+    job: &'a Job,
+    node: &'a str,
+    reservations: &'a [Reservation],
 }
 
 impl BackfillScheduler {
@@ -68,18 +77,53 @@ impl BackfillScheduler {
             .collect();
     }
 
-    /// Returns true when `[start, start+duration)` intersects a reservation on `node`
-    /// and the job is not authorized for that reservation.
-    fn start_overlaps_reservation(
-        job: &Job,
-        node: &str,
-        reservations: &[Reservation],
+    /// Latest end time among reservations on `node` that `[start, start+duration)`
+    /// would intersect without authorization, or `None` if clear.
+    fn reservation_blocker(
+        res_check: ReservationCheck<'_>,
         start: chrono::DateTime<Utc>,
         duration: chrono::Duration,
-    ) -> bool {
-        reservations
+    ) -> Option<chrono::DateTime<Utc>> {
+        res_check
+            .reservations
             .iter()
-            .any(|res| reservation::prospective_overlap_at(job, res, node, start, duration))
+            .filter(|res| {
+                reservation::prospective_overlap_at(
+                    res_check.job,
+                    res,
+                    res_check.node,
+                    start,
+                    duration,
+                )
+            })
+            .map(|res| res.end_time)
+            .max()
+    }
+
+    /// Earliest time `node` is free of both resource conflicts and reservation
+    /// conflicts for `duration`, searching forward from `floor`. Unlike a plain
+    /// `earliest_start` call, this stays valid even when combined with other
+    /// nodes' own (possibly later) start times in a common-window search.
+    fn earliest_valid_start(
+        &self,
+        ni: usize,
+        res_check: ReservationCheck<'_>,
+        request: &ResourceSet,
+        duration: chrono::Duration,
+        floor: chrono::DateTime<Utc>,
+    ) -> chrono::DateTime<Utc> {
+        let max_check = floor + chrono::Duration::days(365);
+        let mut candidate = floor;
+        loop {
+            if candidate > max_check {
+                return max_check;
+            }
+            candidate = self.timelines[ni].earliest_start(request, duration, candidate);
+            match Self::reservation_blocker(res_check, candidate, duration) {
+                Some(end) => candidate = end,
+                None => return candidate,
+            }
+        }
     }
 
     /// Find nodes that satisfy a job's resource requirements.
@@ -285,7 +329,7 @@ impl Scheduler for BackfillScheduler {
                 .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
                 .count();
             let required = job_resource_request(job);
-            let duration = job.spec.time_limit.unwrap_or(Duration::hours(1));
+            let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
             let needed_nodes = (job.spec.num_nodes as usize).max(1);
 
             let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
@@ -297,17 +341,28 @@ impl Scheduler for BackfillScheduler {
             let heterogeneous = !job.spec.exclusive
                 && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
 
-            // Find earliest start across needed_nodes. Exclusive jobs time
-            // against the node's full capacity, not their own modest share.
+            let timing_request = |ni: usize| -> &ResourceSet {
+                if job.spec.exclusive {
+                    &cluster.nodes[ni].total_resources
+                } else {
+                    &required
+                }
+            };
+
+            // Find earliest start across needed_nodes, folding both resource
+            // and reservation conflicts into one forward search per node.
+            // Exclusive jobs time against the node's full capacity, not
+            // their own modest share.
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
                 .iter()
                 .map(|&ni| {
-                    let timing_request: &ResourceSet = if job.spec.exclusive {
-                        &cluster.nodes[ni].total_resources
-                    } else {
-                        &required
+                    let res_check = ReservationCheck {
+                        job,
+                        node: &cluster.nodes[ni].name,
+                        reservations: cluster.reservations,
                     };
-                    let start = self.timelines[ni].earliest_start(timing_request, duration, now);
+                    let start =
+                        self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
                     debug!(
                         job_id = job.job_id,
                         node = %cluster.nodes[ni].name,
@@ -336,16 +391,6 @@ impl Scheduler for BackfillScheduler {
                     })
                     .collect()
             };
-
-            node_starts.retain(|(ni, start)| {
-                !Self::start_overlaps_reservation(
-                    job,
-                    &cluster.nodes[*ni].name,
-                    cluster.reservations,
-                    *start,
-                    duration,
-                )
-            });
 
             if placement.nodelist_is_additive()
                 && node_starts
@@ -434,7 +479,35 @@ impl Scheduler for BackfillScheduler {
             let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
                 node_starts.into_iter().take(needed_nodes).collect();
 
-            let earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap();
+            // Converge on a start every assigned node is simultaneously free
+            // at — an independently-computed per-node start can be stale
+            // once shifted forward to match the slowest node in the set.
+            let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
+            let common_horizon = now + chrono::Duration::days(365);
+            loop {
+                let next = assigned_nodes
+                    .iter()
+                    .map(|&(ni, _)| {
+                        let res_check = ReservationCheck {
+                            job,
+                            node: &cluster.nodes[ni].name,
+                            reservations: cluster.reservations,
+                        };
+                        self.earliest_valid_start(
+                            ni,
+                            res_check,
+                            timing_request(ni),
+                            duration,
+                            earliest,
+                        )
+                    })
+                    .max()
+                    .unwrap_or(earliest);
+                if next == earliest || earliest >= common_horizon {
+                    break;
+                }
+                earliest = next;
+            }
 
             let mut per_node_alloc = HashMap::new();
             if heterogeneous {
@@ -2641,6 +2714,63 @@ mod tests {
         assert!(
             assignments.is_empty(),
             "job that would overlap upcoming reservation must not schedule"
+        );
+    }
+
+    #[test]
+    fn multi_node_future_reservation_does_not_land_inside_another_reservation() {
+        // node001 is free right now, but has an unauthorized reservation from
+        // +90m to +150m. node002 is busy until +120m. A 2-node job's own
+        // earliest_start on node001 alone is `now` (its 1h duration doesn't
+        // reach the +90m reservation), so the per-node overlap check at that
+        // candidate start passes — but the job's actual placement is shifted
+        // to node002's later availability (+120m), landing it at
+        // [+120m, +180m), which DOES overlap node001's reservation.
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(90),
+            end_time: now + Duration::minutes(150),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let mut big = make_job(1, 2, 1);
+        big.spec.exclusive = true;
+        big.spec.time_limit = Some(Duration::hours(1));
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), now + Duration::minutes(120));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[reservation],
+            topology: None,
+        };
+
+        sched.schedule(&[big], &cluster);
+
+        let node001_conflict = sched.timelines[0].intervals.iter().any(|iv| {
+            iv.job_id == Some(1)
+                && iv.start < now + Duration::minutes(150)
+                && iv.end > now + Duration::minutes(90)
+        });
+        assert!(
+            !node001_conflict,
+            "job's shifted reservation on node001 must not land inside the unauthorized reservation window"
         );
     }
 

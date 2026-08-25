@@ -6394,7 +6394,10 @@ fn reservation_fence_reason(
     }
 
     let now = Utc::now();
-    let duration = job.spec.time_limit.unwrap_or(chrono::Duration::hours(1));
+    let duration = job
+        .spec
+        .time_limit
+        .unwrap_or(spur_sched::UNLIMITED_JOB_DURATION);
     let mut maint_block = false;
     let mut blocked = 0;
     let mut listed_blocked = false;
