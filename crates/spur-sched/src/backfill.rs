@@ -1544,6 +1544,70 @@ mod tests {
     }
 
     #[test]
+    fn heterogeneous_job_future_reservation_does_not_land_inside_another_reservation() {
+        // Same shape as the uniform common-window tests above, but through
+        // the heterogeneous (uneven per-node CPU split) allocation path,
+        // which was never exercised together with a reservation before.
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 4;
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(90),
+            end_time: now + Duration::minutes(150),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let big = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), now + Duration::minutes(120));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[reservation],
+            topology: None,
+        };
+
+        sched.schedule(&[big], &cluster);
+
+        let node001_conflict = sched.timelines[0].intervals.iter().any(|iv| {
+            iv.job_id == Some(1)
+                && iv.start < now + Duration::minutes(150)
+                && iv.end > now + Duration::minutes(90)
+        });
+        assert!(
+            !node001_conflict,
+            "heterogeneous job's shifted reservation on node001 must not land inside the unauthorized reservation window"
+        );
+    }
+
+    #[test]
     fn planned_starts_reports_the_job_holding_an_idle_nodes_future_reservation() {
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2);
