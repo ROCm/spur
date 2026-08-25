@@ -892,8 +892,13 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
+    #[serde(default)]
     pub level: String,
+    /// Output format: `"json"`, `"text"`, or empty/unset. Unset resolves at
+    /// startup to text on a TTY and JSON otherwise.
+    #[serde(default)]
     pub format: String,
+    #[serde(default)]
     pub file: Option<String>,
 }
 
@@ -901,7 +906,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".into(),
-            format: "text".into(),
+            format: String::new(),
             file: None,
         }
     }

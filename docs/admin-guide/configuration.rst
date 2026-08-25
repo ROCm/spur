@@ -902,8 +902,17 @@ WireGuard mesh networking and the agent port.
 ``[logging]``
 -------------
 
-**Reload: Not implemented** for every field below. The section is parsed but no
-daemon reads it.
+**Reload: Restart.** Applied once at daemon startup, so a change takes effect on
+the next restart.
+
+Daemons emit one of two formats. In ``json`` mode every line is a single flat
+JSON object with a fixed schema — ``timestamp`` (RFC 3339, nanoseconds),
+``level`` (lowercase), ``component`` (``spurctld``/``spurd``/``spur-cli``/
+``spur-k8s-operator``), ``target`` (Rust module path), ``message``, plus any
+structured fields the event carried (``job_id``, ``node``, ``error``, ...),
+each keeping its native JSON type. In ``text`` mode the output is the
+human-readable form. Logs always go to stderr; capture them with the service
+manager (for example systemd's journal).
 
 .. list-table::
    :header-rows: 1
@@ -916,12 +925,15 @@ daemon reads it.
    * - ``level``
      - string
      - ``"info"``
-     - Intended log level. Use the ``--log-level`` flag or the ``RUST_LOG``
-       environment variable instead.
+     - Log level (``trace``/``debug``/``info``/``warn``/``error``). Precedence:
+       ``RUST_LOG`` > ``--log-level`` > this field > ``info``.
    * - ``format``
      - string
-     - ``"text"``
-     - Intended log format. Output format is not configurable.
+     - unset
+     - ``"json"`` or ``"text"``. Overridden by ``--log-format``. When unset,
+       daemons emit ``text`` on a TTY and ``json`` otherwise, so an interactive
+       run is readable and a service (no TTY) is structured. The shipped
+       ``examples/spur.conf`` sets ``"json"`` for production.
    * - ``file``
      - string
      - none

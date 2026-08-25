@@ -75,16 +75,7 @@ fn load_controller_addr_from_config() {
 /// dropped, so failures the CLI recovers from would be invisible. Warnings and
 /// above are shown by default; `RUST_LOG` opts into more.
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-
-    // Timestamps and targets are noise next to the CLI's own stderr messages.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .with_target(false)
-        .try_init();
+    spur_logging::init_cli("spur-cli");
 }
 
 fn main() -> anyhow::Result<()> {

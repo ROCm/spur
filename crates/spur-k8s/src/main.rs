@@ -66,9 +66,13 @@ struct Args {
     #[arg(long, env = "SPUR_JWT_KEY")]
     jwt_key: Option<String>,
 
-    /// Log level
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error).
+    #[arg(long)]
+    log_level: Option<String>,
+
+    /// Log format: json or text. Defaults to text on a TTY and json otherwise.
+    #[arg(long)]
+    log_format: Option<String>,
 }
 
 /// Parse the `--auth-mode` flag into an [`AuthMode`], failing loudly on an unknown value rather than
@@ -106,12 +110,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Run => {}
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.parse().unwrap()),
-        )
-        .init();
+    spur_logging::init(
+        "spur-k8s-operator",
+        args.log_level.as_deref(),
+        args.log_format.as_deref(),
+        "",
+        "",
+    );
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
