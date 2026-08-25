@@ -1,0 +1,30 @@
+info: syncing channel updates for 1.95.0-aarch64-apple-darwin
+info: latest update on 2026-04-16 for version 1.95.0 (59807616e 2026-04-14)
+info: component clippy is up to date
+info: component rustfmt is up to date
+info: downloading component llvm-tools
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded prost v0.14.4
+  Downloaded tonic-build v0.14.6
+  Downloaded tonic-prost v0.14.6
+  Downloaded tonic-prost-build v0.14.6
+  Downloaded serial_test v4.0.1
+  Downloaded serial_test_derive v4.0.1
+  Downloaded whoami v2.1.3
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded pulldown-cmark-to-cmark v22.0.0
+  Downloaded toml v1.1.3+spec-1.1.0
+  Downloaded base64 v0.23.1
+  Downloaded tonic v0.14.6
+  Downloaded prost-types v0.14.4
+  Downloaded prost-build v0.14.4
+  Downloaded quinn-udp v0.5.15
+  Downloaded h2 v0.4.16
+  Downloaded aws-lc-rs v1.17.1
+  Downloaded prost-derive v0.14.4
+  Downloaded jsonwebtoken v11.0.0
+  Downloaded quinn-proto v0.11.16
+  Downloaded aws-lc-sys v0.42.0
+error: no library targets found in package `spur-cli`
+error: no library targets found in package `spur-cli`
