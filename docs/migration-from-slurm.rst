@@ -55,10 +55,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Difference
    * - Partitions
      - Defined in ``spur.conf``; there is no runtime ``scontrol create/update/delete partition``. Edit the config and reload the controller to change a partition.
-   * - ``squeue --sort``
-     - Accepted for compatibility; result ordering is not yet applied.
-   * - ``sinfo --states``
-     - Accepted for compatibility; the state filter is not yet applied (all node states are returned).
+   * - ``squeue``/``sinfo`` ``--noconvert``
+     - Accepted for compatibility; Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. Slurm also defines the flag on ``sacct``, ``sstat``, ``sshare`` and ``sreport``, where it is not accepted yet.
    * - ``sacct --jobs``
      - Accepted for compatibility; the job-id filter is not yet applied server-side.
    * - ``sacct`` ``ReqMem``
