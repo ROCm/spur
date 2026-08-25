@@ -1912,6 +1912,52 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(RegisterJobAllocationResponse {}))
     }
 
+    /// Write a broadcast file to this node's local storage for a running job —
+    /// the sbcast fan-out target. Controller-only; uid/gid/work_dir arrive from
+    /// the controller's authoritative job record.
+    async fn receive_file(
+        &self,
+        request: Request<ReceiveFileRequest>,
+    ) -> Result<Response<ReceiveFileResponse>, Status> {
+        // Controller-only: the uid/gid/dest are wire-supplied, so a valid *user*
+        // token calling this directly would be an arbitrary write as any uid.
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+
+        // Mirror job execution: refuse writing as root unless the operator opted in.
+        if let Err(msg) = crate::privdrop::check_root_execution_allowed(
+            req.uid,
+            self.allow_root_jobs,
+            self.spurd_is_root,
+        ) {
+            return Ok(Response::new(ReceiveFileResponse {
+                success: false,
+                message: msg,
+            }));
+        }
+
+        let dest = match crate::sbcast::resolve_dest(&req.dest, &req.work_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                return Ok(Response::new(ReceiveFileResponse {
+                    success: false,
+                    message: e,
+                }))
+            }
+        };
+
+        match crate::sbcast::write_file(&dest, &req.data, req.mode, req.force, req.uid, req.gid) {
+            Ok(()) => Ok(Response::new(ReceiveFileResponse {
+                success: true,
+                message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ReceiveFileResponse {
+                success: false,
+                message: e,
+            })),
+        }
+    }
+
     /// Run a one-shot command on this node, used by srun inside an allocation.
     /// Unlike ExecInJob, this does not require a tracked job process — salloc
     /// allocations don't run anything until srun dispatches a step.
