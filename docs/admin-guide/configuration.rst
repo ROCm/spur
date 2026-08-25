@@ -458,6 +458,37 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``.
 
+.. note::
+
+   A pending job that needs more nodes than currently have free capacity is
+   re-evaluated every scheduling cycle, but does not hold a reservation on
+   any node while it waits. In practice this means: as soon as any node the
+   job could use becomes free, that capacity is available to any other
+   pending job that fits it right now — including one submitted after the
+   larger job and with lower priority. A large multi-node job can therefore
+   sit pending indefinitely behind a steady stream of smaller jobs, even
+   though it has higher priority than every one of them individually,
+   because none of them is ever compared against it directly; each is only
+   checked against whatever capacity is free at that moment.
+
+   The reliable way to guarantee a high-priority job is not indefinitely
+   delayed by lower-priority ones is preemption, not priority alone.
+   Priority only affects the order pending jobs are considered for
+   available capacity — it does not reclaim capacity already given to a
+   running job. Configure:
+
+   - A priority gap of more than 2× between the jobs that must run and the
+     jobs they need to be able to displace (via base ``--priority``, QOS
+     ``priority``, or a combination — see :doc:`accounting` for how the
+     effective priority gap is computed).
+   - ``preempt_type`` (and, if a running job should not simply be killed,
+     ``preemptmode=requeue`` or ``suspend`` on its QOS) so that gap actually
+     triggers preemption instead of only affecting scheduling order.
+
+   With both in place, a high-priority job that cannot find free capacity
+   will preempt a lower-priority running job holding the capacity it needs,
+   rather than waiting for it to finish on its own.
+
 ``[auth]``
 ----------
 
