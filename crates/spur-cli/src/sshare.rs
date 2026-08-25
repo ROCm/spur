@@ -7,7 +7,13 @@ use spur_proto::proto::{GetUsageRequest, ListAccountsRequest, ListUsersRequest};
 
 /// Display fair-share information by account and user.
 #[derive(Parser, Debug)]
-#[command(name = "sshare", about = "Show fair-share information")]
+// -h is sshare's --noheader (Slurm convention), so disable clap's auto -h and
+// re-add --help below as long-only.
+#[command(
+    name = "sshare",
+    about = "Show fair-share information",
+    disable_help_flag = true
+)]
 pub struct SshareArgs {
     /// Show only this user
     #[arg(short = 'u', long)]
@@ -24,6 +30,10 @@ pub struct SshareArgs {
     /// Don't print header
     #[arg(short = 'h', long)]
     pub noheader: bool,
+
+    /// Print help
+    #[arg(long, action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
 
     /// Controller address (accounting is served on the same port)
     #[arg(
@@ -219,4 +229,22 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_h_is_noheader_not_help() {
+        let args = SshareArgs::try_parse_from(["sshare", "-h"]).unwrap();
+        assert!(args.noheader);
+    }
+
+    #[test]
+    fn long_help_flag_is_preserved() {
+        // -h is reclaimed for --noheader, but --help must still print help.
+        let err = SshareArgs::try_parse_from(["sshare", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
 }
