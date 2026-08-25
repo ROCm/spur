@@ -12,8 +12,12 @@
 #   1. pending "Waiting for CI to complete..."  -> set-e2e-pending.yml, on PRs.
 #   2. pending "Running E2E tests..."           -> mark-running (this file, CI ok).
 #   3. success/failure                          -> report-* (this file, per pool).
-#   If CI does not succeed, mark-skipped sets a terminal state instead of (2)/(3):
-#   failure for a real CI failure, error for cancelled/other (e.g. superseded).
+#   mark-skipped sets a terminal state instead of (2)/(3) when either:
+#   - CI didn't succeed: failure for a real CI failure, error for cancelled/other
+#     (e.g. superseded).
+#   - CI succeeded but the PR is a draft carrying the `no-e2e-on-draft` label:
+#     success, so the check doesn't block merge; re-evaluated on every CI run,
+#     so E2E resumes automatically once the PR leaves draft state.
 # For direct pushes to main (no PR), the first status appears at step 2/skip.
 #
 # Trigger migration to pull_request_target is deferred to a follow-up PR.
@@ -28,22 +32,64 @@ permissions:
   statuses: write
   actions: read
   contents: read
+  pull-requests: read
+
+# Serialize (not cancel) overlapping E2E evaluations for the same branch: native-host/k8s
+# provision real VMs, so cancelling mid-flight risks orphaning them if cleanup steps don't
+# finish within GitHub's grace window. Queuing avoids that while still avoiding redundant
+# concurrent runs when a branch gets multiple CI completions in quick succession (e.g. a
+# draft PR marked ready shortly after its first CI run finishes).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
 
 jobs:
   mark-skipped:
     name: Mark E2E skipped
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion != 'success'
     permissions:
       statuses: write
       contents: read
+      pull-requests: read
+    outputs:
+      draft-skip: ${{ steps.draft-check.outputs.skip }}
     steps:
       - uses: actions/checkout@v7
         with:
           sparse-checkout: .github/workflows/e2e.yml
           sparse-checkout-cone-mode: false
 
+      - name: Check for no-e2e-on-draft skip
+        id: draft-check
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: actions/github-script@v9
+        with:
+          # Wrapped in try/catch so a transient API error can never fail this job:
+          # a failed job here would skip mark-running/native-host/k8s via `needs`
+          # (they'd never reach their own `if:`), leaving report-* to post a
+          # false "failure" instead of running E2E as normal.
+          script: |
+            try {
+              const sha = context.payload.workflow_run.head_sha;
+              // Note: this API returns [] for fork PRs whose head commit sits on
+              // the fork's default branch (a known GitHub limitation) — such PRs
+              // fail open (E2E still runs) rather than being skippable.
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner, repo: context.repo.repo, commit_sha: sha,
+              });
+              const pr = prs.find((p) => p.head.sha === sha);
+              const skip = !!pr && pr.draft && pr.labels.some((l) => l.name.toLowerCase() === 'no-e2e-on-draft');
+              core.setOutput('skip', skip ? 'true' : 'false');
+              if (skip) {
+                core.notice(`Skipping E2E: PR #${pr.number} is a draft with the 'no-e2e-on-draft' label.`);
+              }
+            } catch (err) {
+              core.warning(`draft-check failed, defaulting to running E2E: ${err.message}`);
+              core.setOutput('skip', 'false');
+            }
+
       - name: Mark E2E statuses
+        if: github.event.workflow_run.conclusion != 'success' || steps.draft-check.outputs.skip == 'true'
         uses: actions/github-script@v9
         with:
           script: |
@@ -59,12 +105,20 @@ jobs:
 
             const sha = '${{ github.event.workflow_run.head_sha }}';
             const conclusion = '${{ github.event.workflow_run.conclusion }}';
-            // error (not failure) when CI didn't genuinely fail, so a
-            // cancelled/superseded run is distinguishable from a real failure.
-            const state = conclusion === 'failure' ? 'failure' : 'error';
-            const desc = conclusion === 'failure'
-              ? 'E2E skipped: CI failed'
-              : `E2E skipped: CI ${conclusion}`;
+            const draftSkip = '${{ steps.draft-check.outputs.skip }}' === 'true';
+
+            let state, desc;
+            if (draftSkip) {
+              state = 'success';
+              desc = "E2E skipped: draft PR with 'no-e2e-on-draft' label";
+            } else {
+              // error (not failure) when CI didn't genuinely fail, so a
+              // cancelled/superseded run is distinguishable from a real failure.
+              state = conclusion === 'failure' ? 'failure' : 'error';
+              desc = conclusion === 'failure'
+                ? 'E2E skipped: CI failed'
+                : `E2E skipped: CI ${conclusion}`;
+            }
 
             for (const ctx of contexts) {
               await github.rest.repos.createCommitStatus({
@@ -78,8 +132,9 @@ jobs:
 
   mark-running:
     name: Mark E2E running
+    needs: mark-skipped
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -108,7 +163,8 @@ jobs:
   native-host:
     name: native-host (${{ matrix.pool }} ${{ matrix.shard_id }}/${{ matrix.shard_count }})
     runs-on: [self-hosted, spur-e2e, "${{ matrix.pool }}"]
-    if: github.event.workflow_run.conclusion == 'success'
+    needs: mark-skipped
+    if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -288,7 +344,8 @@ jobs:
   k8s:
     name: k8s
     runs-on: [self-hosted, spur-e2e, non-gpu]
-    if: github.event.workflow_run.conclusion == 'success'
+    needs: mark-skipped
+    if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     env:
       SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
       RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-k8s
@@ -487,8 +544,8 @@ jobs:
 
   report-native-host:
     name: Report native-host status
-    needs: [native-host, mark-running]
-    if: always() && github.event.workflow_run.conclusion == 'success'
+    needs: [native-host, mark-running, mark-skipped]
+    if: always() && github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     runs-on: ubuntu-latest
     env:
       STATUS_CONTEXT: "E2E / native-host"
@@ -512,8 +569,8 @@ jobs:
 
   report-k8s:
     name: Report k8s status
-    needs: [k8s, mark-running]
-    if: always() && github.event.workflow_run.conclusion == 'success'
+    needs: [k8s, mark-running, mark-skipped]
+    if: always() && github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     runs-on: ubuntu-latest
     env:
       STATUS_CONTEXT: "E2E / k8s"
