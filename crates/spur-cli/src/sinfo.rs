@@ -329,13 +329,16 @@ fn resolve_partition_field(
 }
 
 fn effective_state_str(node: &NodeInfo) -> String {
-    if !node.active_reservation.is_empty()
-        && node.state == spur_proto::proto::NodeState::NodeIdle as i32
-    {
-        if node.reservation_maint {
-            return "maint".into();
+    if node.state == spur_proto::proto::NodeState::NodeIdle as i32 {
+        if !node.active_reservation.is_empty() {
+            if node.reservation_maint {
+                return "maint".into();
+            }
+            return "resv".into();
         }
-        return "resv".into();
+        if node.planned_job_id != 0 {
+            return "plnd".into();
+        }
     }
     spur_core::node::NodeState::from_proto_i32(node.state)
         .map(|s| s.short().to_string())
@@ -805,6 +808,27 @@ mod tests {
     #[test]
     fn test_effective_state_mixed_reserved() {
         let node = make_reserved_node("n1", NodeState::NodeMixed, "p", "maint");
+        assert_eq!(effective_state_str(&node), "mix");
+    }
+
+    #[test]
+    fn test_effective_state_idle_with_planned_reservation_shows_plnd() {
+        let mut node = make_node("n1", NodeState::NodeIdle, "p");
+        node.planned_job_id = 42;
+        assert_eq!(effective_state_str(&node), "plnd");
+    }
+
+    #[test]
+    fn test_effective_state_active_reservation_wins_over_planned() {
+        let mut node = make_reserved_node("n1", NodeState::NodeIdle, "p", "resv1");
+        node.planned_job_id = 42;
+        assert_eq!(effective_state_str(&node), "resv");
+    }
+
+    #[test]
+    fn test_effective_state_planned_only_applies_when_idle() {
+        let mut node = make_node("n1", NodeState::NodeMixed, "p");
+        node.planned_job_id = 42;
         assert_eq!(effective_state_str(&node), "mix");
     }
 

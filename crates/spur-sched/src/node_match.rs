@@ -186,6 +186,17 @@ impl<'a> NodePlacement<'a> {
         true
     }
 
+    /// Like [`matches`](Self::matches), but admits a busy-yet-up node as a
+    /// candidate for a *future* reservation instead of excluding it outright.
+    pub fn matches_for_reservation(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
+        !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.state.is_up()
+    }
+
     fn reservation_ok(
         &self,
         node: &Node,
@@ -308,6 +319,38 @@ mod tests {
             n.k0s_role = Some(role);
             assert!(!p.matches(&n, &[], now), "{role:?} must be excluded");
         }
+    }
+
+    #[test]
+    fn matches_for_reservation_admits_a_fully_busy_but_healthy_node() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut n = node("n1");
+        n.state = NodeState::Allocated;
+        n.alloc_resources = spur_core::resource::ResourceAllocations::with_scalar(64, 256_000);
+
+        assert!(!p.matches(&n, &[], now), "matches() still excludes it");
+        assert!(
+            p.matches_for_reservation(&n, &[], now),
+            "a fully-busy Allocated node is still a valid future-reservation candidate"
+        );
+    }
+
+    #[test]
+    fn matches_for_reservation_still_excludes_down_and_k0s_nodes() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut down = node("n1");
+        down.state = NodeState::Down;
+        assert!(!p.matches_for_reservation(&down, &[], now));
+
+        let mut k0s = node("n2");
+        k0s.k0s_role = Some(spur_core::k0s::K0sRole::Worker);
+        assert!(!p.matches_for_reservation(&k0s, &[], now));
     }
 
     #[test]

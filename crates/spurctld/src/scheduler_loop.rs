@@ -122,6 +122,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         if !raft.is_leader() {
+            // A former leader must not keep serving planned-reservation info
+            // from before it lost leadership.
+            cluster.set_planned_reservations(HashMap::new());
             continue;
         }
 
@@ -142,6 +145,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // even with nothing schedulable.
         let pending = cluster.pending_jobs_and_tag_reasons();
         if pending.is_empty() {
+            // Nothing pending means nothing can be planned either.
+            cluster.set_planned_reservations(HashMap::new());
             continue;
         }
         let hit_depth_limit = pending.len() > max_jobs;
@@ -152,16 +157,19 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         if nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
+            cluster.set_planned_reservations(HashMap::new());
             continue;
         }
 
         let cycle_start = Instant::now();
 
+        let busy_until = running_jobs_busy_until(&cluster);
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
             topology: topology.as_ref(),
+            busy_until: &busy_until,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -184,10 +192,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 let schedule_time_us =
                     schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
+                // Fail safe: a scheduler that just panicked can't be trusted
+                // to have produced a valid plan, planned or otherwise.
+                cluster.set_planned_reservations(HashMap::new());
                 continue;
             }
         };
         let schedule_time_us = schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        cluster.set_planned_reservations(sched_ref.planned_starts());
 
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
@@ -518,6 +530,57 @@ pub(crate) fn compute_job_allocation(
                 .filter_map(|name| per_node_alloc.get(name).cloned()),
         )
     }
+}
+
+/// Real per-node "free again at" times derived from running jobs, so backfill
+/// doesn't fall back to a flat placeholder for every busy node.
+fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
+    let running = cluster.get_jobs(&JobFilter {
+        states: &[spur_core::job::JobState::Running],
+        ..Default::default()
+    });
+    busy_until_from_running_jobs(&running)
+}
+
+/// Pure core of [`running_jobs_busy_until`], split out so it's testable
+/// without a full `ClusterManager` harness.
+fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<String, DateTime<Utc>> {
+    use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
+
+    let now = Utc::now();
+    let far_future = now + UNLIMITED_FALLBACK;
+    let mut busy_until: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for job in running {
+        let start = job.start_time.unwrap_or(now);
+        let mut suspended = job.suspended_secs;
+        if let Some(since) = job.suspended_at {
+            suspended = suspended.saturating_add((now - since).num_seconds().max(0));
+        }
+        // Saturating i64 math, clamped once at the end: avoids the panicking
+        // Duration + Duration path (a huge suspended_secs alone can overflow it).
+        let time_limit_secs = job
+            .spec
+            .time_limit
+            .map(|d| d.num_seconds())
+            .unwrap_or(UNLIMITED_FALLBACK.num_seconds());
+        let slack_secs = time_limit_secs
+            .saturating_add(suspended)
+            .saturating_add(GRACE_PERIOD_SECS)
+            .min(UNLIMITED_FALLBACK.num_seconds());
+        // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
+        // compute an `end` already in the past, producing a backwards interval.
+        let end = start
+            .checked_add_signed(chrono::Duration::seconds(slack_secs))
+            .unwrap_or(far_future)
+            .max(now);
+        for node in &job.allocated_nodes {
+            busy_until
+                .entry(node.clone())
+                .and_modify(|e| *e = (*e).max(end))
+                .or_insert(end);
+        }
+    }
+    busy_until
 }
 
 /// Resolve the effective PreemptMode for a job: QoS override wins if set
@@ -2328,6 +2391,95 @@ mod tests {
         spec.num_tasks = spec.num_tasks.max(1);
         spec.num_nodes = spec.num_nodes.max(1);
         Job::new(1, spec)
+    }
+
+    fn running_job_on(node: &str, start: DateTime<Utc>, minutes: i64) -> Job {
+        let mut job = job_with_spec(JobSpec {
+            time_limit: Some(chrono::Duration::minutes(minutes)),
+            ..Default::default()
+        });
+        job.state = spur_core::job::JobState::Running;
+        job.start_time = Some(start);
+        job.allocated_nodes = vec![node.to_string()];
+        job
+    }
+
+    #[test]
+    fn busy_until_takes_the_max_across_jobs_sharing_a_node() {
+        let now = Utc::now();
+        let sooner = running_job_on("node001", now, 10);
+        let later = running_job_on("node001", now, 60);
+
+        // Larger-ending job processed first: a "last wins" bug (instead of a
+        // true max) would incorrectly keep the smaller value here.
+        let busy_until = busy_until_from_running_jobs(&[later, sooner]);
+
+        let expected =
+            now + chrono::Duration::minutes(60) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let got = busy_until["node001"];
+        assert!(
+            (got - expected).num_seconds().abs() < 2,
+            "expected the later job's end time to win, got {got}, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn busy_until_saturates_instead_of_panicking_on_an_extreme_suspended_secs() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 60);
+        job.suspended_secs = i64::MAX;
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let got = busy_until["node001"];
+        assert!(got > now, "expected a sane future timestamp, got {got}");
+    }
+
+    #[test]
+    fn busy_until_does_not_go_backwards_for_a_long_unbounded_job() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now - chrono::Duration::days(400), 0);
+        job.spec.time_limit = None;
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let got = busy_until["node001"];
+        assert!(
+            got >= now,
+            "busy_until must never be in the past relative to now, got {got}, now {now}"
+        );
+    }
+
+    #[test]
+    fn busy_until_accounts_for_currently_suspended_time() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.suspended_at = Some(now - chrono::Duration::minutes(5));
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let expected = now
+            + chrono::Duration::minutes(10)
+            + chrono::Duration::minutes(5)
+            + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let got = busy_until["node001"];
+        assert!(
+            (got - expected).num_seconds().abs() < 2,
+            "expected suspended time folded in, got {got}, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn busy_until_falls_back_to_now_when_start_time_is_missing() {
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.start_time = None;
+
+        let busy_until = busy_until_from_running_jobs(&[job]);
+        let expected =
+            now + chrono::Duration::minutes(10) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let got = busy_until["node001"];
+        assert!(
+            (got - expected).num_seconds().abs() < 2,
+            "expected now-based fallback, got {got}, expected ~{expected}"
+        );
     }
 
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {

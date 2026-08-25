@@ -280,6 +280,11 @@ message NodeInfo {
   map<string, string> labels = 51;
   bool reservation_maint = 52;
   repeated string features = 53;
+
+  // Set when the node is idle right now but the scheduler holds a future
+  // reservation for a specific pending job (0 = no planned reservation).
+  uint32 planned_job_id = 54;
+  google.protobuf.Timestamp planned_start = 55;
 }
 
 message PartitionInfo {
