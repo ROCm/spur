@@ -138,6 +138,13 @@ CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_submit_time ON jobs(submit_time);
 CREATE INDEX IF NOT EXISTS idx_jobs_start_time ON jobs(start_time);
+-- Serves the GrpWall consumption aggregate, which otherwise scans the whole job
+-- history on every cache refresh; a refresh slow enough to time out leaves the
+-- budget unenforced. end_time leads because it carries the window predicate and
+-- is the only selective one: ordering by qos instead leaves nothing to narrow,
+-- and the planner then prefers a full scan.
+CREATE INDEX IF NOT EXISTS idx_jobs_grp_wall_window ON jobs(end_time, qos, start_time)
+    WHERE qos <> '' AND start_time IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_start, period_end);
 CREATE INDEX IF NOT EXISTS idx_assoc_user ON associations(user_name);
 CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
@@ -705,11 +712,10 @@ pub async fn get_usage(
 /// be written by callers outside the controller and can skew, and a single
 /// end-before-start row would otherwise cancel real consumption in the same QOS
 /// and under-report the budget.
-pub async fn consumed_wall_minutes_by_qos(
-    pool: &PgPool,
-    window_days: u32,
-) -> anyhow::Result<HashMap<String, u64>> {
-    let rows = sqlx::query(
+/// A macro rather than a `const` so the test can prefix it with `EXPLAIN` via
+/// `concat!`: sqlx 0.9 accepts only statically known SQL.
+macro_rules! consumed_wall_minutes_sql {
+    () => {
         r#"
         SELECT qos,
                SUM(GREATEST(
@@ -724,11 +730,18 @@ pub async fn consumed_wall_minutes_by_qos(
           AND start_time IS NOT NULL
           AND (end_time IS NULL OR end_time > now() - make_interval(days => $1))
         GROUP BY qos
-        "#,
-    )
-    .bind(window_days as i32)
-    .fetch_all(pool)
-    .await?;
+        "#
+    };
+}
+
+pub async fn consumed_wall_minutes_by_qos(
+    pool: &PgPool,
+    window_days: u32,
+) -> anyhow::Result<HashMap<String, u64>> {
+    let rows = sqlx::query(consumed_wall_minutes_sql!())
+        .bind(window_days as i32)
+        .fetch_all(pool)
+        .await?;
 
     let consumed = rows
         .iter()
@@ -1897,6 +1910,42 @@ mod job_history_tests {
         );
 
         delete_jobs(&pool, &ids).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn grp_wall_aggregate_is_servable_from_its_index() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+
+        // A partial index qualifies only if its predicate is implied by the query's
+        // WHERE, which is the part that rots silently when either side is edited.
+        // Forcing seqscan off makes the planner say whether the pairing still holds
+        // on a table too small for it to prefer the index on cost alone.
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let plan = sqlx::query(concat!("EXPLAIN ", consumed_wall_minutes_sql!()))
+            .bind(14i32)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            plan.contains("idx_jobs_grp_wall_window"),
+            "GrpWall consumption must be servable from idx_jobs_grp_wall_window; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains("end_time"),
+            "the window predicate must reach the index, or its cost tracks total \
+             history instead of the window; plan was:\n{plan}"
+        );
+
+        tx.rollback().await?;
         Ok(())
     }
 
