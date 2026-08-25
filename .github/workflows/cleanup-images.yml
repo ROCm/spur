@@ -12,11 +12,14 @@ permissions:
 jobs:
   prune:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [spur-ci, spur-build-cache]
     steps:
-      - name: Delete old CI images
+      - name: Delete old ${{ matrix.package }} images
         uses: actions/delete-package-versions@v5
         with:
-          package-name: spur-ci
+          package-name: ${{ matrix.package }}
           package-type: container
           min-versions-to-keep: 20
           ignore-versions: "^(latest|v\\d+)"
