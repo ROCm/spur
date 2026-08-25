@@ -425,10 +425,8 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
-    /// Node -> (job_id, start_time) for a node that's idle right now but
-    /// holds a future backfill reservation, refreshed every scheduling cycle.
-    /// Ephemeral like the scheduler's own timelines: never persisted, cheap
-    /// to lose and recompute on restart/failover.
+    /// Node -> (job_id, start_time) for a future backfill reservation,
+    /// refreshed every cycle. Ephemeral: never persisted, cheap to recompute.
     planned_reservations: RwLock<HashMap<String, (JobId, DateTime<Utc>)>>,
     /// Last keepalive time per interactive allocation, used by the InactiveLimit
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives

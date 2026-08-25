@@ -233,7 +233,9 @@ accepting jobs), ``drng`` (draining), ``err`` (error), ``unk``
 (unknown/unreachable), ``susp`` (suspended), and — all three only shown while
 the node is currently idle — ``resv`` or ``maint`` for a node held by an admin
 reservation, else ``plnd`` for a node currently held by the scheduler for a
-specific pending job's upcoming start.
+specific pending job's upcoming start. The idle gate is checked live, but the
+job and start time shown for ``plnd`` reflect the most recent scheduling
+cycle (``scheduler.interval_secs``), not the current instant.
 
 Accounting History — ``sacct``
 -------------------------------

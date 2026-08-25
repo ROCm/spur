@@ -50,8 +50,8 @@ impl BackfillScheduler {
         }
     }
 
-    /// Nodes that are idle right now but hold a future reservation for a
-    /// specific pending job, as of the last `schedule()` call. Call
+    /// Nodes with no resources currently allocated but a future reservation
+    /// for a specific pending job, as of the last `schedule()` call. Call
     /// immediately after `schedule()`; the timelines are rebuilt every cycle.
     pub fn planned_starts(&self) -> HashMap<String, (JobId, chrono::DateTime<Utc>)> {
         let now = Utc::now();
@@ -100,10 +100,8 @@ impl BackfillScheduler {
             .max()
     }
 
-    /// Earliest time `node` is free of both resource conflicts and reservation
-    /// conflicts for `duration`, searching forward from `floor`. Unlike a plain
-    /// `earliest_start` call, this stays valid even when combined with other
-    /// nodes' own (possibly later) start times in a common-window search.
+    /// Earliest time `node` is free of both resource and reservation
+    /// conflicts for `duration`, searching forward from `floor`.
     fn earliest_valid_start(
         &self,
         ni: usize,
@@ -349,10 +347,9 @@ impl Scheduler for BackfillScheduler {
                 }
             };
 
-            // Find earliest start across needed_nodes, folding both resource
-            // and reservation conflicts into one forward search per node.
-            // Exclusive jobs time against the node's full capacity, not
-            // their own modest share.
+            // Earliest start per node, folding resource and reservation
+            // conflicts into one search. Exclusive jobs time against the
+            // node's full capacity, not their own modest share.
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
                 .iter()
                 .map(|&ni| {
@@ -374,10 +371,8 @@ impl Scheduler for BackfillScheduler {
                 })
                 .collect();
 
-            // Free GPUs of the requested type per candidate, used to pack the
-            // job onto the most-available nodes. Evaluated at each node's own
-            // earliest_start, not `now` — a node's present-moment GPU count
-            // can be stale by the time this job would actually land there.
+            // Free GPUs per candidate, evaluated at each node's own
+            // earliest_start (not `now`, which can be stale by then).
             let free_gpu: HashMap<usize, u32> = if demand.is_none() {
                 HashMap::new()
             } else {
@@ -503,10 +498,14 @@ impl Scheduler for BackfillScheduler {
                     })
                     .max()
                     .unwrap_or(earliest);
-                if next == earliest || earliest >= common_horizon {
+                // Advance before checking the horizon: the horizon only
+                // bounds iteration count, it must never discard a freshly
+                // computed (more accurate) value.
+                let converged = next == earliest;
+                earliest = next;
+                if converged || earliest >= common_horizon {
                     break;
                 }
-                earliest = next;
             }
 
             let mut per_node_alloc = HashMap::new();
@@ -2783,13 +2782,9 @@ mod tests {
 
     #[test]
     fn multi_node_future_reservation_does_not_land_inside_another_reservation() {
-        // node001 is free right now, but has an unauthorized reservation from
-        // +90m to +150m. node002 is busy until +120m. A 2-node job's own
-        // earliest_start on node001 alone is `now` (its 1h duration doesn't
-        // reach the +90m reservation), so the per-node overlap check at that
-        // candidate start passes — but the job's actual placement is shifted
-        // to node002's later availability (+120m), landing it at
-        // [+120m, +180m), which DOES overlap node001's reservation.
+        // node001 is idle but reserved +90m to +150m; node002 is busy until
+        // +120m, shifting the job's actual placement to [+120m, +180m) —
+        // which overlaps node001's reservation unless revalidated.
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2);
         nodes[1].state = NodeState::Allocated;
