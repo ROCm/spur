@@ -206,7 +206,7 @@ impl SlurmAccounting for AccountingService {
             .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_end(
             &mut conn,
-            req.job_id as i32,
+            req.job_id as i64,
             state_str,
             req.exit_code,
             end_time,

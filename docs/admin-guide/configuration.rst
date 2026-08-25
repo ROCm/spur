@@ -190,7 +190,8 @@ and Raft high-availability topology.
      - ``999999999``
      - Not implemented
      - Intended as the job-ID wrap point. No code consumes it; the counter does
-       not wrap.
+       not wrap. Job IDs are 32-bit unsigned and stored as 64-bit in the
+       accounting database, so the full range is usable without one.
    * - ``first_job_id``
      - integer
      - ``1``

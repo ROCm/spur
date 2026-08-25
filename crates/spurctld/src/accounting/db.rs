@@ -33,7 +33,7 @@ const SCHEMA_LOCK_OBJ: i32 = 1;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id          INTEGER PRIMARY KEY,
+    job_id          BIGINT PRIMARY KEY,
     name            TEXT NOT NULL DEFAULT '',
     user_name       TEXT NOT NULL,
     uid             INTEGER NOT NULL DEFAULT 0,
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS associations (
 );
 
 CREATE TABLE IF NOT EXISTS tres_usage (
-    job_id          INTEGER NOT NULL,
+    job_id          BIGINT NOT NULL,
     tres_type       TEXT NOT NULL,
     alloc_value     BIGINT NOT NULL DEFAULT 0,
     used_value      BIGINT NOT NULL DEFAULT 0,
@@ -158,9 +158,34 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
+
+-- Job ids are u32 in the scheduler but these columns were INTEGER, so an id above
+-- i32::MAX wrapped negative and could collide with an unrelated row instead of
+-- failing. Guarded on the current type because ALTER TYPE rewrites the table and
+-- takes ACCESS EXCLUSIVE: it must run once on upgrade, not on every start.
+DO $$
+DECLARE
+    target RECORD;
+BEGIN
+    FOR target IN
+        SELECT *
+        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'))
+             AS t(tbl, col)
+    LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = target.tbl
+              AND column_name = target.col
+              AND data_type = 'integer'
+        ) THEN
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN %I TYPE BIGINT', target.tbl, target.col);
+        END IF;
+    END LOOP;
+END $$;
 
 -- users.default_account is the single source of truth for a user's default
 -- account (the scheduler reads it via the association cache). associations
@@ -254,7 +279,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             end_time = NULL
         "#,
     )
-    .bind(rec.job_id as i32)
+    .bind(rec.job_id as i64)
     .bind(&rec.name)
     .bind(&rec.user)
     .bind(&rec.account)
@@ -275,7 +300,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     let row = sqlx::query(
         "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
     )
-    .bind(rec.job_id as i32)
+    .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -292,13 +317,13 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
 #[allow(clippy::too_many_arguments)]
 pub async fn record_job_end(
     conn: &mut PgConnection,
-    job_id: i32,
+    job_id: i64,
     state: &str,
     exit_code: i32,
     end_time: DateTime<Utc>,
     exit_signal: i32,
     derived_exit_code: i32,
-    preempted_by: Option<i32>,
+    preempted_by: Option<i64>,
     preempt_mode: &str,
     preempt_qos: &str,
 ) -> anyhow::Result<()> {
@@ -352,8 +377,8 @@ pub struct AccountingRowState {
 /// by the reconciliation pass to detect jobs missing or stale in accounting.
 pub async fn job_accounting_states(
     pool: &PgPool,
-    job_ids: &[i32],
-) -> anyhow::Result<HashMap<i32, AccountingRowState>> {
+    job_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, AccountingRowState>> {
     if job_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -366,7 +391,7 @@ pub async fn job_accounting_states(
     Ok(rows
         .into_iter()
         .map(|r| {
-            let job_id: i32 = r.get("job_id");
+            let job_id: i64 = r.get("job_id");
             let user_name: String = r.get("user_name");
             let start_time: Option<DateTime<Utc>> = r.get("start_time");
             let row = AccountingRowState {
@@ -428,7 +453,7 @@ async fn update_usage(
 /// Job record returned from history queries.
 #[derive(Debug)]
 pub struct JobRecord {
-    pub job_id: i32,
+    pub job_id: i64,
     pub name: String,
     pub user_name: String,
     pub account: String,
@@ -444,7 +469,7 @@ pub struct JobRecord {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub reservation: String,
-    pub preempted_by: Option<i32>,
+    pub preempted_by: Option<i64>,
     pub preempt_mode: String,
     pub preempt_qos: String,
 }
@@ -1404,9 +1429,9 @@ mod job_history_tests {
     use super::*;
     use chrono::Duration;
 
-    fn test_job_id(slot: u32) -> i32 {
-        const BASE: i32 = 9_000_000;
-        BASE + (std::process::id() as i32 % 10_000) * 10 + slot as i32
+    fn test_job_id(slot: u32) -> i64 {
+        const BASE: i64 = 9_000_000;
+        BASE + (std::process::id() as i64 % 10_000) * 10 + slot as i64
     }
 
     async fn test_pool() -> anyhow::Result<PgPool> {
@@ -1419,7 +1444,7 @@ mod job_history_tests {
         Ok(pool)
     }
 
-    async fn delete_jobs(pool: &PgPool, ids: &[i32]) -> anyhow::Result<()> {
+    async fn delete_jobs(pool: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
         for id in ids {
             sqlx::query("DELETE FROM jobs WHERE job_id = $1")
                 .bind(id)
@@ -1435,7 +1460,7 @@ mod job_history_tests {
     #[allow(clippy::too_many_arguments)]
     async fn start(
         pool: &PgPool,
-        job_id: i32,
+        job_id: i64,
         name: &str,
         user: &str,
         account: &str,
@@ -1470,7 +1495,7 @@ mod job_history_tests {
     #[allow(clippy::too_many_arguments)]
     async fn start_with_qos(
         pool: &PgPool,
-        job_id: i32,
+        job_id: i64,
         name: &str,
         user: &str,
         account: &str,
@@ -1508,7 +1533,7 @@ mod job_history_tests {
 
     async fn end(
         pool: &PgPool,
-        job_id: i32,
+        job_id: i64,
         state: &str,
         exit_code: i32,
         end_time: DateTime<Utc>,
@@ -1711,6 +1736,123 @@ mod job_history_tests {
 
         delete_jobs(&pool, &[id]).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn job_ids_past_i32_survive_the_accounting_round_trip() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        // The largest id the scheduler can hand out. Narrowed to i32 it arrived as
+        // -1 and, job_id being the primary key, landed on whatever row held that id
+        // rather than failing.
+        let id = i64::from(u32::MAX);
+        let preempter = id - 1;
+        let user = format!("spur_wide_id_{}", std::process::id());
+        delete_jobs(&pool, &[id, preempter]).await.ok();
+
+        let t0 = Utc::now() - Duration::hours(2);
+        start(&pool, id, "wide", &user, "", "", 1, 1, 1, 0, t0, t0, "").await?;
+
+        let mut conn = pool.acquire().await?;
+        record_job_end(
+            &mut conn,
+            id,
+            "PREEMPTED",
+            0,
+            Utc::now(),
+            0,
+            0,
+            Some(preempter),
+            "requeue",
+            "high",
+        )
+        .await?;
+        drop(conn);
+
+        let history = get_job_history(&pool, Some(&user), None, None, None, &[], 100).await?;
+        let row = history
+            .iter()
+            .find(|r| r.job_id == id)
+            .expect("a job id above i32::MAX must be queryable under that same id");
+        assert_eq!(
+            row.preempted_by,
+            Some(preempter),
+            "the preempting job's id is a job id too, so it must survive the same width"
+        );
+        assert!(
+            !history.iter().any(|r| r.job_id < 0),
+            "no id may arrive negative; that is the wrap this widening removes"
+        );
+
+        let states = job_accounting_states(&pool, &[id]).await?;
+        assert!(
+            states.contains_key(&id),
+            "the reconciler looks rows up by id, so its lookup must use the same width"
+        );
+
+        delete_jobs(&pool, &[id, preempter]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_widens_pre_fix_integer_job_ids() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+
+        // Reconstruct a pre-fix database by narrowing the three id columns back,
+        // then let migrate() perform the upgrade an existing cluster would see.
+        sqlx::query("ALTER TABLE jobs ALTER COLUMN job_id TYPE INTEGER")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE jobs ALTER COLUMN preempted_by TYPE INTEGER")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE tres_usage ALTER COLUMN job_id TYPE INTEGER")
+            .execute(&pool)
+            .await?;
+        for (table, column) in id_columns() {
+            assert_eq!(
+                column_type(&pool, table, column).await?,
+                "integer",
+                "{table}.{column} must start narrow for this to test anything"
+            );
+        }
+
+        migrate(&pool).await?;
+
+        for (table, column) in id_columns() {
+            assert_eq!(
+                column_type(&pool, table, column).await?,
+                "bigint",
+                "migrate must widen {table}.{column} on an existing database"
+            );
+        }
+
+        // Idempotent: a second run leaves the widened columns alone.
+        migrate(&pool).await?;
+        for (table, column) in id_columns() {
+            assert_eq!(column_type(&pool, table, column).await?, "bigint");
+        }
+        Ok(())
+    }
+
+    fn id_columns() -> [(&'static str, &'static str); 3] {
+        [
+            ("jobs", "job_id"),
+            ("jobs", "preempted_by"),
+            ("tres_usage", "job_id"),
+        ]
+    }
+
+    async fn column_type(pool: &PgPool, table: &str, column: &str) -> anyhow::Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await?)
     }
 
     /// GrpWall attributes consumption by the QOS recorded on each job, so a start
