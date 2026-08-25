@@ -10,8 +10,6 @@ separately from failure requeues (dispatch failure/Timeout/NodeFail) and are
 never checked against `max_batch_requeue`.
 """
 
-import time
-
 import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state

@@ -106,7 +106,7 @@ def main():
     hostname = socket.gethostname()
     num_gpus = torch.cuda.device_count()
 
-    print(f"=== Spur Distributed PyTorch Test ===")
+    print("=== Spur Distributed PyTorch Test ===")
     print(f"Host: {hostname} | Job: {env['job_id']} | Node rank: {env['node_rank']}/{env['num_nodes']}")
     print(f"Task offset: {env['task_offset']} | Peers: {env['peer_nodes']}")
     print(f"PyTorch: {torch.__version__} | HIP: {torch.version.hip}")

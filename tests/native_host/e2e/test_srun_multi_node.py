@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 
-from cluster import job_state, parse_job_id, wait_job, wait_job_state
+from cluster import parse_job_id, wait_job, wait_job_state
 
 
 class TestStandaloneSrun:

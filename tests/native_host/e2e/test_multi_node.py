@@ -57,8 +57,8 @@ class TestMultiNodeDispatch:
         assert "SLURM_NNODES=2" in all_output, f"missing SLURM_NNODES=2:\n{all_output}"
         assert "SPUR_NODE_RANK=" in all_output, f"missing SPUR_NODE_RANK:\n{all_output}"
         assert any(
-            l.startswith("SPUR_PEER_NODES=") and len(l) > len("SPUR_PEER_NODES=")
-            for l in all_output.splitlines()
+            line.startswith("SPUR_PEER_NODES=") and len(line) > len("SPUR_PEER_NODES=")
+            for line in all_output.splitlines()
         ), f"SPUR_PEER_NODES should be non-empty:\n{all_output}"
         # SLURM twins for prefixed vars
         assert "SLURM_JOB_ID=" in all_output, f"missing SLURM_JOB_ID:\n{all_output}"
@@ -86,8 +86,8 @@ class TestMultiNodeDispatch:
         assert "RANK=1" in all_output
         assert "MASTER_PORT=29500" in all_output
         master_addr_lines = [
-            l for l in all_output.splitlines()
-            if l.startswith("MASTER_ADDR=") and l != "MASTER_ADDR="
+            line for line in all_output.splitlines()
+            if line.startswith("MASTER_ADDR=") and line != "MASTER_ADDR="
         ]
         assert len(master_addr_lines) >= 2, (
             f"MASTER_ADDR should be set on both ranks:\n{all_output}"

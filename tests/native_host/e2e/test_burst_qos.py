@@ -28,11 +28,11 @@ import pytest
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
 _SLEEP_SCRIPT = "#!/bin/bash\nsleep 600\n"
-_QUICK_SCRIPT  = "#!/bin/bash\nsleep 5\n"
+_QUICK_SCRIPT = "#!/bin/bash\nsleep 5\n"
 
 _WAIT_PREEMPT = 60
-_WAIT_RESUME  = 90
-_GUARD_SECS   = 12
+_WAIT_RESUME = 90
+_GUARD_SECS = 12
 
 # Every cluster in this file uses the same base config:
 # preempt_type=qos_priority so the QoS allow-list is enforced, and
