@@ -1,5 +1,0 @@
-# Line width matches the repo's existing style (not PEP 8's 79), so lint
-# noise tracks real problems instead of every moderately long assert/f-string.
-[flake8]
-max-line-length = 120
-exclude = __pycache__,manifests
