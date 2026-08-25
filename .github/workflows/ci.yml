@@ -5,7 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Explicit types (default is opened/synchronize/reopened) so that marking a
+    # draft PR "ready for review" re-runs CI, which in turn re-fires e2e.yml's
+    # workflow_run trigger — the only way E2E's no-e2e-on-draft skip check
+    # re-evaluates without a new commit.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
