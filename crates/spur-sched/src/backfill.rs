@@ -2775,6 +2775,62 @@ mod tests {
     }
 
     #[test]
+    fn multi_node_gpu_future_reservation_does_not_land_inside_another_reservation() {
+        // Same shape as the CPU version above, but with GPU nodes and an
+        // exclusive multi-node GPU job, to prove the common-window fix
+        // isn't CPU-only.
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = vec![
+            make_named_gpu_node("node001", 8),
+            make_named_gpu_node("node002", 8),
+        ];
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(90),
+            end_time: now + Duration::minutes(150),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let mut big = total_gpu_job(1, 2, 8);
+        big.spec.exclusive = true;
+        big.spec.time_limit = Some(Duration::hours(1));
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), now + Duration::minutes(120));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[reservation],
+            topology: None,
+        };
+
+        sched.schedule(&[big], &cluster);
+
+        let node001_conflict = sched.timelines[0].intervals.iter().any(|iv| {
+            iv.job_id == Some(1)
+                && iv.start < now + Duration::minutes(150)
+                && iv.end > now + Duration::minutes(90)
+        });
+        assert!(
+            !node001_conflict,
+            "GPU job's shifted reservation on node001 must not land inside the unauthorized reservation window"
+        );
+    }
+
+    #[test]
     fn test_job_resource_request_includes_countable_gres() {
         let job = Job::new(
             1,
