@@ -329,6 +329,12 @@ pub enum PendingReason {
     /// Replaces `BeginTime` as the pending reason for preempted-requeued jobs so the
     /// reason string is unambiguous.
     Preempted,
+
+    /// Accounting is enabled but its caches hold no snapshot, so the job's QOS or
+    /// association limits cannot be read. Has no Slurm counterpart: Slurm keeps its
+    /// association state on disk and refuses to start without it, so it never
+    /// schedules in this state to begin with.
+    AccountingUnavailable,
 }
 
 impl PendingReason {
@@ -417,6 +423,7 @@ impl PendingReason {
             Self::QosMaxSubmitJobPerAccountLimit => "MaxSubmitJobsPerAccount",
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
             Self::Preempted => "Preempted",
+            Self::AccountingUnavailable => "AccountingUnavailable",
         }
     }
 

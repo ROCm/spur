@@ -610,6 +610,34 @@ applied over it.
    an existing job, set its limit directly with
    ``scontrol update job <id> TimeLimit=<time>``.
 
+.. _limits-unreadable:
+
+When limits cannot be read
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Limits are served from caches that ``spurctld`` refreshes from the accounting
+database, and a freshly started controller has none until its first fetch
+completes. The job queue, by contrast, is durable — a controller that restarts or
+takes over as leader inherits its predecessor's pending jobs immediately.
+
+While accounting is enabled and a cache holds no snapshot, jobs that name a QOS
+or an account are **not scheduled**. They pend with reason
+``AccountingUnavailable`` and start normally once the cache loads. The
+alternative is worse: a running job is never re-checked against limits, so a job
+admitted during that window stays over the cap for its entire run.
+
+Two related cases:
+
+- A job whose QOS no longer exists — deleted or renamed while the job sat in the
+  queue — pends with ``InvalidQOS``, as in Slurm.
+- With accounting disabled (an empty ``database_url``) there are no limits to
+  read, so an empty cache means "no caps exist" and nothing is held.
+
+``AccountingUnavailable`` has no Slurm counterpart, because Slurm keeps its
+association state on disk and declines to schedule without it rather than
+reaching this state. Jobs pending with it point at one thing: ``spurctld`` cannot
+reach the accounting database. The controller log carries the fetch failure.
+
 .. _grpwall-budgets:
 
 Group wall-clock budgets (GrpWall)

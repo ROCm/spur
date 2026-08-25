@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use spur_core::accounting::AccountLimits;
 
+#[derive(Default)]
 struct Snapshot {
     default_qos: HashMap<(String, String), String>,
     default_account: HashMap<String, String>,
@@ -192,6 +193,13 @@ impl AssociationCache {
             admin_level,
             loaded: true,
         };
+    }
+
+    /// Test-only seam: returns the cache to its pre-first-fetch state, as a freshly
+    /// started controller sees it while its predecessor's queue is already durable.
+    #[cfg(test)]
+    pub(crate) fn reset(&self) {
+        *self.snapshot.write() = Snapshot::default();
     }
 
     /// Test-only seam: populates the cache without a database.
