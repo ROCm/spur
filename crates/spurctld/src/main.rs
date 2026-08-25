@@ -47,9 +47,14 @@ struct Args {
     #[arg(long, default_value = "/var/spool/spur")]
     state_dir: PathBuf,
 
-    /// Log level
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Overrides [logging].level.
+    #[arg(long)]
+    log_level: Option<String>,
+
+    /// Log format: json or text. Overrides [logging].format. Defaults to text
+    /// on a TTY and json otherwise.
+    #[arg(long)]
+    log_format: Option<String>,
 
     /// Foreground mode (don't daemonize)
     #[arg(short = 'D', long)]
@@ -77,28 +82,42 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.parse().unwrap()),
-        )
-        .init();
+    // Load config before initializing logging so the [logging] section can
+    // choose the format/level. Nothing may log before init or it is lost.
+    let load_result = if args.config.exists() {
+        Some(spur_core::config::SlurmConfig::load_from_file(&args.config))
+    } else {
+        None
+    };
+    let logging = load_result
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|c| c.logging.clone())
+        .unwrap_or_default();
+    spur_logging::init(
+        "spurctld",
+        args.log_level.as_deref(),
+        args.log_format.as_deref(),
+        &logging.level,
+        &logging.format,
+    );
 
     info!(version = %spur_core::version::version_string(), "spurctld starting");
 
     // Load config if it exists, otherwise use defaults
-    let mut config = if args.config.exists() {
-        spur_core::config::SlurmConfig::load_from_file(&args.config)?
-    } else {
-        info!("no config file found, using defaults");
-        spur_core::config::SlurmConfig {
-            cluster_name: "spur".into(),
-            controller: spur_core::config::ControllerConfig {
-                listen_addr: "[::]:6817".into(),
-                state_dir: args.state_dir.to_string_lossy().into(),
-                ..Default::default()
-            },
-            ..default_config()
+    let mut config = match load_result {
+        Some(result) => result?,
+        None => {
+            info!("no config file found, using defaults");
+            spur_core::config::SlurmConfig {
+                cluster_name: "spur".into(),
+                controller: spur_core::config::ControllerConfig {
+                    listen_addr: "[::]:6817".into(),
+                    state_dir: args.state_dir.to_string_lossy().into(),
+                    ..Default::default()
+                },
+                ..default_config()
+            }
         }
     };
 

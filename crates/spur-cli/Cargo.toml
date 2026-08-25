@@ -15,6 +15,7 @@ spur-client = { path = "../spur-client" }
 spur-core = { path = "../spur-core" }
 spur-update = { path = "../spur-update" }
 spur-net = { path = "../spur-net" }
+spur-logging = { path = "../spur-logging" }
 clap = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
@@ -23,7 +24,6 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tracing-subscriber = { workspace = true }
 prost-types = { workspace = true }
 tokio-stream = "0.1"
 whoami = "2.1.1"
