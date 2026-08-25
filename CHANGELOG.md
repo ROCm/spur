@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.1](https://github.com/ROCm/spur/compare/v0.9.0...v0.9.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **spur-cli:** accept Slurm's --noconvert on squeue and sinfo ([#647](https://github.com/ROCm/spur/issues/647)) ([bfc288c](https://github.com/ROCm/spur/commit/bfc288c11aaec5fa007e5b373543aa193dd562ff))
+* **spur-sched:** protect large multi-node jobs from backfill starvation ([#732](https://github.com/ROCm/spur/issues/732)) ([1b2826b](https://github.com/ROCm/spur/commit/1b2826bf1ca0313efa7d08f97b152a55fe1c7cb9))
+* **spurd:** stop warning when no spur.conf exists at the default path ([#631](https://github.com/ROCm/spur/issues/631)) ([54e1eaf](https://github.com/ROCm/spur/commit/54e1eaf17692c667ba3dfae8595810b4a9922d24))
+
 ## [0.9.0](https://github.com/ROCm/spur/compare/v0.8.0...v0.9.0) (2026-08-24)
 
 
