@@ -200,13 +200,16 @@ class TestBackfillReservation:
         assert filler_id is not None
         wait_job_state(cluster, filler_id, "R", timeout=30)
 
+        # Pinned to n0/n1 specifically: a >2-node cluster (e.g. CI's default 4)
+        # would otherwise let this dispatch immediately onto other free nodes.
         big_out = f"{cluster.remote_dir}/backfill-big.out"
         big_script = cluster.write_file(
             "backfill-big.sh", "#!/bin/bash\necho BIG_RAN\n"
         )
         big_id = parse_job_id(
             cluster.sbatch(
-                ["-J", "backfill-big", "-N", "2", "-o", big_out, big_script]
+                ["-J", "backfill-big", "-N", "2", f"--nodelist={n0},{n1}",
+                 "-o", big_out, big_script]
             )
         )
         assert big_id is not None
