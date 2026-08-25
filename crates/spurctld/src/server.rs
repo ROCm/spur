@@ -4191,40 +4191,60 @@ impl AssocMgrScope {
     }
 }
 
-/// One usage record onto the wire. An unset cap carries the `INFINITE` sentinel,
-/// keeping it distinguishable from a literal `0` cap, as `sacctmgr` already does;
-/// TRES becomes its `cpu=N,mem=N` rendering, empty when nothing is held. Caps
-/// already exceeded are named here rather than in the client, so every consumer
-/// reads the same verdict.
+/// One scope record onto the wire, users nested inside it. An unset cap carries
+/// the `INFINITE` sentinel, keeping it distinguishable from a literal `0` cap as
+/// `sacctmgr` already does, and TRES becomes its `cpu=N,mem=N` rendering. Caps and
+/// consumption stay separate fields: composing Slurm's `Limit(Consumed)` display
+/// is the client's job, and a machine consumer should not have to take it apart
+/// again. Caps already exceeded are named here rather than in the client, so every
+/// consumer reads the same verdict.
 fn assoc_mgr_to_proto(
-    usage: &spur_core::accounting::LimitUsage,
+    usage: &spur_core::accounting::ScopeLimitUsage,
     scope: AssocMgrScope,
 ) -> AssocMgrRecord {
-    let cap = |v: Option<u32>| v.unwrap_or(spur_core::accounting::INFINITE);
-    let tres = |t: &Option<spur_core::accounting::TresRecord>| {
-        t.as_ref().map(|t| t.format()).unwrap_or_default()
-    };
     AssocMgrRecord {
-        over_limit: usage
-            .exceeded_caps()
-            .into_iter()
-            .map(|c| scope.cap_name(c).to_string())
-            .collect(),
-        user: usage.user.clone(),
         scope: usage.scope.clone(),
-        running_jobs: usage.running_jobs,
-        submitted_jobs: usage.submitted_jobs,
-        running_tres: usage.running_tres.format(),
-        max_jobs: cap(usage.max_jobs),
-        max_submit_jobs: cap(usage.max_submit_jobs),
-        max_tres: tres(&usage.max_tres),
-        max_wall_minutes: cap(usage.max_wall_minutes),
         grp_running_jobs: usage.grp_running_jobs,
         grp_submitted_jobs: usage.grp_submitted_jobs,
         grp_running_tres: usage.grp_running_tres.format(),
-        grp_tres: tres(&usage.grp_tres),
-        grp_submit_jobs: cap(usage.grp_submit_jobs),
+        grp_tres: opt_tres(&usage.grp_tres),
+        grp_submit_jobs: opt_cap(usage.grp_submit_jobs),
+        max_wall_minutes: opt_cap(usage.max_wall_minutes),
+        scope_caps: usage.user_caps.as_ref().map(|caps| AssocMgrCaps {
+            max_jobs: opt_cap(caps.max_jobs),
+            max_submit_jobs: opt_cap(caps.max_submit_jobs),
+            max_tres: opt_tres(&caps.max_tres),
+        }),
+        users: usage
+            .users
+            .iter()
+            .map(|user| AssocMgrUserRecord {
+                user: user.user.clone(),
+                running_jobs: user.running_jobs,
+                submitted_jobs: user.submitted_jobs,
+                running_tres: user.running_tres.format(),
+                max_jobs: opt_cap(user.caps.max_jobs),
+                max_submit_jobs: opt_cap(user.caps.max_submit_jobs),
+                max_tres: opt_tres(&user.caps.max_tres),
+                over_limit: cap_names(user.exceeded_caps(), scope),
+            })
+            .collect(),
+        over_limit: cap_names(usage.exceeded_caps(), scope),
     }
+}
+
+fn opt_cap(v: Option<u32>) -> u32 {
+    v.unwrap_or(spur_core::accounting::INFINITE)
+}
+
+fn opt_tres(t: &Option<spur_core::accounting::TresRecord>) -> String {
+    t.as_ref().map(|t| t.format()).unwrap_or_default()
+}
+
+fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec<String> {
+    caps.into_iter()
+        .map(|c| scope.cap_name(c).to_string())
+        .collect()
 }
 
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {

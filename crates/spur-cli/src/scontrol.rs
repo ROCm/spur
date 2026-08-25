@@ -7,6 +7,7 @@ use crate::exit_fmt::{format_exit, render_reason};
 use crate::timefmt::format_timestamp as format_ts;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use spur_core::accounting::TresRecord;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
 /// Administrative control commands.
@@ -892,11 +893,53 @@ const ASSOC_SECTION: AssocMgrSection = AssocMgrSection {
     per_user: "",
 };
 
-/// Render one section as `Key=Value` blocks, reusing `sacctmgr`'s limit-rendering
-/// vocabulary so a cap reads identically in both commands. Unset caps print as an empty value,
-/// as Slurm's own `assoc_mgr` output does, so the field is always present and a
-/// literal `0` cap stays distinguishable from no cap. Returns a string rather
-/// than printing so the layout is testable without a controller.
+/// A cap on its own, `N` when unset. Slurm marks "no limit" with `N` in
+/// `assoc_mgr` output rather than leaving the value empty as `sacctmgr` does.
+fn cap_or_n(cap: u32) -> String {
+    let rendered = crate::sacctmgr::blank_if_unset(cap);
+    if rendered.is_empty() {
+        "N".to_string()
+    } else {
+        rendered
+    }
+}
+
+/// A cap beside what is consumed against it, as Slurm's `assoc_mgr` prints it:
+/// `2(6)` is a cap of two with six in use. Scripts already parse this shape, so it
+/// is a contract rather than a preference.
+fn limit_consumed(cap: u32, used: u32) -> String {
+    format!("{}({})", cap_or_n(cap), used)
+}
+
+/// The same shape per TRES dimension: `cpu=N(24),node=16(9)`. Dimensions are the
+/// union of those capped and those in use, so one appears when either side has
+/// something to say about it, and the field is empty when neither does.
+fn tres_limit_consumed(cap: &str, used: &str) -> String {
+    let cap = TresRecord::parse(cap).unwrap_or_default();
+    let used = TresRecord::parse(used).unwrap_or_default();
+    let mut dimensions = cap.types();
+    for dimension in used.types() {
+        if !dimensions.contains(&dimension) {
+            dimensions.push(dimension);
+        }
+    }
+    dimensions.sort_by_key(|t| t.name());
+    dimensions
+        .into_iter()
+        .map(|t| {
+            let capped = match cap.get(t) {
+                0 => "N".to_string(),
+                v => v.to_string(),
+            };
+            format!("{}={}({})", t.name(), capped, used.get(t))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render one section as `Key=Value` blocks: a line per scope carrying what belongs
+/// to the scope itself, then an indented line per user under it. Returns a string
+/// rather than printing so the layout is testable without a controller.
 fn render_assoc_mgr(
     section: AssocMgrSection,
     records: &[spur_proto::proto::AssocMgrRecord],
@@ -909,34 +952,51 @@ fn render_assoc_mgr(
 
     let pu = section.per_user;
     for r in records {
-        out.push_str(&format!("{}={} User={}\n", section.scope, r.scope, r.user));
-        out.push_str(&format!(
-            "   RunningJobs={} SubmittedJobs={} RunningTRES={}\n",
-            r.running_jobs, r.submitted_jobs, r.running_tres
-        ));
         let max_wall = if r.max_wall_minutes == spur_core::accounting::INFINITE {
-            String::new()
+            "N".to_string()
         } else {
             spur_core::config::format_time(Some(r.max_wall_minutes))
         };
         out.push_str(&format!(
-            "   MaxJobs{pu}={} MaxSubmitJobs{pu}={} MaxTRES{pu}={} MaxWall={}\n",
-            crate::sacctmgr::blank_if_unset(r.max_jobs),
-            crate::sacctmgr::blank_if_unset(r.max_submit_jobs),
-            r.max_tres,
-            max_wall,
+            "{}={} MaxWall={}",
+            section.scope, r.scope, max_wall
         ));
+        // A scope that caps every user the same way says so once, here, so the caps
+        // stay visible with nobody using it. An association has no such caps; its
+        // users carry their own.
+        if let Some(caps) = &r.scope_caps {
+            out.push_str(&format!(
+                " MaxJobs{pu}={} MaxSubmitJobs{pu}={} MaxTRES{pu}={}",
+                cap_or_n(caps.max_jobs),
+                cap_or_n(caps.max_submit_jobs),
+                caps.max_tres,
+            ));
+        }
+        out.push('\n');
+
         out.push_str(&format!(
-            "   GrpRunningJobs={} GrpSubmittedJobs={} GrpRunningTRES={}\n",
-            r.grp_running_jobs, r.grp_submitted_jobs, r.grp_running_tres
-        ));
-        out.push_str(&format!(
-            "   GrpTRES={} GrpSubmitJobs={}\n",
-            r.grp_tres,
-            crate::sacctmgr::blank_if_unset(r.grp_submit_jobs)
+            "   GrpJobs=N({}) GrpSubmitJobs={} GrpTRES={}",
+            r.grp_running_jobs,
+            limit_consumed(r.grp_submit_jobs, r.grp_submitted_jobs),
+            tres_limit_consumed(&r.grp_tres, &r.grp_running_tres),
         ));
         if !r.over_limit.is_empty() {
-            out.push_str(&format!("   OverLimit={}\n", r.over_limit.join(",")));
+            out.push_str(&format!(" OverLimit={}", r.over_limit.join(",")));
+        }
+        out.push('\n');
+
+        for u in &r.users {
+            out.push_str(&format!(
+                "   User={} MaxJobs{pu}={} MaxSubmitJobs{pu}={} MaxTRES{pu}={}",
+                u.user,
+                limit_consumed(u.max_jobs, u.running_jobs),
+                limit_consumed(u.max_submit_jobs, u.submitted_jobs),
+                tres_limit_consumed(&u.max_tres, &u.running_tres),
+            ));
+            if !u.over_limit.is_empty() {
+                out.push_str(&format!(" OverLimit={}", u.over_limit.join(",")));
+            }
+            out.push('\n');
         }
         out.push('\n');
     }
@@ -2130,56 +2190,106 @@ mod tests {
     }
 
     fn assoc_mgr_record() -> spur_proto::proto::AssocMgrRecord {
+        use spur_core::accounting::INFINITE;
         spur_proto::proto::AssocMgrRecord {
-            user: "alice".into(),
             scope: "highprio".into(),
-            running_jobs: 6,
-            submitted_jobs: 7,
-            running_tres: "cpu=24,node=6".into(),
-            max_jobs: 2,
-            max_submit_jobs: spur_core::accounting::INFINITE,
-            max_tres: "node=4".into(),
-            max_wall_minutes: 60,
             grp_running_jobs: 9,
             grp_submitted_jobs: 11,
             grp_running_tres: "cpu=36,node=9".into(),
             grp_tres: "node=16".into(),
-            grp_submit_jobs: spur_core::accounting::INFINITE,
-            over_limit: vec!["MaxJobsPU".into(), "MaxTRESPU".into()],
+            grp_submit_jobs: INFINITE,
+            max_wall_minutes: 60,
+            scope_caps: Some(spur_proto::proto::AssocMgrCaps {
+                max_jobs: 2,
+                max_submit_jobs: INFINITE,
+                max_tres: "node=4".into(),
+            }),
+            users: vec![spur_proto::proto::AssocMgrUserRecord {
+                user: "alice".into(),
+                running_jobs: 6,
+                submitted_jobs: 7,
+                running_tres: "cpu=24,node=6".into(),
+                max_jobs: 2,
+                max_submit_jobs: INFINITE,
+                max_tres: "node=4".into(),
+                over_limit: vec!["MaxJobsPU".into(), "MaxTRESPU".into()],
+            }],
+            over_limit: Vec::new(),
         }
     }
 
     #[test]
-    fn assoc_mgr_qos_section_names_the_per_user_caps() {
+    fn assoc_mgr_renders_caps_beside_what_is_consumed() {
+        // Slurm's assoc_mgr shape: cap(consumed) in one field, N for no cap. Real
+        // scripts parse this, so the layout is a contract.
         let out = render_assoc_mgr(QOS_SECTION, &[assoc_mgr_record()]);
-        assert!(out.starts_with("QOS Records\nQOS=highprio User=alice\n"));
-        assert!(out.contains("   RunningJobs=6 SubmittedJobs=7 RunningTRES=cpu=24,node=6\n"));
-        // A QOS caps each user, so its labels carry the PU suffix, and an unset cap
-        // prints as an empty value the way Slurm's own assoc_mgr output does.
-        assert!(out.contains("   MaxJobsPU=2 MaxSubmitJobsPU= MaxTRESPU=node=4 MaxWall=01:00:00\n"));
-        assert!(out.contains("   GrpTRES=node=16 GrpSubmitJobs=\n"));
-        assert!(out.contains("   OverLimit=MaxJobsPU,MaxTRESPU\n"));
+        assert!(out.starts_with("QOS Records\n"));
+        assert!(out.contains(
+            "QOS=highprio MaxWall=01:00:00 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4\n"
+        ));
+        assert!(out.contains("   GrpJobs=N(9) GrpSubmitJobs=N(11) GrpTRES=cpu=N(36),node=16(9)\n"));
+        // cpu appears with no cap because the user is holding some: a dimension
+        // shows up when either the cap or the usage has something to say.
+        assert!(out.contains(
+            "   User=alice MaxJobsPU=2(6) MaxSubmitJobsPU=N(7) MaxTRESPU=cpu=N(24),node=4(6) OverLimit=MaxJobsPU,MaxTRESPU\n"
+        ));
     }
 
     #[test]
     fn assoc_mgr_association_section_drops_the_per_user_suffix() {
-        // The same figures under an association are that association's own caps,
-        // not per-user ones, so the PU suffix would misname them.
-        let out = render_assoc_mgr(ASSOC_SECTION, &[assoc_mgr_record()]);
-        assert!(out.starts_with("Association Records\nAccount=highprio User=alice\n"));
-        assert!(out.contains("   MaxJobs=2 MaxSubmitJobs= MaxTRES=node=4 MaxWall=01:00:00\n"));
+        // An association's caps are its own, not per-user ones, so the PU suffix
+        // would misname them, and it defines no scope-wide user caps at all.
+        let mut record = spur_proto::proto::AssocMgrRecord {
+            scope_caps: None,
+            ..assoc_mgr_record()
+        };
+        // The controller names a breach for the hierarchy it came from.
+        record.users[0].over_limit = vec!["MaxJobs".into()];
+        let out = render_assoc_mgr(ASSOC_SECTION, &[record]);
+        assert!(out.contains("Account=highprio MaxWall=01:00:00\n"));
+        assert!(!out.contains("MaxJobsPU"));
+        assert!(out.contains(
+            "   User=alice MaxJobs=2(6) MaxSubmitJobs=N(7) MaxTRES=cpu=N(24),node=4(6) OverLimit=MaxJobs\n"
+        ));
+    }
+
+    #[test]
+    fn assoc_mgr_reports_an_idle_scope_with_its_caps_and_no_users() {
+        // Why scopes come from the definitions and not only from the queue: a cap on
+        // a QOS nobody is using is exactly where a misconfiguration hides.
+        let record = spur_proto::proto::AssocMgrRecord {
+            grp_running_jobs: 0,
+            grp_submitted_jobs: 0,
+            grp_running_tres: String::new(),
+            users: Vec::new(),
+            ..assoc_mgr_record()
+        };
+        let out = render_assoc_mgr(QOS_SECTION, &[record]);
+        assert!(out.contains("MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4\n"));
+        assert!(out.contains("   GrpJobs=N(0) GrpSubmitJobs=N(0) GrpTRES=node=16(0)\n"));
+        assert!(!out.contains("User="));
     }
 
     #[test]
     fn assoc_mgr_omits_the_over_limit_line_when_within_every_cap() {
-        // Absence is the signal that everything is in bounds; an empty OverLimit=
-        // on every compliant record would bury the ones that matter.
+        // Absence is the signal that everything is in bounds; an empty OverLimit= on
+        // every compliant record would bury the ones that matter.
+        let mut record = assoc_mgr_record();
+        record.users[0].over_limit.clear();
+        let out = render_assoc_mgr(QOS_SECTION, &[record]);
+        assert!(!out.contains("OverLimit"));
+    }
+
+    #[test]
+    fn assoc_mgr_reports_a_scope_wide_breach_on_the_scope_line() {
+        // Group caps belong to the scope, so a group breach is reported there and
+        // not attributed to whichever user happens to be listed first.
         let record = spur_proto::proto::AssocMgrRecord {
-            over_limit: Vec::new(),
+            over_limit: vec!["GrpTRES".into()],
             ..assoc_mgr_record()
         };
         let out = render_assoc_mgr(QOS_SECTION, &[record]);
-        assert!(!out.contains("OverLimit"));
+        assert!(out.contains("GrpTRES=cpu=N(36),node=16(9) OverLimit=GrpTRES\n"));
     }
 
     #[test]
@@ -2190,13 +2300,22 @@ mod tests {
 
     #[test]
     fn assoc_mgr_renders_a_zero_cap_as_zero() {
-        // A zero cap blocks every job it governs, so it must not read as "no cap".
-        let record = spur_proto::proto::AssocMgrRecord {
-            max_jobs: 0,
-            ..assoc_mgr_record()
-        };
+        // A zero cap blocks every job it governs, so it must not read as N.
+        let mut record = assoc_mgr_record();
+        record.users[0].max_jobs = 0;
         let out = render_assoc_mgr(QOS_SECTION, &[record]);
-        assert!(out.contains("MaxJobsPU=0 "));
+        assert!(out.contains("User=alice MaxJobsPU=0(6)"));
+    }
+
+    #[test]
+    fn tres_limit_consumed_covers_dimensions_from_either_side() {
+        // A capped dimension with nothing in use, and a used dimension with no cap,
+        // both have to appear: either alone is something an operator needs to see.
+        assert_eq!(
+            tres_limit_consumed("node=8", "cpu=12"),
+            "cpu=N(12),node=8(0)"
+        );
+        assert_eq!(tres_limit_consumed("", ""), "");
     }
 
     #[test]

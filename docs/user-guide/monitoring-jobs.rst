@@ -547,38 +547,52 @@ govern them. Without it an operator has to infer per-user totals by counting
    scontrol show assoc_mgr users=alice
 
 Output is two sections of ``Key=Value`` blocks — QOS records, then association
-records — one block per user per scope:
+records. Each block opens with the scope itself and lists a line per user under
+it:
 
 .. code-block:: text
 
    QOS Records
-   QOS=highprio User=alice
-      RunningJobs=6 SubmittedJobs=7 RunningTRES=cpu=24,node=6
-      MaxJobsPU=2 MaxSubmitJobsPU= MaxTRESPU=node=4 MaxWall=01:00:00
-      GrpRunningJobs=9 GrpSubmittedJobs=11 GrpRunningTRES=cpu=36,node=9
-      GrpTRES=node=16 GrpSubmitJobs=
-      OverLimit=MaxJobsPU,MaxTRESPU
+   QOS=highprio MaxWall=01:00:00 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4
+      GrpJobs=N(9) GrpSubmitJobs=N(11) GrpTRES=cpu=N(36),node=16(9)
+      User=alice MaxJobsPU=2(6) MaxSubmitJobsPU=N(7) MaxTRESPU=cpu=N(24),node=4(6) OverLimit=MaxJobsPU,MaxTRESPU
+      User=bob MaxJobsPU=2(1) MaxSubmitJobsPU=N(1) MaxTRESPU=cpu=N(4),node=4(1)
+
+   Association Records
+   Account=tenant-a MaxWall=N
+      GrpJobs=N(1) GrpSubmitJobs=N(1) GrpTRES=node=N(1)
+      User=alice MaxJobs=4(1) MaxSubmitJobs=N(1) MaxTRES=cpu=N(4),node=N(1)
 
 Reading it:
 
-* ``Running*``/``Submitted*`` and the ``TRES`` figures are live, measured exactly
-  as the scheduler measures them when it admits a job. Node counts are distinct
-  occupied nodes, so two jobs sharing a node hold one node, not two.
-* The ``Grp*`` figures are the whole scope's, summed across every user, and
-  repeat on each of that scope's blocks — a group cap cannot be judged from one
-  user's share alone.
-* ``Max*`` are the caps in force. An empty value means no cap, matching Slurm;
-  a literal ``0`` is a real cap that blocks every job it governs.
-* ``OverLimit`` lists caps the record is **already over**, and is absent when
-  everything is within its cap. Usage over a cap is not a contradiction: caps
-  are applied when a job is admitted and running jobs are never re-checked, so
+* Every cap is printed as **``Limit(Consumed)``**, as in Slurm: ``node=4(6)`` is a
+  cap of four nodes with six in use, and ``N`` marks no cap. A literal ``0`` is a
+  real cap that blocks every job it governs.
+* Consumption is live, measured exactly as the scheduler measures it when it
+  admits a job. Node counts are distinct occupied nodes, so two jobs sharing a
+  node hold one node, not two. A TRES dimension appears when either the cap or
+  the usage has something to say about it.
+* The scope line carries what belongs to the scope: its ``MaxWall``, and — for a
+  QOS, which caps every user identically — the per-user caps it enforces. An
+  association's caps are per ``(user, account)``, so they appear on each user's
+  line instead.
+* ``Grp*`` figures are the whole scope's, summed across every user, and stay on
+  the scope line. Filtering to one user narrows the ``User=`` lines but never the
+  group figures, since a group cap cannot be judged from one user's share.
+* ``OverLimit`` lists caps that are **already exceeded**, on the scope line for
+  group caps and on a user's line for that user's caps. It is absent when
+  everything is within its cap. Usage over a cap is not a contradiction: caps are
+  applied when a job is admitted and running jobs are never re-checked, so
   tightening a cap under running work leaves exactly this state.
 
-Two things it deliberately does not do. A QOS or account with no jobs does not
-appear, since records are derived from the queue rather than from the accounting
-definitions — use ``sacctmgr show qos`` to list definitions. And a
-``LimitsReadable=NO`` line above the sections means the accounting caches held no
-snapshot, so no cap could be read; the usage figures are still current.
+Records come from the accounting definitions as well as from the queue, so a QOS
+nobody is using still appears with its caps and no ``User=`` lines — an
+over-tight cap on an idle QOS is exactly the kind of mistake that hides
+otherwise. A QOS deleted after its jobs queued also stays reported for as long as
+those jobs hold resources.
+
+A ``LimitsReadable=NO`` line above the sections means the accounting caches held
+no snapshot, so no cap could be read; the usage figures are still current.
 
 Cluster Metrics — ``/metrics``
 ------------------------------

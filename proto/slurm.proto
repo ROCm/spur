@@ -757,45 +757,62 @@ message SchedStats {
   uint64 jobs_preempted = 15;
 }
 
-// What one user holds under a single QOS or association, beside the caps that
-// govern it. Counts and TRES are live figures from the controller's job table,
-// computed the same way the admission gate computes them, so a row reads as the
-// scheduler sees it. Caps carry the INFINITE sentinel when unset; TRES fields
-// are `cpu=N,mem=N` strings, empty when nothing is held or capped.
-message AssocMgrRecord {
+// What one user holds under a scope, beside the caps governing that user. Counts
+// and TRES are live figures from the controller's job table, computed the way the
+// admission gate computes them, so they read as the scheduler sees them. Caps and
+// consumption stay separate fields rather than arriving pre-rendered as Slurm's
+// `Limit(Consumed)`, so a machine consumer does not have to unpick a display
+// string; the CLI composes that shape. Caps carry the INFINITE sentinel when
+// unset, TRES are `cpu=N,mem=N` strings, empty when nothing is held or capped.
+message AssocMgrUserRecord {
   string user = 1;
-  // The QOS or account this record accounts for; which of the two follows from
-  // the list it appears in.
-  string scope = 2;
+  uint32 running_jobs = 2;
+  uint32 submitted_jobs = 3;   // pending + running
+  string running_tres = 4;
+  uint32 max_jobs = 5;
+  uint32 max_submit_jobs = 6;
+  string max_tres = 7;
+  // Per-user caps this user is already over, named as `sacctmgr` names them (e.g.
+  // "MaxJobsPU"). Decided controller-side so every consumer reads the same
+  // verdict. Empty when everything is within its cap.
+  repeated string over_limit = 8;
+}
 
-  // This user's holdings in the scope.
-  uint32 running_jobs = 3;
-  uint32 submitted_jobs = 4;   // pending + running
-  string running_tres = 5;
+// A QOS or an association with the caps and consumption belonging to the scope
+// itself, plus the users holding work under it. Nesting per-user limits inside
+// the record they qualify follows Slurm's `assoc_mgr`, and keeps a scope's group
+// figures from being repeated once per user. A scope with no queued work carries
+// no user records, and is still reported so a misconfigured cap on an idle QOS
+// remains visible.
+// Caps a scope applies to each of its users, where the scope defines them once —
+// a QOS does. An association's caps are per (user, account) and ride on each user
+// record instead, so this is absent there. Present even for a scope with no queued
+// work, which is where a misconfigured cap on an idle QOS would otherwise be
+// invisible.
+message AssocMgrCaps {
+  uint32 max_jobs = 1;
+  uint32 max_submit_jobs = 2;
+  string max_tres = 3;
+}
 
-  // Caps on this user: the QOS's per-user caps on a QOS record, the
-  // association's own on an association record. `max_tres` is the QOS per-user
-  // TRES cap and is always unset on an association, which has no such limit.
-  uint32 max_jobs = 6;
-  uint32 max_submit_jobs = 7;
-  string max_tres = 8;
-  uint32 max_wall_minutes = 9;
-
-  // The scope's totals across every user, against its group caps.
-  uint32 grp_running_jobs = 10;
-  uint32 grp_submitted_jobs = 11;
-  string grp_running_tres = 12;
-  string grp_tres = 13;
-  uint32 grp_submit_jobs = 14;
-
-  // Caps this record already exceeds, named as `sacctmgr` names them (e.g.
-  // "MaxJobsPU", "GrpTRES"). Decided controller-side so every consumer reads the
-  // same verdict. Empty when everything is within its cap.
-  repeated string over_limit = 15;
+message AssocMgrRecord {
+  string scope = 1;
+  uint32 grp_running_jobs = 2;
+  uint32 grp_submitted_jobs = 3;
+  string grp_running_tres = 4;
+  string grp_tres = 5;
+  uint32 grp_submit_jobs = 6;
+  uint32 max_wall_minutes = 7;
+  repeated AssocMgrUserRecord users = 8;
+  // Scope-wide caps already exceeded, named as `sacctmgr` names them.
+  repeated string over_limit = 9;
+  AssocMgrCaps scope_caps = 10;
 }
 
 message GetAssocMgrInfoRequest {
-  // Restrict to one user; empty covers every user holding queued or running work.
+  // Restrict to one user; empty covers every user. Scopes are still reported when
+  // the filtered user holds nothing in them, since a scope's own caps and group
+  // consumption do not belong to any one user.
   string user = 1;
 }
 
