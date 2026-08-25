@@ -167,6 +167,7 @@ libpmix
 lifecycle
 MaxTRESPerJob
 MaxTRESPerUser
+MaxWall
 msg
 NNodes
 NODELIST
