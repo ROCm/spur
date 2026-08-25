@@ -637,12 +637,145 @@ database available.
    upgrading starts from zero and fills over the following
    ``grp_wall_window_days``.
 
-QOS preemption hierarchy
-~~~~~~~~~~~~~~~~~~~~~~~~
+How the priority gap is computed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 By default, Spur's preemption eligibility is based purely on the numeric
-priority gap: any job with an effective priority more than 2× the running
-job's may preempt it (subject to the partition's ``preempt_mode`` gate).
+priority gap: a pending job may preempt a running job when
+
+.. code-block:: text
+
+   candidate_effective_priority < pending_effective_priority / 2
+
+Effective priority is:
+
+.. code-block:: text
+
+   effective_priority = base_priority × min(fair_share, 10.0) × age_factor × max(partition_tier, 1)
+   age_factor = 1.0 + min(waiting_minutes / 10080, 1.0)   # 1.0 -> 2.0 over 7 days
+
+``base_priority`` is the explicit ``--priority`` if given; otherwise it is
+``1000 + qos.priority`` (see the QOS ``priority`` field, above) — so a QOS's
+priority contributes to the base *before* the multiplicative factors, and is
+scaled by fair-share/age/tier along with everything else, not added on top of
+them. Both sides of the comparison go through the same formula: a pending
+job's stored priority is kept refreshed with it every scheduling pass, and a
+running job's is recomputed the same way at preemption-check time (a running
+job's own priority field is frozen at whatever it was when dispatched).
+
+The gap must exceed 2× — not merely be larger — for preemption to fire.
+
+**Scenarios where preemption fires**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 40 30
+
+   * - Cause
+     - Example
+     - Result
+   * - Higher base priority
+     - Pending base 1000 vs. running base 100 (both otherwise equal)
+     - ``100 × 1.0 = 100 < 1000 / 2 = 500`` → fires
+   * - Higher QOS priority
+     - Pending on a QOS with ``priority=2000`` (base ``1000+2000=3000``) vs.
+       running with no QOS (base 1000), otherwise equal
+     - ``1000 < 3000 / 2 = 1500`` → fires
+   * - Fair-share divergence alone
+     - Same base/QOS/tier; pending's user has low usage
+       (``fair_share=2.0``, fully aged), running's user is heavy
+       (``fair_share=0.1``, no age boost)
+     - ``1000×0.1×1.0=100 < (1000×2.0×2.0)/2=2000`` → fires
+   * - Higher partition tier (≥ 3×)
+     - Pending on a ``priority_tier=3`` partition vs. running on
+       ``priority_tier=1``, otherwise equal
+     - ``1000 < 3000 / 2 = 1500`` → fires
+   * - Combination of smaller gaps
+     - No single factor differs by 2×, but several compound: base 500 both
+       sides; pending has ``fair_share=2.0``, full age boost, ``tier=2``;
+       running has ``fair_share=0.5``, no age boost, ``tier=1``
+     - ``250 < 4000 / 2 = 2000`` → fires
+
+A 2×+ gap in fair-share, age, or partition tier alone is exactly as effective
+as a 2×+ base-priority gap — this is the main **silent** path: two jobs
+submitted with identical priority and QOS by different users can still
+trigger preemption purely from fair-share divergence, with no priority or
+QOS change involved.
+
+**Scenarios where the priority gap alone cannot fire preemption**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 55
+
+   * - Scenario
+     - Why it cannot fire
+   * - Same base, QOS, fair-share, and partition tier
+     - The age factor tops out at 2.0×, exactly cancelling the 2× threshold:
+       worst case is pending at ``2P`` and running at ``P``, and ``P < P`` is
+       false (strict ``<`` is required).
+   * - Pending on ``priority_tier=2`` vs. running on ``priority_tier=1``,
+       otherwise equal
+     - Same cancellation: ``2000 / 2 = 1000``, not strictly less than the
+       running job's 1000.
+
+**Configuration guards checked after the priority gap** (any one blocks
+preemption regardless of how large the gap is):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 55
+
+   * - Guard
+     - Condition
+   * - Pending partition preempt mode
+     - The pending job's own partition ``preempt_mode`` (no QOS override
+       here) is ``off`` — checked once per pending job, before any
+       candidate is considered.
+   * - QOS allow-list
+     - ``preempt_type = "qos_priority"`` and the pending job's QOS does not
+       list the running job's QOS in its ``preempt`` field.
+   * - Preempt mode
+     - The running job's effective ``preempt_mode`` (QOS override, else
+       partition) is ``off``.
+   * - Exempt time
+     - The running job has not yet been running for ``preempt_exempt_time``
+       (QOS > partition > global).
+   * - Reservation protection
+     - The running job is in an active reservation and the pending job's
+       partition tier is not strictly higher than the running job's.
+   * - No node overlap
+     - The pending job does not need any node the running job occupies.
+
+**Comparison with Slurm**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * -
+     - Spur
+     - Slurm (``PreemptType=preempt/qos``)
+   * - Preemption gate
+     - Effective priority gap > 2×
+     - QOS ``Preempt=`` allow-list only
+   * - Does fair-share affect preemption?
+     - Yes, via the effective-priority formula
+     - No — fair-share affects scheduling order only
+   * - Does age affect preemption?
+     - Yes, via the effective-priority formula
+     - No
+   * - Can priority alone trigger preemption with no QOS config?
+     - Yes (``preempt_type = "none"``, the default)
+     - No — QOS preemption always requires an explicit allow-list
+
+The practical difference: in Spur, preemption eligibility can shift day to
+day as fair-share and age change, even with no configuration change. In
+Slurm's QOS-priority model, eligibility is fixed by the allow-list and does
+not drift on its own.
+
+QOS preemption hierarchy
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 To restrict which QOS tiers may preempt which, enable the QOS preemption
 hierarchy in ``spur.conf``:
