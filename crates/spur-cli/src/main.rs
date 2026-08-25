@@ -27,6 +27,7 @@ mod sacctmgr;
 mod salloc;
 mod sattach;
 mod sbatch;
+mod sbcast;
 mod scancel;
 mod scontrol;
 mod scrontab;
@@ -132,6 +133,7 @@ fn main() -> anyhow::Result<()> {
     match bin_name {
         "salloc" => return runtime.block_on(salloc::main()),
         "sbatch" => return runtime.block_on(sbatch::main()),
+        "sbcast" => return runtime.block_on(sbcast::main()),
         "srun" => return runtime.block_on(srun::main()),
         "squeue" => return runtime.block_on(squeue::main()),
         "scancel" => return runtime.block_on(scancel::main()),
@@ -186,6 +188,7 @@ fn main() -> anyhow::Result<()> {
         "report" | "usage" => Some("sreport"),
         "trigger" | "triggers" => Some("strigger"),
         "attach" => Some("sattach"),
+        "sbcast" | "bcast" => Some("sbcast"),
         "crontab" | "cron" => Some("scrontab"),
         "health" | "monitor" => Some("smd"),
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
@@ -235,6 +238,7 @@ fn main() -> anyhow::Result<()> {
                 runtime.block_on(strigger::main_with_args(rewritten))
             }
             "sattach" | "attach" => runtime.block_on(sattach::main_with_args(rewritten)),
+            "sbcast" | "bcast" => runtime.block_on(sbcast::main_with_args(rewritten)),
             "scrontab" | "crontab" | "cron" => {
                 runtime.block_on(scrontab::main_with_args(rewritten))
             }
@@ -355,6 +359,7 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     writeln!(w, "  report      Generate usage reports")?;
     writeln!(w, "  trigger     Manage event triggers")?;
     writeln!(w, "  attach      Attach to a running job's I/O")?;
+    writeln!(w, "  bcast       Broadcast a file to a job's allocated nodes")?;
     writeln!(w, "  crontab     Manage recurring cron-style jobs")?;
     writeln!(w, "  health      Node health monitoring")?;
     writeln!(
@@ -377,7 +382,7 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         w,
-        "  sprio sshare sstat sdiag sreport strigger sattach scrontab smd"
+        "  sprio sshare sstat sdiag sreport strigger sattach scrontab smd sbcast"
     )
 }
 
@@ -401,6 +406,7 @@ mod tests {
         crate::salloc::SallocArgs::command().debug_assert();
         crate::sattach::SattachArgs::command().debug_assert();
         crate::sbatch::SbatchArgs::command().debug_assert();
+        crate::sbcast::SbcastArgs::command().debug_assert();
         crate::scancel::ScancelArgs::command().debug_assert();
         crate::scontrol::ScontrolArgs::command().debug_assert();
         crate::scrontab::ScrontabArgs::command().debug_assert();
@@ -447,6 +453,7 @@ mod tests {
             "report",
             "trigger",
             "attach",
+            "bcast",
             "crontab",
             "health",
             "auth-keys",
