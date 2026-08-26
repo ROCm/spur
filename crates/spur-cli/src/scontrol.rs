@@ -695,6 +695,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 if !node.active_reservation.is_empty() {
                     println!("   ActiveReservation={}", node.active_reservation);
                 }
+                if let Some(line) = planned_reservation_line(&node) {
+                    println!("   {line}");
+                }
                 println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
                 println!();
             }
@@ -920,6 +923,19 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
         }
         _ => "N/A".into(),
     }
+}
+
+/// `PlannedJobId=/PlannedStartTime=` line for `scontrol show node`, or `None`
+/// when the node has no scheduler-held future reservation.
+fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String> {
+    if node.planned_job_id == 0 {
+        return None;
+    }
+    Some(format!(
+        "PlannedJobId={} PlannedStartTime={}",
+        node.planned_job_id,
+        format_ts(node.planned_start.as_ref()),
+    ))
 }
 
 async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
@@ -1734,6 +1750,27 @@ mod tests {
     fn gpu_tres_label_total() {
         assert_eq!(gpu_tres_label("gpu:8"), "TresPerJob");
         assert_eq!(gpu_tres_label("gpu:mi300x:4"), "TresPerJob");
+    }
+
+    #[test]
+    fn planned_reservation_line_none_when_no_planned_job() {
+        let node = spur_proto::proto::NodeInfo::default();
+        assert_eq!(planned_reservation_line(&node), None);
+    }
+
+    #[test]
+    fn planned_reservation_line_shows_job_and_start() {
+        let node = spur_proto::proto::NodeInfo {
+            planned_job_id: 42,
+            planned_start: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let line = planned_reservation_line(&node).unwrap();
+        assert!(line.contains("PlannedJobId=42"), "{line}");
+        assert!(line.contains("PlannedStartTime=2023-11-14"), "{line}");
     }
 
     #[test]
