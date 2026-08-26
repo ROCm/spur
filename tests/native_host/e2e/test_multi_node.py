@@ -241,6 +241,9 @@ class TestBackfillReservation:
             f"n1 is idle-but-reserved for big_id={big_id}, "
             f"scontrol show node should report it:\n{n1_show}"
         )
+        assert "State=IDLE+PLANNED" in n1_show, (
+            f"n1's State= should carry the PLANNED overlay flag:\n{n1_show}"
+        )
 
         cluster.scancel(str(small_id))
 
