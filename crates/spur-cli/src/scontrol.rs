@@ -925,8 +925,8 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
     }
 }
 
-/// `PlannedJobId=/PlannedStartTime=` line for `scontrol show node`, or `None`
-/// when the node has no scheduler-held future reservation.
+/// `PlannedJobId=/PlannedStartTime=` line for `scontrol show node` (`None` if
+/// unset, `N/A` start if unknown); server only sets it while Idle, like sinfo's `plnd`.
 fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String> {
     if node.planned_job_id == 0 {
         return None;
@@ -1768,9 +1768,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        let line = planned_reservation_line(&node).unwrap();
-        assert!(line.contains("PlannedJobId=42"), "{line}");
-        assert!(line.contains("PlannedStartTime=2023-11-14"), "{line}");
+        assert_eq!(
+            planned_reservation_line(&node).unwrap(),
+            "PlannedJobId=42 PlannedStartTime=2023-11-14T22:13:20"
+        );
+    }
+
+    #[test]
+    fn planned_reservation_line_start_na_when_unset() {
+        let node = spur_proto::proto::NodeInfo {
+            planned_job_id: 42,
+            planned_start: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            planned_reservation_line(&node).unwrap(),
+            "PlannedJobId=42 PlannedStartTime=N/A"
+        );
     }
 
     #[test]
