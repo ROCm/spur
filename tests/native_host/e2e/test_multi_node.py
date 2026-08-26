@@ -235,6 +235,13 @@ class TestBackfillReservation:
         assert job_state(sq, small_id) == "PD", (
             f"small job should stay pending, reserved capacity was taken:\n{sq}"
         )
+
+        n1_show = cluster.scontrol_show_node(n1)
+        assert f"PlannedJobId={big_id}" in n1_show, (
+            f"n1 is idle-but-reserved for big_id={big_id}, "
+            f"scontrol show node should report it:\n{n1_show}"
+        )
+
         cluster.scancel(str(small_id))
 
         wait_job(cluster, big_id, timeout=90)
