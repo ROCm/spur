@@ -211,6 +211,49 @@ Running the Tests
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
+End-to-End Tests (WireGuard mesh)
+---------------------------------
+
+The WireGuard mesh E2E suite lives in ``tests/native_host/wg_e2e/`` and stands up a **real** WireGuard mesh (kernel ``wg`` interfaces via ``spur net init``/``join``) across the SSH test nodes. It reuses the base harness (``cluster.py``) from ``tests/native_host/e2e/``.
+
+Automated today: mesh bring-up (all-to-all reachability including worker↔worker), k0s-over-mesh (cluster reaches ready, node InternalIPs are mesh IPs, the controller stays meshed), cross-node pod datapath proven to ride the tunnel (pod-to-pod over the pod CIDR with a rising per-peer ``wg`` transfer counter), service-CIDR reachability (a ClusterIP service reached across nodes over the mesh — kube-proxy DNATs it to a pod IP that the mesh carries, even though the service CIDR is never in any WireGuard ``AllowedIPs``), online node add/remove with ``net remove-peer`` cleanup, graceful k8s remove/add that keeps the node a Spur worker in the mesh with the same WireGuard key across the cycle, and login-node reachability.
+
+Scaffolded but currently skipped: the 3-controller HA re-election (D5 — needs a multi-controller fixture the base harness does not yet provide).
+
+Because it creates root-owned network interfaces and runs ``spurd`` rootful, the suite is **opt-in** and gated three ways:
+
+1. ``SPUR_TEST_NODES`` must list the nodes (as for the native-host suite),
+2. ``SPUR_TEST_WG=1`` must be set to opt in, and
+3. a per-node preflight skips the suite if ``wg``/``wg-quick`` or a usable WireGuard data plane (kernel module or ``wireguard-go`` userspace) is missing.
+
+Prerequisites (on each test node): ``wireguard-tools`` and either the ``wireguard`` kernel module or ``wireguard-go``; passwordless (or ``SPUR_TEST_SSH_PASSWORD``-backed) sudo.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Variable
+     - Description
+   * - ``SPUR_TEST_WG`` *(required)*
+     - Opt-in flag for the mesh suite. Set to ``1``. Without it the suite is skipped even when nodes are configured.
+   * - ``SPUR_TEST_NODES`` *(required)*
+     - Comma-separated node list, shared with the native-host suite. Mesh bring-up (D1) needs >= 2 nodes; the k0s-over-mesh scenarios (D2–D6) need 3.
+
+The suite uses two pytest markers: ``wireguard`` (all tests) and ``k0s`` (the scenarios that require a converged k0s cluster). To run only the mesh-bring-up tests that do not need k0s:
+
+.. code-block:: bash
+
+   export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
+   export SPUR_TEST_WG=1
+
+   # Full mesh suite
+   pytest tests/native_host/wg_e2e/ -v
+
+   # Only the mesh-bring-up scenarios (no k0s convergence needed)
+   pytest tests/native_host/wg_e2e/ -v -m "wireguard and not k0s"
+
+In CI this suite is folded into the existing ``E2E / native-host`` job — it shares the same virtual-machine cluster and test shards rather than reporting as a separate status check. See ``.github/workflows/e2e.yml`` — note the WireGuard kernel-module availability on the runner image is a prerequisite; where it is absent the tests skip rather than fail.
+
 End-to-End Tests (Kubernetes)
 -----------------------------
 
