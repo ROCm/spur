@@ -3836,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "spur-stepd"
-version = "0.8.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "spurd",
