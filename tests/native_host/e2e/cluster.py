@@ -1203,6 +1203,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             f"-f '{self.etc_dir}/spur.conf' "
             f"--controller '{self.controller_addr}' "
             f"--listen '{agent_listen}' "
+            f"--state-dir '{self.state_dir}' "
             f"--hostname '{hostname}' --address '{address}' --log-level info -D"
             f"{label_args}{token_arg} "
             f"> '{self.log_dir}/spurd.log' 2>&1 & echo $!"
