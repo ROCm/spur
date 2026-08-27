@@ -17,7 +17,8 @@ live. It operates in two modes:
   for the allocation, streams output from the node agent, and exits with the
   job's exit code. Pressing Ctrl-C cancels the job. After the allocation is
   granted, standalone ``srun`` (including ``--pty``) resolves the job owner from
-  the controller for step, keepalive, and cancel RPCs, the same way ``srun`` does
+  the controller for step, keepalive, and cancel RPCs, the same way
+  ``srun`` does
   inside an ``salloc`` shell via ``SPUR_JOB_USER``.
 - **Step mode** — when run inside an existing allocation (``SPUR_JOB_ID`` is set,
   as under ``salloc`` or in a batch script), it creates a *job step* against the
@@ -134,7 +135,7 @@ positional argument is ``JOB_ID`` or ``JOB_ID.STEP_ID``; the step-id component i
 accepted, but only the job id is used to route the attach. By default it opens a
 full interactive raw-mode terminal attached through the node agent. Attach RPCs
 use the job owner from ``SPUR_JOB_USER`` (when set), the controller job record, or
-the local login name, matching step-mode ``srun`` under JWT auth.
+the local login name, matching step-mode ``srun`` under JWT authentication.
 
 .. list-table::
    :header-rows: 1

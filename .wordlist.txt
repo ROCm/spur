@@ -24,6 +24,8 @@ hyperconverged
 InfiniBand
 JSON
 JWT
+keepalive
+keepalives
 Kubernetes
 kubeconfig
 kubelet

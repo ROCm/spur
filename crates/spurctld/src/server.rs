@@ -5849,7 +5849,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_job_step_allows_uid_match_without_username() {
+    async fn create_job_step_allows_uid_match_despite_username_mismatch() {
         use spur_core::job::JobState;
         use spur_core::resource::{ResourceAllocations, ResourceSet};
 
@@ -5906,7 +5906,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        let result = svc
+        let resp = svc
             .create_job_step(Request::new(CreateJobStepRequest {
                 job_id,
                 command: vec!["bash".into()],
@@ -5919,16 +5919,10 @@ mod tests {
                 user: "local-wire-name".into(),
                 uid: owner_uid,
             }))
-            .await;
+            .await
+            .expect("uid match must authorize step creation despite username mismatch");
 
-        if let Err(e) = result {
-            assert_ne!(
-                e.code(),
-                Code::PermissionDenied,
-                "uid match must not be rejected as non-owner: {}",
-                e.message()
-            );
-        }
+        assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6066,9 +6060,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_step_allows_uid_match_without_username() {
+    async fn run_step_allows_uid_match_despite_username_mismatch() {
         use spur_core::job::JobState;
         use spur_core::resource::{ResourceAllocations, ResourceSet};
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
 
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
@@ -6123,25 +6118,34 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        let result = svc
-            .run_step(Request::new(RunStepRequest {
+        let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
+        svc.cluster
+            .create_step(JobStep {
                 job_id,
-                command: vec!["id".into()],
-                uid: owner_uid,
                 step_id: 0,
-                user: "local-wire-name".into(),
-                ..Default::default()
-            }))
-            .await;
+                name: "id".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: allocated_nodes,
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+            })
+            .expect("test setup: seed step for run_step");
 
-        if let Err(e) = result {
-            assert_ne!(
-                e.code(),
-                Code::PermissionDenied,
-                "uid match must not be rejected as non-owner: {}",
-                e.message()
-            );
-        }
+        svc.run_step(Request::new(RunStepRequest {
+            job_id,
+            command: vec!["id".into()],
+            uid: owner_uid,
+            step_id: 0,
+            user: "local-wire-name".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("uid match must authorize step dispatch despite username mismatch");
     }
 
     async fn assign_ha_control_plane(svc: &ControllerService) {
