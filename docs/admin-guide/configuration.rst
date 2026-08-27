@@ -14,7 +14,8 @@ and meaning.
 
    ``spurctld`` reads every section of ``spur.conf``. ``spurd`` reads the same file
    but only for local agent settings (``[hooks]``, ``[devices]``, ``rlimits.memlock``,
-   ``[cluster]``, and ``[mpi]``); its identity and networking come from CLI flags.
+   ``[cgroup]``, ``[cluster]``, and ``[mpi]``); its identity and networking come from
+   CLI flags.
    Node CPU, memory, and GRES are reported by each agent when it registers, not
    declared here — ``[[nodes]]`` only overlays scheduling policy onto nodes that
    have already registered.
@@ -1204,6 +1205,151 @@ Job isolation layers.
      - Landlock filesystem access control. Actually opt-in via the
        ``SPUR_LANDLOCK=1`` environment variable on ``spurd`` and **off** unless
        that is set.
+
+``[cgroup]``
+------------
+
+cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Each
+job gets its own cgroup at ``/sys/fs/cgroup/spur/job_<id>``, and the limits are
+derived from the **per-node budget the controller allocated** — not from the
+``--cpus-per-task`` / ``--mem`` the user requested. Kubernetes jobs are unaffected:
+there the kubelet owns the cgroups.
+
+.. note::
+
+   **Reload: Not implemented.** ``spurd`` reads this section once at startup, so
+   ``scontrol reconfigure`` does not apply changes here. Restart the agent.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 8 10 60
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``enabled``
+     - bool
+     - ``true``
+     - Master switch. When ``false``, no cgroup is created and no limit is
+       applied.
+   * - ``constrain_cores``
+     - bool
+     - ``true``
+     - Pin the job to its allocated cores via ``cpuset.cpus``. With
+       ``cpu_quota`` off this is the only CPU bound, so a job whose allocation
+       yields no cores runs CPU-unconstrained and ``spurd`` logs a warning.
+   * - ``cpu_quota``
+     - bool
+     - ``false``
+     - Additionally cap CPU time with a CFS quota (``cpu.max``). Off because the
+       cpuset already bounds whole-core allocations; enabling it adds a hard
+       throttle on top.
+   * - ``constrain_ram_space``
+     - bool
+     - ``true``
+     - Cap memory via ``memory.max`` and ``memory.high``. Costs some per-node job
+       throughput — see the note below.
+   * - ``allowed_ram_percent``
+     - int
+     - ``100``
+     - Hard ceiling (``memory.max``) as a percentage of the allocated memory.
+       ``memory.high`` stays at 100% of the allocation, so the default makes the
+       two equal and a value above 100 opens a soft-throttle band. Must be at
+       least 1.
+   * - ``constrain_swap``
+     - bool
+     - ``true``
+     - Bound swap via ``memory.swap.max``.
+   * - ``allowed_swap_percent``
+     - int
+     - ``0``
+     - Swap allowance as a percentage of the allocated memory. ``0`` means no
+       swap. Must be between 0 and 100.
+   * - ``min_ram_mb``
+     - int
+     - ``30``
+     - Floor for the memory ceilings, in MiB. Guards against a tiny ``--mem``
+       creating a cgroup so small the job dies during its own startup.
+   * - ``oom_kill_job``
+     - bool
+     - ``true``
+     - On OOM, kill every process in the job (``memory.oom.group``) instead of
+       letting the kernel pick one.
+
+A job submitted without ``--mem`` has no memory budget, so ``memory.max``,
+``memory.high``, and ``memory.swap.max`` are all left at the kernel default.
+Constraining swap to zero while memory stayed unlimited would be incoherent.
+
+.. note::
+
+   **Memory constraints cost throughput.** ``memory.high`` makes the kernel
+   reclaim against a job approaching its ceiling rather than failing the
+   allocation outright. At the default ``allowed_ram_percent = 100`` that
+   pressure starts at the same point the OOM kill would, so a job that overruns
+   its budget slows down before it dies. Sites that would rather have headroom
+   than reclaim stalls should raise ``allowed_ram_percent`` (e.g. ``125``) rather
+   than turn ``constrain_ram_space`` off.
+
+Verify what a running job actually got:
+
+.. code-block:: bash
+
+   cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus       # allocated cores
+   cat /sys/fs/cgroup/spur/job_1234/memory.max        # hard ceiling, bytes
+   cat /sys/fs/cgroup/spur/job_1234/memory.high       # reclaim threshold
+   cat /sys/fs/cgroup/spur/job_1234/memory.swap.max   # swap ceiling
+
+Migrating from ``cgroup.conf``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The memory ceilings are computed exactly as Slurm's ``cgroup/v2`` plugin computes
+them, so a site's existing percentages carry over directly.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 34 32
+
+   * - Slurm ``cgroup.conf``
+     - Spur ``[cgroup]``
+     - Notes
+   * - ``ConstrainCores``
+     - ``constrain_cores``
+     -
+   * - ``ConstrainRAMSpace``
+     - ``constrain_ram_space``
+     -
+   * - ``AllowedRAMSpace``
+     - ``allowed_ram_percent``
+     - Integer only; Slurm accepts ``101.5``.
+   * - ``ConstrainSwapSpace``
+     - ``constrain_swap``
+     -
+   * - ``AllowedSwapSpace``
+     - ``allowed_swap_percent``
+     - Integer only.
+   * - ``MinRAMSpace``
+     - ``min_ram_mb``
+     -
+   * - ``OOMKillStep``
+     - ``oom_kill_job``
+     - Applies to the whole job; Spur has no per-step cgroups yet.
+
+Deliberate differences from Slurm:
+
+- **Spur enforces by default.** Every Slurm ``Constrain*`` defaults to ``no``. A
+  job that overran ``--mem`` or leaned on host swap under a stock Slurm
+  configuration will be reclaimed against, or killed, on Spur.
+- **Whole-job OOM kill by default.** Slurm's default kills one process and lets
+  the step keep running; set ``oom_kill_job = false`` for that behaviour.
+- **No CFS quota.** Slurm never writes ``cpu.max``; neither does Spur by default.
+  ``cpu_quota`` exists for sites that want one.
+- **No ``--mem`` means unbounded.** Slurm substitutes the node's configured
+  ``RealMemory``; Spur has no such per-node figure and leaves the ceilings unset.
+- **No plugin selectors.** ``CgroupPlugin``, ``TaskPlugin``, and ``ProctrackType``
+  have no Spur equivalent — the mechanism is not pluggable.
+- **Raising ``allowed_ram_percent`` above 100 over-commits the node** and can
+  trigger a system-wide OOM, the same warning Slurm gives for ``AllowedRAMSpace``.
 
 ``[metrics]``
 -------------

@@ -109,9 +109,10 @@ The two daemons are configured with command-line flags. The most common are belo
 
    Node identity and networking (controller address, hostname, listen address) come
    from CLI flags. ``spurd`` also reads ``spur.conf`` for local agent settings —
-   ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cluster]``, and
-   ``[mpi]``. If the file is absent, the agent logs a warning and falls back to
-   defaults for those sections, which is fine when none of them are in use.
+   ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cgroup]``,
+   ``[cluster]``, and ``[mpi]``. If the file is absent, the agent logs a warning and
+   falls back to defaults for those sections, which is fine when none of them are
+   in use.
 
 Quick Start: Two-Node Cluster
 -----------------------------
@@ -387,6 +388,42 @@ The default can be changed in ``spur.conf``:
    With the default ``"unlimited"`` setting, a ``LimitMEMLOCK=infinity`` line on
    the ``spurd`` systemd unit is no longer required. The agent raises the limit
    itself while still privileged.
+
+CPU and Memory Limits (cgroups)
+-------------------------------
+
+``spurd`` puts every native-host job in its own cgroup-v2 group at
+``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
+allocated** — the cores, memory, and swap the scheduler actually granted this node,
+not what the job asked for. This is what makes it safe for two users' jobs to share
+a node.
+
+Out of the box each job gets:
+
+- ``cpuset.cpus`` pinned to its allocated cores.
+- ``memory.max`` at its allocated memory, with ``memory.high`` at the same value so
+  the kernel reclaims against the job before killing it.
+- ``memory.swap.max`` at ``0`` — jobs cannot fall back on host swap.
+- ``memory.oom.group`` set, so an OOM kills the whole job rather than one process.
+- ``pids.max`` as a fork-bomb guard.
+
+A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
+left unset.
+
+Inspect what a running job actually got:
+
+.. code-block:: bash
+
+   ls /sys/fs/cgroup/spur/                            # one dir per running job
+   cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus
+   cat /sys/fs/cgroup/spur/job_1234/memory.max
+   cat /sys/fs/cgroup/spur/job_1234/memory.swap.max
+
+Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
+and runs jobs unconstrained. Every knob — including turning enforcement off
+entirely — lives in the ``[cgroup]`` section; see
+:doc:`/admin-guide/configuration` for the full field list and the mapping from
+Slurm's ``cgroup.conf``.
 
 MPI (PMIx)
 ----------
