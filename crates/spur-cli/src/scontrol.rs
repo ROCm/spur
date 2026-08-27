@@ -1717,10 +1717,16 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_ts(job.eligible_time.as_ref()),
         format_ts(job.accrue_time.as_ref()),
     );
+    // Slurm reports a pending job's projected start under StartTime; Spur has
+    // the same figure from the scheduler's held future slot.
+    let start = match (job.start_time.as_ref(), job.planned_start_time.as_ref()) {
+        (None, Some(planned)) => format_ts(Some(planned)),
+        (actual, _) => format_ts(actual),
+    };
     let _ = writeln!(
         out,
         "   StartTime={} EndTime={} Deadline={}",
-        format_ts(job.start_time.as_ref()),
+        start,
         format_ts(job.end_time.as_ref()),
         format_ts(job.deadline.as_ref()),
     );
@@ -1735,7 +1741,11 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         or_null(&job.req_nodelist),
         or_null(&job.exc_nodelist),
     );
-    let _ = writeln!(out, "   NodeList={}", or_null(&job.nodelist));
+    let _ = write!(out, "   NodeList={}", or_null(&job.nodelist));
+    if !job.sched_nodelist.is_empty() {
+        let _ = write!(out, " SchedNodeList={}", job.sched_nodelist);
+    }
+    let _ = writeln!(out);
     let _ = writeln!(
         out,
         "   NumNodes={} NumTasks={} CPUs/Task={}",
@@ -1918,6 +1928,47 @@ mod tests {
             out.contains("EligibleTime=2025-08-27T08:03:07 AccrueTime=2025-08-27T08:03:07"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn job_detail_reports_the_projected_start_of_a_held_future_slot() {
+        let mut job = pending_pinned_job();
+        job.planned_start_time = Some(prost_types::Timestamp {
+            seconds: 1_756_281_787,
+            nanos: 0,
+        });
+        job.sched_nodelist = "node[1-2]".into();
+
+        let out = format_job_detail(&job);
+        assert!(out.contains("StartTime=2025-08-27T08:03:07"), "{out}");
+        assert!(
+            out.contains("NodeList=(null) SchedNodeList=node[1-2]"),
+            "the allocated list stays empty; the planned one answers 'which nodes': {out}"
+        );
+    }
+
+    #[test]
+    fn job_detail_prefers_the_actual_start_over_the_projection() {
+        let mut job = pending_pinned_job();
+        job.start_time = Some(prost_types::Timestamp {
+            seconds: 1_756_281_787,
+            nanos: 0,
+        });
+        job.planned_start_time = Some(prost_types::Timestamp {
+            seconds: 1_900_000_000,
+            nanos: 0,
+        });
+        assert!(
+            format_job_detail(&job).contains("StartTime=2025-08-27T08:03:07"),
+            "a started job must not display a stale projection"
+        );
+    }
+
+    #[test]
+    fn job_detail_omits_sched_nodelist_when_no_slot_is_held() {
+        let out = format_job_detail(&pending_pinned_job());
+        assert!(out.contains("NodeList=(null)\n"), "{out}");
+        assert!(!out.contains("SchedNodeList"), "{out}");
     }
 
     #[test]

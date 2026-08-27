@@ -575,11 +575,18 @@ impl ControllerService {
             privileged,
             self.cluster.config().controller.job_info_visibility,
         ) {
-            JobInfoDisclosure::Full => Some(job_to_proto(job)),
             JobInfoDisclosure::Hidden => None,
-            JobInfoDisclosure::Redacted => {
+            disclosure => {
                 let mut info = job_to_proto(job);
-                redact_sensitive_job_info(&mut info);
+                // Annotate before redacting, so the redacted branch strips the
+                // planned nodelist rather than having it added back after.
+                annotate_jobs_with_planned_reservations(
+                    std::slice::from_mut(&mut info),
+                    &self.cluster,
+                );
+                if disclosure == JobInfoDisclosure::Redacted {
+                    redact_sensitive_job_info(&mut info);
+                }
                 Some(info)
             }
         }
@@ -846,7 +853,8 @@ impl SlurmController for ControllerService {
             nodes: &req.nodes,
         });
 
-        let proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
+        let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
+        annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
 
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
@@ -3863,6 +3871,7 @@ fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.submit_line = String::new();
     info.req_nodelist = String::new();
     info.exc_nodelist = String::new();
+    info.sched_nodelist = String::new();
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -3953,6 +3962,10 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         restarts: job.requeue_count + job.preempt_requeue_count + job.user_requeue_count,
         batch_flag: job.spec.script.is_some(),
         exclusive: job.spec.exclusive,
+        // Filled by annotate_jobs_with_planned_reservations: the scheduler's
+        // plan lives on the cluster, not the job record.
+        planned_start_time: None,
+        sched_nodelist: String::new(),
     }
 }
 
@@ -4239,6 +4252,29 @@ fn annotate_nodes_with_reservations(
                 }
             }
         }
+    }
+}
+
+/// Surface the future slot the scheduler is holding for a pending job, so
+/// `StartTime` answers "when" instead of staying N/A while the job waits.
+fn annotate_jobs_with_planned_reservations(jobs: &mut [JobInfo], cluster: &ClusterManager) {
+    if jobs.is_empty() {
+        return;
+    }
+    apply_planned_reservations(jobs, &cluster.planned_job_starts());
+}
+
+fn apply_planned_reservations(
+    jobs: &mut [JobInfo],
+    by_job: &spur_sched::backfill::PlannedJobStarts,
+) {
+    let pending = spur_core::job::JobState::Pending.to_proto_i32();
+    for job in jobs.iter_mut().filter(|j| j.state == pending) {
+        let Some((nodes, start)) = by_job.get(&job.job_id) else {
+            continue;
+        };
+        job.planned_start_time = Some(datetime_to_proto(*start));
+        job.sched_nodelist = spur_core::hostlist::compress(nodes);
     }
 }
 
@@ -6988,6 +7024,49 @@ mod tests {
             MAX_SUBMIT_LINE_LEN
         );
         assert_eq!(sanitize_submit_line("\u{1b}\u{7}"), None);
+    }
+
+    #[test]
+    fn annotate_jobs_fills_only_pending_jobs_from_the_planned_map() {
+        use std::collections::HashMap;
+
+        let start = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let by_job = HashMap::from([
+            (7u32, (vec!["n1".to_string(), "n2".to_string()], start)),
+            (9u32, (vec!["n3".to_string()], start)),
+        ]);
+
+        let mut jobs = vec![
+            JobInfo {
+                job_id: 7,
+                state: spur_core::job::JobState::Pending.to_proto_i32(),
+                ..Default::default()
+            },
+            JobInfo {
+                job_id: 9,
+                state: spur_core::job::JobState::Running.to_proto_i32(),
+                ..Default::default()
+            },
+        ];
+        apply_planned_reservations(&mut jobs, &by_job);
+
+        assert!(jobs[0].planned_start_time.is_some());
+        assert_eq!(jobs[0].sched_nodelist, "n[1-2]");
+        // A running job holds no future slot; a leftover entry must not surface.
+        assert!(jobs[1].planned_start_time.is_none());
+        assert!(jobs[1].sched_nodelist.is_empty());
+    }
+
+    #[test]
+    fn redaction_strips_the_planned_nodelist() {
+        // Ordering guard: annotation runs before redaction, so the planned list
+        // must not reappear on a redacted record.
+        let mut info = JobInfo {
+            sched_nodelist: "gpu-b-[01-04]".into(),
+            ..Default::default()
+        };
+        redact_sensitive_job_info(&mut info);
+        assert!(info.sched_nodelist.is_empty());
     }
 
     #[test]

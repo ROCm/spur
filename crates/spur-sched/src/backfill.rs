@@ -36,6 +36,9 @@ pub struct BackfillScheduler {
     last_outcome: HashMap<JobId, Unplaced>,
 }
 
+/// Scheduler's future-slot plan: job -> (nodes held, projected start).
+pub type PlannedJobStarts = HashMap<JobId, (Vec<String>, chrono::DateTime<Utc>)>;
+
 /// Why the backfill pass did not start a job now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnplacedKind {
@@ -140,6 +143,32 @@ impl BackfillScheduler {
                     .map(|(job_id, start)| (tl.node_name.clone(), (job_id, start)))
             })
             .collect()
+    }
+
+    /// Future slot held per pending job, with the nodes it is held on. Unlike
+    /// `planned_starts`, busy nodes are included: a job pinned to a running
+    /// node is exactly the case that needs a projected start.
+    pub fn planned_job_starts(&self) -> PlannedJobStarts {
+        let now = Utc::now();
+        let mut by_job: PlannedJobStarts = HashMap::new();
+        for tl in &self.timelines {
+            let mut earliest_per_job: HashMap<JobId, chrono::DateTime<Utc>> = HashMap::new();
+            for iv in tl.intervals.iter().filter(|iv| iv.start > now) {
+                if let Some(job_id) = iv.job_id {
+                    earliest_per_job
+                        .entry(job_id)
+                        .and_modify(|s| *s = (*s).min(iv.start))
+                        .or_insert(iv.start);
+                }
+            }
+            for (job_id, start) in earliest_per_job {
+                let entry = by_job.entry(job_id).or_insert_with(|| (Vec::new(), start));
+                entry.0.push(tl.node_name.clone());
+                // The job waits on its last node, so the projection is the max.
+                entry.1 = entry.1.max(start);
+            }
+        }
+        by_job
     }
 
     /// Initialize or reset timelines from current cluster state.
@@ -1809,6 +1838,44 @@ mod tests {
             !node001_conflict,
             "heterogeneous job's shifted reservation on node001 must not land inside the unauthorized reservation window"
         );
+    }
+
+    #[test]
+    fn planned_job_starts_covers_a_job_queued_behind_a_busy_node() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(1);
+        // The node is fully occupied now, so the job can only take a future
+        // slot -- the case `planned_starts` filters out as not-idle.
+        nodes[0].state = NodeState::Allocated;
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node001".to_string(), Utc::now() + Duration::minutes(30));
+
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        assert!(sched.schedule(&[make_job(1, 1, 32)], &cluster).is_empty());
+        assert!(
+            sched.planned_starts().is_empty(),
+            "the idle-node view must stay empty while the node is busy"
+        );
+
+        let (nodes_held, start) = sched
+            .planned_job_starts()
+            .get(&1)
+            .cloned()
+            .expect("job-keyed view must report the held slot");
+        assert_eq!(nodes_held, vec!["node001"]);
+        assert!(start > Utc::now());
     }
 
     #[test]

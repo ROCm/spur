@@ -435,6 +435,9 @@ pub struct ClusterManager {
     /// Node -> (job_id, start_time) for a future backfill reservation,
     /// refreshed every cycle. Ephemeral: never persisted, cheap to recompute.
     planned_reservations: RwLock<HashMap<String, (JobId, DateTime<Utc>)>>,
+    /// Same scheduler plan keyed by job, including slots on busy nodes that
+    /// `planned_reservations` (an idle-node view for sinfo) leaves out.
+    planned_job_starts: RwLock<spur_sched::backfill::PlannedJobStarts>,
     /// Last keepalive time per interactive allocation, used by the InactiveLimit
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
@@ -533,6 +536,7 @@ impl ClusterManager {
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             planned_reservations: RwLock::new(HashMap::new()),
+            planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
         };
@@ -4678,6 +4682,14 @@ impl ClusterManager {
     /// holds a future reservation for a specific pending job on it.
     pub fn planned_reservation(&self, node: &str) -> Option<(JobId, DateTime<Utc>)> {
         self.planned_reservations.read().get(node).copied()
+    }
+
+    pub(crate) fn set_planned_job_starts(&self, planned: spur_sched::backfill::PlannedJobStarts) {
+        *self.planned_job_starts.write() = planned;
+    }
+
+    pub(crate) fn planned_job_starts(&self) -> spur_sched::backfill::PlannedJobStarts {
+        self.planned_job_starts.read().clone()
     }
 
     pub(crate) fn record_sched_cycle(

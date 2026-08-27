@@ -345,6 +345,8 @@ impl SlurmAccounting for AccountingService {
                 restarts: 0,
                 batch_flag: false,
                 exclusive: false,
+                planned_start_time: None,
+                sched_nodelist: String::new(),
             })
             .collect();
 

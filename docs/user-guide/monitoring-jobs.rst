@@ -389,6 +389,11 @@ request as submitted, which distinguishes the two:
      - Earliest the job may start (``--begin``, otherwise submit time).
    * - ``AccrueTime``
      - When the job began accruing age priority.
+   * - ``StartTime`` / ``SchedNodeList``
+     - While pending, the slot the scheduler is holding: when it projects the
+       job will start, and on which nodes. Absent when no slot is reserved
+       (nothing can run the job yet). ``StartTime`` becomes the real start
+       once the job runs.
    * - ``LastSchedEval``
      - When the scheduler last considered the job **for placement**. ``N/A``
        before the first cycle, frozen once the job starts, and reset by a
@@ -401,8 +406,10 @@ fields between these lines):
 
       JobState=PENDING Reason=Resources Dependency=(null)
       ...
+      StartTime=2026-08-27T17:09:56 EndTime=N/A Deadline=N/A
+      ...
       ReqNodeList=node07 ExcNodeList=(null)
-      NodeList=(null)
+      NodeList=(null) SchedNodeList=node07
       ...
       SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
 

@@ -286,6 +286,11 @@ message JobInfo {
   uint32 restarts = 74;
   bool batch_flag = 75;
   bool exclusive = 76;
+
+  // Future slot the scheduler is holding for a pending job: when it projects
+  // the job will start, and on which nodes. Unset when no slot is reserved.
+  google.protobuf.Timestamp planned_start_time = 77;
+  string sched_nodelist = 78;
 }
 
 message NodeInfo {
