@@ -3214,7 +3214,9 @@ impl ClusterManager {
         let now = Utc::now();
         let mut jobs = self.jobs.write();
         for id in job_ids {
-            if let Some(job) = jobs.get_mut(id) {
+            // Re-check under the write lock: the read snapshot was released, so
+            // the job may have started since and must not gain a stamp.
+            if let Some(job) = jobs.get_mut(id).filter(|j| j.state == JobState::Pending) {
                 job.last_sched_eval = Some(now);
             }
         }

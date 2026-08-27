@@ -326,10 +326,26 @@ impl SlurmAccounting for AccountingService {
                 preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
-                // Requested-placement and scheduling-provenance fields are not
-                // columns in the accounting store; only the live controller
-                // reports them.
-                ..Default::default()
+                // Kept exhaustive rather than `..Default::default()` so adding
+                // a JobInfo field forces a decision here. The accounting store
+                // has no column for the requested-placement fields.
+                req_nodelist: String::new(),
+                exc_nodelist: String::new(),
+                features: String::new(),
+                dependency: Vec::new(),
+                submit_line: String::new(),
+                req_tres: String::new(),
+                min_cpus_node: 0,
+                min_memory_node_mb: 0,
+                eligible_time: None,
+                accrue_time: None,
+                last_sched_eval: None,
+                deadline: None,
+                time_min: None,
+                requeue: false,
+                restarts: 0,
+                batch_flag: false,
+                exclusive: false,
             })
             .collect();
 

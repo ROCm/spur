@@ -591,7 +591,8 @@ pub struct JobSpec {
     #[serde(default)]
     pub pty: bool,
 
-    /// Verbatim submit command line, captured by the CLI for observability.
+    /// Submit command line as invoked, shell-quoted by the CLI so word
+    /// boundaries survive. Client-asserted, so advisory rather than audit.
     #[serde(default)]
     pub submit_line: Option<String>,
 }

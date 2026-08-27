@@ -344,6 +344,12 @@ Detailed Records — ``scontrol show``
 ``spur show`` (Slurm ``scontrol show``) prints the full ``Key=Value`` record for
 an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
 
+.. note::
+
+   The job record is fixed-shape: every field is printed on every job, with
+   ``(null)`` for an unset string. Parsers must key on the field name, not on a
+   line being absent.
+
 .. code-block:: bash
 
    scontrol show job 1024
@@ -375,7 +381,7 @@ request as submitted, which distinguishes the two:
    * - ``ReqTRES``
      - Requested resource totals, e.g. ``cpu=16,mem=32000M,node=2,gres/gpu=8``.
    * - ``MinCPUsNode`` / ``MinMemoryNode``
-     - Per-node minima implied by the request.
+     - Per-node minima implied by the request; memory is in MB.
    * - ``SubmitLine``
      - The submit command as invoked, so any submission-flag question is
        answerable from one command.
@@ -384,17 +390,21 @@ request as submitted, which distinguishes the two:
    * - ``AccrueTime``
      - When the job began accruing age priority.
    * - ``LastSchedEval``
-     - When the scheduler last considered the job. ``N/A`` before the first
-       cycle, and reset by a controller restart or failover.
+     - When the scheduler last considered the job **for placement**. ``N/A``
+       before the first cycle, frozen once the job starts, and reset by a
+       controller restart or failover.
 
-So a job pinned to a busy node reads:
+So a job pinned to a busy node reads (excerpt — the full record has more
+fields between these lines):
 
 .. code-block:: text
 
-   JobState=PENDING Reason=Resources Dependency=(null)
-   ReqNodeList=node07 ExcNodeList=(null)
-   NodeList=(null)
-   SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
+      JobState=PENDING Reason=Resources Dependency=(null)
+      ...
+      ReqNodeList=node07 ExcNodeList=(null)
+      NodeList=(null)
+      ...
+      SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
 
 The controller logs the matching scheduler-side view at ``info`` level, one line
 per job when its placement outcome changes (not every cycle):
@@ -405,7 +415,7 @@ per job when its placement outcome changes (not every cycle):
 
 ``reason`` is one of ``het_group_incomplete``, ``no_suitable_nodes``,
 ``requested_nodes_unavailable``, ``too_few_candidates``, ``no_capacity_at_start``,
-or ``future_slot_reserved``. The last means the job is placeable and the
+or ``future_slot_reserved``. The last means the job can be placed and the
 scheduler is holding a future slot for it, reported with ``planned_start``.
 
 .. note::

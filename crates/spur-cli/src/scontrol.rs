@@ -1758,7 +1758,7 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     }
     let _ = writeln!(
         out,
-        "   MinCPUsNode={} MinMemoryNode={}",
+        "   MinCPUsNode={} MinMemoryNode={}M",
         job.min_cpus_node, job.min_memory_node_mb
     );
     let _ = writeln!(out, "   Features={}", or_null(&job.features));
@@ -1870,7 +1870,7 @@ mod tests {
         assert!(out.contains("Features=mi300x"), "{out}");
         assert!(out.contains("Dependency=afterok:5"), "{out}");
         assert!(out.contains("ReqTRES=cpu=16,node=2,gres/gpu=8"), "{out}");
-        assert!(out.contains("MinCPUsNode=8 MinMemoryNode=16000"), "{out}");
+        assert!(out.contains("MinCPUsNode=8 MinMemoryNode=16000M"), "{out}");
     }
 
     #[test]

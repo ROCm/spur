@@ -189,7 +189,8 @@ message JobSpec {
   bool pty = 83;
   WindowSize initial_winsize = 84;
 
-  // Verbatim submit command line, for `scontrol show job` SubmitLine=.
+  // Submit command line as invoked, shell-quoted so word boundaries survive.
+  // Client-asserted: the controller bounds and sanitizes it but cannot verify it.
   string submit_line = 85;
 }
 

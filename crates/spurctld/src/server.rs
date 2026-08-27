@@ -3769,11 +3769,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.open_mode)
         },
         pty: spec.pty,
-        submit_line: if spec.submit_line.is_empty() {
-            None
-        } else {
-            Some(spec.submit_line)
-        },
+        submit_line: sanitize_submit_line(&spec.submit_line),
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -3862,6 +3858,12 @@ fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.comment = String::new();
     info.nodelist = String::new();
     info.resources = None;
+    // The submit line carries the command and its flags, so it re-exposes most
+    // of the above; the requested lists are the same targeting oracle as the
+    // allocated one.
+    info.submit_line = String::new();
+    info.req_nodelist = String::new();
+    info.exc_nodelist = String::new();
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -3938,7 +3940,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         dependency: job.spec.dependency.clone(),
         submit_line: job.spec.submit_line.clone().unwrap_or_default(),
         req_tres: requested_tres(&job.spec),
-        min_cpus_node: min_cpus_per_node(&job.spec),
+        min_cpus_node: min_cpus_per_node(&job.spec).try_into().unwrap_or(u32::MAX),
         min_memory_node_mb: min_memory_per_node_mb(&job.spec),
         eligible_time: Some(datetime_to_proto(job.eligible_time())),
         accrue_time: Some(datetime_to_proto(job.accrue_time())),
@@ -3955,16 +3957,32 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     }
 }
 
+/// Longest submit line kept. It is client-asserted, replicated in every Raft
+/// entry, and echoed to `scontrol show job`, so it is bounded and stripped of
+/// control characters that would rewrite an operator's terminal.
+const MAX_SUBMIT_LINE_LEN: usize = 1024;
+
+fn sanitize_submit_line(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_SUBMIT_LINE_LEN)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 /// Tasks that land on one node, used for the per-node minima Slurm reports.
-fn tasks_per_node(spec: &spur_core::job::JobSpec) -> u32 {
-    spec.tasks_per_node.unwrap_or_else(|| {
-        let nodes = spec.num_nodes.max(1);
-        spec.num_tasks.max(1).div_ceil(nodes)
+/// Nothing bounds `num_tasks` or `cpus_per_task` at submit, and these feed
+/// every `GetJobs`, so the whole family saturates rather than overflowing.
+fn tasks_per_node(spec: &spur_core::job::JobSpec) -> u64 {
+    spec.tasks_per_node.map(u64::from).unwrap_or_else(|| {
+        let nodes = u64::from(spec.num_nodes.max(1));
+        u64::from(spec.num_tasks.max(1)).div_ceil(nodes)
     })
 }
 
-fn min_cpus_per_node(spec: &spur_core::job::JobSpec) -> u32 {
-    tasks_per_node(spec) * spec.cpus_per_task.max(1)
+fn min_cpus_per_node(spec: &spur_core::job::JobSpec) -> u64 {
+    tasks_per_node(spec).saturating_mul(u64::from(spec.cpus_per_task.max(1)))
 }
 
 /// Per-node memory floor. A `--mem-per-cpu` job has none declared directly, so
@@ -3974,25 +3992,26 @@ fn min_memory_per_node_mb(spec: &spur_core::job::JobSpec) -> u64 {
         return mb;
     }
     spec.memory_per_cpu_mb
-        .map(|per_cpu| per_cpu * min_cpus_per_node(spec) as u64)
+        .map(|per_cpu| per_cpu.saturating_mul(min_cpus_per_node(spec)))
         .unwrap_or(0)
 }
 
 /// Slurm-style requested TRES summary. `billing` is omitted: Spur has no TRES
 /// billing weights, and emitting a made-up value would misreport usage.
 fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
-    let nodes = spec.num_nodes.max(1);
-    let mut parts = vec![
-        format!("cpu={}", min_cpus_per_node(spec) as u64 * nodes as u64),
-        format!("node={nodes}"),
-    ];
+    let nodes = u64::from(spec.num_nodes.max(1));
+    // The CPU total is the job's real ask, not the per-node minimum scaled up:
+    // an uneven split (-N2 -n7) would otherwise round the total upward.
+    let cpu_total =
+        u64::from(spec.num_tasks.max(1)).saturating_mul(u64::from(spec.cpus_per_task.max(1)));
+    let mut parts = vec![format!("cpu={cpu_total}"), format!("node={nodes}")];
 
-    let mem_mb = min_memory_per_node_mb(spec) * nodes as u64;
+    let mem_mb = min_memory_per_node_mb(spec).saturating_mul(nodes);
     if mem_mb > 0 {
         parts.insert(1, format!("mem={mem_mb}M"));
     }
 
-    let gpus = spur_core::job::effective_gpus(spec, nodes);
+    let gpus = spur_core::job::effective_gpus(spec, nodes as u32);
     if gpus > 0 {
         parts.push(format!("gres/gpu={gpus}"));
     }
@@ -4544,6 +4563,9 @@ mod tests {
             stdin_path: "/home/bob/in".into(),
             comment: "internal".into(),
             nodelist: "gpu-b-[01-04]".into(),
+            submit_line: "sbatch --wrap 'python train.py --secret'".into(),
+            req_nodelist: "gpu-b-[01-04]".into(),
+            exc_nodelist: "gpu-b-05".into(),
             ..Default::default()
         };
         redact_sensitive_job_info(&mut info);
@@ -4556,6 +4578,9 @@ mod tests {
         assert!(info.comment.is_empty());
         assert!(info.nodelist.is_empty());
         assert!(info.resources.is_none());
+        assert!(info.submit_line.is_empty());
+        assert!(info.req_nodelist.is_empty());
+        assert!(info.exc_nodelist.is_empty());
         // Non-sensitive identity/state fields survive so the queue view still works.
         assert_eq!(info.job_id, 42);
         assert_eq!(info.name, "train");
@@ -6945,6 +6970,30 @@ mod tests {
     }
 
     #[test]
+    fn proto_to_job_spec_maps_an_empty_submit_line_to_none() {
+        assert_eq!(sanitize_submit_line(""), None);
+        assert_eq!(
+            sanitize_submit_line("sbatch job.sh"),
+            Some("sbatch job.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_submit_line_strips_control_characters_and_bounds_length() {
+        // A client-asserted field printed straight to an operator's terminal.
+        assert_eq!(
+            sanitize_submit_line("sbatch \u{1b}[2Kjob.sh"),
+            Some("sbatch [2Kjob.sh".to_string())
+        );
+        let long = "x".repeat(MAX_SUBMIT_LINE_LEN * 2);
+        assert_eq!(
+            sanitize_submit_line(&long).unwrap().len(),
+            MAX_SUBMIT_LINE_LEN
+        );
+        assert_eq!(sanitize_submit_line("\u{1b}\u{7}"), None);
+    }
+
+    #[test]
     fn job_to_proto_reports_requested_placement_and_submit_line() {
         use spur_core::job::{Job, JobSpec};
 
@@ -6997,6 +7046,38 @@ mod tests {
         assert_eq!(requested_tres(&spec), "cpu=16,mem=32000M,node=2,gres/gpu=8");
         assert_eq!(min_cpus_per_node(&spec), 8);
         assert_eq!(min_memory_per_node_mb(&spec), 16000);
+    }
+
+    #[test]
+    fn requested_tres_cpu_total_is_the_real_ask_not_the_rounded_per_node_minimum() {
+        use spur_core::job::JobSpec;
+
+        // -N2 -n7 -c1: the per-node minimum rounds up to 4, but the job asked
+        // for 7 CPUs, and that is what ReqTRES must report.
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 7,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=7,node=2");
+        assert_eq!(min_cpus_per_node(&spec), 4);
+    }
+
+    #[test]
+    fn requested_tres_saturates_instead_of_overflowing() {
+        use spur_core::job::JobSpec;
+
+        // Nothing bounds these at submit, and they feed every GetJobs.
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: u32::MAX,
+            cpus_per_task: u32::MAX,
+            memory_per_cpu_mb: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(requested_tres(&spec).starts_with("cpu="));
+        assert_eq!(min_memory_per_node_mb(&spec), u64::MAX);
     }
 
     #[test]
