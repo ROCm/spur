@@ -875,8 +875,19 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Cgroup placement already happened pre-exec (join_cgroup_self); a move here
-    // would race the wrapper's fork.
+    // Attaches after `exec`, so an immediate fork strands descendants. A `pre_exec`
+    // barrier cannot fix it: `Command::spawn` returns only once the child execs.
+    if let Some(ref cgroup) = cgroup_path {
+        if let Some(pid) = child.id() {
+            if !move_to_cgroup(cgroup, pid) && cfg.cgroup.required {
+                let _ = child.kill().await;
+                return Err(anyhow::anyhow!(
+                    "[cgroup] required but the job could not join its cgroup"
+                )
+                .into());
+            }
+        }
+    }
 
     debug!(
         job_id,
@@ -893,10 +904,8 @@ async fn spawn_job_process(
     })
 }
 
-/// Render a job's cgroup-v2 control files as (filename, content) pairs.
-///
-/// Pure so the file layout is testable without a real cgroupfs; the values
-/// themselves are resolved by `CgroupConfig::limits_for`.
+/// Render a job's cgroup-v2 control files as (filename, content) pairs. Pure so
+/// the layout is testable without a cgroupfs; values come from `limits_for`.
 fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
     let mut files: Vec<(&'static str, String)> = Vec::new();
     if let Some(quota) = limits.cpu_quota_us {
@@ -936,7 +945,7 @@ fn setup_cgroup(
     cpu_ids: &[u32],
     swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let Some(limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
+    let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
         debug!(job_id, "cgroup enforcement disabled by config");
         return Ok(None);
     };
@@ -947,9 +956,21 @@ fn setup_cgroup(
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
     // without this the per-job memory limit is never enforced. Root failure fatal.
+    // Steps below degrade to a warning by default; `required` turns the first
+    // degrade into a refusal so a node that cannot enforce stops pretending.
+    let mut degraded: Option<String> = None;
+    let mut degrade = |what: &str| {
+        if degraded.is_none() {
+            degraded = Some(what.to_string());
+        }
+    };
+
     if let Err(e) = std::fs::create_dir_all(&cgroup_root) {
         if nix::unistd::geteuid().is_root() {
             anyhow::bail!("cgroup root creation failed as root: {}", e);
+        }
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the cgroup root is unavailable: {e}");
         }
         warn!(job_id, error = %e, "cgroup creation failed (not root), running without isolation");
         return Ok(None);
@@ -958,11 +979,15 @@ fn setup_cgroup(
     for ctrl in ["+memory", "+cpu", "+pids", "+cpuset"] {
         if let Err(e) = std::fs::write(&subtree, ctrl) {
             warn!(job_id, controller = ctrl, error = %e, "failed to delegate cgroup controller");
+            degrade(&format!("controller {ctrl} not delegated"));
         }
     }
     if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
         if nix::unistd::geteuid().is_root() {
             anyhow::bail!("cgroup creation failed as root: {}", e);
+        }
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the job cgroup could not be created: {e}");
         }
         warn!(
             job_id,
@@ -972,6 +997,34 @@ fn setup_cgroup(
         return Ok(None);
     }
 
+    // Core ids come from a synthesized 0..n range, which can name cores this
+    // cgroup may not hold. Drop those rather than let the whole write fail.
+    if !limits.cpuset_cpus.is_empty() {
+        match std::fs::read_to_string(cgroup_root.join("cpuset.cpus.effective")) {
+            Ok(effective) => {
+                let permitted = permitted_cores(&limits.cpuset_cpus, effective.trim());
+                if permitted.len() != limits.cpuset_cpus.len() {
+                    warn!(
+                        job_id,
+                        allocated = ?limits.cpuset_cpus,
+                        permitted = ?permitted,
+                        effective = effective.trim(),
+                        "some allocated cores lie outside the cgroup's permitted set"
+                    );
+                }
+                limits.cpuset_cpus = permitted;
+            }
+            Err(e) => {
+                warn!(job_id, error = %e, "cannot read cpuset.cpus.effective; writing the allocated set unchecked");
+            }
+        }
+    }
+
+    for (name, content) in cgroup_limit_files(&limits) {
+        if let Err(e) = std::fs::write(cgroup_path.join(name), &content) {
+            warn!(job_id, file = name, error = %e, "failed to write cgroup control file");
+            degrade(&format!("{name} not applied"));
+        }
     // Set CPU limit (cpu.max: quota period)
     // e.g., 4 CPUs → "400000 100000" (400ms out of 100ms period)
     let quota = cpus as u64 * 100_000;
@@ -1003,10 +1056,27 @@ fn setup_cgroup(
         warn!(job_id, error = %e, "failed to set memory.oom.group");
     }
 
-    // With the CFS quota off by default the cpuset is the only CPU bound, so an
-    // empty one means the job is not CPU-constrained at all.
-    if cgroup.constrain_cores && limits.cpuset_cpus.is_empty() {
+    // The cpuset is the only CPU bound once the quota is off, and a rejected write
+    // reads back empty — i.e. inherit everything. Verify rather than trust.
+    if cgroup.constrain_cores && !limits.cpuset_cpus.is_empty() {
+        let applied = std::fs::read_to_string(cgroup_path.join("cpuset.cpus")).unwrap_or_default();
+        let applied = parse_cpu_list(applied.trim());
+        if applied.is_empty() {
+            warn!(job_id, allocated = ?limits.cpuset_cpus, "cpuset not applied; job runs without a CPU bound");
+            degrade("cpuset not applied");
+        } else if applied != limits.cpuset_cpus.iter().copied().collect() {
+            warn!(job_id, expected = ?limits.cpuset_cpus, applied = ?applied, "cpuset differs from the allocated cores");
+            degrade("cpuset differs from the allocated cores");
+        }
+    } else if cgroup.constrain_cores {
         warn!(job_id, "no cores to pin; job runs without a CPU bound");
+    }
+
+    if let Some(reason) = degraded {
+        if cgroup.required {
+            let _ = std::fs::remove_dir(&cgroup_path);
+            anyhow::bail!("[cgroup] required but enforcement is incomplete: {reason}");
+        }
     }
 
     debug!(
@@ -1020,54 +1090,71 @@ fn setup_cgroup(
     Ok(Some(cgroup_path))
 }
 
-/// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
-/// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
-fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
-    let pid = unsafe { libc::getpid() };
+/// Parse a cgroup cpu list (`"0-3"`, `"0-1,4"`, `""`) into core ids.
+fn parse_cpu_list(spec: &str) -> std::collections::BTreeSet<u32> {
+    let mut ids = std::collections::BTreeSet::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                if let (Ok(lo), Ok(hi)) = (lo.parse::<u32>(), hi.parse::<u32>()) {
+                    ids.extend(lo..=hi);
+                }
+            }
+            None => {
+                if let Ok(id) = part.parse::<u32>() {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
+}
 
-    let mut buf = [0u8; 24];
-    let mut i = buf.len();
-    let mut n = pid.max(0) as u64;
+/// Cores from `requested` the parent cgroup permits. A child cpuset must be a
+/// subset: an id the parent lacks fails ERANGE and leaves the job unpinned.
+fn permitted_cores(requested: &[u32], parent_effective: &str) -> Vec<u32> {
+    let allowed = parse_cpu_list(parent_effective);
+    requested
+        .iter()
+        .copied()
+        .filter(|id| allowed.contains(id))
+        .collect()
+}
+
+/// Hold the forked child until the parent attaches it: cgroup-v2 moves only the
+/// written pid, so forking first strands descendants. Post-`fork`; fails open.
+unsafe fn await_cgroup_attach(read_fd: RawFd, write_fd: RawFd) {
+    // The child inherits the write end across fork, so EOF never arrives unless
+    // it drops its own copy first.
+    libc::close(write_fd);
+    let mut byte = 0u8;
     loop {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
+        let n = libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1);
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
         }
+        break;
     }
-    let digits = &buf[i..];
-
-    unsafe {
-        let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
-        if fd < 0 {
-            warn_cgroup_join_failed(log_fd);
-            return;
-        }
-        let written = libc::write(fd, digits.as_ptr() as *const libc::c_void, digits.len());
-        libc::close(fd);
-        if written < 0 {
-            warn_cgroup_join_failed(log_fd);
-        }
-    }
+    libc::close(read_fd);
 }
 
-/// Async-signal-safe warning for a failed cgroup join: a fixed message to
-/// `log_fd`, or a no-op when it is negative.
-fn warn_cgroup_join_failed(log_fd: RawFd) {
-    if log_fd < 0 {
-        return;
+/// Move a process into a cgroup. Returns true if successful.
+fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
+    let procs_file = cgroup_path.join("cgroup.procs");
+    if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
+        warn!(
+            pid,
+            error = %e,
+            "failed to move process to cgroup — job runs without isolation"
+        );
+        false
+    } else {
+        true
     }
-    const MSG: &[u8] = b"spur: failed to join cgroup; job runs without resource limits\n";
-    unsafe {
-        libc::write(log_fd, MSG.as_ptr() as *const libc::c_void, MSG.len());
-    }
-}
-
-/// Duplicate `fd` with CLOEXEC set, returning the new fd or -1. The copy is
-/// usable in the pre-exec child but closes automatically at exec.
-fn dup_cloexec(fd: RawFd) -> RawFd {
-    unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1530,6 +1617,12 @@ async fn launch_container_job(
     let ready_r = pipe_r.as_raw_fd();
     let ready_w = pipe_w.as_raw_fd();
 
+    // Must clear before `container_init`, which forks the pid-namespace PID 1:
+    // forking before the attach would strand the whole container tree.
+    let (barrier_r, barrier_w) = nix::unistd::pipe().context("create cgroup attach barrier")?;
+    let barrier_r_raw = barrier_r.as_raw_fd();
+    let barrier_w_raw = barrier_w.as_raw_fd();
+
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
     // across the fork boundary).
@@ -1564,6 +1657,11 @@ async fn launch_container_job(
             unsafe {
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+
+            // Before anything that forks.
+            unsafe {
+                await_cgroup_attach(barrier_r_raw, barrier_w_raw);
             }
 
             unsafe {
@@ -1659,6 +1757,19 @@ async fn launch_container_job(
 
             let child_pid = child.as_raw();
 
+            // Verify rather than trust (DC2): the container tree inherits this
+            // membership, so losing it silently unbounds the whole tree.
+            let joined = match cgroup_path {
+                Some(ref cgroup) => move_to_cgroup(cgroup, child_pid as u32),
+                None => true,
+            };
+            // Releases the child to run container_init; see await_cgroup_attach.
+            drop(barrier_w);
+
+            if !joined && cfg.cgroup.required {
+                let _ = signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL);
+                anyhow::bail!("[cgroup] required but the container could not join its cgroup");
+            }
             // Cgroup placement already happened in the child before exec; a
             // parent-side write here would race the container's execve.
 
@@ -1808,6 +1919,37 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 
     wrapper.push_str("exit $SPUR_BB_EXIT\n");
     wrapper
+}
+
+#[cfg(test)]
+mod cpuset_tests {
+    use super::{parse_cpu_list, permitted_cores};
+
+    #[test]
+    fn parses_ranges_lists_and_empty() {
+        assert_eq!(parse_cpu_list("0-3"), [0, 1, 2, 3].into_iter().collect());
+        assert_eq!(parse_cpu_list("0,2,4"), [0, 2, 4].into_iter().collect());
+        assert_eq!(
+            parse_cpu_list("0-1,4-5"),
+            [0, 1, 4, 5].into_iter().collect()
+        );
+        assert!(parse_cpu_list("").is_empty());
+        assert!(parse_cpu_list("\n").is_empty());
+    }
+
+    #[test]
+    fn drops_cores_the_parent_cgroup_does_not_hold() {
+        // Core ids are synthesized from a count, so a sparse online mask can name
+        // cores that do not exist. Writing one fails ERANGE, leaving it unbounded.
+        assert_eq!(permitted_cores(&[0, 1, 99], "0-3"), vec![0, 1]);
+        assert_eq!(permitted_cores(&[64, 65], "0-63"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn keeps_the_full_set_when_the_parent_permits_it() {
+        assert_eq!(permitted_cores(&[0, 1, 2, 3], "0-3"), vec![0, 1, 2, 3]);
+        assert_eq!(permitted_cores(&[2, 3], "0-1,2-3"), vec![2, 3]);
+    }
 }
 
 #[cfg(test)]

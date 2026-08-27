@@ -249,6 +249,71 @@ Follow this order for any cluster upgrade:
    32-bit and its accounting queries fail against a migrated database. Take a database
    backup before upgrading if you need a recovery path.
 
+Behavior Changes Between Releases
+---------------------------------
+
+Some releases change how an existing ``spur.conf`` behaves without that file being
+edited. Review these before rolling binaries out.
+
+.. _cgroup-upgrade-notes:
+
+Job resource enforcement (``[cgroup]``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing the ``[cgroup]`` section changed what ``spurd`` writes for
+a config that has **no** ``[cgroup]`` section. Two of these can affect jobs that
+ran fine before the upgrade.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Control file
+     - Before
+     - After
+     - Effect
+   * - ``memory.swap.max``
+     - unset — swap unbounded
+     - ``0`` — no swap
+     - **A job that was completing by swapping is now OOM-killed.**
+   * - ``memory.high``
+     - unset
+     - equal to ``memory.max``
+     - **Memory-heavy jobs stall in reclaim before the OOM kill**, costing
+       throughput.
+   * - ``cpu.max``
+     - CFS quota sized from ``--cpus-per-task``
+     - unset
+     - Relaxed: the cpuset is the CPU bound, as in Slurm.
+   * - ``cpuset.cpus``
+     - sized from ``--cpus-per-task``
+     - sized from the node allocation
+     - Relaxed: a multi-task job gets all the cores it was granted, not one
+       task's worth.
+
+To keep the previous behavior, put this in ``spur.conf`` on every compute node
+**before** restarting ``spurd``:
+
+.. code-block:: toml
+
+   [cgroup]
+   cpu_quota = true        # restore the CFS quota
+   constrain_swap = false  # restore unbounded swap
+
+``spurd`` reads ``[cgroup]`` only at startup, so this has to be in place before the
+restart — ``scontrol reconfigure`` will not apply it afterwards.
+
+.. note::
+
+   No knob disables ``memory.high`` on its own; it is written whenever
+   ``constrain_ram_space`` is on, matching Slurm's ``cgroup/v2`` plugin. If reclaim
+   stalls are the problem, raise ``allowed_ram_percent`` (for example ``125``) so
+   reclaim begins above the allocation instead of at it, rather than turning memory
+   constraints off entirely.
+
+Rolling back is safe with the section left in place: older binaries do not know
+``[cgroup]`` and ignore it.
+
 See Also
 --------
 

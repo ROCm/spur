@@ -116,10 +116,8 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
-/// Enforced per-node budget. The controller's allocation is authoritative; the
-/// spec is the fallback for fields the allocation did not carry, resolved the
-/// way the controller would have (every task on this node, and `--mem-per-cpu`
-/// when `--mem` is absent).
+/// Enforced per-node budget: the controller's allocation wins, the spec is the
+/// fallback (every task on this node, and `--mem-per-cpu` when `--mem` is unset).
 fn resolve_cgroup_budget(
     alloc: Option<&ResourceAllocations>,
     spec: &JobSpec,
@@ -2747,9 +2745,8 @@ impl AgentService {
         }
     }
 
-    /// Record controller-allocated GPUs and reserve the job's local CPU/memory
-    /// budget. `cpus`/`memory_mb` are the resolved per-node budget, so the core
-    /// IDs this picks (and thus `cpuset.cpus`) match what the controller granted.
+    /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
+    /// `cpus`/`memory_mb` are the resolved grant, so the core IDs match it.
     async fn allocate_local_resources(
         &self,
         job_id: u32,

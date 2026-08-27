@@ -1494,48 +1494,45 @@ impl RlimitsConfig {
 /// CFS period that cgroup-v2 CPU quotas are expressed against.
 const CPU_PERIOD_US: u64 = 100_000;
 
-/// cgroup-v2 enforcement settings for native-host jobs (spurd).
-///
-/// A focused equivalent of Slurm's `cgroup.conf`: the same user-facing knobs
-/// without the plugin selectors. Where Slurm defaults to permissive, Spur
-/// defaults to enforcing — see `docs/admin-guide/configuration.rst`.
+/// cgroup-v2 enforcement for native-host jobs — a focused `cgroup.conf` without
+/// the plugin selectors. Slurm defaults permissive here, Spur enforcing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CgroupConfig {
     /// Master switch. When false, spurd creates no cgroup and applies no limits.
     #[serde(default = "default_true_fn")]
     pub enabled: bool,
+    /// Refuse to launch when a constraint cannot be applied, rather than warning and
+    /// running unconstrained. Off by default so a bad host degrades, not stalls.
+    #[serde(default)]
+    pub required: bool,
     /// Pin the job to its allocated cores via `cpuset.cpus` (`ConstrainCores`).
     #[serde(default = "default_true_fn")]
     pub constrain_cores: bool,
-    /// Additionally cap CPU time with a CFS quota (`cpu.max`). Off by default:
-    /// Slurm bounds whole-core allocations with the cpuset alone, and a quota
-    /// layered on top only adds throttling risk when it is mis-derived.
+    /// Also cap CPU time with a CFS quota (`cpu.max`). Off by default: Slurm bounds
+    /// whole cores with the cpuset alone, and a quota on top only risks throttling.
     #[serde(default)]
     pub cpu_quota: bool,
     /// Cap resident memory via `memory.max` + `memory.high`
     /// (`ConstrainRAMSpace`).
     #[serde(default = "default_true_fn")]
     pub constrain_ram_space: bool,
-    /// Hard memory ceiling as a percentage of the job's budget
-    /// (`AllowedRAMSpace`). `memory.high` stays at 100% of the budget, so a
-    /// value above 100 buys reclaim pressure at the allocation and an OOM kill
-    /// only at the headroom — at the cost of letting the node over-commit.
+    /// Hard ceiling as a percent of the job's budget (`AllowedRAMSpace`).
+    /// `memory.high` stays at 100%, so above 100 reclaims first and kills later.
     #[serde(default = "default_allowed_ram_percent")]
     pub allowed_ram_percent: u32,
     /// Bound swap via `memory.swap.max` (`ConstrainSwapSpace`).
     #[serde(default = "default_true_fn")]
     pub constrain_swap: bool,
-    /// Swap allowance as a percentage of the job's memory budget
-    /// (`AllowedSwapSpace`). Default 0 = no swap.
+    /// Swap allowance as a percent of the memory budget (`AllowedSwapSpace`), 0 =
+    /// none. Uncapped above 100, as in Slurm: swap may legitimately exceed RAM.
     #[serde(default)]
     pub allowed_swap_percent: u32,
     /// Floor for `memory.max`, in MiB (`MinRAMSpace`). Below this a job is
     /// killed during its own startup, before anything can clean up after it.
     #[serde(default = "default_min_ram_mb")]
     pub min_ram_mb: u64,
-    /// Kill every process in the job on OOM (`memory.oom.group`) rather than
-    /// letting the kernel pick one. Slurm's `OOMKillStep` defaults off; Spur
-    /// defaults on because a partially-killed job fails in murkier ways.
+    /// Kill the whole job on OOM (`memory.oom.group`), not one process. Slurm's
+    /// `OOMKillStep` defaults off; on here, since partial kills fail murkily.
     #[serde(default = "default_true_fn")]
     pub oom_kill_job: bool,
 }
@@ -1552,6 +1549,7 @@ impl Default for CgroupConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            required: false,
             constrain_cores: true,
             cpu_quota: false,
             constrain_ram_space: true,
@@ -1579,14 +1577,8 @@ pub struct CgroupLimits {
 }
 
 impl CgroupConfig {
-    /// `(memory.max, memory.high, memory.swap.max)` for a job whose per-node
-    /// budget is `memory_mb`, resolved as Slurm's cgroup/v2 plugin resolves
-    /// them across all four `Constrain{RAMSpace,SwapSpace}` combinations.
-    ///
-    /// The subtle case is swap-without-RAM: Slurm forces `AllowedRAMSpace` to
-    /// 100% and sets the RAM ceiling to the combined RAM+swap total, so the
-    /// *sum* stays bounded. Leaving memory unlimited there would let a job
-    /// bypass the very ceiling the swap bound is derived from.
+    /// `(memory.max, memory.high, memory.swap.max)` as Slurm's cgroup/v2 plugin
+    /// computes them. Swap-without-RAM: the RAM ceiling becomes the RAM+swap total.
     fn memory_limits(&self, memory_mb: u64) -> (Option<u64>, Option<u64>, Option<u64>) {
         // A job with no memory budget gets no ceiling at all. Bounding swap on
         // its own here would forbid swap while RAM stayed unlimited.
@@ -1604,9 +1596,8 @@ impl CgroupConfig {
             100
         };
 
-        // Hard ceiling is AllowedRAMSpace% of the budget, soft is 100% of it,
-        // both floored at MinRAMSpace. A soft limit above the hard one is moot,
-        // so it collapses onto it.
+        // Hard is AllowedRAMSpace% of the budget, soft 100%, both floored at
+        // MinRAMSpace. A soft limit above the hard one is moot, so it collapses.
         let hard = (memory_bytes.saturating_mul(ram_percent) / 100).max(min_ram_bytes);
         let soft = memory_bytes.max(min_ram_bytes).min(hard);
         let combined = hard
@@ -1625,9 +1616,8 @@ impl CgroupConfig {
         (Some(memory_max), Some(soft), swap_max)
     }
 
-    /// Resolve the limits for a job whose per-node budget is `cpus`/`memory_mb`
-    /// on cores `cpu_ids`. `None` when enforcement is off — the single place
-    /// `enabled` is consulted, so no caller can half-apply the master switch.
+    /// Limits for a job budgeted `cpus`/`memory_mb` on `cpu_ids`. `None` when
+    /// disabled — the only place `enabled` is read, so it cannot be half-applied.
     pub fn limits_for(&self, cpus: u32, memory_mb: u64, cpu_ids: &[u32]) -> Option<CgroupLimits> {
         if !self.enabled {
             return None;
@@ -1778,20 +1768,8 @@ impl SlurmConfig {
                 ),
             });
         }
-        // Above 100% the swap ceiling exceeds the memory the job was granted,
-        // which defeats the bound rather than tuning it.
-        if self.cgroup.allowed_swap_percent > 100 {
-            return Err(ConfigError::InvalidValue {
-                field: "cgroup.allowed_swap_percent".into(),
-                value: format!(
-                    "{} (must be between 0 and 100)",
-                    self.cgroup.allowed_swap_percent
-                ),
-            });
-        }
-        // Zero collapses every job's memory ceiling onto `min_ram_mb`, which is
-        // a typo and never an intent. No upper bound: over-committing the node
-        // is a documented (if hazardous) choice, as it is in Slurm.
+        // Zero collapses every ceiling onto `min_ram_mb` — a typo, never an intent.
+        // Above 100 is legal (as in Slurm), so only zero is rejected.
         if self.cgroup.allowed_ram_percent == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "cgroup.allowed_ram_percent".into(),
@@ -2249,6 +2227,8 @@ mod tests {
         assert!(c.enabled);
         assert!(c.constrain_cores && c.constrain_ram_space && c.constrain_swap);
         assert!(c.oom_kill_job);
+        // Degrade rather than stop accepting work on a misconfigured host.
+        assert!(!c.required);
         // Slurm bounds whole-core allocations with the cpuset alone (D4).
         assert!(!c.cpu_quota);
         assert_eq!(c.allowed_swap_percent, 0);
@@ -2450,12 +2430,19 @@ mod tests {
     }
 
     #[test]
-    fn swap_percent_above_100_is_rejected() {
-        let err = SlurmConfig::load_from_str(
-            "cluster_name = \"test\"\n[cgroup]\nallowed_swap_percent = 150\n",
+    fn swap_percent_above_100_is_accepted() {
+        // Slurm applies no upper bound to AllowedSwapSpace, so a `cgroup.conf`
+        // carrying one must not stop the controller from starting.
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[cgroup]\nallowed_swap_percent = 200\n",
         )
-        .expect_err("must not validate");
-        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+        .expect("parses");
+        assert_eq!(cfg.cgroup.allowed_swap_percent, 200);
+
+        // 200% of a 1 GiB grant is 2 GiB of swap on top of the RAM ceiling.
+        let l = cfg.cgroup.limits_for(1, 1024, &[]).expect("enabled");
+        assert_eq!(l.memory_max_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(l.swap_max_bytes, Some(2048 * 1024 * 1024));
     }
 
     #[test]

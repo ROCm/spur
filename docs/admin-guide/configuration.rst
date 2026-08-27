@@ -1209,16 +1209,27 @@ Job isolation layers.
 ``[cgroup]``
 ------------
 
-cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Each
-job gets its own cgroup at ``/sys/fs/cgroup/spur/job_<id>``, and the limits are
-derived from the **per-node budget the controller allocated** — not from the
-``--cpus-per-task`` / ``--mem`` the user requested. Kubernetes jobs are unaffected:
-there the kubelet owns the cgroups.
+cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. The
+job's batch payload runs in a cgroup at ``/sys/fs/cgroup/spur/job_<id>``, and the
+limits are derived from the **per-node budget the controller allocated** — not
+from the ``--cpus-per-task`` / ``--mem`` the user requested. Kubernetes jobs are
+unaffected: there the kubelet owns the cgroups.
+
+.. warning::
+
+   These limits bound the batch payload only. ``srun`` steps, ``spur exec``, and
+   interactive attaches into a running job currently run outside the job cgroup,
+   so they are not bounded by these settings and this section is not a security
+   boundary between users sharing a node. See
+   :ref:`cgroup-containment-gaps` for the full list.
 
 .. note::
 
    **Reload: Not implemented.** ``spurd`` reads this section once at startup, so
    ``scontrol reconfigure`` does not apply changes here. Restart the agent.
+
+   Upgrading a cluster whose ``spur.conf`` has no ``[cgroup]`` section changes
+   what gets enforced — see :ref:`cgroup-upgrade-notes`.
 
 .. list-table::
    :header-rows: 1
@@ -1233,6 +1244,11 @@ there the kubelet owns the cgroups.
      - ``true``
      - Master switch. When ``false``, no cgroup is created and no limit is
        applied.
+   * - ``required``
+     - bool
+     - ``false``
+     - Refuse to launch a job when a requested constraint cannot be applied,
+       instead of warning and running it unconstrained. See the note below.
    * - ``constrain_cores``
      - bool
      - ``true``
@@ -1267,7 +1283,8 @@ there the kubelet owns the cgroups.
      - int
      - ``0``
      - Swap allowance as a percentage of the allocated memory. ``0`` means no
-       swap. Must be between 0 and 100.
+       swap. Not capped at 100 — a swap-rich node may grant more swap than RAM,
+       and Slurm places no upper bound on ``AllowedSwapSpace`` either.
    * - ``min_ram_mb``
      - int
      - ``30``
@@ -1320,6 +1337,27 @@ combined RAM+swap total, so the sum a job can reach stays bounded.
 Every ceiling is floored at ``min_ram_mb``, and ``memory.high`` never exceeds
 ``memory.max``.
 
+When enforcement fails
+~~~~~~~~~~~~~~~~~~~~~~
+
+By default every step degrades to a warning: an undelegated controller, a
+rejected control-file write, a cpuset that did not apply, or a process that
+could not join the cgroup all leave the job **running unconstrained**. Grep the
+agent log for these to find silently-unenforced nodes:
+
+.. code-block:: text
+
+   failed to delegate cgroup controller
+   failed to write cgroup control file
+   cpuset not applied; job runs without a CPU bound
+   failed to move process to cgroup
+
+Set ``required = true`` to refuse the launch instead. The job fails rather than
+running outside its limits, which is the right trade on a shared node where the
+limits are the isolation boundary. It also means a host that cannot enforce
+stops accepting work, so roll it out only once the agent runs as root and the
+cgroup tree is confirmed writable.
+
 .. note::
 
    **Memory constraints cost throughput.** ``memory.high`` makes the kernel
@@ -1366,7 +1404,7 @@ them, so a site's existing percentages carry over directly.
      -
    * - ``AllowedSwapSpace``
      - ``allowed_swap_percent``
-     - Integer only.
+     - Integer only. Values above 100 carry over unchanged.
    * - ``MinRAMSpace``
      - ``min_ram_mb``
      -
@@ -1379,6 +1417,10 @@ Deliberate differences from Slurm:
 - **Spur enforces by default.** Every Slurm ``Constrain*`` defaults to ``no``. A
   job that overran ``--mem`` or leaned on host swap under a stock Slurm
   configuration will be reclaimed against, or killed, on Spur.
+- **``allowed_ram_percent = 0`` is rejected**, where Slurm would accept it and
+  floor every job at ``MinRAMSpace``. That silently caps a whole cluster at
+  30 MiB per job, so Spur treats it as the typo it almost certainly is. Every
+  other percentage carries over from ``cgroup.conf`` unchanged.
 - **Whole-job OOM kill by default.** Slurm's default kills one process and lets
   the step keep running; set ``oom_kill_job = false`` for that behaviour.
 - **No CFS quota.** Slurm never writes ``cpu.max``; neither does Spur by default.

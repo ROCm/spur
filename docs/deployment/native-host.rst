@@ -392,13 +392,17 @@ The default can be changed in ``spur.conf``:
 CPU and Memory Limits (cgroups)
 -------------------------------
 
-``spurd`` puts every native-host job in its own cgroup-v2 group at
+``spurd`` puts the payload it launches for a job into a cgroup-v2 group at
 ``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
 allocated** — the cores, memory, and swap the scheduler actually granted this node,
-not what the job asked for. This is what makes it safe for two users' jobs to share
-a node.
+not what the job asked for.
 
-Out of the box each job gets:
+This covers the batch payload: ``sbatch`` scripts, ``--pty`` jobs, and
+containerized jobs (a container's process tree inherits the job cgroup). It does
+**not** yet cover every process a job can start — see
+:ref:`cgroup-containment-gaps` below.
+
+Out of the box the batch payload gets:
 
 - ``cpuset.cpus`` pinned to its allocated cores.
 - ``memory.max`` at its allocated memory, with ``memory.high`` at the same value so
@@ -424,6 +428,40 @@ and runs jobs unconstrained. Every knob — including turning enforcement off
 entirely — lives in the ``[cgroup]`` section; see
 :doc:`/admin-guide/configuration` for the full field list and the mapping from
 Slurm's ``cgroup.conf``.
+
+.. _cgroup-containment-gaps:
+
+What is not contained yet
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Only the payload launched through the agent's ``LaunchJob`` path joins
+``job_<id>``. These paths start processes that stay outside it, in ``spurd``'s own
+cgroup, and are therefore **not** bounded by the job's limits:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 68
+
+   * - Path
+     - Why it escapes
+   * - ``srun`` steps inside a job
+     - Steps are spawned directly by the agent rather than through the batch
+       launch path.
+   * - ``spur exec`` into a running job
+     - Enters the job's *namespaces* via ``nsenter``; namespaces are not cgroups,
+       so the process keeps ``spurd``'s cgroup.
+   * - Interactive attach to a running job
+     - Same namespace-entry path as ``spur exec``. Note this is distinct from a
+       ``--pty`` job, which *is* contained because it launches as a batch payload.
+   * - Standalone ``srun`` allocations
+     - The allocation is recorded for accounting, but its steps run through the
+       ``srun`` step path above.
+
+Practically: a job cannot exceed its memory or core budget through its batch
+script, but it can through ``srun`` steps or an interactive shell. Closing this
+needs per-step cgroups nested under the job, which is planned but not implemented.
+Until then, do not rely on these limits as a security boundary between users on a
+shared node.
 
 MPI (PMIx)
 ----------

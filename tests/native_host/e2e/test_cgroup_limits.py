@@ -10,6 +10,7 @@ instead of on the submitted request. Each job reads its own cgroup through
 which the ``cgroup_cluster`` fixture enforces.
 """
 
+import time
 from typing import NamedTuple
 
 import pytest
@@ -144,9 +145,8 @@ class TestCgroupDefaults:
         assert _core_count(probe.values["cpuset.cpus"]) == 4, probe.context()
 
     def test_job_without_a_memory_request_is_left_unbounded(self, cgroup_cluster):
-        # A job with no memory budget gets no memory ceiling — and therefore no
-        # swap ceiling either. Bounding swap to 0 while RAM stays unlimited is a
-        # combination Slurm never emits.
+        # No memory budget means no memory ceiling, and so no swap ceiling either:
+        # swap 0 with RAM unlimited is a pair Slurm never emits.
         probe = _run_probe(cgroup_cluster, ["--cpus-per-task=1"], "cg-nomem")
         vals = probe.values
 
@@ -164,10 +164,8 @@ class TestCgroupDefaults:
         assert probe.values["memory.high"] == str(30 * MIB), probe.context()
 
     def test_container_job_runs_inside_the_job_cgroup(self, cgroup_cluster, tmp_path):
-        # Containers share the batch cgroup, so the limits come for free; the
-        # container-specific risk is the pid-namespace tree escaping it. The
-        # container mounts a fresh sysfs with no cgroup2 under it, so membership
-        # is asserted via /proc/self/cgroup rather than by re-reading the files.
+        # Containers share the batch cgroup, so the risk is the pid-namespace tree
+        # escaping it. /sys/fs/cgroup is unmounted inside, so read /proc/self/cgroup.
         cluster = cgroup_cluster
         cluster.container_preflight()
         image = cluster.build_container_image(tmp_path)
@@ -251,16 +249,51 @@ class TestCgroupDisabled:
         )
 
 
+class TestCgroupRequired:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"cgroup": {"required": True}}
+
+    def test_required_refuses_to_launch_when_enforcement_is_unavailable(self, cluster):
+        # Unprivileged `cluster`, not cgroup_cluster, on purpose: an agent that cannot
+        # enforce must refuse the job rather than run it unconstrained.
+        script = cluster.write_file("cg-required.sh", "#!/bin/bash\necho RAN\n")
+        out_path = f"{cluster.remote_dir}/cg-required.out"
+        sb = cluster.sbatch(
+            ["-J", "cg-required", "-N", "1", "--cpus-per-task=1", "--mem=256",
+             "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+
+        # A refused launch is retried, so the job stays pending rather than failing.
+        # What matters is that the body never runs and the agent says why.
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if "required" in cluster.spurd_log(0):
+                break
+            time.sleep(2)
+
+        assert "RAN" not in cluster.read_output_on_any_node(out_path), (
+            f"job body executed despite [cgroup] required\n{cluster.debug_job(job_id)}"
+        )
+        assert "required but" in cluster.spurd_log(0), (
+            "agent must log why it refused the launch\n"
+            f"{cluster.spurd_log(0)[-2000:]}"
+        )
+        cluster.scancel(str(job_id))
+
+
 class TestCgroupConfigValidation:
-    def test_controller_refuses_an_out_of_range_swap_percent(self, unstarted_cluster):
-        # An ignored bad value would silently hand jobs a swap ceiling larger
-        # than the memory they were granted, so the daemon must refuse to start.
+    def test_controller_refuses_a_zero_ram_percent(self, unstarted_cluster):
+        # Zero silently floors every job's memory ceiling to min_ram_mb, so the
+        # daemon refuses to start rather than run a whole cluster that way.
         cluster = unstarted_cluster
         conf = cluster.write_file(
             "bad-cgroup.conf",
             'cluster_name = "cgroup-validation"\n'
             "[cgroup]\n"
-            "allowed_swap_percent = 150\n",
+            "allowed_ram_percent = 0\n",
             executable=False,
         )
         out = cluster.nodes[0].exec_allow_fail(
@@ -269,6 +302,6 @@ class TestCgroupConfigValidation:
             f"2>&1; echo EXIT=$?"
         )
         assert "EXIT=0" not in out, f"spurctld must not start with an invalid config:\n{out}"
-        assert "allowed_swap_percent" in out, (
+        assert "allowed_ram_percent" in out, (
             f"startup failure must name the offending field:\n{out}"
         )
