@@ -295,9 +295,6 @@ jobs:
           chmod +x ${{ env.RUN_DIR }}/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
           rc=0
-          # WireGuard mesh tests live in native_host/e2e (test_wg_*.py). Their
-          # fixtures install WireGuard on the nodes where missing, so no CI-side
-          # setup is needed; they skip only where a data plane can't be provided.
           pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v \
             -m "${{ matrix.selector }}" \
             --shard-count ${{ matrix.shard_count }} --shard-id ${{ matrix.shard_id }} \

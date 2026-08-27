@@ -1,27 +1,13 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""WireGuard-mesh cluster management for the native-host WG E2E suite.
+"""WireGuard-mesh helpers for the native-host WG E2E tests.
 
-Reuses the base :class:`SpurCluster` (SSH, binary deploy, daemon lifecycle,
-config write) from ``native_host/e2e/cluster.py`` — that directory is on the
-pytest ``pythonpath`` — and layers the WireGuard mesh mechanics on top:
-
-* ``spur net`` CLI wrappers run **per node** (not just the controller, as the
-  base ``SpurCluster.cli`` does), since a mesh is stood up by running
-  ``net init`` on the head and ``net join`` on every other node.
-* ``wg show`` parsers (peers, endpoints, transfer counters, allowed-ips) so a
-  test can assert real datapath facts, not just CLI exit codes.
-* Mesh-IP allocation over a test CIDR and helpers to ping / prove that traffic
-  rides a specific WireGuard tunnel (rising transfer counters on the exact
-  peer, per-peer routes, pod-CIDR folded into AllowedIPs).
-
-Design: this is a thin *composition* over ``SpurCluster``, not a subclass — the
-mesh lifecycle (``net init``/``join``/``mesh``) is orthogonal to the daemon
-lifecycle, and keeping them separate avoids overriding the base class's private
-start helpers. Tests that need the daemon stack (k0s scenarios) drive the base
-cluster directly; tests that only need the raw mesh (bring-up, remove-peer) use
-the mesh helpers here.
+:class:`WgMesh` is a thin *composition* over ``SpurCluster``, not a subclass —
+the mesh lifecycle (``net init``/``join``, ``wg show`` parsing) is orthogonal to
+the daemon lifecycle, and keeping them separate avoids overriding the base
+class's private start helpers. Tests that need the daemon stack (k0s scenarios)
+drive the base cluster directly; tests that only need the raw mesh use this.
 """
 
 from __future__ import annotations
@@ -141,11 +127,6 @@ class WgMesh:
         if program_routes:
             args += ["--program-routes"]
         return self._spur(self.nodes[on_index], args)
-
-    def net_remove_peer(self, on_index: int, peer_key: str) -> str:
-        return self._spur(self.nodes[on_index], [
-            "net", "remove-peer", "--key", peer_key, "--interface", self.iface,
-        ])
 
     # --- wg introspection ---
 

@@ -3,35 +3,16 @@
 
 """End-to-end tests for k0s-over-WireGuard, driven over real `wg` interfaces.
 
-The raw-mesh (no-k0s) bring-up scenario (D1) lives in ``test_wg_mesh.py``; this
-file holds the scenarios that need a converged k0s cluster on top of the mesh.
-The D-numbers are the SPUR-212 scenario ids; not every id has a test (D8 has no
-mesh-specific behavior to assert) and they are ordered here by id, not by file
-position:
+The raw-mesh (no-k0s) bring-up scenario lives in ``test_wg_mesh.py``; this file
+holds the scenarios that need a converged k0s cluster on top of the mesh. Each
+class documents the invariant it proves — k0s reaches ready over the mesh with
+node InternalIPs on the mesh CIDR, cross-node pod and ClusterIP datapath riding
+the tunnel, online add/remove leaving no ghost peer, graceful k8s remove/add
+preserving the node's Spur identity + WireGuard key, login-node reachability,
+and (skipped) 3-controller HA re-election.
 
-* D2 — k0s over mesh (``TestK0sOverMesh``): `spur k8s up` reaches ready, k8s node
-  InternalIPs are the mesh IPs, and the controller stays meshed (not pruned).
-* D3 — cross-node pods on the mesh (``TestPodsOnMesh``): pod-CIDR is folded into
-  peer AllowedIPs, and wg transfer counters on the exact peer rise while traffic
-  flows — proving the traffic rides the tunnel.
-* D4 — online add/remove (``TestOnlineAddRemove``): a worker added via
-  `k8s add-nodes` then removed; `net remove-peer` drops the stale peer so no
-  ghost peer remains.
-* D5 — HA over the mesh, 3 controllers (``TestHaOverMesh``): SKIPPED — needs a
-  multi-controller fixture the base harness does not yet provide (see the class
-  docstring); tracked as a SPUR-212 follow-up.
-* D6 — login-node reachability (``TestLoginNodeReachability``): spur-controller +
-  k8s-controller + login node, where the login node is meshed but outside k0s
-  scope, still reaches every mesh node.
-* D7 — graceful k8s remove/add (``TestGracefulK8sRemoveAdd``): a worker cycled
-  out of and back into k0s keeps its Spur registration and WireGuard key.
-* D9 — service CIDR over the mesh (``TestServiceCidrOverMesh``): a ClusterIP
-  service is reachable cross-node even though the service CIDR is never in any
-  WireGuard AllowedIPs (kube-proxy DNATs it to a pod IP the mesh carries).
-
-Every test is marked ``wireguard`` and ``k0s``. The ``wireguard`` fixtures
-install WireGuard where missing and stand up the mesh per test; ``k0s`` marks
-the ones that also need a converged k0s cluster.
+The k0s tests are marked ``k0s``; the WG fixtures they use skip when a node can't
+run a real WireGuard mesh.
 """
 
 from __future__ import annotations
@@ -42,7 +23,11 @@ import pytest
 
 from wg_cluster import WG_IFACE, wait_until
 
-pytestmark = pytest.mark.wireguard
+# An IPv4 dotted-quad, used to filter kubectl output tokens (pod IPs, ClusterIPs,
+# InternalIPs) so a kubectl error string is never mistaken for an address.
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+BUSYBOX_IMAGE = "docker.io/library/busybox:1.36"
 
 
 # --- kubectl helpers (run `k0s kubectl` on the control-plane node) -----------
@@ -123,12 +108,10 @@ def _launch_pinned_pod(c, cp_index: int, name: str, node_name: str) -> str:
 
 def _wait_pod_ip(c, cp_index: int, pod: str, timeout_s: int = 180) -> str:
     """Poll until the pod reports a pod-CIDR IP (Running with an IP assigned)."""
-    ipv4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-
     def read_ip() -> str:
         out = _kubectl(c, cp_index,
                        f"get pod {pod} -o jsonpath='{{.status.podIP}}'").strip()
-        return out if ipv4.match(out) else ""
+        return out if _IPV4_RE.match(out) else ""
 
     wait_until(lambda: bool(read_ip()), timeout_s=timeout_s,
                desc=f"pod {pod} got a pod-CIDR IP")
@@ -187,19 +170,15 @@ def _expose_clusterip(c, cp_index: int, pod: str, svc: str, port: int = 80) -> s
         f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
     )
     _assert_kubectl_applied(out, f"service {svc}")
-    ipv4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
     def read_cip() -> str:
         cip = _kubectl(c, cp_index,
                        f"get svc {svc} -o jsonpath='{{.spec.clusterIP}}'").strip()
-        return cip if ipv4.match(cip) else ""
+        return cip if _IPV4_RE.match(cip) else ""
 
     wait_until(lambda: bool(read_cip()), timeout_s=60,
                desc=f"service {svc} got a ClusterIP")
     return read_cip()
-
-
-BUSYBOX_IMAGE = "docker.io/library/busybox:1.36"
 
 
 def _prepull_busybox(c, node_indices: list[int]) -> bool:
@@ -227,7 +206,7 @@ def _ready_two_workers_with_image(c, cp_index: int, worker_names: list[str],
     calico must be up cluster-wide, and the pod image must be pre-pulled on each
     worker. ``pytest.skip`` if the image can't be obtained (offline registry).
 
-    Shared by the D3 (pod↔pod) and D9 (ClusterIP) scenarios, which need the exact
+    Shared by the pod-to-pod and ClusterIP datapath tests, which need the exact
     same preconditions before they can place pods on two distinct workers.
     """
     # Workers must register with the k8s API before we can place pods…
@@ -243,7 +222,7 @@ def _ready_two_workers_with_image(c, cp_index: int, worker_names: list[str],
         pytest.skip(f"{BUSYBOX_IMAGE} unavailable on the workers (offline registry)")
 
 
-# --- D2: k0s over mesh -------------------------------------------------------
+# --- k0s over mesh -------------------------------------------------------
 
 
 @pytest.mark.k0s
@@ -274,14 +253,12 @@ class TestK0sOverMesh:
         # settling (kubectl can transiently report "connection refused"). Poll
         # until real IPv4 InternalIPs appear, keeping ONLY IP-shaped tokens so a
         # kubectl error string is never mistaken for an address.
-        ipv4_re = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-
         def read_internal_ips() -> set[str]:
             out = c.nodes[cp_index].exec_allow_fail(
                 f"{c._sudo_prefix()}k0s kubectl get nodes "
                 "-o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}'"
             )
-            return {t for t in (line.strip() for line in out.splitlines()) if ipv4_re.match(t)}
+            return {t for t in (line.strip() for line in out.splitlines()) if _IPV4_RE.match(t)}
 
         wait_until(lambda: len(read_internal_ips()) > 0, timeout_s=180,
                    desc="kubelet InternalIPs registered with the k8s API")
@@ -315,7 +292,7 @@ class TestK0sOverMesh:
                    desc="all nodes reach the controller mesh IP after k8s up")
 
 
-# --- D3: cross-node pods ride the tunnel ------------------------------------
+# --- cross-node pods ride the tunnel ------------------------------------
 
 
 @pytest.mark.k0s
@@ -412,7 +389,7 @@ class TestPodsOnMesh:
                    desc=f"wg transfer counter rose on peer {peer_key[:8]}…")
 
 
-# --- D9: service CIDR reachable over the mesh -------------------------------
+# --- service CIDR reachable over the mesh -------------------------------
 
 
 @pytest.mark.k0s
@@ -426,8 +403,9 @@ class TestServiceCidrOverMesh:
     proves that path end to end: a server pod on worker A behind a ClusterIP,
     hit from a client pod on worker B.
 
-    Topology like D3: node0 = CP, nodes 1 and 2 = workers, so the server and
-    client land on distinct nodes and the request must cross the mesh.
+    Topology like the pod-datapath test: node0 = control plane, nodes 1 and 2 =
+    workers, so the server and client land on distinct nodes and the request must
+    cross the mesh.
     """
 
     def test_clusterip_service_reachable_cross_node(self, wg_k0s_cluster):
@@ -476,7 +454,7 @@ class TestServiceCidrOverMesh:
             )
 
 
-# --- D4: online add/remove + no ghost peer ----------------------------------
+# --- online add/remove + no ghost peer ----------------------------------
 
 
 @pytest.mark.k0s
@@ -575,26 +553,20 @@ class TestOnlineAddRemove:
         )
 
 
-# --- D7: graceful k8s remove/add keeps the node a spur worker + wg identity --
+# --- graceful k8s remove/add keeps the node a spur worker + wg identity --
 
 
 @pytest.mark.k0s
 class TestGracefulK8sRemoveAdd:
-    """Topology: node0 = spur controller + k8s control-plane, node1 + node2 =
-    k8s workers. The test cycles node1 out of and back into k0s while node2 stays
-    a worker throughout — a single-worker (CP + 1) cluster can't converge calico/
-    coredns (nothing schedulable is left once the sole worker drains), so keeping
-    a second worker keeps the cluster healthy across the remove/add.
+    """A k8s worker cycled out of and back into the k0s cluster keeps its Spur
+    identity and WireGuard key throughout — removal takes it out of k0s only, not
+    out of Spur or the mesh, and the re-add does not re-key it.
 
-    Validates that a k8s worker can be cleanly cycled out of and back into the
-    k0s cluster WITHOUT losing its Spur identity or WireGuard keys:
-
-      1. Manually cordon + drain the worker (operator pre-drain), then
-         `spur k8s remove-nodes` it. Removal is graceful — it leaves k0s only.
-      2. The node REMAINS a registered Spur worker and stays in the mesh (spurd
-         and spur0 untouched), just outside k0s scope.
-      3. `spur k8s add-nodes` makes it a k8s worker again, and its WireGuard
-         public key is UNCHANGED across the whole cycle (no re-key in the mesh).
+    Topology: node0 = spur controller + k8s control-plane, node1 + node2 = k8s
+    workers. The test cycles node1 while node2 stays a worker throughout — a
+    single-worker (CP + 1) cluster can't converge calico/coredns once the sole
+    worker drains, so the second worker keeps the cluster healthy across the
+    remove/add. The step-by-step is in the test body.
     """
 
     def test_remove_keeps_spur_and_wg_then_add_restores_k8s(self, wg_k0s_cluster):
@@ -685,7 +657,7 @@ class TestGracefulK8sRemoveAdd:
                    desc=f"{worker} reassigned a k0s role after re-add")
 
 
-# --- D5: HA over the mesh (3 controllers) -----------------------------------
+# --- HA over the mesh (3 controllers) -----------------------------------
 
 
 @pytest.mark.k0s
@@ -698,25 +670,24 @@ class TestHaOverMesh:
         Raft-over-mesh is a bootstrap ordering problem (the mesh must be up
         before controllers can dial each other's mesh IPs for the raft_listen
         peers). A dedicated multi-controller fixture is required; it is tracked
-        as a follow-up and validated on the local 3-CP bed, not CI.
+        as a follow-up and validated on a local 3-controller bed, not CI.
         """
         pytest.skip(
-            "D5 needs a multi-controller (3× spurctld, controller.peers over "
-            "mesh IPs) fixture the base harness does not yet provide — see "
-            "the SPUR-212 follow-up note"
+            "needs a multi-controller (3× spurctld, controller.peers over mesh "
+            "IPs) fixture the base harness does not yet provide"
         )
 
 
-# --- D6: login-node reachability --------------------------------------------
+# --- login-node reachability --------------------------------------------
 
 
 @pytest.mark.k0s
 class TestLoginNodeReachability:
-    def test_login_node_reaches_every_mesh_node(self, wg_login_topology):
+    def test_login_node_reaches_every_mesh_node(self, wg_login_cluster):
         """node2 (login node) is meshed but outside k0s scope. It must still
         reach every other mesh node over the mesh IPs after `k8s up` scopes the
         cluster to only the k8s controller (node1)."""
-        c = wg_login_topology
+        c = wg_login_cluster
         k8s_ctrl, login = c.node_names[1], c.node_names[2]
 
         # Scope k0s to the k8s controller only; spur-ctrl (node0) and login

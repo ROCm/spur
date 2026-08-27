@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_dir
-from wg_cluster import WG_IFACE, WgMesh, wg_available
+from wg_cluster import MESH_CIDR, WG_IFACE, WgMesh, wg_available
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +38,6 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "gpu: requires GPU hardware on the nodes (auto-applied to tests using GPU fixtures)",
-    )
-    config.addinivalue_line(
-        "markers",
-        "wireguard: WireGuard mesh tests (fixture installs wg + stands up a real "
-        "spur0 mesh; rootful; auto-skips only where a data plane can't be provided)",
     )
 
 
@@ -409,16 +404,11 @@ def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 
 # --- WireGuard mesh fixtures -------------------------------------------------
 #
-# WireGuard tests run automatically wherever the nodes allow a real mesh — there
-# is no opt-in env var (mirroring gpu_cluster / k8s_multicp_cluster, which also
-# auto-run on capable beds). The fixtures ENABLE WireGuard rather than detect it:
-# they flip network.wg_enabled on in config AND install the wg data plane on the
-# node if it is missing (_ensure_wireguard), so the tests execute instead of
-# skipping. They skip only on a genuine environmental impossibility (no kernel
-# module AND no wireguard-go userspace fallback obtainable) or missing sudo.
-
-
-_WG_CIDR = "10.44.0.0/16"
+# WireGuard tests run wherever the nodes can run a real mesh — no opt-in env var
+# (mirroring gpu_cluster / k8s_multicp_cluster, which auto-run on capable beds).
+# The fixtures flip network.wg_enabled on in config and stand up the spur0 mesh;
+# they DETECT the wg data plane and skip cleanly when it is absent (a test does
+# not install its own dependencies — nodes are expected to ship WireGuard).
 
 
 def _wg_addresses() -> dict[int, str] | None:
@@ -442,51 +432,37 @@ def _wg_addresses() -> dict[int, str] | None:
     return {i: a for i, a in enumerate(addrs)}
 
 
-def _ensure_wireguard(cluster: SpurCluster) -> None:
-    """Make every node able to run a real WireGuard mesh, installing if needed.
+def _require_wireguard(cluster: SpurCluster) -> None:
+    """Skip unless every node can run a real WireGuard mesh.
 
-    Enables WireGuard even on a node that starts without it: installs
-    ``wireguard-tools`` when ``wg``/``wg-quick`` are missing, then ensures a data
-    plane — the in-tree kernel module (``modprobe wireguard``) or, if that won't
-    load, the ``wireguard-go`` userspace fallback. Only when neither a module nor
-    the userspace fallback can be obtained does it ``pytest.skip`` (a genuine
-    environmental limit, not a policy toggle). apt-based: assumes Debian/Ubuntu
-    nodes (the testbed + CI image).
+    Checks ``wg``/``wg-quick`` plus a usable data plane (kernel module or the
+    ``wireguard-go`` userspace fallback) via :func:`wg_available`. Nodes are
+    expected to ship WireGuard (CI bakes it into the image); a test does not
+    install its own dependencies, so a node without it skips rather than failing.
     """
     sudo = cluster._sudo_prefix()
     for node in cluster.nodes:
-        if "OK" not in node.exec_allow_fail("command -v wg >/dev/null && command -v wg-quick >/dev/null && echo OK"):
-            node.exec_allow_fail(
-                f"{sudo}apt-get update -qq && {sudo}DEBIAN_FRONTEND=noninteractive "
-                "apt-get install -y -qq wireguard-tools 2>/dev/null || true"
-            )
-        # Ensure a data plane: prefer the kernel module, else install wireguard-go.
-        node.exec_allow_fail(
-            f"{sudo}modprobe wireguard 2>/dev/null "
-            "|| command -v wireguard-go >/dev/null 2>&1 "
-            f"|| {sudo}DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-go 2>/dev/null "
-            "|| true"
-        )
         ok, reason = wg_available(node, sudo)
         if not ok:
-            pytest.skip(f"WireGuard unavailable on {node.host} and could not be provisioned: {reason}")
+            pytest.skip(f"WireGuard unavailable on {node.host}: {reason}")
 
 
 @pytest.fixture
-def wg_mesh(ssh_nodes, remote_bin_dir):
+def raw_wg_mesh(ssh_nodes, remote_bin_dir):
     """A raw WireGuard mesh across all nodes (no spur daemons).
 
-    Yields a :class:`WgMesh` with the interface provisioned via ``net init`` on
-    node 0 and ``net join`` on the rest, promoted to a full mesh. The mesh is
-    installed if missing (``_ensure_wireguard``) and fully torn down (interfaces +
-    confs removed) after the test so a shared node is left clean.
+    Provisions a :class:`SpurCluster` only to resolve node names, then stands up
+    the ``spur0`` interface via ``net init`` on node 0 and ``net join`` on the
+    rest, promoted to a full mesh. Unlike the other WG fixtures, no spurctld/spurd
+    runs underneath. Fully torn down (interfaces + confs removed) after the test
+    so a shared node is left clean.
     """
     if len(ssh_nodes) < 2:
         pytest.skip(f"WG mesh needs >= 2 nodes (got {len(ssh_nodes)})")
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()  # resolves node_names; no daemons started
     c.root_agent_preflight()  # rootful: spur0 needs wg/ip via sudo; skips if none
-    _ensure_wireguard(c)
+    _require_wireguard(c)
     mesh = WgMesh(ssh_nodes, c.node_names, remote_bin_dir, c._sudo_prefix(),
                   iface=WG_IFACE, wg_addresses=_wg_addresses())
     indices = list(range(len(ssh_nodes)))
@@ -551,7 +527,7 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()  # skips if no sudo
-    _ensure_wireguard(c)
+    _require_wireguard(c)
 
     # Start from a clean k0s slate: a prior test (or a crashed run) can leave k0s
     # services + an etcd datadir behind, which corrupts this cluster's membership.
@@ -573,7 +549,7 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
     c.wg_mesh_indices = indices
 
     overrides = {
-        "network": {"wg_enabled": True, "wg_cidr": _WG_CIDR},
+        "network": {"wg_enabled": True, "wg_cidr": MESH_CIDR},
         "cluster": {"enabled": True, "cni": "calico",
                     "control_plane_node": c.node_names[control_plane_index]},
     }
@@ -619,15 +595,16 @@ def wg_k0s_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
-def wg_login_topology(ssh_nodes, remote_bin_dir):
-    """3-node topology for the login-node reachability scenario:
+def wg_login_cluster(ssh_nodes, remote_bin_dir):
+    """k0s-over-mesh cluster wired for the login-node reachability scenario:
 
       node0 = spur controller (spurctld + spurd, mesh head, NOT in k0s scope)
-      node1 = k8s control-plane (spurd, k0s CP)
+      node1 = k8s control-plane (spurd, k0s control plane)
       node2 = login node (spurd, meshed, NOT in k0s scope)
 
-    All three are meshed; only node1 is in the k0s scope. Asserts the login node
-    reaches every mesh node.
+    All three are meshed; only node1 is in the k0s scope. Same running
+    :class:`SpurCluster` as ``wg_k0s_cluster``, just with the control plane pinned
+    to node1.
     """
     if len(ssh_nodes) < 3:
         pytest.skip(f"login-node topology needs 3 nodes (got {len(ssh_nodes)})")

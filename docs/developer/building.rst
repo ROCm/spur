@@ -218,43 +218,42 @@ The WireGuard mesh tests are part of the native-host suite
 (``tests/native_host/e2e/test_wg_mesh.py`` for raw mesh bring-up,
 ``tests/native_host/e2e/test_wg_k0s.py`` for k0s-over-mesh). They stand up a
 **real** WireGuard mesh (kernel ``wg`` interfaces via ``spur net init``/``join``)
-across the SSH test nodes, marked ``wireguard``.
+across the SSH test nodes and enable it in the cluster config
+(``network.wg_enabled``).
 
-They run **automatically** wherever the nodes allow — there is no opt-in flag.
-The ``wireguard`` fixtures *enable* WireGuard rather than merely detect it: they
-turn ``network.wg_enabled`` on in the cluster config and, if the node lacks the
-data plane, install it (``wireguard-tools``, then the ``wireguard`` kernel module
-or the ``wireguard-go`` userspace fallback). A test skips only where a data plane
-genuinely cannot be provided, or where sudo/node-count requirements are unmet —
-the same capability-gated model as the GPU and multi-CP k0s fixtures.
+They run **automatically** wherever the nodes can run a real mesh — there is no
+opt-in flag. The fixtures detect the WireGuard data plane (``wg``/``wg-quick``
+plus the ``wireguard`` kernel module or a ``wireguard-go`` userspace fallback)
+and **skip** when it is absent, rather than installing it — nodes are expected to
+ship WireGuard (CI bakes it into the runner image). This is the same
+capability-gated model as the GPU and multi-control-plane k0s fixtures.
 
-Automated today: mesh bring-up (all-to-all reachability including worker↔worker), k0s-over-mesh (cluster reaches ready, node InternalIPs are mesh IPs, the controller stays meshed), cross-node pod datapath proven to ride the tunnel (pod-to-pod over the pod CIDR with a rising per-peer ``wg`` transfer counter), service-CIDR reachability (a ClusterIP service reached across nodes over the mesh — kube-proxy DNATs it to a pod IP that the mesh carries, even though the service CIDR is never in any WireGuard ``AllowedIPs``), online node add/remove with ``net remove-peer`` cleanup, graceful k8s remove/add that keeps the node a Spur worker in the mesh with the same WireGuard key across the cycle, and login-node reachability.
+Covered: mesh bring-up (all-to-all reachability including worker↔worker), k0s-over-mesh (cluster reaches ready, node InternalIPs are mesh IPs, the controller stays meshed), cross-node pod datapath proven to ride the tunnel (pod-to-pod over the pod CIDR with a rising per-peer ``wg`` transfer counter), service-CIDR reachability (a ClusterIP service reached across nodes over the mesh — kube-proxy DNATs it to a pod IP that the mesh carries, even though the service CIDR is never in any WireGuard ``AllowedIPs``), online node add/remove with mesh peer cleanup, graceful k8s remove/add that keeps the node a Spur worker in the mesh with the same WireGuard key across the cycle, and login-node reachability.
 
-Scaffolded but currently skipped: the 3-controller HA re-election (D5 — needs a multi-controller fixture the base harness does not yet provide).
+Scaffolded but currently skipped: the 3-controller HA re-election (needs a multi-controller fixture the base harness does not yet provide).
 
 Because the mesh is root-owned and ``spurd`` runs rootful, the fixtures require
 passwordless (or ``SPUR_TEST_SSH_PASSWORD``-backed) sudo, and ``SPUR_TEST_NODES``
-must list the nodes (as for the rest of the native-host suite): mesh bring-up
-(D1) needs >= 2 nodes; the k0s-over-mesh scenarios need 3. Nodes are assumed
-Debian/Ubuntu (the installer is apt-based).
+must list the nodes (as for the rest of the native-host suite): raw mesh bring-up
+needs >= 2 nodes; the k0s-over-mesh scenarios need 3.
 
-The tests use two pytest markers: ``wireguard`` (all of them) and ``k0s`` (the
-scenarios that also need a converged k0s cluster). To select them:
+The k0s-over-mesh tests carry the ``k0s`` marker. To run just the WireGuard
+tests, point pytest at the two files:
 
 .. code-block:: bash
 
    export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
 
    # All WireGuard tests
-   pytest tests/native_host/e2e/ -v -m wireguard
+   pytest tests/native_host/e2e/test_wg_mesh.py tests/native_host/e2e/test_wg_k0s.py -v
 
    # Only the raw mesh-bring-up scenarios (no k0s convergence needed)
-   pytest tests/native_host/e2e/ -v -m "wireguard and not k0s"
+   pytest tests/native_host/e2e/test_wg_mesh.py -v
 
 In CI these tests run inside the existing ``E2E / native-host`` job and its
-shards — no separate suite, path, or status check, and no CI-side WireGuard
-setup (the fixtures install it on the nodes). Where a shard's nodes can't provide
-a data plane, the WireGuard tests skip while the rest of the shard runs normally.
+shards — no separate suite, path, or status check. Where a shard's nodes can't
+provide a WireGuard data plane, the mesh tests skip while the rest of the shard
+runs normally.
 
 End-to-End Tests (Kubernetes)
 -----------------------------
