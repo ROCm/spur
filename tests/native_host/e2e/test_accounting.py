@@ -433,7 +433,8 @@ class TestQosLimitReasons:
 
         wait_job_state(c, new_id, "R", timeout=30)
         show = c.scontrol("show", "job", str(new_id))
-        node_match = re.search(r"NodeList=(\S+)", show)
+        # Anchored: ReqNodeList=/ExcNodeList= also contain "NodeList=".
+        node_match = re.search(r"(?<![A-Za-z])NodeList=(\S+)", show)
         assert node_match, f"missing NodeList in scontrol output:\n{show}"
         landed_on = node_match.group(1)
         assert landed_on in (n0, n1), (

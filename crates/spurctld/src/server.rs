@@ -4293,7 +4293,7 @@ fn annotate_jobs_with_planned_reservations(jobs: &mut [JobInfo], cluster: &Clust
     if jobs.is_empty() {
         return;
     }
-    apply_planned_reservations(jobs, &cluster.planned_job_starts());
+    cluster.with_planned_job_starts(|by_job| apply_planned_reservations(jobs, by_job));
 }
 
 fn apply_planned_reservations(

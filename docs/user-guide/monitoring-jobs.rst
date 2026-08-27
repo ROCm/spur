@@ -427,7 +427,7 @@ fields between these lines):
 
 The controller logs the matching scheduler-side view at ``info`` level, one line
 per job when its placement outcome changes (not every cycle). Jobs beyond the
-scheduler's per-cycle depth limit are not reported:
+per-cycle scheduling depth limit are not reported:
 
 .. code-block:: text
 

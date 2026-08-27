@@ -4688,8 +4688,13 @@ impl ClusterManager {
         *self.planned_job_starts.write() = planned;
     }
 
-    pub(crate) fn planned_job_starts(&self) -> spur_sched::backfill::PlannedJobStarts {
-        self.planned_job_starts.read().clone()
+    /// Borrow the plan under the read lock; cloning it per job-info response
+    /// would be avoidable per-request work as the pending queue grows.
+    pub(crate) fn with_planned_job_starts<R>(
+        &self,
+        f: impl FnOnce(&spur_sched::backfill::PlannedJobStarts) -> R,
+    ) -> R {
+        f(&self.planned_job_starts.read())
     }
 
     pub(crate) fn record_sched_cycle(
