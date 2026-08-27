@@ -29,7 +29,6 @@ const FINALIZER: &str = "spur.amd.com/cleanup";
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 60;
 const LABEL_PATCH_BUDGET: Duration = Duration::from_secs(3);
-const STATUS_PATCH_BUDGET: Duration = Duration::from_secs(3);
 
 fn is_transient_kube_error(err: &kube::Error) -> bool {
     match err {
@@ -224,14 +223,16 @@ async fn submit_to_controller(
         }
         Err(e) => {
             error!(spurjob = %name, error = %e, "SpurJob rejected by the controller");
+            // Release the controller lock before the (possibly long) status write
+            // so other reconciles can keep talking to spurctld during an API outage.
+            drop(ctrl);
             let new_status = SpurJobStatus {
                 state: "Failed".into(),
                 message: Some(format!("rejected by spurctld: {}", e.message())),
                 ..fresh_status.clone()
             };
-            // Rejected returns await_change(), so a dropped write here can't
-            // self-heal. Retry the write in place rather than propagating, which
-            // would re-run submit_job on the next pass for an already-doomed spec.
+            // Rejected returns await_change(), so a dropped write can't self-heal; land
+            // it here rather than propagating, which would resubmit the doomed spec.
             patch_terminal_status(api, name, &new_status)
                 .await
                 .map_err(ReconcileError::Kube)?;
@@ -844,38 +845,23 @@ async fn patch_status(
         .map(|_| ())
 }
 
-/// Write a terminal status, retrying transient API errors within a budget. The
-/// submit that produced this state is already spent, so a dropped write must not
-/// fall back to re-running submit on the next reconcile.
+/// Write a terminal status, retrying transient API errors until they clear.
+/// The Rejected path uses await_change(), so a dropped write never self-heals; a
+/// bounded budget would resubmit the doomed spec. Permanent errors stop the retry.
 async fn patch_terminal_status(
     api: &Api<SpurJob>,
     name: &str,
     status: &SpurJobStatus,
 ) -> Result<(), kube::Error> {
-    tokio::time::timeout(
-        STATUS_PATCH_BUDGET,
-        (|| async { patch_status(api, name, status).await })
-            .retry(
-                ExponentialBuilder::default()
-                    .with_min_delay(Duration::from_millis(200))
-                    .with_max_delay(Duration::from_secs(1))
-                    .without_max_times(),
-            )
-            .when(is_transient_kube_error),
-    )
-    .await
-    .unwrap_or_else(|_elapsed| {
-        Err(kube::Error::Api(Box::new(
-            kube::core::Status::failure(
-                "TimedOut",
-                &format!(
-                    "status patch timed out after {}s",
-                    STATUS_PATCH_BUDGET.as_secs()
-                ),
-            )
-            .with_code(504),
-        )))
-    })
+    (|| async { patch_status(api, name, status).await })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(5))
+                .without_max_times(),
+        )
+        .when(is_transient_kube_error)
+        .await
 }
 
 fn is_terminal(state: &str) -> bool {

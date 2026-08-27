@@ -4172,6 +4172,7 @@ fn reservation_rpc_status(err: ReservationError) -> Status {
 fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
     match err {
         crate::cluster::SubmitError::InvalidArgument(m) => Status::invalid_argument(m),
+        crate::cluster::SubmitError::Unavailable(m) => Status::unavailable(m),
         crate::cluster::SubmitError::Internal(m) => Status::internal(m),
     }
 }
@@ -4725,6 +4726,17 @@ mod tests {
         let status = submit_rpc_status(SubmitError::invalid("partition 'gpu' not found"));
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "partition 'gpu' not found");
+    }
+
+    #[test]
+    fn submit_rpc_status_maps_unavailable_as_retryable() {
+        use crate::cluster::SubmitError;
+
+        // A cold association cache is transient; it must surface as Unavailable so
+        // clients (e.g. the k8s operator) retry instead of failing the job.
+        let status = submit_rpc_status(SubmitError::unavailable("associations unavailable"));
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(spur_proto::controller_rpc_retryable(&status));
     }
 
     /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,

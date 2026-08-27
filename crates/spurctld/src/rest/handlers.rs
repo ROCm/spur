@@ -155,6 +155,7 @@ fn parse_rest_gpu(
 fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
     match err {
         crate::cluster::SubmitError::InvalidArgument(m) => bad_request_response(&m),
+        crate::cluster::SubmitError::Unavailable(m) => unavailable_response(&m),
         crate::cluster::SubmitError::Internal(m) => error_response(&format!("submit failed: {m}")),
     }
 }

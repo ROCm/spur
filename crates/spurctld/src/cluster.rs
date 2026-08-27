@@ -106,6 +106,9 @@ impl std::error::Error for ReservationError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
     InvalidArgument(String),
+    /// A transient condition the client should retry (maps to gRPC `Unavailable`,
+    /// REST 503), e.g. a cold association cache right after controller start.
+    Unavailable(String),
     Internal(String),
 }
 
@@ -166,7 +169,7 @@ impl std::error::Error for SrunCompleteError {}
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidArgument(m) | Self::Internal(m) => f.write_str(m),
+            Self::InvalidArgument(m) | Self::Unavailable(m) | Self::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -176,6 +179,10 @@ impl std::error::Error for SubmitError {}
 impl SubmitError {
     pub fn invalid(msg: impl Into<String>) -> Self {
         Self::InvalidArgument(msg.into())
+    }
+
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self::Unavailable(msg.into())
     }
 
     pub fn internal(msg: impl Into<String>) -> Self {
@@ -7348,6 +7355,16 @@ fn validate_user_account(
 ) -> Result<(), SubmitError> {
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
         if accounting.require_association {
+            // Cold cache: the user's default account may still resolve once the refresh
+            // loop populates associations, so this is transient (retryable), not permanent.
+            if accounting.enabled() && !assoc_cache.is_loaded() {
+                return Err(SubmitError::unavailable(format!(
+                    "account associations are temporarily unavailable (accounting cache not loaded); \
+                     no default account resolved for user '{}' yet. Try again once the accounting \
+                     database is reachable.",
+                    spec.user
+                )));
+            }
             let hint = if assoc_cache.is_loaded() {
                 ""
             } else {
@@ -7373,7 +7390,9 @@ fn validate_user_account(
                 "association cache not loaded while accounting is enabled — denying account-scoped \
                  submission (fail closed). Check the accounting database is reachable."
             );
-            Err(SubmitError::invalid(format!(
+            // Transient: the refresh loop populates the cache shortly after start, so
+            // this must be retryable (Unavailable), not a permanent rejection.
+            Err(SubmitError::unavailable(format!(
                 "account associations are temporarily unavailable (accounting cache not loaded); \
                  cannot verify user '{}' is associated with account '{account}'. Try again once \
                  the accounting database is reachable.",
@@ -13514,8 +13533,8 @@ mod tests {
         spec.account = Some("tenant-b".into());
         let err = validate_user_account(&spec, &cache, &acct_cfg_enabled(true)).unwrap_err();
         assert!(
-            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("temporarily unavailable")),
-            "cold cache with accounting enabled must fail closed, got {err:?}"
+            matches!(&err, SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache with accounting enabled must fail closed (retryable), got {err:?}"
         );
     }
 
@@ -13573,8 +13592,8 @@ mod tests {
         spec.account = Some("tenant-b".into());
         let err = cm.submit_job(spec).unwrap_err();
         assert!(
-            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("temporarily unavailable")),
-            "cold cache must fail closed end-to-end, got {err:?}"
+            matches!(&err, SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache must fail closed end-to-end (retryable), got {err:?}"
         );
     }
 
@@ -20453,7 +20472,8 @@ mod tests {
     #[test]
     fn validate_user_account_fails_closed_on_cold_cache_with_explicit_account_and_require_association(
     ) {
-        // require_association=true doesn't bypass the cold-cache fence for an explicit account.
+        // require_association=true doesn't bypass the cold-cache fence for an explicit
+        // account. The fence is transient (cache still loading), so it must be retryable.
         let assoc = AssociationCache::new(); // never loaded
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
@@ -20464,7 +20484,30 @@ mod tests {
         };
 
         let err = super::validate_user_account(&spec, &assoc, &cfg).unwrap_err();
-        assert!(err.to_string().contains("temporarily unavailable"));
+        assert!(
+            matches!(&err, super::SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache must be retryable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_user_account_cold_cache_no_account_require_association_is_retryable() {
+        // A user's default account may still be loading; rejecting it permanently would
+        // fail a job that would succeed once the refresh loop populates the cache.
+        let assoc = AssociationCache::new(); // never loaded
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+        let cfg = spur_core::config::AccountingConfig {
+            database_url: "postgresql://test".into(),
+            require_association: true,
+            ..Default::default()
+        };
+
+        let err = super::validate_user_account(&spec, &assoc, &cfg).unwrap_err();
+        assert!(
+            matches!(&err, super::SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache must be retryable, got {err:?}"
+        );
     }
 
     #[test]

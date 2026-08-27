@@ -755,9 +755,8 @@ async fn spawn_job_process(
         });
     }
 
-    // Join the cgroup pre-exec, not parent-side after spawn: under `unshare
-    // --fork` the workload inherits the cgroup only if we join before exec, and a
-    // parent-side move races that fork. Precedes priv drop -- only root writes here.
+    // Join pre-exec, not parent-side after spawn: under `unshare --fork` a
+    // parent-side move races the fork and misses the workload's cgroup.
     let cgroup_procs = cgroup_path
         .as_ref()
         .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
@@ -993,10 +992,8 @@ fn setup_cgroup(
     Ok(Some(cgroup_path))
 }
 
-/// Move the calling process into a cgroup by writing its own pid to
-/// `cgroup.procs`. Runs post-fork before exec, so it must be async-signal-safe:
-/// no heap allocation, only raw syscalls. Best-effort — on failure it warns to
-/// `log_fd` (spurd's log; -1 to stay silent) and the job runs unconstrained.
+/// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
+/// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
 fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
     let pid = unsafe { libc::getpid() };
 
@@ -1543,9 +1540,8 @@ async fn launch_container_job(
                 }
             }
 
-            // Join the cgroup while still root and before container_init's
-            // pivot_root hides the host cgroupfs; do it before close_inherited_fds
-            // reaps the log fd. A parent-side write would race this child's execve.
+            // Join while still root, before pivot_root hides the host cgroupfs and
+            // before close_inherited_fds reaps the log fd.
             if let Some(ref procs) = cgroup_procs {
                 join_cgroup_self(procs, cgroup_log_fd);
             }
