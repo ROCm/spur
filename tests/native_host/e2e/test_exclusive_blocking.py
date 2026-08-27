@@ -37,40 +37,47 @@ def _job_state_and_reason(cluster, job_id: int) -> tuple[str, str]:
     return state, reason
 
 
-def _assert_stays_pending_for_resources(cluster, job_id: int, holder_id: int, duration: int):
-    """Poll for `duration` seconds and assert the job stays PD with reason Resources.
+def _assert_all_stay_pending_for_resources(
+    cluster, job_ids: list, holder_id: int, duration: int
+):
+    """Poll for `duration` seconds and assert every job in job_ids stays PD
+    with reason Resources throughout.
 
-    Fails immediately if the job starts running or if the reason is wrong after
-    at least one scheduler pass (i.e., after the first non-empty reason is seen).
+    All jobs are checked on every tick so that a job running and completing
+    while another is being examined cannot slip through undetected. Fails
+    immediately the moment any job starts running or shows a wrong reason.
+    Requires every job to have been seen as PD at least once.
     """
     deadline = time.time() + duration
-    reason_seen = False
+    seen = {jid: False for jid in job_ids}
 
     while time.time() < deadline:
-        state, reason = _job_state_and_reason(cluster, job_id)
+        for jid in job_ids:
+            state, reason = _job_state_and_reason(cluster, jid)
 
-        if state == "R":
-            sq = cluster.squeue_all()
-            raise AssertionError(
-                f"Job {job_id} started running while exclusive job {holder_id} "
-                f"holds the node — exclusive blocking is broken.\n{sq}"
-            )
+            if state == "R":
+                sq = cluster.squeue_all()
+                raise AssertionError(
+                    f"Job {jid} started running while exclusive job {holder_id} "
+                    f"holds the node — exclusive blocking is broken.\n{sq}"
+                )
 
-        if state == "PD":
-            reason_seen = True
-            assert reason == "Resources", (
-                f"Job {job_id} is PENDING but for the wrong reason: {reason!r}. "
-                f"Expected 'Resources' (blocked by exclusive holder {holder_id}). "
-                f"This may indicate a misconfigured partition or a different "
-                f"scheduling issue masking the real block."
-            )
+            if state == "PD":
+                seen[jid] = True
+                assert reason == "Resources", (
+                    f"Job {jid} is PENDING but for the wrong reason: {reason!r}. "
+                    f"Expected 'Resources' (blocked by exclusive holder {holder_id}). "
+                    f"This may indicate a misconfigured partition or a different "
+                    f"scheduling issue masking the real block."
+                )
 
         time.sleep(_BLOCKING_POLL_STEP)
 
-    assert reason_seen, (
-        f"Job {job_id} never appeared as PD in squeue during the {duration}s window — "
-        f"it may have completed instantly or never been queued properly."
-    )
+    for jid, was_seen in seen.items():
+        assert was_seen, (
+            f"Job {jid} never appeared as PD in squeue during the {duration}s window — "
+            f"it may have completed instantly or never been queued properly."
+        )
 
 
 class TestExclusiveBlocking:
@@ -123,8 +130,8 @@ class TestExclusiveBlocking:
             assert blocked_id is not None, "blocked job did not submit"
 
             try:
-                _assert_stays_pending_for_resources(
-                    cluster, blocked_id, holder_id, _BLOCKING_POLL_SECS
+                _assert_all_stay_pending_for_resources(
+                    cluster, [blocked_id], holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
                 cluster.scancel(str(blocked_id))
@@ -189,8 +196,8 @@ class TestExclusiveBlocking:
             assert blocked_id is not None, "GPU blocked job did not submit"
 
             try:
-                _assert_stays_pending_for_resources(
-                    cluster, blocked_id, holder_id, _BLOCKING_POLL_SECS
+                _assert_all_stay_pending_for_resources(
+                    cluster, [blocked_id], holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
                 cluster.scancel(str(blocked_id))
@@ -291,15 +298,16 @@ class TestExclusiveBlocking:
         try:
             wait_job_state(cluster, holder_id, "R", timeout=60)
 
-            # Verify it actually landed on both nodes.
-            sq = cluster.squeue_all()
-            holder_lines = [line for line in sq.splitlines() if str(holder_id) in line]
-            assert holder_lines, f"holder {holder_id} not in squeue"
-            assert "2" in holder_lines[0], (
-                f"holder should show 2 nodes in squeue:\n{holder_lines[0]}"
+            # Verify it actually landed on both nodes by checking NODES column (field 8).
+            sq = cluster.squeue(["-j", str(holder_id), "-h", "-o", "%i %D %R"])
+            parts = sq.strip().split()
+            assert parts, f"holder {holder_id} not found in squeue"
+            assert parts[1] == "2", (
+                f"holder should show 2 nodes in squeue, got: {sq.strip()!r}"
             )
 
-            # A job pinned to node0 must pend for Resources.
+            # Submit both blocked jobs before polling either — so that a failure
+            # on one node is not masked by the time we check the other.
             blocked0_script = cluster.write_file(
                 "excl-mn-blocked0.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
             )
@@ -310,7 +318,6 @@ class TestExclusiveBlocking:
             )
             assert blocked0_id is not None
 
-            # A job pinned to node1 must also pend for Resources.
             blocked1_script = cluster.write_file(
                 "excl-mn-blocked1.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
             )
@@ -322,11 +329,10 @@ class TestExclusiveBlocking:
             assert blocked1_id is not None
 
             try:
-                _assert_stays_pending_for_resources(
-                    cluster, blocked0_id, holder_id, _BLOCKING_POLL_SECS
-                )
-                _assert_stays_pending_for_resources(
-                    cluster, blocked1_id, holder_id, _BLOCKING_POLL_SECS
+                # Poll both jobs together on every tick so neither can run and
+                # complete while the other is being checked.
+                _assert_all_stay_pending_for_resources(
+                    cluster, [blocked0_id, blocked1_id], holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
                 cluster.scancel(str(blocked0_id))
@@ -397,11 +403,8 @@ class TestExclusiveBlocking:
             assert blocked1_id is not None
 
             try:
-                _assert_stays_pending_for_resources(
-                    cluster, blocked0_id, holder_id, _BLOCKING_POLL_SECS
-                )
-                _assert_stays_pending_for_resources(
-                    cluster, blocked1_id, holder_id, _BLOCKING_POLL_SECS
+                _assert_all_stay_pending_for_resources(
+                    cluster, [blocked0_id, blocked1_id], holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
                 cluster.scancel(str(blocked0_id))
