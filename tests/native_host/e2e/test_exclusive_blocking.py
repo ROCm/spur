@@ -261,3 +261,150 @@ class TestExclusiveBlocking:
             )
         finally:
             cluster.scancel(str(holder_id))
+
+    def test_exclusive_multinode_blocks_coscheduling(self, cluster):
+        """An exclusive 2-node job requesting 1 CPU per node blocks a third job
+        from landing on either node, even though 63 CPUs per node are free.
+
+        Requires at least 2 nodes in SPUR_TEST_NODES.
+        """
+        cluster.require_nodes(2)
+        node0 = cluster.node_names[0]
+        node1 = cluster.node_names[1]
+
+        holder_script = cluster.write_file(
+            "excl-mn-holder.sh", "#!/bin/bash\nsleep 300\n"
+        )
+        holder_id = parse_job_id(
+            cluster.sbatch(
+                [
+                    "-N", "2",
+                    "--exclusive",
+                    "-c", "1",
+                    "-t", "10",
+                    holder_script,
+                ]
+            )
+        )
+        assert holder_id is not None, "multi-node exclusive holder did not submit"
+
+        try:
+            wait_job_state(cluster, holder_id, "R", timeout=60)
+
+            # Verify it actually landed on both nodes.
+            sq = cluster.squeue_all()
+            holder_lines = [l for l in sq.splitlines() if str(holder_id) in l]
+            assert holder_lines, f"holder {holder_id} not in squeue"
+            assert "2" in holder_lines[0], (
+                f"holder should show 2 nodes in squeue:\n{holder_lines[0]}"
+            )
+
+            # A job pinned to node0 must pend for Resources.
+            blocked0_script = cluster.write_file(
+                "excl-mn-blocked0.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
+            )
+            blocked0_id = parse_job_id(
+                cluster.sbatch(
+                    ["-N", "1", "-w", node0, "-c", "1", "-t", "1", blocked0_script]
+                )
+            )
+            assert blocked0_id is not None
+
+            # A job pinned to node1 must also pend for Resources.
+            blocked1_script = cluster.write_file(
+                "excl-mn-blocked1.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
+            )
+            blocked1_id = parse_job_id(
+                cluster.sbatch(
+                    ["-N", "1", "-w", node1, "-c", "1", "-t", "1", blocked1_script]
+                )
+            )
+            assert blocked1_id is not None
+
+            try:
+                _assert_stays_pending_for_resources(
+                    cluster, blocked0_id, holder_id, _BLOCKING_POLL_SECS
+                )
+                _assert_stays_pending_for_resources(
+                    cluster, blocked1_id, holder_id, _BLOCKING_POLL_SECS
+                )
+            finally:
+                cluster.scancel(str(blocked0_id))
+                cluster.scancel(str(blocked1_id))
+        finally:
+            cluster.scancel(str(holder_id))
+
+    def test_exclusive_multinode_gpu_blocks_coscheduling(self, gpu_cluster):
+        """An exclusive 2-node GPU job requesting 1 GPU per node blocks further
+        GPU jobs from landing on either node, even though most GPUs are free.
+
+        Requires at least 2 nodes in SPUR_TEST_NODES.
+        """
+        cluster = gpu_cluster
+        cluster.require_nodes(2)
+        cluster.gpu_preflight(2)
+
+        node0 = cluster.node_names[0]
+        node1 = cluster.node_names[1]
+
+        for name in [node0, node1]:
+            if cluster.node_gpu_count(name) < 2:
+                pytest.skip(
+                    f"need >= 2 GPUs on each node to prove remaining GPUs are blocked "
+                    f"(node {name} has {cluster.node_gpu_count(name)})"
+                )
+
+        holder_script = cluster.write_file(
+            "excl-mn-gpu-holder.sh", "#!/bin/bash\nsleep 300\n"
+        )
+        holder_id = parse_job_id(
+            cluster.sbatch(
+                [
+                    "-N", "2",
+                    "--exclusive",
+                    "-c", "1",
+                    "--gres=gpu:1",
+                    "-t", "10",
+                    holder_script,
+                ]
+            )
+        )
+        assert holder_id is not None, "multi-node GPU exclusive holder did not submit"
+
+        try:
+            wait_job_state(cluster, holder_id, "R", timeout=60)
+
+            blocked0_script = cluster.write_file(
+                "excl-mn-gpu-blocked0.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
+            )
+            blocked0_id = parse_job_id(
+                cluster.sbatch(
+                    ["-N", "1", "-w", node0, "-c", "1", "--gres=gpu:1", "-t", "1",
+                     blocked0_script]
+                )
+            )
+            assert blocked0_id is not None
+
+            blocked1_script = cluster.write_file(
+                "excl-mn-gpu-blocked1.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
+            )
+            blocked1_id = parse_job_id(
+                cluster.sbatch(
+                    ["-N", "1", "-w", node1, "-c", "1", "--gres=gpu:1", "-t", "1",
+                     blocked1_script]
+                )
+            )
+            assert blocked1_id is not None
+
+            try:
+                _assert_stays_pending_for_resources(
+                    cluster, blocked0_id, holder_id, _BLOCKING_POLL_SECS
+                )
+                _assert_stays_pending_for_resources(
+                    cluster, blocked1_id, holder_id, _BLOCKING_POLL_SECS
+                )
+            finally:
+                cluster.scancel(str(blocked0_id))
+                cluster.scancel(str(blocked1_id))
+        finally:
+            cluster.scancel(str(holder_id))
