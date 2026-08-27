@@ -293,7 +293,7 @@ class TestExclusiveBlocking:
 
             # Verify it actually landed on both nodes.
             sq = cluster.squeue_all()
-            holder_lines = [l for l in sq.splitlines() if str(holder_id) in l]
+            holder_lines = [line for line in sq.splitlines() if str(holder_id) in line]
             assert holder_lines, f"holder {holder_id} not in squeue"
             assert "2" in holder_lines[0], (
                 f"holder should show 2 nodes in squeue:\n{holder_lines[0]}"
