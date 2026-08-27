@@ -217,6 +217,33 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 
 
 @pytest.fixture
+def cgroup_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """
+    Per-test fixture for cgroup enforcement tests: a rootful, non-GPU cluster.
+
+    spurd must be root to create ``/sys/fs/cgroup/spur/job_<id>``; an
+    unprivileged agent degrades to "no isolation" and every limit assertion
+    would then pass vacuously, so the agent's user is checked up front.
+    """
+    if len(ssh_nodes) < 1:
+        pytest.skip("cgroup tests require at least one node in SPUR_TEST_NODES")
+    fstype = ssh_nodes[0].exec_allow_fail("stat -fc %T /sys/fs/cgroup").strip()
+    if "cgroup2fs" not in fstype:
+        pytest.skip(f"node 0 is not running cgroup v2 (/sys/fs/cgroup is {fstype!r})")
+
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=True,
+                        config_overrides=cluster_config_overrides)
+    try:
+        agent_user = c.spurd_agent_user(0)
+        assert agent_user == "root", (
+            f"cgroup enforcement needs a rootful agent, got user {agent_user!r}"
+        )
+        yield c
+    finally:
+        c.teardown()
+
+
+@pytest.fixture
 def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
     """Native k0s enabled, spurd rootful. Skips unless >= 3 nodes (etcd quorum) + sudo."""
     if len(ssh_nodes) < 3:
