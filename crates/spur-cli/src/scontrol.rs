@@ -1756,10 +1756,15 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
             job.req_gpus
         );
     }
+    // Slurm suffixes the unit only on a real request; an unset floor is bare 0.
+    let min_mem = match job.min_memory_node_mb {
+        0 => "0".to_string(),
+        mb => format!("{mb}M"),
+    };
     let _ = writeln!(
         out,
-        "   MinCPUsNode={} MinMemoryNode={}M",
-        job.min_cpus_node, job.min_memory_node_mb
+        "   MinCPUsNode={} MinMemoryNode={}",
+        job.min_cpus_node, min_mem
     );
     let _ = writeln!(out, "   Features={}", or_null(&job.features));
     if !job.reservation.is_empty() {
@@ -1871,6 +1876,9 @@ mod tests {
         assert!(out.contains("Dependency=afterok:5"), "{out}");
         assert!(out.contains("ReqTRES=cpu=16,node=2,gres/gpu=8"), "{out}");
         assert!(out.contains("MinCPUsNode=8 MinMemoryNode=16000M"), "{out}");
+        // Slurm prints a bare 0 when no per-node floor was requested.
+        let unset = format_job_detail(&spur_proto::proto::JobInfo::default());
+        assert!(unset.contains("MinMemoryNode=0\n"), "{unset}");
     }
 
     #[test]
