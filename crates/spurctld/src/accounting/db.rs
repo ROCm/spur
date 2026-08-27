@@ -704,16 +704,8 @@ pub async fn get_usage(
     Ok(records)
 }
 
-/// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
-/// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
-/// that started before the window contributes only the part inside it.
-///
-/// Each row is clamped at zero inside the `SUM`, not after it: start/end times can
-/// be written by callers outside the controller and can skew, and a single
-/// end-before-start row would otherwise cancel real consumption in the same QOS
-/// and under-report the budget.
-/// A macro rather than a `const` so the test can prefix it with `EXPLAIN` via
-/// `concat!`: sqlx 0.9 accepts only statically known SQL.
+// A macro rather than a `const` so the EXPLAIN test can build its statement with
+// `concat!`, which needs a literal on both sides.
 macro_rules! consumed_wall_minutes_sql {
     () => {
         r#"
@@ -734,6 +726,14 @@ macro_rules! consumed_wall_minutes_sql {
     };
 }
 
+/// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
+/// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
+/// that started before the window contributes only the part inside it.
+///
+/// Each row is clamped at zero inside the `SUM`, not after it: start/end times can
+/// be written by callers outside the controller and can skew, and a single
+/// end-before-start row would otherwise cancel real consumption in the same QOS
+/// and under-report the budget.
 pub async fn consumed_wall_minutes_by_qos(
     pool: &PgPool,
     window_days: u32,
@@ -1935,14 +1935,19 @@ mod job_history_tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // The scan node varies with table statistics — index-only on a populated
+        // table, a bitmap OR over the two end_time branches on a small one — so the
+        // pairing is asserted by which relation is read, not by node shape. With
+        // seqscan off, a full scan is what the planner falls back to when the index
+        // predicate is no longer implied, which is the rot this test is here for.
         assert!(
             plan.contains("idx_jobs_grp_wall_window"),
             "GrpWall consumption must be servable from idx_jobs_grp_wall_window; plan was:\n{plan}"
         );
         assert!(
-            plan.contains("end_time"),
-            "the window predicate must reach the index, or its cost tracks total \
-             history instead of the window; plan was:\n{plan}"
+            !plan.contains("Seq Scan on jobs"),
+            "the index no longer covers this query, so its cost tracks total history \
+             instead of the window; plan was:\n{plan}"
         );
 
         tx.rollback().await?;
