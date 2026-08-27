@@ -15,7 +15,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use spur_core::config::{MemlockLimit, SwapLimit};
+use spur_core::config::{CgroupConfig, CgroupLimits, MemlockLimit, SwapLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
@@ -505,7 +505,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
+    let cgroup_path = setup_cgroup(job_id, &CgroupConfig::default(), cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -891,14 +891,54 @@ async fn spawn_job_process(
     })
 }
 
+/// Render a job's cgroup-v2 control files as (filename, content) pairs.
+///
+/// Pure so the file layout is testable without a real cgroupfs; the values
+/// themselves are resolved by `CgroupConfig::limits_for`.
+fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = Vec::new();
+    if let Some(quota) = limits.cpu_quota_us {
+        files.push(("cpu.max", format!("{} {}", quota, limits.cpu_period_us)));
+    }
+    if let Some(bytes) = limits.memory_max_bytes {
+        files.push(("memory.max", bytes.to_string()));
+    }
+    if let Some(bytes) = limits.memory_high_bytes {
+        files.push(("memory.high", bytes.to_string()));
+    }
+    if let Some(bytes) = limits.swap_max_bytes {
+        files.push(("memory.swap.max", bytes.to_string()));
+    }
+    if limits.oom_kill_job {
+        files.push(("memory.oom.group", "1".to_string()));
+    }
+    files.push(("pids.max", limits.pids_max.to_string()));
+    if !limits.cpuset_cpus.is_empty() {
+        let cpuset = limits
+            .cpuset_cpus
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        files.push(("cpuset.cpus", cpuset));
+    }
+    files
+}
+
 /// Set up a cgroups v2 hierarchy for a job.
 fn setup_cgroup(
     job_id: JobId,
+    cgroup: &CgroupConfig,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
     swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
+    let Some(limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
+        debug!(job_id, "cgroup enforcement disabled by config");
+        return Ok(None);
+    };
+
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
 
@@ -961,24 +1001,10 @@ fn setup_cgroup(
         warn!(job_id, error = %e, "failed to set memory.oom.group");
     }
 
-    // Fork bomb protection: limit total processes per job
-    let max_pids = (cpus as u64 * 256).max(1024);
-    if let Err(e) = std::fs::write(cgroup_path.join("pids.max"), max_pids.to_string()) {
-        warn!(job_id, error = %e, "failed to set pids.max");
-    }
-
-    // Pin to specific CPU cores via cpuset
-    if !cpu_ids.is_empty() {
-        let cpuset_str: String = cpu_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        if let Err(e) = std::fs::write(cgroup_path.join("cpuset.cpus"), &cpuset_str) {
-            warn!(job_id, error = %e, "failed to set cpuset.cpus");
-        } else {
-            debug!(job_id, cpuset = %cpuset_str, "cpuset pinning configured");
-        }
+    // With the CFS quota off by default the cpuset is the only CPU bound, so an
+    // empty one means the job is not CPU-constrained at all.
+    if cgroup.constrain_cores && limits.cpuset_cpus.is_empty() {
+        warn!(job_id, "no cores to pin; job runs without a CPU bound");
     }
 
     debug!(
@@ -1478,10 +1504,16 @@ async fn launch_container_job(
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
     let cgroup_path = setup_cgroup(
+        
         job_id,
+        &CgroupConfig::default(),
+       
         cfg.cpus,
+       
         cfg.memory_mb,
+       
         &cfg.cpu_ids,
+    ,
         cfg.swap_limit,
     )?;
 
@@ -1774,6 +1806,87 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 
     wrapper.push_str("exit $SPUR_BB_EXIT\n");
     wrapper
+}
+
+#[cfg(test)]
+mod cgroup_files_tests {
+    use super::cgroup_limit_files;
+    use spur_core::config::CgroupConfig;
+
+    fn files_for(
+        cfg: &CgroupConfig,
+        cpus: u32,
+        memory_mb: u64,
+        cpu_ids: &[u32],
+    ) -> Vec<(&'static str, String)> {
+        cgroup_limit_files(&cfg.limits_for(cpus, memory_mb, cpu_ids).expect("enabled"))
+    }
+
+    #[test]
+    fn writes_defaults_without_a_cfs_quota() {
+        let files = files_for(&CgroupConfig::default(), 4, 2048, &[0, 1, 2, 3]);
+        let get = |k: &str| files.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        let expect_mem = (2048u64 * 1024 * 1024).to_string();
+        assert_eq!(get("cpu.max"), None);
+        assert_eq!(get("memory.max"), Some(expect_mem.as_str()));
+        // AllowedRAMSpace=100 collapses the soft limit onto the hard one.
+        assert_eq!(get("memory.high"), Some(expect_mem.as_str()));
+        assert_eq!(get("memory.swap.max"), Some("0"));
+        assert_eq!(get("memory.oom.group"), Some("1"));
+        assert_eq!(get("pids.max"), Some("1024")); // max(4*256, 1024)
+        assert_eq!(get("cpuset.cpus"), Some("0,1,2,3"));
+    }
+
+    #[test]
+    fn cpu_quota_knob_emits_cpu_max() {
+        let cfg = CgroupConfig {
+            cpu_quota: true,
+            ..CgroupConfig::default()
+        };
+        let files = files_for(&cfg, 4, 0, &[]);
+        assert_eq!(
+            files
+                .iter()
+                .find(|(n, _)| *n == "cpu.max")
+                .map(|(_, v)| v.as_str()),
+            Some("400000 100000")
+        );
+    }
+
+    #[test]
+    fn headroom_emits_a_lower_memory_high_than_memory_max() {
+        let cfg = CgroupConfig {
+            allowed_ram_percent: 150,
+            ..CgroupConfig::default()
+        };
+        let files = files_for(&cfg, 1, 1024, &[]);
+        let get = |k: &str| files.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        let high = (1024u64 * 1024 * 1024).to_string();
+        let max = (1536u64 * 1024 * 1024).to_string();
+        assert_eq!(get("memory.high"), Some(high.as_str()));
+        assert_eq!(get("memory.max"), Some(max.as_str()));
+    }
+
+    #[test]
+    fn omits_memory_and_swap_for_an_unbounded_job() {
+        let files = files_for(&CgroupConfig::default(), 1, 0, &[]);
+        let has = |k: &str| files.iter().any(|(n, _)| *n == k);
+        assert!(!has("memory.max"));
+        assert!(!has("memory.high"));
+        assert!(!has("memory.swap.max"));
+        assert!(!has("cpuset.cpus"));
+        assert!(has("pids.max"));
+    }
+
+    #[test]
+    fn oom_kill_job_can_be_turned_off() {
+        let cfg = CgroupConfig {
+            oom_kill_job: false,
+            ..CgroupConfig::default()
+        };
+        let files = files_for(&cfg, 1, 1024, &[]);
+        assert!(!files.iter().any(|(n, _)| *n == "memory.oom.group"));
+    }
 }
 
 #[cfg(test)]
