@@ -19,8 +19,9 @@ from dataclasses import dataclass
 # cluster.py lives in native_host/e2e, which pytest.ini puts on pythonpath.
 from cluster import SshNode
 
-# The mesh test CIDR. .1 is the head/controller; workers get .2, .3, ...
-MESH_CIDR = "10.44.0.0/16"
+# Test mesh CIDR. Not the product default (10.44.0.0/16): that overlaps the CI
+# runner underlay, which routes the underlay into spur0 and stalls k0s/calico.
+MESH_CIDR = "10.46.0.0/16"
 MESH_PREFIX = 16
 WG_PORT = 51820
 WG_IFACE = "spur0"
@@ -72,11 +73,11 @@ class WgMesh:
         just makes the assignment stable across runs; it is not tied to any
         k0s-internal pool ordering.
         """
-        mapping = {0: "10.44.0.1"}  # node 0 is the bootstrap controller -> reserved .1
+        mapping = {0: "10.46.0.1"}  # node 0 is the bootstrap controller -> reserved .1
         rest = sorted(range(1, len(self.node_names)),
                       key=lambda i: self.node_names[i])
         for pos, idx in enumerate(rest):
-            mapping[idx] = f"10.44.0.{pos + 2}"
+            mapping[idx] = f"10.46.0.{pos + 2}"
         return mapping
 
     def mesh_ip_for(self, index: int) -> str:
@@ -271,14 +272,8 @@ class WgMesh:
             )
 
 
-def wg_available(node: SshNode, sudo_prefix: str, *,
-                 require_kmod: bool = False) -> tuple[bool, str]:
+def wg_available(node: SshNode, sudo_prefix: str) -> tuple[bool, str]:
     """Check a node can run a real WireGuard mesh: `wg` tool + a data plane.
-
-    With ``require_kmod`` the in-tree ``wireguard`` kernel module must load — the
-    ``wireguard-go`` userspace fallback is not accepted. k0s-over-mesh needs this:
-    calico + the full mesh datapath converge far too slowly over userspace-go for
-    the tests' timeouts, so those fixtures require a real module.
 
     Returns (ok, reason). Reason is human-readable for a pytest.skip message.
     """
@@ -291,13 +286,7 @@ def wg_available(node: SshNode, sudo_prefix: str, *,
         f"{sudo_prefix}modprobe wireguard 2>/dev/null && echo KMOD || "
         "{ command -v wireguard-go >/dev/null && echo USERSPACE; } || echo NONE"
     )
-    if "KMOD" in probe:
-        return True, ""
-    if "USERSPACE" in probe:
-        if require_kmod:
-            return False, ("only the wireguard-go userspace data plane is "
-                           "available; k0s-over-mesh needs the in-tree "
-                           "`wireguard` kernel module")
+    if "KMOD" in probe or "USERSPACE" in probe:
         return True, ""
     return False, "no WireGuard kernel module and no wireguard-go userspace fallback"
 

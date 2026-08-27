@@ -154,7 +154,7 @@ def _launch_httpd_pod(c, cp_index: int, name: str, node_name: str, body: str) ->
 
 def _expose_clusterip(c, cp_index: int, pod: str, svc: str, port: int = 80) -> str:
     """Create a ClusterIP Service *svc* selecting app=<pod> on *port*, and return
-    its allocated ClusterIP (10.43.x.x)."""
+    its allocated ClusterIP (10.48.x.x)."""
     manifest = (
         "apiVersion: v1\n"
         "kind: Service\n"
@@ -264,8 +264,8 @@ class TestK0sOverMesh:
                    desc="kubelet InternalIPs registered with the k8s API")
 
         internal_ips = read_internal_ips()
-        assert all(ip.startswith("10.44.0.") for ip in internal_ips), (
-            f"expected all InternalIPs on the mesh CIDR 10.44.0.0/16, got {internal_ips}"
+        assert all(ip.startswith("10.46.") for ip in internal_ips), (
+            f"expected all InternalIPs on the mesh CIDR 10.46.0.0/16, got {internal_ips}"
         )
 
     def test_controller_stays_meshed(self, wg_k0s_cluster):
@@ -313,10 +313,10 @@ class TestPodsOnMesh:
             out = c.nodes[0].exec_allow_fail(
                 f"{c._sudo_prefix()}wg show '{WG_IFACE}' allowed-ips"
             )
-            return "10.42." in out
+            return "10.47." in out
 
         wait_until(pod_cidr_present, timeout_s=180,
-                   desc="pod CIDR (10.42.x) folded into a peer's AllowedIPs")
+                   desc="pod CIDR (10.47.x) folded into a peer's AllowedIPs")
 
     def test_cross_node_pod_ping_rides_the_tunnel(self, wg_k0s_cluster):
         """A pod on worker A pings a pod on worker B over the pod CIDR, and the
@@ -350,7 +350,7 @@ class TestPodsOnMesh:
         pod_b = _launch_pinned_pod(c, cp_index, "wg-d3-b", worker_b)
         ip_a = _wait_pod_ip(c, cp_index, pod_a)
         ip_b = _wait_pod_ip(c, cp_index, pod_b)
-        assert ip_a.startswith("10.42.") and ip_b.startswith("10.42."), (
+        assert ip_a.startswith("10.47.") and ip_b.startswith("10.47."), (
             f"pods did not get pod-CIDR IPs: a={ip_a} b={ip_b}"
         )
 
@@ -394,7 +394,7 @@ class TestPodsOnMesh:
 
 @pytest.mark.k0s
 class TestServiceCidrOverMesh:
-    """A ClusterIP service (service CIDR 10.43.0.0/16) is reachable across the
+    """A ClusterIP service (service CIDR 10.48.0.0/16) is reachable across the
     mesh even though the service CIDR is never in any WireGuard AllowedIPs.
 
     WireGuard only carries each node's mesh /32 + pod CIDR. A ClusterIP is
@@ -428,8 +428,8 @@ class TestServiceCidrOverMesh:
         _wait_pod_ip(c, cp_index, server)
         # Expose it as a ClusterIP service.
         cluster_ip = _expose_clusterip(c, cp_index, server, "wg-svc", port=80)
-        assert cluster_ip.startswith("10.43."), (
-            f"service ClusterIP not in the service CIDR (10.43.x): {cluster_ip}"
+        assert cluster_ip.startswith("10.48."), (
+            f"service ClusterIP not in the service CIDR (10.48.x): {cluster_ip}"
         )
 
         # Client pod on worker B curls the ClusterIP; kube-proxy DNATs it to the

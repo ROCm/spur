@@ -410,12 +410,16 @@ def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 # they DETECT the wg data plane and skip cleanly when it is absent (a test does
 # not install its own dependencies — nodes are expected to ship WireGuard).
 
+# Test pod / service CIDRs, clear of the mesh CIDR and the CI runner underlay.
+POD_CIDR = "10.47.0.0/16"
+SERVICE_CIDR = "10.48.0.0/16"
+
 
 def _wg_addresses() -> dict[int, str] | None:
     """Optional explicit per-node mesh addresses, positional like SPUR_TEST_NODES.
 
     Mirrors spur-toolkit's per-node ``spur_wg_address`` inventory var. Example:
-    ``SPUR_TEST_WG_ADDRESSES=10.44.0.1,10.44.0.2,10.44.0.3``. When unset, WgMesh
+    ``SPUR_TEST_WG_ADDRESSES=10.46.0.1,10.46.0.2,10.46.0.3``. When unset, WgMesh
     falls back to its default assignment. When set, the count must match
     SPUR_TEST_NODES.
     """
@@ -432,20 +436,17 @@ def _wg_addresses() -> dict[int, str] | None:
     return {i: a for i, a in enumerate(addrs)}
 
 
-def _require_wireguard(cluster: SpurCluster, *, require_kmod: bool = False) -> None:
+def _require_wireguard(cluster: SpurCluster) -> None:
     """Skip unless every node can run a real WireGuard mesh.
 
-    Checks ``wg``/``wg-quick`` plus a usable data plane via :func:`wg_available`.
-    With ``require_kmod`` the in-tree kernel module is required (userspace
-    ``wireguard-go`` is rejected) — the k0s-over-mesh scenarios need it, since
-    calico + the full mesh datapath converge too slowly over userspace-go for
-    their timeouts. Nodes are expected to ship WireGuard (CI bakes it into the
-    image); a test does not install its own dependencies, so a node without a
-    suitable data plane skips rather than failing.
+    Checks ``wg``/``wg-quick`` plus a usable data plane (kernel module or the
+    ``wireguard-go`` userspace fallback) via :func:`wg_available`. Nodes are
+    expected to ship WireGuard (CI bakes it into the image); a test does not
+    install its own dependencies, so a node without it skips rather than failing.
     """
     sudo = cluster._sudo_prefix()
     for node in cluster.nodes:
-        ok, reason = wg_available(node, sudo, require_kmod=require_kmod)
+        ok, reason = wg_available(node, sudo)
         if not ok:
             pytest.skip(f"WireGuard unavailable on {node.host}: {reason}")
 
@@ -530,9 +531,7 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()  # skips if no sudo
-    # k0s-over-mesh requires the in-tree kernel module: calico + the full mesh
-    # datapath converge too slowly over userspace wireguard-go for the timeouts.
-    _require_wireguard(c, require_kmod=True)
+    _require_wireguard(c)
 
     # Start from a clean k0s slate: a prior test (or a crashed run) can leave k0s
     # services + an etcd datadir behind, which corrupts this cluster's membership.
@@ -556,7 +555,8 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
     overrides = {
         "network": {"wg_enabled": True, "wg_cidr": MESH_CIDR},
         "cluster": {"enabled": True, "cni": "calico",
-                    "control_plane_node": c.node_names[control_plane_index]},
+                    "control_plane_node": c.node_names[control_plane_index],
+                    "pod_cidr": POD_CIDR, "service_cidr": SERVICE_CIDR},
     }
     try:
         c.start(config_overrides=overrides, agent_as_root=True)
