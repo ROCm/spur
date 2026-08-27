@@ -3854,9 +3854,9 @@ fn job_info_disclosure(
 }
 
 /// Blank the fields of a `JobInfo` that a non-owner should not see: the working directory, the first
-/// command line, the stdio paths, the comment, the resource detail, and — most importantly for
-/// cross-tenant targeting — the allocated nodelist. The identity/state/timing/account fields are
-/// left intact so the Slurm-standard cluster-visible queue view still works.
+/// command line, the submit line, the stdio paths, the comment, the resource detail, and — most
+/// importantly for cross-tenant targeting — the allocated, requested, and planned node lists. The
+/// identity/state/timing/account fields are left intact so the Slurm-standard queue view works.
 fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.work_dir = String::new();
     info.command = String::new();
@@ -3949,7 +3949,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         submit_line: job.spec.submit_line.clone().unwrap_or_default(),
         req_tres: requested_tres(&job.spec),
         min_cpus_node: min_cpus_per_node(&job.spec).try_into().unwrap_or(u32::MAX),
-        min_memory_node_mb: min_memory_per_node_mb(&job.spec),
+        min_memory_node_mb: min_memory_requested_mb(&job.spec),
+        min_memory_is_per_cpu: job.spec.memory_per_node_mb.is_none()
+            && job.spec.memory_per_cpu_mb.is_some(),
         eligible_time: Some(datetime_to_proto(job.eligible_time())),
         accrue_time: Some(datetime_to_proto(job.accrue_time())),
         last_sched_eval: job.last_sched_eval.map(datetime_to_proto),
@@ -3959,7 +3961,10 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             nanos: 0,
         }),
         requeue: job.spec.requeue,
-        restarts: job.requeue_count + job.preempt_requeue_count + job.user_requeue_count,
+        restarts: job
+            .requeue_count
+            .saturating_add(job.preempt_requeue_count)
+            .saturating_add(job.user_requeue_count),
         batch_flag: job.spec.script.is_some(),
         exclusive: job.spec.exclusive,
         // Filled by annotate_jobs_with_planned_reservations: the scheduler's
@@ -3970,16 +3975,36 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
 }
 
 /// Client-asserted, replicated in every Raft entry, and printed to a terminal,
-/// so it is bounded and stripped of control characters.
-const MAX_SUBMIT_LINE_LEN: usize = 1024;
+/// so it is bounded in bytes and stripped of terminal-controlling characters.
+const MAX_SUBMIT_LINE_BYTES: usize = 1024;
 
+/// Neutralize characters that would rewrite an operator's terminal or reorder
+/// the rendered text, and bound the length. Controls become spaces rather than
+/// vanishing, so `--wrap $'a\nb'` cannot silently render as one token.
 fn sanitize_submit_line(raw: &str) -> Option<String> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_SUBMIT_LINE_LEN)
-        .collect();
-    (!cleaned.is_empty()).then_some(cleaned)
+    let mut cleaned = String::new();
+    for c in raw.chars() {
+        let c = if c.is_control() || is_format_char(c) {
+            ' '
+        } else {
+            c
+        };
+        if cleaned.len() + c.len_utf8() > MAX_SUBMIT_LINE_BYTES {
+            cleaned.push('…');
+            break;
+        }
+        cleaned.push(c);
+    }
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Unicode `Cf`: bidi overrides and zero-width joiners render deceptively but
+/// are not `char::is_control`.
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
 }
 
 /// Tasks landing on one node, for the per-node minima Slurm reports. Nothing
@@ -3995,8 +4020,15 @@ fn min_cpus_per_node(spec: &spur_core::job::JobSpec) -> u64 {
     tasks_per_node(spec).saturating_mul(u64::from(spec.cpus_per_task.max(1)))
 }
 
-/// Per-node memory floor. A `--mem-per-cpu` job has none declared directly, so
-/// scale it by the CPUs that land on a node.
+/// The memory floor as requested. A `--mem-per-cpu` job reports the per-CPU
+/// figure verbatim; Slurm labels that MinMemoryCPU rather than converting it.
+fn min_memory_requested_mb(spec: &spur_core::job::JobSpec) -> u64 {
+    spec.memory_per_node_mb
+        .or(spec.memory_per_cpu_mb)
+        .unwrap_or(0)
+}
+
+/// Total per-node memory the job implies, for the TRES roll-up.
 fn min_memory_per_node_mb(spec: &spur_core::job::JobSpec) -> u64 {
     if let Some(mb) = spec.memory_per_node_mb {
         return mb;
@@ -7012,18 +7044,45 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_submit_line_strips_control_characters_and_bounds_length() {
+    fn sanitize_submit_line_neutralizes_terminal_control_characters() {
         // A client-asserted field printed straight to an operator's terminal.
         assert_eq!(
             sanitize_submit_line("sbatch \u{1b}[2Kjob.sh"),
-            Some("sbatch [2Kjob.sh".to_string())
+            Some("sbatch  [2Kjob.sh".to_string())
         );
-        let long = "x".repeat(MAX_SUBMIT_LINE_LEN * 2);
+        // Bidi override renders deceptively but is not char::is_control.
         assert_eq!(
-            sanitize_submit_line(&long).unwrap().len(),
-            MAX_SUBMIT_LINE_LEN
+            sanitize_submit_line("sbatch \u{202e}job.sh"),
+            Some("sbatch  job.sh".to_string())
         );
         assert_eq!(sanitize_submit_line("\u{1b}\u{7}"), None);
+    }
+
+    #[test]
+    fn sanitize_submit_line_replaces_controls_rather_than_joining_tokens() {
+        // Deleting the newline would render `a b` as the single token `ab`.
+        assert_eq!(
+            sanitize_submit_line("sbatch --wrap 'a\nb'"),
+            Some("sbatch --wrap 'a b'".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_submit_line_bounds_bytes_not_chars() {
+        let ascii = "x".repeat(MAX_SUBMIT_LINE_BYTES * 2);
+        let out = sanitize_submit_line(&ascii).unwrap();
+        assert!(out.len() <= MAX_SUBMIT_LINE_BYTES + '\u{2026}'.len_utf8());
+        assert!(out.ends_with('\u{2026}'), "truncation must be visible");
+
+        // Multibyte input is where a char-based bound silently stores ~4x the
+        // budget into every Raft entry.
+        let wide = "\u{4e16}".repeat(MAX_SUBMIT_LINE_BYTES);
+        let out = sanitize_submit_line(&wide).unwrap();
+        assert!(
+            out.len() <= MAX_SUBMIT_LINE_BYTES + '\u{2026}'.len_utf8(),
+            "bounded in bytes, got {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -7152,7 +7211,10 @@ mod tests {
             memory_per_cpu_mb: Some(u64::MAX),
             ..Default::default()
         };
-        assert!(requested_tres(&spec).starts_with("cpu="));
+        assert_eq!(
+            requested_tres(&spec),
+            format!("cpu=18446744065119617025,mem={}M,node=1", u64::MAX)
+        );
         assert_eq!(min_memory_per_node_mb(&spec), u64::MAX);
     }
 
@@ -7168,6 +7230,39 @@ mod tests {
         };
         assert_eq!(requested_tres(&spec), "cpu=1,node=1");
         assert_eq!(min_memory_per_node_mb(&spec), 0);
+    }
+
+    #[test]
+    fn mem_per_cpu_is_reported_verbatim_under_the_slurm_cpu_label() {
+        use spur_core::job::{Job, JobSpec};
+
+        // Slurm prints MinMemoryCPU=1000M here; converting to a per-node
+        // figure would report a request the user never made.
+        let job = Job::new(
+            1,
+            JobSpec {
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 4,
+                memory_per_cpu_mb: Some(1000),
+                ..Default::default()
+            },
+        );
+        let info = job_to_proto(&job);
+        assert_eq!(info.min_memory_node_mb, 1000);
+        assert!(info.min_memory_is_per_cpu);
+
+        // A per-node request keeps the node label and its own value.
+        let job = Job::new(
+            2,
+            JobSpec {
+                memory_per_node_mb: Some(16000),
+                ..Default::default()
+            },
+        );
+        let info = job_to_proto(&job);
+        assert_eq!(info.min_memory_node_mb, 16000);
+        assert!(!info.min_memory_is_per_cpu);
     }
 
     #[test]

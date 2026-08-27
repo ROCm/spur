@@ -1766,14 +1766,20 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
             job.req_gpus
         );
     }
-    // Slurm suffixes the unit only on a real request; an unset floor is bare 0.
+    // Slurm suffixes the unit only on a real request; an unset floor is bare 0,
+    // and a --mem-per-cpu request is labelled MinMemoryCPU, not converted.
     let min_mem = match job.min_memory_node_mb {
         0 => "0".to_string(),
         mb => format!("{mb}M"),
     };
+    let mem_label = if job.min_memory_is_per_cpu {
+        "MinMemoryCPU"
+    } else {
+        "MinMemoryNode"
+    };
     let _ = writeln!(
         out,
-        "   MinCPUsNode={} MinMemoryNode={}",
+        "   MinCPUsNode={} {mem_label}={}",
         job.min_cpus_node, min_mem
     );
     let _ = writeln!(out, "   Features={}", or_null(&job.features));
@@ -1986,6 +1992,16 @@ mod tests {
             out.contains("ExitCode=0:0 DerivedExitCode=0:0 Priority=11000"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn job_detail_labels_a_mem_per_cpu_request_the_way_slurm_does() {
+        let mut job = pending_pinned_job();
+        job.min_memory_node_mb = 1000;
+        job.min_memory_is_per_cpu = true;
+        let out = format_job_detail(&job);
+        assert!(out.contains("MinMemoryCPU=1000M"), "{out}");
+        assert!(!out.contains("MinMemoryNode"), "{out}");
     }
 
     #[test]

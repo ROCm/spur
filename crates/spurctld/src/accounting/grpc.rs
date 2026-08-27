@@ -336,6 +336,7 @@ impl SlurmAccounting for AccountingService {
                 req_tres: String::new(),
                 min_cpus_node: 0,
                 min_memory_node_mb: 0,
+                min_memory_is_per_cpu: false,
                 eligible_time: None,
                 accrue_time: None,
                 last_sched_eval: None,

@@ -346,9 +346,11 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
 
 .. note::
 
-   The job record is fixed-shape: every field is printed on every job, with
-   ``(null)`` for an unset string. Parsers must key on the field name, not on a
-   line being absent.
+   The diagnostic fields below are printed on every job, with ``(null)`` for an
+   unset string, so a parser must key on the field name rather than on a line
+   being absent. Some fields still appear only when set (``Comment``,
+   ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, the GPU line, and the
+   preemption line).
 
 .. code-block:: bash
 
@@ -381,7 +383,16 @@ request as submitted, which distinguishes the two:
    * - ``ReqTRES``
      - Requested resource totals, e.g. ``cpu=16,mem=32000M,node=2,gres/gpu=8``.
    * - ``MinCPUsNode`` / ``MinMemoryNode``
-     - Per-node minima implied by the request; memory is in MB.
+     - Per-node minima implied by the request. Memory is in MB with an ``M``
+       suffix; a bare ``0`` means none was requested. A ``--mem-per-cpu`` job
+       reports ``MinMemoryCPU`` instead, as Slurm does.
+   * - ``Dependency``, ``Requeue``, ``Restarts``, ``BatchFlag``, ``Exclusive``
+     - Submission flags and the requeue count for this job.
+   * - ``RunTime`` / ``TimeLimit`` / ``TimeMin`` / ``Deadline``
+     - Elapsed and requested wall time. ``TimeLimit`` reads ``UNLIMITED`` when
+       none was set; ``TimeMin`` and ``Deadline`` read ``N/A`` when unset.
+   * - ``Command``
+     - First executable line of the batch script.
    * - ``SubmitLine``
      - The submit command as invoked, so any submission-flag question is
        answerable from one command.
@@ -391,13 +402,14 @@ request as submitted, which distinguishes the two:
      - When the job began accruing age priority.
    * - ``StartTime`` / ``SchedNodeList``
      - While pending, the slot the scheduler is holding: when it projects the
-       job will start, and on which nodes. Absent when no slot is reserved
-       (nothing can run the job yet). ``StartTime`` becomes the real start
-       once the job runs.
+       job will start, and on which nodes. With no slot reserved, ``StartTime``
+       reads ``N/A`` and ``SchedNodeList`` is omitted. ``StartTime`` becomes the
+       real start once the job runs.
    * - ``LastSchedEval``
-     - When the scheduler last considered the job **for placement**. ``N/A``
-       before the first cycle, frozen once the job starts, and reset by a
-       controller restart or failover.
+     - The last scheduling cycle that considered this job. Stamped during
+       classification, so it advances even on a cycle that places nothing.
+       ``N/A`` before the first cycle, frozen once the job starts, and reset by
+       a controller restart or failover.
 
 So a job pinned to a busy node reads (excerpt — the full record has more
 fields between these lines):
@@ -414,7 +426,8 @@ fields between these lines):
       SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
 
 The controller logs the matching scheduler-side view at ``info`` level, one line
-per job when its placement outcome changes (not every cycle):
+per job when its placement outcome changes (not every cycle). Jobs beyond the
+scheduler's per-cycle depth limit are not reported:
 
 .. code-block:: text
 

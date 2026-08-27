@@ -146,8 +146,7 @@ impl BackfillScheduler {
     }
 
     /// Future slot held per pending job, with the nodes it is held on. Unlike
-    /// `planned_starts`, busy nodes are included: a job pinned to a running
-    /// node is exactly the case that needs a projected start.
+    /// `planned_starts`, busy nodes are included.
     pub fn planned_job_starts(&self) -> PlannedJobStarts {
         let now = Utc::now();
         let mut by_job: PlannedJobStarts = HashMap::new();

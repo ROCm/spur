@@ -72,7 +72,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - ``scancel`` arrays
      - Array-element syntax (``123_4``) is not yet supported client-side; cancel by plain job id.
    * - ``scontrol show``
-     - Output is always the multi-line ``Key=Value`` block; there is no ``--oneliner``. Unset string fields print as ``(null)`` rather than being omitted. ``ReqTRES`` omits Slurm's ``billing=`` component, as Spur has no TRES billing weights.
+     - Output is always the multi-line ``Key=Value`` block; there is no ``--oneliner``. Unset diagnostic fields print as ``(null)`` rather than being omitted — notably ``NodeList=(null)`` on a pending job, where earlier Spur releases omitted the line. ``ReqTRES`` omits Slurm's ``billing=`` component, as Spur computes no TRES billing weights. ``MinCPUsNode`` is the per-node CPU floor implied by the task layout, which can read higher than Slurm's ``pn_min_cpus`` for an uneven split such as ``-N2 -n7``.
    * - QOS ``GrpWall``
      - Enforced at scheduling admission only: an over-budget QOS stops admitting jobs, and running jobs are never killed where Slurm cancels them. Consumption is a trailing window (``grp_wall_window_days`` under ``[accounting]``) rather than decayed usage, and the cap exists on a QOS only, not on an association. See :ref:`grpwall-budgets`.
 

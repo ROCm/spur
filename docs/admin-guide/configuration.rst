@@ -257,9 +257,10 @@ and Raft high-availability topology.
      - ``redacted``
      - Live
      - How much of another user's job an identified non-owner (non-admin) may
-       read via ``get_job`` / ``scontrol show job``. ``redacted`` (default) shows
-       identity, state, timing, and account but blanks the working directory,
-       command, stdio paths, comment, resource detail, and allocated nodelist;
+       read via ``get_job``. ``redacted`` (default) shows identity, state,
+       timing, and account but blanks the working directory, command, submit
+       line, stdio paths, comment, resource detail, and the allocated,
+       requested, and planned node lists;
        ``owner_only`` returns ``NOT_FOUND`` for other users' jobs; ``full`` is the
        legacy behaviour where every field is visible to any caller. Owners and
        admins always see the full record. Scoping applies only to identified

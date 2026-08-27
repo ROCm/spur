@@ -272,7 +272,10 @@ message JobInfo {
   // minima Slurm reports alongside it.
   string req_tres = 65;
   uint32 min_cpus_node = 66;
+  // Per-node memory floor. `min_memory_is_per_cpu` marks a --mem-per-cpu
+  // request, which Slurm reports as MinMemoryCPU rather than MinMemoryNode.
   uint64 min_memory_node_mb = 67;
+  bool min_memory_is_per_cpu = 79;
 
   // Earliest start (--begin, else submit), when age priority began accruing,
   // and when the scheduler last considered the job (unset until evaluated).
