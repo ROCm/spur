@@ -326,9 +326,8 @@ impl SlurmAccounting for AccountingService {
                 preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
-                // Kept exhaustive rather than `..Default::default()` so adding
-                // a JobInfo field forces a decision here. The accounting store
-                // has no column for the requested-placement fields.
+                // Kept exhaustive so a new JobInfo field forces a decision here;
+                // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),
                 exc_nodelist: String::new(),
                 features: String::new(),

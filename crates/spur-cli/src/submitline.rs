@@ -2,9 +2,8 @@
 
 //! Renders the submit command line recorded on a job for `scontrol show job`.
 
-/// Join argv into a single displayable line, quoting only the arguments that
-/// would otherwise be ambiguous. Slurm leaves these unquoted, which loses the
-/// word boundaries of `--wrap "a b"`.
+/// Join argv into one displayable line, quoting only ambiguous arguments.
+/// Slurm leaves these unquoted, losing the word boundaries of `--wrap "a b"`.
 pub fn render(args: &[String]) -> String {
     args.iter()
         .map(|arg| quote(arg))

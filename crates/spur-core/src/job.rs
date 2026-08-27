@@ -874,9 +874,8 @@ pub struct Job {
     #[serde(skip)]
     pub preferred_nodes: HashSet<String>,
 
-    /// When the scheduler last evaluated this job for placement. Never
-    /// persisted: replicating a per-cycle timestamp would be a Raft write
-    /// storm, so it resets on controller restart or failover.
+    /// When the scheduler last evaluated this job for placement. Not persisted:
+    /// replicating a per-cycle timestamp would be a Raft write storm.
     #[serde(skip)]
     pub last_sched_eval: Option<DateTime<Utc>>,
 }
@@ -1039,8 +1038,7 @@ impl Job {
     }
 
     /// When the job began accruing age priority. Spur ages every pending job
-    /// from submit, including held and dependency-blocked ones; Slurm suspends
-    /// accrual for those, so this can read earlier than Slurm's AccrueTime.
+    /// from submit; Slurm suspends accrual for held and dependency-blocked ones.
     pub fn accrue_time(&self) -> DateTime<Utc> {
         self.submit_time
     }

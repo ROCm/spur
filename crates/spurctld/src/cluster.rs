@@ -3204,9 +3204,8 @@ impl ClusterManager {
         classification.jobs
     }
 
-    /// Record that this cycle considered these jobs, for `LastSchedEval`.
-    /// Keyed by id rather than scanning every job so the write lock stays
-    /// bounded to the pending set.
+    /// Record that this cycle considered these jobs, for `LastSchedEval`. Keyed
+    /// by id rather than scanning every job, to bound the write lock.
     fn mark_scheduler_evaluated(&self, job_ids: &[JobId]) {
         if job_ids.is_empty() {
             return;

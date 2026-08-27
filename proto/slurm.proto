@@ -259,9 +259,8 @@ message JobInfo {
   string preempt_mode = 58;
   string preempt_qos = 59;
 
-  // Requested placement and constraints, as submitted. Distinct from
-  // `nodelist` (field 23), which is the *allocated* list and stays empty
-  // while the job is pending.
+  // Requested placement, as submitted. Distinct from `nodelist` (field 23),
+  // the *allocated* list, which stays empty while the job is pending.
   string req_nodelist = 60;
   string exc_nodelist = 61;
   string features = 62;
@@ -269,16 +268,14 @@ message JobInfo {
 
   string submit_line = 64;
 
-  // Requested TRES summary ("cpu=8,mem=32000M,node=2,gres/gpu=8") plus the
-  // per-node minima Slurm reports alongside it.
+  // Requested TRES ("cpu=8,mem=32000M,node=2,gres/gpu=8") and the per-node
+  // minima Slurm reports alongside it.
   string req_tres = 65;
   uint32 min_cpus_node = 66;
   uint64 min_memory_node_mb = 67;
 
-  // `eligible_time` is the earliest the job may start (--begin, else submit).
-  // `accrue_time` is when it began accruing age priority. `last_sched_eval`
-  // is when the scheduler last considered it (unset until first evaluated,
-  // and reset by a controller restart or failover).
+  // Earliest start (--begin, else submit), when age priority began accruing,
+  // and when the scheduler last considered the job (unset until evaluated).
   google.protobuf.Timestamp eligible_time = 68;
   google.protobuf.Timestamp accrue_time = 69;
   google.protobuf.Timestamp last_sched_eval = 70;

@@ -3858,9 +3858,8 @@ fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.comment = String::new();
     info.nodelist = String::new();
     info.resources = None;
-    // The submit line carries the command and its flags, so it re-exposes most
-    // of the above; the requested lists are the same targeting oracle as the
-    // allocated one.
+    // The submit line re-exposes most of the above, and the requested lists are
+    // the same targeting oracle as the allocated one.
     info.submit_line = String::new();
     info.req_nodelist = String::new();
     info.exc_nodelist = String::new();
@@ -3957,9 +3956,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     }
 }
 
-/// Longest submit line kept. It is client-asserted, replicated in every Raft
-/// entry, and echoed to `scontrol show job`, so it is bounded and stripped of
-/// control characters that would rewrite an operator's terminal.
+/// Client-asserted, replicated in every Raft entry, and printed to a terminal,
+/// so it is bounded and stripped of control characters.
 const MAX_SUBMIT_LINE_LEN: usize = 1024;
 
 fn sanitize_submit_line(raw: &str) -> Option<String> {
@@ -3971,9 +3969,8 @@ fn sanitize_submit_line(raw: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// Tasks that land on one node, used for the per-node minima Slurm reports.
-/// Nothing bounds `num_tasks` or `cpus_per_task` at submit, and these feed
-/// every `GetJobs`, so the whole family saturates rather than overflowing.
+/// Tasks landing on one node, for the per-node minima Slurm reports. Nothing
+/// bounds the inputs at submit, so this family saturates rather than overflows.
 fn tasks_per_node(spec: &spur_core::job::JobSpec) -> u64 {
     spec.tasks_per_node.map(u64::from).unwrap_or_else(|| {
         let nodes = u64::from(spec.num_nodes.max(1));
