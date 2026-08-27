@@ -432,17 +432,20 @@ def _wg_addresses() -> dict[int, str] | None:
     return {i: a for i, a in enumerate(addrs)}
 
 
-def _require_wireguard(cluster: SpurCluster) -> None:
+def _require_wireguard(cluster: SpurCluster, *, require_kmod: bool = False) -> None:
     """Skip unless every node can run a real WireGuard mesh.
 
-    Checks ``wg``/``wg-quick`` plus a usable data plane (kernel module or the
-    ``wireguard-go`` userspace fallback) via :func:`wg_available`. Nodes are
-    expected to ship WireGuard (CI bakes it into the image); a test does not
-    install its own dependencies, so a node without it skips rather than failing.
+    Checks ``wg``/``wg-quick`` plus a usable data plane via :func:`wg_available`.
+    With ``require_kmod`` the in-tree kernel module is required (userspace
+    ``wireguard-go`` is rejected) — the k0s-over-mesh scenarios need it, since
+    calico + the full mesh datapath converge too slowly over userspace-go for
+    their timeouts. Nodes are expected to ship WireGuard (CI bakes it into the
+    image); a test does not install its own dependencies, so a node without a
+    suitable data plane skips rather than failing.
     """
     sudo = cluster._sudo_prefix()
     for node in cluster.nodes:
-        ok, reason = wg_available(node, sudo)
+        ok, reason = wg_available(node, sudo, require_kmod=require_kmod)
         if not ok:
             pytest.skip(f"WireGuard unavailable on {node.host}: {reason}")
 
@@ -527,7 +530,9 @@ def _deploy_wg_k0s(ssh_nodes, remote_bin_dir, *, control_plane_index: int = 0):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()  # skips if no sudo
-    _require_wireguard(c)
+    # k0s-over-mesh requires the in-tree kernel module: calico + the full mesh
+    # datapath converge too slowly over userspace wireguard-go for the timeouts.
+    _require_wireguard(c, require_kmod=True)
 
     # Start from a clean k0s slate: a prior test (or a crashed run) can leave k0s
     # services + an etcd datadir behind, which corrupts this cluster's membership.

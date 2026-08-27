@@ -222,11 +222,14 @@ across the SSH test nodes and enable it in the cluster config
 (``network.wg_enabled``).
 
 They run **automatically** wherever the nodes can run a real mesh — there is no
-opt-in flag. The fixtures detect the WireGuard data plane (``wg``/``wg-quick``
-plus the ``wireguard`` kernel module or a ``wireguard-go`` userspace fallback)
-and **skip** when it is absent, rather than installing it — nodes are expected to
-ship WireGuard (CI bakes it into the runner image). This is the same
-capability-gated model as the GPU and multi-control-plane k0s fixtures.
+opt-in flag. The fixtures detect the WireGuard data plane and **skip** when it is
+absent, rather than installing it — nodes are expected to ship WireGuard (CI
+bakes it into the runner image). The raw mesh accepts either the ``wireguard``
+kernel module or the ``wireguard-go`` userspace fallback; the k0s-over-mesh
+scenarios require the **in-tree kernel module** (calico and the full mesh
+datapath converge too slowly over userspace-go), so on a userspace-only node
+they skip. This is the same capability-gated model as the GPU and
+multi-control-plane k0s fixtures.
 
 Covered: mesh bring-up (all-to-all reachability including worker↔worker), k0s-over-mesh (cluster reaches ready, node InternalIPs are mesh IPs, the controller stays meshed), cross-node pod datapath proven to ride the tunnel (pod-to-pod over the pod CIDR with a rising per-peer ``wg`` transfer counter), service-CIDR reachability (a ClusterIP service reached across nodes over the mesh — kube-proxy DNATs it to a pod IP that the mesh carries, even though the service CIDR is never in any WireGuard ``AllowedIPs``), online node add/remove with mesh peer cleanup, graceful k8s remove/add that keeps the node a Spur worker in the mesh with the same WireGuard key across the cycle, and login-node reachability.
 
@@ -238,9 +241,10 @@ must list the nodes (as for the rest of the native-host suite): raw mesh bring-u
 needs >= 2 nodes; the k0s-over-mesh scenarios need 3.
 
 Prerequisites (on each test node, since the fixtures do not install them):
-``wireguard-tools`` (``wg``/``wg-quick``) and a usable data plane — the
-``wireguard`` kernel module or the ``wireguard-go`` userspace binary. Nodes
-lacking these are skipped, not failed.
+``wireguard-tools`` (``wg``/``wg-quick``) and a data plane. The raw mesh tests
+accept the ``wireguard`` kernel module or the ``wireguard-go`` userspace binary;
+the k0s-over-mesh tests need the kernel module specifically. Nodes lacking a
+suitable data plane are skipped, not failed.
 
 The k0s-over-mesh tests carry the ``k0s`` marker. To run just the WireGuard
 tests, point pytest at the two files:

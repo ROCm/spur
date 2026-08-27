@@ -271,8 +271,14 @@ class WgMesh:
             )
 
 
-def wg_available(node: SshNode, sudo_prefix: str) -> tuple[bool, str]:
-    """Check a node can run a real WireGuard mesh: `wg` tool + module loadable.
+def wg_available(node: SshNode, sudo_prefix: str, *,
+                 require_kmod: bool = False) -> tuple[bool, str]:
+    """Check a node can run a real WireGuard mesh: `wg` tool + a data plane.
+
+    With ``require_kmod`` the in-tree ``wireguard`` kernel module must load — the
+    ``wireguard-go`` userspace fallback is not accepted. k0s-over-mesh needs this:
+    calico + the full mesh datapath converge far too slowly over userspace-go for
+    the tests' timeouts, so those fixtures require a real module.
 
     Returns (ok, reason). Reason is human-readable for a pytest.skip message.
     """
@@ -285,7 +291,13 @@ def wg_available(node: SshNode, sudo_prefix: str) -> tuple[bool, str]:
         f"{sudo_prefix}modprobe wireguard 2>/dev/null && echo KMOD || "
         "{ command -v wireguard-go >/dev/null && echo USERSPACE; } || echo NONE"
     )
-    if "KMOD" in probe or "USERSPACE" in probe:
+    if "KMOD" in probe:
+        return True, ""
+    if "USERSPACE" in probe:
+        if require_kmod:
+            return False, ("only the wireguard-go userspace data plane is "
+                           "available; k0s-over-mesh needs the in-tree "
+                           "`wireguard` kernel module")
         return True, ""
     return False, "no WireGuard kernel module and no wireguard-go userspace fallback"
 
