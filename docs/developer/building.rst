@@ -237,6 +237,11 @@ passwordless (or ``SPUR_TEST_SSH_PASSWORD``-backed) sudo, and ``SPUR_TEST_NODES`
 must list the nodes (as for the rest of the native-host suite): raw mesh bring-up
 needs >= 2 nodes; the k0s-over-mesh scenarios need 3.
 
+Prerequisites (on each test node, since the fixtures do not install them):
+``wireguard-tools`` (``wg``/``wg-quick``) and a usable data plane — the
+``wireguard`` kernel module or the ``wireguard-go`` userspace binary. Nodes
+lacking these are skipped, not failed.
+
 The k0s-over-mesh tests carry the ``k0s`` marker. To run just the WireGuard
 tests, point pytest at the two files:
 
