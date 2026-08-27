@@ -85,4 +85,5 @@ class TestTimeLimitExpiry:
         show = _show_job(cluster, job_id)
         assert "JobState=FAILED" in show, show
         assert "ExitCode=3:0" in show, show
-        assert "TimeLimit" not in show, show
+        # The record always carries a TimeLimit= field; the verdict is the reason.
+        assert "Reason=TimeLimit" not in show, show
