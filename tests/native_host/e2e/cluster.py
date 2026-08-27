@@ -423,15 +423,65 @@ class SpurCluster:
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
 
-    def srun_in_allocation(self, job_id: int, args: list[str]) -> tuple[int, str]:
-        """Run srun inside an existing allocation (step mode, as after salloc)."""
+    def srun_in_allocation(
+        self,
+        job_id: int,
+        args: list[str],
+        extra_env: dict[str, str] | None = None,
+        unset_env: list[str] | None = None,
+    ) -> tuple[int, str]:
+        """Run srun inside an existing allocation (step mode, as after salloc).
+
+        *extra_env* can set ``SPUR_JOB_USER`` / ``SPUR_AUTH_TOKEN`` to exercise
+        step-mode identity separately from the invoking account.  *unset_env*
+        removes variables (via ``env -u``) so an empty value does not fall through
+        to ``~/.spur/token``.
+        """
         cmd_parts = [
             f"SPUR_JOB_ID={job_id}",
             f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            shlex.quote(f"{self.bin_dir}/srun"),
         ]
+        for key, value in (extra_env or {}).items():
+            cmd_parts.append(f"{key}={shlex.quote(str(value))}")
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
+        cmd = " ".join(cmd_parts)
+        if unset_env:
+            unset = " ".join(f"-u {shlex.quote(name)}" for name in unset_env)
+            cmd = f"env {unset} {cmd}"
+        _, stdout, stderr = self.nodes[0].client.exec_command(cmd)
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
+    def salloc_run(
+        self,
+        shell_body: str,
+        *,
+        salloc_args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        """Run salloc with *shell_body* as the allocation shell (via ``SHELL``).
+
+        salloc exports allocation env vars into the shell, then cancels the job
+        when the shell exits.  Returns ``(exit_code, combined_output)``.
+        """
+        script_path = self.write_file(
+            f"salloc-shell-{time.time_ns()}.sh",
+            f"#!/bin/bash\nset -euo pipefail\n{shell_body}\n",
+        )
+
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            f"SHELL={shlex.quote(script_path)}",
+        ]
+        for key, value in (extra_env or {}).items():
+            cmd_parts.append(f"{key}={shlex.quote(str(value))}")
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/spur"))
+        cmd_parts.append("salloc")
+        cmd_parts.extend(shlex.quote(a) for a in (salloc_args or ["-N", "1", "-t", "0:05"]))
+
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()

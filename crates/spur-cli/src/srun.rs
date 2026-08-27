@@ -221,7 +221,17 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // --jobid --overlap: exec into a running job (interactive PTY session)
     if let Some(job_id) = args.jobid {
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
-        let user = crate::interactive::current_user()?;
+        let channel = crate::authclient::connect(&args.controller)
+            .await
+            .context("cannot connect to controller")?;
+        let mut ctrl = spur_proto::controller_client(channel);
+        let job = ctrl
+            .get_job(GetJobRequest { job_id })
+            .await
+            .context("failed to get job info")?
+            .into_inner();
+        let known_owner = (!job.user.is_empty()).then_some(job.user.as_str());
+        let user = crate::interactive::job_caller_user(&mut ctrl, job_id, known_owner).await?;
         let exit_code =
             run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
                 .await?;
@@ -613,17 +623,20 @@ fn build_srun_job_spec(
 fn install_ctrl_c_cancel(
     client: SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
-    user: String,
+    submit_user: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut client = client;
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("\nsrun: cancelling job {}...", job_id);
+            let cancel_user =
+                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
+                    .await;
             let _ = client
                 .cancel_job(CancelJobRequest {
                     job_id,
                     signal: 2,
-                    user,
+                    user: cancel_user,
                 })
                 .await;
             std::process::exit(130);
@@ -631,10 +644,15 @@ fn install_ctrl_c_cancel(
     })
 }
 
+struct RunningAllocation {
+    nodelist: String,
+    user: String,
+}
+
 async fn wait_for_job_running(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
-) -> Result<String> {
+) -> Result<RunningAllocation> {
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut warned_unknown_state = false;
 
@@ -648,7 +666,10 @@ async fn wait_for_job_running(
 
         match JobState::try_from(job.state) {
             Ok(JobState::JobRunning) if !job.nodelist.is_empty() => {
-                return Ok(job.nodelist);
+                return Ok(RunningAllocation {
+                    nodelist: job.nodelist,
+                    user: job.user,
+                });
             }
             Ok(JobState::JobRunning) => {}
             Ok(
@@ -732,6 +753,7 @@ async fn dispatch_step(
             winsize: None,
             node: String::new(),
             user: params.user.to_string(),
+            uid: nix::unistd::geteuid().as_raw(),
         })
         .await
         .context("failed to create job step")?
@@ -841,7 +863,7 @@ async fn run_standalone_srun(
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
     let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
-    let user = job_spec.user.clone();
+    let submit_user = job_spec.user.clone();
     let submit_resp = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
@@ -856,32 +878,39 @@ async fn run_standalone_srun(
 
     eprintln!("srun: Pending job allocation {}...", job_id);
 
-    let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, user.clone());
+    let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, submit_user.clone());
+
+    let running = wait_for_job_running(&mut client, job_id).await?;
+    if !running.nodelist.is_empty() {
+        eprintln!("srun: job {} running on {}", job_id, running.nodelist);
+    }
+
+    let known_owner = (!running.user.is_empty()).then_some(running.user.as_str());
+    let owner = crate::interactive::job_caller_user(&mut client, job_id, known_owner).await?;
+    if owner.is_empty() {
+        anyhow::bail!("srun: job {} has no owner after allocation", job_id);
+    }
+
     // Guard drops (and stops pinging) on every return path, including `?`.
     let _keepalive =
-        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "srun");
-
-    let nodelist = wait_for_job_running(&mut client, job_id).await?;
-    if !nodelist.is_empty() {
-        eprintln!("srun: job {} running on {}", job_id, nodelist);
-    }
+        crate::interactive::spawn_keepalive(client.clone(), job_id, owner.clone(), "srun");
 
     if args.pty {
         ctrl_c_handle.abort();
-        eprintln!("srun: opening interactive session on {}", nodelist);
+        eprintln!("srun: opening interactive session on {}", running.nodelist);
         let result = run_interactive_pty(
             &args.controller,
             job_id,
             args.command.clone(),
             String::new(),
-            &user,
+            &owner,
         )
         .await;
         let _ = client
             .cancel_job(CancelJobRequest {
                 job_id,
                 signal: 0,
-                user: user.clone(),
+                user: owner.clone(),
             })
             .await;
         std::process::exit(result?);
@@ -899,7 +928,7 @@ async fn run_standalone_srun(
             work_dir,
             io: &io,
             mpi,
-            user: &user,
+            user: &owner,
         };
         let dispatch_result =
             dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
@@ -907,7 +936,7 @@ async fn run_standalone_srun(
             Ok(result) => result.exit_code,
             Err(_) => 1,
         };
-        release_srun_allocation(&mut client, job_id, &user, exit_code).await;
+        release_srun_allocation(&mut client, job_id, &owner, exit_code).await;
         let result = dispatch_result?;
         let state = if result.exit_code == 0 {
             JobState::JobCompleted
@@ -927,7 +956,7 @@ async fn run_standalone_srun(
     }
 
     let output_streamed = if io.stdout.is_empty() {
-        try_stream_output(&mut client, &nodelist, job_id, &user).await
+        try_stream_output(&mut client, &running.nodelist, job_id, &owner).await
     } else {
         false
     };
@@ -1236,6 +1265,7 @@ async fn run_interactive_pty(
                     winsize: Some(winsize),
                     node: node.clone(),
                     user: user.to_string(),
+                    uid: nix::unistd::geteuid().as_raw(),
                 })
                 .await
             {
@@ -1319,7 +1349,7 @@ async fn run_as_step(
     }
 
     let io = resolve_io_paths(args);
-    let user = crate::interactive::current_user()?;
+    let user = crate::interactive::job_caller_user(&mut client, job_id, None).await?;
 
     let step_params = StepDispatchParams {
         args,

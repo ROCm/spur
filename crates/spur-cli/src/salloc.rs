@@ -119,7 +119,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let controller = args.controller.clone();
     let job_spec = build_salloc_job_spec(&args, nodelist)?;
-    let user = job_spec.user.clone();
+    let submit_user = job_spec.user.clone();
 
     let channel = crate::authclient::connect(&controller)
         .await
@@ -142,11 +142,17 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Set up Ctrl+C handler to cancel the job on interrupt
     let cancel_client = client.clone();
-    let cancel_user = user.clone();
+    let cancel_submit_user = submit_user.clone();
     tokio::spawn(async move {
         let mut cancel_client = cancel_client;
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("\nsalloc: cancelling job {}...", job_id);
+            let cancel_user = crate::interactive::resolve_job_owner_for_cancel(
+                &mut cancel_client,
+                job_id,
+                &cancel_submit_user,
+            )
+            .await;
             let _ = cancel_client
                 .cancel_job(CancelJobRequest {
                     job_id,
@@ -171,11 +177,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 "salloc: timed out waiting for job {} to start (last reason: {})",
                 job_id, last_reason
             );
+            let cancel_user =
+                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
+                    .await;
             let _ = client
                 .cancel_job(CancelJobRequest {
                     job_id,
                     signal: 0,
-                    user: user.clone(),
+                    user: cancel_user,
                 })
                 .await;
             std::process::exit(1);
@@ -214,9 +223,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     eprintln!("salloc: Nodes {} are ready for job {}", nodelist, job_id);
     eprintln!("salloc: Granted job allocation {}", job_id);
 
+    let owner = job_info.user.clone();
+    if owner.is_empty() {
+        anyhow::bail!("salloc: job {} has no owner after allocation", job_id);
+    }
+
     let mut env = SpurEnv::new();
     env.set_with_slurm_twin("SPUR_JOB_ID", job_id);
     env.set_with_slurm_twin("SPUR_JOBID", job_id);
+    env.set_with_slurm_twin("SPUR_JOB_USER", &owner);
     env.set_with_slurm_twin("SPUR_JOB_NAME", &job_info.name);
     env.set_with_slurm_twin("SPUR_JOB_PARTITION", &job_info.partition);
     env.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &job_info.account);
@@ -234,13 +249,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // pings past the controller's InactiveLimit is what lets it reap an
     // abandoned allocation. The guard stops the pings on drop.
     let _keepalive =
-        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "salloc");
+        crate::interactive::spawn_keepalive(client.clone(), job_id, owner.clone(), "salloc");
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = tokio::process::Command::new(&shell);
     for (k, v) in env.into_map() {
         cmd.env(k, v);
     }
+    crate::interactive::inherit_auth_token(&mut cmd);
     let status = cmd
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -257,7 +273,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .cancel_job(CancelJobRequest {
             job_id,
             signal: 0,
-            user,
+            user: owner,
         })
         .await;
 

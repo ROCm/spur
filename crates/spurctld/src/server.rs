@@ -1003,8 +1003,7 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         // A real keepalive always carries the caller's username. Reject an empty
-        // one explicitly: `check_job_owner` treats empty as authorized, which
-        // would let anyone hold any allocation open forever.
+        // one explicitly: an empty user must not bypass ownership checks.
         if req.user.is_empty() {
             return Err(Status::permission_denied(
                 "keepalive requires a user".to_string(),
@@ -1014,10 +1013,13 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
-        spur_core::auth::check_job_owner(
+        spur_core::auth::check_job_caller(
             &req.user,
+            None,
             self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
+            job.spec.uid,
+            __identity.as_ref(),
             "send keepalive for",
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
@@ -2035,10 +2037,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(
+        spur_core::auth::check_job_caller(
             &req.user,
+            Some(req.uid),
             self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
+            job.spec.uid,
+            __identity.as_ref(),
             "attach to",
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
@@ -2572,10 +2577,13 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        spur_core::auth::check_job_owner(
+        spur_core::auth::check_job_caller(
             &req.user,
+            None,
             self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
+            job.spec.uid,
+            __identity.as_ref(),
             "exec into",
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
@@ -2645,10 +2653,13 @@ impl SlurmController for ControllerService {
 
         // A step executes arbitrary commands on the job's allocated nodes, so the
         // caller must own the target job — same gate as create_job_step / exec_in_job.
-        spur_core::auth::check_job_owner(
+        spur_core::auth::check_job_caller(
             &req.user,
+            Some(req.uid),
             self.caller_is_admin(__identity.as_ref()),
             &job.spec.user,
+            job.spec.uid,
+            __identity.as_ref(),
             "run a step in",
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
@@ -5497,6 +5508,7 @@ mod tests {
                     winsize: None,
                     node: "ghost".into(),
                     user: "u".into(),
+                    ..Default::default()
                 }))
                 .await
                 .expect_err("unregistered target must fail");
@@ -5571,6 +5583,7 @@ mod tests {
                 pty: false,
                 winsize: None,
                 node: String::new(),
+                ..Default::default()
             }))
             .await
             .expect_err("a still-Pending job must not accept a new step");
@@ -5797,6 +5810,7 @@ mod tests {
                 winsize: None,
                 node: String::new(),
                 user: "rsikande".into(),
+                ..Default::default()
             }))
             .await
             .expect_err("a non-owner must not attach to another user's job");
@@ -5826,11 +5840,95 @@ mod tests {
                 winsize: None,
                 node: String::new(),
                 user: "ubuntu".into(),
+                ..Default::default()
             }))
             .await
             .expect("the owner must be allowed to attach");
 
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_allows_uid_match_without_username() {
+        use spur_core::job::JobState;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                true,
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let owner_uid = 1000;
+        let spec = spur_core::job::JobSpec {
+            name: "uid-owned".into(),
+            user: "jwt-subject".into(),
+            uid: owner_uid,
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let result = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["bash".into()],
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                pty: false,
+                winsize: None,
+                node: String::new(),
+                user: "local-wire-name".into(),
+                uid: owner_uid,
+            }))
+            .await;
+
+        if let Err(e) = result {
+            assert_ne!(
+                e.code(),
+                Code::PermissionDenied,
+                "uid match must not be rejected as non-owner: {}",
+                e.message()
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5965,6 +6063,85 @@ mod tests {
             .expect_err("a non-owner must not run a step in another user's allocation");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_allows_uid_match_without_username() {
+        use spur_core::job::JobState;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                true,
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let owner_uid = 1000;
+        let spec = spur_core::job::JobSpec {
+            name: "uid-owned".into(),
+            user: "jwt-subject".into(),
+            uid: owner_uid,
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let result = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["id".into()],
+                uid: owner_uid,
+                step_id: 0,
+                user: "local-wire-name".into(),
+                ..Default::default()
+            }))
+            .await;
+
+        if let Err(e) = result {
+            assert_ne!(
+                e.code(),
+                Code::PermissionDenied,
+                "uid match must not be rejected as non-owner: {}",
+                e.message()
+            );
+        }
     }
 
     async fn assign_ha_control_plane(svc: &ControllerService) {
