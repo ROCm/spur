@@ -4666,10 +4666,6 @@ impl ClusterManager {
         }
     }
 
-    /// Submit-time limit gate (Slurm's `acct_policy_validate`). Submit-count
-    /// limits and the association per-job wall deny unconditionally; stand-alone
-    /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
-    /// (treated as on when the job has no QOS). `incoming` is the task count added.
     /// The wall-clock ceilings that already govern this submission, for defaulting.
     /// An unloaded cache reports nothing rather than holding the job, matching how
     /// `enforce_submit_limits` treats limits it cannot read yet.
@@ -4697,6 +4693,10 @@ impl ClusterManager {
         }
     }
 
+    /// Submit-time limit gate (Slurm's `acct_policy_validate`). Submit-count
+    /// limits and the association per-job wall deny unconditionally; stand-alone
+    /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
+    /// (treated as on when the job has no QOS). `incoming` is the task count added.
     fn enforce_submit_limits(&self, spec: &JobSpec, incoming: u32) -> Result<(), SubmitError> {
         let jobs = self.jobs.read();
         let user = spec.user.as_str();
@@ -7401,10 +7401,13 @@ fn wall_cap_default(requested: &[&Partition], caps: WallCaps) -> Option<u32> {
     .min()?;
 
     // The limit has to stay schedulable somewhere: a requested partition with no
-    // `MaxTime` takes any, otherwise the most permissive one is the ceiling.
-    let partition_ceiling = requested
-        .iter()
-        .try_fold(0, |acc: u32, p| p.max_time_minutes.map(|m| acc.max(m)));
+    // `MaxTime` takes any, otherwise the most permissive one is the ceiling. With
+    // no partition in play nothing caps the ceiling, so the wall cap stands.
+    let partition_ceiling = if requested.iter().any(|p| p.max_time_minutes.is_none()) {
+        None
+    } else {
+        requested.iter().filter_map(|p| p.max_time_minutes).max()
+    };
 
     [Some(cap), partition_ceiling].into_iter().flatten().min()
 }
@@ -20344,6 +20347,14 @@ mod tests {
             qos_minutes: Some(minutes),
             account_minutes: None,
         }
+    }
+
+    // No partition in play means nothing caps the wall ceiling. Folding over an
+    // empty slice from a zero seed would instead collapse the cap to a zero-length
+    // limit, so the ceiling is computed without relying on a non-empty caller.
+    #[test]
+    fn wall_cap_default_without_partitions_keeps_the_cap() {
+        assert_eq!(super::wall_cap_default(&[], qos_wall(720)), Some(720));
     }
 
     #[test]
