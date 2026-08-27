@@ -593,14 +593,6 @@ impl ClusterManager {
             &self.qos_cache,
             &config.accounting,
         )?;
-        // Wall-time defaulting reads the governing QOS, so it follows QOS defaulting.
-        let wall_caps = self.wall_caps(&spec);
-        apply_default_time_limit(
-            &mut spec,
-            &partitions,
-            config.scheduler.default_time_limit_minutes,
-            wall_caps,
-        );
         self.validate_partition(&spec, &partitions)?;
 
         // Fewer tasks than nodes cannot use the surplus nodes; cap at the task
@@ -658,6 +650,17 @@ impl ClusterManager {
         check_submission_size(&spec)?;
 
         self.run_job_submit_hook(&mut spec, &partitions)?;
+
+        // Every input to wall-time defaulting — partition, account, QOS — is a field
+        // the hook may rewrite, so defaulting follows the hook and reads the scope
+        // that actually governs the job. A limit the hook set is left alone.
+        let wall_caps = self.wall_caps(&spec);
+        apply_default_time_limit(
+            &mut spec,
+            &partitions,
+            config.scheduler.default_time_limit_minutes,
+            wall_caps,
+        );
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -8397,6 +8400,84 @@ mod tests {
         assert!(
             err.to_string().contains("outside partition"),
             "expected a node-bounds rejection, got: {err:?}"
+        );
+    }
+
+    // A hook-set QOS governs the job, so its MaxWall has to reach an untimed job
+    // as the default; caps read before the hook would be the wrong QOS's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_set_qos_supplies_the_wall_default() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"capped"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("hook-qos-wall");
+        spec.time_limit = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(30))
+        );
+    }
+
+    // The partition also decides the default, so a hook that reroutes the job
+    // must be defaulted from the partition it ends up on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_set_partition_supplies_the_wall_default() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let mut timed = config.partitions[0].clone();
+        timed.name = "timed".into();
+        timed.default = false;
+        timed.default_time = Some("00:15:00".into());
+        config.partitions.push(timed);
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"timed"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("hook-part-wall");
+        spec.time_limit = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(15))
+        );
+    }
+
+    // Defaulting only fills an absent limit: one the hook set itself stands,
+    // even where a cap would have produced a different value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_set_time_limit_survives_defaulting() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"qos":"capped","time_limit_minutes":45}'"#,
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("hook-own-limit");
+        spec.time_limit = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(45))
         );
     }
 

@@ -598,6 +598,11 @@ the job would pend indefinitely on ``PartitionTimeLimit`` for a limit it never
 asked for. A ``maxwall`` of ``0`` blocks every job it governs
 (:ref:`limit-values`) and is never used as a default.
 
+A ``job_submit`` hook may reassign the partition, account or QOS, so the default
+is resolved after the hook runs and reflects the scope the job ends up in. A
+hook that sets ``time_limit`` itself supplies the job's limit, and no default is
+applied over it.
+
 .. note::
 
    Jobs already running when this behaviour arrives keep the unbounded limit they
