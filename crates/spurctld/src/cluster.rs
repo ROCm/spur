@@ -3283,23 +3283,20 @@ impl ClusterManager {
         });
 
         let mut array_counts = running_array_counts;
-        for candidate in &mut candidates {
-            if !candidate.scheduling_eligible {
-                continue;
-            }
-            let (Some(array_id), Some(max)) = (
-                candidate.job.spec.array_job_id,
-                candidate.job.spec.array_max_concurrent,
-            ) else {
-                continue;
+        retain_eligible(&mut candidates, &mut blocked, |job| {
+            let (Some(array_id), Some(max)) =
+                (job.spec.array_job_id, job.spec.array_max_concurrent)
+            else {
+                return GateOutcome::Keep;
             };
             let count = array_counts.entry(array_id).or_insert(0);
             if *count >= max {
-                candidate.scheduling_eligible = false;
+                GateOutcome::Block(PendingReason::JobArrayTaskLimit)
             } else {
                 *count += 1;
+                GateOutcome::Keep
             }
-        }
+        });
 
         {
             let mut reserved = PassReservations::default();
@@ -16596,6 +16593,41 @@ mod tests {
             .collect();
         let admitted = task_ids.iter().filter(|id| pending.contains(id)).count();
         assert_eq!(admitted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_tags_job_array_task_limit_reason() {
+        // A task held by its own %N throttle used to report Reason=None,
+        // indistinguishable from a genuine scheduling stall.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("arr-throttle-reason");
+        spec.array_spec = Some("0-2%1".into());
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let task_ids: Vec<JobId> = (1..=3).map(|offset| parent_id + offset).collect();
+        for id in &task_ids {
+            wait_for(&format!("array task {id}"), || cm.get_job(*id).is_some());
+        }
+
+        cm.pending_jobs_and_tag_reasons();
+        let throttled: Vec<JobId> = task_ids
+            .iter()
+            .filter(|id| {
+                cm.get_job(**id).unwrap().pending_reason == PendingReason::JobArrayTaskLimit
+            })
+            .copied()
+            .collect();
+        assert_eq!(
+            throttled.len(),
+            2,
+            "the two tasks held back by %1 must be tagged JobArrayTaskLimit"
+        );
+        assert!(
+            !throttled.contains(&task_ids[0]),
+            "the one admitted task must not carry the throttle reason"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

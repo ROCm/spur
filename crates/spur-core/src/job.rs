@@ -328,6 +328,10 @@ pub enum PendingReason {
     /// Replaces `BeginTime` as the pending reason for preempted-requeued jobs so the
     /// reason string is unambiguous.
     Preempted,
+
+    /// Array task held back by the job's own `%N` concurrency throttle
+    /// (`array_max_concurrent`), not by cluster contention.
+    JobArrayTaskLimit,
 }
 
 impl PendingReason {
@@ -415,6 +419,7 @@ impl PendingReason {
             Self::QosMaxSubmitJobPerAccountLimit => "MaxSubmitJobsPerAccount",
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
             Self::Preempted => "Preempted",
+            Self::JobArrayTaskLimit => "JobArrayTaskLimit",
         }
     }
 
