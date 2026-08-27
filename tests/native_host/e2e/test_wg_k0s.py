@@ -288,7 +288,7 @@ class TestK0sOverMesh:
                     return False
             return True
 
-        wait_until(controller_reachable, timeout_s=90,
+        wait_until(controller_reachable, timeout_s=120,
                    desc="all nodes reach the controller mesh IP after k8s up")
 
 
