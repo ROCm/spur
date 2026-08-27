@@ -1,16 +1,14 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end tests for the WireGuard mesh, driven over real `wg` interfaces.
+"""End-to-end tests for k0s-over-WireGuard, driven over real `wg` interfaces.
 
-Scenarios (as validated by hand during SPUR-195/198 mesh characterization).
+The raw-mesh (no-k0s) bring-up scenario (D1) lives in ``test_wg_mesh.py``; this
+file holds the scenarios that need a converged k0s cluster on top of the mesh.
 The D-numbers are the SPUR-212 scenario ids; not every id has a test (D8 has no
 mesh-specific behavior to assert) and they are ordered here by id, not by file
 position:
 
-* D1 — mesh bring-up (``TestMeshBringUp``): 1 controller + N workers join the
-  mesh; every node reaches every other over the mesh IPs (controller↔worker AND
-  worker↔worker).
 * D2 — k0s over mesh (``TestK0sOverMesh``): `spur k8s up` reaches ready, k8s node
   InternalIPs are the mesh IPs, and the controller stays meshed (not pruned).
 * D3 — cross-node pods on the mesh (``TestPodsOnMesh``): pod-CIDR is folded into
@@ -31,9 +29,9 @@ position:
   service is reachable cross-node even though the service CIDR is never in any
   WireGuard AllowedIPs (kube-proxy DNATs it to a pod IP the mesh carries).
 
-Every test is marked ``wireguard``; those that need k0s convergence are also
-marked ``k0s`` (hardware-only — CI VMs without the kernel bits skip via the
-suite preflight).
+Every test is marked ``wireguard`` and ``k0s``. The ``wireguard`` fixtures
+install WireGuard where missing and stand up the mesh per test; ``k0s`` marks
+the ones that also need a converged k0s cluster.
 """
 
 from __future__ import annotations
@@ -243,40 +241,6 @@ def _ready_two_workers_with_image(c, cp_index: int, worker_names: list[str],
     # cache; skip cleanly if the registry is unreachable.
     if not _prepull_busybox(c, worker_indices):
         pytest.skip(f"{BUSYBOX_IMAGE} unavailable on the workers (offline registry)")
-
-
-# --- D1: mesh bring-up + all-to-all -----------------------------------------
-
-
-class TestMeshBringUp:
-    def test_all_nodes_reach_each_other_over_mesh(self, wg_mesh):
-        """Every meshed node pings every other over its mesh IP — including
-        worker↔worker, not just node↔controller (the hub-and-spoke default)."""
-        indices = list(range(len(wg_mesh.nodes)))
-        wg_mesh.assert_all_to_all(indices)
-
-    def test_each_node_peers_every_other(self, wg_mesh):
-        """After full-mesh bring-up, each node's wg peer table lists all others."""
-        indices = list(range(len(wg_mesh.nodes)))
-        for i in indices:
-            keys = set(wg_mesh.wg_peer_keys(i))
-            expected = {wg_mesh.pubkeys[j] for j in indices if j != i}
-            assert expected <= keys, (
-                f"node {wg_mesh.node_names[i]} missing peers: "
-                f"{expected - keys}"
-            )
-
-    def test_worker_to_worker_has_endpoint(self, wg_mesh):
-        """The worker↔worker peers carry a real endpoint (the bug where a full
-        mesh had AllowedIPs but no endpoint, so those tunnels never connected)."""
-        if len(wg_mesh.nodes) < 3:
-            pytest.skip("worker↔worker endpoint check needs >= 3 nodes")
-        # From worker 1's view, the peer for worker 2 must have an endpoint set.
-        peer = wg_mesh.wg_peer(1, wg_mesh.pubkeys[2])
-        assert peer is not None, "worker 2 not a peer of worker 1"
-        assert peer.endpoint is not None, (
-            f"worker↔worker peer has no endpoint (hub-and-spoke regression): {peer}"
-        )
 
 
 # --- D2: k0s over mesh -------------------------------------------------------

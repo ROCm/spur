@@ -278,32 +278,6 @@ jobs:
             ssh $SSH_OPTS -i "$KEY" ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
           done
 
-      # WireGuard mesh suite (tests/native_host/wg_e2e/) is folded into the
-      # native-host shards, so every node needs `wg`/`wg-quick` and a working
-      # data plane. This step installs them best-effort; the suite's own
-      # preflight (_wg_preflight) skips cleanly when a usable mesh can't be
-      # provided, so a shard that lands no WG tests — or a runner image without
-      # the kmod and no `wireguard-go` fallback — yields SKIPS, not failures.
-      - name: Install WireGuard on test nodes
-        run: |
-          NODE_IPS="${{ steps.cluster.outputs.node_ips }}"
-          KEY="${{ steps.ssh.outputs.privkey }}"
-          IFS=',' read -ra NODES <<< "$NODE_IPS"
-          for node in "${NODES[@]}"; do
-            ssh $SSH_OPTS -i "$KEY" ci@"$node" bash -s <<'REMOTE' || true
-          set -uo pipefail
-          if ! command -v wg >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive \
-              apt-get install -y -qq wireguard-tools || true
-          fi
-          # Prefer the kernel module; fall back to userspace wireguard-go.
-          sudo modprobe wireguard 2>/dev/null \
-            || command -v wireguard-go >/dev/null 2>&1 \
-            || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-go || true
-          echo "wg: $(command -v wg || echo MISSING); kmod: $(lsmod | grep -q wireguard && echo yes || echo no)"
-          REMOTE
-          done
-
       - name: Run tests inside driver VM
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
@@ -318,14 +292,13 @@ jobs:
           export SPUR_TEST_BINARIES_DIR=${{ env.RUN_DIR }}/release-binaries
           export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin-${{ github.run_id }}
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
-          # Opt in to the WireGuard mesh suite; folded into these shards. The
-          # suite's preflight skips it where a real mesh can't be stood up.
-          export SPUR_TEST_WG=1
           chmod +x ${{ env.RUN_DIR }}/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
           rc=0
-          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ \
-                 ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/wg_e2e/ -v \
+          # WireGuard mesh tests live in native_host/e2e (test_wg_*.py). Their
+          # fixtures install WireGuard on the nodes where missing, so no CI-side
+          # setup is needed; they skip only where a data plane can't be provided.
+          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v \
             -m "${{ matrix.selector }}" \
             --shard-count ${{ matrix.shard_count }} --shard-id ${{ matrix.shard_id }} \
             --durations=25 \

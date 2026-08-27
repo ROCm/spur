@@ -74,7 +74,6 @@ def _running_full_suite(config) -> bool:
         path = Path(str(arg)).resolve()
         if path == _TESTS_ROOT \
                 or path == _TESTS_ROOT / "native_host" / "e2e" \
-                or path == _TESTS_ROOT / "native_host" / "wg_e2e" \
                 or path == _TESTS_ROOT / "k8s" / "e2e":
             return True
     return False
@@ -94,17 +93,10 @@ def pytest_ignore_collect(collection_path, config):
     path = Path(str(collection_path))
     parts = path.parts
 
-    # The WireGuard suite needs both the SSH node list and an explicit opt-in
-    # (SPUR_TEST_WG), since it stands up a real mesh + rootful daemons. It lives
-    # under native_host/, so its path also contains "native_host" — this branch
-    # must be checked BEFORE the generic native_host rule below, or the WG suite
-    # would collect without its SPUR_TEST_WG gate.
-    if "wg_e2e" in parts:
-        if not os.environ.get("SPUR_TEST_NODES", "").strip():
-            return True
-        if not os.environ.get("SPUR_TEST_WG", "").strip():
-            return True
-        return False
+    # WireGuard tests are ordinary native_host/e2e files gated by their fixtures
+    # (they install WireGuard where missing and skip only where a data plane
+    # can't be provided), so the base native_host rule covers them — no separate
+    # WG branch or opt-in var.
     if "native_host" in parts and not os.environ.get("SPUR_TEST_NODES", "").strip():
         return True
     if "k8s" in parts and not _kubeconfig_available():

@@ -4,6 +4,5 @@ Test suites organized by deployment target. See [docs/developer/building.rst](..
 
 | Path | Description |
 |------|-------------|
-| `native_host/e2e/` | Deploys Spur on bare-metal nodes via SSH |
-| `native_host/wg_e2e/` | Stands up a real WireGuard mesh over SSH nodes; verifies mesh bring-up, k0s-over-mesh, and cross-node pod/service datapath over the tunnel (the 3-controller HA scenario is scaffolded but currently skipped). Opt-in via `SPUR_TEST_WG=1` |
+| `native_host/e2e/` | Deploys Spur on bare-metal nodes via SSH. Includes the WireGuard mesh tests (`test_wg_mesh.py`, `test_wg_k0s.py`, marked `wireguard`), which auto-run where the nodes allow — the fixtures install WireGuard if missing and skip only where a data plane can't be provided |
 | `k8s/e2e/` | Deploys Spur into a Kubernetes cluster via SpurJob CRDs |
