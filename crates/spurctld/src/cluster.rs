@@ -3315,11 +3315,6 @@ impl ClusterManager {
             }
         });
 
-        let qos_by_job: HashMap<JobId, Qos> = candidates
-            .iter()
-            .map(|candidate| (candidate.job.job_id, self.resolve_qos(&candidate.job)))
-            .collect();
-
         let reservations = self.get_reservations();
         retain_unblocked(&mut candidates, &mut reason_updates, |job| {
             reservation_block(job, &reservations, now)
@@ -3375,9 +3370,23 @@ impl ClusterManager {
             *count += 1;
         }
 
-        retain_unblocked(&mut candidates, &mut reason_updates, |job| {
-            self.accounting_block(job)
+        // Eligible-only: an unreadable cap is transient, not structural, so it must
+        // not claim a begin-deferred job and report itself in place of BeginTime.
+        // Nothing is admitted past the gate either way — ineligible candidates leave
+        // the schedulable set below.
+        retain_eligible(&mut candidates, &mut reason_updates, |job| {
+            match self.accounting_block(job) {
+                Some(reason) => GateOutcome::Block(reason),
+                None => GateOutcome::Keep,
+            }
         });
+
+        // Built after the accounting gate so a held job never gets the limitless
+        // default `resolve_qos` warns about.
+        let qos_by_job: HashMap<JobId, Qos> = candidates
+            .iter()
+            .map(|candidate| (candidate.job.job_id, self.resolve_qos(&candidate.job)))
+            .collect();
 
         {
             let mut reserved = PassReservations::default();
@@ -4798,12 +4807,7 @@ impl ClusterManager {
     /// Holds a candidate whose accounting limits cannot be read. Admission is the
     /// last point at which a cap can still be applied — a running job is never
     /// re-checked — so a cold cache pends the job rather than gating it against a
-    /// limitless default. Mirrors the submit-time fail-closed gate; with accounting
-    /// disabled there are no limits to read and nothing is held.
-    ///
-    /// The window is real despite submit validating the QOS: the queue is durable
-    /// and the caches are not, so a restarted controller inherits its predecessor's
-    /// pending jobs before its first fetch completes.
+    /// limitless default.
     fn accounting_block(&self, job: &Job) -> Option<PendingReason> {
         if !self.config().accounting.enabled() {
             return None;
@@ -17544,8 +17548,8 @@ mod tests {
     }
 
     fn admitted_of(cm: &ClusterManager, ids: &[JobId]) -> usize {
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        ids.iter().filter(|id| pending.contains(id)).count()
+        let admitted: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        ids.iter().filter(|id| admitted.contains(id)).count()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17585,6 +17589,33 @@ mod tests {
         assert_eq!(
             cm.get_job(ids[0]).unwrap().pending_reason,
             PendingReason::AccountingUnavailable
+        );
+    }
+
+    // A job waiting on its start time is not waiting on the cache: the cold-cache
+    // hold gates admission, and a begin-deferred job is not up for admission, so
+    // BeginTime stays its reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_cache_does_not_claim_a_begin_deferred_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = accounting_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("later");
+        spec.qos = Some("cnt".into());
+        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
+        let id = submit_and_wait(&cm, spec);
+
+        cm.qos_cache().reset();
+        cm.refresh_pending_reasons();
+
+        assert_eq!(
+            cm.get_job(id).unwrap().pending_reason,
+            PendingReason::BeginTime
         );
     }
 

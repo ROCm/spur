@@ -626,12 +626,16 @@ or an account are **not scheduled**. They pend with reason
 alternative is worse: a running job is never re-checked against limits, so a job
 admitted during that window stays over the cap for its entire run.
 
-Two related cases:
+Related cases:
 
 - A job whose QOS no longer exists — deleted or renamed while the job sat in the
   queue — pends with ``InvalidQOS``, as in Slurm.
 - With accounting disabled (an empty ``database_url``) there are no limits to
   read, so an empty cache means "no caps exist" and nothing is held.
+- The hold covers QOS and association limits. Consumption figures for
+  :ref:`grpwall-budgets` load separately, and a ``grpwall`` cap is unapplied
+  until the first figure is read — so do not assume every accounting limit fails
+  closed on restart.
 
 ``AccountingUnavailable`` has no Slurm counterpart, because Slurm keeps its
 association state on disk and declines to schedule without it rather than

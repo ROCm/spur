@@ -2346,6 +2346,21 @@ mod tests {
         );
     }
 
+    // The variant reaches the Raft log through `WalOperation`, so its serialized
+    // name is a compatibility surface: renaming or reordering must fail here rather
+    // than on a controller replaying a log it cannot parse.
+    #[test]
+    fn accounting_unavailable_reason_displays_and_roundtrips() {
+        assert_eq!(
+            PendingReason::AccountingUnavailable.display(),
+            "AccountingUnavailable"
+        );
+        let json = serde_json::to_string(&PendingReason::AccountingUnavailable).unwrap();
+        assert_eq!(json, "\"AccountingUnavailable\"");
+        let back: PendingReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PendingReason::AccountingUnavailable);
+    }
+
     #[test]
     fn pending_reason_exit_vocabulary_display() {
         assert_eq!(PendingReason::NonZeroExitCode.display(), "NonZeroExitCode");
