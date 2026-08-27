@@ -15,14 +15,74 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+# How long to keep polling after the holder is running before declaring the
+# blocked job incorrectly scheduled. The backfill interval in e2e tests is
+# 1 second, so 10 seconds covers at least 10 full scheduler passes.
+_BLOCKING_POLL_SECS = 10
+_BLOCKING_POLL_STEP = 1
+
+
+def _job_state_and_reason(cluster, job_id: int) -> tuple[str, str]:
+    """Return (state, reason) for job_id using squeue %t and %r format fields.
+
+    Returns ("", "") when the job is not found (already gone).
+    """
+    out = cluster.squeue(["-j", str(job_id), "-h", "-o", "%t %r"])
+    out = out.strip()
+    if not out:
+        return "", ""
+    parts = out.split(None, 1)
+    state = parts[0] if parts else ""
+    reason = parts[1] if len(parts) > 1 else ""
+    return state, reason
+
+
+def _assert_stays_pending_for_resources(cluster, job_id: int, holder_id: int, duration: int):
+    """Poll for `duration` seconds and assert the job stays PD with reason Resources.
+
+    Fails immediately if the job starts running or if the reason is wrong after
+    at least one scheduler pass (i.e., after the first non-empty reason is seen).
+    """
+    deadline = time.time() + duration
+    reason_seen = False
+
+    while time.time() < deadline:
+        state, reason = _job_state_and_reason(cluster, job_id)
+
+        if state == "R":
+            sq = cluster.squeue_all()
+            raise AssertionError(
+                f"Job {job_id} started running while exclusive job {holder_id} "
+                f"holds the node — exclusive blocking is broken.\n{sq}"
+            )
+
+        if state == "PD":
+            reason_seen = True
+            assert reason == "Resources", (
+                f"Job {job_id} is PENDING but for the wrong reason: {reason!r}. "
+                f"Expected 'Resources' (blocked by exclusive holder {holder_id}). "
+                f"This may indicate a misconfigured partition or a different "
+                f"scheduling issue masking the real block."
+            )
+
+        time.sleep(_BLOCKING_POLL_STEP)
+
+    assert reason_seen, (
+        f"Job {job_id} never appeared as PD in squeue during the {duration}s window — "
+        f"it may have completed instantly or never been queued properly."
+    )
+
 
 class TestExclusiveBlocking:
     def test_exclusive_cpu_blocks_coscheduling(self, cluster):
         """An exclusive job requesting 1 CPU blocks a second job from landing on
-        the same node, even though 63 of 64 CPUs are nominally free."""
+        the same node, even though 63 of 64 CPUs are nominally free.
+
+        The blocked job must stay PD with reason=Resources (not Priority or
+        any other reason) for the duration of multiple backfill passes.
+        """
         node = cluster.node_names[0]
 
-        # A long-running exclusive job that requests just 1 CPU.
         holder_script = cluster.write_file(
             "excl-holder.sh", "#!/bin/bash\nsleep 300\n"
         )
@@ -43,10 +103,10 @@ class TestExclusiveBlocking:
         try:
             wait_job_state(cluster, holder_id, "R", timeout=60)
 
-            # A second job targeting the same node must stay PENDING.
-            # Use -c 1 so the request is trivially satisfiable on resources
-            # alone — the only reason it should pend is the exclusive hold.
-            blocker_script = cluster.write_file(
+            # -c 1 is trivially satisfiable on an idle node, so Resources is the
+            # only legitimate reason to pend — it proves the exclusive hold is
+            # blocking the scheduler, not a resource shortage or priority issue.
+            blocked_script = cluster.write_file(
                 "excl-blocked.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
             )
             blocked_id = parse_job_id(
@@ -56,22 +116,15 @@ class TestExclusiveBlocking:
                         "-w", node,
                         "-c", "1",
                         "-t", "1",
-                        blocker_script,
+                        blocked_script,
                     ]
                 )
             )
             assert blocked_id is not None, "blocked job did not submit"
 
             try:
-                # Give the scheduler several cycles to (incorrectly) start it.
-                time.sleep(15)
-                sq = cluster.squeue_all()
-                lines = [l for l in sq.splitlines() if str(blocked_id) in l]
-                assert lines, f"blocked job {blocked_id} not found in squeue:\n{sq}"
-                state = lines[0].split()[4] if len(lines[0].split()) > 4 else ""
-                assert state == "PD", (
-                    f"job {blocked_id} should be PENDING while exclusive job "
-                    f"{holder_id} holds the node, but state={state!r}:\n{sq}"
+                _assert_stays_pending_for_resources(
+                    cluster, blocked_id, holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
                 cluster.scancel(str(blocked_id))
@@ -80,7 +133,11 @@ class TestExclusiveBlocking:
 
     def test_exclusive_gpu_blocks_coscheduling(self, gpu_cluster):
         """An exclusive job requesting 1 CPU and 1 GPU blocks a second GPU job
-        from landing on the same node, even though most GPUs are nominally free."""
+        from landing on the same node, even though most GPUs are nominally free.
+
+        The blocked job must stay PD with reason=Resources across multiple
+        backfill passes.
+        """
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
 
@@ -92,7 +149,7 @@ class TestExclusiveBlocking:
                 f"(found {total_gpus})"
             )
 
-        # Exclusive holder: 1 CPU, 1 GPU — leaving total_gpus-1 GPUs "free".
+        # Exclusive holder: 1 CPU, 1 GPU — leaving total_gpus-1 GPUs nominally free.
         holder_script = cluster.write_file(
             "excl-gpu-holder.sh", "#!/bin/bash\nsleep 300\n"
         )
@@ -114,7 +171,6 @@ class TestExclusiveBlocking:
         try:
             wait_job_state(cluster, holder_id, "R", timeout=60)
 
-            # Second job wants 1 GPU on the same node — should be blocked.
             blocked_script = cluster.write_file(
                 "excl-gpu-blocked.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
             )
@@ -133,15 +189,8 @@ class TestExclusiveBlocking:
             assert blocked_id is not None, "GPU blocked job did not submit"
 
             try:
-                time.sleep(15)
-                sq = cluster.squeue_all()
-                lines = [l for l in sq.splitlines() if str(blocked_id) in l]
-                assert lines, f"blocked GPU job {blocked_id} not found in squeue:\n{sq}"
-                state = lines[0].split()[4] if len(lines[0].split()) > 4 else ""
-                assert state == "PD", (
-                    f"GPU job {blocked_id} should be PENDING while exclusive job "
-                    f"{holder_id} holds the node with {total_gpus} GPUs, "
-                    f"but state={state!r}:\n{sq}"
+                _assert_stays_pending_for_resources(
+                    cluster, blocked_id, holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
                 cluster.scancel(str(blocked_id))
@@ -150,10 +199,9 @@ class TestExclusiveBlocking:
 
     def test_exclusive_node_released_after_job_completes(self, cluster):
         """After an exclusive job finishes, the node becomes available and a
-        waiting job schedules without manual intervention."""
+        waiting job schedules and completes without manual intervention."""
         node = cluster.node_names[0]
 
-        # Short exclusive holder.
         holder_script = cluster.write_file(
             "excl-release-holder.sh", "#!/bin/bash\nsleep 10\n"
         )
@@ -174,7 +222,6 @@ class TestExclusiveBlocking:
         try:
             wait_job_state(cluster, holder_id, "R", timeout=60)
 
-            # Waiter submitted while holder is running.
             out_path = f"{cluster.remote_dir}/excl-release-waiter.out"
             waiter_script = cluster.write_file(
                 "excl-release-waiter.sh", "#!/bin/bash\necho RELEASED_OK\n"
@@ -193,7 +240,14 @@ class TestExclusiveBlocking:
             )
             assert waiter_id is not None
 
-            # Holder finishes, then waiter must complete.
+            # Confirm waiter is blocked with the right reason before holder exits.
+            state, reason = _job_state_and_reason(cluster, waiter_id)
+            if state == "PD":
+                assert reason == "Resources", (
+                    f"waiter {waiter_id} is PD for wrong reason {reason!r} "
+                    f"before holder finishes"
+                )
+
             wait_job(cluster, holder_id, timeout=60)
             state = wait_job(cluster, waiter_id, timeout=60)
             assert state in ("CD", "GONE"), (
