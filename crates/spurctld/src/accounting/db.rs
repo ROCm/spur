@@ -317,13 +317,13 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
 #[allow(clippy::too_many_arguments)]
 pub async fn record_job_end(
     conn: &mut PgConnection,
-    job_id: i64,
+    job_id: JobId,
     state: &str,
     exit_code: i32,
     end_time: DateTime<Utc>,
     exit_signal: i32,
     derived_exit_code: i32,
-    preempted_by: Option<i64>,
+    preempted_by: Option<JobId>,
     preempt_mode: &str,
     preempt_qos: &str,
 ) -> anyhow::Result<()> {
@@ -345,13 +345,13 @@ pub async fn record_job_end(
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task
         "#,
     )
-    .bind(job_id)
+    .bind(job_id as i64)
     .bind(state)
     .bind(exit_code)
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
-    .bind(preempted_by)
+    .bind(preempted_by.map(|id| id as i64))
     .bind(preempt_mode)
     .bind(preempt_qos)
     .fetch_one(&mut *conn)
@@ -377,28 +377,32 @@ pub struct AccountingRowState {
 /// by the reconciliation pass to detect jobs missing or stale in accounting.
 pub async fn job_accounting_states(
     pool: &PgPool,
-    job_ids: &[i64],
-) -> anyhow::Result<HashMap<i64, AccountingRowState>> {
+    job_ids: &[JobId],
+) -> anyhow::Result<HashMap<JobId, AccountingRowState>> {
     if job_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    // Keyed by the stored form so a returned row is decoded by the id it was
+    // queried with, never by narrowing whatever the column holds.
+    let queried: HashMap<i64, JobId> = job_ids.iter().map(|&id| (id as i64, id)).collect();
+    let stored: Vec<i64> = queried.keys().copied().collect();
     let rows =
         sqlx::query("SELECT job_id, state, user_name, start_time FROM jobs WHERE job_id = ANY($1)")
-            .bind(job_ids)
+            .bind(&stored)
             .fetch_all(pool)
             .await?;
 
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let job_id: i64 = r.get("job_id");
+        .filter_map(|r| {
+            let job_id = queried.get(&r.get::<i64, _>("job_id")).copied()?;
             let user_name: String = r.get("user_name");
             let start_time: Option<DateTime<Utc>> = r.get("start_time");
             let row = AccountingRowState {
                 state: r.get("state"),
                 needs_start_backfill: user_name.is_empty() || start_time.is_none(),
             };
-            (job_id, row)
+            Some((job_id, row))
         })
         .collect())
 }
@@ -450,10 +454,17 @@ async fn update_usage(
     Ok(())
 }
 
+/// A stored id back to the in-memory `JobId` it was written from. Rows written
+/// before the columns were widened hold the id narrowed to 32 bits, so a large id
+/// reads back negative; truncating to the low 32 bits recovers it either way.
+fn decode_job_id(stored: i64) -> JobId {
+    stored as JobId
+}
+
 /// Job record returned from history queries.
 #[derive(Debug)]
 pub struct JobRecord {
-    pub job_id: i64,
+    pub job_id: JobId,
     pub name: String,
     pub user_name: String,
     pub account: String,
@@ -469,7 +480,7 @@ pub struct JobRecord {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub reservation: String,
-    pub preempted_by: Option<i64>,
+    pub preempted_by: Option<JobId>,
     pub preempt_mode: String,
     pub preempt_qos: String,
 }
@@ -521,7 +532,7 @@ pub async fn get_job_history(
     let records = rows
         .iter()
         .map(|row| JobRecord {
-            job_id: row.get("job_id"),
+            job_id: decode_job_id(row.get("job_id")),
             name: row.get("name"),
             user_name: row.get("user_name"),
             account: row.get("account"),
@@ -537,7 +548,7 @@ pub async fn get_job_history(
             start_time: row.get("start_time"),
             end_time: row.get("end_time"),
             reservation: row.get("reservation"),
-            preempted_by: row.get("preempted_by"),
+            preempted_by: row.get::<Option<i64>, _>("preempted_by").map(decode_job_id),
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
         })
@@ -1429,9 +1440,9 @@ mod job_history_tests {
     use super::*;
     use chrono::Duration;
 
-    fn test_job_id(slot: u32) -> i64 {
-        const BASE: i64 = 9_000_000;
-        BASE + (std::process::id() as i64 % 10_000) * 10 + slot as i64
+    fn test_job_id(slot: u32) -> JobId {
+        const BASE: JobId = 9_000_000;
+        BASE + (std::process::id() % 10_000) * 10 + slot
     }
 
     async fn test_pool() -> anyhow::Result<PgPool> {
@@ -1444,10 +1455,10 @@ mod job_history_tests {
         Ok(pool)
     }
 
-    async fn delete_jobs(pool: &PgPool, ids: &[i64]) -> anyhow::Result<()> {
+    async fn delete_jobs(pool: &PgPool, ids: &[JobId]) -> anyhow::Result<()> {
         for id in ids {
             sqlx::query("DELETE FROM jobs WHERE job_id = $1")
-                .bind(id)
+                .bind(*id as i64)
                 .execute(pool)
                 .await?;
         }
@@ -1460,7 +1471,7 @@ mod job_history_tests {
     #[allow(clippy::too_many_arguments)]
     async fn start(
         pool: &PgPool,
-        job_id: i64,
+        job_id: JobId,
         name: &str,
         user: &str,
         account: &str,
@@ -1495,7 +1506,7 @@ mod job_history_tests {
     #[allow(clippy::too_many_arguments)]
     async fn start_with_qos(
         pool: &PgPool,
-        job_id: i64,
+        job_id: JobId,
         name: &str,
         user: &str,
         account: &str,
@@ -1513,7 +1524,7 @@ mod job_history_tests {
         record_job_start(
             &mut conn,
             &JobStartRecord {
-                job_id: job_id as JobId,
+                job_id,
                 name: name.to_string(),
                 user: user.to_string(),
                 account: account.to_string(),
@@ -1533,7 +1544,7 @@ mod job_history_tests {
 
     async fn end(
         pool: &PgPool,
-        job_id: i64,
+        job_id: JobId,
         state: &str,
         exit_code: i32,
         end_time: DateTime<Utc>,
@@ -1745,7 +1756,7 @@ mod job_history_tests {
         // The largest id the scheduler can hand out. Narrowed to i32 it arrived as
         // -1 and, job_id being the primary key, landed on whatever row held that id
         // rather than failing.
-        let id = i64::from(u32::MAX);
+        let id = u32::MAX;
         let preempter = id - 1;
         let user = format!("spur_wide_id_{}", std::process::id());
         delete_jobs(&pool, &[id, preempter]).await.ok();
@@ -1779,11 +1790,6 @@ mod job_history_tests {
             Some(preempter),
             "the preempting job's id is a job id too, so it must survive the same width"
         );
-        assert!(
-            !history.iter().any(|r| r.job_id < 0),
-            "no id may arrive negative; that is the wrap this widening removes"
-        );
-
         let states = job_accounting_states(&pool, &[id]).await?;
         assert!(
             states.contains_key(&id),
@@ -1791,6 +1797,43 @@ mod job_history_tests {
         );
 
         delete_jobs(&pool, &[id, preempter]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn a_row_written_before_the_widening_reads_back_under_its_real_id() -> anyhow::Result<()>
+    {
+        let pool = test_pool().await?;
+        // What a pre-fix controller left behind: the id narrowed to 32 bits, which
+        // for u32::MAX was stored as -1. Widening the column does not rewrite it,
+        // so history has to keep decoding it to the id the job actually had.
+        let id = u32::MAX;
+        let user = format!("spur_legacy_id_{}", std::process::id());
+        delete_jobs(&pool, &[id]).await.ok();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, user_name, state, submit_time, preempted_by) \
+             VALUES ($1, 'legacy', $2, 'COMPLETED', $3, $4)",
+        )
+        .bind(-1_i64)
+        .bind(&user)
+        .bind(Utc::now())
+        .bind(-2_i64)
+        .execute(&pool)
+        .await?;
+
+        let history = get_job_history(&pool, Some(&user), None, None, None, &[], 100).await?;
+        let row = history.first().expect("the legacy row must be returned");
+        assert_eq!(
+            row.job_id, id,
+            "a narrowed id must decode to its real value"
+        );
+        assert_eq!(row.preempted_by, Some(id - 1));
+
+        sqlx::query("DELETE FROM jobs WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 
