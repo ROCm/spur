@@ -9,11 +9,42 @@ scheduler from placing any other job on that node while the exclusive job runs,
 regardless of how many resources remain nominally free.
 """
 
+import re
 import time
 
 import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
+
+
+def _expand_nodelist(nodelist: str) -> list:
+    """Expand a Slurm compressed hostlist into individual node names.
+
+    Handles plain names, comma-separated lists, and bracket notation like
+    ``node[1-3,5]`` → [node1, node2, node3, node5].  Commas inside brackets
+    are treated as range separators, not top-level delimiters.
+    """
+    # Split on commas that are outside brackets.
+    parts = re.split(r",(?![^\[]*\])", nodelist)
+    nodes = []
+    for part in parts:
+        part = part.strip()
+        m = re.match(r"^(.*)\[([^\]]+)\](.*)$", part)
+        if not m:
+            nodes.append(part)
+            continue
+        prefix, ranges, suffix = m.group(1), m.group(2), m.group(3)
+        for token in ranges.split(","):
+            token = token.strip()
+            if "-" in token:
+                lo, hi = token.split("-", 1)
+                width = len(lo)
+                for n in range(int(lo), int(hi) + 1):
+                    nodes.append(f"{prefix}{str(n).zfill(width)}{suffix}")
+            else:
+                nodes.append(f"{prefix}{token}{suffix}")
+    return nodes
+
 
 # How long to keep polling after the holder is running before declaring the
 # blocked job incorrectly scheduled. The backfill interval in e2e tests is
@@ -276,8 +307,6 @@ class TestExclusiveBlocking:
         Requires at least 2 nodes in SPUR_TEST_NODES.
         """
         cluster.require_nodes(2)
-        node0 = cluster.node_names[0]
-        node1 = cluster.node_names[1]
 
         holder_script = cluster.write_file(
             "excl-mn-holder.sh", "#!/bin/bash\nsleep 300\n"
@@ -298,45 +327,42 @@ class TestExclusiveBlocking:
         try:
             wait_job_state(cluster, holder_id, "R", timeout=60)
 
-            # Verify it actually landed on both nodes by checking NODES column (field 8).
-            sq = cluster.squeue(["-j", str(holder_id), "-h", "-o", "%i %D %R"])
-            parts = sq.strip().split()
-            assert parts, f"holder {holder_id} not found in squeue"
-            assert parts[1] == "2", (
-                f"holder should show 2 nodes in squeue, got: {sq.strip()!r}"
+            # Read the nodes the holder actually landed on — do not assume
+            # node_names[0]/[1] match the allocated nodes. The cluster may have
+            # a controller-only node that the scheduler skips.
+            sq = cluster.squeue(["-j", str(holder_id), "-h", "-o", "%D %N"])
+            parts = sq.strip().split(None, 1)
+            assert len(parts) == 2, f"unexpected squeue output for holder: {sq!r}"
+            assert parts[0] == "2", (
+                f"holder should be allocated 2 nodes, got: {sq.strip()!r}"
+            )
+            allocated_nodes = _expand_nodelist(parts[1].strip())
+            assert len(allocated_nodes) == 2, (
+                f"expected 2 allocated nodes, got {allocated_nodes}"
             )
 
-            # Submit both blocked jobs before polling either — so that a failure
-            # on one node is not masked by the time we check the other.
-            blocked0_script = cluster.write_file(
-                "excl-mn-blocked0.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
-            )
-            blocked0_id = parse_job_id(
-                cluster.sbatch(
-                    ["-N", "1", "-w", node0, "-c", "1", "-t", "1", blocked0_script]
+            # Submit one blocked job per allocated node before polling either,
+            # so a failure on one node is not masked while we watch the other.
+            blocked_ids = []
+            for i, node in enumerate(allocated_nodes):
+                script = cluster.write_file(
+                    f"excl-mn-blocked{i}.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
                 )
-            )
-            assert blocked0_id is not None
-
-            blocked1_script = cluster.write_file(
-                "excl-mn-blocked1.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
-            )
-            blocked1_id = parse_job_id(
-                cluster.sbatch(
-                    ["-N", "1", "-w", node1, "-c", "1", "-t", "1", blocked1_script]
+                bid = parse_job_id(
+                    cluster.sbatch(
+                        ["-N", "1", "-w", node, "-c", "1", "-t", "1", script]
+                    )
                 )
-            )
-            assert blocked1_id is not None
+                assert bid is not None, f"blocked job {i} did not submit"
+                blocked_ids.append(bid)
 
             try:
-                # Poll both jobs together on every tick so neither can run and
-                # complete while the other is being checked.
                 _assert_all_stay_pending_for_resources(
-                    cluster, [blocked0_id, blocked1_id], holder_id, _BLOCKING_POLL_SECS
+                    cluster, blocked_ids, holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
-                cluster.scancel(str(blocked0_id))
-                cluster.scancel(str(blocked1_id))
+                for bid in blocked_ids:
+                    cluster.scancel(str(bid))
         finally:
             cluster.scancel(str(holder_id))
 
@@ -349,16 +375,6 @@ class TestExclusiveBlocking:
         cluster = gpu_cluster
         cluster.require_nodes(2)
         cluster.gpu_preflight(2)
-
-        node0 = cluster.node_names[0]
-        node1 = cluster.node_names[1]
-
-        for name in [node0, node1]:
-            if cluster.node_gpu_count(name) < 2:
-                pytest.skip(
-                    f"need >= 2 GPUs on each node to prove remaining GPUs are blocked "
-                    f"(node {name} has {cluster.node_gpu_count(name)})"
-                )
 
         holder_script = cluster.write_file(
             "excl-mn-gpu-holder.sh", "#!/bin/bash\nsleep 300\n"
@@ -380,34 +396,45 @@ class TestExclusiveBlocking:
         try:
             wait_job_state(cluster, holder_id, "R", timeout=60)
 
-            blocked0_script = cluster.write_file(
-                "excl-mn-gpu-blocked0.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
+            # Read the nodes the holder actually landed on.
+            sq = cluster.squeue(["-j", str(holder_id), "-h", "-o", "%D %N"])
+            parts = sq.strip().split(None, 1)
+            assert len(parts) == 2, f"unexpected squeue output for holder: {sq!r}"
+            assert parts[0] == "2", (
+                f"holder should be allocated 2 nodes, got: {sq.strip()!r}"
             )
-            blocked0_id = parse_job_id(
-                cluster.sbatch(
-                    ["-N", "1", "-w", node0, "-c", "1", "--gres=gpu:1", "-t", "1",
-                     blocked0_script]
-                )
+            allocated_nodes = _expand_nodelist(parts[1].strip())
+            assert len(allocated_nodes) == 2, (
+                f"expected 2 allocated nodes, got {allocated_nodes}"
             )
-            assert blocked0_id is not None
 
-            blocked1_script = cluster.write_file(
-                "excl-mn-gpu-blocked1.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
-            )
-            blocked1_id = parse_job_id(
-                cluster.sbatch(
-                    ["-N", "1", "-w", node1, "-c", "1", "--gres=gpu:1", "-t", "1",
-                     blocked1_script]
+            for name in allocated_nodes:
+                if cluster.node_gpu_count(name) < 2:
+                    pytest.skip(
+                        f"need >= 2 GPUs on each node to prove remaining GPUs are blocked "
+                        f"(node {name} has {cluster.node_gpu_count(name)})"
+                    )
+
+            blocked_ids = []
+            for i, node in enumerate(allocated_nodes):
+                script = cluster.write_file(
+                    f"excl-mn-gpu-blocked{i}.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
                 )
-            )
-            assert blocked1_id is not None
+                bid = parse_job_id(
+                    cluster.sbatch(
+                        ["-N", "1", "-w", node, "-c", "1", "--gres=gpu:1", "-t", "1",
+                         script]
+                    )
+                )
+                assert bid is not None, f"GPU blocked job {i} did not submit"
+                blocked_ids.append(bid)
 
             try:
                 _assert_all_stay_pending_for_resources(
-                    cluster, [blocked0_id, blocked1_id], holder_id, _BLOCKING_POLL_SECS
+                    cluster, blocked_ids, holder_id, _BLOCKING_POLL_SECS
                 )
             finally:
-                cluster.scancel(str(blocked0_id))
-                cluster.scancel(str(blocked1_id))
+                for bid in blocked_ids:
+                    cluster.scancel(str(bid))
         finally:
             cluster.scancel(str(holder_id))
