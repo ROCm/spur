@@ -350,6 +350,73 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
    spur show node node01
    scontrol show partition gpu
 
+Diagnosing a job that will not start
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job pending on ``Reason=Resources`` looks the same whether the cluster is full
+or the job is pinned to a busy subset of it. ``scontrol show job`` reports the
+request as submitted, which distinguishes the two:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Field
+     - Meaning
+   * - ``ReqNodeList``
+     - Nodes requested with ``-w/--nodelist``. ``(null)`` when unrestricted.
+   * - ``ExcNodeList``
+     - Nodes excluded with ``-x/--exclude``.
+   * - ``NodeList``
+     - Nodes actually **allocated**. Empty (``(null)``) while pending — do not
+       confuse it with ``ReqNodeList``.
+   * - ``Features``
+     - Node feature constraint from ``-C/--constraint``.
+   * - ``ReqTRES``
+     - Requested resource totals, e.g. ``cpu=16,mem=32000M,node=2,gres/gpu=8``.
+   * - ``MinCPUsNode`` / ``MinMemoryNode``
+     - Per-node minima implied by the request.
+   * - ``SubmitLine``
+     - The submit command as invoked, so any submission-flag question is
+       answerable from one command.
+   * - ``EligibleTime``
+     - Earliest the job may start (``--begin``, otherwise submit time).
+   * - ``AccrueTime``
+     - When the job began accruing age priority.
+   * - ``LastSchedEval``
+     - When the scheduler last considered the job. ``N/A`` before the first
+       cycle, and reset by a controller restart or failover.
+
+So a job pinned to a busy node reads:
+
+.. code-block:: text
+
+   JobState=PENDING Reason=Resources Dependency=(null)
+   ReqNodeList=node07 ExcNodeList=(null)
+   NodeList=(null)
+   SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
+
+The controller logs the matching scheduler-side view at ``info`` level, one line
+per job when its placement outcome changes (not every cycle):
+
+.. code-block:: text
+
+   backfill did not start job job_id=1024 reason=no_suitable_nodes needed_nodes=1 candidate_nodes=0
+
+``reason`` is one of ``het_group_incomplete``, ``no_suitable_nodes``,
+``requested_nodes_unavailable``, ``too_few_candidates``, ``no_capacity_at_start``,
+or ``future_slot_reserved``. The last means the job is placeable and the
+scheduler is holding a future slot for it, reported with ``planned_start``.
+
+.. note::
+
+   Spur accrues age priority from submit time for every pending job, including
+   held and dependency-blocked ones. Slurm suspends accrual for those, so
+   ``AccrueTime`` can read earlier here than on an equivalent Slurm job.
+
+Preemption provenance
+~~~~~~~~~~~~~~~~~~~~~
+
 When a job has been preempted, ``scontrol show job`` includes three additional
 fields:
 
