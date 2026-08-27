@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crate::exit_fmt::{format_exit, render_reason};
+use crate::timefmt::format_timestamp as format_ts;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -576,72 +577,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .context("failed to get jobs")?;
 
             for job in resp.into_inner().jobs {
-                println!("JobId={} JobName={}", job.job_id, job.name);
-                if !job.comment.is_empty() {
-                    println!("   Comment={}", job.comment);
-                }
-                println!("   UserId={} Account={}", job.user, job.account);
-                println!("   Partition={} QOS={}", job.partition, job.qos);
-                println!(
-                    "   JobState={} Reason={}",
-                    state_name(job.state),
-                    render_reason(&job.state_reason, job.exit_signal),
-                );
-                println!(
-                    "   NumNodes={} NumTasks={} CPUs/Task={}",
-                    job.num_nodes, job.num_tasks, job.cpus_per_task
-                );
-                if job.req_gpus > 0 || !job.req_gpus_detail.is_empty() {
-                    let detail = if job.req_gpus_detail.is_empty() {
-                        format!("gpu:{}", job.req_gpus)
-                    } else {
-                        job.req_gpus_detail.clone()
-                    };
-                    let label = gpu_tres_label(&detail);
-                    println!("   {}={} ReqGPUs={}", label, detail, job.req_gpus);
-                }
-                if !job.nodelist.is_empty() {
-                    println!("   NodeList={}", job.nodelist);
-                }
-                println!(
-                    "   SubmitTime={} StartTime={} EndTime={}",
-                    format_ts(job.submit_time.as_ref()),
-                    format_ts(job.start_time.as_ref()),
-                    format_ts(job.end_time.as_ref()),
-                );
-                println!("   WorkDir={}", job.work_dir);
-                print!("   StdOut={} StdErr={}", job.stdout_path, job.stderr_path);
-                if !job.stdin_path.is_empty() {
-                    print!(" StdIn={}", job.stdin_path);
-                }
-                println!();
-                println!(
-                    "   ExitCode={} DerivedExitCode={} Priority={}",
-                    format_exit(job.exit_code, job.exit_signal),
-                    format_exit(job.derived_exit_code, 0),
-                    job.priority
-                );
-                if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
-                    println!(
-                        "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
-                        if job.preempted_by == 0 {
-                            "N/A".to_string()
-                        } else {
-                            job.preempted_by.to_string()
-                        },
-                        if job.preempt_mode.is_empty() {
-                            "N/A"
-                        } else {
-                            &job.preempt_mode
-                        },
-                        if job.preempt_qos.is_empty() {
-                            "N/A"
-                        } else {
-                            &job.preempt_qos
-                        },
-                    );
-                }
-                println!();
+                print!("{}", format_job_detail(&job));
             }
         }
         "node" | "nodes" => {
@@ -927,17 +863,6 @@ fn node_state_display(node: &spur_proto::proto::NodeInfo) -> String {
         }
         Some(spur_core::node::NodeOverlay::Planned) => format!("{base}+PLANNED"),
         None => base.to_string(),
-    }
-}
-
-fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
-    match ts {
-        Some(t) if t.seconds > 0 => {
-            let dt =
-                chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default();
-            dt.format("%Y-%m-%dT%H:%M:%S").to_string()
-        }
-        _ => "N/A".into(),
     }
 }
 
@@ -1736,6 +1661,161 @@ async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Slurm renders unset strings as `(null)` rather than omitting the field, so
+/// an operator can tell "not requested" from "not reported".
+fn or_null(value: &str) -> &str {
+    if value.is_empty() {
+        "(null)"
+    } else {
+        value
+    }
+}
+
+fn format_limit(d: Option<&prost_types::Duration>) -> String {
+    match d {
+        Some(d) if d.seconds > 0 => crate::timefmt::format_duration_dhms(d.seconds),
+        _ => "UNLIMITED".into(),
+    }
+}
+
+fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let _ = writeln!(out, "JobId={} JobName={}", job.job_id, job.name);
+    if !job.comment.is_empty() {
+        let _ = writeln!(out, "   Comment={}", job.comment);
+    }
+    let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
+    let _ = writeln!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    let _ = writeln!(
+        out,
+        "   JobState={} Reason={} Dependency={}",
+        state_name(job.state),
+        render_reason(&job.state_reason, job.exit_signal),
+        or_null(&job.dependency.join(",")),
+    );
+    let _ = writeln!(
+        out,
+        "   Requeue={} Restarts={} BatchFlag={} Exclusive={}",
+        job.requeue as u8, job.restarts, job.batch_flag as u8, job.exclusive as u8,
+    );
+    let _ = writeln!(
+        out,
+        "   RunTime={} TimeLimit={} TimeMin={}",
+        crate::timefmt::format_duration_dhms(job.run_time.as_ref().map_or(0, |d| d.seconds)),
+        format_limit(job.time_limit.as_ref()),
+        match job.time_min.as_ref() {
+            Some(d) if d.seconds > 0 => crate::timefmt::format_duration_dhms(d.seconds),
+            _ => "N/A".into(),
+        },
+    );
+    let _ = writeln!(
+        out,
+        "   SubmitTime={} EligibleTime={} AccrueTime={}",
+        format_ts(job.submit_time.as_ref()),
+        format_ts(job.eligible_time.as_ref()),
+        format_ts(job.accrue_time.as_ref()),
+    );
+    let _ = writeln!(
+        out,
+        "   StartTime={} EndTime={} Deadline={}",
+        format_ts(job.start_time.as_ref()),
+        format_ts(job.end_time.as_ref()),
+        format_ts(job.deadline.as_ref()),
+    );
+    let _ = writeln!(
+        out,
+        "   LastSchedEval={}",
+        format_ts(job.last_sched_eval.as_ref())
+    );
+    let _ = writeln!(
+        out,
+        "   ReqNodeList={} ExcNodeList={}",
+        or_null(&job.req_nodelist),
+        or_null(&job.exc_nodelist),
+    );
+    let _ = writeln!(out, "   NodeList={}", or_null(&job.nodelist));
+    let _ = writeln!(
+        out,
+        "   NumNodes={} NumTasks={} CPUs/Task={}",
+        job.num_nodes, job.num_tasks, job.cpus_per_task
+    );
+    let _ = writeln!(out, "   ReqTRES={}", or_null(&job.req_tres));
+    if job.req_gpus > 0 || !job.req_gpus_detail.is_empty() {
+        let detail = if job.req_gpus_detail.is_empty() {
+            format!("gpu:{}", job.req_gpus)
+        } else {
+            job.req_gpus_detail.clone()
+        };
+        let _ = writeln!(
+            out,
+            "   {}={} ReqGPUs={}",
+            gpu_tres_label(&detail),
+            detail,
+            job.req_gpus
+        );
+    }
+    let _ = writeln!(
+        out,
+        "   MinCPUsNode={} MinMemoryNode={}",
+        job.min_cpus_node, job.min_memory_node_mb
+    );
+    let _ = writeln!(out, "   Features={}", or_null(&job.features));
+    if !job.reservation.is_empty() {
+        let _ = writeln!(out, "   Reservation={}", job.reservation);
+    }
+    if job.array_job_id != 0 {
+        let _ = writeln!(
+            out,
+            "   ArrayJobId={} ArrayTaskId={}",
+            job.array_job_id, job.array_task_id
+        );
+    }
+    let _ = writeln!(out, "   WorkDir={}", job.work_dir);
+    let _ = write!(
+        out,
+        "   StdOut={} StdErr={}",
+        job.stdout_path, job.stderr_path
+    );
+    if !job.stdin_path.is_empty() {
+        let _ = write!(out, " StdIn={}", job.stdin_path);
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "   Command={}", or_null(&job.command));
+    let _ = writeln!(out, "   SubmitLine={}", or_null(&job.submit_line));
+    let _ = writeln!(
+        out,
+        "   ExitCode={} DerivedExitCode={} Priority={}",
+        format_exit(job.exit_code, job.exit_signal),
+        format_exit(job.derived_exit_code, 0),
+        job.priority
+    );
+    if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
+        let _ = writeln!(
+            out,
+            "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
+            if job.preempted_by == 0 {
+                "N/A".to_string()
+            } else {
+                job.preempted_by.to_string()
+            },
+            if job.preempt_mode.is_empty() {
+                "N/A"
+            } else {
+                &job.preempt_mode
+            },
+            if job.preempt_qos.is_empty() {
+                "N/A"
+            } else {
+                &job.preempt_qos
+            },
+        );
+    }
+    let _ = writeln!(out);
+    out
+}
+
 fn gpu_tres_label(detail: &str) -> &'static str {
     if detail.ends_with("/node") {
         "TresPerNode"
@@ -1749,6 +1829,111 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_pinned_job() -> spur_proto::proto::JobInfo {
+        spur_proto::proto::JobInfo {
+            job_id: 71860,
+            name: "probe".into(),
+            state: spur_proto::proto::JobState::JobPending as i32,
+            state_reason: "Resources".into(),
+            req_nodelist: "node[1-2]".into(),
+            exc_nodelist: "node9".into(),
+            features: "mi300x".into(),
+            submit_line: "sbatch -w 'node[1-2]' job.sh".into(),
+            req_tres: "cpu=16,node=2,gres/gpu=8".into(),
+            min_cpus_node: 8,
+            min_memory_node_mb: 16000,
+            dependency: vec!["afterok:5".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn job_detail_shows_the_requested_and_excluded_node_lists() {
+        let out = format_job_detail(&pending_pinned_job());
+        assert!(
+            out.contains("ReqNodeList=node[1-2] ExcNodeList=node9"),
+            "{out}"
+        );
+        // Allocated list is empty while pending; it must not be confused with
+        // the requested one.
+        assert!(out.contains("NodeList=(null)"), "{out}");
+    }
+
+    #[test]
+    fn job_detail_shows_submit_line_and_constraints() {
+        let out = format_job_detail(&pending_pinned_job());
+        assert!(
+            out.contains("SubmitLine=sbatch -w 'node[1-2]' job.sh"),
+            "{out}"
+        );
+        assert!(out.contains("Features=mi300x"), "{out}");
+        assert!(out.contains("Dependency=afterok:5"), "{out}");
+        assert!(out.contains("ReqTRES=cpu=16,node=2,gres/gpu=8"), "{out}");
+        assert!(out.contains("MinCPUsNode=8 MinMemoryNode=16000"), "{out}");
+    }
+
+    #[test]
+    fn job_detail_renders_null_for_unrequested_placement_fields() {
+        let out = format_job_detail(&spur_proto::proto::JobInfo::default());
+        // Printing the field as (null) is the point: absence of the line is
+        // indistinguishable from an unsupported build.
+        assert!(
+            out.contains("ReqNodeList=(null) ExcNodeList=(null)"),
+            "{out}"
+        );
+        assert!(out.contains("SubmitLine=(null)"), "{out}");
+        assert!(out.contains("Features=(null)"), "{out}");
+    }
+
+    #[test]
+    fn job_detail_reports_last_sched_eval_and_accrual_times() {
+        let mut job = pending_pinned_job();
+        job.submit_time = Some(prost_types::Timestamp {
+            seconds: 1_756_281_787,
+            nanos: 0,
+        });
+        job.eligible_time = job.submit_time;
+        job.accrue_time = job.submit_time;
+        assert!(
+            format_job_detail(&job).contains("LastSchedEval=N/A"),
+            "unevaluated job must say so, not omit the field"
+        );
+
+        job.last_sched_eval = Some(prost_types::Timestamp {
+            seconds: 1_756_281_999,
+            nanos: 0,
+        });
+        let out = format_job_detail(&job);
+        assert!(out.contains("LastSchedEval=2025-08-27T08:06:39"), "{out}");
+        assert!(
+            out.contains("EligibleTime=2025-08-27T08:03:07 AccrueTime=2025-08-27T08:03:07"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn job_detail_keeps_the_time_limit_and_exit_summary() {
+        let mut job = pending_pinned_job();
+        job.time_limit = Some(prost_types::Duration {
+            seconds: 300,
+            nanos: 0,
+        });
+        job.priority = 11000;
+        let out = format_job_detail(&job);
+        assert!(out.contains("TimeLimit=00:05:00"), "{out}");
+        assert!(out.contains("RunTime=00:00:00"), "{out}");
+        assert!(
+            out.contains("ExitCode=0:0 DerivedExitCode=0:0 Priority=11000"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn job_detail_reports_unlimited_when_no_time_limit_is_set() {
+        let out = format_job_detail(&pending_pinned_job());
+        assert!(out.contains("TimeLimit=UNLIMITED"), "{out}");
+    }
 
     #[test]
     fn gpu_tres_label_per_node() {

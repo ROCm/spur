@@ -6,6 +6,7 @@ use clap::Parser;
 use spur_proto::proto::GetJobsRequest;
 
 use crate::format_engine;
+use crate::timefmt::format_timestamp;
 
 /// View information about jobs in the scheduling queue.
 #[derive(Parser, Debug)]
@@ -431,17 +432,6 @@ fn format_duration_hms(total_seconds: i64) -> String {
         format!("{}:{:02}:{:02}", hours, minutes, seconds)
     } else {
         format!("{}:{:02}", minutes, seconds)
-    }
-}
-
-fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
-    match ts {
-        Some(t) if t.seconds > 0 => {
-            let dt =
-                chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default();
-            dt.format("%Y-%m-%dT%H:%M:%S").to_string()
-        }
-        _ => "N/A".into(),
     }
 }
 

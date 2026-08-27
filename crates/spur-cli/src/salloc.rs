@@ -112,13 +112,15 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let submit_line = crate::submitline::render(&args);
     let matches = SallocArgs::command().try_get_matches_from(&args)?;
     let mut args = SallocArgs::from_arg_matches(&matches)?;
     resolve_salloc_env(&matches, &mut args);
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     let controller = args.controller.clone();
-    let job_spec = build_salloc_job_spec(&args, nodelist)?;
+    let mut job_spec = build_salloc_job_spec(&args, nodelist)?;
+    job_spec.submit_line = submit_line;
     let submit_user = job_spec.user.clone();
 
     let channel = crate::authclient::connect(&controller)

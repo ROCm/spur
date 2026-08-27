@@ -982,6 +982,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         srun_job: false,
         pty: false,
         initial_winsize: None,
+        submit_line: crate::submitline::render(&cli_args),
     };
 
     // Submit to controller

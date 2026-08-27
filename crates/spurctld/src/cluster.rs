@@ -3192,9 +3192,32 @@ impl ClusterManager {
     /// stage-in for selected candidates, and return the jobs eligible for scheduling.
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
         let classification = self.classify_pending_jobs();
+        let evaluated: Vec<JobId> = classification
+            .jobs
+            .iter()
+            .map(|job| job.job_id)
+            .chain(classification.reason_updates.iter().map(|(id, _)| *id))
+            .collect();
         self.apply_pending_reason_updates(classification.reason_updates);
         self.advance_bb_staging_for(&classification.bb_stage_candidates);
+        self.mark_scheduler_evaluated(&evaluated);
         classification.jobs
+    }
+
+    /// Record that this cycle considered these jobs, for `LastSchedEval`.
+    /// Keyed by id rather than scanning every job so the write lock stays
+    /// bounded to the pending set.
+    fn mark_scheduler_evaluated(&self, job_ids: &[JobId]) {
+        if job_ids.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let mut jobs = self.jobs.write();
+        for id in job_ids {
+            if let Some(job) = jobs.get_mut(id) {
+                job.last_sched_eval = Some(now);
+            }
+        }
     }
 
     fn classify_pending_jobs(&self) -> PendingJobClassification {
@@ -16852,6 +16875,29 @@ mod tests {
             2,
             "configured total must never be mutated"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduling_pass_stamps_last_sched_eval() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let job_id = cm.submit_job(basic_spec("last-eval")).unwrap().job_id;
+        wait_for("job visible", || cm.get_job(job_id).is_some());
+        assert!(
+            cm.get_job(job_id).unwrap().last_sched_eval.is_none(),
+            "a job must not claim to have been evaluated before any cycle ran"
+        );
+
+        cm.pending_jobs_and_tag_reasons();
+
+        let stamped = cm.get_job(job_id).unwrap().last_sched_eval;
+        assert!(
+            stamped.is_some(),
+            "scheduling pass must record LastSchedEval"
+        );
+        assert!(stamped.unwrap() >= cm.get_job(job_id).unwrap().submit_time);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

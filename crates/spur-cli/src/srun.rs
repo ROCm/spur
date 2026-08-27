@@ -208,6 +208,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let submit_line = crate::submitline::render(&args);
     let matches = SrunArgs::command().try_get_matches_from(&args)?;
     let mut args = SrunArgs::from_arg_matches(&matches)?;
 
@@ -286,7 +287,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi).await
+    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi, &submit_line).await
 }
 
 /// Resolve `--mpi` for standalone srun vs step mode inside an allocation.
@@ -856,13 +857,15 @@ async fn run_standalone_srun(
     hooks: &HooksConfig,
     work_dir: &str,
     mpi: &str,
+    submit_line: &str,
 ) -> Result<()> {
     let io = resolve_io_paths(args);
     let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
-    let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
+    let mut job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
+    job_spec.submit_line = submit_line.to_string();
     let submit_user = job_spec.user.clone();
     let submit_resp = client
         .submit_job(SubmitJobRequest {

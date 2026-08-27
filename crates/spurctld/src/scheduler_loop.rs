@@ -956,6 +956,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         open_mode: s.open_mode.clone().unwrap_or_default(),
         pty: s.pty,
         initial_winsize: None,
+        submit_line: s.submit_line.clone().unwrap_or_default(),
     }
 }
 
@@ -1166,6 +1167,7 @@ async fn dispatch_to_agent(
         open_mode: spec.open_mode.clone().unwrap_or_default(),
         pty: spec.pty,
         initial_winsize: None,
+        submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
     let response = client

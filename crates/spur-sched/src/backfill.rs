@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
-use tracing::debug;
+use tracing::{debug, info};
 
 use spur_core::gpu_request::{distribute_total, resolve_gpu_demand, GpuDemand};
 use spur_core::job::{Job, JobId};
@@ -31,6 +31,59 @@ pub struct BackfillScheduler {
     timelines: Vec<NodeTimeline>,
     /// Max jobs to consider per cycle.
     max_jobs: usize,
+    /// Last cycle's outcome per unplaced job, so a steady-state stuck queue
+    /// logs once on entry rather than every cycle.
+    last_outcome: HashMap<JobId, Unplaced>,
+}
+
+/// Why the backfill pass did not start a job now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnplacedKind {
+    /// A sibling component of the heterogeneous job has no suitable nodes.
+    HetGroupIncomplete,
+    /// Nothing in the partition satisfies the request (resources, features,
+    /// nodelist, or reservation access).
+    NoSuitableNodes,
+    /// Some requested nodes are suitable but unavailable, and the request
+    /// cannot be satisfied without them.
+    RequestedNodesUnavailable,
+    /// Fewer candidate nodes than the job asked for.
+    TooFewCandidates,
+    /// Candidates found, but not enough free capacity at the computed start.
+    NoCapacityAtStart,
+    /// Placeable, but only in a future slot, which is now held for the job.
+    FutureSlotReserved,
+}
+
+impl UnplacedKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HetGroupIncomplete => "het_group_incomplete",
+            Self::NoSuitableNodes => "no_suitable_nodes",
+            Self::RequestedNodesUnavailable => "requested_nodes_unavailable",
+            Self::TooFewCandidates => "too_few_candidates",
+            Self::NoCapacityAtStart => "no_capacity_at_start",
+            Self::FutureSlotReserved => "future_slot_reserved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Unplaced {
+    kind: UnplacedKind,
+    needed_nodes: u32,
+    candidates: u32,
+    planned_start: Option<chrono::DateTime<Utc>>,
+}
+
+/// `planned_start` drifts by seconds every cycle, so it is excluded from the
+/// comparison that decides whether the situation actually changed.
+impl PartialEq for Unplaced {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.needed_nodes == other.needed_nodes
+            && self.candidates == other.candidates
+    }
 }
 
 /// Bundles the reservation-authorization inputs shared by every candidate
@@ -47,7 +100,27 @@ impl BackfillScheduler {
         Self {
             timelines: Vec::new(),
             max_jobs,
+            last_outcome: HashMap::new(),
         }
+    }
+
+    /// Emit one line per job whose placement outcome changed since the last
+    /// cycle, then adopt this cycle's set (which also drops jobs that started).
+    fn log_unplaced(&mut self, current: HashMap<JobId, Unplaced>) {
+        for (job_id, outcome) in &current {
+            if self.last_outcome.get(job_id) == Some(outcome) {
+                continue;
+            }
+            info!(
+                job_id = job_id,
+                reason = outcome.kind.as_str(),
+                needed_nodes = outcome.needed_nodes,
+                candidate_nodes = outcome.candidates,
+                planned_start = outcome.planned_start.map(|t| t.to_rfc3339()),
+                "backfill did not start job"
+            );
+        }
+        self.last_outcome = current;
     }
 
     /// Nodes with no resources currently allocated but a future reservation
@@ -309,15 +382,30 @@ impl Scheduler for BackfillScheduler {
         }
 
         let mut assignments = Vec::new();
+        let mut unplaced: HashMap<JobId, Unplaced> = HashMap::new();
         let limit = pending.len().min(self.max_jobs);
 
         for (job_idx, job) in pending.iter().enumerate().take(limit) {
+            let mut note = |kind: UnplacedKind, candidates: usize, planned_start| {
+                unplaced.insert(
+                    job.job_id,
+                    Unplaced {
+                        kind,
+                        needed_nodes: job.spec.num_nodes.max(1),
+                        candidates: candidates as u32,
+                        planned_start,
+                    },
+                );
+            };
+
             // Skip jobs that are part of an unschedulable het group
             if skip_indices.contains(&job_idx) {
+                note(UnplacedKind::HetGroupIncomplete, 0, None);
                 continue;
             }
             let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.reservations);
             if suitable.is_empty() {
+                note(UnplacedKind::NoSuitableNodes, 0, None);
                 continue;
             }
 
@@ -394,6 +482,11 @@ impl Scheduler for BackfillScheduler {
                     .count()
                     < listed_suitable
             {
+                note(
+                    UnplacedKind::RequestedNodesUnavailable,
+                    suitable.len(),
+                    None,
+                );
                 continue;
             }
 
@@ -436,6 +529,7 @@ impl Scheduler for BackfillScheduler {
             }
 
             if node_starts.len() < needed_nodes {
+                note(UnplacedKind::TooFewCandidates, node_starts.len(), None);
                 continue;
             }
 
@@ -521,7 +615,10 @@ impl Scheduler for BackfillScheduler {
                     earliest,
                 ) {
                     Some(allocs) => per_node_alloc = allocs,
-                    None => continue, // not enough free capacity at that time
+                    None => {
+                        note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
+                        continue;
+                    }
                 }
             } else {
                 for (ni, _) in &assigned_nodes {
@@ -579,9 +676,15 @@ impl Scheduler for BackfillScheduler {
                         Some(job.job_id),
                     );
                 }
+                note(
+                    UnplacedKind::FutureSlotReserved,
+                    assigned_nodes.len(),
+                    Some(earliest),
+                );
             }
         }
 
+        self.log_unplaced(unplaced);
         assignments
     }
 
@@ -743,6 +846,108 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn unplaced_job_records_why_it_was_not_started() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut job = make_job(1, 1, 1);
+        job.spec.nodelist = Some("nosuchnode".into());
+
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        assert!(sched.schedule(&[job], &cluster).is_empty());
+        let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
+        assert_eq!(outcome.kind, UnplacedKind::NoSuitableNodes);
+        assert_eq!(outcome.needed_nodes, 1);
+    }
+
+    #[test]
+    fn unplaced_job_asking_for_more_nodes_than_exist_reports_too_few_candidates() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        assert!(sched.schedule(&[make_job(1, 4, 1)], &cluster).is_empty());
+        let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
+        assert_eq!(outcome.kind, UnplacedKind::TooFewCandidates);
+        assert_eq!(outcome.needed_nodes, 4);
+        assert_eq!(outcome.candidates, 2);
+    }
+
+    #[test]
+    fn started_job_is_dropped_from_the_unplaced_set() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        assert!(sched.schedule(&[make_job(1, 4, 1)], &cluster).is_empty());
+        assert!(sched.last_outcome.contains_key(&1));
+
+        // Next cycle places it: the stale entry must not linger and re-log.
+        let mut sched = BackfillScheduler {
+            last_outcome: sched.last_outcome.clone(),
+            ..BackfillScheduler::new(100)
+        };
+        assert_eq!(sched.schedule(&[make_job(1, 2, 1)], &cluster).len(), 1);
+        assert!(sched.last_outcome.is_empty());
+    }
+
+    #[test]
+    fn unplaced_outcome_ignores_planned_start_drift() {
+        let now = Utc::now();
+        let base = Unplaced {
+            kind: UnplacedKind::FutureSlotReserved,
+            needed_nodes: 2,
+            candidates: 2,
+            planned_start: Some(now),
+        };
+        let drifted = Unplaced {
+            planned_start: Some(now + Duration::seconds(30)),
+            ..base
+        };
+        assert_eq!(
+            base, drifted,
+            "a drifting start must not re-log every cycle"
+        );
+
+        let changed = Unplaced {
+            kind: UnplacedKind::TooFewCandidates,
+            ..base
+        };
+        assert_ne!(base, changed);
     }
 
     #[test]

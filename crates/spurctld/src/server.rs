@@ -3769,6 +3769,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.open_mode)
         },
         pty: spec.pty,
+        submit_line: if spec.submit_line.is_empty() {
+            None
+        } else {
+            Some(spec.submit_line)
+        },
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -3927,7 +3932,72 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         preempted_by: job.preempted_by.unwrap_or(0),
         preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
         preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+        req_nodelist: job.spec.nodelist.clone().unwrap_or_default(),
+        exc_nodelist: job.spec.exclude.clone().unwrap_or_default(),
+        features: job.spec.constraint.clone().unwrap_or_default(),
+        dependency: job.spec.dependency.clone(),
+        submit_line: job.spec.submit_line.clone().unwrap_or_default(),
+        req_tres: requested_tres(&job.spec),
+        min_cpus_node: min_cpus_per_node(&job.spec),
+        min_memory_node_mb: min_memory_per_node_mb(&job.spec),
+        eligible_time: Some(datetime_to_proto(job.eligible_time())),
+        accrue_time: Some(datetime_to_proto(job.accrue_time())),
+        last_sched_eval: job.last_sched_eval.map(datetime_to_proto),
+        deadline: job.spec.deadline.map(datetime_to_proto),
+        time_min: job.spec.time_min.map(|d| prost_types::Duration {
+            seconds: d.num_seconds(),
+            nanos: 0,
+        }),
+        requeue: job.spec.requeue,
+        restarts: job.requeue_count + job.preempt_requeue_count + job.user_requeue_count,
+        batch_flag: job.spec.script.is_some(),
+        exclusive: job.spec.exclusive,
     }
+}
+
+/// Tasks that land on one node, used for the per-node minima Slurm reports.
+fn tasks_per_node(spec: &spur_core::job::JobSpec) -> u32 {
+    spec.tasks_per_node.unwrap_or_else(|| {
+        let nodes = spec.num_nodes.max(1);
+        spec.num_tasks.max(1).div_ceil(nodes)
+    })
+}
+
+fn min_cpus_per_node(spec: &spur_core::job::JobSpec) -> u32 {
+    tasks_per_node(spec) * spec.cpus_per_task.max(1)
+}
+
+/// Per-node memory floor. A `--mem-per-cpu` job has none declared directly, so
+/// scale it by the CPUs that land on a node.
+fn min_memory_per_node_mb(spec: &spur_core::job::JobSpec) -> u64 {
+    if let Some(mb) = spec.memory_per_node_mb {
+        return mb;
+    }
+    spec.memory_per_cpu_mb
+        .map(|per_cpu| per_cpu * min_cpus_per_node(spec) as u64)
+        .unwrap_or(0)
+}
+
+/// Slurm-style requested TRES summary. `billing` is omitted: Spur has no TRES
+/// billing weights, and emitting a made-up value would misreport usage.
+fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
+    let nodes = spec.num_nodes.max(1);
+    let mut parts = vec![
+        format!("cpu={}", min_cpus_per_node(spec) as u64 * nodes as u64),
+        format!("node={nodes}"),
+    ];
+
+    let mem_mb = min_memory_per_node_mb(spec) * nodes as u64;
+    if mem_mb > 0 {
+        parts.insert(1, format!("mem={mem_mb}M"));
+    }
+
+    let gpus = spur_core::job::effective_gpus(spec, nodes);
+    if gpus > 0 {
+        parts.push(format!("gres/gpu={gpus}"));
+    }
+
+    parts.join(",")
 }
 
 /// Human-readable summary of a job's GPU request for display.
@@ -6872,6 +6942,90 @@ mod tests {
     fn select_step_node_rejects_comma_joined_request() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
         assert!(select_step_node(&allocated, "node001,node002").is_err());
+    }
+
+    #[test]
+    fn job_to_proto_reports_requested_placement_and_submit_line() {
+        use spur_core::job::{Job, JobSpec};
+
+        let job = Job::new(
+            7,
+            JobSpec {
+                nodelist: Some("node[1-2]".into()),
+                exclude: Some("node9".into()),
+                constraint: Some("mi300x".into()),
+                dependency: vec!["afterok:5".into()],
+                submit_line: Some("sbatch -w node[1-2] job.sh".into()),
+                ..Default::default()
+            },
+        );
+
+        let info = job_to_proto(&job);
+        assert_eq!(info.req_nodelist, "node[1-2]");
+        assert_eq!(info.exc_nodelist, "node9");
+        assert_eq!(info.features, "mi300x");
+        assert_eq!(info.dependency, vec!["afterok:5".to_string()]);
+        assert_eq!(info.submit_line, "sbatch -w node[1-2] job.sh");
+        // The allocated list stays empty while pending: this is exactly the
+        // distinction that made a pinned pending job undiagnosable.
+        assert!(info.nodelist.is_empty());
+    }
+
+    #[test]
+    fn job_to_proto_leaves_last_sched_eval_unset_until_evaluated() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(7, JobSpec::default());
+        assert!(job_to_proto(&job).last_sched_eval.is_none());
+
+        job.last_sched_eval = Some(job.submit_time);
+        assert!(job_to_proto(&job).last_sched_eval.is_some());
+    }
+
+    #[test]
+    fn requested_tres_summarizes_cpu_memory_nodes_and_gpus() {
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 8,
+            memory_per_node_mb: Some(16000),
+            gres: vec!["gpu:4".into()],
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=16,mem=32000M,node=2,gres/gpu=8");
+        assert_eq!(min_cpus_per_node(&spec), 8);
+        assert_eq!(min_memory_per_node_mb(&spec), 16000);
+    }
+
+    #[test]
+    fn requested_tres_omits_memory_when_none_requested() {
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=1,node=1");
+        assert_eq!(min_memory_per_node_mb(&spec), 0);
+    }
+
+    #[test]
+    fn min_memory_per_node_scales_a_mem_per_cpu_request() {
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: 4,
+            cpus_per_task: 2,
+            memory_per_cpu_mb: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(min_cpus_per_node(&spec), 8);
+        assert_eq!(min_memory_per_node_mb(&spec), 8000);
     }
 
     #[test]

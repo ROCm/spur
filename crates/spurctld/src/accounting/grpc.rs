@@ -326,6 +326,10 @@ impl SlurmAccounting for AccountingService {
                 preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
+                // Requested-placement and scheduling-provenance fields are not
+                // columns in the accounting store; only the live controller
+                // reports them.
+                ..Default::default()
             })
             .collect();
 
