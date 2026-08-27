@@ -162,6 +162,8 @@ pub struct JobLaunchConfig {
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
+    /// cgroup-v2 enforcement settings from `[cgroup]`.
+    pub cgroup: CgroupConfig,
     /// Swap budget for the job's cgroup.
     pub swap_limit: SwapLimit,
     /// I/O mode for the job.
@@ -505,7 +507,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, &CgroupConfig::default(), cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
+    let cgroup_path = setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -2361,6 +2363,7 @@ mod tests {
             nodelist: String::new(),
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
+            cgroup: CgroupConfig::default(),
             swap_limit: SwapLimit::Unconstrained,
             io_mode: LaunchIo::File,
             pmix_multi_task: false,

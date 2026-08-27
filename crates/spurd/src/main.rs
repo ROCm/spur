@@ -344,6 +344,10 @@ async fn main() -> anyhow::Result<()> {
         None => spur_core::config::JobLimits::default(),
     };
     log_memlock_status(limits.memlock);
+    let cgroup_config = config
+        .as_ref()
+        .map(|c| c.cgroup.clone())
+        .unwrap_or_default();
     log_swap_status(limits.swap);
     let cluster_config = config
         .as_ref()
@@ -377,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         &cluster_config,
         limits,
+        cgroup_config,
         mpi_config,
         running_jobs,
         allow_root_jobs,
