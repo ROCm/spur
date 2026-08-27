@@ -1579,6 +1579,52 @@ pub struct CgroupLimits {
 }
 
 impl CgroupConfig {
+    /// `(memory.max, memory.high, memory.swap.max)` for a job whose per-node
+    /// budget is `memory_mb`, resolved as Slurm's cgroup/v2 plugin resolves
+    /// them across all four `Constrain{RAMSpace,SwapSpace}` combinations.
+    ///
+    /// The subtle case is swap-without-RAM: Slurm forces `AllowedRAMSpace` to
+    /// 100% and sets the RAM ceiling to the combined RAM+swap total, so the
+    /// *sum* stays bounded. Leaving memory unlimited there would let a job
+    /// bypass the very ceiling the swap bound is derived from.
+    fn memory_limits(&self, memory_mb: u64) -> (Option<u64>, Option<u64>, Option<u64>) {
+        // A job with no memory budget gets no ceiling at all. Bounding swap on
+        // its own here would forbid swap while RAM stayed unlimited.
+        if memory_mb == 0 || !(self.constrain_ram_space || self.constrain_swap) {
+            return (None, None, None);
+        }
+        let memory_bytes = memory_mb.saturating_mul(1024 * 1024);
+        let min_ram_bytes = self.min_ram_mb.saturating_mul(1024 * 1024);
+
+        // The percentage only exists to build the ceilings from, so it reverts
+        // to 100% when RAM itself is unconstrained.
+        let ram_percent = if self.constrain_ram_space {
+            self.allowed_ram_percent as u64
+        } else {
+            100
+        };
+
+        // Hard ceiling is AllowedRAMSpace% of the budget, soft is 100% of it,
+        // both floored at MinRAMSpace. A soft limit above the hard one is moot,
+        // so it collapses onto it.
+        let hard = (memory_bytes.saturating_mul(ram_percent) / 100).max(min_ram_bytes);
+        let soft = memory_bytes.max(min_ram_bytes).min(hard);
+        let combined = hard
+            .saturating_add(memory_bytes.saturating_mul(self.allowed_swap_percent as u64) / 100);
+
+        let memory_max = if self.constrain_ram_space {
+            hard
+        } else {
+            combined
+        };
+        let swap_max = if self.constrain_swap {
+            Some(combined.saturating_sub(memory_max))
+        } else {
+            None
+        };
+        (Some(memory_max), Some(soft), swap_max)
+    }
+
     /// Resolve the limits for a job whose per-node budget is `cpus`/`memory_mb`
     /// on cores `cpu_ids`. `None` when enforcement is off — the single place
     /// `enabled` is consulted, so no caller can half-apply the master switch.
@@ -1587,32 +1633,7 @@ impl CgroupConfig {
             return None;
         }
         let cpus = cpus.max(1);
-        // memory_mb == 0 means the job has no memory budget, so neither ceiling
-        // applies. Writing swap = 0 there would forbid swap while RAM stays
-        // unlimited — a pair Slurm never emits.
-        let bounded_memory = memory_mb > 0;
-        let memory_bytes = memory_mb.saturating_mul(1024 * 1024);
-        let min_ram_bytes = self.min_ram_mb.saturating_mul(1024 * 1024);
-
-        // Slurm's `_memcg_initialize`: the hard ceiling is AllowedRAMSpace% of
-        // the budget and the soft one is 100% of it, both floored at
-        // MinRAMSpace. A soft limit above the hard one is moot — the kernel
-        // would never reach it — so it collapses onto the hard limit.
-        let (memory_max_bytes, memory_high_bytes) = if self.constrain_ram_space && bounded_memory {
-            let hard = (memory_bytes.saturating_mul(self.allowed_ram_percent as u64) / 100)
-                .max(min_ram_bytes);
-            let soft = memory_bytes.max(min_ram_bytes).min(hard);
-            (Some(hard), Some(soft))
-        } else {
-            (None, None)
-        };
-        // Percent of the *allocated* memory. Slurm's `memsw - mem` cancels the
-        // AllowedRAMSpace term, so this does not depend on the hard ceiling.
-        let swap_max_bytes = if self.constrain_swap && bounded_memory {
-            Some(memory_bytes.saturating_mul(self.allowed_swap_percent as u64) / 100)
-        } else {
-            None
-        };
+        let (memory_max_bytes, memory_high_bytes, swap_max_bytes) = self.memory_limits(memory_mb);
         let cpu_quota_us = if self.cpu_quota {
             Some(cpus as u64 * CPU_PERIOD_US)
         } else {
@@ -2306,6 +2327,55 @@ mod tests {
             c.limits_for(4, 1024, &[]).unwrap().swap_max_bytes,
             Some(256 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn memory_ceilings_cover_the_constrain_matrix() {
+        // 1 GiB budget with AllowedSwapSpace=25%, checked against what Slurm's
+        // cgroup/v2 plugin writes for each Constrain{RAMSpace,SwapSpace} pair.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let cases = [
+            // Neither constrained: the memory cgroup is left alone entirely.
+            (false, false, None, None, None),
+            // RAM only: ceiling at the budget, swap left to the kernel.
+            (true, false, Some(GIB), Some(GIB), None),
+            // Swap only: the RAM ceiling becomes the RAM+swap total so the sum
+            // stays bounded, and swap itself is then pinned to zero.
+            (false, true, Some(GIB + GIB / 4), Some(GIB), Some(0)),
+            // Both: swap gets its own allowance on top of the RAM ceiling.
+            (true, true, Some(GIB), Some(GIB), Some(GIB / 4)),
+        ];
+
+        for (constrain_ram, constrain_swap, want_max, want_high, want_swap) in cases {
+            let c = CgroupConfig {
+                constrain_ram_space: constrain_ram,
+                constrain_swap,
+                allowed_swap_percent: 25,
+                ..CgroupConfig::default()
+            };
+            let l = c.limits_for(1, 1024, &[]).expect("enabled");
+            assert_eq!(
+                (l.memory_max_bytes, l.memory_high_bytes, l.swap_max_bytes),
+                (want_max, want_high, want_swap),
+                "constrain_ram_space={constrain_ram}, constrain_swap={constrain_swap}"
+            );
+        }
+    }
+
+    #[test]
+    fn ram_percent_is_ignored_when_ram_is_not_constrained() {
+        // AllowedRAMSpace only shapes the ceiling Spur derives the swap bound
+        // from, so with RAM unconstrained Slurm reverts it to 100%.
+        let c = CgroupConfig {
+            constrain_ram_space: false,
+            allowed_ram_percent: 150,
+            allowed_swap_percent: 50,
+            ..CgroupConfig::default()
+        };
+        let l = c.limits_for(1, 1024, &[]).expect("enabled");
+        assert_eq!(l.memory_max_bytes, Some(1536 * 1024 * 1024));
+        assert_eq!(l.memory_high_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(l.swap_max_bytes, Some(0));
     }
 
     #[test]

@@ -1256,11 +1256,13 @@ there the kubelet owns the cgroups.
      - Hard ceiling (``memory.max``) as a percentage of the allocated memory.
        ``memory.high`` stays at 100% of the allocation, so the default makes the
        two equal and a value above 100 opens a soft-throttle band. Must be at
-       least 1.
+       least 1. Ignored when ``constrain_ram_space`` is ``false``, where it
+       reverts to 100%.
    * - ``constrain_swap``
      - bool
      - ``true``
-     - Bound swap via ``memory.swap.max``.
+     - Bound swap via ``memory.swap.max``. Turning this on with
+       ``constrain_ram_space`` off still bounds memory — see below.
    * - ``allowed_swap_percent``
      - int
      - ``0``
@@ -1280,6 +1282,43 @@ there the kubelet owns the cgroups.
 A job submitted without ``--mem`` has no memory budget, so ``memory.max``,
 ``memory.high``, and ``memory.swap.max`` are all left at the kernel default.
 Constraining swap to zero while memory stayed unlimited would be incoherent.
+
+The two ``constrain_*`` memory switches interact, matching Slurm. Constraining
+swap on its own does **not** leave RAM unlimited: the RAM ceiling becomes the
+combined RAM+swap total, so the sum a job can reach stays bounded.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 16 22 22 22
+
+   * - ``constrain_ram_space``
+     - ``constrain_swap``
+     - ``memory.max``
+     - ``memory.high``
+     - ``memory.swap.max``
+   * - ``false``
+     - ``false``
+     - unset
+     - unset
+     - unset
+   * - ``true``
+     - ``false``
+     - ``allowed_ram_percent``\ % of the allocation
+     - the allocation
+     - unset
+   * - ``false``
+     - ``true``
+     - allocation + ``allowed_swap_percent``\ %
+     - the allocation
+     - ``0``
+   * - ``true``
+     - ``true``
+     - ``allowed_ram_percent``\ % of the allocation
+     - the allocation
+     - ``allowed_swap_percent``\ % of the allocation
+
+Every ceiling is floored at ``min_ram_mb``, and ``memory.high`` never exceeds
+``memory.max``.
 
 .. note::
 

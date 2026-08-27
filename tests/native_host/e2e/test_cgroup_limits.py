@@ -210,6 +210,28 @@ class TestCgroupRamHeadroom:
         assert probe.values["memory.max"] == str(1536 * MIB), probe.context()
 
 
+class TestCgroupSwapOnly:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {
+            "cgroup": {
+                "constrain_ram_space": False,
+                "constrain_swap": True,
+                "allowed_swap_percent": 25,
+            }
+        }
+
+    def test_swap_only_still_bounds_the_ram_plus_swap_total(self, cgroup_cluster):
+        # Constraining swap alone must not leave RAM unlimited: the RAM ceiling
+        # becomes the combined total, and swap itself is then pinned to zero.
+        probe = _run_probe(
+            cgroup_cluster, ["--cpus-per-task=1", "--mem=1024"], "cg-swaponly"
+        )
+        assert probe.values["memory.max"] == str(1280 * MIB), probe.context()
+        assert probe.values["memory.high"] == str(1024 * MIB), probe.context()
+        assert probe.values["memory.swap.max"] == "0", probe.context()
+
+
 class TestCgroupDisabled:
     @pytest.fixture
     def cluster_config_overrides(self):
