@@ -189,9 +189,10 @@ and Raft high-availability topology.
      - integer
      - ``999999999``
      - Not implemented
-     - Intended as the job-ID wrap point. No code consumes it; the counter does
-       not wrap. Job IDs are 32-bit unsigned and stored as 64-bit in the
-       accounting database, so the full range is usable without one.
+     - Intended as the job-ID wrap point. No code consumes it. Job IDs are 32-bit
+       unsigned and stored as 64-bit in the accounting database, so ids above
+       ``i32::MAX`` are recorded correctly; the counter still wraps to zero past
+       ``u32::MAX`` and would re-issue ids that collide with existing rows.
    * - ``first_job_id``
      - integer
      - ``1``

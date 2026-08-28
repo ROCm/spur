@@ -162,10 +162,8 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
 
--- Job ids are u32 in the scheduler but these columns were INTEGER, so an id above
--- i32::MAX wrapped negative and could collide with an unrelated row instead of
--- failing. Guarded on the current type because ALTER TYPE rewrites the table and
--- takes ACCESS EXCLUSIVE: it must run once on upgrade, not on every start.
+-- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
+-- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
 DO $$
 DECLARE
     target RECORD;
@@ -186,6 +184,21 @@ BEGIN
         END IF;
     END LOOP;
 END $$;
+
+-- Restore the true id of a row a pre-fix controller narrowed: the u32 wrapped to a
+-- negative int4, so add 2^32 back. Skip a row whose true id already exists so the
+-- rewrite can never violate the primary key. No-op (and cheap on the PK) once clean.
+UPDATE jobs SET job_id = job_id + 4294967296
+WHERE job_id < 0
+  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.job_id = jobs.job_id + 4294967296);
+UPDATE jobs SET preempted_by = preempted_by + 4294967296
+WHERE preempted_by < 0;
+UPDATE tres_usage t SET job_id = job_id + 4294967296
+WHERE job_id < 0
+  AND NOT EXISTS (
+    SELECT 1 FROM tres_usage u
+    WHERE u.job_id = t.job_id + 4294967296 AND u.tres_type = t.tres_type
+  );
 
 -- users.default_account is the single source of truth for a user's default
 -- account (the scheduler reads it via the association cache). associations
@@ -382,10 +395,7 @@ pub async fn job_accounting_states(
     if job_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    // Keyed by the stored form so a returned row is decoded by the id it was
-    // queried with, never by narrowing whatever the column holds.
-    let queried: HashMap<i64, JobId> = job_ids.iter().map(|&id| (id as i64, id)).collect();
-    let stored: Vec<i64> = queried.keys().copied().collect();
+    let stored: Vec<i64> = job_ids.iter().map(|&id| id as i64).collect();
     let rows =
         sqlx::query("SELECT job_id, state, user_name, start_time FROM jobs WHERE job_id = ANY($1)")
             .bind(&stored)
@@ -394,15 +404,15 @@ pub async fn job_accounting_states(
 
     Ok(rows
         .into_iter()
-        .filter_map(|r| {
-            let job_id = queried.get(&r.get::<i64, _>("job_id")).copied()?;
+        .map(|r| {
+            let job_id = r.get::<i64, _>("job_id") as JobId;
             let user_name: String = r.get("user_name");
             let start_time: Option<DateTime<Utc>> = r.get("start_time");
             let row = AccountingRowState {
                 state: r.get("state"),
                 needs_start_backfill: user_name.is_empty() || start_time.is_none(),
             };
-            Some((job_id, row))
+            (job_id, row)
         })
         .collect())
 }
@@ -452,13 +462,6 @@ async fn update_usage(
     .await?;
 
     Ok(())
-}
-
-/// A stored id back to the in-memory `JobId` it was written from. Rows written
-/// before the columns were widened hold the id narrowed to 32 bits, so a large id
-/// reads back negative; truncating to the low 32 bits recovers it either way.
-fn decode_job_id(stored: i64) -> JobId {
-    stored as JobId
 }
 
 /// Job record returned from history queries.
@@ -532,7 +535,7 @@ pub async fn get_job_history(
     let records = rows
         .iter()
         .map(|row| JobRecord {
-            job_id: decode_job_id(row.get("job_id")),
+            job_id: row.get::<i64, _>("job_id") as JobId,
             name: row.get("name"),
             user_name: row.get("user_name"),
             account: row.get("account"),
@@ -548,7 +551,9 @@ pub async fn get_job_history(
             start_time: row.get("start_time"),
             end_time: row.get("end_time"),
             reservation: row.get("reservation"),
-            preempted_by: row.get::<Option<i64>, _>("preempted_by").map(decode_job_id),
+            preempted_by: row
+                .get::<Option<i64>, _>("preempted_by")
+                .map(|id| id as JobId),
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
         })
@@ -1753,9 +1758,8 @@ mod job_history_tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn job_ids_past_i32_survive_the_accounting_round_trip() -> anyhow::Result<()> {
         let pool = test_pool().await?;
-        // The largest id the scheduler can hand out. Narrowed to i32 it arrived as
-        // -1 and, job_id being the primary key, landed on whatever row held that id
-        // rather than failing.
+        // The largest id the scheduler can hand out; as i32 it wrapped to -1 and,
+        // job_id being the primary key, overwrote whatever row already held -1.
         let id = u32::MAX;
         let preempter = id - 1;
         let user = format!("spur_wide_id_{}", std::process::id());
@@ -1802,38 +1806,97 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
-    async fn a_row_written_before_the_widening_reads_back_under_its_real_id() -> anyhow::Result<()>
-    {
+    async fn migrate_rewrites_a_legacy_narrowed_row_to_its_real_id() -> anyhow::Result<()> {
         let pool = test_pool().await?;
-        // What a pre-fix controller left behind: the id narrowed to 32 bits, which
-        // for u32::MAX was stored as -1. Widening the column does not rewrite it,
-        // so history has to keep decoding it to the id the job actually had.
+        // A pre-fix controller stored u32::MAX as -1 in the narrow columns; migrate
+        // must widen and rewrite it so reads and reconciler lookups agree on the id.
         let id = u32::MAX;
         let user = format!("spur_legacy_id_{}", std::process::id());
-        delete_jobs(&pool, &[id]).await.ok();
+        let outcome = migrate_rewrites_legacy_row_body(&pool, id, &user).await;
+        clear_user_rows(&pool, &user).await.ok();
+        let restore = widen_id_columns(&pool).await;
+        outcome.and(restore)
+    }
+
+    async fn migrate_rewrites_legacy_row_body(
+        pool: &PgPool,
+        id: JobId,
+        user: &str,
+    ) -> anyhow::Result<()> {
+        clear_user_rows(pool, user).await?;
+        narrow_id_columns(pool).await?;
         sqlx::query(
             "INSERT INTO jobs (job_id, name, user_name, state, submit_time, preempted_by) \
              VALUES ($1, 'legacy', $2, 'COMPLETED', $3, $4)",
         )
         .bind(-1_i64)
-        .bind(&user)
+        .bind(user)
         .bind(Utc::now())
         .bind(-2_i64)
-        .execute(&pool)
+        .execute(pool)
         .await?;
 
-        let history = get_job_history(&pool, Some(&user), None, None, None, &[], 100).await?;
-        let row = history.first().expect("the legacy row must be returned");
+        migrate(pool).await?;
+
+        let history = get_job_history(pool, Some(user), None, None, None, &[], 100).await?;
+        let row = history.first().expect("the migrated row must be returned");
         assert_eq!(
             row.job_id, id,
-            "a narrowed id must decode to its real value"
+            "the narrowed id must be rewritten to its real value"
         );
         assert_eq!(row.preempted_by, Some(id - 1));
 
-        sqlx::query("DELETE FROM jobs WHERE user_name = $1")
+        let states = job_accounting_states(pool, &[id]).await?;
+        assert!(
+            states.contains_key(&id),
+            "the reconciler looks the row up by its real id, so the rewrite must match it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_skips_a_legacy_id_whose_real_id_already_exists() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        // Defensive: if the true id is already taken, the rewrite must skip the
+        // negative row rather than duplicate it or violate the primary key.
+        let user = format!("spur_guard_id_{}", std::process::id());
+        clear_user_rows(&pool, &user).await.ok();
+        for stored in [(u32::MAX as i64), -1_i64] {
+            sqlx::query(
+                "INSERT INTO jobs (job_id, name, user_name, state, submit_time) \
+                 VALUES ($1, 'row', $2, 'COMPLETED', $3)",
+            )
+            .bind(stored)
             .bind(&user)
+            .bind(Utc::now())
             .execute(&pool)
             .await?;
+        }
+
+        migrate(&pool).await?;
+
+        let negatives: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE user_name = $1 AND job_id < 0")
+                .bind(&user)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            negatives, 1,
+            "the colliding negative row must be left untouched"
+        );
+        let at_true_id: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE user_name = $1 AND job_id = $2")
+                .bind(&user)
+                .bind(u32::MAX as i64)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            at_true_id, 1,
+            "the pre-existing true-id row must be the only one"
+        );
+
+        clear_user_rows(&pool, &user).await?;
         Ok(())
     }
 
@@ -1841,40 +1904,39 @@ mod job_history_tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn migrate_widens_pre_fix_integer_job_ids() -> anyhow::Result<()> {
         let pool = test_pool().await?;
+        let outcome = migrate_widens_body(&pool).await;
+        // Restore the shared schema even on the failure path, so a serial `--ignored`
+        // run does not leave every later test on a narrow column.
+        let restore = widen_id_columns(&pool).await;
+        outcome.and(restore)
+    }
 
+    async fn migrate_widens_body(pool: &PgPool) -> anyhow::Result<()> {
         // Reconstruct a pre-fix database by narrowing the three id columns back,
         // then let migrate() perform the upgrade an existing cluster would see.
-        sqlx::query("ALTER TABLE jobs ALTER COLUMN job_id TYPE INTEGER")
-            .execute(&pool)
-            .await?;
-        sqlx::query("ALTER TABLE jobs ALTER COLUMN preempted_by TYPE INTEGER")
-            .execute(&pool)
-            .await?;
-        sqlx::query("ALTER TABLE tres_usage ALTER COLUMN job_id TYPE INTEGER")
-            .execute(&pool)
-            .await?;
+        narrow_id_columns(pool).await?;
         for (table, column) in id_columns() {
             assert_eq!(
-                column_type(&pool, table, column).await?,
+                column_type(pool, table, column).await?,
                 "integer",
                 "{table}.{column} must start narrow for this to test anything"
             );
         }
 
-        migrate(&pool).await?;
+        migrate(pool).await?;
 
         for (table, column) in id_columns() {
             assert_eq!(
-                column_type(&pool, table, column).await?,
+                column_type(pool, table, column).await?,
                 "bigint",
                 "migrate must widen {table}.{column} on an existing database"
             );
         }
 
         // Idempotent: a second run leaves the widened columns alone.
-        migrate(&pool).await?;
+        migrate(pool).await?;
         for (table, column) in id_columns() {
-            assert_eq!(column_type(&pool, table, column).await?, "bigint");
+            assert_eq!(column_type(pool, table, column).await?, "bigint");
         }
         Ok(())
     }
@@ -1885,6 +1947,36 @@ mod job_history_tests {
             ("jobs", "preempted_by"),
             ("tres_usage", "job_id"),
         ]
+    }
+
+    async fn narrow_id_columns(pool: &PgPool) -> anyhow::Result<()> {
+        for stmt in [
+            "ALTER TABLE jobs ALTER COLUMN job_id TYPE INTEGER",
+            "ALTER TABLE jobs ALTER COLUMN preempted_by TYPE INTEGER",
+            "ALTER TABLE tres_usage ALTER COLUMN job_id TYPE INTEGER",
+        ] {
+            sqlx::query(stmt).execute(pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn widen_id_columns(pool: &PgPool) -> anyhow::Result<()> {
+        for stmt in [
+            "ALTER TABLE jobs ALTER COLUMN job_id TYPE BIGINT",
+            "ALTER TABLE jobs ALTER COLUMN preempted_by TYPE BIGINT",
+            "ALTER TABLE tres_usage ALTER COLUMN job_id TYPE BIGINT",
+        ] {
+            sqlx::query(stmt).execute(pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_user_rows(pool: &PgPool, user: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM jobs WHERE user_name = $1")
+            .bind(user)
+            .execute(pool)
+            .await?;
+        Ok(())
     }
 
     async fn column_type(pool: &PgPool, table: &str, column: &str) -> anyhow::Result<String> {
