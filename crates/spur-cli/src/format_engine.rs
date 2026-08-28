@@ -309,9 +309,8 @@ impl OutputStyle {
     }
 }
 
-/// Join field values with the delimiter, unpadded and untruncated. Literal tokens are
-/// dropped: the delimiter replaces whatever spacing the format string asked for. Empty
-/// values keep their separators, so the field count stays fixed for the caller parsing it.
+/// Join field values with the delimiter, unpadded and untruncated; literal spacing tokens
+/// are dropped. Empty values keep their separators so the field count stays fixed.
 fn join_fields(
     tokens: &[FormatToken],
     value: &dyn Fn(&FormatField) -> String,

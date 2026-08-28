@@ -866,8 +866,8 @@ Scripted output
 ---------------
 
 ``sacctmgr show`` prints a column-aligned table for reading. For scripts, three
-Slurm flags change that rendering; they are global, so they may appear before or
-after the subcommand.
+Slurm flags change that rendering; they are global, so they may appear anywhere on
+the command line, including after the entity and its ``key=value`` filters.
 
 .. list-table::
    :header-rows: 1
@@ -896,13 +896,17 @@ stable across rows.
 Delimited output ignores column widths and truncation, so a long value is printed
 in full rather than clipped to fit a column.
 
+Field values are not escaped. A free-text field carrying a literal ``|`` (an
+account ``Descr``/``Org``, or a transaction's ``Info``) shifts every field after
+it, so ``cut -d'|'`` reads the wrong column. Slurm behaves identically; treat
+delimited output as unambiguous only when the fields you select cannot contain ``|``.
+
 .. note::
 
-   ``-p`` and ``-P`` work for ``show account`` and ``show qos``.
-   For ``show user``, ``show association``, ``show tres``, and ``show txn``,
-   Spur does not model the columns, so it refuses the flag with an error naming
-   the entity rather than printing padded text a script cannot parse. ``-n``
-   works for every entity.
+   ``-p`` and ``-P`` work for ``show account``, ``show qos``, and ``show txn``.
+   For ``show user``, ``show association``, and ``show tres``, Spur does not model
+   the columns, so it refuses the flag with an error naming the entity rather than
+   printing padded text a script cannot parse. ``-n`` works for every entity.
 
    Passing both ``-p`` and ``-P`` gives ``-P``. Slurm applies whichever came
    last; the flag order is not visible here, so the no-trailing form wins.
