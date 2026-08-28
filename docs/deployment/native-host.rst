@@ -394,8 +394,8 @@ CPU and Memory Limits (cgroups)
 
 ``spurd`` puts the payload it launches for a job into a cgroup-v2 group at
 ``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
-allocated** — the cores, memory, and swap the scheduler actually granted this node,
-not what the job asked for.
+allocated** — the cores and memory the scheduler actually granted this node, not
+what the job asked for.
 
 This covers the batch payload: ``sbatch`` scripts, ``--pty`` jobs, and
 containerized jobs (a container's process tree inherits the job cgroup). It does
@@ -407,7 +407,9 @@ Out of the box the batch payload gets:
 - ``cpuset.cpus`` pinned to its allocated cores.
 - ``memory.max`` at its allocated memory, with ``memory.high`` at the same value so
   the kernel reclaims against the job before killing it.
-- ``memory.swap.max`` at ``0`` — jobs cannot fall back on host swap.
+- ``memory.swap.max`` left alone: swap is unconstrained by default, as in Slurm, so
+  ``memory.max`` bounds resident memory only. Set ``constrain_swap`` to make
+  ``--mem`` a hard cap.
 - ``memory.oom.group`` set, so an OOM kills the whole job rather than one process.
 - ``pids.max`` as a fork-bomb guard.
 

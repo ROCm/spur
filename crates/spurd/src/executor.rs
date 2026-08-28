@@ -1943,7 +1943,8 @@ mod cgroup_files_tests {
         assert_eq!(get("memory.max"), Some(expect_mem.as_str()));
         // AllowedRAMSpace=100 collapses the soft limit onto the hard one.
         assert_eq!(get("memory.high"), Some(expect_mem.as_str()));
-        assert_eq!(get("memory.swap.max"), Some("0"));
+        // Swap is unconstrained by default, as in Slurm.
+        assert_eq!(get("memory.swap.max"), None);
         assert_eq!(get("memory.oom.group"), Some("1"));
         assert_eq!(get("pids.max"), Some("1024")); // max(4*256, 1024)
         assert_eq!(get("cpuset.cpus"), Some("0,1,2,3"));

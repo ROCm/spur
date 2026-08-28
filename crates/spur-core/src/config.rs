@@ -1463,8 +1463,9 @@ pub struct CgroupConfig {
     /// `memory.high` stays at 100%, so above 100 reclaims first and kills later.
     #[serde(default = "default_allowed_ram_percent")]
     pub allowed_ram_percent: u32,
-    /// Bound swap via `memory.swap.max` (`ConstrainSwapSpace`).
-    #[serde(default = "default_true_fn")]
+    /// Bound swap via `memory.swap.max` (`ConstrainSwapSpace`). Off by default,
+    /// as in Slurm: turning it on kills jobs that used to survive by swapping.
+    #[serde(default)]
     pub constrain_swap: bool,
     /// Swap allowance as a percent of the memory budget (`AllowedSwapSpace`), 0 =
     /// none. Uncapped above 100, as in Slurm: swap may legitimately exceed RAM.
@@ -1497,7 +1498,7 @@ impl Default for CgroupConfig {
             cpu_quota: false,
             constrain_ram_space: true,
             allowed_ram_percent: default_allowed_ram_percent(),
-            constrain_swap: true,
+            constrain_swap: false,
             allowed_swap_percent: 0,
             min_ram_mb: default_min_ram_mb(),
             oom_kill_job: true,
@@ -2168,12 +2169,14 @@ mod tests {
     fn cgroup_config_defaults_match_intended_posture() {
         let c = CgroupConfig::default();
         assert!(c.enabled);
-        assert!(c.constrain_cores && c.constrain_ram_space && c.constrain_swap);
+        assert!(c.constrain_cores && c.constrain_ram_space);
         assert!(c.oom_kill_job);
         // Degrade rather than stop accepting work on a misconfigured host.
         assert!(!c.required);
         // Slurm bounds whole-core allocations with the cpuset alone (D4).
         assert!(!c.cpu_quota);
+        // Off as in Slurm: bounding swap kills jobs that used to ride it out.
+        assert!(!c.constrain_swap);
         assert_eq!(c.allowed_swap_percent, 0);
         assert_eq!(c.allowed_ram_percent, 100);
         assert_eq!(c.min_ram_mb, 30);
@@ -2217,12 +2220,16 @@ mod tests {
 
     #[test]
     fn swap_ceiling_is_a_percent_of_allocated_memory() {
-        // Default 0% => memory.swap.max = 0, i.e. Slurm's `memsw - mem` with
+        // 0% => memory.swap.max = 0, i.e. Slurm's `memsw - mem` with
         // AllowedSwapSpace=0 and AllowedRAMSpace=100.
-        let c = CgroupConfig::default();
+        let c = CgroupConfig {
+            constrain_swap: true,
+            ..CgroupConfig::default()
+        };
         assert_eq!(c.limits_for(4, 1024, &[]).unwrap().swap_max_bytes, Some(0));
 
         let c50 = CgroupConfig {
+            constrain_swap: true,
             allowed_swap_percent: 50,
             ..CgroupConfig::default()
         };
@@ -2242,6 +2249,7 @@ mod tests {
     fn swap_ceiling_is_independent_of_the_ram_percent() {
         // Slurm's `memsw - mem` cancels the AllowedRAMSpace term.
         let c = CgroupConfig {
+            constrain_swap: true,
             allowed_ram_percent: 150,
             allowed_swap_percent: 25,
             ..CgroupConfig::default()
@@ -2291,6 +2299,7 @@ mod tests {
         // from, so with RAM unconstrained Slurm reverts it to 100%.
         let c = CgroupConfig {
             constrain_ram_space: false,
+            constrain_swap: true,
             allowed_ram_percent: 150,
             allowed_swap_percent: 50,
             ..CgroupConfig::default()
@@ -2377,7 +2386,7 @@ mod tests {
         // Slurm applies no upper bound to AllowedSwapSpace, so a `cgroup.conf`
         // carrying one must not stop the controller from starting.
         let cfg = SlurmConfig::load_from_str(
-            "cluster_name = \"test\"\n[cgroup]\nallowed_swap_percent = 200\n",
+            "cluster_name = \"test\"\n[cgroup]\nconstrain_swap = true\nallowed_swap_percent = 200\n",
         )
         .expect("parses");
         assert_eq!(cfg.cgroup.allowed_swap_percent, 200);

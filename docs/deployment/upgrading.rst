@@ -261,8 +261,8 @@ Job resource enforcement (``[cgroup]``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The release introducing the ``[cgroup]`` section changed what ``spurd`` writes for
-a config that has **no** ``[cgroup]`` section. Two of these can affect jobs that
-ran fine before the upgrade.
+a config that has **no** ``[cgroup]`` section. One of these can affect jobs that
+ran fine before the upgrade; the rest relax an existing bound.
 
 .. list-table::
    :header-rows: 1
@@ -272,10 +272,6 @@ ran fine before the upgrade.
      - Before
      - After
      - Effect
-   * - ``memory.swap.max``
-     - unset — swap unbounded
-     - ``0`` — no swap
-     - **A job that was completing by swapping is now OOM-killed.**
    * - ``memory.high``
      - unset
      - equal to ``memory.max``
@@ -297,8 +293,7 @@ To keep the previous behavior, put this in ``spur.conf`` on every compute node
 .. code-block:: toml
 
    [cgroup]
-   cpu_quota = true        # restore the CFS quota
-   constrain_swap = false  # restore unbounded swap
+   cpu_quota = true  # restore the CFS quota
 
 ``spurd`` reads ``[cgroup]`` only at startup, so this has to be in place before the
 restart — ``scontrol reconfigure`` will not apply it afterwards.

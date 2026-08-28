@@ -126,7 +126,8 @@ class TestCgroupDefaults:
         # allowed_ram_percent defaults to 100, which collapses the soft ceiling
         # onto the hard one.
         assert vals["memory.high"] == vals["memory.max"], probe.context()
-        assert vals["memory.swap.max"] == "0", probe.context()
+        # Swap is unconstrained by default, as in Slurm.
+        assert vals["memory.swap.max"] == "max", probe.context()
         assert vals["memory.oom.group"] == "1", probe.context()
         assert _core_count(vals["cpuset.cpus"]) == 2, probe.context()
         # Slurm bounds CPU with the cpuset alone; the CFS quota is opt-in.

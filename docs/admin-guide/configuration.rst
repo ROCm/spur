@@ -1239,8 +1239,10 @@ unaffected: there the kubelet owns the cgroups.
        reverts to 100%.
    * - ``constrain_swap``
      - bool
-     - ``true``
-     - Bound swap via ``memory.swap.max``. Turning this on with
+     - ``false``
+     - Bound swap via ``memory.swap.max``. Off by default, as in Slurm: while
+       off, ``memory.max`` bounds resident memory only and a job that outgrows
+       ``--mem`` swaps instead of being killed. Turning it on with
        ``constrain_ram_space`` off still bounds memory — see below.
    * - ``allowed_swap_percent``
      - int
@@ -1377,9 +1379,11 @@ them, so a site's existing percentages carry over directly.
 
 Deliberate differences from Slurm:
 
-- **Spur enforces by default.** Every Slurm ``Constrain*`` defaults to ``no``. A
-  job that overran ``--mem`` or leaned on host swap under a stock Slurm
-  configuration will be reclaimed against, or killed, on Spur.
+- **Spur constrains cores and RAM by default.** Every Slurm ``Constrain*``
+  defaults to ``no``, so a job that overran ``--mem`` under a stock Slurm
+  configuration will be reclaimed against, or killed, on Spur. Swap is the
+  exception and stays off, matching Slurm: bounding it turns a job that
+  completed slowly into one that is killed outright.
 - **``allowed_ram_percent = 0`` is rejected**, where Slurm would accept it and
   floor every job at ``MinRAMSpace``. That silently caps a whole cluster at
   30 MiB per job, so Spur treats it as the typo it almost certainly is. Every
