@@ -622,9 +622,21 @@ takes over as leader inherits its predecessor's pending jobs immediately.
 
 While accounting is enabled and a cache holds no snapshot, jobs that name a QOS
 or an account are **not scheduled**. They pend with reason
-``AccountingUnavailable`` and start normally once the cache loads. The
+``AccountingUnavailable`` and start on their own once the cache loads. The
 alternative is worse: a running job is never re-checked against limits, so a job
 admitted during that window stays over the cap for its entire run.
+
+The hold is **self-clearing**, including on a cold start. If the accounting
+database is unreachable when ``spurctld`` starts, the controller does not give
+up: it retries the connection in the background with backoff and, once the
+database returns, connects, migrates, and starts the cache-refresh loops. The
+next scheduling pass then reads a loaded cache and admits the held jobs. No
+operator action is needed — there is deliberately no manual override, because
+``AccountingUnavailable`` is not an administrative hold (``scontrol release``
+does not apply to it) and clearing it by hand would admit jobs against the very
+limits that could not be read. The only operator lever is the configuration
+itself: fix ``database_url`` (or clear it to disable accounting) and the hold
+resolves accordingly.
 
 Related cases:
 

@@ -4804,6 +4804,22 @@ impl ClusterManager {
         }
     }
 
+    /// Whether QOS limits can be *read* right now: either accounting is off (no
+    /// caps exist to read) or the QOS cache has loaded at least one snapshot.
+    /// This is the canonical per-cache verdict `accounting_block` gates on; it
+    /// is exposed so operator-facing surfaces report the same thing rather than
+    /// re-deriving a weaker `loaded`-only check that misreports both the
+    /// accounting-disabled case (no caps) and a split cache (one cache warm).
+    pub(crate) fn qos_limits_readable(&self) -> bool {
+        !self.config().accounting.enabled() || self.qos_cache.is_loaded()
+    }
+
+    /// Whether association limits can be read right now; the association-cache
+    /// counterpart of [`qos_limits_readable`](Self::qos_limits_readable).
+    pub(crate) fn association_limits_readable(&self) -> bool {
+        !self.config().accounting.enabled() || self.association_cache.is_loaded()
+    }
+
     /// Holds a candidate whose accounting limits cannot be read. Admission is the
     /// last point at which a cap can still be applied — a running job is never
     /// re-checked — so a cold cache pends the job rather than gating it against a
@@ -4814,7 +4830,7 @@ impl ClusterManager {
         }
 
         if let Some(name) = job.spec.qos.as_deref().filter(|n| !n.is_empty()) {
-            if !self.qos_cache.is_loaded() {
+            if !self.qos_limits_readable() {
                 return Some(PendingReason::AccountingUnavailable);
             }
             // Loaded and still absent means the QOS was removed after the job
@@ -4825,7 +4841,7 @@ impl ClusterManager {
         }
 
         let has_account = job.spec.account.as_deref().is_some_and(|a| !a.is_empty());
-        if has_account && !self.association_cache.is_loaded() {
+        if has_account && !self.association_limits_readable() {
             return Some(PendingReason::AccountingUnavailable);
         }
 
@@ -17696,6 +17712,80 @@ mod tests {
         let ids = submit_three_under_capped_qos(&cm);
 
         assert_eq!(admitted_of(&cm, &ids), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_cache_hold_clears_once_the_qos_cache_reloads() {
+        // The fail-closed hold must be self-clearing. A controller that boots
+        // with the database down keeps the cache cold and holds every job; once
+        // the background bring-up connects and a refresh lands, the same
+        // scheduling pass that held these jobs must admit them — no operator
+        // release. This mirrors that transition at the cache boundary the
+        // scheduler reads.
+        let dir = TempDir::new().unwrap();
+        let cm = accounting_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let ids = submit_three_under_capped_qos(&cm);
+
+        cm.qos_cache().reset();
+        assert_eq!(admitted_of(&cm, &ids), 0, "a cold cache holds every job");
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(ids[0]).unwrap().pending_reason,
+            PendingReason::AccountingUnavailable
+        );
+
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(
+            admitted_of(&cm, &ids),
+            2,
+            "once the cache reloads the hold clears and the cap applies"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn limits_readable_tracks_enabled_and_per_cache_state() {
+        // The canonical "can limits be read?" verdict is per cache: a cold cache
+        // on an accounting cluster is unreadable, and a warm QOS cache does not
+        // make the still-cold association cache readable. This split is exactly
+        // what a conjoined loaded-only check gets wrong.
+        let dir = TempDir::new().unwrap();
+        let cm = accounting_cluster(&dir).await;
+        assert!(!cm.qos_limits_readable());
+        assert!(!cm.association_limits_readable());
+
+        cm.qos_cache().insert(Qos {
+            name: "any".into(),
+            ..Default::default()
+        });
+        assert!(cm.qos_limits_readable());
+        assert!(
+            !cm.association_limits_readable(),
+            "a warm QOS cache must not vouch for a cold association cache"
+        );
+
+        cm.association_cache()
+            .insert_association("alice", "research");
+        assert!(cm.association_limits_readable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn limits_readable_is_true_when_accounting_is_disabled() {
+        // With no database there are no caps to read, so both caches read as
+        // "readable" even cold — the accounting-disabled case a loaded-only
+        // check misreports as "unreadable" forever.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(cm.qos_limits_readable());
+        assert!(cm.association_limits_readable());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
