@@ -138,11 +138,8 @@ CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_submit_time ON jobs(submit_time);
 CREATE INDEX IF NOT EXISTS idx_jobs_start_time ON jobs(start_time);
--- Serves the GrpWall consumption aggregate, which otherwise scans the whole job
--- history on every cache refresh; a refresh slow enough to time out leaves the
--- budget unenforced. end_time leads because it carries the window predicate and
--- is the only selective one: ordering by qos instead leaves nothing to narrow,
--- and the planner then prefers a full scan.
+-- Serves the GrpWall aggregate, which otherwise scans all job history per refresh;
+-- a first-refresh timeout leaves the budget unapplied. end_time leads: it bounds the window.
 CREATE INDEX IF NOT EXISTS idx_jobs_grp_wall_window ON jobs(end_time, qos, start_time)
     WHERE qos <> '' AND start_time IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_start, period_end);
@@ -1544,6 +1541,41 @@ mod job_history_tests {
         .await
     }
 
+    /// Seeds one job through the real start/end path on `conn`, so the EXPLAIN test
+    /// can build its fixture inside a transaction that rolls back. `end = None`
+    /// leaves the job running with a NULL end_time.
+    async fn seed_job(
+        conn: &mut PgConnection,
+        job_id: i32,
+        qos: &str,
+        start_time: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        record_job_start(
+            conn,
+            &JobStartRecord {
+                job_id: job_id as JobId,
+                name: "fixture".to_string(),
+                user: "root".to_string(),
+                account: String::new(),
+                partition: String::new(),
+                qos: qos.to_string(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                memory_mb: 0,
+                submit_time: start_time,
+                start_time,
+                reservation: Some(String::new()),
+            },
+        )
+        .await?;
+        if let Some(end_time) = end {
+            record_job_end(conn, job_id, "COMPLETED", 0, end_time, 0, 0, None, "", "").await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn get_job_history_query_builder() -> anyhow::Result<()> {
@@ -1918,6 +1950,48 @@ mod job_history_tests {
     async fn grp_wall_aggregate_is_servable_from_its_index() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let mut tx = pool.begin().await?;
+        let now = Utc::now();
+
+        // Seed a known shape inside the transaction so the plan is chosen from these
+        // rows, not from ambient statistics left by sibling tests: two in-window,
+        // one out-of-window, one still running (NULL end_time, the branch the
+        // predicate deliberately omits), one with no QOS. ANALYZE makes it visible
+        // to the planner; everything rolls back.
+        let base = 9_100_000 + (std::process::id() as i32 % 10_000) * 10;
+        seed_job(
+            &mut tx,
+            base,
+            "gw",
+            now - Duration::minutes(60),
+            Some(now - Duration::minutes(30)),
+        )
+        .await?;
+        seed_job(
+            &mut tx,
+            base + 1,
+            "gw",
+            now - Duration::days(5),
+            Some(now - Duration::days(2)),
+        )
+        .await?;
+        seed_job(
+            &mut tx,
+            base + 2,
+            "gw",
+            now - Duration::days(365),
+            Some(now - Duration::days(364)),
+        )
+        .await?;
+        seed_job(&mut tx, base + 3, "gw", now - Duration::minutes(15), None).await?;
+        seed_job(
+            &mut tx,
+            base + 4,
+            "",
+            now - Duration::minutes(45),
+            Some(now - Duration::minutes(20)),
+        )
+        .await?;
+        sqlx::query("ANALYZE jobs").execute(&mut *tx).await?;
 
         // A partial index qualifies only if its predicate is implied by the query's
         // WHERE, which is the part that rots silently when either side is edited.
@@ -1935,19 +2009,17 @@ mod job_history_tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // The scan node varies with table statistics — index-only on a populated
-        // table, a bitmap OR over the two end_time branches on a small one — so the
-        // pairing is asserted by which relation is read, not by node shape. With
-        // seqscan off, a full scan is what the planner falls back to when the index
-        // predicate is no longer implied, which is the rot this test is here for.
         assert!(
             plan.contains("idx_jobs_grp_wall_window"),
             "GrpWall consumption must be servable from idx_jobs_grp_wall_window; plan was:\n{plan}"
         );
+        // A broken predicate degrades to idx_jobs_start_time (start_time IS NOT NULL is
+        // indexable), not a seq scan — enable_seqscan = off is a cost penalty, not a
+        // prohibition. That index scans all history, so its absence is what ties cost to the window.
         assert!(
-            !plan.contains("Seq Scan on jobs"),
-            "the index no longer covers this query, so its cost tracks total history \
-             instead of the window; plan was:\n{plan}"
+            !plan.contains("idx_jobs_start_time"),
+            "the window predicate no longer reaches idx_jobs_grp_wall_window, so the plan \
+             degraded to the non-selective start_time index; plan was:\n{plan}"
         );
 
         tx.rollback().await?;
