@@ -4755,10 +4755,19 @@ impl ClusterManager {
         &self.association_cache
     }
 
+    /// Whether accounting is configured. A cluster with no `database_url` never
+    /// loads caps, so a cold cache there means "no caps exist" rather than
+    /// "caps could not be read".
+    pub(crate) fn accounting_enabled(&self) -> bool {
+        !self.config().accounting.database_url.is_empty()
+    }
+
     /// Limits beside live usage, per user and scope, for `scontrol show assoc_mgr`.
     /// Usage always reflects the job table; caps appear only where a cache holds a
     /// snapshot, which `limits_readable` reports so an operator can tell an
-    /// uncapped scope from an unreadable one.
+    /// enabled-but-cold cache from an accounting-off cluster with no caps at all.
+    /// `only_user` narrows the view to scopes that user takes part in, so a
+    /// non-admin caller cannot enumerate the cluster-wide QOS/account inventory.
     pub(crate) fn assoc_mgr_info(&self, only_user: Option<&str>) -> AssocMgrInfo {
         let jobs = self.jobs.read();
 
@@ -4773,7 +4782,7 @@ impl ClusterManager {
 
         let qos_records = qos_scopes
             .into_iter()
-            .map(|scope| {
+            .filter_map(|scope| {
                 let limits = defined_qos.get(&scope).map(|q| q.limits.clone());
                 // A QOS holds one set of per-user caps for everyone it governs.
                 let user_caps = limits.as_ref().map(|l| PerUserCaps {
@@ -4783,12 +4792,12 @@ impl ClusterManager {
                 });
                 let mut record = scope_usage(&jobs, &scope, qos_of, only_user, &[], |_| {
                     user_caps.clone().unwrap_or_default()
-                });
+                })?;
                 record.max_wall_minutes = limits.as_ref().and_then(|l| l.max_wall_minutes);
                 record.grp_tres = limits.as_ref().and_then(|l| l.grp_tres.clone());
                 record.grp_submit_jobs = limits.as_ref().and_then(|l| l.grp_submit_jobs);
                 record.user_caps = user_caps;
-                record
+                Some(record)
             })
             .collect();
 
@@ -4806,11 +4815,15 @@ impl ClusterManager {
 
         let assoc_records = assoc_scopes
             .into_iter()
-            .map(|scope| {
-                let defined_users: Vec<String> = defined_assoc
-                    .get(&scope)
-                    .map(|rows| rows.iter().map(|(user, _)| user.clone()).collect())
+            .filter_map(|scope| {
+                let rows = defined_assoc.get(&scope);
+                // The rows from `association_cache.all()` already carry each
+                // (user, account) limit, so read the per-user and group caps from
+                // them rather than re-locking the cache once per user.
+                let by_user: HashMap<&str, &AccountLimits> = rows
+                    .map(|rows| rows.iter().map(|(u, l)| (u.as_str(), l)).collect())
                     .unwrap_or_default();
+                let defined_users: Vec<String> = by_user.keys().map(|u| (*u).to_owned()).collect();
                 // An association carries no per-user TRES cap, so `max_tres` stays unset.
                 let mut record = scope_usage(
                     &jobs,
@@ -4819,31 +4832,34 @@ impl ClusterManager {
                     only_user,
                     &defined_users,
                     |user| {
-                        let limits = self.association_cache.limits(user, &scope);
+                        let limits = by_user.get(user);
                         PerUserCaps {
-                            max_jobs: limits.max_running_jobs,
-                            max_submit_jobs: limits.max_submit_jobs,
+                            max_jobs: limits.and_then(|l| l.max_running_jobs),
+                            max_submit_jobs: limits.and_then(|l| l.max_submit_jobs),
                             max_tres: None,
                         }
                     },
-                );
+                )?;
                 // The group caps are the account's, but the schema keys every
                 // association row separately, so take them from the first row
                 // rather than inventing a merge across rows that disagree.
-                if let Some((user, _)) = defined_assoc.get(&scope).and_then(|rows| rows.first()) {
-                    let limits = self.association_cache.limits(user, &scope);
+                if let Some((_, limits)) = rows.and_then(|rows| rows.first()) {
                     record.max_wall_minutes = limits.max_wall_minutes;
-                    record.grp_tres = limits.grp_tres;
+                    record.grp_tres = limits.grp_tres.clone();
                     record.grp_submit_jobs = limits.grp_submit_jobs;
                 }
-                record
+                Some(record)
             })
             .collect();
 
         AssocMgrInfo {
             qos_records,
             assoc_records,
-            limits_readable: self.qos_cache.is_loaded() && self.association_cache.is_loaded(),
+            limits_readable: limits_readable(
+                self.accounting_enabled(),
+                self.qos_cache.is_loaded(),
+                self.association_cache.is_loaded(),
+            ),
         }
     }
 
@@ -7073,6 +7089,15 @@ pub(crate) struct AssocMgrInfo {
     pub limits_readable: bool,
 }
 
+/// Whether the caps in an assoc-mgr response can be trusted as complete.
+/// Evaluated per cache: a cache is only ever unreadable when accounting is
+/// enabled yet its snapshot has not loaded. With accounting off there are no
+/// caps to load, so a cold cache is not a fault — otherwise the banner reads as
+/// a standing fault on a cluster that simply has no limits.
+pub(crate) fn limits_readable(enabled: bool, qos_loaded: bool, assoc_loaded: bool) -> bool {
+    !enabled || (qos_loaded && assoc_loaded)
+}
+
 /// A scope name only counts when it is actually set: an empty QOS or account
 /// string is the same as none.
 fn named(value: Option<&str>) -> Option<&str> {
@@ -7109,6 +7134,10 @@ fn queued_scopes(
 /// get an entry at zero usage so a cap on an idle association is still reported.
 /// Group figures are the scope's own and are never narrowed by `only_user`, since
 /// a group cap cannot be judged from one user's share.
+///
+/// `None` when `only_user` is set and that user neither holds work nor is defined
+/// under the scope: a user-scoped read only sees scopes it takes part in, so the
+/// rest are dropped rather than leaked as cluster-wide inventory.
 fn scope_usage(
     jobs: &HashMap<JobId, Job>,
     scope: &str,
@@ -7116,7 +7145,7 @@ fn scope_usage(
     only_user: Option<&str>,
     defined_users: &[String],
     caps_for: impl Fn(&str) -> PerUserCaps,
-) -> ScopeLimitUsage {
+) -> Option<ScopeLimitUsage> {
     let in_scope = |j: &Job| scope_of(j) == Some(scope);
 
     let mut users: BTreeSet<&str> = jobs
@@ -7127,7 +7156,11 @@ fn scope_usage(
     users.extend(defined_users.iter().map(String::as_str));
     users.retain(|u| only_user.is_none() || only_user == Some(u));
 
-    ScopeLimitUsage {
+    if only_user.is_some() && users.is_empty() {
+        return None;
+    }
+
+    Some(ScopeLimitUsage {
         scope: scope.to_owned(),
         grp_running_jobs: jobs
             .values()
@@ -7156,7 +7189,7 @@ fn scope_usage(
             })
             .collect(),
         ..Default::default()
-    }
+    })
 }
 
 /// Distinct nodes currently occupied by running jobs matching `pred`, so the
@@ -11139,9 +11172,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn assoc_mgr_info_reports_each_user_against_the_qos_cap() {
-        // The SPUR-205 shape: a user over MaxJobsPU with the cap in force. The
-        // record has to name the breach, since nothing else surfaces it once the
-        // jobs are running.
+        // A user over MaxJobsPU with the cap in force. The record has to name
+        // the breach, since nothing else surfaces it once the jobs are running.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 64, 128000);
@@ -11268,20 +11300,67 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn assoc_mgr_info_reports_usage_with_caps_it_could_not_read() {
-        // With no cache snapshot the usage still stands; only the caps are missing,
-        // and `limits_readable` is what says so rather than the scope looking
-        // uncapped. Shown through the association cache, which starts cold.
+        // Accounting is on and the QOS cache is warm, but the association cache
+        // has not loaded, so its caps are genuinely missing — `limits_readable`
+        // is what says so rather than the scope looking uncapped.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.accounting.database_url = "postgres://unused-in-test".into();
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(capped_qos("cnt", Default::default()));
+        run_qos_job_for(&cm, "alice", "cnt", "n1");
+
+        assert!(!cm.association_cache().is_loaded());
+        let info = cm.assoc_mgr_info(None);
+        assert!(!info.limits_readable);
+        let record = &info.qos_records[0];
+        assert_eq!(record.users[0].running_jobs, 1);
+        assert!(record.users[0].exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn limits_readable_gates_on_accounting_and_each_cache() {
+        // Accounting off: no caps to load, so a cold cache is readable, not a
+        // fault. Accounting on: both caches must be warm, so a split cache still
+        // reads as incomplete.
+        assert!(limits_readable(false, false, false));
+        assert!(limits_readable(true, true, true));
+        assert!(!limits_readable(true, true, false));
+        assert!(!limits_readable(true, false, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_reads_limits_when_accounting_is_disabled() {
+        // With accounting off there are no caps to load, so a cold cache is not a
+        // fault: the banner must not stand at `LimitsReadable=NO` on a cluster
+        // that simply has no limits.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 64, 128000);
         run_account_job_for(&cm, "alice", "tenant-a", "n1");
 
         let info = cm.assoc_mgr_info(None);
-        assert!(!info.limits_readable);
-        let record = &info.assoc_records[0];
-        assert_eq!(record.users[0].running_jobs, 1);
-        assert_eq!(record.users[0].caps.max_jobs, None);
-        assert!(record.users[0].exceeded_caps().is_empty());
+        assert!(info.limits_readable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_hides_scopes_a_filtered_user_has_no_part_in() {
+        // A user-scoped read must not enumerate the cluster's QOS inventory: a QOS
+        // the caller holds no work under is dropped, not returned empty.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache()
+            .insert(capped_qos("mine", Default::default()));
+        cm.qos_cache()
+            .insert(capped_qos("theirs", Default::default()));
+        run_qos_job_for(&cm, "alice", "mine", "n1");
+        run_qos_job_for(&cm, "bob", "theirs", "n1");
+
+        let info = cm.assoc_mgr_info(Some("alice"));
+        let scopes: Vec<&str> = info.qos_records.iter().map(|r| r.scope.as_str()).collect();
+        assert_eq!(scopes, vec!["mine"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
