@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,7 +15,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use spur_core::config::MemlockLimit;
+use spur_core::config::{MemlockLimit, SwapLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
@@ -161,6 +162,8 @@ pub struct JobLaunchConfig {
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
+    /// Swap budget for the job's cgroup.
+    pub swap_limit: SwapLimit,
     /// I/O mode for the job.
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
@@ -502,7 +505,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -518,15 +521,11 @@ async fn spawn_job_process(
     };
     let work_dir = effective_work_dir.as_str();
 
-    // Wrap script with burst buffer stage-in/stage-out if configured
-    let script = if let Ok(bb) = std::env::var("SPUR_BURST_BUFFER") {
-        if !bb.is_empty() {
-            wrap_with_burst_buffer(script, &bb)
-        } else {
-            script.to_string()
-        }
-    } else {
-        script.to_string()
+    // The directive is per job, so it comes from the job's environment. Reading
+    // the daemon's own env instead would only ever see a cluster-wide value.
+    let script = match environment.get("SPUR_BURST_BUFFER") {
+        Some(bb) if !bb.is_empty() => wrap_with_burst_buffer(script, bb),
+        _ => script.to_string(),
     };
     let script = script.as_str();
 
@@ -756,6 +755,25 @@ async fn spawn_job_process(
         });
     }
 
+    // Join pre-exec, not parent-side after spawn: under `unshare --fork` a
+    // parent-side move races the fork and misses the workload's cgroup.
+    let cgroup_procs = cgroup_path
+        .as_ref()
+        .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
+    // fd 2 is redirected to the job's stdio before pre_exec runs, so hand the
+    // child a dup of spurd's stderr (CLOEXEC) to report a join failure.
+    let mut cgroup_log_fd: RawFd = -1;
+    if let Some(procs) = cgroup_procs {
+        cgroup_log_fd = dup_cloexec(libc::STDERR_FILENO);
+        let log_fd = cgroup_log_fd;
+        unsafe {
+            cmd.pre_exec(move || {
+                join_cgroup_self(&procs, log_fd);
+                Ok(())
+            });
+        }
+    }
+
     // Issue #99, #107: Run job as the submitting user (not root).
     // Must set supplementary groups (video, render) so the process can
     // access GPU device nodes.
@@ -824,7 +842,13 @@ async fn spawn_job_process(
         });
     }
 
-    let mut child = cmd.spawn().context("failed to spawn job process")?;
+    let spawn_result = cmd.spawn();
+    if cgroup_log_fd >= 0 {
+        unsafe {
+            libc::close(cgroup_log_fd);
+        }
+    }
+    let mut child = spawn_result.context("failed to spawn job process")?;
 
     if piped_mpi_stdio {
         let shared = stderr_resolved == stdout_resolved;
@@ -849,12 +873,8 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Move process into cgroup
-    if let Some(ref cgroup) = cgroup_path {
-        if let Some(pid) = child.id() {
-            move_to_cgroup(cgroup, pid);
-        }
-    }
+    // Cgroup placement already happened pre-exec (join_cgroup_self); a move here
+    // would race the wrapper's fork.
 
     debug!(
         job_id,
@@ -877,6 +897,7 @@ fn setup_cgroup(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
+    swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
@@ -923,6 +944,16 @@ fn setup_cgroup(
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
             warn!(job_id, error = %e, "failed to set memory.max");
         }
+        // memory.max bounds resident memory only: with swap available the
+        // kernel pages the overflow out instead of OOM-killing. Opt-in, since
+        // capping swap starts killing jobs that used to survive.
+        if let Some(swap_bytes) = swap_limit.bytes_for(memory_bytes) {
+            if let Err(e) =
+                std::fs::write(cgroup_path.join("memory.swap.max"), swap_bytes.to_string())
+            {
+                warn!(job_id, error = %e, "failed to set memory.swap.max");
+            }
+        }
     }
 
     // OOM isolation: kill entire cgroup on OOM, not a random process
@@ -961,19 +992,54 @@ fn setup_cgroup(
     Ok(Some(cgroup_path))
 }
 
-/// Move a process into a cgroup. Returns true if successful.
-fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
-    let procs_file = cgroup_path.join("cgroup.procs");
-    if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
-        warn!(
-            pid,
-            error = %e,
-            "failed to move process to cgroup — job runs without isolation"
-        );
-        false
-    } else {
-        true
+/// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
+/// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
+fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
+    let pid = unsafe { libc::getpid() };
+
+    let mut buf = [0u8; 24];
+    let mut i = buf.len();
+    let mut n = pid.max(0) as u64;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
     }
+    let digits = &buf[i..];
+
+    unsafe {
+        let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            warn_cgroup_join_failed(log_fd);
+            return;
+        }
+        let written = libc::write(fd, digits.as_ptr() as *const libc::c_void, digits.len());
+        libc::close(fd);
+        if written < 0 {
+            warn_cgroup_join_failed(log_fd);
+        }
+    }
+}
+
+/// Async-signal-safe warning for a failed cgroup join: a fixed message to
+/// `log_fd`, or a no-op when it is negative.
+fn warn_cgroup_join_failed(log_fd: RawFd) {
+    if log_fd < 0 {
+        return;
+    }
+    const MSG: &[u8] = b"spur: failed to join cgroup; job runs without resource limits\n";
+    unsafe {
+        libc::write(log_fd, MSG.as_ptr() as *const libc::c_void, MSG.len());
+    }
+}
+
+/// Duplicate `fd` with CLOEXEC set, returning the new fd or -1. The copy is
+/// usable in the pre-exec child but closes automatically at exec.
+fn dup_cloexec(fd: RawFd) -> RawFd {
+    unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1411,7 +1477,13 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+        cfg.swap_limit,
+    )?;
 
     // Sync pipe: child writes status, parent reads.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
@@ -1436,6 +1508,18 @@ async fn launch_container_job(
     let container_env = config.container_env.clone();
     let entrypoint = config.entrypoint.clone();
 
+    // Precomputed before fork; the forked child joins the cgroup itself (below).
+    let cgroup_procs = cgroup_path
+        .as_ref()
+        .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
+    // Dup spurd's stderr (CLOEXEC) so the child can report a join failure; its
+    // own stderr is wired to the job before the join runs.
+    let cgroup_log_fd = if cgroup_procs.is_some() {
+        dup_cloexec(libc::STDERR_FILENO)
+    } else {
+        -1
+    };
+
     match unsafe { nix::unistd::fork().context("fork for container job")? } {
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
@@ -1454,6 +1538,12 @@ async fn launch_container_job(
                     let _ = libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
                     libc::_exit(1);
                 }
+            }
+
+            // Join while still root, before pivot_root hides the host cgroupfs and
+            // before close_inherited_fds reaps the log fd.
+            if let Some(ref procs) = cgroup_procs {
+                join_cgroup_self(procs, cgroup_log_fd);
             }
 
             crate::container::close_inherited_fds(ready_w);
@@ -1523,15 +1613,20 @@ async fn launch_container_job(
 
         nix::unistd::ForkResult::Parent { child } => {
             drop(pipe_w);
+            unsafe {
+                libc::close(ready_w);
+                if cgroup_log_fd >= 0 {
+                    libc::close(cgroup_log_fd);
+                }
+            }
 
             // Drop the slave fd immediately so the master gets EOF when the child exits.
             let pty_master = job_io.into_master();
 
             let child_pid = child.as_raw();
 
-            if let Some(ref cgroup) = cgroup_path {
-                let _ = std::fs::write(cgroup.join("cgroup.procs"), child_pid.to_string());
-            }
+            // Cgroup placement already happened in the child before exec; a
+            // parent-side write here would race the container's execve.
 
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();
@@ -2153,6 +2248,7 @@ mod tests {
             nodelist: String::new(),
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
+            swap_limit: SwapLimit::Unconstrained,
             io_mode: LaunchIo::File,
             pmix_multi_task: false,
         }
@@ -2485,6 +2581,54 @@ mod tests {
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "wire() should have returned an error for bad fd"
+        );
+    }
+
+    #[test]
+    fn join_cgroup_self_writes_own_pid() {
+        // cgroup.procs is a plain "write my decimal pid" interface, so a regular
+        // file exercises the hand-rolled formatting and write without a cgroup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cgroup.procs");
+        // The real cgroup.procs is kernel-created; join_cgroup_self opens it
+        // without O_CREAT, so the stand-in must exist first.
+        std::fs::write(&path, "").unwrap();
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+
+        join_cgroup_self(&c_path, -1);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, std::process::id().to_string());
+    }
+
+    #[test]
+    fn join_cgroup_self_is_silent_when_the_path_is_missing() {
+        // Best-effort: a non-existent cgroup.procs must not panic, so a failed
+        // placement degrades to an unconstrained job instead of aborting launch.
+        let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
+        join_cgroup_self(&c_path, -1);
+    }
+
+    #[test]
+    fn join_cgroup_self_warns_to_log_fd_on_failure() {
+        // A failed placement must surface on the log fd so an unenforced limit is
+        // not silent; the child's own stderr points at the job, hence a dup here.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
+
+        join_cgroup_self(&c_path, write_fd);
+        unsafe { libc::close(write_fd) };
+
+        let mut buf = [0u8; 128];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        unsafe { libc::close(read_fd) };
+        assert!(n > 0, "expected a warning on the log fd");
+        let msg = std::str::from_utf8(&buf[..n as usize]).unwrap();
+        assert!(
+            msg.contains("failed to join cgroup"),
+            "unexpected message: {msg}"
         );
     }
 }

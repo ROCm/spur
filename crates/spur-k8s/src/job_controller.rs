@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
@@ -26,6 +26,7 @@ use spur_proto::proto::{
 };
 
 const FINALIZER: &str = "spur.amd.com/cleanup";
+const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 60;
 const LABEL_PATCH_BUDGET: Duration = Duration::from_secs(3);
 
@@ -53,6 +54,60 @@ pub struct JobControllerCtx {
     pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
+    /// Consecutive reconcile failures per SpurJob (keyed by [`failure_key`]),
+    /// driving the retry delay. Std mutex because `error_policy` is synchronous.
+    pub(crate) failures: StdMutex<HashMap<String, u32>>,
+}
+
+fn object_key(job: &SpurJob) -> String {
+    format!(
+        "{}/{}",
+        job.metadata.namespace.as_deref().unwrap_or_default(),
+        job.metadata.name.as_deref().unwrap_or_default()
+    )
+}
+
+/// Map key for the failure counter. Includes the UID so a delete+recreate under
+/// the same name starts a fresh backoff sequence instead of inheriting the count.
+fn failure_key(job: &SpurJob) -> String {
+    format!(
+        "{}/{}",
+        object_key(job),
+        job.metadata.uid.as_deref().unwrap_or("")
+    )
+}
+
+type FailureCounts = StdMutex<HashMap<String, u32>>;
+
+/// Delay before the *attempt*-th retry: doubling from `INITIAL_BACKOFF_SECS`, capped.
+fn backoff_delay(attempt: u32) -> Duration {
+    // Cap the shift before the multiply so the doubling cannot overflow.
+    let shift = attempt.saturating_sub(1).min(u32::BITS - 1);
+    let secs = INITIAL_BACKOFF_SECS
+        .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
+        .min(MAX_BACKOFF_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Counts another consecutive failure for *key* and returns how long to wait.
+fn record_failure(failures: &FailureCounts, key: &str) -> Duration {
+    let mut counts = failures.lock().unwrap_or_else(|e| e.into_inner());
+    let attempt = counts.entry(key.to_string()).or_insert(0);
+    *attempt = attempt.saturating_add(1);
+    backoff_delay(*attempt)
+}
+
+impl JobControllerCtx {
+    fn next_backoff(&self, key: &str) -> Duration {
+        record_failure(&self.failures, key)
+    }
+
+    fn clear_backoff(&self, key: &str) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
 }
 
 pub(crate) struct PodTracker {
@@ -75,8 +130,9 @@ async fn reconcile(
         .clone()
         .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let api: Api<SpurJob> = Api::namespaced(ctx.client.clone(), &ns);
+    let key = failure_key(&job);
 
-    finalizer(&api, FINALIZER, job, |event| {
+    let result = finalizer(&api, FINALIZER, job, |event| {
         let api = api.clone();
         let ctx = ctx.clone();
         async move {
@@ -87,7 +143,14 @@ async fn reconcile(
         }
     })
     .await
-    .map_err(map_finalizer_err)
+    .map_err(map_finalizer_err);
+
+    // A clean pass ends the retry sequence; a successful cleanup lands here too,
+    // reaping the entry on delete so it does not outlive the SpurJob.
+    if result.is_ok() {
+        ctx.clear_backoff(&key);
+    }
+    result
 }
 
 fn map_finalizer_err(e: finalizer::Error<ReconcileError>) -> ReconcileError {
@@ -108,22 +171,31 @@ fn should_submit(status: &SpurJobStatus) -> bool {
     status.spur_job_id.is_none()
 }
 
+use spur_proto::controller_rpc_retryable;
+
+enum SubmitOutcome {
+    Submitted,
+    /// A prior reconcile already submitted this SpurJob.
+    AlreadySubmitted,
+    /// The controller refused the spec; the SpurJob is now Failed.
+    Rejected,
+}
+
 /// Submit to spurctld, apply job-id label, and patch CRD status.
 /// Re-reads from the API server first to guard against stale informer cache.
-/// Returns `Ok(None)` if a prior reconcile already submitted.
 async fn submit_to_controller(
     api: &Api<SpurJob>,
     ctx: &JobControllerCtx,
     name: &str,
     ns: &str,
     job: &SpurJob,
-) -> Result<Option<u32>, ReconcileError> {
+) -> Result<SubmitOutcome, ReconcileError> {
     // Fresh read from API server — informer cache may be stale after finalizer patch
     let fresh = api.get(name).await.map_err(ReconcileError::Kube)?;
     let fresh_status = fresh.status.clone().unwrap_or_default();
     if !should_submit(&fresh_status) {
         debug!(spurjob = %name, "already submitted by prior reconcile");
-        return Ok(None);
+        return Ok(SubmitOutcome::AlreadySubmitted);
     }
 
     let user = job
@@ -145,9 +217,26 @@ async fn submit_to_controller(
         .await
     {
         Ok(resp) => resp.into_inner().job_id,
-        Err(e) => {
+        Err(e) if controller_rpc_retryable(&e) => {
             error!(spurjob = %name, error = %e, "failed to submit SpurJob");
             return Err(ReconcileError::Grpc(e));
+        }
+        Err(e) => {
+            error!(spurjob = %name, error = %e, "SpurJob rejected by the controller");
+            // Release the controller lock before the (possibly long) status write
+            // so other reconciles can keep talking to spurctld during an API outage.
+            drop(ctrl);
+            let new_status = SpurJobStatus {
+                state: "Failed".into(),
+                message: Some(format!("rejected by spurctld: {}", e.message())),
+                ..fresh_status.clone()
+            };
+            // Rejected returns await_change(), so a dropped write can't self-heal; land
+            // it here rather than propagating, which would resubmit the doomed spec.
+            patch_terminal_status(api, name, &new_status)
+                .await
+                .map_err(ReconcileError::Kube)?;
+            return Ok(SubmitOutcome::Rejected);
         }
     };
     drop(ctrl);
@@ -164,9 +253,12 @@ async fn submit_to_controller(
         spur_job_id: Some(job_id),
         ..fresh_status
     };
-    patch_status(api, name, &new_status).await;
+    // Best-effort: the Submitted path requeues in 5s, which retries the write.
+    if let Err(e) = patch_status(api, name, &new_status).await {
+        error!(spurjob = %name, error = %e, "failed to patch SpurJob status");
+    }
 
-    Ok(Some(job_id))
+    Ok(SubmitOutcome::Submitted)
 }
 
 /// State-machine dispatcher: submit if no job_id, otherwise poll spurctld.
@@ -190,8 +282,9 @@ async fn handle_job(
     // Phase 1: Submit (no spur_job_id yet)
     if should_submit(&status) {
         return match submit_to_controller(api, ctx, &name, &ns, &job).await? {
-            Some(_job_id) => Ok(Action::requeue(Duration::from_secs(5))),
-            None => Ok(Action::requeue(Duration::from_secs(2))),
+            SubmitOutcome::Submitted => Ok(Action::requeue(Duration::from_secs(5))),
+            SubmitOutcome::AlreadySubmitted => Ok(Action::requeue(Duration::from_secs(2))),
+            SubmitOutcome::Rejected => Ok(Action::await_change()),
         };
     }
 
@@ -219,7 +312,9 @@ async fn handle_job(
                         .map(|s| s.trim().to_string())
                         .collect();
                 }
-                patch_status(api, &name, &new_status).await;
+                if let Err(e) = patch_status(api, &name, &new_status).await {
+                    warn!(spurjob = %name, job_id, error = %e, "failed to patch SpurJob status");
+                }
             }
 
             if is_terminal(&spur_state) {
@@ -280,10 +375,15 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     Ok(Action::await_change())
 }
 
-fn error_policy(_job: Arc<SpurJob>, error: &ReconcileError, _ctx: Arc<JobControllerCtx>) -> Action {
-    error!(error = %error, "SpurJob reconciler error");
-    // Exponential backoff capped at MAX_BACKOFF_SECS
-    Action::requeue(Duration::from_secs(MAX_BACKOFF_SECS))
+fn error_policy(job: Arc<SpurJob>, error: &ReconcileError, ctx: Arc<JobControllerCtx>) -> Action {
+    let delay = ctx.next_backoff(&failure_key(&job));
+    error!(
+        spurjob = %object_key(&job),
+        error = %error,
+        retry_in_secs = delay.as_secs(),
+        "SpurJob reconciler error"
+    );
+    Action::requeue(delay)
 }
 
 /// Start the SpurJob controller and Pod watcher.
@@ -306,6 +406,7 @@ pub async fn run(
         client: client.clone(),
         ctrl_client: Mutex::new(ctrl_client),
         pod_tracker: Mutex::new(HashMap::new()),
+        failures: StdMutex::new(HashMap::new()),
     });
 
     let spurjobs: Api<SpurJob> = Api::all(client.clone());
@@ -732,12 +833,35 @@ async fn ensure_job_id_label(
     .inspect_err(|e| warn!(spurjob = %name, job_id, error = %e, "failed to apply job-id label"))
 }
 
-async fn patch_status(api: &Api<SpurJob>, name: &str, status: &SpurJobStatus) {
+async fn patch_status(
+    api: &Api<SpurJob>,
+    name: &str,
+    status: &SpurJobStatus,
+) -> Result<(), kube::Error> {
     let patch = serde_json::json!({ "status": status });
     let pp = PatchParams::apply("spur-k8s-operator");
-    if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
-        error!(spurjob = %name, error = %e, "failed to patch SpurJob status");
-    }
+    api.patch_status(name, &pp, &Patch::Merge(&patch))
+        .await
+        .map(|_| ())
+}
+
+/// Write a terminal status, retrying transient API errors until they clear.
+/// The Rejected path uses await_change(), so a dropped write never self-heals; a
+/// bounded budget would resubmit the doomed spec. Permanent errors stop the retry.
+async fn patch_terminal_status(
+    api: &Api<SpurJob>,
+    name: &str,
+    status: &SpurJobStatus,
+) -> Result<(), kube::Error> {
+    (|| async { patch_status(api, name, status).await })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(5))
+                .without_max_times(),
+        )
+        .when(is_transient_kube_error)
+        .await
 }
 
 fn is_terminal(state: &str) -> bool {
@@ -858,6 +982,56 @@ mod tests {
         }
         assert_eq!(proto_job_state_to_string(-1), "Unknown");
         assert_eq!(proto_job_state_to_string(99), "Unknown");
+    }
+
+    // --- retry backoff ---
+
+    #[test]
+    fn test_backoff_doubles_from_one_second_and_caps() {
+        let seconds: Vec<u64> = (1..=10).map(|n| backoff_delay(n).as_secs()).collect();
+        assert_eq!(seconds, vec![1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
+        assert_eq!(backoff_delay(u32::MAX).as_secs(), MAX_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_record_failure_counts_per_object() {
+        let failures = FailureCounts::default();
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 1);
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 2);
+        // A different SpurJob starts its own sequence.
+        assert_eq!(record_failure(&failures, "ns/b").as_secs(), 1);
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 4);
+    }
+
+    #[test]
+    fn failure_key_distinguishes_recreated_objects() {
+        let recreate = |uid: &str| -> SpurJob {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "spur.amd.com/v1",
+                "kind": "SpurJob",
+                "metadata": { "namespace": "ns", "name": "job", "uid": uid },
+                "spec": { "name": "job", "image": "img" },
+            }))
+            .unwrap()
+        };
+        let old = recreate("uid-a");
+        let new = recreate("uid-b");
+
+        // Same name, but a recreate gets its own backoff sequence.
+        assert_eq!(object_key(&old), object_key(&new));
+        assert_ne!(failure_key(&old), failure_key(&new));
+    }
+
+    #[test]
+    fn test_cleared_object_restarts_backoff() {
+        let failures = FailureCounts::default();
+        record_failure(&failures, "ns/a");
+        record_failure(&failures, "ns/a");
+        failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("ns/a");
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 1);
     }
 
     // --- is_terminal ---

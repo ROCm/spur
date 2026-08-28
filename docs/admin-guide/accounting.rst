@@ -938,9 +938,12 @@ How a job's account is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 At submit, Spur resolves the job's account in this order, matching Slurm.
-This validation is skipped (fail-open) while the association cache has not
-yet loaded, e.g. at controller startup or while the accounting database is
-unreachable:
+When accounting is enabled but the association cache has not yet loaded
+(e.g. just after controller startup, or while the accounting database is
+unreachable), account validation cannot run yet: an account-scoped submit is
+refused with a *transient* error (gRPC ``Unavailable`` / REST ``503``) rather
+than a permanent rejection, so clients retry once the cache is populated. With
+accounting disabled there are no associations to check:
 
 1. **Explicit** ``--account`` on the job. Once the association cache has
    loaded, it must name an account the user is associated with, or the job
@@ -949,11 +952,12 @@ unreachable:
    if the user has none at all.
 2. Otherwise the **user's default account**, if the user has one on file.
 3. Otherwise, if ``accounting.require_association`` is ``true``, the job is
-   **rejected** (``no account resolved for user 'X'``) — even if the user
-   does have associations, just none flagged as their default. This step is
-   unconditional, unlike step 1: it applies even before the association
-   cache has loaded. If ``require_association`` is ``false`` (the default),
-   the job runs with no account.
+   **rejected** (``no account resolved for user 'X'``) once the cache has
+   loaded and the user has no default on file — even if the user does have
+   associations, just none flagged as their default. Before the cache loads
+   this is transient (as above), since the default may still resolve. If
+   ``require_association`` is ``false`` (the default), the job runs with no
+   account.
 
 TRES
 ----
