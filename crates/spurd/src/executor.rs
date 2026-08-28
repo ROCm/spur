@@ -505,7 +505,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = CgroupGuard(setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -663,7 +663,7 @@ async fn spawn_job_process(
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io).await?;
+        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, cgroup_path).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
@@ -758,7 +758,7 @@ async fn spawn_job_process(
     // Join pre-exec, not parent-side after spawn: under `unshare --fork` a
     // parent-side move races the fork and misses the workload's cgroup.
     let cgroup_procs = cgroup_path
-        .as_ref()
+        .path()
         .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
     // fd 2 is redirected to the job's stdio before pre_exec runs, so hand the
     // child a dup of spurd's stderr (CLOEXEC) to report a join failure.
@@ -876,8 +876,9 @@ async fn spawn_job_process(
     // The child joined its own cgroup pre-exec; confirm it landed so `required`
     // can refuse a job that would otherwise run outside every limit.
     if cfg.cgroup.required {
-        if let (Some(cgroup), Some(pid)) = (cgroup_path.as_ref(), child.id()) {
+        if let (Some(cgroup), Some(pid)) = (cgroup_path.path(), child.id()) {
             if !cgroup_has_pid(cgroup, pid) {
+                // Reaps as well as kills, so the guard finds the cgroup empty.
                 let _ = child.kill().await;
                 return Err(anyhow::anyhow!(
                     "[cgroup] required but the job did not join its cgroup"
@@ -895,7 +896,10 @@ async fn spawn_job_process(
     );
 
     Ok(LaunchResult {
-        job: RunningJob::Managed { child, cgroup_path },
+        job: RunningJob::Managed {
+            child,
+            cgroup_path: cgroup_path.into_inner(),
+        },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
         pty_master,
@@ -1162,6 +1166,29 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
         let mut it = line.split_whitespace();
         matches!((it.next(), it.next()), (Some("oom_kill"), Some(n)) if n != "0")
     })
+}
+
+/// Owns a job's cgroup between creation and the point the running job takes it
+/// over. Every error return in between would otherwise strand the directory.
+struct CgroupGuard(Option<PathBuf>);
+
+impl CgroupGuard {
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+
+    /// Hand the cgroup to the caller; dropping the guard no longer removes it.
+    fn into_inner(mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            cleanup_cgroup(&path);
+        }
+    }
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
@@ -1585,9 +1612,9 @@ async fn launch_container_job(
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
     job_io: JobIo,
+    cgroup_path: CgroupGuard,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, &cfg.cgroup, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
 
     // Sync pipe: child writes status, parent reads.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
@@ -1614,7 +1641,7 @@ async fn launch_container_job(
 
     // Precomputed before fork; the forked child joins the cgroup itself (below).
     let cgroup_procs = cgroup_path
-        .as_ref()
+        .path()
         .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
     // Dup spurd's stderr (CLOEXEC) so the child can report a join failure; its
     // own stderr is wired to the job before the join runs.
@@ -1749,10 +1776,13 @@ async fn launch_container_job(
             // rather than write (DC2): the container tree inherits this membership.
             if cfg.cgroup.required {
                 let joined = cgroup_path
-                    .as_ref()
+                    .path()
                     .is_none_or(|cgroup| cgroup_has_pid(cgroup, child_pid as u32));
                 if !joined {
-                    let _ = signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL);
+                    signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL).ok();
+                    // Reap before returning: the guard's rmdir races an exit
+                    // that has been signalled but not yet completed.
+                    let _ = nix::sys::wait::waitpid(child, None);
                     anyhow::bail!("[cgroup] required but the container did not join its cgroup");
                 }
             }
@@ -1768,7 +1798,7 @@ async fn launch_container_job(
                 RunningJob::Forked {
                     pid: child_pid,
                     _pidfd: pidfd,
-                    cgroup_path,
+                    cgroup_path: cgroup_path.into_inner(),
                     reaped: false,
                 },
                 pty_master,
@@ -1917,6 +1947,42 @@ mod cpuset_tests {
     fn keeps_the_full_set_when_the_parent_permits_it() {
         assert_eq!(permitted_cores(&[0, 1, 2, 3], "0-3"), vec![0, 1, 2, 3]);
         assert_eq!(permitted_cores(&[2, 3], "0-1,2-3"), vec![2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod cgroup_guard_tests {
+    use super::CgroupGuard;
+
+    #[test]
+    fn dropping_the_guard_removes_the_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_1");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        drop(CgroupGuard(Some(cgroup.clone())));
+        assert!(
+            !cgroup.exists(),
+            "a failed launch must not strand its cgroup"
+        );
+    }
+
+    #[test]
+    fn releasing_the_guard_keeps_the_cgroup() {
+        // The running job owns the cgroup once a launch succeeds; removing it
+        // here would unbound the job it was created for.
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_2");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let released = CgroupGuard(Some(cgroup.clone())).into_inner();
+        assert_eq!(released.as_deref(), Some(cgroup.as_path()));
+        assert!(cgroup.exists());
+    }
+
+    #[test]
+    fn a_disabled_cgroup_is_a_no_op() {
+        drop(CgroupGuard(None));
     }
 }
 
