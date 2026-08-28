@@ -261,7 +261,7 @@ Job resource enforcement (``[cgroup]``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The release introducing the ``[cgroup]`` section changed what ``spurd`` writes for
-a config that has **no** ``[cgroup]`` section. One of these can affect jobs that
+a config that has **no** ``[cgroup]`` section. The first two can affect jobs that
 ran fine before the upgrade; the rest relax an existing bound.
 
 .. list-table::
@@ -272,6 +272,12 @@ ran fine before the upgrade; the rest relax an existing bound.
      - Before
      - After
      - Effect
+   * - ``memory.max``
+     - unset for ``--mem-per-cpu`` jobs
+     - the memory the scheduler allocated
+     - **A ``--mem-per-cpu`` job that ran unbounded is now capped, and is
+       OOM-killed if it overruns.** Only the per-node request was read before,
+       which those jobs do not set.
    * - ``memory.high``
      - unset
      - equal to ``memory.max``
@@ -300,11 +306,13 @@ restart — ``scontrol reconfigure`` will not apply it afterwards.
 
 .. note::
 
-   No knob disables ``memory.high`` on its own; it is written whenever
-   ``constrain_ram_space`` is on, matching Slurm's ``cgroup/v2`` plugin. If reclaim
-   stalls are the problem, raise ``allowed_ram_percent`` (for example ``125``) so
-   reclaim begins above the allocation instead of at it, rather than turning memory
-   constraints off entirely.
+   Neither memory change has a knob of its own: ``memory.max`` and ``memory.high``
+   are both written whenever ``constrain_ram_space`` is on, matching Slurm's
+   ``cgroup/v2`` plugin. Setting ``constrain_ram_space = false`` restores the old
+   behaviour but drops the memory ceiling for *every* job, not just the
+   ``--mem-per-cpu`` ones. Prefer raising ``allowed_ram_percent`` (for example
+   ``125``), which gives jobs headroom above their allocation and starts reclaim
+   there, over turning memory constraints off.
 
 Rolling back is safe with the section left in place: older binaries do not know
 ``[cgroup]`` and ignore it.
