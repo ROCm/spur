@@ -442,6 +442,77 @@ class TestQosLimitReasons:
         )
 
 
+# Deadline (1 min) + watchdog tick + SIGTERM grace + reap, with slack. The
+# smallest MaxWall is a minute, so this path costs roughly that in wall time.
+WALLCAP_FINISH_TIMEOUT = 240
+
+
+def _wait_time_limit(cluster, job_id: int, timeout: int = 30) -> str:
+    """Poll squeue until the job's TIME_LIMIT column is populated, then return it.
+
+    Defaulting runs synchronously at submit, so the row carries its limit the
+    first time it is visible. ``-t all`` keeps it readable even if the job has
+    already reached a terminal state.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = cluster.squeue(["-j", str(job_id), "-h", "-o", "%l", "-t", "all"]).strip()
+        if out:
+            return out
+        time.sleep(1)
+    raise AssertionError(f"job {job_id} never appeared in squeue within {timeout}s")
+
+
+class TestQosWallCapDefaulting:
+    """A job submitted without --time under a QOS with MaxWall must inherit that
+    MaxWall as its limit and actually be killed at the wall, not admitted
+    unbounded and left to run forever (the live incident where 31 jobs ran ~6x
+    past their cap). The QOS/account wall cap only becomes the default when the
+    partition imposes no DefaultTime/MaxTime of its own, so this runs on an
+    unbounded partition."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {
+            "partitions": [
+                {"name": "default", "state": "UP", "default": True, "nodes": "ALL"}
+            ]
+        }
+
+    def test_untimed_job_inherits_qos_maxwall_and_is_killed(self, accounting_cluster):
+        c = accounting_cluster
+
+        # MaxWall granularity is minutes; 1 is the smallest meaningful cap.
+        c.sacctmgr(["add", "qos", "name=wallcap", "maxwall=1"])
+        # Wait past the QOS cache refresh floor (10s) so the cap loads before submit.
+        time.sleep(15)
+
+        script = c.write_file("wallcap-untimed.sh", "#!/bin/bash\nsleep 600\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "wallcap-untimed", "-N", "1", "-q", "wallcap", script])
+        )
+        assert job_id is not None
+
+        # Half one: the untimed job inherits MaxWall (1:00) as its limit rather
+        # than being admitted UNLIMITED — the bug this PR fixes.
+        limit = _wait_time_limit(c, job_id)
+        assert limit == "1:00", (
+            f"untimed job must inherit the QOS MaxWall as its limit, got {limit!r} "
+            f"(UNLIMITED means defaulting never fired)"
+        )
+
+        # Half two: the wall-clock watchdog actually terminates it at the cap
+        # instead of letting the 600s sleep run to completion.
+        state = wait_job(c, job_id, timeout=WALLCAP_FINISH_TIMEOUT)
+        assert state == "TO", (
+            f"a job killed by its inherited wall limit must report TIMEOUT, got "
+            f"{state}:\n{c.debug_job(job_id)}"
+        )
+        show = c.scontrol("show", "job", str(job_id))
+        assert "JobState=TIMEOUT" in show, show
+        assert "Reason=TimeLimit" in show, show
+
+
 class TestSacctmgrUserAssociationLimits:
     def test_maxjobs_set_via_add_user_blocks_a_second_job(self, accounting_cluster):
         c = accounting_cluster
