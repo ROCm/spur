@@ -1305,9 +1305,10 @@ Every ceiling is floored at ``min_ram_mb``, and ``memory.high`` never exceeds
 When enforcement fails
 ~~~~~~~~~~~~~~~~~~~~~~
 
-By default every step degrades to a warning: an undelegated controller, a
-rejected control-file write, a cpuset that did not apply, or a process that
-could not join the cgroup all leave the job **running unconstrained**. Grep the
+By default every step degrades to a warning: a controller that could not be
+delegated, a rejected control-file write, a cpuset that did not apply, or a
+process that could not join the cgroup all leave the job **running
+unconstrained**. Grep the
 agent log for these to find silently-unenforced nodes:
 
 .. code-block:: text

@@ -290,3 +290,9 @@ Scaffolded
 ClusterIP
 DNATs
 kube
+cgroups
+cpuset
+CFS
+MiB
+OOM
+pluggable
