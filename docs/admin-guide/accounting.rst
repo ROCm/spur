@@ -356,7 +356,8 @@ User keys
      - Aggregate TRES cap across the association's jobs.
    * - ``maxwall`` (alias ``maxwallduration``)
      - unset (no limit)
-     - Maximum wall-clock time per job.
+     - Maximum wall-clock time per job. Also supplies the time limit for a job
+       that requests none — see :ref:`maxwall-default`.
 
 .. note::
 
@@ -490,7 +491,8 @@ QOS keys
      - Maximum running jobs per user under this QOS. See :ref:`limit-values`.
    * - ``maxwall``
      - unset (no limit)
-     - Maximum wall-clock time per job.
+     - Maximum wall-clock time per job. Also supplies the time limit for a job
+       that requests none — see :ref:`maxwall-default`.
    * - ``maxtresperjob``
      - ``""``
      - TRES cap for a single job (see `TRES`_).
@@ -563,6 +565,50 @@ Set ``DenyOnLimit`` through the QOS ``flags`` key:
 .. code-block:: bash
 
    sacctmgr modify qos name=highprio set flags=DenyOnLimit
+
+.. _maxwall-default:
+
+MaxWall as the default time limit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job that requests no wall-time takes its ``maxwall`` cap as its time limit, as
+in Slurm. Without this a ``-t``-less job would carry no limit at all: it would
+report ``UNLIMITED``, and the running-job watchdog — which acts on a job's own
+limit — would have no deadline to enforce, so the cap would hold only for jobs
+that named a limit themselves.
+
+Both the QOS and the association carry ``maxwall``, and a job has to satisfy
+both, so the smaller of the two is what it inherits.
+
+The limit is filled in at submit, so ``squeue`` and ``scontrol show job`` report
+it, and it is the job's own limit from then on: a later change to the QOS does
+not move it.
+
+Precedence for a job that requests nothing, first match winning:
+
+1. The partition's ``DefaultTime``, or the chain described under
+   ``default_time_limit_minutes`` in :doc:`configuration`.
+2. The smaller of the QOS and association ``maxwall``.
+3. Otherwise the job stays unbounded.
+
+So a partition ``DefaultTime`` shorter than ``maxwall`` still wins — ``maxwall``
+is a ceiling, and only supplies a default where nothing else does. The value
+filled in is also held under the requested partition's ``MaxTime``, above which
+the job would pend indefinitely on ``PartitionTimeLimit`` for a limit it never
+asked for. A ``maxwall`` of ``0`` blocks every job it governs
+(:ref:`limit-values`) and is never used as a default.
+
+A ``job_submit`` hook may reassign the partition, account or QOS, so the default
+is resolved after the hook runs and reflects the scope the job ends up in. A
+hook that sets ``time_limit`` itself supplies the job's limit, and no default is
+applied over it.
+
+.. note::
+
+   Jobs already running when this behaviour arrives keep the unbounded limit they
+   were submitted with; the QOS cap applies to submissions from then on. To bound
+   an existing job, set its limit directly with
+   ``scontrol update job <id> TimeLimit=<time>``.
 
 .. _grpwall-budgets:
 
