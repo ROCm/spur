@@ -635,8 +635,8 @@ operator action is needed — there is deliberately no manual override, because
 ``AccountingUnavailable`` is not an administrative hold (``scontrol release``
 does not apply to it) and clearing it by hand would admit jobs against the very
 limits that could not be read. The only operator lever is the configuration
-itself: fix ``database_url`` (or clear it to disable accounting) and the hold
-resolves accordingly.
+itself: fix ``database_url`` so the retry succeeds, or clear it to disable
+accounting — the latter is read at startup, so it takes a controller restart.
 
 Related cases:
 

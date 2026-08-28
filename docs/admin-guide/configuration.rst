@@ -334,7 +334,8 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Restart
      - PostgreSQL connection string. A non-empty value enables accounting; empty
        disables it entirely. Example: ``"postgresql://spur:spur@localhost/spur"``.
-       The connection pool is built at startup.
+       The controller connects in the background and retries with backoff, so an
+       unreachable database at startup does not stop it from connecting later.
    * - ``fairshare_refresh_secs``
      - integer
      - ``300``
