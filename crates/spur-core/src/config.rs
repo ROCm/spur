@@ -2382,6 +2382,18 @@ mod tests {
     }
 
     #[test]
+    fn shipped_example_config_parses() {
+        // Releases ship this as etc/spur.conf.example, so a stale field here
+        // reaches operators as a config that will not load.
+        let example = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/spur.conf"
+        ));
+        let cfg = SlurmConfig::load_from_str(example).expect("examples/spur.conf parses");
+        assert!(cfg.cgroup.constrain_swap, "example should bound swap");
+    }
+
+    #[test]
     fn swap_percent_above_100_is_accepted() {
         // Slurm applies no upper bound to AllowedSwapSpace, so a `cgroup.conf`
         // carrying one must not stop the controller from starting.
