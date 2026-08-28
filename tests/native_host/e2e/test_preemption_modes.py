@@ -112,6 +112,10 @@ class TestCancelMode:
                 f"cancelled job must not re-enter the queue; got {recheck!r}"
             )
 
+            assert cluster.sdiag_jobs_preempted() == 1, (
+                "sdiag jobs_preempted counter must be 1 after one cancel-mode preemption"
+            )
+
             final = wait_job(cluster, aggressor_id, timeout=30)
             assert final == "CD", f"aggressor must complete successfully; got {final!r}"
         finally:
@@ -160,6 +164,10 @@ class TestRequeueMode:
                 "requeued victim must remain pending while aggressor holds the node"
             )
             _assert_scontrol_state(cluster, victim_id, "PENDING", "victim while aggressor runs")
+
+            assert cluster.sdiag_jobs_preempted() == 1, (
+                "sdiag jobs_preempted counter must be 1 after one requeue-mode preemption"
+            )
 
             final = wait_job(cluster, aggressor_id, timeout=30)
             assert final == "CD", f"aggressor must complete successfully; got {final!r}"

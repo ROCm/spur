@@ -151,6 +151,9 @@ fn print_job_statistics(metrics: &JobMetrics) {
     println!("  Total Jobs        : {}", metrics.total);
 
     for &state in &CoreJobState::ALL {
+        if matches!(state, CoreJobState::Preempted | CoreJobState::Requeued) {
+            continue;
+        }
         let count = job_count(metrics, state);
         println!("  {:18}: {}", state.display(), count);
     }
@@ -232,6 +235,7 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
         format!("  Jobs submitted      : {}", stats.jobs_submitted),
         format!("  Jobs started        : {}", stats.jobs_started),
         format!("  Jobs finalized      : {}", stats.jobs_finalized),
+        format!("  Jobs preempted      : {}", stats.jobs_preempted),
         format!("  Jobs started (last) : {}", stats.jobs_started_last_cycle),
         format!("  Exit end of queue   : {}", stats.exit_end),
         format!("  Exit max depth      : {}", stats.exit_max_depth),
@@ -372,6 +376,7 @@ mod tests {
             jobs_submitted: 10,
             jobs_started: 8,
             jobs_finalized: 7,
+            jobs_preempted: 3,
             jobs_started_last_cycle: 2,
             exit_end: 4,
             exit_max_depth: 1,
@@ -381,6 +386,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Cycles")));
         assert!(lines.iter().any(|l| l.contains("Cycle total (us)")));
         assert!(lines.iter().any(|l| l.contains("Schedule total (us)")));
+        assert!(lines.iter().any(|l| l.contains("Jobs preempted      : 3")));
         assert!(lines.iter().any(|l| l.contains("Jobs started (last) : 2")));
         assert!(lines.iter().any(|l| l.contains("Exit end of queue   : 4")));
         assert!(lines.iter().any(|l| l.contains("Exit max depth      : 1")));

@@ -707,6 +707,7 @@ message SchedStats {
   uint64 jobs_started_last_cycle = 12;
   uint64 exit_end = 13;
   uint64 exit_max_depth = 14;
+  uint64 jobs_preempted = 15;
 }
 
 message RegisterAgentRequest {

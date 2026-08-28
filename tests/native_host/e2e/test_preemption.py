@@ -100,6 +100,12 @@ class TestChronicPreemption:
                 f"low-priority job held after {cycles} preemption cycles "
                 f"(max_batch_requeue={self.MAX_BATCH_REQUEUE}):\n{show}"
             )
+
+            preempted = cluster.sdiag_jobs_preempted()
+            assert preempted == cycles, (
+                f"sdiag jobs_preempted expected {cycles} after {cycles} preemption "
+                f"cycles, got {preempted}"
+            )
         finally:
             if low_id is not None:
                 cluster.cli_allow_fail(["scancel", str(low_id)])

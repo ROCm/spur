@@ -26,6 +26,7 @@ pub struct SchedStatsCollector {
     jobs_submitted: AtomicU64,
     jobs_started: AtomicU64,
     jobs_finalized: AtomicU64,
+    jobs_preempted: AtomicU64,
     exit_end: AtomicU64,
     exit_max_depth: AtomicU64,
 }
@@ -38,6 +39,7 @@ impl SchedStatsCollector {
             jobs_submitted: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
             jobs_finalized: AtomicU64::new(0),
+            jobs_preempted: AtomicU64::new(0),
             exit_end: AtomicU64::new(0),
             exit_max_depth: AtomicU64::new(0),
         }
@@ -82,6 +84,10 @@ impl SchedStatsCollector {
         self.jobs_finalized.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_preempted(&self) {
+        self.jobs_preempted.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> SchedStatsSnapshot {
         let accum = self.cycle.lock();
         SchedStatsSnapshot {
@@ -94,6 +100,7 @@ impl SchedStatsCollector {
             jobs_submitted: self.jobs_submitted.load(Ordering::Relaxed),
             jobs_started: self.jobs_started.load(Ordering::Relaxed),
             jobs_finalized: self.jobs_finalized.load(Ordering::Relaxed),
+            jobs_preempted: self.jobs_preempted.load(Ordering::Relaxed),
             jobs_started_last_cycle: accum.jobs_started_last_cycle,
             exit_end: self.exit_end.load(Ordering::Relaxed),
             exit_max_depth: self.exit_max_depth.load(Ordering::Relaxed),
@@ -105,6 +112,7 @@ impl SchedStatsCollector {
         self.jobs_submitted.store(0, Ordering::Relaxed);
         self.jobs_started.store(0, Ordering::Relaxed);
         self.jobs_finalized.store(0, Ordering::Relaxed);
+        self.jobs_preempted.store(0, Ordering::Relaxed);
         self.exit_end.store(0, Ordering::Relaxed);
         self.exit_max_depth.store(0, Ordering::Relaxed);
     }
@@ -144,6 +152,32 @@ mod tests {
         assert_eq!(snap.jobs_submitted, 3);
         assert_eq!(snap.jobs_started, 2);
         assert_eq!(snap.jobs_finalized, 1);
+    }
+
+    #[test]
+    fn preempted_counter_increments_independently() {
+        let stats = SchedStatsCollector::new("backfill");
+        stats.record_finalized();
+        stats.record_finalized();
+        stats.record_preempted();
+        stats.record_finalized();
+        stats.record_preempted();
+        stats.record_preempted();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.jobs_finalized, 3);
+        assert_eq!(snap.jobs_preempted, 3);
+    }
+
+    #[test]
+    fn reset_clears_preempted_counter() {
+        let stats = SchedStatsCollector::new("backfill");
+        stats.record_preempted();
+        stats.record_preempted();
+        assert_eq!(stats.snapshot().jobs_preempted, 2);
+        stats.reset();
+        assert_eq!(stats.snapshot().jobs_preempted, 0);
+        assert_eq!(stats.snapshot().plugin, "backfill");
     }
 
     #[test]

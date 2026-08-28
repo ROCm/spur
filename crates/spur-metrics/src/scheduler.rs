@@ -13,6 +13,7 @@ pub struct SchedStatsSnapshot {
     pub jobs_submitted: u64,
     pub jobs_started: u64,
     pub jobs_finalized: u64,
+    pub jobs_preempted: u64,
     pub jobs_started_last_cycle: u64,
     /// Cycles that considered every pending job (not depth-limited).
     pub exit_end: u64,
