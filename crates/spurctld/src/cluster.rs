@@ -662,6 +662,7 @@ impl ClusterManager {
         // the hook may rewrite, so defaulting follows the hook and reads the scope
         // that actually governs the job. A limit the hook set is left alone.
         let wall_caps = self.wall_caps(&spec);
+        validate_default_time_limit(&spec, &partitions)?;
         apply_default_time_limit(
             &mut spec,
             &partitions,
@@ -7348,6 +7349,26 @@ impl WallCaps {
     }
 }
 
+fn validate_default_time_limit(
+    spec: &JobSpec,
+    partitions: &[Partition],
+) -> Result<(), SubmitError> {
+    if spec.time_limit.is_some() {
+        return Ok(());
+    }
+    let requested = partitions_for_defaulting(spec, partitions);
+    if let Some(partition) = requested
+        .iter()
+        .find(|part| part.default_time_minutes == Some(0))
+    {
+        return Err(SubmitError::invalid(format!(
+            "partition '{}' has a default time limit of zero; specify a time limit",
+            partition.name
+        )));
+    }
+    Ok(())
+}
+
 /// Fill in a job's wall-time when none was requested. Each requested partition
 /// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
 /// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
@@ -9634,6 +9655,26 @@ mod tests {
         exact.num_tasks = 4;
         let outcome = cm.submit_job(exact).unwrap();
         assert!(outcome.warnings.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_zero_partition_default_time_when_time_is_unset() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].default_time = Some("0".into());
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("untimed")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "partition 'default' has a default time limit of zero; specify a time limit"
+            )
+        );
+
+        let mut timed = basic_spec("timed");
+        timed.time_limit = Some(chrono::Duration::minutes(5));
+        assert!(cm.submit_job(timed).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20252,6 +20293,26 @@ mod tests {
             ..Default::default()
         }];
         default_time_limit(&mut spec, &partitions, 0);
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn validate_default_time_limit_rejects_zero_partition_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(0),
+            ..Default::default()
+        }];
+        let err = super::validate_default_time_limit(&spec, &partitions).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "partition 'gpu' has a default time limit of zero; specify a time limit"
+            )
+        );
         assert!(spec.time_limit.is_none());
     }
 
