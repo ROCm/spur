@@ -88,16 +88,11 @@ pub enum SacctmgrCommand {
     Show {
         /// Entity type: account, user, qos, association
         entity: String,
-        /// Optional filter
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` filters; a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// List entities (alias for show)
-    List {
-        entity: String,
-        #[arg(trailing_var_arg = true)]
-        params: Vec<String>,
-    },
+    List { entity: String, params: Vec<String> },
 }
 
 pub async fn main() -> Result<()> {
@@ -866,23 +861,12 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
-/// Entities `show` prints as fixed-width tables, with no field-spec table behind them.
-/// A new entity rendered that way belongs here.
-const FIXED_WIDTH_ENTITIES: [&str; 8] = [
-    "user",
-    "users",
-    "association",
-    "associations",
-    "tres",
-    "txn",
-    "transaction",
-    "transactions",
-];
+/// Entities `show` prints as hardcoded fixed-width tables, with no field-spec table behind
+/// them. A new entity rendered that way belongs here.
+const FIXED_WIDTH_ENTITIES: [&str; 5] = ["user", "users", "association", "associations", "tres"];
 
-/// Accepting `-p`/`-P` for a fixed-width entity would hand a script padded text where it
-/// expects delimited fields, so refuse loudly instead of returning output that silently
-/// will not parse. Unrecognized entities are left to `show`, so they still report the
-/// unknown entity rather than a delimiter complaint.
+/// Delimiting a fixed-width table hands a script padded text it cannot parse, so refuse it.
+/// Unknown entities fall through to `show`, which reports them itself.
 fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle) -> Result<()> {
     if !style.is_delimited() || !FIXED_WIDTH_ENTITIES.contains(&entity) {
         return Ok(());
@@ -890,7 +874,7 @@ fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle)
 
     bail!(
         "sacctmgr: delimited output (-p/-P) is not supported for '{entity}'. \
-         Supported entities: account, qos"
+         Supported entities: account, qos, txn"
     )
 }
 
@@ -1029,12 +1013,9 @@ async fn show(
                 .into_inner()
                 .transactions;
 
-            format_engine::print_header(&fields);
+            style.print_header(&fields);
             for t in &txns {
-                println!(
-                    "{}",
-                    format_engine::format_row(&fields, &|spec| resolve_txn_field(t, spec))
-                );
+                println!("{}", style.row(&fields, &|spec| resolve_txn_field(t, spec)));
             }
             Ok(())
         }
@@ -2498,6 +2479,42 @@ mod tests {
         assert_eq!(params, vec!["format=Name,Priority".to_string()]);
     }
 
+    #[test]
+    fn a_delimiter_flag_after_a_param_is_still_parsed() {
+        let args =
+            SacctmgrArgs::try_parse_from(["sacctmgr", "show", "qos", "format=Name,Priority", "-P"])
+                .expect("a flag after a param must parse");
+
+        assert!(args.parsable2);
+        let SacctmgrCommand::Show { params, .. } = args.command else {
+            panic!("expected a show command");
+        };
+        assert_eq!(params, vec!["format=Name,Priority".to_string()]);
+    }
+
+    #[test]
+    fn a_delimiter_flag_between_params_does_not_swallow_the_next() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "show",
+            "qos",
+            "name=gpu",
+            "-P",
+            "format=Name",
+        ])
+        .expect("a flag between params must parse");
+
+        assert!(args.parsable2);
+        let SacctmgrCommand::Show { params, .. } = args.command else {
+            panic!("expected a show command");
+        };
+        assert_eq!(
+            params,
+            vec!["name=gpu".to_string(), "format=Name".to_string()],
+            "the flag must not consume the following filter as its value"
+        );
+    }
+
     fn style_from(flags: &[&str]) -> format_engine::OutputStyle {
         let mut argv = vec!["sacctmgr"];
         argv.extend_from_slice(flags);
@@ -2559,28 +2576,71 @@ mod tests {
     }
 
     #[test]
-    fn header_suppression_applies_to_fixed_width_entities_too() {
+    fn noheader_flag_resolves_into_the_style() {
         assert!(style_from(&[]).shows_header());
         assert!(!style_from(&["-n"]).shows_header());
+    }
+
+    fn stub_txn() -> TransactionRecord {
+        TransactionRecord {
+            id: 7,
+            timestamp: None,
+            actor: "bob".into(),
+            actor_uid: 1000,
+            verified: true,
+            source: "api".into(),
+            action: "create".into(),
+            entity_type: "qos".into(),
+            entity_name: "gpu".into(),
+            outcome: "success".into(),
+            details: "{}".into(),
+        }
+    }
+
+    /// A `show txn` header block and row for the given flags, mirroring the arm's rendering.
+    fn txn_render(flags: &[&str], format: &str) -> (Vec<String>, String) {
+        let fields = txn_format_fields(Some(format)).expect("txn format must parse");
+        let style = SacctmgrArgs::try_parse_from(
+            ["sacctmgr"]
+                .iter()
+                .chain(flags)
+                .chain(&["show", "txn"])
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .expect("flags must parse")
+        .output_style();
+        let row = style.row(&fields, &|spec| resolve_txn_field(&stub_txn(), spec));
+        (style.header_lines(&fields), row)
+    }
+
+    #[test]
+    fn txn_honours_noheader_and_delimited_output() {
+        let (header, row) = txn_render(&["-n", "-P"], "Action,Actor");
+        assert!(header.is_empty(), "-n must suppress the txn header");
+        assert_eq!(row, "create|bob");
+
+        let (header, _) = txn_render(&[], "Action,Actor");
+        assert!(!header.is_empty(), "the txn header must print by default");
     }
 
     #[test]
     fn delimited_output_is_refused_only_where_columns_are_not_modelled() {
         let delimited = style_from(&["-P"]);
-        for entity in ["account", "accounts", "qos"] {
+        for entity in [
+            "account",
+            "accounts",
+            "qos",
+            "txn",
+            "transaction",
+            "transactions",
+        ] {
             assert!(
                 reject_unsupported_delimiter(entity, delimited).is_ok(),
                 "{entity} should support delimited output"
             );
         }
-        for entity in [
-            "user",
-            "users",
-            "association",
-            "tres",
-            "txn",
-            "transactions",
-        ] {
+        for entity in FIXED_WIDTH_ENTITIES {
             assert!(
                 reject_unsupported_delimiter(entity, delimited).is_err(),
                 "{entity} should refuse delimited output"
@@ -2589,7 +2649,7 @@ mod tests {
 
         // Padded output stays available for every entity.
         let padded = style_from(&[]);
-        for entity in ["user", "association", "tres"] {
+        for entity in FIXED_WIDTH_ENTITIES {
             assert!(reject_unsupported_delimiter(entity, padded).is_ok());
         }
     }
