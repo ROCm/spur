@@ -867,7 +867,12 @@ Scripted output
 
 ``sacctmgr show`` prints a column-aligned table for reading. For scripts, three
 Slurm flags change that rendering; they are global, so they may appear anywhere on
-the command line, including after the entity and its ``key=value`` filters.
+the command line, including after the entity and its ``key=value`` filters. The
+same holds for ``add``, ``delete``, and ``modify``: a global flag among their
+``key=value`` pairs is parsed as a flag, not absorbed as a pair. An
+**unrecognised** token there is now an error naming the argument, where earlier
+releases silently absorbed it — and, if a ``key=value`` pair followed, dropped
+that pair too.
 
 .. list-table::
    :header-rows: 1

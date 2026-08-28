@@ -64,24 +64,21 @@ pub enum SacctmgrCommand {
     Add {
         /// Entity type: account, user, qos
         entity: String,
-        /// key=value pairs
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` pairs; a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// Delete entities
     Delete {
         /// Entity type: account, user, qos
         entity: String,
-        /// key=value pairs (name= or where clause)
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` pairs (name= or where clause); a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// Modify entities
     Modify {
         /// Entity type: account, user, qos
         entity: String,
-        /// key=value pairs
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` pairs; a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// List/show entities
@@ -2512,6 +2509,30 @@ mod tests {
             params,
             vec!["name=gpu".to_string(), "format=Name".to_string()],
             "the flag must not consume the following filter as its value"
+        );
+    }
+
+    #[test]
+    fn a_flag_among_modify_params_does_not_swallow_an_update() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "modify",
+            "qos",
+            "gpu",
+            "set",
+            "-i",
+            "priority=10",
+        ])
+        .expect("a flag among modify params must parse");
+
+        assert!(args.immediate);
+        let SacctmgrCommand::Modify { params, .. } = args.command else {
+            panic!("expected a modify command");
+        };
+        assert_eq!(
+            parse_params(&params).get("priority").map(String::as_str),
+            Some("10"),
+            "a swallowed flag would consume the update and silently apply nothing"
         );
     }
 
