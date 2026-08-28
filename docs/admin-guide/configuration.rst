@@ -955,43 +955,6 @@ POSIX ``RLIMIT_*`` values ``spurd`` applies to job steps at launch.
    ``memlock = "unlimited"`` lets RDMA and NCCL workloads pin memory out of the box.
    Lower it only when a hard cap is required.
 
-``[cgroup]``
-------------
-
-How ``spurd`` enforces a job's cgroup limits. The limits themselves come from the
-allocation (``--mem``, ``--cpus-per-task``); this section only sets policy. The
-fields mirror ``ConstrainSwapSpace`` and ``AllowedSwapSpace`` in Slurm's
-``cgroup.conf``, including their defaults.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 24 10 12 54
-
-   * - Field
-     - Type
-     - Default
-     - Description
-   * - ``constrain_swap_space``
-     - bool
-     - ``false``
-     - Cap a job's swap along with its memory. While ``false``, ``memory.max``
-       bounds resident memory only: on a node with swap, a job that outgrows
-       ``--mem`` keeps running on swap instead of being killed.
-   * - ``allowed_swap_space``
-     - integer
-     - ``0``
-     - Swap a job may use, as a percentage (0-100) of its memory allocation.
-       Only consulted when ``constrain_swap_space`` is set; ``0`` denies swap
-       outright. A value above 100 is rejected when spurd starts.
-
-.. note::
-
-   Enabling ``constrain_swap_space`` is what makes ``--mem`` a hard cap and lets a
-   runaway job be reported as ``OUT_OF_MEMORY`` rather than completing slowly on
-   swap. It is off by default because turning it on starts killing jobs that
-   previously survived by swapping. Both fields are read at ``spurd`` startup, so
-   changing them needs an agent restart.
-
 ``[mpi]``
 ---------
 

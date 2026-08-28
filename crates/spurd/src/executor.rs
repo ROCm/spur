@@ -15,7 +15,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use spur_core::config::{CgroupConfig, CgroupLimits, MemlockLimit, SwapLimit};
+use spur_core::config::{CgroupConfig, CgroupLimits, MemlockLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
@@ -164,8 +164,6 @@ pub struct JobLaunchConfig {
     pub memlock: MemlockLimit,
     /// cgroup-v2 enforcement settings from `[cgroup]`.
     pub cgroup: CgroupConfig,
-    /// Swap budget for the job's cgroup.
-    pub swap_limit: SwapLimit,
     /// I/O mode for the job.
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
@@ -507,7 +505,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
+    let cgroup_path = setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -875,14 +873,14 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Attaches after `exec`, so an immediate fork strands descendants. A `pre_exec`
-    // barrier cannot fix it: `Command::spawn` returns only once the child execs.
-    if let Some(ref cgroup) = cgroup_path {
-        if let Some(pid) = child.id() {
-            if !move_to_cgroup(cgroup, pid) && cfg.cgroup.required {
+    // The child joined its own cgroup pre-exec; confirm it landed so `required`
+    // can refuse a job that would otherwise run outside every limit.
+    if cfg.cgroup.required {
+        if let (Some(cgroup), Some(pid)) = (cgroup_path.as_ref(), child.id()) {
+            if !cgroup_has_pid(cgroup, pid) {
                 let _ = child.kill().await;
                 return Err(anyhow::anyhow!(
-                    "[cgroup] required but the job could not join its cgroup"
+                    "[cgroup] required but the job did not join its cgroup"
                 )
                 .into());
             }
@@ -943,7 +941,6 @@ fn setup_cgroup(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
-    swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
     let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
         debug!(job_id, "cgroup enforcement disabled by config");
@@ -1025,35 +1022,6 @@ fn setup_cgroup(
             warn!(job_id, file = name, error = %e, "failed to write cgroup control file");
             degrade(&format!("{name} not applied"));
         }
-    // Set CPU limit (cpu.max: quota period)
-    // e.g., 4 CPUs → "400000 100000" (400ms out of 100ms period)
-    let quota = cpus as u64 * 100_000;
-    let cpu_max = format!("{} 100000", quota);
-    if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), &cpu_max) {
-        warn!(job_id, error = %e, "failed to set cpu.max");
-    }
-
-    // Set memory limit
-    if memory_mb > 0 {
-        let memory_bytes = memory_mb * 1024 * 1024;
-        if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
-            warn!(job_id, error = %e, "failed to set memory.max");
-        }
-        // memory.max bounds resident memory only: with swap available the
-        // kernel pages the overflow out instead of OOM-killing. Opt-in, since
-        // capping swap starts killing jobs that used to survive.
-        if let Some(swap_bytes) = swap_limit.bytes_for(memory_bytes) {
-            if let Err(e) =
-                std::fs::write(cgroup_path.join("memory.swap.max"), swap_bytes.to_string())
-            {
-                warn!(job_id, error = %e, "failed to set memory.swap.max");
-            }
-        }
-    }
-
-    // OOM isolation: kill entire cgroup on OOM, not a random process
-    if let Err(e) = std::fs::write(cgroup_path.join("memory.oom.group"), "1") {
-        warn!(job_id, error = %e, "failed to set memory.oom.group");
     }
 
     // The cpuset is the only CPU bound once the quota is off, and a rejected write
@@ -1125,36 +1093,63 @@ fn permitted_cores(requested: &[u32], parent_effective: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Hold the forked child until the parent attaches it: cgroup-v2 moves only the
-/// written pid, so forking first strands descendants. Post-`fork`; fails open.
-unsafe fn await_cgroup_attach(read_fd: RawFd, write_fd: RawFd) {
-    // The child inherits the write end across fork, so EOF never arrives unless
-    // it drops its own copy first.
-    libc::close(write_fd);
-    let mut byte = 0u8;
+/// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
+/// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
+fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
+    let pid = unsafe { libc::getpid() };
+
+    let mut buf = [0u8; 24];
+    let mut i = buf.len();
+    let mut n = pid.max(0) as u64;
     loop {
-        let n = libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1);
-        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
         }
-        break;
     }
-    libc::close(read_fd);
+    let digits = &buf[i..];
+
+    unsafe {
+        let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            warn_cgroup_join_failed(log_fd);
+            return;
+        }
+        let written = libc::write(fd, digits.as_ptr() as *const libc::c_void, digits.len());
+        libc::close(fd);
+        if written < 0 {
+            warn_cgroup_join_failed(log_fd);
+        }
+    }
 }
 
-/// Move a process into a cgroup. Returns true if successful.
-fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
-    let procs_file = cgroup_path.join("cgroup.procs");
-    if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
-        warn!(
-            pid,
-            error = %e,
-            "failed to move process to cgroup — job runs without isolation"
-        );
-        false
-    } else {
-        true
+/// Async-signal-safe warning for a failed cgroup join: a fixed message to
+/// `log_fd`, or a no-op when it is negative.
+fn warn_cgroup_join_failed(log_fd: RawFd) {
+    if log_fd < 0 {
+        return;
     }
+    const MSG: &[u8] = b"spur: failed to join cgroup; job runs without resource limits\n";
+    unsafe {
+        libc::write(log_fd, MSG.as_ptr() as *const libc::c_void, MSG.len());
+    }
+}
+
+/// Duplicate `fd` with CLOEXEC set, returning the new fd or -1. The copy is
+/// usable in the pre-exec child but closes automatically at exec.
+fn dup_cloexec(fd: RawFd) -> RawFd {
+    unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }
+}
+
+/// Whether `pid` is in the job's cgroup. The child joins itself pre-exec, so
+/// this verifies the join rather than performing it.
+fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
+    let Ok(procs) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) else {
+        return false;
+    };
+    procs.lines().any(|line| line.trim() == pid.to_string())
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1592,19 +1587,7 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(
-        
-        job_id,
-        &CgroupConfig::default(),
-       
-        cfg.cpus,
-       
-        cfg.memory_mb,
-       
-        &cfg.cpu_ids,
-    ,
-        cfg.swap_limit,
-    )?;
+    let cgroup_path = setup_cgroup(job_id, &cfg.cgroup, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
 
     // Sync pipe: child writes status, parent reads.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
@@ -1616,12 +1599,6 @@ async fn launch_container_job(
     .ok();
     let ready_r = pipe_r.as_raw_fd();
     let ready_w = pipe_w.as_raw_fd();
-
-    // Must clear before `container_init`, which forks the pid-namespace PID 1:
-    // forking before the attach would strand the whole container tree.
-    let (barrier_r, barrier_w) = nix::unistd::pipe().context("create cgroup attach barrier")?;
-    let barrier_r_raw = barrier_r.as_raw_fd();
-    let barrier_w_raw = barrier_w.as_raw_fd();
 
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
@@ -1657,11 +1634,6 @@ async fn launch_container_job(
             unsafe {
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            }
-
-            // Before anything that forks.
-            unsafe {
-                await_cgroup_attach(barrier_r_raw, barrier_w_raw);
             }
 
             unsafe {
@@ -1757,22 +1729,6 @@ async fn launch_container_job(
 
             let child_pid = child.as_raw();
 
-            // Verify rather than trust (DC2): the container tree inherits this
-            // membership, so losing it silently unbounds the whole tree.
-            let joined = match cgroup_path {
-                Some(ref cgroup) => move_to_cgroup(cgroup, child_pid as u32),
-                None => true,
-            };
-            // Releases the child to run container_init; see await_cgroup_attach.
-            drop(barrier_w);
-
-            if !joined && cfg.cgroup.required {
-                let _ = signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL);
-                anyhow::bail!("[cgroup] required but the container could not join its cgroup");
-            }
-            // Cgroup placement already happened in the child before exec; a
-            // parent-side write here would race the container's execve.
-
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();
             if pidfd.is_none() {
@@ -1787,6 +1743,18 @@ async fn launch_container_job(
             if n < 2 || &buf[..2] != b"OK" {
                 let msg = String::from_utf8_lossy(&buf[..n]);
                 bail!("container init failed for job {}: {}", job_id, msg);
+            }
+
+            // Only now is the child's self-join guaranteed to have run. Verify
+            // rather than write (DC2): the container tree inherits this membership.
+            if cfg.cgroup.required {
+                let joined = cgroup_path
+                    .as_ref()
+                    .is_none_or(|cgroup| cgroup_has_pid(cgroup, child_pid as u32));
+                if !joined {
+                    let _ = signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL);
+                    anyhow::bail!("[cgroup] required but the container did not join its cgroup");
+                }
             }
 
             info!(
@@ -2506,7 +2474,6 @@ mod tests {
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
             cgroup: CgroupConfig::default(),
-            swap_limit: SwapLimit::Unconstrained,
             io_mode: LaunchIo::File,
             pmix_multi_task: false,
         }

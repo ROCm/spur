@@ -334,10 +334,7 @@ impl AgentService {
             hooks,
             device_registry,
             &spur_core::config::ClusterConfig::default(),
-            spur_core::config::JobLimits {
-                memlock,
-                ..Default::default()
-            },
+            spur_core::config::JobLimits { memlock },
             CgroupConfig::default(),
             MpiConfig::default(),
             new_running_jobs(),
@@ -1569,7 +1566,6 @@ impl SlurmAgent for AgentService {
             host_device_plan: Some(host_device_plan),
             memlock: self.limits.memlock,
             cgroup: self.cgroup.clone(),
-            swap_limit: self.limits.swap,
             io_mode: if spec.pty {
                 executor::LaunchIo::Pty
             } else {
