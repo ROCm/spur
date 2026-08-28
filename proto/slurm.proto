@@ -763,7 +763,8 @@ message SchedStats {
 // consumption stay separate fields rather than arriving pre-rendered as Slurm's
 // `Limit(Consumed)`, so a machine consumer does not have to unpick a display
 // string; the CLI composes that shape. Caps carry the INFINITE sentinel when
-// unset, TRES are `cpu=N,mem=N` strings, empty when nothing is held or capped.
+// unset, TRES are `<name>=<value>` strings (e.g. `cpu=36,node=9`), empty when
+// nothing is held or capped.
 message AssocMgrUserRecord {
   string user = 1;
   uint32 running_jobs = 2;
@@ -778,12 +779,6 @@ message AssocMgrUserRecord {
   repeated string over_limit = 8;
 }
 
-// A QOS or an association with the caps and consumption belonging to the scope
-// itself, plus the users holding work under it. Nesting per-user limits inside
-// the record they qualify follows Slurm's `assoc_mgr`, and keeps a scope's group
-// figures from being repeated once per user. A scope with no queued work carries
-// no user records, and is still reported so a misconfigured cap on an idle QOS
-// remains visible.
 // Caps a scope applies to each of its users, where the scope defines them once —
 // a QOS does. An association's caps are per (user, account) and ride on each user
 // record instead, so this is absent there. Present even for a scope with no queued
@@ -795,6 +790,12 @@ message AssocMgrCaps {
   string max_tres = 3;
 }
 
+// A QOS or an association with the caps and consumption belonging to the scope
+// itself, plus the users holding work under it. Nesting per-user limits inside
+// the record they qualify follows Slurm's `assoc_mgr`, and keeps a scope's group
+// figures from being repeated once per user. A scope with no queued work carries
+// no user records, and is still reported so a misconfigured cap on an idle QOS
+// remains visible.
 message AssocMgrRecord {
   string scope = 1;
   uint32 grp_running_jobs = 2;
@@ -819,9 +820,10 @@ message GetAssocMgrInfoRequest {
 message GetAssocMgrInfoResponse {
   repeated AssocMgrRecord qos_records = 1;
   repeated AssocMgrRecord assoc_records = 2;
-  // False when the accounting caches hold no snapshot: the usage figures still
-  // stand, but no cap could be read — the same condition that holds jobs at
-  // admission, so an operator seeing held jobs can tell the two apart.
+  // False only when accounting is enabled yet a cache still holds no snapshot:
+  // the usage figures stand, but some caps below may be missing. Accounting-off
+  // clusters report true, since a cluster with no caps is not one whose caps
+  // could not be read.
   bool limits_readable = 3;
 }
 

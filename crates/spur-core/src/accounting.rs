@@ -93,10 +93,9 @@ impl TresRecord {
         }
     }
 
-    /// Format as "cpu=N,mem=N,gres/gpu=N" string.
     /// The TRES types carrying a value here, name-sorted so output is stable.
     /// Lets a caller walk the dimensions a record actually uses instead of
-    /// assuming a fixed set.
+    /// assuming a fixed set. A dimension at 0 is omitted — 0 is not a cap.
     pub fn types(&self) -> Vec<TresType> {
         let mut types: Vec<TresType> = self
             .values
@@ -108,6 +107,8 @@ impl TresRecord {
         types
     }
 
+    /// Format as a `cpu=36,node=9` string, dimensions name-sorted. Dimensions at
+    /// 0 are omitted, so an all-zero record formats to the empty string.
     pub fn format(&self) -> String {
         let mut parts: Vec<String> = self
             .values
@@ -500,6 +501,9 @@ mod tests {
     fn scope_exceeded_caps_covers_the_group_caps_only() {
         // Group caps belong to the scope, not to any one user, so they are
         // reported from the scope record and never duplicated onto its users.
+        // The user carries a per-user cap it is within (12 running jobs under a
+        // cap of 20), so an empty result proves the group caps were not leaked
+        // onto it rather than that the user had no caps to report.
         let usage = ScopeLimitUsage {
             grp_running_tres: tres("node=9"),
             grp_tres: Some(tres("node=8")),
@@ -507,6 +511,10 @@ mod tests {
             grp_submit_jobs: Some(10),
             users: vec![UserLimitUsage {
                 running_jobs: 12,
+                caps: PerUserCaps {
+                    max_jobs: Some(20),
+                    ..Default::default()
+                },
                 ..Default::default()
             }],
             ..Default::default()

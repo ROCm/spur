@@ -31,7 +31,7 @@ pub struct ScontrolArgs {
 pub enum ScontrolCommand {
     /// Show detailed information
     Show {
-        /// Entity type: job, node, partition, config
+        /// Entity type: job, node, partition, reservation, assoc_mgr, federation, config
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -824,21 +824,15 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             }
         }
         "assoc_mgr" | "assocmgr" => {
-            // Slurm's filter syntax is `users=<name>`; a bare name means the same.
-            let user = name
-                .map(|n| n.strip_prefix("users=").unwrap_or(n).to_string())
-                .unwrap_or_default();
+            let user = assoc_mgr_user_filter(name)?;
             let resp = client
                 .get_assoc_mgr_info(spur_proto::proto::GetAssocMgrInfoRequest { user })
                 .await
                 .context("failed to get association manager info")?
                 .into_inner();
 
-            if !resp.limits_readable {
-                println!(
-                    "LimitsReadable=NO (the accounting caches hold no snapshot, so no limit \
-                     below could be read; usage is still current)"
-                );
+            if let Some(banner) = limits_readable_banner(resp.limits_readable) {
+                println!("{banner}");
                 println!();
             }
             print!("{}", render_assoc_mgr(QOS_SECTION, &resp.qos_records));
@@ -904,6 +898,52 @@ fn cap_or_n(cap: u32) -> String {
     }
 }
 
+/// The `users=` selector for `scontrol show assoc_mgr`, or a bare name meaning
+/// the same user filter. Any other `<key>=` token is a wrong flag rather than a
+/// username: the migration guide promises those are rejected, so it errors here
+/// instead of silently filtering for a user literally named `qos=highprio`.
+fn assoc_mgr_user_filter(selector: Option<&str>) -> Result<String> {
+    let Some(sel) = selector else {
+        return Ok(String::new());
+    };
+    if let Some(user) = sel.strip_prefix("users=") {
+        return Ok(user.to_string());
+    }
+    if let Some((key, _)) = sel.split_once('=') {
+        bail!(
+            "scontrol show assoc_mgr: unknown selector '{key}='; only 'users=' is accepted \
+             (a bare name filters by that user)"
+        );
+    }
+    Ok(sel.to_string())
+}
+
+/// The `LimitsReadable=NO` banner, or `None` when caps are fully readable so the
+/// line is suppressed. It prints only when accounting is enabled yet a cache has
+/// not loaded — some caps below may be missing while the usage figures stand.
+fn limits_readable_banner(limits_readable: bool) -> Option<String> {
+    if limits_readable {
+        return None;
+    }
+    Some(
+        "LimitsReadable=NO (accounting is enabled but a cache holds no snapshot, so some \
+         limits below may be missing; usage is still current)"
+            .to_string(),
+    )
+}
+
+/// A per-user TRES cap on its own, `N` when the scope sets none. Mirrors
+/// `cap_or_n` for the TRES string so `MaxTRES*=` never renders empty beside a
+/// sibling that shows `N`, which a parser splitting on `=` would read as a
+/// missing field rather than "no cap".
+fn tres_cap_or_n(cap: &str) -> String {
+    if cap.is_empty() {
+        "N".to_string()
+    } else {
+        cap.to_string()
+    }
+}
+
 /// A cap beside what is consumed against it, as Slurm's `assoc_mgr` prints it:
 /// `2(6)` is a cap of two with six in use. Scripts already parse this shape, so it
 /// is a contract rather than a preference.
@@ -918,12 +958,9 @@ fn tres_limit_consumed(cap: &str, used: &str) -> String {
     let cap = TresRecord::parse(cap).unwrap_or_default();
     let used = TresRecord::parse(used).unwrap_or_default();
     let mut dimensions = cap.types();
-    for dimension in used.types() {
-        if !dimensions.contains(&dimension) {
-            dimensions.push(dimension);
-        }
-    }
+    dimensions.extend(used.types());
     dimensions.sort_by_key(|t| t.name());
+    dimensions.dedup();
     dimensions
         .into_iter()
         .map(|t| {
@@ -969,7 +1006,7 @@ fn render_assoc_mgr(
                 " MaxJobs{pu}={} MaxSubmitJobs{pu}={} MaxTRES{pu}={}",
                 cap_or_n(caps.max_jobs),
                 cap_or_n(caps.max_submit_jobs),
-                caps.max_tres,
+                tres_cap_or_n(&caps.max_tres),
             ));
         }
         out.push('\n');
@@ -2316,6 +2353,41 @@ mod tests {
             "cpu=N(12),node=8(0)"
         );
         assert_eq!(tres_limit_consumed("", ""), "");
+    }
+
+    #[test]
+    fn assoc_mgr_renders_n_for_an_unset_per_user_tres_cap() {
+        // MaxTRESPU must read `N` like its count siblings, not an empty field a
+        // parser splitting on `=` would see as missing.
+        let mut record = assoc_mgr_record();
+        record.scope_caps.as_mut().unwrap().max_tres = String::new();
+        let out = render_assoc_mgr(QOS_SECTION, &[record]);
+        assert!(out.contains("MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=N\n"));
+    }
+
+    #[test]
+    fn assoc_mgr_user_filter_reads_users_prefix_and_bare_name() {
+        assert_eq!(assoc_mgr_user_filter(None).unwrap(), "");
+        assert_eq!(assoc_mgr_user_filter(Some("alice")).unwrap(), "alice");
+        assert_eq!(assoc_mgr_user_filter(Some("users=alice")).unwrap(), "alice");
+        // An empty `users=` clears the filter, same as passing nothing.
+        assert_eq!(assoc_mgr_user_filter(Some("users=")).unwrap(), "");
+    }
+
+    #[test]
+    fn assoc_mgr_user_filter_rejects_a_non_users_selector() {
+        // A wrong flag must error, not silently filter for a user literally named
+        // `qos=highprio` and print an empty result.
+        let err = assoc_mgr_user_filter(Some("qos=highprio")).unwrap_err();
+        assert!(err.to_string().contains("qos="), "got: {err}");
+        assert!(assoc_mgr_user_filter(Some("accounts=eng")).is_err());
+    }
+
+    #[test]
+    fn limits_readable_banner_prints_only_when_caps_are_incomplete() {
+        assert!(limits_readable_banner(true).is_none());
+        let banner = limits_readable_banner(false).expect("banner when not readable");
+        assert!(banner.starts_with("LimitsReadable=NO"));
     }
 
     #[test]

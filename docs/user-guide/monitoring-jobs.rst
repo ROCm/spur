@@ -565,9 +565,14 @@ it:
 
 Reading it:
 
-* Every cap is printed as **``Limit(Consumed)``**, as in Slurm: ``node=4(6)`` is a
-  cap of four nodes with six in use, and ``N`` marks no cap. A literal ``0`` is a
-  real cap that blocks every job it governs.
+* On the ``Grp*`` line and the ``User=`` lines every cap is printed as
+  **``Limit(Consumed)``**, as in Slurm: ``node=4(6)`` is a cap of four nodes with
+  six in use, and ``N`` marks no cap. ``MaxWall`` and the per-user caps on the
+  scope line print bare, with no consumption beside them.
+* For the count caps a literal ``0`` is a real cap that blocks every job it
+  governs. A TRES dimension is the exception: ``0`` there is treated as *unset* —
+  it renders as ``N`` and is not enforced, so ``GrpTRES=node=0`` does not block a
+  dimension the way ``MaxJobs=0`` blocks jobs.
 * Consumption is live, measured exactly as the scheduler measures it when it
   admits a job. Node counts are distinct occupied nodes, so two jobs sharing a
   node hold one node, not two. A TRES dimension appears when either the cap or
@@ -591,8 +596,15 @@ over-tight cap on an idle QOS is exactly the kind of mistake that hides
 otherwise. A QOS deleted after its jobs queued also stays reported for as long as
 those jobs hold resources.
 
-A ``LimitsReadable=NO`` line above the sections means the accounting caches held
-no snapshot, so no cap could be read; the usage figures are still current.
+A ``LimitsReadable=NO`` line above the sections means accounting is enabled but a
+cache has not loaded yet, so some caps below may be missing; the usage figures
+are still current. A cluster with accounting disabled has no caps to read and so
+never prints this line.
+
+An unprivileged caller sees only their own usage: ``scontrol show assoc_mgr``
+scopes the view to the caller and lists only the QOS and accounts they take part
+in. Administrators see every scope, and may pass ``users=<name>`` to inspect one
+user.
 
 Cluster Metrics — ``/metrics``
 ------------------------------
