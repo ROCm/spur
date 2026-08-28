@@ -1041,7 +1041,10 @@ fn setup_cgroup(
             degrade("cpuset differs from the allocated cores");
         }
     } else if cgroup.constrain_cores {
+        // No cpuset is written at all in this case, so the job is free to run on
+        // every core on the node — the clamp above can empty a non-empty set.
         warn!(job_id, "no cores to pin; job runs without a CPU bound");
+        degrade("no cores to pin");
     }
 
     if let Some(reason) = degraded {

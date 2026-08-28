@@ -124,17 +124,21 @@ fn resolve_cgroup_budget(
     tasks_per_node: u32,
 ) -> (u32, u64) {
     let (alloc_cpus, alloc_mem_mb) = alloc.map(|a| (a.cpus, a.memory_mb)).unwrap_or((0, 0));
+    // Saturating: the spec is caller-supplied, and a wrapped product would set
+    // limits from a budget bearing no relation to what the job asked for.
     let cpus = if alloc_cpus > 0 {
         alloc_cpus
     } else {
-        tasks_per_node.max(1) * spec.cpus_per_task.max(1)
+        tasks_per_node
+            .max(1)
+            .saturating_mul(spec.cpus_per_task.max(1))
     };
     let memory_mb = if alloc_mem_mb > 0 {
         alloc_mem_mb
     } else if spec.memory_per_node_mb > 0 {
         spec.memory_per_node_mb
     } else {
-        spec.memory_per_cpu_mb * cpus as u64
+        spec.memory_per_cpu_mb.saturating_mul(cpus as u64)
     };
     (cpus, memory_mb)
 }
@@ -276,6 +280,19 @@ mod budget_tests {
     fn spec_fallback_honors_mem_per_cpu() {
         // --mem-per-cpu=512 with 8 cores on this node.
         assert_eq!(resolve_cgroup_budget(None, &spec(2, 0, 512), 4), (8, 4096));
+    }
+
+    #[test]
+    fn an_absurd_spec_saturates_instead_of_wrapping() {
+        // A spec reaches the agent unvalidated, and a wrapped product would
+        // hand limits_for a budget unrelated to the request.
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec(100_000, 0, 0), 100_000);
+        assert_eq!(cpus, u32::MAX);
+        assert_eq!(memory_mb, 0, "no memory request stays unbounded");
+
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec(u32::MAX, 0, u64::MAX), 2);
+        assert_eq!(cpus, u32::MAX);
+        assert_eq!(memory_mb, u64::MAX);
     }
 
     #[test]
@@ -1228,7 +1245,7 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPURD_NODENAME", &hostname);
         senv.set_with_slurm_twin(
             "SPUR_CPUS_ON_NODE",
-            tasks_per_node * spec.cpus_per_task.max(1),
+            tasks_per_node.saturating_mul(spec.cpus_per_task.max(1)),
         );
 
         if array_job_id != 0 {
