@@ -84,6 +84,9 @@ impl SchedStatsCollector {
         self.jobs_finalized.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the preemption counter. Also call `record_finalized` for the
+    /// same job — `jobs_preempted` is a subset of `jobs_finalized`, not a
+    /// separate category.
     pub fn record_preempted(&self) {
         self.jobs_preempted.fetch_add(1, Ordering::Relaxed);
     }
