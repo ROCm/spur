@@ -20317,6 +20317,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_default_time_limit_rejects_when_any_requested_partition_is_zero() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu,cpu".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "gpu".into(),
+                default_time_minutes: Some(30),
+                ..Default::default()
+            },
+            Partition {
+                name: "cpu".into(),
+                default_time_minutes: Some(0),
+                ..Default::default()
+            },
+        ];
+        let err = super::validate_default_time_limit(&spec, &partitions).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "partition 'cpu' has a default time limit of zero; specify a time limit"
+            )
+        );
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
     fn apply_default_time_limit_falls_back_to_partition_max_time() {
         // No DefaultTime but a finite MaxTime: Slurm uses MaxTime as the default.
         let mut spec = basic_spec("j");
