@@ -42,6 +42,7 @@ pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
         jobs_submitted: snap.jobs_submitted,
         jobs_started: snap.jobs_started,
         jobs_finalized: snap.jobs_finalized,
+        jobs_preempted: snap.jobs_preempted,
         jobs_started_last_cycle: snap.jobs_started_last_cycle,
         exit_end: snap.exit_end,
         exit_max_depth: snap.exit_max_depth,
@@ -308,6 +309,7 @@ mod tests {
             jobs_submitted: 42,
             jobs_started: 30,
             jobs_finalized: 28,
+            jobs_preempted: 5,
             jobs_started_last_cycle: 3,
             exit_end: 8,
             exit_max_depth: 2,
@@ -330,6 +332,10 @@ mod tests {
         assert_eq!(
             proto.jobs_finalized,
             gauge_value(&body, "spur_scheduler_jobs_finalized_total")
+        );
+        assert_eq!(
+            proto.jobs_preempted,
+            gauge_value(&body, "spur_scheduler_jobs_preempted_total")
         );
         assert_eq!(
             proto.jobs_started_last_cycle,

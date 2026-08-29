@@ -1831,6 +1831,9 @@ impl ClusterManager {
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
         if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
+            if finalized.state == JobState::Preempted {
+                stats.record_preempted();
+            }
         }
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
@@ -9818,6 +9821,45 @@ mod tests {
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();
         settle(&cm, job_id, JobState::Completed);
         assert_eq!(stats.snapshot().jobs_finalized, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sched_stats_track_preempted_jobs() {
+        use std::sync::Arc;
+
+        use crate::sched_stats::SchedStatsCollector;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job1 = run_job_on(&cm, "victim-1", "worker1");
+        cm.preempt_job(job1, PreemptMode::Requeue, 99, None)
+            .unwrap();
+        settle(&cm, job1, JobState::Pending);
+        assert_eq!(
+            stats.snapshot().jobs_preempted,
+            1,
+            "requeue preemption counted"
+        );
+
+        let job2 = run_job_on(&cm, "victim-2", "worker1");
+        cm.preempt_job(job2, PreemptMode::Cancel, 99, None).unwrap();
+        settle(&cm, job2, JobState::Cancelled);
+        assert_eq!(
+            stats.snapshot().jobs_preempted,
+            2,
+            "cancel preemption counted"
+        );
+
+        assert_eq!(
+            stats.snapshot().jobs_finalized,
+            2,
+            "both preemptions counted as finalized"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
