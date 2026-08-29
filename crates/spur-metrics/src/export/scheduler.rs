@@ -93,7 +93,7 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     register_counter(
         registry,
         "spur_scheduler_jobs_preempted",
-        "Jobs preempted since reset",
+        "Jobs preempted (cancel or requeue mode) since reset; suspend-mode preemptions are excluded",
         snap.jobs_preempted,
     );
     register_counter(

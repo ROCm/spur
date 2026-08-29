@@ -1831,6 +1831,8 @@ impl ClusterManager {
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
         if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
+            // JobPreemptCancel and JobPreemptRequeue are the only WAL
+            // operations that set state=Preempted; Suspend does not.
             if finalized.state == JobState::Preempted {
                 stats.record_preempted();
             }

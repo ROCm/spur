@@ -28,7 +28,7 @@ spur_scheduler_jobs_started_total 30
 # HELP spur_scheduler_jobs_finalized Jobs reaching a terminal state since reset.
 # TYPE spur_scheduler_jobs_finalized counter
 spur_scheduler_jobs_finalized_total 28
-# HELP spur_scheduler_jobs_preempted Jobs preempted since reset.
+# HELP spur_scheduler_jobs_preempted Jobs preempted (cancel or requeue mode) since reset; suspend-mode preemptions are excluded.
 # TYPE spur_scheduler_jobs_preempted counter
 spur_scheduler_jobs_preempted_total 5
 # HELP spur_scheduler_exit_end Cycles that considered every pending job.
