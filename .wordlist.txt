@@ -277,3 +277,13 @@ drivable
 enablement
 AllowedIPs
 Deregister
+datapath
+passwordless
+preflight
+rootful
+userspace
+InternalIPs
+Scaffolded
+ClusterIP
+DNATs
+kube
