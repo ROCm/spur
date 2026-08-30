@@ -138,6 +138,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_submit_time ON jobs(submit_time);
 CREATE INDEX IF NOT EXISTS idx_jobs_start_time ON jobs(start_time);
+-- Serves the GrpWall aggregate, which otherwise scans all job history per refresh;
+-- a first-refresh timeout leaves the budget unapplied. end_time leads: it bounds the window.
+CREATE INDEX IF NOT EXISTS idx_jobs_grp_wall_window ON jobs(end_time, qos, start_time)
+    WHERE qos <> '' AND start_time IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_start, period_end);
 CREATE INDEX IF NOT EXISTS idx_assoc_user ON associations(user_name);
 CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
@@ -738,19 +742,10 @@ pub async fn get_usage(
     Ok(records)
 }
 
-/// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
-/// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
-/// that started before the window contributes only the part inside it.
-///
-/// Each row is clamped at zero inside the `SUM`, not after it: start/end times can
-/// be written by callers outside the controller and can skew, and a single
-/// end-before-start row would otherwise cancel real consumption in the same QOS
-/// and under-report the budget.
-pub async fn consumed_wall_minutes_by_qos(
-    pool: &PgPool,
-    window_days: u32,
-) -> anyhow::Result<HashMap<String, u64>> {
-    let rows = sqlx::query(
+// A macro rather than a `const` so the EXPLAIN test can build its statement with
+// `concat!`, which needs a literal on both sides.
+macro_rules! consumed_wall_minutes_sql {
+    () => {
         r#"
         SELECT qos,
                SUM(GREATEST(
@@ -765,11 +760,26 @@ pub async fn consumed_wall_minutes_by_qos(
           AND start_time IS NOT NULL
           AND (end_time IS NULL OR end_time > now() - make_interval(days => $1))
         GROUP BY qos
-        "#,
-    )
-    .bind(window_days as i32)
-    .fetch_all(pool)
-    .await?;
+        "#
+    };
+}
+
+/// Wall-clock minutes consumed per QOS inside the trailing `window_days`, for
+/// `GrpWall` enforcement. Running jobs count their elapsed time so far, and a job
+/// that started before the window contributes only the part inside it.
+///
+/// Each row is clamped at zero inside the `SUM`, not after it: start/end times can
+/// be written by callers outside the controller and can skew, and a single
+/// end-before-start row would otherwise cancel real consumption in the same QOS
+/// and under-report the budget.
+pub async fn consumed_wall_minutes_by_qos(
+    pool: &PgPool,
+    window_days: u32,
+) -> anyhow::Result<HashMap<String, u64>> {
+    let rows = sqlx::query(consumed_wall_minutes_sql!())
+        .bind(window_days as i32)
+        .fetch_all(pool)
+        .await?;
 
     let consumed = rows
         .iter()
@@ -1572,6 +1582,41 @@ mod job_history_tests {
         .await
     }
 
+    /// Seeds one job through the real start/end path on `conn`, so the EXPLAIN test
+    /// can build its fixture inside a transaction that rolls back. `end = None`
+    /// leaves the job running with a NULL end_time.
+    async fn seed_job(
+        conn: &mut PgConnection,
+        job_id: i32,
+        qos: &str,
+        start_time: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        record_job_start(
+            conn,
+            &JobStartRecord {
+                job_id: job_id as JobId,
+                name: "fixture".to_string(),
+                user: "root".to_string(),
+                account: String::new(),
+                partition: String::new(),
+                qos: qos.to_string(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                memory_mb: 0,
+                submit_time: start_time,
+                start_time,
+                reservation: Some(String::new()),
+            },
+        )
+        .await?;
+        if let Some(end_time) = end {
+            record_job_end(conn, job_id, "COMPLETED", 0, end_time, 0, 0, None, "", "").await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn get_job_history_query_builder() -> anyhow::Result<()> {
@@ -2174,6 +2219,87 @@ mod job_history_tests {
         );
 
         delete_jobs(&pool, &ids).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn grp_wall_aggregate_is_servable_from_its_index() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let now = Utc::now();
+
+        // Seed a known shape inside the transaction so the plan is chosen from these
+        // rows, not from ambient statistics left by sibling tests: two in-window,
+        // one out-of-window, one still running (NULL end_time, the branch the
+        // predicate deliberately omits), one with no QOS. ANALYZE makes it visible
+        // to the planner; everything rolls back.
+        let base = 9_100_000 + (std::process::id() as i32 % 10_000) * 10;
+        seed_job(
+            &mut tx,
+            base,
+            "gw",
+            now - Duration::minutes(60),
+            Some(now - Duration::minutes(30)),
+        )
+        .await?;
+        seed_job(
+            &mut tx,
+            base + 1,
+            "gw",
+            now - Duration::days(5),
+            Some(now - Duration::days(2)),
+        )
+        .await?;
+        seed_job(
+            &mut tx,
+            base + 2,
+            "gw",
+            now - Duration::days(365),
+            Some(now - Duration::days(364)),
+        )
+        .await?;
+        seed_job(&mut tx, base + 3, "gw", now - Duration::minutes(15), None).await?;
+        seed_job(
+            &mut tx,
+            base + 4,
+            "",
+            now - Duration::minutes(45),
+            Some(now - Duration::minutes(20)),
+        )
+        .await?;
+        sqlx::query("ANALYZE jobs").execute(&mut *tx).await?;
+
+        // A partial index qualifies only if its predicate is implied by the query's
+        // WHERE, which is the part that rots silently when either side is edited.
+        // Forcing seqscan off makes the planner say whether the pairing still holds
+        // on a table too small for it to prefer the index on cost alone.
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let plan = sqlx::query(concat!("EXPLAIN ", consumed_wall_minutes_sql!()))
+            .bind(14i32)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            plan.contains("idx_jobs_grp_wall_window"),
+            "GrpWall consumption must be servable from idx_jobs_grp_wall_window; plan was:\n{plan}"
+        );
+        // A broken predicate degrades to idx_jobs_start_time (start_time IS NOT NULL is
+        // indexable), not a seq scan — enable_seqscan = off is a cost penalty, not a
+        // prohibition. That index scans all history, so its absence is what ties cost to the window.
+        assert!(
+            !plan.contains("idx_jobs_start_time"),
+            "the window predicate no longer reaches idx_jobs_grp_wall_window, so the plan \
+             degraded to the non-selective start_time index; plan was:\n{plan}"
+        );
+
+        tx.rollback().await?;
         Ok(())
     }
 
