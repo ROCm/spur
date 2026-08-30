@@ -1587,7 +1587,7 @@ mod job_history_tests {
     /// leaves the job running with a NULL end_time.
     async fn seed_job(
         conn: &mut PgConnection,
-        job_id: i32,
+        job_id: JobId,
         qos: &str,
         start_time: DateTime<Utc>,
         end: Option<DateTime<Utc>>,
@@ -1595,7 +1595,7 @@ mod job_history_tests {
         record_job_start(
             conn,
             &JobStartRecord {
-                job_id: job_id as JobId,
+                job_id,
                 name: "fixture".to_string(),
                 user: "root".to_string(),
                 account: String::new(),
@@ -2234,7 +2234,7 @@ mod job_history_tests {
         // one out-of-window, one still running (NULL end_time, the branch the
         // predicate deliberately omits), one with no QOS. ANALYZE makes it visible
         // to the planner; everything rolls back.
-        let base = 9_100_000 + (std::process::id() as i32 % 10_000) * 10;
+        let base = 9_100_000 + (std::process::id() % 10_000) * 10;
         seed_job(
             &mut tx,
             base,
