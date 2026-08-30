@@ -3303,17 +3303,12 @@ impl ClusterManager {
                     PendingReason::JobArrayTaskLimit,
                 );
                 candidate.scheduling_eligible = false;
-            } else {
-                if candidate.job.pending_reason == PendingReason::JobArrayTaskLimit {
-                    record_pending_reason_update(
-                        &mut reason_updates,
-                        candidate,
-                        PendingReason::None,
-                    );
-                    candidate.job.set_pending_reason(PendingReason::None);
-                }
-                *count += 1;
+                continue;
             }
+            if candidate.job.pending_reason == PendingReason::JobArrayTaskLimit {
+                record_pending_reason_update(&mut reason_updates, candidate, PendingReason::None);
+            }
+            *count += 1;
         }
 
         {
@@ -3692,7 +3687,7 @@ impl ClusterManager {
     /// Leader-only; enforced by the scheduler-loop caller, not this function
     /// itself (mirrors `cancel_unsatisfiable_dependency_jobs()`).
     #[cfg(test)]
-    fn tag_blocked_pending_reasons(&self) {
+    fn refresh_pending_reasons(&self) {
         let reason_updates = self.classify_pending_jobs().reason_updates;
         self.apply_pending_reason_updates(reason_updates);
     }
@@ -6480,7 +6475,7 @@ fn retain_unblocked(
 enum GateOutcome {
     /// Keep the candidate in the schedulable set.
     Keep,
-    /// Drop and record `reason` (a no-op tag for already-tagged candidates).
+    /// Drop and queue `reason` when the candidate permits reason updates.
     Block(PendingReason),
     /// Drop without recording a reason. Only the burst-buffer stage-in handoff
     /// uses this: the gate reserved capacity and enqueued the job for staging,
@@ -6491,8 +6486,8 @@ enum GateOutcome {
 
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
 /// `gate` reserve in-pass headroom on the keep path. A [`GateOutcome::Block`]
-/// drop is recorded via `record_pending_reason_update` (a no-op for already-tagged
-/// candidates); [`GateOutcome::DropUntagged`] drops without a reason.
+/// drop queues its reason when the candidate permits reason updates;
+/// [`GateOutcome::DropUntagged`] drops without a reason.
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
     reason_updates: &mut Vec<(JobId, PendingReason)>,
@@ -11264,11 +11259,11 @@ mod tests {
             PendingReason::Preempted
         );
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Preempted,
-            "tag_blocked_pending_reasons must not clobber an active Preempted hold"
+            "refresh_pending_reasons must not clobber an active Preempted hold"
         );
     }
 
@@ -11587,12 +11582,12 @@ mod tests {
         cm.requeue_job(job_id).unwrap();
         settle(&cm, job_id, JobState::Pending);
 
-        // Both guard sites in tag_blocked_pending_reasons.
-        cm.tag_blocked_pending_reasons();
+        // Both guard sites in refresh_pending_reasons.
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::JobLaunchFailure,
-            "tag_blocked_pending_reasons must not clobber an active hold"
+            "refresh_pending_reasons must not clobber an active hold"
         );
 
         // The guard site in update_pending_reasons. An empty cluster_state would
@@ -12762,7 +12757,7 @@ mod tests {
         });
         wait_for("job applied", || cm.get_job(job_id).is_some());
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::PartitionConfig
@@ -12806,7 +12801,7 @@ mod tests {
         });
         wait_for("undernodes applied", || cm.get_job(n_id).is_some());
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(t_id).unwrap().pending_reason,
             PendingReason::PartitionTimeLimit,
@@ -12839,7 +12834,7 @@ mod tests {
         spec.partition = Some("default".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::PartitionInactive
@@ -12863,7 +12858,7 @@ mod tests {
         spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BeginTime
@@ -12885,7 +12880,7 @@ mod tests {
         let mut spec = basic_spec("begin-lapse");
         spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
         let job_id = submit_and_wait(&cm, spec);
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BeginTime
@@ -12932,7 +12927,7 @@ mod tests {
         spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::PartitionInactive
@@ -13644,7 +13639,7 @@ mod tests {
         spec.reservation = Some("does-not-exist".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Reservation
@@ -14781,7 +14776,7 @@ mod tests {
         .unwrap();
 
         let job_id = submit_and_wait(&cm, basic_spec("fence"));
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         let job = cm.get_job(job_id).unwrap();
         assert_ne!(
             job.pending_reason,
@@ -15027,7 +15022,7 @@ mod tests {
             jobs.get_mut(&job_id).unwrap().priority = 0;
         }
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::ReservationDeleted
@@ -15333,7 +15328,7 @@ mod tests {
         spec.gres = vec!["license:flexlm:1".into()];
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Licenses
@@ -15360,7 +15355,7 @@ mod tests {
         spec.time_limit = Some(chrono::Duration::hours(1));
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::QosMaxWallDurationPerJobLimit
@@ -15405,7 +15400,7 @@ mod tests {
         s2.num_tasks = 1;
         let j2 = submit_and_wait(&cm, s2);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QosGrpCpuLimit
@@ -15458,7 +15453,7 @@ mod tests {
             Some("highprio")
         );
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QoSMaxJobsPerUser
@@ -15500,7 +15495,7 @@ mod tests {
         settle(&cm, j1, JobState::Running);
 
         let j2 = submit_and_wait(&cm, basic_spec("d2"));
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QoSMaxJobsPerUser,
@@ -15539,7 +15534,7 @@ mod tests {
         s2.account = Some("research".into());
         let j2 = submit_and_wait(&cm, s2);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::AssocMaxJobsLimit
@@ -15573,7 +15568,7 @@ mod tests {
             },
         );
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         // j1 alone is within the limit (max_submit_jobs=1) and must not be
         // blocked by counting itself; only j2, which pushes the count over
         // the cap, should be blocked.
@@ -15613,7 +15608,7 @@ mod tests {
             ..Default::default()
         });
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         // j1 alone is within the limit (max_submit_jobs_per_user=1) and must
         // not be blocked by counting itself; only j2, which pushes the count
         // over the cap, should be blocked.
@@ -15672,7 +15667,7 @@ mod tests {
         s2.num_tasks = 1;
         let j2 = submit_and_wait(&cm, s2);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::AssocGrpCpuLimit
@@ -15704,7 +15699,7 @@ mod tests {
         s2.qos = Some("capped".into());
         let j2 = submit_and_wait(&cm, s2);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
@@ -15799,7 +15794,7 @@ mod tests {
         newjob.num_nodes = 1;
         let new_id = submit_and_wait(&cm, newjob);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(new_id).unwrap().pending_reason,
             PendingReason::QosGrpNodeLimit,
@@ -15846,7 +15841,7 @@ mod tests {
         newjob.num_tasks = 2; // avoid effective_num_nodes() clamping to num_tasks
         let new_id = submit_and_wait(&cm, newjob);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(new_id).unwrap().pending_reason,
             PendingReason::QosGrpNodeLimit,
@@ -16000,7 +15995,7 @@ mod tests {
              (3rd) node and blocked at the grp cap of 2"
         );
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(id_b).unwrap().pending_reason,
             PendingReason::QosGrpNodeLimit,
@@ -16069,7 +16064,7 @@ mod tests {
              already-claimed spare capacity"
         );
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(id_b).unwrap().pending_reason,
             PendingReason::AssocGrpNodeLimit,
@@ -16154,7 +16149,7 @@ mod tests {
         newjob.num_nodes = 1;
         let new_id = submit_and_wait(&cm, newjob);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(new_id).unwrap().pending_reason,
             PendingReason::None,
@@ -16365,7 +16360,7 @@ mod tests {
         s2.account = Some("research".into());
         let j2 = submit_and_wait(&cm, s2);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
@@ -16498,7 +16493,7 @@ mod tests {
         newjob.num_tasks = 4; // avoid effective_num_nodes() clamping to num_tasks
         let new_id = submit_and_wait(&cm, newjob);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(new_id).unwrap().pending_reason,
             PendingReason::QosGrpNodeLimit,
@@ -16524,7 +16519,7 @@ mod tests {
         s2.burst_buffer = Some("capacity=60".into());
         let j2 = submit_and_wait(&cm, s2);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::BurstBufferResources
@@ -16549,7 +16544,7 @@ mod tests {
         let spec = basic_spec("d1");
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_ne!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::AssocMaxJobsLimit
@@ -16773,6 +16768,59 @@ mod tests {
         assert_eq!(
             cm.get_job(t2).unwrap().pending_reason,
             PendingReason::JobArrayTaskLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_reason_hands_off_to_license_blocker() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.license_pool.write().insert("fluent".into(), 1);
+
+        let mut spec = basic_spec("arr-throttle-license");
+        spec.array_spec = Some("0-1%1".into());
+        spec.gres = vec!["license:fluent:2".into()];
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let t1 = parent_id + 1;
+        let t2 = parent_id + 2;
+        wait_for("array license tasks", || {
+            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
+        });
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+
+        assert!(!pending.contains(&t1));
+        assert!(!pending.contains(&t2));
+        assert_eq!(
+            cm.get_job(t1).unwrap().pending_reason,
+            PendingReason::Licenses
+        );
+        assert_eq!(
+            license_block(&cm.get_job(t2).unwrap(), &cm.available_licenses()),
+            Some(PendingReason::Licenses)
+        );
+        assert_eq!(
+            cm.get_job(t2).unwrap().pending_reason,
+            PendingReason::JobArrayTaskLimit
+        );
+
+        cm.cancel_job(t1, "testuser").unwrap();
+        settle(&cm, t1, JobState::Cancelled);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+
+        assert!(!pending.contains(&t2));
+        assert_eq!(
+            cm.get_job(t2).unwrap().pending_reason,
+            PendingReason::Licenses
         );
     }
 
@@ -17148,7 +17196,7 @@ mod tests {
         spec.burst_buffer = Some("capacity=500".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BurstBufferResources
@@ -17181,7 +17229,7 @@ mod tests {
         );
         assert_eq!(cm.available_bb(), 60);
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::BurstBufferStageIn
@@ -17238,7 +17286,7 @@ mod tests {
             .count();
         assert_eq!((staging, none), (1, 1), "exactly one job stages");
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         let unstaged = states
             .iter()
             .find(|(_, s)| *s == BbStageState::None)
@@ -17306,7 +17354,7 @@ mod tests {
             jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::Held;
         }
 
-        cm.tag_blocked_pending_reasons();
+        cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Held
