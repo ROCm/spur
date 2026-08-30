@@ -33,7 +33,7 @@ const SCHEMA_LOCK_OBJ: i32 = 1;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id          INTEGER PRIMARY KEY,
+    job_id          BIGINT PRIMARY KEY,
     name            TEXT NOT NULL DEFAULT '',
     user_name       TEXT NOT NULL,
     uid             INTEGER NOT NULL DEFAULT 0,
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS associations (
 );
 
 CREATE TABLE IF NOT EXISTS tres_usage (
-    job_id          INTEGER NOT NULL,
+    job_id          BIGINT NOT NULL,
     tres_type       TEXT NOT NULL,
     alloc_value     BIGINT NOT NULL DEFAULT 0,
     used_value      BIGINT NOT NULL DEFAULT 0,
@@ -158,9 +158,47 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
+
+-- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
+-- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
+DO $$
+DECLARE
+    target RECORD;
+BEGIN
+    FOR target IN
+        SELECT *
+        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'))
+             AS t(tbl, col)
+    LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = target.tbl
+              AND column_name = target.col
+              AND data_type = 'integer'
+        ) THEN
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN %I TYPE BIGINT', target.tbl, target.col);
+        END IF;
+    END LOOP;
+END $$;
+
+-- Restore the true id of a row a pre-fix controller narrowed: the u32 wrapped to a
+-- negative int4, so add 2^32 back. Skip a row whose true id already exists so the
+-- rewrite can never violate the primary key. No-op (and cheap on the PK) once clean.
+UPDATE jobs SET job_id = job_id + 4294967296
+WHERE job_id < 0
+  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.job_id = jobs.job_id + 4294967296);
+UPDATE jobs SET preempted_by = preempted_by + 4294967296
+WHERE preempted_by < 0;
+UPDATE tres_usage t SET job_id = job_id + 4294967296
+WHERE job_id < 0
+  AND NOT EXISTS (
+    SELECT 1 FROM tres_usage u
+    WHERE u.job_id = t.job_id + 4294967296 AND u.tres_type = t.tres_type
+  );
 
 -- users.default_account is the single source of truth for a user's default
 -- account (the scheduler reads it via the association cache). associations
@@ -254,7 +292,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             end_time = NULL
         "#,
     )
-    .bind(rec.job_id as i32)
+    .bind(rec.job_id as i64)
     .bind(&rec.name)
     .bind(&rec.user)
     .bind(&rec.account)
@@ -275,7 +313,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     let row = sqlx::query(
         "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
     )
-    .bind(rec.job_id as i32)
+    .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -292,13 +330,13 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
 #[allow(clippy::too_many_arguments)]
 pub async fn record_job_end(
     conn: &mut PgConnection,
-    job_id: i32,
+    job_id: JobId,
     state: &str,
     exit_code: i32,
     end_time: DateTime<Utc>,
     exit_signal: i32,
     derived_exit_code: i32,
-    preempted_by: Option<i32>,
+    preempted_by: Option<JobId>,
     preempt_mode: &str,
     preempt_qos: &str,
 ) -> anyhow::Result<()> {
@@ -320,13 +358,13 @@ pub async fn record_job_end(
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task
         "#,
     )
-    .bind(job_id)
+    .bind(job_id as i64)
     .bind(state)
     .bind(exit_code)
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
-    .bind(preempted_by)
+    .bind(preempted_by.map(|id| id as i64))
     .bind(preempt_mode)
     .bind(preempt_qos)
     .fetch_one(&mut *conn)
@@ -352,21 +390,22 @@ pub struct AccountingRowState {
 /// by the reconciliation pass to detect jobs missing or stale in accounting.
 pub async fn job_accounting_states(
     pool: &PgPool,
-    job_ids: &[i32],
-) -> anyhow::Result<HashMap<i32, AccountingRowState>> {
+    job_ids: &[JobId],
+) -> anyhow::Result<HashMap<JobId, AccountingRowState>> {
     if job_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    let stored: Vec<i64> = job_ids.iter().map(|&id| id as i64).collect();
     let rows =
         sqlx::query("SELECT job_id, state, user_name, start_time FROM jobs WHERE job_id = ANY($1)")
-            .bind(job_ids)
+            .bind(&stored)
             .fetch_all(pool)
             .await?;
 
     Ok(rows
         .into_iter()
         .map(|r| {
-            let job_id: i32 = r.get("job_id");
+            let job_id = r.get::<i64, _>("job_id") as JobId;
             let user_name: String = r.get("user_name");
             let start_time: Option<DateTime<Utc>> = r.get("start_time");
             let row = AccountingRowState {
@@ -428,7 +467,7 @@ async fn update_usage(
 /// Job record returned from history queries.
 #[derive(Debug)]
 pub struct JobRecord {
-    pub job_id: i32,
+    pub job_id: JobId,
     pub name: String,
     pub user_name: String,
     pub account: String,
@@ -444,7 +483,7 @@ pub struct JobRecord {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub reservation: String,
-    pub preempted_by: Option<i32>,
+    pub preempted_by: Option<JobId>,
     pub preempt_mode: String,
     pub preempt_qos: String,
 }
@@ -496,7 +535,7 @@ pub async fn get_job_history(
     let records = rows
         .iter()
         .map(|row| JobRecord {
-            job_id: row.get("job_id"),
+            job_id: row.get::<i64, _>("job_id") as JobId,
             name: row.get("name"),
             user_name: row.get("user_name"),
             account: row.get("account"),
@@ -512,7 +551,9 @@ pub async fn get_job_history(
             start_time: row.get("start_time"),
             end_time: row.get("end_time"),
             reservation: row.get("reservation"),
-            preempted_by: row.get("preempted_by"),
+            preempted_by: row
+                .get::<Option<i64>, _>("preempted_by")
+                .map(|id| id as JobId),
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
         })
@@ -1404,9 +1445,9 @@ mod job_history_tests {
     use super::*;
     use chrono::Duration;
 
-    fn test_job_id(slot: u32) -> i32 {
-        const BASE: i32 = 9_000_000;
-        BASE + (std::process::id() as i32 % 10_000) * 10 + slot as i32
+    fn test_job_id(slot: u32) -> JobId {
+        const BASE: JobId = 9_000_000;
+        BASE + (std::process::id() % 10_000) * 10 + slot
     }
 
     async fn test_pool() -> anyhow::Result<PgPool> {
@@ -1419,10 +1460,10 @@ mod job_history_tests {
         Ok(pool)
     }
 
-    async fn delete_jobs(pool: &PgPool, ids: &[i32]) -> anyhow::Result<()> {
+    async fn delete_jobs(pool: &PgPool, ids: &[JobId]) -> anyhow::Result<()> {
         for id in ids {
             sqlx::query("DELETE FROM jobs WHERE job_id = $1")
-                .bind(id)
+                .bind(*id as i64)
                 .execute(pool)
                 .await?;
         }
@@ -1435,7 +1476,7 @@ mod job_history_tests {
     #[allow(clippy::too_many_arguments)]
     async fn start(
         pool: &PgPool,
-        job_id: i32,
+        job_id: JobId,
         name: &str,
         user: &str,
         account: &str,
@@ -1470,7 +1511,7 @@ mod job_history_tests {
     #[allow(clippy::too_many_arguments)]
     async fn start_with_qos(
         pool: &PgPool,
-        job_id: i32,
+        job_id: JobId,
         name: &str,
         user: &str,
         account: &str,
@@ -1488,7 +1529,7 @@ mod job_history_tests {
         record_job_start(
             &mut conn,
             &JobStartRecord {
-                job_id: job_id as JobId,
+                job_id,
                 name: name.to_string(),
                 user: user.to_string(),
                 account: account.to_string(),
@@ -1508,7 +1549,7 @@ mod job_history_tests {
 
     async fn end(
         pool: &PgPool,
-        job_id: i32,
+        job_id: JobId,
         state: &str,
         exit_code: i32,
         end_time: DateTime<Utc>,
@@ -1711,6 +1752,242 @@ mod job_history_tests {
 
         delete_jobs(&pool, &[id]).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn job_ids_past_i32_survive_the_accounting_round_trip() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        // The largest id the scheduler can hand out; as i32 it wrapped to -1 and,
+        // job_id being the primary key, overwrote whatever row already held -1.
+        let id = u32::MAX;
+        let preempter = id - 1;
+        let user = format!("spur_wide_id_{}", std::process::id());
+        delete_jobs(&pool, &[id, preempter]).await.ok();
+
+        let t0 = Utc::now() - Duration::hours(2);
+        start(&pool, id, "wide", &user, "", "", 1, 1, 1, 0, t0, t0, "").await?;
+
+        let mut conn = pool.acquire().await?;
+        record_job_end(
+            &mut conn,
+            id,
+            "PREEMPTED",
+            0,
+            Utc::now(),
+            0,
+            0,
+            Some(preempter),
+            "requeue",
+            "high",
+        )
+        .await?;
+        drop(conn);
+
+        let history = get_job_history(&pool, Some(&user), None, None, None, &[], 100).await?;
+        let row = history
+            .iter()
+            .find(|r| r.job_id == id)
+            .expect("a job id above i32::MAX must be queryable under that same id");
+        assert_eq!(
+            row.preempted_by,
+            Some(preempter),
+            "the preempting job's id is a job id too, so it must survive the same width"
+        );
+        let states = job_accounting_states(&pool, &[id]).await?;
+        assert!(
+            states.contains_key(&id),
+            "the reconciler looks rows up by id, so its lookup must use the same width"
+        );
+
+        delete_jobs(&pool, &[id, preempter]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_rewrites_a_legacy_narrowed_row_to_its_real_id() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        // A pre-fix controller stored u32::MAX as -1 in the narrow columns; migrate
+        // must widen and rewrite it so reads and reconciler lookups agree on the id.
+        let id = u32::MAX;
+        let user = format!("spur_legacy_id_{}", std::process::id());
+        let outcome = migrate_rewrites_legacy_row_body(&pool, id, &user).await;
+        clear_user_rows(&pool, &user).await.ok();
+        let restore = widen_id_columns(&pool).await;
+        outcome.and(restore)
+    }
+
+    async fn migrate_rewrites_legacy_row_body(
+        pool: &PgPool,
+        id: JobId,
+        user: &str,
+    ) -> anyhow::Result<()> {
+        clear_user_rows(pool, user).await?;
+        narrow_id_columns(pool).await?;
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, user_name, state, submit_time, preempted_by) \
+             VALUES ($1, 'legacy', $2, 'COMPLETED', $3, $4)",
+        )
+        .bind(-1_i64)
+        .bind(user)
+        .bind(Utc::now())
+        .bind(-2_i64)
+        .execute(pool)
+        .await?;
+
+        migrate(pool).await?;
+
+        let history = get_job_history(pool, Some(user), None, None, None, &[], 100).await?;
+        let row = history.first().expect("the migrated row must be returned");
+        assert_eq!(
+            row.job_id, id,
+            "the narrowed id must be rewritten to its real value"
+        );
+        assert_eq!(row.preempted_by, Some(id - 1));
+
+        let states = job_accounting_states(pool, &[id]).await?;
+        assert!(
+            states.contains_key(&id),
+            "the reconciler looks the row up by its real id, so the rewrite must match it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_skips_a_legacy_id_whose_real_id_already_exists() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        // Defensive: if the true id is already taken, the rewrite must skip the
+        // negative row rather than duplicate it or violate the primary key.
+        let user = format!("spur_guard_id_{}", std::process::id());
+        clear_user_rows(&pool, &user).await.ok();
+        for stored in [(u32::MAX as i64), -1_i64] {
+            sqlx::query(
+                "INSERT INTO jobs (job_id, name, user_name, state, submit_time) \
+                 VALUES ($1, 'row', $2, 'COMPLETED', $3)",
+            )
+            .bind(stored)
+            .bind(&user)
+            .bind(Utc::now())
+            .execute(&pool)
+            .await?;
+        }
+
+        migrate(&pool).await?;
+
+        let negatives: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE user_name = $1 AND job_id < 0")
+                .bind(&user)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            negatives, 1,
+            "the colliding negative row must be left untouched"
+        );
+        let at_true_id: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE user_name = $1 AND job_id = $2")
+                .bind(&user)
+                .bind(u32::MAX as i64)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            at_true_id, 1,
+            "the pre-existing true-id row must be the only one"
+        );
+
+        clear_user_rows(&pool, &user).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_widens_pre_fix_integer_job_ids() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let outcome = migrate_widens_body(&pool).await;
+        // Restore the shared schema even on the failure path, so a serial `--ignored`
+        // run does not leave every later test on a narrow column.
+        let restore = widen_id_columns(&pool).await;
+        outcome.and(restore)
+    }
+
+    async fn migrate_widens_body(pool: &PgPool) -> anyhow::Result<()> {
+        // Reconstruct a pre-fix database by narrowing the three id columns back,
+        // then let migrate() perform the upgrade an existing cluster would see.
+        narrow_id_columns(pool).await?;
+        for (table, column) in id_columns() {
+            assert_eq!(
+                column_type(pool, table, column).await?,
+                "integer",
+                "{table}.{column} must start narrow for this to test anything"
+            );
+        }
+
+        migrate(pool).await?;
+
+        for (table, column) in id_columns() {
+            assert_eq!(
+                column_type(pool, table, column).await?,
+                "bigint",
+                "migrate must widen {table}.{column} on an existing database"
+            );
+        }
+
+        // Idempotent: a second run leaves the widened columns alone.
+        migrate(pool).await?;
+        for (table, column) in id_columns() {
+            assert_eq!(column_type(pool, table, column).await?, "bigint");
+        }
+        Ok(())
+    }
+
+    fn id_columns() -> [(&'static str, &'static str); 3] {
+        [
+            ("jobs", "job_id"),
+            ("jobs", "preempted_by"),
+            ("tres_usage", "job_id"),
+        ]
+    }
+
+    async fn narrow_id_columns(pool: &PgPool) -> anyhow::Result<()> {
+        for stmt in [
+            "ALTER TABLE jobs ALTER COLUMN job_id TYPE INTEGER",
+            "ALTER TABLE jobs ALTER COLUMN preempted_by TYPE INTEGER",
+            "ALTER TABLE tres_usage ALTER COLUMN job_id TYPE INTEGER",
+        ] {
+            sqlx::query(stmt).execute(pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn widen_id_columns(pool: &PgPool) -> anyhow::Result<()> {
+        for stmt in [
+            "ALTER TABLE jobs ALTER COLUMN job_id TYPE BIGINT",
+            "ALTER TABLE jobs ALTER COLUMN preempted_by TYPE BIGINT",
+            "ALTER TABLE tres_usage ALTER COLUMN job_id TYPE BIGINT",
+        ] {
+            sqlx::query(stmt).execute(pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_user_rows(pool: &PgPool, user: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM jobs WHERE user_name = $1")
+            .bind(user)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn column_type(pool: &PgPool, table: &str, column: &str) -> anyhow::Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await?)
     }
 
     /// GrpWall attributes consumption by the QOS recorded on each job, so a start
