@@ -198,6 +198,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_agent_connection_succeeds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let accept = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let result = connect(endpoint).await;
+
+        accept.abort();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn agent_request_is_bounded() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
