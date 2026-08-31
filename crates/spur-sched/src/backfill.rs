@@ -15,7 +15,7 @@ use spur_core::resource::{
 };
 
 use crate::node_match::NodePlacement;
-use crate::timeline::NodeTimeline;
+use crate::timeline::{NodeTimeline, UNLIMITED_JOB_DURATION};
 use crate::traits::{Assignment, ClusterState, Scheduler};
 
 /// Backfill scheduler.
@@ -33,12 +33,40 @@ pub struct BackfillScheduler {
     max_jobs: usize,
 }
 
+/// Bundles the reservation-authorization inputs shared by every candidate
+/// node check for one job, to keep `earliest_valid_start` under clippy's arg limit.
+#[derive(Clone, Copy)]
+struct ReservationCheck<'a> {
+    job: &'a Job,
+    node: &'a str,
+    reservations: &'a [Reservation],
+}
+
 impl BackfillScheduler {
     pub fn new(max_jobs: usize) -> Self {
         Self {
             timelines: Vec::new(),
             max_jobs,
         }
+    }
+
+    /// Nodes with no resources currently allocated but a future reservation
+    /// for a specific pending job, as of the last `schedule()` call. Call
+    /// immediately after `schedule()`; the timelines are rebuilt every cycle.
+    pub fn planned_starts(&self) -> HashMap<String, (JobId, chrono::DateTime<Utc>)> {
+        let now = Utc::now();
+        self.timelines
+            .iter()
+            .filter(|tl| tl.accumulated_at(now).is_empty())
+            .filter_map(|tl| {
+                tl.intervals
+                    .iter()
+                    .filter(|iv| iv.start > now)
+                    .filter_map(|iv| iv.job_id.map(|id| (id, iv.start)))
+                    .min_by_key(|(_, start)| *start)
+                    .map(|(job_id, start)| (tl.node_name.clone(), (job_id, start)))
+            })
+            .collect()
     }
 
     /// Initialize or reset timelines from current cluster state.
@@ -49,18 +77,51 @@ impl BackfillScheduler {
             .collect();
     }
 
-    /// Returns true when `[start, start+duration)` intersects a reservation on `node`
-    /// and the job is not authorized for that reservation.
-    fn start_overlaps_reservation(
-        job: &Job,
-        node: &str,
-        reservations: &[Reservation],
+    /// Latest end time among reservations on `node` that `[start, start+duration)`
+    /// would intersect without authorization, or `None` if clear.
+    fn reservation_blocker(
+        res_check: ReservationCheck<'_>,
         start: chrono::DateTime<Utc>,
         duration: chrono::Duration,
-    ) -> bool {
-        reservations
+    ) -> Option<chrono::DateTime<Utc>> {
+        res_check
+            .reservations
             .iter()
-            .any(|res| reservation::prospective_overlap_at(job, res, node, start, duration))
+            .filter(|res| {
+                reservation::prospective_overlap_at(
+                    res_check.job,
+                    res,
+                    res_check.node,
+                    start,
+                    duration,
+                )
+            })
+            .map(|res| res.end_time)
+            .max()
+    }
+
+    /// Earliest time `node` is free of both resource and reservation
+    /// conflicts for `duration`, searching forward from `floor`.
+    fn earliest_valid_start(
+        &self,
+        ni: usize,
+        res_check: ReservationCheck<'_>,
+        request: &ResourceSet,
+        duration: chrono::Duration,
+        floor: chrono::DateTime<Utc>,
+    ) -> chrono::DateTime<Utc> {
+        let max_check = floor + chrono::Duration::days(365);
+        let mut candidate = floor;
+        loop {
+            if candidate > max_check {
+                return max_check;
+            }
+            candidate = self.timelines[ni].earliest_start(request, duration, candidate);
+            match Self::reservation_blocker(res_check, candidate, duration) {
+                Some(end) => candidate = end,
+                None => return candidate,
+            }
+        }
     }
 
     /// Find nodes that satisfy a job's resource requirements.
@@ -75,10 +136,7 @@ impl BackfillScheduler {
         let now = Utc::now();
 
         let suitable = |node: &Node| {
-            if !placement.matches(node, reservations, now) {
-                return false;
-            }
-            if !node.has_free_cpu_capacity() {
+            if !placement.matches_for_reservation(node, reservations, now) {
                 return false;
             }
             node.total_resources.can_satisfy(&required)
@@ -120,14 +178,14 @@ impl BackfillScheduler {
 
     /// Resolve concrete per-node CPU and GPU allocations for non-uniform demand.
     /// CPU counts are positional (aligned to task launch order); a GPU total is
-    /// packed greedily onto the most-available nodes. `None` if it cannot fit now.
+    /// packed greedily onto the most-available nodes. `None` if it cannot fit at `at_time`.
     fn plan_per_node_alloc(
         &self,
         job: &Job,
         demand: &GpuDemand,
         assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
         nodes: &[Node],
-        now: chrono::DateTime<Utc>,
+        at_time: chrono::DateTime<Utc>,
     ) -> Option<HashMap<String, ResourceAllocations>> {
         let base = base_node_request(job);
         let cpu_counts = cpu_per_node_counts(job);
@@ -150,7 +208,7 @@ impl BackfillScheduler {
                 // Capacity-sorted greedy: pack GPUs onto most-available nodes.
                 let mut caps: Vec<(usize, u32)> = assigned_nodes
                     .iter()
-                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, now)))
+                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, at_time)))
                     .collect();
                 caps.sort_by_key(|(_, cap)| std::cmp::Reverse(*cap));
                 let cap_values: Vec<u32> = caps.iter().map(|(_, c)| *c).collect();
@@ -165,7 +223,7 @@ impl BackfillScheduler {
         let mut per_node_alloc = HashMap::new();
         for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
             let node = &nodes[*ni];
-            let current = self.timelines[*ni].accumulated_at(now);
+            let current = self.timelines[*ni].accumulated_at(at_time);
 
             let mut req = base.clone();
             let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
@@ -199,14 +257,16 @@ impl Scheduler for BackfillScheduler {
         let now = Utc::now();
         self.init_timelines(cluster.nodes);
 
-        // Add current allocations to timelines
+        // Add current allocations to timelines. Real per-node end times (from
+        // busy_until) replace the flat placeholder wherever known.
         for (i, node) in cluster.nodes.iter().enumerate() {
             if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
-                self.timelines[i].reserve(
-                    now,
-                    now + Duration::hours(24),
-                    node.alloc_resources.clone(),
-                );
+                let free_at = cluster
+                    .busy_until
+                    .get(&node.name)
+                    .copied()
+                    .unwrap_or(now + Duration::hours(24));
+                self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
             }
             debug!(
                 node = %node.name,
@@ -267,7 +327,7 @@ impl Scheduler for BackfillScheduler {
                 .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
                 .count();
             let required = job_resource_request(job);
-            let duration = job.spec.time_limit.unwrap_or(Duration::hours(1));
+            let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
             let needed_nodes = (job.spec.num_nodes as usize).max(1);
 
             let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
@@ -279,27 +339,27 @@ impl Scheduler for BackfillScheduler {
             let heterogeneous = !job.spec.exclusive
                 && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
 
-            // Free GPUs of the requested type per candidate, used to pack the
-            // job onto the most-available nodes.
-            let free_gpu: HashMap<usize, u32> = if demand.is_none() {
-                HashMap::new()
-            } else {
-                suitable
-                    .iter()
-                    .map(|&ni| {
-                        (
-                            ni,
-                            self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), now),
-                        )
-                    })
-                    .collect()
+            let timing_request = |ni: usize| -> &ResourceSet {
+                if job.spec.exclusive {
+                    &cluster.nodes[ni].total_resources
+                } else {
+                    &required
+                }
             };
 
-            // Find earliest start across needed_nodes
+            // Earliest start per node, folding resource and reservation
+            // conflicts into one search. Exclusive jobs time against the
+            // node's full capacity, not their own modest share.
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
                 .iter()
                 .map(|&ni| {
-                    let start = self.timelines[ni].earliest_start(&required, duration, now);
+                    let res_check = ReservationCheck {
+                        job,
+                        node: &cluster.nodes[ni].name,
+                        reservations: cluster.reservations,
+                    };
+                    let start =
+                        self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
                     debug!(
                         job_id = job.job_id,
                         node = %cluster.nodes[ni].name,
@@ -311,15 +371,21 @@ impl Scheduler for BackfillScheduler {
                 })
                 .collect();
 
-            node_starts.retain(|(ni, start)| {
-                !Self::start_overlaps_reservation(
-                    job,
-                    &cluster.nodes[*ni].name,
-                    cluster.reservations,
-                    *start,
-                    duration,
-                )
-            });
+            // Free GPUs per candidate, evaluated at each node's own
+            // earliest_start (not `now`, which can be stale by then).
+            let free_gpu: HashMap<usize, u32> = if demand.is_none() {
+                HashMap::new()
+            } else {
+                node_starts
+                    .iter()
+                    .map(|&(ni, start)| {
+                        (
+                            ni,
+                            self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), start),
+                        )
+                    })
+                    .collect()
+            };
 
             if placement.nodelist_is_additive()
                 && node_starts
@@ -408,21 +474,54 @@ impl Scheduler for BackfillScheduler {
             let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
                 node_starts.into_iter().take(needed_nodes).collect();
 
-            let earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap();
+            // Converge on a start every assigned node is simultaneously free
+            // at — an independently-computed per-node start can be stale
+            // once shifted forward to match the slowest node in the set.
+            let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
+            let common_horizon = now + chrono::Duration::days(365);
+            loop {
+                let next = assigned_nodes
+                    .iter()
+                    .map(|&(ni, _)| {
+                        let res_check = ReservationCheck {
+                            job,
+                            node: &cluster.nodes[ni].name,
+                            reservations: cluster.reservations,
+                        };
+                        self.earliest_valid_start(
+                            ni,
+                            res_check,
+                            timing_request(ni),
+                            duration,
+                            earliest,
+                        )
+                    })
+                    .max()
+                    .unwrap_or(earliest);
+                // Advance before checking the horizon: the horizon only
+                // bounds iteration count, it must never discard a freshly
+                // computed (more accurate) value.
+                let converged = next == earliest;
+                earliest = next;
+                if converged || earliest >= common_horizon {
+                    break;
+                }
+            }
 
             let mut per_node_alloc = HashMap::new();
             if heterogeneous {
                 // Non-uniform per-node CPU or GPU counts: resolve concrete
-                // per-node allocations against current free capacity. We only
-                // place these when the job can start now (no heterogeneous
-                // future shadow reservation yet); otherwise leave it pending for
-                // a later cycle.
-                if earliest > now {
-                    continue;
-                }
-                match self.plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, now) {
+                // per-node allocations against free capacity at the job's
+                // actual (possibly future) start time, same as the uniform path.
+                match self.plan_per_node_alloc(
+                    job,
+                    &demand,
+                    &assigned_nodes,
+                    cluster.nodes,
+                    earliest,
+                ) {
                     Some(allocs) => per_node_alloc = allocs,
-                    None => continue, // not enough free capacity right now
+                    None => continue, // not enough free capacity at that time
                 }
             } else {
                 for (ni, _) in &assigned_nodes {
@@ -430,7 +529,7 @@ impl Scheduler for BackfillScheduler {
                     let node_alloc = if job.spec.exclusive {
                         build_exclusive_allocation(&node.total_resources, required.memory_mb)
                     } else {
-                        let current = self.timelines[*ni].accumulated_at(now);
+                        let current = self.timelines[*ni].accumulated_at(earliest);
                         build_node_allocation(&node.total_resources, &current, &required)
                     };
                     per_node_alloc.insert(node.name.clone(), node_alloc);
@@ -448,7 +547,12 @@ impl Scheduler for BackfillScheduler {
                         .get(&cluster.nodes[*ni].name)
                         .cloned()
                         .unwrap_or_default();
-                    self.timelines[*ni].reserve(now, now + duration, node_alloc);
+                    self.timelines[*ni].reserve_for_job(
+                        now,
+                        now + duration,
+                        node_alloc,
+                        Some(job.job_id),
+                    );
                 }
 
                 debug!(
@@ -468,7 +572,12 @@ impl Scheduler for BackfillScheduler {
                         .get(&cluster.nodes[*ni].name)
                         .cloned()
                         .unwrap_or_default();
-                    self.timelines[*ni].reserve(earliest, earliest + duration, node_alloc);
+                    self.timelines[*ni].reserve_for_job(
+                        earliest,
+                        earliest + duration,
+                        node_alloc,
+                        Some(job.job_id),
+                    );
                 }
             }
         }
@@ -647,6 +756,7 @@ mod tests {
 
         let pending = vec![make_job(1, 2, 32)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -670,6 +780,7 @@ mod tests {
 
         let pending = vec![make_job(1, 2, 32), make_job(2, 2, 32)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -706,6 +817,7 @@ mod tests {
             },
         );
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -753,6 +865,7 @@ mod tests {
             },
         );
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -810,6 +923,7 @@ mod tests {
             },
         );
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -851,6 +965,7 @@ mod tests {
             None,
         )];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -924,6 +1039,7 @@ mod tests {
 
         let pending = vec![make_gpu_job(1, 4), make_gpu_job(2, 4)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -993,6 +1109,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 4, 8)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1016,6 +1133,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 2, 5)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1043,6 +1161,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 4, 8)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1065,6 +1184,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 2, 6)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1101,6 +1221,7 @@ mod tests {
             },
         )];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1143,6 +1264,7 @@ mod tests {
             },
         )];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1168,6 +1290,7 @@ mod tests {
         // Request 4 nodes but only 2 available
         let pending = vec![make_job(1, 4, 32)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1176,6 +1299,414 @@ mod tests {
 
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 0);
+    }
+
+    // A job needing more nodes than are currently free must still reserve its
+    // eventual start against saturated nodes, so a later smaller job can't steal one.
+    #[test]
+    fn large_job_reservation_blocks_an_overlapping_smaller_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut big = make_job(1, 2, 1);
+        big.spec.exclusive = true;
+        let mut small = make_job(2, 1, 1);
+        small.spec.time_limit = Some(Duration::days(30));
+
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert!(
+            assignments.is_empty(),
+            "neither job can start now: node002 is saturated and node001 is \
+             reserved for the pending big job's eventual start, {assignments:?}"
+        );
+    }
+
+    // A non-overreach guard: this passes whether or not the reservation fix is
+    // present, since node001 was never contended for. It exists to confirm the
+    // fix doesn't turn into a blanket "anyone pending blocks everyone" hold.
+    #[test]
+    fn large_job_reservation_does_not_block_a_non_overlapping_smaller_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut big = make_job(1, 2, 1);
+        big.spec.exclusive = true;
+        let small = make_job(2, 1, 1); // default 1h, ends long before the big job's window.
+
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, 2);
+        assert_eq!(assignments[0].nodes, vec!["node001".to_string()]);
+
+        // Confirm the big job's own future reservation was recorded internally
+        // even though it produced no Assignment yet.
+        assert!(
+            sched.timelines[1]
+                .intervals
+                .iter()
+                .any(|iv| iv.start > Utc::now()),
+            "node002 should carry the big job's future reservation"
+        );
+    }
+
+    // The realistic case: node002's running job actually ends in ~20s (via
+    // busy_until), not the flat 24h placeholder. A perfectly ordinary 1h job
+    // now correctly overlaps that near-term reservation and gets deferred.
+    #[test]
+    fn busy_until_protects_a_realistic_duration_reservation() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut big = make_job(1, 2, 1);
+        big.spec.exclusive = true;
+        let small = make_job(2, 1, 1); // ordinary default 1h duration, no artificial trick.
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert!(
+            assignments.is_empty(),
+            "a normal-duration job must not slip onto node001 ahead of the \
+             big job's near-term (20s) reservation, {assignments:?}"
+        );
+    }
+
+    // Complement: a small job whose own short duration finishes before
+    // node002's real (busy_until) completion time must still run now.
+    #[test]
+    fn busy_until_does_not_block_a_job_finishing_before_the_real_completion() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut big = make_job(1, 2, 1);
+        big.spec.exclusive = true;
+        let mut small = make_job(2, 1, 1);
+        small.spec.time_limit = Some(Duration::seconds(5));
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, 2);
+        assert_eq!(assignments[0].nodes, vec!["node001".to_string()]);
+    }
+
+    // node001 is sized to exactly match big's real per-node share (4 cpus),
+    // so this is sensitive to reservation size, not just existence.
+    #[test]
+    fn heterogeneous_job_reservation_blocks_an_overlapping_smaller_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 4;
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let big = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        // Non-exclusive: only conflicts if the reservation correctly claims
+        // all 4 of node001's cpus, not merely if *some* reservation exists.
+        let small = make_job(2, 1, 1);
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert!(
+            assignments.is_empty(),
+            "the uneven-split job's 4-cpu reservation on node001 must hold, {assignments:?}"
+        );
+    }
+
+    // Complement: a heterogeneous job's own future reservation must not block
+    // a smaller job that genuinely finishes first, even on the same
+    // exactly-sized node.
+    #[test]
+    fn heterogeneous_job_reservation_does_not_block_a_non_overlapping_smaller_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 4;
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let big = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let mut small = make_job(2, 1, 1);
+        small.spec.time_limit = Some(Duration::seconds(5)); // finishes before node002's 20s window.
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big, small], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, 2);
+        assert_eq!(assignments[0].nodes, vec!["node001".to_string()]);
+    }
+
+    #[test]
+    fn heterogeneous_job_future_reservation_does_not_land_inside_another_reservation() {
+        // Same shape as the uniform common-window tests above, but through
+        // the heterogeneous (uneven per-node CPU split) allocation path,
+        // which was never exercised together with a reservation before.
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 4;
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(90),
+            end_time: now + Duration::minutes(150),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let big = Job::new(
+            1,
+            JobSpec {
+                name: "uneven".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 2,
+                num_tasks: 7,
+                cpus_per_task: 1,
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), now + Duration::minutes(120));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[reservation],
+            topology: None,
+        };
+
+        sched.schedule(&[big], &cluster);
+
+        let node001_conflict = sched.timelines[0].intervals.iter().any(|iv| {
+            iv.job_id == Some(1)
+                && iv.start < now + Duration::minutes(150)
+                && iv.end > now + Duration::minutes(90)
+        });
+        assert!(
+            !node001_conflict,
+            "heterogeneous job's shifted reservation on node001 must not land inside the unauthorized reservation window"
+        );
+    }
+
+    #[test]
+    fn planned_starts_reports_the_job_holding_an_idle_nodes_future_reservation() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut big = make_job(7, 2, 1);
+        big.spec.exclusive = true;
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&[big], &cluster);
+        assert!(assignments.is_empty(), "big job can't start yet");
+
+        let planned = sched.planned_starts();
+        let (job_id, start) = planned
+            .get("node001")
+            .copied()
+            .expect("node001 is idle now but reserved for the pending job");
+        assert_eq!(job_id, 7);
+        assert!(start > Utc::now());
+        // node002 is not idle right now, so it must not show up as "planned".
+        assert!(!planned.contains_key("node002"));
+    }
+
+    #[test]
+    fn planned_starts_is_empty_when_nothing_is_reserved() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let busy_until = std::collections::HashMap::new();
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        // Every node is idle and unclaimed with nothing pending.
+        sched.schedule(&[], &cluster);
+        assert!(sched.planned_starts().is_empty());
+    }
+
+    #[test]
+    fn planned_starts_picks_the_earliest_of_several_reservations_on_one_node() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut earlier = make_job(7, 2, 1);
+        earlier.spec.exclusive = true;
+        earlier.spec.time_limit = Some(Duration::minutes(5));
+        let mut later = make_job(8, 2, 1);
+        later.spec.exclusive = true;
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        // Both need node001+node002; job 8 is queued behind job 7's reservation
+        // on node002, so it lands on a later slot on node001 too.
+        let assignments = sched.schedule(&[earlier, later], &cluster);
+        assert!(assignments.is_empty(), "neither job can start yet");
+
+        let (job_id, _start) = sched
+            .planned_starts()
+            .get("node001")
+            .copied()
+            .expect("node001 is idle now but reserved");
+        assert_eq!(
+            job_id, 7,
+            "must report the earlier reservation, not the later one"
+        );
     }
 
     fn make_job_with_nodelist(
@@ -1214,6 +1745,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 1, Some("node001"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1236,6 +1768,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 2, Some("node001,node002"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1260,6 +1793,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1288,6 +1822,7 @@ mod tests {
             None,
         )];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1315,6 +1850,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1356,6 +1892,7 @@ mod tests {
         job.spec.topology = Some("tree".into());
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1382,6 +1919,7 @@ mod tests {
         job.spec.num_tasks = 6;
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1404,6 +1942,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1431,6 +1970,7 @@ mod tests {
         job.spec.constraint = Some("mi300x".into());
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1461,6 +2001,7 @@ mod tests {
             None,
         )];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1491,6 +2032,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -1527,6 +2069,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -1549,6 +2092,7 @@ mod tests {
         // "nodeXXX" does not exist in the cluster
         let pending = vec![make_job_with_nodelist(1, 1, Some("nodeXXX"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1571,6 +2115,7 @@ mod tests {
         // Exclude node001 and node002 → only node003 and node004 remain
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1603,6 +2148,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1630,6 +2176,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1656,6 +2203,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1678,6 +2226,7 @@ mod tests {
         // Exclude both → 2-node job can't schedule
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1699,6 +2248,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 2, Some("node[001-002]"), None)];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1723,6 +2273,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node[001-002]"))];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1765,6 +2316,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1799,6 +2351,7 @@ mod tests {
 
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1845,6 +2398,7 @@ mod tests {
 
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1878,6 +2432,7 @@ mod tests {
 
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1915,6 +2470,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1939,6 +2495,7 @@ mod tests {
         }];
         let pending: Vec<Job> = (1..=8).map(|id| make_job(id, 1, 1)).collect();
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1974,6 +2531,7 @@ mod tests {
         for id in 1..=8 {
             let pending = vec![make_job(id, 1, 1)];
             let cluster = ClusterState {
+                busy_until: &std::collections::HashMap::new(),
                 nodes: &nodes,
                 partitions: &partitions,
                 reservations: &[],
@@ -2014,6 +2572,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2061,6 +2620,7 @@ mod tests {
         let job = make_job(1, 1, 1);
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -2095,6 +2655,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -2129,6 +2690,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -2165,6 +2727,7 @@ mod tests {
         let job = make_job(1, 1, 1);
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
@@ -2203,6 +2766,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
@@ -2213,6 +2777,115 @@ mod tests {
         assert!(
             assignments.is_empty(),
             "job that would overlap upcoming reservation must not schedule"
+        );
+    }
+
+    #[test]
+    fn multi_node_future_reservation_does_not_land_inside_another_reservation() {
+        // node001 is idle but reserved +90m to +150m; node002 is busy until
+        // +120m, shifting the job's actual placement to [+120m, +180m) —
+        // which overlaps node001's reservation unless revalidated.
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(90),
+            end_time: now + Duration::minutes(150),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let mut big = make_job(1, 2, 1);
+        big.spec.exclusive = true;
+        big.spec.time_limit = Some(Duration::hours(1));
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), now + Duration::minutes(120));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[reservation],
+            topology: None,
+        };
+
+        sched.schedule(&[big], &cluster);
+
+        let node001_conflict = sched.timelines[0].intervals.iter().any(|iv| {
+            iv.job_id == Some(1)
+                && iv.start < now + Duration::minutes(150)
+                && iv.end > now + Duration::minutes(90)
+        });
+        assert!(
+            !node001_conflict,
+            "job's shifted reservation on node001 must not land inside the unauthorized reservation window"
+        );
+    }
+
+    #[test]
+    fn multi_node_gpu_future_reservation_does_not_land_inside_another_reservation() {
+        // Same shape as the CPU version above, but with GPU nodes and an
+        // exclusive multi-node GPU job, to prove the common-window fix
+        // isn't CPU-only.
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = vec![
+            make_named_gpu_node("node001", 8),
+            make_named_gpu_node("node002", 8),
+        ];
+        nodes[1].state = NodeState::Allocated;
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(90),
+            end_time: now + Duration::minutes(150),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let mut big = total_gpu_job(1, 2, 8);
+        big.spec.exclusive = true;
+        big.spec.time_limit = Some(Duration::hours(1));
+
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node002".to_string(), now + Duration::minutes(120));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[reservation],
+            topology: None,
+        };
+
+        sched.schedule(&[big], &cluster);
+
+        let node001_conflict = sched.timelines[0].intervals.iter().any(|iv| {
+            iv.job_id == Some(1)
+                && iv.start < now + Duration::minutes(150)
+                && iv.end > now + Duration::minutes(90)
+        });
+        assert!(
+            !node001_conflict,
+            "GPU job's shifted reservation on node001 must not land inside the unauthorized reservation window"
         );
     }
 

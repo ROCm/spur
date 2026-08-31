@@ -62,17 +62,19 @@ impl AssociationCache {
         self.snapshot.read().loaded
     }
 
-    /// Whether `user` holds the `Admin` accounting admin-level. Fails closed: an unloaded cache
-    /// (accounting off or not yet fetched) reports no admins.
+    /// Whether `user` holds the admin accounting level, in any spelling Slurm accepts. Fails closed:
+    /// an unloaded cache (accounting off or not yet fetched) reports no admins.
     pub fn is_admin(&self, user: &str) -> bool {
         let snapshot = self.snapshot.read();
         snapshot.loaded
             && snapshot
                 .admin_level
                 .get(user)
-                .is_some_and(|lvl| lvl.eq_ignore_ascii_case("admin"))
+                .is_some_and(|lvl| crate::accounting::admin_level_is_admin(lvl))
     }
 
+    /// Whether `user` is associated with `account`. An unloaded cache reports `CacheUnavailable`
+    /// rather than guessing; see `validate_user_account` in `cluster.rs` for how callers must treat that.
     pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {
         let snapshot = self.snapshot.read();
         if !snapshot.loaded {
@@ -327,12 +329,22 @@ mod tests {
         assert!(!cache.is_admin("carol"));
     }
 
+    /// Every spelling Slurm's parser maps to super-user must resolve here, or a row stored as
+    /// `Administrator` (what `sacctmgr show user` prints) would confer nothing.
     #[test]
-    fn is_admin_true_only_for_admin_level_case_insensitive() {
+    fn is_admin_accepts_every_slurm_admin_spelling() {
         let cache = AssociationCache::new();
-        cache.insert_admin_level("carol", "admin");
+        for (user, level) in [
+            ("carol", "admin"),
+            ("frank", "Admin"),
+            ("grace", "Administrator"),
+            ("heidi", "SuperUser"),
+        ] {
+            cache.insert_admin_level(user, level);
+            assert!(cache.is_admin(user), "level {level:?} must be admin");
+        }
+
         cache.insert_admin_level("dave", "Operator");
-        assert!(cache.is_admin("carol"));
         assert!(!cache.is_admin("dave"));
         assert!(!cache.is_admin("erin"));
     }

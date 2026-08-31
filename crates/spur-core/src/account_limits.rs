@@ -11,7 +11,7 @@
 //! across all its users.
 
 use crate::accounting::{AccountLimits, TresRecord, TresType};
-use crate::job::{effective_gpus, effective_memory_mb, Job, PendingReason};
+use crate::job::{effective_gpus, effective_memory_mb, Job, JobSpec, PendingReason};
 
 /// Result of an account/association limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +22,87 @@ pub enum AccountCheckResult {
     Blocked(PendingReason),
 }
 
-/// Check if a job would violate its account/association limits.
+/// Whether the job's requested wall time exceeds `max_wall` minutes. A cap of 0
+/// is "block all" per the limit convention, so it breaches even a job with no
+/// explicit time limit.
+fn wall_breach(spec: &JobSpec, max_wall: u32) -> bool {
+    if max_wall == 0 {
+        return true;
+    }
+    spec.time_limit
+        .is_some_and(|w| w.num_minutes() > max_wall as i64)
+}
+
+/// The four TRES quantities a single job requests: (cpu, node, mem_mb, gpu).
+fn job_tres(spec: &JobSpec) -> (u64, u64, u64, u64) {
+    let cpus = (spec.num_tasks * spec.cpus_per_task) as u64;
+    let nodes = spec.num_nodes as u64;
+    let mem = effective_memory_mb(spec, spec.num_nodes);
+    let gpus = effective_gpus(spec, spec.num_nodes);
+    (cpus, nodes, mem, gpus)
+}
+
+/// Standalone TRES breach for an association: does this job, folded onto
+/// `account_running_tres` (empty for the submit-time standalone evaluation),
+/// exceed the per-job or account-group cap? Wall is handled separately because
+/// the association wall cap denies unconditionally at submission.
+///
+/// `grp_node_charge` is the node count charged against `grp_tres` specifically
+/// — distinct from `job_node` below because a caller that knows the job could
+/// pack onto nodes the account already occupies may pass a smaller number than
+/// `spec.num_nodes`. The per-job node cap always uses the job's real requested
+/// node count, since it bounds a single job's own footprint rather than
+/// account-wide reuse.
+fn account_resource_breach(
+    spec: &JobSpec,
+    limits: &AccountLimits,
+    account_running_tres: &TresRecord,
+    grp_node_charge: u64,
+) -> Option<PendingReason> {
+    let (job_cpu, job_node, job_mem, job_gpu) = job_tres(spec);
+
+    if let Some(ref max_tres) = limits.max_tres_per_job {
+        if max_tres.get(TresType::Cpu) > 0 && job_cpu > max_tres.get(TresType::Cpu) {
+            return Some(PendingReason::AssocMaxCpuPerJobLimit);
+        }
+        if max_tres.get(TresType::Node) > 0 && job_node > max_tres.get(TresType::Node) {
+            return Some(PendingReason::AssocMaxNodePerJobLimit);
+        }
+        if max_tres.get(TresType::Memory) > 0 && job_mem > max_tres.get(TresType::Memory) {
+            return Some(PendingReason::AssocMaxMemPerJob);
+        }
+        if max_tres.get(TresType::Gpu) > 0 && job_gpu > max_tres.get(TresType::Gpu) {
+            return Some(PendingReason::AssocMaxGpuPerJobLimit);
+        }
+    }
+
+    if let Some(ref grp) = limits.grp_tres {
+        if grp.get(TresType::Cpu) > 0
+            && account_running_tres.get(TresType::Cpu) + job_cpu > grp.get(TresType::Cpu)
+        {
+            return Some(PendingReason::AssocGrpCpuLimit);
+        }
+        if grp.get(TresType::Node) > 0
+            && account_running_tres.get(TresType::Node) + grp_node_charge > grp.get(TresType::Node)
+        {
+            return Some(PendingReason::AssocGrpNodeLimit);
+        }
+        if grp.get(TresType::Memory) > 0
+            && account_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
+        {
+            return Some(PendingReason::AssocGrpMemLimit);
+        }
+        if grp.get(TresType::Gpu) > 0
+            && account_running_tres.get(TresType::Gpu) + job_gpu > grp.get(TresType::Gpu)
+        {
+            return Some(PendingReason::AssocGrpGpuLimit);
+        }
+    }
+
+    None
+}
+
+/// Check if a job would violate its account/association limits (scheduler path).
 ///
 /// `user_running_count`/`user_submitted_count` are the requesting user's
 /// running/(pending+running) job count under this account; `account_running_tres`
@@ -33,6 +113,27 @@ pub fn check_account_limits(
     user_running_count: u32,
     user_submitted_count: u32,
     account_running_tres: &TresRecord,
+) -> AccountCheckResult {
+    check_account_limits_with_grp_node_charge(
+        job,
+        limits,
+        user_running_count,
+        user_submitted_count,
+        account_running_tres,
+        job.spec.num_nodes as u64,
+    )
+}
+
+/// Like `check_account_limits`, but the node count charged against `grp_tres`
+/// is `grp_node_charge` rather than `job.spec.num_nodes` — see
+/// `account_resource_breach`.
+pub fn check_account_limits_with_grp_node_charge(
+    job: &Job,
+    limits: &AccountLimits,
+    user_running_count: u32,
+    user_submitted_count: u32,
+    account_running_tres: &TresRecord,
+    grp_node_charge: u64,
 ) -> AccountCheckResult {
     if let Some(max) = limits.max_running_jobs {
         if user_running_count >= max {
@@ -47,66 +148,58 @@ pub fn check_account_limits(
     }
 
     if let Some(max_wall) = limits.max_wall_minutes {
-        if let Some(job_wall) = job.spec.time_limit {
-            if job_wall.num_minutes() > max_wall as i64 {
-                return AccountCheckResult::Blocked(PendingReason::AssocMaxWallDurationPerJobLimit);
-            }
+        if wall_breach(&job.spec, max_wall) {
+            return AccountCheckResult::Blocked(PendingReason::AssocMaxWallDurationPerJobLimit);
         }
     }
 
-    if let Some(ref max_tres) = limits.max_tres_per_job {
-        let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-        if max_tres.get(TresType::Cpu) > 0 && job_cpus > max_tres.get(TresType::Cpu) {
-            return AccountCheckResult::Blocked(PendingReason::AssocMaxCpuPerJobLimit);
-        }
+    match account_resource_breach(&job.spec, limits, account_running_tres, grp_node_charge) {
+        Some(reason) => AccountCheckResult::Blocked(reason),
+        None => AccountCheckResult::Allowed,
+    }
+}
 
-        let job_nodes = job.spec.num_nodes as u64;
-        if max_tres.get(TresType::Node) > 0 && job_nodes > max_tres.get(TresType::Node) {
-            return AccountCheckResult::Blocked(PendingReason::AssocMaxNodePerJobLimit);
-        }
-
-        let total_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-        if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
-            return AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob);
-        }
-
-        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
-        if max_tres.get(TresType::Gpu) > 0 && job_gpus > max_tres.get(TresType::Gpu) {
-            return AccountCheckResult::Blocked(PendingReason::AssocMaxGpuPerJobLimit);
+/// Association submit-count limits (`MaxSubmitJobs`, `GrpSubmitJobs`). These
+/// always deny at submission, independent of `DenyOnLimit`. `incoming` is how
+/// many jobs this submission adds (array size or 1).
+pub fn check_account_submit_limits(
+    limits: &AccountLimits,
+    user_submitted: u32,
+    account_submitted: u32,
+    incoming: u32,
+) -> Option<PendingReason> {
+    if let Some(max) = limits.max_submit_jobs {
+        if user_submitted.saturating_add(incoming) > max {
+            return Some(PendingReason::AssocMaxSubmitJobLimit);
         }
     }
-
-    if let Some(ref grp) = limits.grp_tres {
-        let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
-        if grp.get(TresType::Cpu) > 0
-            && account_running_tres.get(TresType::Cpu) + job_cpus > grp.get(TresType::Cpu)
-        {
-            return AccountCheckResult::Blocked(PendingReason::AssocGrpCpuLimit);
-        }
-
-        let job_nodes = job.spec.num_nodes as u64;
-        if grp.get(TresType::Node) > 0
-            && account_running_tres.get(TresType::Node) + job_nodes > grp.get(TresType::Node)
-        {
-            return AccountCheckResult::Blocked(PendingReason::AssocGrpNodeLimit);
-        }
-
-        let job_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
-        if grp.get(TresType::Memory) > 0
-            && account_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
-        {
-            return AccountCheckResult::Blocked(PendingReason::AssocGrpMemLimit);
-        }
-
-        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
-        if grp.get(TresType::Gpu) > 0
-            && account_running_tres.get(TresType::Gpu) + job_gpus > grp.get(TresType::Gpu)
-        {
-            return AccountCheckResult::Blocked(PendingReason::AssocGrpGpuLimit);
+    if let Some(max) = limits.grp_submit_jobs {
+        if account_submitted.saturating_add(incoming) > max {
+            return Some(PendingReason::AssocGrpSubmitJobsLimit);
         }
     }
+    None
+}
 
-    AccountCheckResult::Allowed
+/// Association `MaxWallDurationPerJob` breach. Slurm denies this
+/// unconditionally at submission (it does not depend on `DenyOnLimit`).
+pub fn check_account_wall_limit(spec: &JobSpec, limits: &AccountLimits) -> Option<PendingReason> {
+    match limits.max_wall_minutes {
+        Some(max_wall) if wall_breach(spec, max_wall) => {
+            Some(PendingReason::AssocMaxWallDurationPerJobLimit)
+        }
+        _ => None,
+    }
+}
+
+/// Standalone association TRES breach for the submission gate: evaluates the
+/// job on its own. Denied at submit only when the governing QOS has
+/// `DenyOnLimit`; otherwise the scheduler pends it.
+pub fn check_account_standalone_limits(
+    spec: &JobSpec,
+    limits: &AccountLimits,
+) -> Option<PendingReason> {
+    account_resource_breach(spec, limits, &TresRecord::new(), spec.num_nodes as u64)
 }
 
 #[cfg(test)]
@@ -188,6 +281,31 @@ mod tests {
             result,
             AccountCheckResult::Blocked(PendingReason::AssocMaxWallDurationPerJobLimit)
         );
+    }
+
+    #[test]
+    fn max_wall_zero_blocks_time_less_job() {
+        let limits = AccountLimits {
+            max_wall_minutes: Some(0), // 0 = block all
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.time_limit = None;
+        assert_eq!(
+            check_account_wall_limit(&job.spec, &limits),
+            Some(PendingReason::AssocMaxWallDurationPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn positive_max_wall_leaves_time_less_job_alone() {
+        let limits = AccountLimits {
+            max_wall_minutes: Some(60),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.time_limit = None;
+        assert_eq!(check_account_wall_limit(&job.spec, &limits), None);
     }
 
     #[test]
@@ -333,6 +451,46 @@ mod tests {
         assert_eq!(
             result,
             AccountCheckResult::Blocked(PendingReason::AssocGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn test_grp_node_charge_overrides_only_grp_branch() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        let limits = AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut running = TresRecord::new();
+        running.set(TresType::Node, 2); // raw request (2+3>4) would block
+
+        // A caller that knows the job can pack onto already-occupied nodes
+        // charges only 1 new node: 2 + 1 = 4 <= 4, so it's allowed.
+        let result = check_account_limits_with_grp_node_charge(&job, &limits, 0, 0, &running, 1);
+        assert_eq!(result, AccountCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_grp_node_charge_does_not_affect_max_tres_per_job() {
+        let mut max_tres = TresRecord::new();
+        max_tres.set(TresType::Node, 2);
+        let limits = AccountLimits {
+            max_tres_per_job: Some(max_tres),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3; // breaches the per-job cap of 2 regardless of packing
+
+        // Even a grp_node_charge of 0 must not rescue the per-job cap: it only
+        // overrides the grp_tres branch, not max_tres_per_job.
+        let result =
+            check_account_limits_with_grp_node_charge(&job, &limits, 0, 0, &TresRecord::new(), 0);
+        assert_eq!(
+            result,
+            AccountCheckResult::Blocked(PendingReason::AssocMaxNodePerJobLimit)
         );
     }
 

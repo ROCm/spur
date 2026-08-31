@@ -244,6 +244,16 @@ message JobInfo {
   // "gpu:2/task".
   uint32 req_gpus = 55;
   string req_gpus_detail = 56;
+
+  // Preemption provenance. Set when this job was preempted.
+  // `preempted_by` is the job ID of the higher-priority job that caused the
+  // preemption (0 when not preempted or unknown). `preempt_mode` is one of
+  // "Requeue", "Cancel", or "Suspend". `preempt_qos` is the QOS name that
+  // authorized the preemption under QosPriority type; empty for plain
+  // priority-based preemption.
+  uint32 preempted_by = 57;
+  string preempt_mode = 58;
+  string preempt_qos = 59;
 }
 
 message NodeInfo {
@@ -270,6 +280,11 @@ message NodeInfo {
   map<string, string> labels = 51;
   bool reservation_maint = 52;
   repeated string features = 53;
+
+  // Set when the node is idle right now but the scheduler holds a future
+  // reservation for a specific pending job (0 = no planned reservation).
+  uint32 planned_job_id = 54;
+  google.protobuf.Timestamp planned_start = 55;
 }
 
 message PartitionInfo {
@@ -467,6 +482,9 @@ service SlurmAccounting {
 
   // Fairshare
   rpc GetFairshareFactors(GetFairshareFactorsRequest) returns (GetFairshareFactorsResponse);
+
+  // Transaction / audit log (reservation admin actions today; entity-agnostic)
+  rpc GetTransactions(GetTransactionsRequest) returns (GetTransactionsResponse);
 }
 
 // ============================================================
@@ -543,6 +561,7 @@ message UpdateJobRequest {
   optional bool hold = 6;
   optional string comment = 7;
   optional string qos = 8;
+  string user = 9;   // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message RequeueJobRequest {
@@ -688,6 +707,7 @@ message SchedStats {
   uint64 jobs_started_last_cycle = 12;
   uint64 exit_end = 13;
   uint64 exit_max_depth = 14;
+  uint64 jobs_preempted = 15;
 }
 
 message RegisterAgentRequest {
@@ -845,7 +865,7 @@ message NodeResourcesResponse {
 message ExecInJobRequest {
   uint32 job_id = 1;
   repeated string command = 2;  // Command to exec inside the container
-  string user = 3;              // Requesting user; must own the job (empty/root bypasses)
+  string user = 3;              // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message ExecInJobResponse {
@@ -868,6 +888,7 @@ message RunStepRequest {
   uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
   bool label = 8;      // Prefix output lines with [rank] (srun -l)
   string mpi = 9;      // Step MPI type; when empty, inherit job.spec.mpi
+  string user = 10;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message RunStepResponse {
@@ -1126,7 +1147,7 @@ message CancelStepRequest {
 message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
-  string user = 3;    // Requesting user; must own the job (empty/root bypasses)
+  string user = 3;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message StreamJobOutputChunk {
@@ -1151,7 +1172,7 @@ message InitSession {
   WindowSize winsize = 5;    // Initial terminal dimensions
   repeated string argv = 6;  // Command to run (empty = default shell)
   map<string, string> env = 7;
-  string user = 8;           // Requesting user; must own the job (empty/root bypasses)
+  string user = 8;           // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message InteractiveInput {
@@ -1182,6 +1203,7 @@ message RecordJobStartRequest {
   string reservation = 7;
   string name = 8;
   google.protobuf.Timestamp submit_time = 9;
+  string qos = 10;
 }
 
 message RecordJobEndRequest {
@@ -1205,6 +1227,37 @@ message GetJobHistoryRequest {
 
 message GetJobHistoryResponse {
   repeated JobInfo jobs = 1;
+}
+
+// Audit/transaction log query. All string filters are optional (empty = no
+// filter); time bounds are optional (unset = no time constraint).
+message GetTransactionsRequest {
+  string actor = 1;
+  string entity_type = 2;
+  string entity_name = 3;
+  string action = 4;
+  string outcome = 5;
+  google.protobuf.Timestamp start_after = 6;
+  google.protobuf.Timestamp start_before = 7;
+  uint32 limit = 8;
+}
+
+message TransactionRecord {
+  int64 id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string actor = 3;
+  uint32 actor_uid = 4;         // 0 when unknown (e.g. unauthenticated caller)
+  bool verified = 5;            // true only when a JWT identity was verified
+  string source = 6;            // "api" | "system"
+  string action = 7;            // "create" | "update" | "delete"
+  string entity_type = 8;       // "reservation"
+  string entity_name = 9;
+  string outcome = 10;          // "success" | "denied" | "error"
+  string details = 11;          // JSON: requested parameters (+ error on failure)
+}
+
+message GetTransactionsResponse {
+  repeated TransactionRecord transactions = 1;
 }
 
 message GetUsageRequest {
@@ -1267,15 +1320,19 @@ message ReportJobStatusRequest {
 // ============================================================
 
 // Add or modify an account (proto3 presence: unset = leave unchanged on modify,
-// set = write; `add` sets every field). Empty/0 clears parent_account, grp_tres,
-// and max_running_jobs to NULL; description, organization, and fairshare_weight
-// store their literal value (0 is a real weight, not a clear).
+// set = write; `add` sets every field). Empty string clears the text fields
+// parent_account and grp_tres to NULL. max_running_jobs follows the sentinel
+// rule on its field (INFINITE clears, a literal 0 is stored). description,
+// organization, and fairshare_weight store their literal value (0 is a real
+// weight, not a clear).
 message CreateAccountRequest {
   string name = 1;
   optional string description = 2;
   optional string organization = 3;
   optional string parent_account = 4;
   optional double fairshare_weight = 5;
+  // Unset preserves the stored value; the INFINITE sentinel (4294967295) clears
+  // to no-limit; any other value (including a literal 0) is stored as-is.
   optional uint32 max_running_jobs = 6;
   optional string grp_tres = 7;
 }
@@ -1301,8 +1358,11 @@ message AccountInfo {
 }
 
 // Add or modify a user-account association (proto3 presence: unset = leave
-// unchanged on modify, set = write; `add` sets every field). The limit/QOS
-// fields below are nullable and clear to NULL when set empty/0; admin_level is
+// unchanged on modify, set = write; `add` sets every field). For the numeric
+// limit fields below: unset preserves the stored value, the INFINITE sentinel
+// (4294967295) clears to no-limit (SQL NULL), and any other value (including a
+// literal 0, which means "block all") is stored as-is. Text limit fields
+// (max_tres_*, grp_tres) clear to NULL when set empty. admin_level is
 // non-nullable, storing the literal sent (unset keeps it, 'none' on create).
 message AddUserRequest {
   string user = 1;
@@ -1312,8 +1372,8 @@ message AddUserRequest {
   // Default QOS for this user's association with `account`. Unset preserves
   // the stored default; explicit empty clears it.
   optional string default_qos = 5;
-  // Association-level resource limits for `user` within `account`. Unset
-  // preserves the stored limit; an explicit 0/empty clears it (no limit).
+  // Association-level resource limits for `user` within `account`. See the
+  // message-level comment for the unset/INFINITE/literal sentinel semantics.
   optional uint32 max_running_jobs = 6;
   optional uint32 max_submit_jobs = 7;
   optional string max_tres_per_job = 8;
@@ -1323,6 +1383,8 @@ message AddUserRequest {
   // stored allow-list; explicit empty clears it back to unrestricted.
   // default_qos must be a member when both are set in the same request.
   optional string allowed_qos = 11;
+  // Max submitted (pending + running) jobs across all users in the account.
+  optional uint32 grp_submit_jobs = 12;
 }
 
 message RemoveUserRequest {
@@ -1346,12 +1408,24 @@ message UserInfo {
   string default_account = 4;
   string default_qos = 5;
   string allowed_qos = 6;
+  // Per-association limits (read-back of what `sacctmgr add/modify user` set).
+  // Numeric fields use the INFINITE sentinel (4294967295) for "no limit"; a
+  // literal 0 means "block all". Text fields are empty when unset.
+  uint32 max_running_jobs = 7;
+  uint32 max_submit_jobs = 8;
+  uint32 grp_submit_jobs = 9;
+  uint32 max_wall_minutes = 10;
+  string max_tres_per_job = 11;
+  string grp_tres = 12;
 }
 
 // Add or modify a QOS (proto3 presence: unset = leave unchanged on modify, set =
-// write; `add` sets every field). Empty/0 clears the nullable limits
-// (max_*_per_user, *_wall_minutes, max_tres_*, grp_tres) to NULL; description,
-// preempt_mode, priority, and usage_factor store their literal value (0 is real).
+// write; `add` sets every field). For the numeric limit fields: unset preserves
+// the stored value, the INFINITE sentinel (4294967295) clears to no-limit (SQL
+// NULL), and any other value (including a literal 0, which means "block all") is
+// stored as-is. Text limits (max_tres_*, grp_tres) clear to NULL when set empty.
+// description, preempt_mode, priority, and usage_factor store their literal
+// value (0 is real).
 message CreateQosRequest {
   string name = 1;
   optional string description = 2;
@@ -1376,6 +1450,13 @@ message CreateQosRequest {
   // Set to true to clear preempt_exempt_time back to NULL (inherit from
   // partition / global default). Takes precedence over preempt_exempt_time.
   bool clear_preempt_exempt_time = 15;
+  // Max submitted (pending + running) jobs per account within this QOS.
+  optional uint32 max_submit_jobs_per_account = 16;
+  // Max submitted (pending + running) jobs across all users in this QOS.
+  optional uint32 grp_submit_jobs = 17;
+  // Comma-separated QOS flags. Recognized: DenyOnLimit. Unset preserves the
+  // stored flags; explicit empty clears them.
+  optional string flags = 18;
 }
 
 message DeleteQosRequest {
@@ -1404,6 +1485,9 @@ message QosInfo {
   // Comma-separated QOS names this QOS may preempt (empty = none allowed).
   string preempt = 13;
   optional uint32 preempt_exempt_time = 14;  // absent = unset (inherits partition/global); 0 = no exemption
+  uint32 max_submit_jobs_per_account = 16;
+  uint32 grp_submit_jobs = 17;
+  string flags = 18;
 }
 
 // ============================================================
@@ -1435,7 +1519,7 @@ message CreateJobStepRequest {
   bool pty = 6;               // Allocate a PTY for the step
   WindowSize winsize = 7;     // Initial terminal dimensions
   string node = 8;            // Target node (-w); empty = first allocated node
-  string user = 9;            // Requesting user; must own the job (empty/root bypasses)
+  string user = 9;            // Requesting user; verified identity must own the job; the controller/admin credential overrides
 }
 
 message CreateJobStepResponse {
@@ -1508,6 +1592,10 @@ message DeletePartitionRequest {
 
 // ============================================================
 // Reservation Management
+//
+// Create, update, and delete require an operator: a cluster admin, or a caller the controller
+// resolves to uid 0 or a `sudo`/`wheel` member. The `user` fields below are overwritten with the
+// authenticated name when a credential is presented, so they are only trusted without one.
 // ============================================================
 
 message CreateReservationRequest {
@@ -1518,7 +1606,7 @@ message CreateReservationRequest {
   repeated string accounts = 5;
   repeated string users = 6;
   repeated string flags = 7;
-  string user = 8;            // requesting user; recorded as reservation owner
+  string user = 8;            // requesting user; must be an operator, and is recorded as the owner
 }
 
 message UpdateReservationRequest {
@@ -1530,12 +1618,12 @@ message UpdateReservationRequest {
   repeated string remove_users = 6;
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
-  string user = 9;              // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
+  string user = 9;              // requesting user; must be an operator, who may update any reservation
 }
 
 message DeleteReservationRequest {
   string name = 1;
-  string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
+  string user = 2;             // requesting user; must be an operator, who may delete any reservation
 }
 
 message ListReservationsRequest {

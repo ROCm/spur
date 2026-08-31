@@ -28,8 +28,9 @@ use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 /// enough to tolerate clock skew between the controller and a node.
 const CREDENTIAL_TTL_SECS: u64 = 300;
 
-/// Subject the agent sees for controller-issued credentials.
-const CONTROLLER_SUBJECT: &str = "spurctld";
+/// Subject the agent sees for controller-issued credentials. Shared with the agent (which gates
+/// controller-only RPCs on it) via `spur_core::auth` so the two cannot drift apart.
+use spur_core::auth::CONTROLLER_SUBJECT;
 
 /// An agent channel that presents the controller's credential.
 pub type AgentChannel = InterceptedService<Channel, ControllerCredential>;

@@ -7,6 +7,10 @@ use std::collections::BinaryHeap;
 use chrono::{DateTime, Duration, Utc};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 
+/// Assumed occupancy for a job with no explicit time limit, shared by
+/// backfill sizing and spurctld's running-job busy_until estimate.
+pub const UNLIMITED_JOB_DURATION: Duration = Duration::days(365);
+
 /// Per-node resource timeline for backfill scheduling.
 ///
 /// Tracks when resources become available on a node by maintaining
@@ -24,6 +28,9 @@ pub struct Interval {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub resources: ResourceAllocations,
+    /// The job this reservation belongs to, if attributable to exactly one
+    /// (e.g. `None` for the aggregate "current allocation" seed interval).
+    pub job_id: Option<u32>,
 }
 
 /// Incremental sweep over sorted interval start/end events.
@@ -138,20 +145,15 @@ impl NodeTimeline {
     }
 
     /// Find the earliest time at which `request` resources are available
-    /// for `duration` contiguous time.
+    /// for `duration` contiguous time. `after` may itself be in the future
+    /// (e.g. a reservation's end time) — already-elapsed intervals relative
+    /// to `after` are handled correctly by the sweep, not a staleness bug.
     pub fn earliest_start(
         &self,
         request: &ResourceSet,
         duration: Duration,
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            self.intervals.iter().all(|i| i.end > after),
-            "stale interval in timeline for {}",
-            self.node_name,
-        );
-
         let mut candidate = after;
         let max_check = after + Duration::days(365);
         let mut sweep = AllocationSweep::new(&self.intervals, after);
@@ -186,10 +188,23 @@ impl NodeTimeline {
         end: DateTime<Utc>,
         resources: ResourceAllocations,
     ) {
+        self.reserve_for_job(start, end, resources, None);
+    }
+
+    /// Like [`reserve`](Self::reserve), attributing the interval to a job so
+    /// callers can later report which pending job a future reservation is for.
+    pub fn reserve_for_job(
+        &mut self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        resources: ResourceAllocations,
+        job_id: Option<u32>,
+    ) {
         self.intervals.push(Interval {
             start,
             end,
             resources,
+            job_id,
         });
         self.intervals.sort_by_key(|i| i.start);
     }

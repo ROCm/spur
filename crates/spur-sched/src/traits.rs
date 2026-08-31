@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
@@ -26,6 +27,9 @@ pub struct ClusterState<'a> {
     pub reservations: &'a [Reservation],
     /// Fabric topology (switch hierarchy). None if topology is not configured.
     pub topology: Option<&'a TopologyTree>,
+    /// Node name -> real time its last currently-running job is expected to
+    /// end. Absent entries fall back to a conservative placeholder.
+    pub busy_until: &'a HashMap<String, DateTime<Utc>>,
 }
 
 /// Trait for pluggable scheduler implementations.

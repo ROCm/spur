@@ -65,6 +65,10 @@ mod local_path_tests {
 /// the underlay to leave room for WireGuard's ~50-byte overhead, avoiding fragmentation). Returns
 /// `None` for any `cni` other than `"calico"` (the k0s default, kube-router, needs no config file).
 /// `sans` are extra API-server certificate SANs (e.g. the control-plane's mesh + underlay IPs).
+///
+/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over WireGuard cryptokey routing, so
+/// node-local load balancing (EnvoyProxy) is enabled to give konnectivity a cluster-wide balanced
+/// endpoint instead of pinning every agent to one controller.
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,
@@ -72,6 +76,7 @@ pub fn k0s_controller_config_yaml(
     cni_mtu: u16,
     api_address: &str,
     sans: &[String],
+    cp_count: usize,
 ) -> Option<String> {
     if cni != "calico" {
         return None;
@@ -97,6 +102,11 @@ pub fn k0s_controller_config_yaml(
     y.push_str("    calico:\n");
     y.push_str("      mode: bird\n");
     y.push_str(&format!("      mtu: {cni_mtu}\n"));
+    if cp_count > 1 {
+        y.push_str("    nodeLocalLoadBalancing:\n");
+        y.push_str("      enabled: true\n");
+        y.push_str("      type: EnvoyProxy\n");
+    }
     Some(y)
 }
 
@@ -178,6 +188,7 @@ mod k0s_config_tests {
             1450,
             "192.0.2.1",
             &["192.0.2.1".to_string(), "203.0.113.9".to_string()],
+            1,
         )
         .unwrap();
         assert!(y.contains("address: 192.0.2.1"));
@@ -197,9 +208,44 @@ mod k0s_config_tests {
             "198.51.100.0/24",
             1450,
             "192.0.2.1",
-            &[]
+            &[],
+            3,
         )
         .is_none());
+    }
+
+    #[test]
+    fn multi_cp_calico_enables_node_local_load_balancing() {
+        // Documentation-range addresses only (RFC 5737 TEST-NET); no real infrastructure IPs.
+        let y = k0s_controller_config_yaml(
+            "calico",
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            1450,
+            "192.0.2.1",
+            &["192.0.2.1".to_string()],
+            3,
+        )
+        .unwrap();
+        assert!(y.contains("nodeLocalLoadBalancing:"));
+        assert!(y.contains("enabled: true"));
+        assert!(y.contains("type: EnvoyProxy"));
+    }
+
+    #[test]
+    fn single_cp_calico_omits_node_local_load_balancing() {
+        // Documentation-range addresses only (RFC 5737 TEST-NET); no real infrastructure IPs.
+        let y = k0s_controller_config_yaml(
+            "calico",
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            1450,
+            "192.0.2.1",
+            &["192.0.2.1".to_string()],
+            1,
+        )
+        .unwrap();
+        assert!(!y.contains("nodeLocalLoadBalancing"));
     }
 }
 

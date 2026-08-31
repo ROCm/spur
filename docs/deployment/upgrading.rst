@@ -239,6 +239,15 @@ Follow this order for any cluster upgrade:
 5. **HA membership is fixed at init** in Spur 0.3.0. You can roll new binaries onto the
    existing controller set freely, but changing *which* hosts are controllers requires
    ``deploy.yml -e spur_wipe_state=true``.
+6. **Only roll forward across an accounting schema migration.** The first upgraded
+   controller applies pending PostgreSQL migrations on startup, so upgrade controllers
+   before agents and let each migration finish before the next controller starts. One
+   such migration widens the ``jobs`` job-id columns to 64-bit: it rewrites the table
+   under an ``ACCESS EXCLUSIVE`` lock, so its duration scales with the row count and
+   accounting writes block until it completes. **Rolling back to a pre-migration
+   controller is not supported** — an older controller reads the widened columns as
+   32-bit and its accounting queries fail against a migrated database. Take a database
+   backup before upgrading if you need a recovery path.
 
 See Also
 --------

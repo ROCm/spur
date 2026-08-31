@@ -218,6 +218,15 @@ async fn main() -> anyhow::Result<()> {
                         std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
                     );
 
+                    if let Some(days) = config.accounting.txn_retention_days.filter(|d| *d > 0) {
+                        accounting::spawn_txn_purge_loop(
+                            pool.clone(),
+                            raft_handle.clone(),
+                            days,
+                            std::time::Duration::from_secs(3600),
+                        );
+                    }
+
                     cluster.fairshare_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.scheduler.fairshare_halflife_days,
@@ -232,6 +241,12 @@ async fn main() -> anyhow::Result<()> {
                     cluster.association_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.accounting.fairshare_refresh_secs as u64,
+                    );
+
+                    cluster.grp_wall_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.accounting.fairshare_refresh_secs as u64,
+                        config.accounting.grp_wall_window_days,
                     );
 
                     Some(accounting::AccountingService::available(pool))
@@ -261,7 +276,9 @@ async fn main() -> anyhow::Result<()> {
         let k8s_cluster = cluster.clone();
         let k8s_raft = raft_handle.clone();
         let k8s_net = cluster_k8s::ClusterNetworking {
+            wg_enabled: config.network.wg_enabled,
             mesh_cidr: config.network.wg_cidr.clone(),
+            mesh_interface: config.network.wg_interface.clone(),
             pod_cidr: config.cluster.pod_cidr.clone(),
             service_cidr: config.cluster.service_cidr.clone(),
             cni_mtu: config.cluster.cni_mtu,
@@ -451,6 +468,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         devices: Default::default(),
         admission: Default::default(),
         rlimits: Default::default(),
+        cgroup: Default::default(),
         mpi: Default::default(),
     }
 }

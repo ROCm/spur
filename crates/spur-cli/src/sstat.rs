@@ -258,3 +258,59 @@ fn format_duration(total_seconds: i64) -> String {
         format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_field_list_accepts_aliases_case_and_padding() {
+        assert_eq!(parse_field_list("jobid"), [StatField::JobId]);
+        assert_eq!(parse_field_list("NCPUS"), [StatField::Cpus]);
+        assert_eq!(parse_field_list("cpus"), [StatField::Cpus]);
+        assert_eq!(parse_field_list("reqmem"), [StatField::MemAlloc]);
+        assert_eq!(parse_field_list("gres"), [StatField::GpuAlloc]);
+        assert_eq!(
+            parse_field_list("  JobID , Elapsed  "),
+            [StatField::JobId, StatField::Elapsed]
+        );
+    }
+
+    #[test]
+    fn parse_field_list_skips_unknown_fields_but_keeps_the_rest() {
+        assert_eq!(
+            parse_field_list("jobid,bogus,elapsed"),
+            [StatField::JobId, StatField::Elapsed]
+        );
+        assert!(parse_field_list("bogus").is_empty());
+    }
+
+    #[test]
+    fn format_duration_rolls_over_into_days() {
+        assert_eq!(format_duration(0), "00:00:00");
+        assert_eq!(format_duration(59), "00:00:59");
+        assert_eq!(format_duration(3_600), "01:00:00");
+        assert_eq!(format_duration(86_399), "23:59:59");
+        assert_eq!(format_duration(86_400), "1-00:00:00");
+        assert_eq!(format_duration(90_061), "1-01:01:01");
+    }
+
+    /// Run time arrives as a signed proto duration, so clock skew that yields a
+    /// negative value must still format as a sane magnitude.
+    #[test]
+    fn format_duration_treats_negative_as_magnitude() {
+        assert_eq!(format_duration(-1), "00:00:01");
+    }
+
+    #[test]
+    fn header_width_matches_formatted_header() {
+        for field in default_fields() {
+            assert_eq!(format_header(&field).len(), field_width(&field));
+        }
+    }
+
+    #[test]
+    fn state_name_falls_back_to_unknown() {
+        assert_eq!(state_name(i32::MAX), "UNKNOWN");
+    }
+}

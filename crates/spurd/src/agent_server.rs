@@ -233,7 +233,7 @@ pub struct AgentService {
     spank: Arc<Option<SpankHost>>,
     mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
-    memlock: spur_core::config::MemlockLimit,
+    limits: spur_core::config::JobLimits,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
@@ -262,7 +262,10 @@ impl AgentService {
             hooks,
             device_registry,
             &spur_core::config::ClusterConfig::default(),
-            memlock,
+            spur_core::config::JobLimits {
+                memlock,
+                ..Default::default()
+            },
             MpiConfig::default(),
             new_running_jobs(),
             spur_core::config::AuthConfig::default().allow_root_jobs,
@@ -280,7 +283,7 @@ impl AgentService {
         hooks: HooksConfig,
         device_registry: Arc<Mutex<DeviceRegistry>>,
         cluster: &spur_core::config::ClusterConfig,
-        memlock: spur_core::config::MemlockLimit,
+        limits: spur_core::config::JobLimits,
         mpi: MpiConfig,
         running: RunningJobs,
         allow_root_jobs: bool,
@@ -343,7 +346,7 @@ impl AgentService {
             spank: Arc::new(spank),
             mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
-            memlock,
+            limits,
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
@@ -583,13 +586,7 @@ impl Drop for LaunchReservationGuard {
     }
 }
 
-fn controller_rpc_retryable(status: &tonic::Status) -> bool {
-    use tonic::Code;
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
-    )
-}
+use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1054,8 +1051,17 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         let job_id = req.job_id;
+        // A launch names the node the controller scheduled it onto. If it does not name this host it
+        // was aimed at the wrong agent — refuse rather than run another node's allocation here.
+        if !req.target_node.is_empty() && !self.agent_owns_node(&req.target_node) {
+            return Err(Status::failed_precondition(format!(
+                "launch targeted node '{}' but this agent serves '{}'",
+                req.target_node, self.reporter.hostname
+            )));
+        }
         let peer_nodes = req.peer_nodes;
         let task_offset = req.task_offset;
         // Per-task array identity is controller-assigned on the launch request,
@@ -1483,7 +1489,8 @@ impl SlurmAgent for AgentService {
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
-            memlock: self.memlock,
+            memlock: self.limits.memlock,
+            swap_limit: self.limits.swap,
             io_mode: if spec.pty {
                 executor::LaunchIo::Pty
             } else {
@@ -1664,6 +1671,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<AgentCancelJobRequest>,
     ) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         let job_id = req.job_id;
 
@@ -1694,6 +1702,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<CancelStepRequest>,
     ) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         let step_key = (req.job_id, req.step_id);
         let signal = if req.signal > 0 {
@@ -1721,6 +1730,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<AgentSuspendJobRequest>,
     ) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         self.suspend_signal(req.job_id, req.resume).await;
         Ok(Response::new(()))
@@ -1743,9 +1753,10 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
 
-        self.check_job_access(req.job_id, &req.user, "exec into")
+        self.check_job_access(req.job_id, identity.as_ref(), &req.user, "exec into")
             .await?;
 
         let entry = self.job_entry(req.job_id).await?;
@@ -1906,6 +1917,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -2186,7 +2198,7 @@ impl SlurmAgent for AgentService {
             cmd.env(k, v);
         }
 
-        let memlock = self.memlock;
+        let memlock = self.limits.memlock;
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {
@@ -2267,10 +2279,11 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<StreamJobOutputRequest>,
     ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        self.check_job_access(job_id, &req.user, "read output of")
+        self.check_job_access(job_id, identity.as_ref(), &req.user, "read output of")
             .await?;
 
         // No retry on a miss, same as run_command: a Running job has been
@@ -2364,6 +2377,7 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
         use crate::pty::WindowSize as PtyWinSize;
 
+        let identity = Self::verified_identity(&request).cloned();
         let mut inbound = request.into_inner();
 
         let first = inbound
@@ -2381,7 +2395,7 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        self.check_job_access(init.job_id, &init.user, "attach to")
+        self.check_job_access(init.job_id, identity.as_ref(), &init.user, "attach to")
             .await?;
 
         let entry = self.job_entry(init.job_id).await?;
@@ -2484,6 +2498,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<CreateK0sJoinTokenRequest>,
     ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         match self
             .k0s
@@ -2539,9 +2554,12 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<GetKubeconfigRequest>,
     ) -> Result<Response<GetKubeconfigResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         // Empty user -> cluster-admin kubeconfig; set -> a scoped kubeconfig (SA + bound token in the
-        // user's account namespace).
+        // user's account namespace). The controller already gates admin kubeconfig behind
+        // `is_k0s_admin` + `allow_admin_kubeconfig`; requiring the controller here keeps that from
+        // being sidestepped by dialing the agent directly.
         let result = if req.user.is_empty() {
             self.k0s.admin_kubeconfig().await
         } else {
@@ -2559,7 +2577,9 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<MeshMembership>,
     ) -> Result<Response<ApplyMeshResponse>, Status> {
-        let iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        // Use the interface spurd resolved at startup (via the reporter), not a fresh env read
+        // that would ignore spur.conf and could diverge from the rest of spurd.
+        let iface = self.reporter.wg_iface.clone();
         // proto -> spur-net mesh types.
         let members: Vec<spur_net::mesh::MeshNode> = request
             .into_inner()
@@ -2840,18 +2860,76 @@ impl AgentService {
         });
     }
 
-    /// Gate `user` for `action` on job `job_id`, per
-    /// [`spur_core::auth::check_job_owner`].
+    /// The verified identity for this request, if the auth layer authenticated one.
     ///
-    /// Enforced here as well as on the controller because `sattach` and the
-    /// output stream dial the agent's port directly.
-    async fn check_job_access(&self, job_id: u32, user: &str, action: &str) -> Result<(), Status> {
+    /// `None` means the caller presented no credential — allowed only under `permissive`/`disabled`,
+    /// where the pre-auth behavior is preserved (`required` never reaches a handler unauthenticated,
+    /// the auth layer rejects first). Only [`crate::auth_middleware`] inserts this, so its presence
+    /// always means "verified".
+    fn verified_identity<T>(request: &Request<T>) -> Option<&spur_core::auth::Identity> {
+        request.extensions().get::<spur_core::auth::Identity>()
+    }
+
+    /// Refuse a controller-only RPC unless the verified caller is the cluster controller.
+    ///
+    /// These RPCs (launch/run/cancel/suspend, kubeconfig, join-token) drive work and secrets that
+    /// only the control plane may request; a valid *user* token — which verifies identically to the
+    /// controller's under the shared cluster key — must not reach them by dialing the agent directly.
+    /// An unauthenticated caller is tolerated only under `permissive`/`disabled` (there is no
+    /// identity to check), matching the rest of the agent's no-auth behavior.
+    fn require_controller<T>(request: &Request<T>) -> Result<(), Status> {
+        match Self::verified_identity(request) {
+            Some(id) if id.is_controller() => Ok(()),
+            Some(id) => Err(Status::permission_denied(format!(
+                "this RPC is reachable only by the cluster controller; caller '{}' is not the \
+                 controller — route the request through spurctld",
+                id.user
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `node` names this agent's own host.
+    ///
+    /// A launch carries the node the controller scheduled it onto; if it does not name this host the
+    /// request was misrouted (or aimed straight at the wrong node's agent) and must not run here.
+    /// Accepts either the reporter's node name or the OS hostname to tolerate short/long-name skew.
+    fn agent_owns_node(&self, node: &str) -> bool {
+        if node == self.reporter.hostname {
+            return true;
+        }
+        hostname::get()
+            .map(|h| h.to_string_lossy() == node)
+            .unwrap_or(false)
+    }
+
+    /// Gate a user-facing attach/exec/stream on job `job_id` for `action`.
+    ///
+    /// The caller is the *verified* identity, not a wire-supplied `user`: the owner reaches their own
+    /// job, an admin (or the controller) reaches any job, and everyone else is refused. With no
+    /// verified identity (`permissive`/`disabled` and no credential) the asserted `user` is trusted
+    /// as a plain, non-privileged principal — never as an internal caller — so an empty or `"root"`
+    /// string can no longer stand in for one.
+    ///
+    /// Enforced here as well as on the controller because `sattach` and the output stream dial the
+    /// agent's port directly.
+    async fn check_job_access(
+        &self,
+        job_id: u32,
+        identity: Option<&spur_core::auth::Identity>,
+        asserted_user: &str,
+        action: &str,
+    ) -> Result<(), Status> {
         let jobs = self.running.lock().await;
         let tracked = jobs
             .get(&job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
 
-        spur_core::auth::check_job_owner(user, &tracked.user, action)
+        let (user, is_internal) = match identity {
+            Some(id) => (id.user.as_str(), id.is_admin),
+            None => (asserted_user, false),
+        };
+        spur_core::auth::check_job_owner(user, is_internal, &tracked.user, action)
             .map_err(|e| Status::permission_denied(e.to_string()))
     }
 
@@ -3855,6 +3933,24 @@ mod tests {
         assert_ne!(code, Some(tonic::Code::PermissionDenied));
     }
 
+    fn user_identity(name: &str) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: name.into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        }
+    }
+
+    fn controller_identity() -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: spur_core::auth::CONTROLLER_SUBJECT.into(),
+            uid: 0,
+            gid: 0,
+            is_admin: true,
+        }
+    }
+
     /// `interactive_session` (the `sattach` and `srun --pty` path) gates on
     /// `check_job_access`, but its handler consumes a gRPC stream that cannot be
     /// built in-process, so the gate is exercised directly here.
@@ -3869,27 +3965,47 @@ mod tests {
         svc.insert_test_job(46, TrackedJob::dummy(std::process::id()))
             .await;
 
-        svc.check_job_access(46, "testuser", "attach to")
+        // Verified owner and a verified admin (the controller mints an admin credential) are allowed.
+        svc.check_job_access(46, Some(&user_identity("testuser")), "", "attach to")
             .await
             .expect("the owner must be allowed to attach");
-        svc.check_job_access(46, "root", "attach to")
+        svc.check_job_access(46, Some(&controller_identity()), "", "attach to")
             .await
-            .expect("root is an admin override");
+            .expect("an admin/controller is an override");
 
+        // A verified non-owner is refused even if it claims the owner's name on the wire — the
+        // verified identity wins over the asserted `user`.
         let err = svc
-            .check_job_access(46, "intruder", "attach to")
+            .check_job_access(
+                46,
+                Some(&user_identity("intruder")),
+                "testuser",
+                "attach to",
+            )
             .await
             .expect_err("a non-owner must not attach to another user's job");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
+        // With no verified identity (permissive/disabled) the asserted user is trusted only as a
+        // plain principal: the owner's name clears, another user's does not.
+        svc.check_job_access(46, None, "testuser", "attach to")
+            .await
+            .expect("the asserted owner clears under permissive");
+        let err = svc
+            .check_job_access(46, None, "intruder", "attach to")
+            .await
+            .expect_err("an asserted non-owner must be denied");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
         let missing = svc
-            .check_job_access(999, "testuser", "attach to")
+            .check_job_access(999, Some(&user_identity("testuser")), "", "attach to")
             .await
             .expect_err("an untracked job must report not-found");
         assert_eq!(missing.code(), tonic::Code::NotFound);
     }
 
-    /// An empty-owner job runs as root, so non-root callers must be denied.
+    /// An empty-owner job runs as root, so only an internal caller (a verified admin/controller) is
+    /// allowed — an empty or `"root"` string no longer stands in for one.
     #[tokio::test]
     async fn check_job_access_denies_non_root_on_empty_owner() {
         let svc = AgentService::new(
@@ -3902,19 +4018,105 @@ mod tests {
         job.user = String::new();
         svc.insert_test_job(47, job).await;
 
-        let err = svc
-            .check_job_access(47, "alice", "attach to")
+        // A verified admin/controller reaches the root-owned job.
+        svc.check_job_access(47, Some(&controller_identity()), "", "attach to")
             .await
-            .expect_err("empty-owner jobs run as root; non-root must be denied");
+            .expect("an admin/controller must reach a root-owned job");
+
+        // A verified non-admin user must not.
+        let err = svc
+            .check_job_access(47, Some(&user_identity("alice")), "", "attach to")
+            .await
+            .expect_err("empty-owner jobs run as root; a named user must be denied");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-        svc.check_job_access(47, "root", "attach to")
-            .await
-            .expect("root must always be allowed");
+        // The removed bypass: an empty or literal-"root" asserted user (no verified identity) is now
+        // rejected instead of silently authorized.
+        for forged in ["", "root"] {
+            let err = svc
+                .check_job_access(47, None, forged, "attach to")
+                .await
+                .expect_err("empty/root string must not bypass the ownership check");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+    }
 
-        svc.check_job_access(47, "", "attach to")
+    /// The controller gate on the controller-only RPCs: a verified user token is refused, the
+    /// controller's own credential passes, and an unauthenticated caller is left to the permissive
+    /// path (no identity to check).
+    #[test]
+    fn require_controller_admits_only_the_controller() {
+        let mut user_req = Request::new(());
+        user_req.extensions_mut().insert(user_identity("attacker"));
+        let err = AgentService::require_controller(&user_req)
+            .expect_err("a plain user credential must not drive a controller-only RPC");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let mut ctl_req = Request::new(());
+        ctl_req.extensions_mut().insert(controller_identity());
+        AgentService::require_controller(&ctl_req)
+            .expect("the controller's own credential must pass");
+
+        let anon_req = Request::new(());
+        AgentService::require_controller(&anon_req)
+            .expect("no credential is tolerated (permissive/disabled)");
+    }
+
+    /// End-to-end: a verified *user* identity in the request extensions cannot cancel a job through
+    /// the agent — the controller-only gate refuses it before any signal is sent.
+    #[tokio::test]
+    async fn cancel_job_rejects_a_non_controller_caller() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(48, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 48,
+            signal: 9,
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .cancel_job(req)
             .await
-            .expect("daemon (empty user) must always be allowed");
+            .expect_err("a user token must not cancel jobs by dialing the agent directly");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// A launch aimed at another node's name must be refused: the agent only runs allocations
+    /// scheduled onto its own host.
+    #[tokio::test]
+    async fn launch_job_rejects_a_foreign_target_node() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let err = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 7,
+                target_node: "some-other-node".into(),
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a launch targeting another node must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -4937,7 +5139,7 @@ mod tests {
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             &spur_core::config::ClusterConfig::default(),
-            spur_core::config::MemlockLimit::Unlimited,
+            spur_core::config::JobLimits::default(),
             MpiConfig::default(),
             running,
             false, // allow_root_jobs

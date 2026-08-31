@@ -55,10 +55,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Difference
    * - Partitions
      - Defined in ``spur.conf``; there is no runtime ``scontrol create/update/delete partition``. Edit the config and reload the controller to change a partition.
-   * - ``squeue --sort``
-     - Accepted for compatibility; result ordering is not yet applied.
-   * - ``sinfo --states``
-     - Accepted for compatibility; the state filter is not yet applied (all node states are returned).
+   * - ``squeue``/``sinfo`` ``--noconvert``
+     - Accepted for compatibility; Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. Slurm also defines the flag on ``sacct``, ``sstat``, ``sshare`` and ``sreport``, where it is not accepted yet.
    * - ``sacct --jobs``
      - Accepted for compatibility; the job-id filter is not yet applied server-side.
    * - ``sacct`` ``ReqMem``
@@ -69,10 +67,14 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``
      - The ``FAIRSHARE`` column is a placeholder and does not yet reflect usage.
+   * - ``sacctmgr`` ``-p``/``-P``
+     - Delimited output covers ``show account``, ``show qos``, and ``show txn``; for ``show user``, ``show association``, and ``show tres`` it errors instead of printing a table no script can parse. ``-n`` works for every entity.
    * - ``scancel`` arrays
      - Array-element syntax (``123_4``) is not yet supported client-side; cancel by plain job id.
    * - ``scontrol show``
      - Output is always the multi-line ``Key=Value`` block; there is no ``--oneliner``.
+   * - QOS ``GrpWall``
+     - Enforced at scheduling admission only: an over-budget QOS stops admitting jobs, and running jobs are never killed where Slurm cancels them. Consumption is a trailing window (``grp_wall_window_days`` under ``[accounting]``) rather than decayed usage, and the cap exists on a QOS only, not on an association. See :ref:`grpwall-budgets`.
 
 Accounting and QOS Mapping
 --------------------------
@@ -84,6 +86,8 @@ Accounting entities map directly from Slurm:
   ordering.
 - The ``[accounting] require_qos`` setting is the equivalent of Slurm's
   ``AccountingStorageEnforce=qos``.
+- The ``[accounting] require_association`` setting is the equivalent of Slurm's
+  ``AccountingStorageEnforce=associations``.
 - The ``default_qos`` setting is the equivalent of Slurm's fallback QOS.
 
 See :doc:`/admin-guide/accounting` for the accounting concept guide.

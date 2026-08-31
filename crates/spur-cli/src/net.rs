@@ -96,6 +96,16 @@ pub enum NetCommand {
         #[arg(long, default_value = "spur0")]
         interface: String,
     },
+    /// Remove a peer from the running WireGuard interface by its public key (the counterpart to
+    /// add-peer; e.g. when a node leaves the mesh). Idempotent — removing an absent peer succeeds.
+    RemovePeer {
+        /// Peer's WireGuard public key
+        #[arg(long)]
+        key: String,
+        /// WireGuard interface name
+        #[arg(long, default_value = "spur0")]
+        interface: String,
+    },
     /// Apply a full-mesh peering from a membership file on the local node.
     ///
     /// Adds every other node as a direct peer with pod-CIDR-aware AllowedIPs,
@@ -172,6 +182,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             endpoint.as_deref(),
             &interface,
         ),
+        NetCommand::RemovePeer { key, interface } => cmd_remove_peer(&key, &interface),
         NetCommand::Mesh {
             config,
             self_ip,
@@ -359,6 +370,13 @@ fn cmd_add_peer(
     Ok(())
 }
 
+fn cmd_remove_peer(key: &str, interface: &str) -> Result<()> {
+    wireguard::remove_peer(interface, key)?;
+    eprintln!("Peer removed from {}:", interface);
+    eprintln!("  Public key: {}", key);
+    Ok(())
+}
+
 fn cmd_mesh(
     config: &Path,
     self_ip: &str,
@@ -453,7 +471,68 @@ fn cmd_mesh(
 /// Given an IP and prefix length, compute the network address.
 fn address_network(ip: &str, prefix_len: u8) -> Result<String> {
     let addr: Ipv4Addr = ip.parse().context("invalid IP address")?;
-    let mask = !((1u32 << (32 - prefix_len)) - 1);
+    if prefix_len > 32 {
+        bail!("invalid prefix length /{}, expected 0-32", prefix_len);
+    }
+    // A /0 has no network bits, and shifting a u32 by a full 32 would overflow.
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
     let network = u32::from(addr) & mask;
     Ok(Ipv4Addr::from(network).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_network_masks_host_bits() {
+        assert_eq!(address_network("10.42.7.9", 24).unwrap(), "10.42.7.0");
+        assert_eq!(address_network("10.42.7.9", 16).unwrap(), "10.42.0.0");
+        assert_eq!(address_network("10.42.7.9", 8).unwrap(), "10.0.0.0");
+        assert_eq!(address_network("10.42.7.130", 25).unwrap(), "10.42.7.128");
+        assert_eq!(address_network("10.42.7.9", 32).unwrap(), "10.42.7.9");
+    }
+
+    /// A /0 shifts the mask by 32 bits, which is where the unchecked shift
+    /// overflowed instead of yielding the empty mask.
+    #[test]
+    fn address_network_handles_zero_prefix() {
+        assert_eq!(address_network("10.42.7.9", 0).unwrap(), "0.0.0.0");
+    }
+
+    /// Above /32 the `32 - prefix_len` subtraction underflowed before the shift
+    /// was ever reached, so the length is now rejected up front.
+    #[test]
+    fn address_network_rejects_prefix_above_32() {
+        assert!(address_network("10.42.7.9", 33).is_err());
+        assert!(address_network("10.42.7.9", u8::MAX).is_err());
+    }
+
+    #[test]
+    fn address_network_rejects_malformed_addresses() {
+        assert!(address_network("not-an-ip", 24).is_err());
+        assert!(address_network("10.42.7", 24).is_err());
+        assert!(address_network("::1", 24).is_err());
+    }
+
+    #[test]
+    fn parses_remove_peer_with_key_and_iface_default() {
+        let args = NetArgs::try_parse_from(["net", "remove-peer", "--key", "abc="]).unwrap();
+        match args.command {
+            NetCommand::RemovePeer { key, interface } => {
+                assert_eq!(key, "abc=");
+                assert_eq!(interface, "spur0");
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn remove_peer_requires_key() {
+        assert!(NetArgs::try_parse_from(["net", "remove-peer"]).is_err());
+    }
 }

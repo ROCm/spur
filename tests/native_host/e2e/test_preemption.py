@@ -10,8 +10,6 @@ separately from failure requeues (dispatch failure/Timeout/NodeFail) and are
 never checked against `max_batch_requeue`.
 """
 
-import time
-
 import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
@@ -86,6 +84,12 @@ class TestChronicPreemption:
                 assert "Reason=JobHoldMaxRequeue" not in show, (
                     f"low-priority job held after preemption cycle {i}:\n{show}"
                 )
+                assert f"PreemptedBy={hi_id}" in show, (
+                    f"PreemptedBy not set on preempted job at cycle {i}:\n{show}"
+                )
+                assert "PreemptMode=Requeue" in show, (
+                    f"PreemptMode not set on preempted job at cycle {i}:\n{show}"
+                )
 
                 state = wait_job(cluster, hi_id, timeout=30)
                 assert state == "CD", f"high job {hi_id} did not complete: {state}"
@@ -95,6 +99,12 @@ class TestChronicPreemption:
             assert "Reason=JobHoldMaxRequeue" not in show, (
                 f"low-priority job held after {cycles} preemption cycles "
                 f"(max_batch_requeue={self.MAX_BATCH_REQUEUE}):\n{show}"
+            )
+
+            preempted = cluster.sdiag_jobs_preempted()
+            assert preempted == cycles, (
+                f"sdiag jobs_preempted expected {cycles} after {cycles} preemption "
+                f"cycles, got {preempted}"
             )
         finally:
             if low_id is not None:

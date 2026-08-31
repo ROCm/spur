@@ -10,6 +10,9 @@ use tracing::error;
 
 use spur_core::job::{JobId, JobState};
 
+use super::db::JobStartRecord;
+use super::txn::{TxnOutcome, TxnRecord};
+
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 // Bounds how long a single attempt can pin one of the pool's 8 connections.
@@ -51,21 +54,6 @@ where
     }
 }
 
-pub struct JobStartRecord {
-    pub job_id: JobId,
-    pub name: String,
-    pub user: String,
-    pub account: String,
-    pub partition: String,
-    pub num_nodes: u32,
-    pub num_tasks: u32,
-    pub cpus_per_task: u32,
-    pub memory_mb: u64,
-    pub submit_time: DateTime<Utc>,
-    pub start_time: DateTime<Utc>,
-    pub reservation: Option<String>,
-}
-
 pub struct AccountingNotifier {
     pool: PgPool,
 }
@@ -78,36 +66,10 @@ impl AccountingNotifier {
     pub fn notify_job_start(&self, record: JobStartRecord) {
         let pool = self.pool.clone();
         let job_id = record.job_id;
-        let name = record.name;
-        let user = record.user;
-        let account = record.account;
-        let partition = record.partition;
-        let num_nodes = record.num_nodes as i32;
-        let num_tasks = record.num_tasks as i32;
-        let cpus_per_task = record.cpus_per_task as i32;
-        let memory_mb = record.memory_mb as i64;
-        let submit_time = record.submit_time;
-        let start_time = record.start_time;
-        let reservation = record.reservation.unwrap_or_default();
         tokio::spawn(async move {
             let write = || async {
                 let mut conn = pool.acquire().await?;
-                super::db::record_job_start(
-                    &mut conn,
-                    job_id as i32,
-                    &name,
-                    &user,
-                    &account,
-                    &partition,
-                    num_nodes,
-                    num_tasks,
-                    cpus_per_task,
-                    memory_mb,
-                    submit_time,
-                    start_time,
-                    &reservation,
-                )
-                .await
+                super::db::record_job_start(&mut conn, &record).await
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job start in accounting after retries");
@@ -115,6 +77,7 @@ impl AccountingNotifier {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_job_end(
         &self,
         job_id: JobId,
@@ -123,6 +86,9 @@ impl AccountingNotifier {
         end_time: DateTime<Utc>,
         exit_signal: i32,
         derived_exit_code: i32,
+        preempted_by: Option<JobId>,
+        preempt_mode: Option<String>,
+        preempt_qos: Option<String>,
     ) {
         let pool = self.pool.clone();
         let state_str = state.display().to_owned();
@@ -131,17 +97,49 @@ impl AccountingNotifier {
                 let mut conn = pool.acquire().await?;
                 super::db::record_job_end(
                     &mut conn,
-                    job_id as i32,
+                    job_id,
                     &state_str,
                     exit_code,
                     end_time,
                     exit_signal,
                     derived_exit_code,
+                    preempted_by,
+                    preempt_mode.as_deref().unwrap_or(""),
+                    preempt_qos.as_deref().unwrap_or(""),
                 )
                 .await
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job end in accounting after retries");
+            }
+        });
+    }
+
+    /// Best-effort async write of an audit record. Only committed (`Success`)
+    /// rows retry; `Denied`/`Error` rows use a single attempt so a flood of
+    /// (cheaply-triggered, possibly unauthenticated) failed attempts cannot pin
+    /// the connection pool against real accounting writes.
+    pub fn notify_txn(&self, record: TxnRecord) {
+        let pool = self.pool.clone();
+        let attempts = if record.outcome == TxnOutcome::Success {
+            RETRY_ATTEMPTS
+        } else {
+            1
+        };
+        tokio::spawn(async move {
+            let write = || async {
+                let mut conn = pool.acquire().await?;
+                super::db::record_txn(&mut conn, &record).await
+            };
+            if let Err(e) = retry_with_backoff(write, attempts, RETRY_BACKOFF).await {
+                error!(
+                    actor = %record.actor,
+                    action = record.action.as_str(),
+                    entity = %record.entity_name,
+                    attempts,
+                    error = %e,
+                    "failed to record txn in accounting"
+                );
             }
         });
     }

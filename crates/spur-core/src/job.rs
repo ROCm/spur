@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use crate::burst_buffer::BbStageState;
@@ -297,6 +297,7 @@ pub enum PendingReason {
     QosGrpMemLimit,
     QosGrpNodeLimit,
     QosGrpGpuLimit,
+    QosGrpWallLimit,
     BurstBufferResources,
     BurstBufferStageIn,
     ReservedMaintenance,
@@ -316,7 +317,17 @@ pub enum PendingReason {
     AssocGrpMemLimit,
     AssocGrpGpuLimit,
     AssocMaxWallDurationPerJobLimit,
+
+    // Submit-count group limits (deny unconditionally at submission).
+    AssocGrpSubmitJobsLimit,
+    QosGrpSubmitJobsLimit,
+    QosMaxSubmitJobPerAccountLimit,
     K8sReserved,
+
+    /// Job was preempted and is now pending (requeue mode) or terminal (cancel mode).
+    /// Replaces `BeginTime` as the pending reason for preempted-requeued jobs so the
+    /// reason string is unambiguous.
+    Preempted,
 }
 
 impl PendingReason {
@@ -332,7 +343,10 @@ impl PendingReason {
     /// Any other reason on a held job is unrelated to the hold, so recomputing
     /// it loses nothing.
     pub fn explains_begin_hold(&self) -> bool {
-        matches!(self, Self::BeginTime | Self::JobLaunchFailure)
+        matches!(
+            self,
+            Self::BeginTime | Self::JobLaunchFailure | Self::Preempted
+        )
     }
 
     pub fn display(&self) -> &'static str {
@@ -379,6 +393,7 @@ impl PendingReason {
             Self::QosGrpMemLimit => "QOSGrpMemLimit",
             Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
             Self::QosGrpGpuLimit => "QOSGrpGRES",
+            Self::QosGrpWallLimit => "QOSGrpWallLimit",
             Self::BurstBufferResources => "BurstBufferResources",
             Self::BurstBufferStageIn => "BurstBufferStageIn",
             Self::ReservedMaintenance => "ReqNodeNotAvail, Reserved for maintenance",
@@ -395,7 +410,41 @@ impl PendingReason {
             Self::AssocGrpMemLimit => "AssocGrpMemLimit",
             Self::AssocGrpGpuLimit => "AssocGrpGRES",
             Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
+            Self::AssocGrpSubmitJobsLimit => "AssocGrpSubmitJobsLimit",
+            Self::QosGrpSubmitJobsLimit => "QOSGrpSubmitJobsLimit",
+            Self::QosMaxSubmitJobPerAccountLimit => "MaxSubmitJobsPerAccount",
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
+            Self::Preempted => "Preempted",
+        }
+    }
+
+    /// Human-readable explanation for a submit-time denial, shown alongside the
+    /// exact Slurm code (which `display()` yields for squeue scrapers). Reasons
+    /// outside the submit gate fall back to a generic phrase.
+    pub fn submit_denial_message(&self) -> &'static str {
+        match self {
+            Self::AssocMaxSubmitJobLimit => {
+                "you have reached the maximum submitted (pending + running) jobs for your association"
+            }
+            Self::AssocGrpSubmitJobsLimit => {
+                "your association has reached its aggregate submitted-jobs limit"
+            }
+            Self::AssocMaxWallDurationPerJobLimit => {
+                "the requested wall time exceeds your association's per-job limit"
+            }
+            Self::QosMaxSubmitJobPerUserLimit => {
+                "you have reached the QOS limit on submitted jobs per user"
+            }
+            Self::QosMaxSubmitJobPerAccountLimit => {
+                "your account has reached the QOS limit on submitted jobs per account"
+            }
+            Self::QosGrpSubmitJobsLimit => {
+                "the QOS has reached its aggregate submitted-jobs limit"
+            }
+            Self::QosMaxWallDurationPerJobLimit => {
+                "the requested wall time exceeds the QOS per-job limit"
+            }
+            _ => "the job exceeds a configured accounting or QOS limit",
         }
     }
 }
@@ -796,6 +845,26 @@ pub struct Job {
     /// Set when a job is evicted during PMIx bootstrap or partial dispatch.
     #[serde(default)]
     pub launch_failure_detail: Option<String>,
+
+    /// Job ID of the higher-priority job that caused this preemption. Set on
+    /// both cancel and requeue preemption; `None` for jobs never preempted.
+    #[serde(default)]
+    pub preempted_by: Option<JobId>,
+    /// How the preemption was carried out: `"Requeue"`, `"Cancel"`, or `"Suspend"`.
+    #[serde(default)]
+    pub preempt_mode: Option<String>,
+    /// QOS name of the preempting job, when `preempt_type = QosPriority` authorized
+    /// the preemption. `None` for plain priority-based preemption.
+    #[serde(default)]
+    pub preempt_qos: Option<String>,
+
+    /// Nodes the QOS/account grp-node admission check credited this job for
+    /// reusing (they had spare capacity), recomputed fresh every scheduling
+    /// pass. Consulted by `NodePlacement` as a nodelist fallback so placement
+    /// honors the assumption admission made. Never persisted: a same-pass hint
+    /// only, meaningless once the pass that computed it ends.
+    #[serde(skip)]
+    pub preferred_nodes: HashSet<String>,
 }
 
 impl Job {
@@ -846,6 +915,10 @@ impl Job {
             actual_stdout_path: None,
             actual_stderr_path: None,
             launch_failure_detail: None,
+            preempted_by: None,
+            preempt_mode: None,
+            preempt_qos: None,
+            preferred_nodes: HashSet::new(),
         }
     }
 
@@ -2142,6 +2215,7 @@ mod tests {
         (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
         (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
         (PendingReason::QosGrpGpuLimit, "QOSGrpGRES"),
+        (PendingReason::QosGrpWallLimit, "QOSGrpWallLimit"),
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
@@ -2169,6 +2243,18 @@ mod tests {
             PendingReason::AssocMaxWallDurationPerJobLimit,
             "AssocMaxWallDurationPerJobLimit",
         ),
+        (
+            PendingReason::AssocGrpSubmitJobsLimit,
+            "AssocGrpSubmitJobsLimit",
+        ),
+        (
+            PendingReason::QosGrpSubmitJobsLimit,
+            "QOSGrpSubmitJobsLimit",
+        ),
+        (
+            PendingReason::QosMaxSubmitJobPerAccountLimit,
+            "MaxSubmitJobsPerAccount",
+        ),
     ];
 
     #[test]
@@ -2180,12 +2266,38 @@ mod tests {
     }
 
     #[test]
+    fn submit_denial_message_is_human_readable_and_not_the_bare_code() {
+        // Submit-count reasons get a specific sentence, distinct from the
+        // machine-facing Slurm code.
+        let per_account = PendingReason::QosMaxSubmitJobPerAccountLimit;
+        assert_ne!(per_account.submit_denial_message(), per_account.display());
+        assert!(per_account
+            .submit_denial_message()
+            .contains("submitted jobs per account"));
+
+        // Reasons outside the submit gate fall back to a generic sentence.
+        assert_eq!(
+            PendingReason::BurstBufferResources.submit_denial_message(),
+            "the job exceeds a configured accounting or QOS limit"
+        );
+    }
+
+    #[test]
     fn reason_vocab_serde_roundtrips() {
         for (reason, _) in REASON_VOCAB {
             let json = serde_json::to_string(reason).expect("serialize reason");
             let back: PendingReason = serde_json::from_str(&json).expect("deserialize reason");
             assert_eq!(&back, reason, "serde roundtrip for {reason:?}");
         }
+    }
+
+    #[test]
+    fn preempted_reason_displays_correctly_and_explains_begin_hold() {
+        assert_eq!(PendingReason::Preempted.display(), "Preempted");
+        assert!(
+            PendingReason::Preempted.explains_begin_hold(),
+            "Preempted must be treated as a begin-time hold so it is not clobbered"
+        );
     }
 
     #[test]

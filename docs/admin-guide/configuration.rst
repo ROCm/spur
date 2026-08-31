@@ -189,8 +189,10 @@ and Raft high-availability topology.
      - integer
      - ``999999999``
      - Not implemented
-     - Intended as the job-ID wrap point. No code consumes it; the counter does
-       not wrap.
+     - Intended as the job-ID wrap point. No code consumes it. Job IDs are 32-bit
+       unsigned and stored as 64-bit in the accounting database, so ids above
+       ``i32::MAX`` are recorded correctly; the counter still wraps to zero past
+       ``u32::MAX`` and would re-issue ids that collide with existing rows.
    * - ``first_job_id``
      - integer
      - ``1``
@@ -295,6 +297,16 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Restart
      - How often (seconds) to refresh fairshare and QOS caches from the database.
        The interval is baked into the refresh loops when they are spawned.
+   * - ``grp_wall_window_days``
+     - integer
+     - ``14``
+     - Restart
+     - Trailing window over which a QOS's wall-clock consumption is measured for
+       the ``grpwall`` limit. Must be between ``1`` and ``3650``; a zero window
+       would measure nothing and silently stop every ``grpwall`` budget applying,
+       so it is rejected at startup. Independent of
+       ``scheduler.fairshare_halflife_days``: that fades usage for priority
+       scoring, this is a hard budget cutoff.
    * - ``default_qos``
      - string
      - ``""``
@@ -308,9 +320,24 @@ in-process inside ``spurctld`` (served on port 6817) — there is no separate
      - Live
      - Reject at submit any job that still has no QOS after the resolution chain.
        Mirrors Slurm's ``AccountingStorageEnforce=qos``.
+   * - ``require_association``
+     - bool
+     - ``false``
+     - Live
+     - Reject at submit any job whose user resolves to no account: no
+       ``--account`` given and no default account on file. Unconditional, like
+       ``require_qos``. Mirrors Slurm's ``AccountingStorageEnforce=associations``.
+   * - ``txn_retention_days``
+     - integer
+     - unset
+     - Restart
+     - Delete admin audit-log (``txn``) rows older than this many days. Unset (the
+       default) or ``0`` disables purging (rows kept forever, matching Slurm's
+       default purge-off behavior); a positive value enables it. See :doc:`accounting`.
 
 See :doc:`accounting` for how ``default_qos`` and ``require_qos`` interact with the
-per-job QOS resolution chain.
+per-job QOS resolution chain, and how ``require_association`` interacts with the
+per-job account resolution chain.
 
 ``[scheduler]``
 ---------------
@@ -363,7 +390,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        flat value. Prior to this release the setting was inert (never applied);
        it now takes effect, and its default changed from ``60`` to ``0`` so
        ``-t``-less jobs stay unbounded exactly as before. A site that had set it
-       expecting an effect will now see that effect.
+       expecting an effect will now see that effect. A job the partitions leave
+       unbounded still takes its QOS or association ``MaxWall`` when one is set —
+       see :ref:`maxwall-default`.
    * - ``enforce_part_limits``
      - string
      - ``NO``
@@ -433,10 +462,57 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``.
 
+.. note::
+
+   A pending job that needs more nodes than currently have free capacity is
+   re-evaluated every scheduling cycle, but does not hold a reservation on
+   any node while it waits. In practice this means: as soon as any node the
+   job could use becomes free, that capacity is available to any other
+   pending job that fits it right now — including one submitted after the
+   larger job and with lower priority. A large multi-node job can therefore
+   sit pending indefinitely behind a steady stream of smaller jobs, even
+   though it has higher priority than every one of them individually,
+   because none of them is ever compared against it directly; each is only
+   checked against whatever capacity is free at that moment.
+
+   The reliable way to guarantee a high-priority job is not indefinitely
+   delayed by lower-priority ones is preemption, not priority alone.
+   Priority only affects the order pending jobs are considered for
+   available capacity — it does not reclaim capacity already given to a
+   running job. Configure:
+
+   - A priority gap of more than 2× between the jobs that must run and the
+     jobs they need to be able to displace (via base ``--priority``, QOS
+     ``priority``, or a combination — see :doc:`accounting` for how the
+     effective priority gap is computed).
+   - ``preempt_type`` (and, if a running job should not simply be killed,
+     ``preemptmode=requeue`` or ``suspend`` on its QOS) so that gap actually
+     triggers preemption instead of only affecting scheduling order.
+
+   With both in place, a high-priority job that cannot find free capacity
+   will preempt a lower-priority running job holding the capacity it needs,
+   rather than waiting for it to finish on its own.
+
+.. note::
+
+   Backfill protection for a large multi-node job (holding a node against
+   smaller jobs until the job it's waiting on can start) is only as good as
+   the wall-time information available for the jobs already running. A job
+   with no wall-time is assumed to run for up to a year, but that number is
+   only a placeholder used to size the *reservation itself*; it is not
+   compared against how long an incoming job actually needs the node, so a
+   fully unbounded cluster gets little practical protection from this
+   mechanism — a large job can still be starved by a continuous stream of
+   equally unbounded smaller jobs. Setting ``default_time_limit_minutes``
+   (or a per-partition ``DefaultTime``/``MaxTime``) so jobs carry real
+   wall-time information makes backfill reservations meaningful. For a job
+   that must not be starved by anything wall-time can't bound, use
+   preemption (``preempt_type``, above) instead.
+
 ``[auth]``
 ----------
 
-Authentication plugin for client requests.
+How client requests are authenticated.
 
 .. list-table::
    :header-rows: 1
@@ -450,16 +526,28 @@ Authentication plugin for client requests.
    * - ``plugin``
      - string
      - ``"jwt"``
-     - Not implemented
-     - Intended to select an authentication plugin. No code reads it, and no
-       plugin is enforced regardless of its value — see the warning below.
+     - Restart
+     - Constrains startup only: ``"munge"`` and any unrecognised value are
+       rejected rather than silently ignored, and ``"none"`` with
+       ``mode = "required"`` is refused as contradictory. Nothing reads it
+       afterwards — whether a presented credential is verified is decided by
+       ``mode`` and ``jwt_key`` alone, so ``plugin = "none"`` does **not** turn
+       verification off.
+   * - ``mode``
+     - string
+     - ``"permissive"``
+     - Restart
+     - ``"disabled"`` ignores credentials entirely, even valid ones.
+       ``"permissive"`` verifies a credential that is presented — an invalid or
+       malformed one is always refused — but allows a request that carries none.
+       ``"required"`` refuses every request without a valid credential.
    * - ``jwt_key``
      - string
      - none
      - Restart
-     - Signing key for node admission tokens, given as a file path or inline
-       value. Deliberately not reloadable: swapping it live would immediately
-       invalidate every outstanding node token.
+     - Signing key for user credentials (``spur token user``) and node admission
+       tokens, given as a file path or inline value. Deliberately not reloadable:
+       swapping it live would immediately invalidate every outstanding token.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -468,19 +556,72 @@ Authentication plugin for client requests.
 
 .. warning::
 
-   ``[auth] plugin`` is inert. Setting it to ``"jwt"`` does **not** authenticate
-   RPCs — the controller accepts requests from anyone who can reach its gRPC port,
-   and ``spurctld`` warns about this at startup whenever it binds a non-loopback
-   address. Restrict access to the controller port at the network layer. See
-   :doc:`accounting` for how identity maps to accounts and admin rights.
+   Under the default ``mode = "permissive"``, a caller that presents no
+   credential is unauthenticated, and the username it asserts in the request is
+   taken at face value. Identity-dependent decisions — job ownership, reservation
+   management, job-info visibility — are then only as trustworthy as the network.
+   Set ``mode = "required"`` (with a ``jwt_key``) to make them enforceable, and
+   restrict the controller port at the network layer either way. ``spurctld``
+   warns at startup whenever it binds a non-loopback address without
+   ``required``.
 
 .. note::
 
-   ``jwt_key`` is used for node admission tokens (``[admission] mode = "token"``),
-   which is a separate mechanism from the unimplemented ``plugin`` field. When
-   ``jwt_key`` is unset, admission tokens are signed with a well-known built-in
-   key and are therefore forgeable; set an explicit key before enabling token
-   admission.
+   When ``jwt_key`` is unset, admission tokens are signed with a well-known
+   built-in key and are therefore forgeable; set an explicit key before enabling
+   token admission (``[admission] mode = "token"``).
+
+.. _privileged-operations:
+
+Privileged operations
+~~~~~~~~~~~~~~~~~~~~~
+
+The control-plane mutations that define cluster tenancy — partitions, node
+placement and labels, ``reconfigure``, admission tokens, reservations, and the
+accounting account/user/QOS records — require a **cluster admin**. A caller with
+a verified non-admin identity is refused with ``PermissionDenied``. A caller with
+*no* verified identity is allowed, so that ``disabled`` and credential-less
+``permissive`` deployments keep working; under ``mode = "required"`` every caller
+is authenticated, so the bar binds everyone.
+
+Admin means one of the following:
+
+* a credential minted with ``spur token user --admin``;
+* a credential for the user ``root``;
+* an accounting admin level of ``Admin`` (see :doc:`accounting`).
+
+Only the first counts for the accounting service's own mutations: it holds no
+association cache and does not special-case ``root``, so it accepts the token
+claim alone. The controller RPCs honour all three.
+
+Reservations are the one exception, and are stricter in two ways. An
+unidentified caller is **not** waved through, and membership of ``sudo`` or
+``wheel`` also qualifies. Creating, updating, or deleting a reservation is
+allowed when any of these holds:
+
+* the caller is a cluster admin, as above;
+* the caller resolves to UID 0 on the controller;
+* the caller is a member of the ``sudo`` or ``wheel`` group, as the controller's
+  own NSS resolves the name — so a site using LDAP or SSSD grants this by group
+  membership, and a controller with no shared user directory can only resolve
+  local accounts.
+
+Anyone else is refused, as is a name the controller cannot resolve at all — a
+caller it cannot vouch for is denied, not allowed. The rule mirrors the one the
+CLI applies locally before it ever connects, which is the point — a client that
+does not go through the CLI cannot skip it. The cost is that a ``sudo``/``wheel``
+operator must be resolvable *on the controller*, not only on the login node.
+
+Ownership is not part of this decision. The creator is recorded as ``Owner`` for
+attribution and shown by ``scontrol show reservation``, but any operator may
+update or delete any reservation, matching Slurm's operator semantics.
+
+.. warning::
+
+   Without a credential the controller can only check the username the client
+   asserted, so under ``permissive`` this stops an unprivileged client but not a
+   deliberately crafted request. ``mode = "required"`` is what makes it a
+   boundary, because there the name comes from the verified credential.
 
 ``[[partitions]]``
 ------------------
@@ -553,17 +694,39 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
    * - ``priority_tier``
      - integer
      - ``0``
-     - Partition priority tier; a higher tier preempts a lower one.
+     - Priority ranking for this partition. Jobs on a higher-tier partition are
+       treated as more urgent than jobs on a lower-tier partition, even if their
+       raw submitted priority is the same. This allows a "premium" partition to
+       bump jobs off a "standard" partition without the admin manually adjusting
+       job priorities. A job that spans multiple partitions inherits the highest
+       tier among them.
    * - ``preempt_mode``
      - string
      - ``"off"``
-     - Preemption mode: ``cancel``, ``requeue``, ``suspend``; anything else is off.
+     - What the scheduler does to a running job when a higher-priority job needs
+       its node.
+
+       ``"cancel"`` — the running job is stopped and removed from the queue.
+       ``"requeue"`` — the running job is stopped and put back in the queue;
+       it will start again automatically once a node is free.
+       ``"suspend"`` — the running job is paused (not stopped). It keeps its
+       node allocation and continues automatically once the higher-priority job
+       finishes. Because the node stays occupied, any other job that also needs
+       that node exclusively will have to wait until the paused job either
+       finishes or is cancelled.
+       ``"off"`` (default) — running jobs in this partition are never kicked
+       out. The scheduler will wait for a free slot instead of preempting.
+
+       A job's QOS can change what happens to *that specific job* when it is
+       kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
+       field is the on/off switch: preemption is only attempted at all when
+       this is set to something other than ``"off"``.
    * - ``preempt_exempt_time``
      - integer or null
      - ``null`` (inherit global)
      - Per-partition override for the minimum seconds a job must have been running
        before it is eligible for preemption. Overrides ``scheduler.preempt_exempt_time``
-       for jobs in this partition. Can be further overridden per-job by the QOS's
+       for jobs in this partition. Can be further overridden per-QOS by the QOS's
        ``preemptexempttime`` field. Can also be set at runtime without restart via
        ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
        use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
@@ -748,6 +911,43 @@ POSIX ``RLIMIT_*`` values ``spurd`` applies to job steps at launch.
 
    ``memlock = "unlimited"`` lets RDMA and NCCL workloads pin memory out of the box.
    Lower it only when a hard cap is required.
+
+``[cgroup]``
+------------
+
+How ``spurd`` enforces a job's cgroup limits. The limits themselves come from the
+allocation (``--mem``, ``--cpus-per-task``); this section only sets policy. The
+fields mirror ``ConstrainSwapSpace`` and ``AllowedSwapSpace`` in Slurm's
+``cgroup.conf``, including their defaults.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 10 12 54
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``constrain_swap_space``
+     - bool
+     - ``false``
+     - Cap a job's swap along with its memory. While ``false``, ``memory.max``
+       bounds resident memory only: on a node with swap, a job that outgrows
+       ``--mem`` keeps running on swap instead of being killed.
+   * - ``allowed_swap_space``
+     - integer
+     - ``0``
+     - Swap a job may use, as a percentage (0-100) of its memory allocation.
+       Only consulted when ``constrain_swap_space`` is set; ``0`` denies swap
+       outright. A value above 100 is rejected when spurd starts.
+
+.. note::
+
+   Enabling ``constrain_swap_space`` is what makes ``--mem`` a hard cap and lets a
+   runaway job be reported as ``OUT_OF_MEMORY`` rather than completing slowly on
+   swap. It is off by default because turning it on starts killing jobs that
+   previously survived by swapping. Both fields are read at ``spurd`` startup, so
+   changing them needs an agent restart.
 
 ``[mpi]``
 ---------

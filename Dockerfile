@@ -68,11 +68,11 @@ RUN if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \
         printf '%s\n' /usr/local/lib /usr/local/lib64 > /etc/ld.so.conf.d/openpmix.conf && \
         ldconfig && \
         rm -rf "/tmp/pmix-${OPENPMIX_VERSION}" && \
-        dnf clean all; \
-    fi && \
-    cd /build && \
-    PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
-    cargo build --release --locked -p spur-mpi-pmix
+        dnf clean all && \
+        cd /build && \
+        PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
+        cargo build --release --locked -p spur-mpi-pmix; \
+    fi
 
 RUN mkdir -p /dist/lib/spur && \
     if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \

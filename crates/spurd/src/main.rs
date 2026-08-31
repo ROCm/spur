@@ -17,11 +17,12 @@ mod seccomp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use spur_core::config::SlurmConfig;
+use spur_core::config::{ConfigError, SlurmConfig};
 use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
@@ -53,6 +54,16 @@ fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
              jobs will get at most the hard limit unless spurd runs as root"
         );
     }
+}
+
+/// Whether a best-effort config load failed only because no file exists at the default
+/// path, which is the expected shape for an agent configured entirely by flags.
+///
+/// Anything else — an explicitly requested path, or a file that is present but malformed,
+/// invalid, or unreadable — means settings the operator intended are being ignored, and
+/// has to stay visible.
+fn absent_optional_config(explicit_path: bool, err: &ConfigError) -> bool {
+    !explicit_path && matches!(err, ConfigError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Parse a "key=value" string into a validated label.
@@ -110,6 +121,19 @@ struct Args {
     log_level: String,
 }
 
+fn log_swap_status(swap: spur_core::config::SwapLimit) {
+    use spur_core::config::SwapLimit;
+    match swap {
+        SwapLimit::Unconstrained => info!(
+            "job swap unconstrained; --mem bounds resident memory only \
+             (see cgroup.constrain_swap_space)"
+        ),
+        SwapLimit::Percent(percent) => {
+            info!(allowed_swap_space = percent, "job swap constrained")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args_os()
@@ -120,7 +144,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    // Any source but the built-in default means the operator named this path themselves.
+    let explicit_config = matches.value_source("config") != Some(ValueSource::DefaultValue);
+    let args = Args::from_arg_matches(&matches)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -157,6 +184,10 @@ async fn main() -> anyhow::Result<()> {
             info!(path = %args.config.display(), "loaded spur.conf");
             Some(config)
         }
+        Err(e) if absent_optional_config(explicit_config, &e) => {
+            info!(path = %args.config.display(), "no spur.conf found, using default config");
+            None
+        }
         Err(e) => {
             warn!(
                 path = %args.config.display(),
@@ -167,6 +198,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
+
+    // WireGuard interface for mesh address/key/peers. Resolution: SPUR_WG_INTERFACE env >
+    // [network] wg_interface in spur.conf > "spur0", so a non-default conf name is honored.
+    let wg_iface = std::env::var("SPUR_WG_INTERFACE").ok().unwrap_or_else(|| {
+        config
+            .as_ref()
+            .map(|c| c.network.wg_interface.clone())
+            .unwrap_or_else(|| "spur0".into())
+    });
 
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(
@@ -226,9 +266,9 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         let detect_hostname = hostname.clone();
-        let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        let detect_iface = wg_iface.clone();
         tokio::task::spawn_blocking(move || {
-            spur_net::detect_node_address(&detect_hostname, listen_port, &wg_interface)
+            spur_net::detect_node_address(&detect_hostname, listen_port, &detect_iface)
         })
         .await
         .map_err(|e| anyhow::anyhow!("node address detection task failed: {e}"))?
@@ -266,9 +306,8 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // The WireGuard interface this node's mesh key is read from; the reporter re-reads the key on
-    // every register/heartbeat so the controller learns a key that appears/changes after startup.
-    let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+    // The reporter re-reads the mesh key from `wg_iface` (resolved above) each heartbeat, so a
+    // key that appears/changes after startup reaches the controller.
 
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.
@@ -297,11 +336,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
-    let memlock = match config.as_ref() {
-        Some(c) => c.rlimits.memlock_limit()?,
-        None => spur_core::config::MemlockLimit::Unlimited,
+    let limits = match config.as_ref() {
+        Some(c) => spur_core::config::JobLimits {
+            memlock: c.rlimits.memlock_limit()?,
+            swap: c.cgroup.swap_limit()?,
+        },
+        None => spur_core::config::JobLimits::default(),
     };
-    log_memlock_status(memlock);
+    log_memlock_status(limits.memlock);
+    log_swap_status(limits.swap);
     let cluster_config = config
         .as_ref()
         .map(|c| c.cluster.clone())
@@ -333,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
         hooks_config,
         registry.clone(),
         &cluster_config,
-        memlock,
+        limits,
         mpi_config,
         running_jobs,
         allow_root_jobs,
@@ -475,5 +518,38 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    #[test]
+    fn absent_config_at_default_path_is_expected() {
+        let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(absent_optional_config(false, &err));
+    }
+
+    #[test]
+    fn absent_config_at_explicit_path_is_reported() {
+        // A typo'd --config must not be silently ignored.
+        let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!absent_optional_config(true, &err));
+    }
+
+    #[test]
+    fn unreadable_config_is_reported_even_at_default_path() {
+        // Present but unreadable is a misconfiguration, not an absent file.
+        let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!absent_optional_config(false, &err));
+    }
+
+    #[test]
+    fn malformed_config_is_reported_even_at_default_path() {
+        let err = SlurmConfig::load_from_str("this is not toml").expect_err("must not parse");
+        assert!(!absent_optional_config(false, &err));
+    }
+
+    #[test]
+    fn invalid_config_is_reported_even_at_default_path() {
+        // Parses, then fails validation — settings the operator wrote are ignored.
+        let err = SlurmConfig::load_from_str("cluster_name = \"\"").expect_err("must not validate");
+        assert!(!absent_optional_config(false, &err));
     }
 }

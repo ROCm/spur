@@ -131,7 +131,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            0,
+            0,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
         assert_eq!(result, QosCheckResult::Allowed);
     }
 
@@ -154,7 +162,15 @@ mod tests {
             },
         );
         // User already has 2 running
-        let result = check_qos_limits(&job, &qos, 2, 2, &TresRecord::new(), &TresRecord::new());
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            2,
+            2,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser)
@@ -180,7 +196,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            0,
+            0,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
         // QOS wall-clock cap uses the QOS-specific reason, not PartitionTimeLimit.
         assert_eq!(
             result,
@@ -210,7 +234,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            0,
+            0,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
         // QOS MaxTRES (CPU) cap uses the specific QOS reason, not generic Resources.
         assert_eq!(
             result,

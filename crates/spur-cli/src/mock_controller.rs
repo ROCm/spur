@@ -8,9 +8,9 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every other RPC
-//! reports `unimplemented` so an unexpected call fails loudly instead of
-//! silently returning a default.
+//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
+//! other RPC reports `unimplemented` so an unexpected call fails loudly instead
+//! of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -35,6 +35,7 @@ pub(crate) struct StepCapture {
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
     get_node_names: Arc<Mutex<Vec<String>>>,
+    get_node_requests: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
     drain_node_names: Arc<Mutex<Vec<String>>>,
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
@@ -60,6 +61,11 @@ impl StepCapture {
 
     pub(crate) fn set_get_node_names(&self, names: Vec<String>) {
         *self.get_node_names.lock().unwrap() = names;
+    }
+
+    /// Node names asked for by `GetNode`, in call order.
+    pub(crate) fn get_node_requests(&self) -> Vec<String> {
+        self.get_node_requests.lock().unwrap().clone()
     }
 
     pub(crate) fn update_node_names(&self) -> Vec<String> {
@@ -150,6 +156,18 @@ mock_controller_impl! {
             Ok(tonic::Response::new(()))
         }
 
+        /// Records the name, then reports `NotFound`. A caller treats a failed
+        /// lookup as "node unreachable" and stops there, which keeps tests off
+        /// the network instead of dialling an agent that is not running.
+        async fn get_node(
+            &self,
+            request: tonic::Request<proto::GetNodeRequest>,
+        ) -> Result<tonic::Response<proto::NodeInfo>, tonic::Status> {
+            let name = request.into_inner().name;
+            self.capture.get_node_requests.lock().unwrap().push(name.clone());
+            Err(tonic::Status::not_found(format!("node {name} not found")))
+        }
+
         async fn get_nodes(
             &self,
             _request: tonic::Request<proto::GetNodesRequest>,
@@ -204,7 +222,6 @@ mock_controller_impl! {
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
         requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
-        get_node(proto::GetNodeRequest) -> proto::NodeInfo;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         create_partition(proto::CreatePartitionRequest) -> ();

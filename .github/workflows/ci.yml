@@ -5,7 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Explicit types (default is opened/synchronize/reopened) so that marking a
+    # draft PR "ready for review" re-runs CI, which in turn re-fires e2e.yml's
+    # workflow_run trigger — the only way E2E's no-e2e-on-draft skip check
+    # re-evaluates without a new commit.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,6 +71,21 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --exclude spur-ffi --all-targets --locked
+
+  flake8:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install flake8 and test dependencies
+        run: pip install flake8 -r tests/requirements.txt
+
+      - name: Lint pytest e2e suite
+        run: flake8 --config tests/.flake8 tests/
 
   build:
     runs-on: ubuntu-latest
@@ -203,11 +227,28 @@ jobs:
   build-docker-image:
     name: Build Docker Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Registry cache avoids the 10 GB Actions cache budget shared with the cargo jobs; writes are gated to main so PRs read-only.
+      - name: Compute build cache ref
+        id: cacheref
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "ref=ghcr.io/${owner}/spur-build-cache:ci" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         uses: docker/build-push-action@v7
@@ -218,8 +259,8 @@ jobs:
           push: false
           tags: spur:ci
           outputs: type=docker,dest=/tmp/spur-image.tar
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ steps.cacheref.outputs.ref }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0},mode=max,ignore-error=true', steps.cacheref.outputs.ref) || '' }}
 
       - name: Upload Docker image
         uses: actions/upload-artifact@v7
@@ -291,7 +332,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4.37.7
+        uses: github/codeql-action/upload-sarif@v4.37.8
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
@@ -319,7 +360,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4.37.7
+        uses: github/codeql-action/upload-sarif@v4.37.8
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config

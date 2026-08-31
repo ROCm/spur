@@ -69,6 +69,13 @@ All tests are self-contained. No external services needed (no database, no netwo
 
    The E2E suites do not support parallel test execution. Do not use ``pytest-xdist``.
 
+The E2E suites are linted with `flake8 <https://flake8.pycqa.org/>`_, enforced in CI. Run it locally before opening a PR:
+
+.. code-block:: bash
+
+   pip install flake8
+   cd tests && flake8 .
+
 End-to-End Tests (Native-Host)
 ------------------------------
 
@@ -155,6 +162,46 @@ If you do **not** set ``SPUR_TEST_REMOTE_BIN_DIR``, binaries go into an ephemera
    # On each node (persists across reboots):
    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
    echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/99-spur-userns.conf
+
+Running on Localhost (single-node quickstart)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No separate hardware is needed. The test framework SSHes to ``localhost``; the
+controller, agent, and (for accounting tests) a Postgres container all run on
+the same machine. Requires Docker for accounting tests.
+
+.. code-block:: bash
+
+   # 1. Install dependencies
+   sudo apt-get install -y openssh-server
+   pip install paramiko tomli-w pytest pytest-timeout
+
+   # 2. Generate an SSH keypair and authorise it for the current user
+   ssh-keygen -t rsa -f /tmp/e2e_id_rsa -N ""
+   cat /tmp/e2e_id_rsa.pub >> ~/.ssh/authorized_keys
+   chmod 600 ~/.ssh/authorized_keys
+
+   # 3. Start sshd (allow root login if running as root)
+   echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
+   sudo ssh-keygen -A          # generate host keys if missing
+   sudo /usr/sbin/sshd
+
+   # 4. Build release binaries
+   cargo build --release
+
+   # 5. Run the e2e tests
+   cd tests/native_host/e2e
+   SPUR_TEST_NODES=localhost \
+   SPUR_TEST_SSH_USER=$(whoami) \
+   SPUR_TEST_SSH_KEY=/tmp/e2e_id_rsa \
+   SPUR_TEST_BINARIES_DIR=$(git rev-parse --show-toplevel)/target/release \
+   pytest test_preemption_qos_hierarchy.py -v
+
+.. note::
+
+   If running as root, add ``"auth": {"allow_root_jobs": True}`` to the
+   ``cluster_config_overrides`` fixture in your test class, or jobs will be
+   rejected by ``spurd`` (root job execution is off by default).
 
 Running the Tests
 ~~~~~~~~~~~~~~~~~

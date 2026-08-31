@@ -7,3 +7,5 @@ pub mod node_match;
 pub mod priority;
 pub mod timeline;
 pub mod traits;
+
+pub use timeline::UNLIMITED_JOB_DURATION;

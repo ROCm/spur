@@ -1,11 +1,16 @@
 # Sets E2E commit statuses to pending as soon as a PR is opened or updated.
 # Uses pull_request_target so fork PRs get write access to the Status API.
 # Never checks out or executes fork code — only reads e2e.yml from the base branch.
+#
+# ready_for_review is included so a stale terminal status (e.g. "success:
+# skipped" from no-e2e-on-draft) is visibly reset to pending the moment a
+# draft PR is marked ready, rather than sitting stale until the CI re-run
+# triggered by ci.yml's matching ready_for_review type completes.
 name: Set E2E Pending
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   statuses: write

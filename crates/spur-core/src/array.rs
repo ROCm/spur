@@ -122,10 +122,23 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
             if start > end {
                 return Err(ArrayError::InvalidSpec(format!("{} > {}", start, end)));
             }
+
+            // Bound element count BEFORE materializing (u64 avoids overflow in the count itself).
+            let count = (end as u64 - start as u64) / step as u64 + 1;
+            if task_ids.len() as u64 + count > MAX_ARRAY_SIZE as u64 {
+                return Err(ArrayError::TooLarge {
+                    count: (task_ids.len() as u64 + count) as usize,
+                    max: MAX_ARRAY_SIZE,
+                });
+            }
+
             let mut i = start;
             while i <= end {
                 task_ids.push(i);
-                i += step;
+                match i.checked_add(step) {
+                    Some(n) => i = n,
+                    None => break, // reached top of u32 range
+                }
             }
         } else {
             let id: u32 = range_str
@@ -304,5 +317,25 @@ mod tests {
             aggregate_array_state(&[JobState::OutOfMemory, JobState::Failed]),
             Some(JobState::OutOfMemory)
         );
+    }
+
+    #[test]
+    fn rejects_range_overflow_at_u32_max() {
+        let spec = parse_array_spec("4294967293-4294967295:2").unwrap();
+        assert_eq!(spec.task_ids, vec![4294967293, 4294967295]);
+    }
+
+    #[test]
+    fn rejects_oversized_range_before_alloc() {
+        assert!(matches!(
+            parse_array_spec("0-4000000000"),
+            Err(ArrayError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn max_size_boundary_unchanged() {
+        assert!(parse_array_spec("0-99999").is_ok());
+        assert!(parse_array_spec("0-100000").is_err());
     }
 }

@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::format_engine;
+use crate::timearg::{datetime_to_proto, parse_time_arg};
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::*;
 
@@ -27,6 +28,34 @@ pub struct SacctmgrArgs {
     /// Immediate mode (no confirmation)
     #[arg(short = 'i', long, global = true)]
     pub immediate: bool,
+
+    /// Omit the header line
+    #[arg(short = 'n', long, global = true)]
+    pub noheader: bool,
+
+    /// Output '|' delimited with a trailing '|'
+    #[arg(short = 'p', long, global = true)]
+    pub parsable: bool,
+
+    /// Output '|' delimited without a trailing '|'
+    #[arg(short = 'P', long, global = true)]
+    pub parsable2: bool,
+}
+
+impl SacctmgrArgs {
+    /// Slurm takes whichever delimiter flag came last; clap's derive cannot see flag order,
+    /// so `-P` wins when both are given rather than rejecting input Slurm accepts.
+    fn output_style(&self) -> format_engine::OutputStyle {
+        let layout = if self.parsable2 {
+            format_engine::RowLayout::Delimited
+        } else if self.parsable {
+            format_engine::RowLayout::DelimitedTrailing
+        } else {
+            format_engine::RowLayout::Aligned
+        };
+
+        format_engine::OutputStyle::new(self.noheader, layout)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -35,40 +64,32 @@ pub enum SacctmgrCommand {
     Add {
         /// Entity type: account, user, qos
         entity: String,
-        /// key=value pairs
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` pairs; a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// Delete entities
     Delete {
         /// Entity type: account, user, qos
         entity: String,
-        /// key=value pairs (name= or where clause)
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` pairs (name= or where clause); a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// Modify entities
     Modify {
         /// Entity type: account, user, qos
         entity: String,
-        /// key=value pairs
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` pairs; a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// List/show entities
     Show {
         /// Entity type: account, user, qos, association
         entity: String,
-        /// Optional filter
-        #[arg(trailing_var_arg = true)]
+        /// Optional `key=value` filters; a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// List entities (alias for show)
-    List {
-        entity: String,
-        #[arg(trailing_var_arg = true)]
-        params: Vec<String>,
-    },
+    List { entity: String, params: Vec<String> },
 }
 
 pub async fn main() -> Result<()> {
@@ -78,13 +99,14 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SacctmgrArgs::try_parse_from(&args)?;
     let addr = args.controller.clone();
+    let style = args.output_style();
 
     match args.command {
         SacctmgrCommand::Add { entity, params } => add(&entity, &params, &addr).await,
         SacctmgrCommand::Delete { entity, params } => delete(&entity, &params, &addr).await,
         SacctmgrCommand::Modify { entity, params } => modify(&entity, &params, &addr).await,
         SacctmgrCommand::Show { entity, params } | SacctmgrCommand::List { entity, params } => {
-            show(&entity, &params, &addr).await
+            show(&entity, &params, &addr, style).await
         }
     }
 }
@@ -125,9 +147,15 @@ const QOS_KEYS: &[&str] = &[
     "maxwall",
     "maxtresperjob",
     "maxsubmitjobsperuser",
+    "maxsubmitjobsperaccount",
+    "maxsubmitpa",
+    "maxsubmitjobspa",
+    "grpsubmit",
+    "grpsubmitjobs",
     "maxtresperuser",
     "grptres",
     "grpwall",
+    "flags",
 ];
 
 /// Input keys the `add`/`modify user` handlers read (names + aliases). Gates
@@ -143,6 +171,8 @@ const USER_KEYS: &[&str] = &[
     "maxrunningjobs",
     "maxjobs",
     "maxsubmitjobs",
+    "grpsubmit",
+    "grpsubmitjobs",
     "maxtresperjob",
     "grptres",
     "maxwall",
@@ -187,18 +217,37 @@ async fn connect(addr: &str) -> Result<SlurmAccountingClient<crate::authclient::
     Ok(spur_proto::accounting_client(channel))
 }
 
-/// Parse a numeric limit value where `0` is a keyword meaning "no limit".
-/// Fails loudly instead of silently defaulting to `0` so a typo or
-/// out-of-range value never accidentally lifts a limit.
+/// Parse a numeric limit value. `-1` is Slurm's keyword for "no limit" and maps
+/// to the INFINITE sentinel (clears the stored limit); `0` is a literal value
+/// meaning "block all". Any other negative, or a value at/above INFINITE, is
+/// rejected. Fails loudly instead of silently defaulting so a typo never
+/// accidentally lifts or sets a limit.
 fn parse_limit(key: &str, val: &str) -> Result<u32> {
-    val.parse()
-        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+    let n: i64 = val
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))?;
+    if n == -1 {
+        return Ok(spur_core::accounting::INFINITE);
+    }
+    if n < 0 || n >= spur_core::accounting::INFINITE as i64 {
+        bail!("invalid value for {key}=: '{val}'");
+    }
+    Ok(n as u32)
 }
 
 /// Same as `parse_limit`, but for wall-time fields that also accept Slurm's
-/// `d-hh:mm:ss`/`hh:mm:ss` duration syntax (see `parse_wall_time`).
+/// `d-hh:mm:ss`/`hh:mm:ss` duration syntax (see `parse_wall_time`). `-1` clears
+/// the limit (INFINITE sentinel).
 fn parse_wall_limit(key: &str, val: &str) -> Result<u32> {
-    parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+    if val == "-1" {
+        return Ok(spur_core::accounting::INFINITE);
+    }
+    let minutes =
+        parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))?;
+    if minutes == spur_core::accounting::INFINITE {
+        bail!("invalid value for {key}=: '{val}'");
+    }
+    Ok(minutes)
 }
 
 /// Parse a floating-point field (e.g. `fairshare=`/`usagefactor=`), failing
@@ -254,6 +303,7 @@ struct UserUpsertFields {
     allowed_qos: String,
     max_running_jobs: u32,
     max_submit_jobs: u32,
+    grp_submit_jobs: u32,
     max_tres_per_job: String,
     grp_tres: String,
     max_wall_minutes: u32,
@@ -308,21 +358,28 @@ fn build_add_user_request(
     {
         bail!("defaultqos={default_qos} must be included in qos={allowed_qos}");
     }
+    // An unset numeric limit sends INFINITE (clear/no-limit) on `add`; a literal
+    // 0 would mean "block all" under the sentinel semantics.
+    let no_limit = spur_core::accounting::INFINITE;
     let max_running_jobs: u32 = find_alias(p, &["maxrunningjobs", "maxjobs"])
         .map(|(k, v)| parse_limit(k, v))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(no_limit);
     let max_submit_jobs: u32 = p
         .get("maxsubmitjobs")
         .map(|v| parse_limit("maxsubmitjobs", v))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(no_limit);
+    let grp_submit_jobs: u32 = find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+        .map(|(k, v)| parse_limit(k, v))
+        .transpose()?
+        .unwrap_or(no_limit);
     let max_tres_per_job = p.get("maxtresperjob").cloned().unwrap_or_default();
     let grp_tres = p.get("grptres").cloned().unwrap_or_default();
     let max_wall_minutes: u32 = find_alias(p, &["maxwall", "maxwallduration"])
         .map(|(k, v)| parse_wall_limit(k, v))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(no_limit);
 
     Ok(UserUpsertFields {
         name,
@@ -332,6 +389,7 @@ fn build_add_user_request(
         allowed_qos,
         max_running_jobs,
         max_submit_jobs,
+        grp_submit_jobs,
         max_tres_per_job,
         grp_tres,
         max_wall_minutes,
@@ -368,7 +426,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let max_jobs: u32 = find_alias(&p, &["maxrunningjobs", "maxjobs"])
                 .map(|(k, v)| parse_limit(k, v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(spur_core::accounting::INFINITE);
             let grp_tres = p.get("grptres").cloned().unwrap_or_default();
 
             let mut client = connect(addr).await?;
@@ -412,6 +470,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     allowed_qos: Some(fields.allowed_qos.clone()),
                     max_running_jobs: Some(fields.max_running_jobs),
                     max_submit_jobs: Some(fields.max_submit_jobs),
+                    grp_submit_jobs: Some(fields.grp_submit_jobs),
                     max_tres_per_job: Some(fields.max_tres_per_job.clone()),
                     grp_tres: Some(fields.grp_tres.clone()),
                     max_wall_minutes: Some(fields.max_wall_minutes),
@@ -429,13 +488,17 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             if !fields.default_qos.is_empty() {
                 println!("  DefQOS     = {}", fields.default_qos);
             }
-            if fields.max_running_jobs > 0 {
+            let unset = spur_core::accounting::INFINITE;
+            if fields.max_running_jobs != unset {
                 println!("  MaxJobs    = {}", fields.max_running_jobs);
             }
-            if fields.max_submit_jobs > 0 {
+            if fields.max_submit_jobs != unset {
                 println!("  MaxSubmit  = {}", fields.max_submit_jobs);
             }
-            if fields.max_wall_minutes > 0 {
+            if fields.grp_submit_jobs != unset {
+                println!("  GrpSubmit  = {}", fields.grp_submit_jobs);
+            }
+            if fields.max_wall_minutes != unset {
                 println!("  MaxWall    = {} min", fields.max_wall_minutes);
             }
             if !fields.max_tres_per_job.is_empty() {
@@ -463,21 +526,22 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .get("usagefactor")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0);
+            let no_limit = spur_core::accounting::INFINITE;
             let max_jobs: u32 = find_alias(&p, &["maxjobsperuser", "maxjobspu"])
                 .map(|(k, v)| parse_limit(k, v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(no_limit);
             let max_wall: u32 = p
                 .get("maxwall")
                 .map(|v| parse_wall_limit("maxwall", v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(no_limit);
             let max_tres = p.get("maxtresperjob").cloned().unwrap_or_default();
             let grp_wall: u32 = p
                 .get("grpwall")
                 .map(|v| parse_wall_limit("grpwall", v))
                 .transpose()?
-                .unwrap_or(0);
+                .unwrap_or(no_limit);
 
             let mut client = connect(addr).await?;
             client
@@ -495,7 +559,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         p.get("maxsubmitjobsperuser")
                             .map(|v| parse_limit("maxsubmitjobsperuser", v))
                             .transpose()?
-                            .unwrap_or(0),
+                            .unwrap_or(no_limit),
                     ),
                     max_tres_per_user: Some(p.get("maxtresperuser").cloned().unwrap_or_default()),
                     grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
@@ -505,6 +569,22 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|v| parse_u32("preemptexempttime", v))
                         .transpose()?,
                     clear_preempt_exempt_time: false,
+                    max_submit_jobs_per_account: Some(
+                        find_alias(
+                            &p,
+                            &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
+                        )
+                        .map(|(k, v)| parse_limit(k, v))
+                        .transpose()?
+                        .unwrap_or(no_limit),
+                    ),
+                    grp_submit_jobs: Some(
+                        find_alias(&p, &["grpsubmit", "grpsubmitjobs"])
+                            .map(|(k, v)| parse_limit(k, v))
+                            .transpose()?
+                            .unwrap_or(no_limit),
+                    ),
+                    flags: Some(p.get("flags").cloned().unwrap_or_default()),
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -513,10 +593,10 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 " Adding QOS(s)\n  Name       = {}\n  Priority   = {}\n  Preempt    = {}",
                 name, priority, preempt
             );
-            if max_wall > 0 {
+            if max_wall != no_limit {
                 println!("  MaxWall    = {} min", max_wall);
             }
-            if max_jobs > 0 {
+            if max_jobs != no_limit {
                 println!("  MaxJobsPU  = {}", max_jobs);
             }
             println!(" QOS added.");
@@ -676,6 +756,16 @@ fn build_modify_qos_request(
             .get("clearpreemptexempttime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
+        max_submit_jobs_per_account: find_alias(
+            p,
+            &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
+        )
+        .map(|(k, v)| parse_limit(k, v))
+        .transpose()?,
+        grp_submit_jobs: find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+            .map(|(k, v)| parse_limit(k, v))
+            .transpose()?,
+        flags: p.get("flags").cloned(),
     })
 }
 
@@ -713,6 +803,9 @@ fn build_modify_user_request(
         max_submit_jobs: p
             .get("maxsubmitjobs")
             .map(|v| parse_limit("maxsubmitjobs", v))
+            .transpose()?,
+        grp_submit_jobs: find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+            .map(|(k, v)| parse_limit(k, v))
             .transpose()?,
         max_tres_per_job: p.get("maxtresperjob").cloned(),
         grp_tres: p.get("grptres").cloned(),
@@ -765,10 +858,34 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
-async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
-    let p = parse_params(params);
+/// Entities `show` prints as hardcoded fixed-width tables, with no field-spec table behind
+/// them. A new entity rendered that way belongs here.
+const FIXED_WIDTH_ENTITIES: [&str; 5] = ["user", "users", "association", "associations", "tres"];
 
-    match entity.to_lowercase().as_str() {
+/// Delimiting a fixed-width table hands a script padded text it cannot parse, so refuse it.
+/// Unknown entities fall through to `show`, which reports them itself.
+fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle) -> Result<()> {
+    if !style.is_delimited() || !FIXED_WIDTH_ENTITIES.contains(&entity) {
+        return Ok(());
+    }
+
+    bail!(
+        "sacctmgr: delimited output (-p/-P) is not supported for '{entity}'. \
+         Supported entities: account, qos, txn"
+    )
+}
+
+async fn show(
+    entity: &str,
+    params: &[String],
+    addr: &str,
+    style: format_engine::OutputStyle,
+) -> Result<()> {
+    let p = parse_params(params);
+    let entity = entity.to_lowercase();
+    reject_unsupported_delimiter(&entity, style)?;
+
+    match entity.as_str() {
         "account" | "accounts" => {
             let fields = account_format_fields(p.get("format").map(String::as_str))?;
 
@@ -780,12 +897,12 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let accounts = resp.into_inner().accounts;
 
-            format_engine::print_header(&fields);
+            style.print_header(&fields);
 
             for a in &accounts {
                 println!(
                     "{}",
-                    format_engine::format_row(&fields, &|spec| resolve_account_field(a, spec))
+                    style.row(&fields, &|spec| resolve_account_field(a, spec))
                 );
             }
             Ok(())
@@ -804,22 +921,13 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let users = resp.into_inner().users;
 
-            println!(
-                "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15}",
-                "User", "Account", "Admin", "Default Acct", "QOS", "Def QOS"
-            );
-            println!("{}", "-".repeat(95));
+            if style.shows_header() {
+                println!("{}", user_header_row());
+                println!("{}", "-".repeat(180));
+            }
 
             for u in &users {
-                println!(
-                    "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15}",
-                    u.name,
-                    u.account,
-                    u.admin_level,
-                    u.default_account,
-                    u.allowed_qos,
-                    u.default_qos,
-                );
+                println!("{}", format_user_row(u));
             }
             Ok(())
         }
@@ -847,7 +955,7 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 filter_qos_by_name(&mut qos_list, name_filter);
             }
 
-            format_engine::print_header(&fields);
+            style.print_header(&fields);
 
             if qos_list.is_empty() && !has_name_filter {
                 let default_qos = QosInfo {
@@ -858,32 +966,30 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 };
                 println!(
                     "{}",
-                    format_engine::format_row(&fields, &|spec| resolve_qos_field(
-                        &default_qos,
-                        spec
-                    ))
+                    style.row(&fields, &|spec| resolve_qos_field(&default_qos, spec))
                 );
             } else {
                 for q in &qos_list {
-                    println!(
-                        "{}",
-                        format_engine::format_row(&fields, &|spec| resolve_qos_field(q, spec))
-                    );
+                    println!("{}", style.row(&fields, &|spec| resolve_qos_field(q, spec)));
                 }
             }
             Ok(())
         }
         "association" | "associations" => {
-            println!(
-                "{:<15} {:<20} {:<15} {:<10} {:<10}",
-                "User", "Account", "Partition", "Share", "Default"
-            );
-            println!("{}", "-".repeat(70));
+            if style.shows_header() {
+                println!(
+                    "{:<15} {:<20} {:<15} {:<10} {:<10}",
+                    "User", "Account", "Partition", "Share", "Default"
+                );
+                println!("{}", "-".repeat(70));
+            }
             Ok(())
         }
         "tres" => {
-            println!("{:<5} {:<15} {:<10}", "ID", "Type", "Name");
-            println!("{}", "-".repeat(30));
+            if style.shows_header() {
+                println!("{:<5} {:<15} {:<10}", "ID", "Type", "Name");
+                println!("{}", "-".repeat(30));
+            }
             println!("{:<5} {:<15} {:<10}", "1", "cpu", "");
             println!("{:<5} {:<15} {:<10}", "2", "mem", "");
             println!("{:<5} {:<15} {:<10}", "3", "energy", "");
@@ -892,8 +998,26 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             println!("{:<5} {:<15} {:<10}", "1002", "billing", "");
             Ok(())
         }
+        "txn" | "transaction" | "transactions" => {
+            let fields = txn_format_fields(p.get("format").map(String::as_str))?;
+            let request = build_txn_request(&p);
+
+            let mut client = connect(addr).await?;
+            let txns = client
+                .get_transactions(request)
+                .await
+                .context("GetTransactions RPC failed")?
+                .into_inner()
+                .transactions;
+
+            style.print_header(&fields);
+            for t in &txns {
+                println!("{}", style.row(&fields, &|spec| resolve_txn_field(t, spec)));
+            }
+            Ok(())
+        }
         other => bail!(
-            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres",
+            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres, txn",
             other
         ),
     }
@@ -902,6 +1026,128 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
     let names: Vec<&str> = filter.split(',').map(str::trim).collect();
     qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+}
+
+// Slurm's default `sacctmgr show transaction` columns: Time, Action, Actor,
+// Where, Info. Where renders entity_type:entity_name; Info renders details JSON.
+const TXN_DEFAULT_FORMAT: &str = "%-20t %-8a %-14A %-24w %-40i";
+const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-24w %-10o %-8u %-40i";
+
+fn txn_header(spec: char) -> &'static str {
+    match spec {
+        't' => "Time",
+        'a' => "Action",
+        'A' => "Actor",
+        'w' => "Where",
+        'i' => "Info",
+        'o' => "Outcome",
+        'v' => "Verified",
+        's' => "Source",
+        'd' => "ID",
+        'u' => "ActorUID",
+        _ => "?",
+    }
+}
+
+fn txn_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "time" | "timestamp" | "ts" => Some('t'),
+        "action" => Some('a'),
+        "actor" => Some('A'),
+        "where" | "entity" => Some('w'),
+        "info" | "details" => Some('i'),
+        "outcome" => Some('o'),
+        "verified" => Some('v'),
+        "source" => Some('s'),
+        "id" => Some('d'),
+        "actoruid" | "uid" => Some('u'),
+        _ => None,
+    }
+}
+
+fn txn_format_fields(
+    format_param: Option<&str>,
+) -> anyhow::Result<Vec<format_engine::FormatToken>> {
+    format_engine::resolve_format(
+        format_param,
+        TXN_DEFAULT_FORMAT,
+        TXN_ALL_FORMAT,
+        &txn_field_spec,
+        &txn_header,
+        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID",
+    )
+}
+
+/// Build a `GetTransactions` request from Slurm-style `key=value` filters
+/// (`Actor=`, `Action=`, `Entity=`, `Name=`, `Outcome=`, `Start=`, `End=`,
+/// `limit=`). `action`/`outcome` are lowercased to match the stored values.
+fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransactionsRequest {
+    GetTransactionsRequest {
+        actor: p.get("actor").cloned().unwrap_or_default(),
+        entity_type: p
+            .get("entity")
+            .or_else(|| p.get("entitytype"))
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        entity_name: p
+            .get("name")
+            .or_else(|| p.get("entityname"))
+            .cloned()
+            .unwrap_or_default(),
+        action: p
+            .get("action")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        outcome: p
+            .get("outcome")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        start_after: p
+            .get("start")
+            .and_then(|s| parse_time_arg(s))
+            .map(datetime_to_proto),
+        start_before: p
+            .get("end")
+            .and_then(|s| parse_time_arg(s))
+            .map(datetime_to_proto),
+        limit: p.get("limit").and_then(|s| s.parse().ok()).unwrap_or(0),
+    }
+}
+
+fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
+    match spec {
+        't' => t.timestamp.as_ref().map(fmt_txn_ts).unwrap_or_default(),
+        'a' => t.action.clone(),
+        'A' => t.actor.clone(),
+        'w' => format!("{}:{}", t.entity_type, t.entity_name),
+        'i' => t.details.clone(),
+        'o' => t.outcome.clone(),
+        'v' => if t.verified { "yes" } else { "no" }.to_string(),
+        's' => t.source.clone(),
+        'd' => t.id.to_string(),
+        // uid is recorded only for a verified identity; render blank otherwise so
+        // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
+        'u' => {
+            if t.verified {
+                t.actor_uid.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => "?".to_string(),
+    }
+}
+
+fn fmt_txn_ts(ts: &prost_types::Timestamp) -> String {
+    // Sanitize nanos (never displayed) so a negative/out-of-range value can't wrap
+    // via `as u32` and blank an otherwise-valid timestamp.
+    let nanos = u32::try_from(ts.nanos)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)
+        .unwrap_or(0);
+    chrono::DateTime::from_timestamp(ts.seconds, nanos)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_default()
 }
 
 const ACCOUNT_DEFAULT_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G";
@@ -949,13 +1195,60 @@ fn account_format_fields(
     )
 }
 
-/// Render a numeric limit, blank when zero (Slurm shows "unlimited" as an empty cell).
+/// Render a numeric limit, blank when unset/unlimited (the INFINITE sentinel);
+/// Slurm shows "no limit" as an empty cell. A literal 0 renders as "0".
+fn blank_if_unset(v: u32) -> String {
+    if v == spur_core::accounting::INFINITE {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Render a numeric value, blank when zero. Used for `preempt_exempt_time`,
+/// whose absence is carried as `None` (not the `INFINITE` sentinel).
 fn blank_if_zero(v: u32) -> String {
     if v == 0 {
         String::new()
     } else {
         v.to_string()
     }
+}
+
+fn user_header_row() -> String {
+    format!(
+        "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15} {:<10} {:<10} {:<10} {:<10} {:<16} {:<16}",
+        "User",
+        "Account",
+        "Admin",
+        "Default Acct",
+        "QOS",
+        "Def QOS",
+        "MaxJobs",
+        "MaxSubmit",
+        "GrpSubmit",
+        "MaxWall",
+        "MaxTRES",
+        "GrpTRES",
+    )
+}
+
+fn format_user_row(u: &UserInfo) -> String {
+    format!(
+        "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15} {:<10} {:<10} {:<10} {:<10} {:<16} {:<16}",
+        u.name,
+        u.account,
+        u.admin_level,
+        u.default_account,
+        u.allowed_qos,
+        u.default_qos,
+        blank_if_unset(u.max_running_jobs),
+        blank_if_unset(u.max_submit_jobs),
+        blank_if_unset(u.grp_submit_jobs),
+        blank_if_unset(u.max_wall_minutes),
+        u.max_tres_per_job,
+        u.grp_tres,
+    )
 }
 
 fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
@@ -966,15 +1259,16 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
         'P' => a.parent_account.clone(),
         'S' => (a.fairshare_weight as u32).to_string(),
         'G' => a.grp_tres.clone(),
-        'J' => blank_if_zero(a.max_running_jobs),
+        'J' => blank_if_unset(a.max_running_jobs),
         _ => "?".into(),
     }
 }
 
-const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+const QOS_DEFAULT_FORMAT: &str =
+    "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
 const QOS_ALL_FORMAT: &str =
-    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -990,8 +1284,11 @@ fn qos_header(spec: char) -> &'static str {
         'V' => "MaxTRESPU",
         'J' => "MaxJobsPU",
         'S' => "MaxSubmitPU",
+        'A' => "MaxSubmitPA",
+        'B' => "GrpSubmit",
         'W' => "MaxWall",
         'w' => "GrpWall",
+        'F' => "Flags",
         _ => "?",
     }
 }
@@ -1010,8 +1307,11 @@ fn qos_field_spec(name: &str) -> Option<char> {
         "maxtrespu" | "maxtresperuser" => Some('V'),
         "maxjobspu" | "maxjobsperuser" => Some('J'),
         "maxsubmitpu" | "maxsubmitjobspu" | "maxsubmitjobsperuser" => Some('S'),
+        "maxsubmitpa" | "maxsubmitjobspa" | "maxsubmitjobsperaccount" => Some('A'),
+        "grpsubmit" | "grpsubmitjobs" => Some('B'),
         "maxwall" | "maxwalldurationperjob" => Some('W'),
         "grpwall" => Some('w'),
+        "flags" => Some('F'),
         _ => None,
     }
 }
@@ -1028,10 +1328,13 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
         'V' => q.max_tres_per_user.clone(),
-        'J' => blank_if_zero(q.max_jobs_per_user),
-        'S' => blank_if_zero(q.max_submit_jobs_per_user),
-        'W' => blank_if_zero(q.max_wall_minutes),
-        'w' => blank_if_zero(q.grp_wall_minutes),
+        'J' => blank_if_unset(q.max_jobs_per_user),
+        'S' => blank_if_unset(q.max_submit_jobs_per_user),
+        'A' => blank_if_unset(q.max_submit_jobs_per_account),
+        'B' => blank_if_unset(q.grp_submit_jobs),
+        'W' => blank_if_unset(q.max_wall_minutes),
+        'w' => blank_if_unset(q.grp_wall_minutes),
+        'F' => q.flags.clone(),
         _ => "?".into(),
     }
 }
@@ -1159,9 +1462,12 @@ mod tests {
             "maxwall",
             "maxtresperjob",
             "maxsubmitjobsperuser",
+            "maxsubmitjobsperaccount",
+            "grpsubmit",
             "maxtresperuser",
             "grptres",
             "grpwall",
+            "flags",
         ];
         for field in parsed_fields {
             let p = parse_params(&["name=normal".into(), format!("{field}=1")]);
@@ -1185,6 +1491,7 @@ mod tests {
             "maxrunningjobs",
             "maxjobs",
             "maxsubmitjobs",
+            "grpsubmit",
             "maxtresperjob",
             "grptres",
             "maxwall",
@@ -1317,14 +1624,17 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_account_limits_absent_are_zero() {
+    fn build_add_user_request_account_limits_absent_are_unset() {
+        // Absent numeric limits default to the INFINITE sentinel (leave
+        // unchanged / no limit), not a literal 0 which would block all.
+        let unset = spur_core::accounting::INFINITE;
         let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
         let fields = build_add_user_request(&p).unwrap();
-        assert_eq!(fields.max_running_jobs, 0);
-        assert_eq!(fields.max_submit_jobs, 0);
+        assert_eq!(fields.max_running_jobs, unset);
+        assert_eq!(fields.max_submit_jobs, unset);
         assert_eq!(fields.max_tres_per_job, "");
         assert_eq!(fields.grp_tres, "");
-        assert_eq!(fields.max_wall_minutes, 0);
+        assert_eq!(fields.max_wall_minutes, unset);
     }
 
     #[test]
@@ -1383,11 +1693,23 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_rejects_negative_maxsubmitjobs() {
+    fn build_add_user_request_maxsubmitjobs_minus_one_clears() {
+        // -1 is the clear sentinel (INFINITE), not an error.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),
             "maxsubmitjobs=-1".into(),
+        ]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.max_submit_jobs, spur_core::accounting::INFINITE);
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_other_negative_maxsubmitjobs() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxsubmitjobs=-5".into(),
         ]);
         assert!(build_add_user_request(&p).is_err());
     }
@@ -1651,17 +1973,95 @@ mod tests {
     }
 
     #[test]
-    fn qos_resolve_zero_fields_are_blank() {
+    fn qos_resolve_unset_fields_are_blank_and_zero_is_shown() {
+        // Post sentinel-flip: the INFINITE sentinel renders blank (no limit);
+        // a literal 0 renders as "0" (block all).
+        let unset = spur_core::accounting::INFINITE;
         let q = QosInfo {
             name: "normal".into(),
             preempt_mode: "off".into(),
             usage_factor: 1.0,
+            max_jobs_per_user: unset,
+            max_submit_jobs_per_user: unset,
+            max_wall_minutes: unset,
+            grp_wall_minutes: unset,
+            max_submit_jobs_per_account: unset,
+            grp_submit_jobs: unset,
             ..Default::default()
         };
         assert_eq!(resolve_qos_field(&q, 'J'), "");
         assert_eq!(resolve_qos_field(&q, 'S'), "");
         assert_eq!(resolve_qos_field(&q, 'W'), "");
         assert_eq!(resolve_qos_field(&q, 'w'), "");
+        assert_eq!(resolve_qos_field(&q, 'A'), "");
+        assert_eq!(resolve_qos_field(&q, 'B'), "");
+
+        let blocking = QosInfo {
+            max_jobs_per_user: 0,
+            ..q
+        };
+        assert_eq!(resolve_qos_field(&blocking, 'J'), "0");
+    }
+
+    #[test]
+    fn format_user_row_renders_limits_and_blanks_unset() {
+        let unset = spur_core::accounting::INFINITE;
+        let header = user_header_row();
+        for column in [
+            "User",
+            "Account",
+            "MaxJobs",
+            "MaxSubmit",
+            "GrpSubmit",
+            "MaxWall",
+            "MaxTRES",
+            "GrpTRES",
+        ] {
+            assert!(header.contains(column), "header missing {column}: {header}");
+        }
+
+        let u = UserInfo {
+            name: "carol".into(),
+            account: "ml".into(),
+            admin_level: "None".into(),
+            max_running_jobs: 4,
+            max_submit_jobs: 8,
+            grp_submit_jobs: unset,
+            max_wall_minutes: 1440,
+            max_tres_per_job: "cpu=64".into(),
+            grp_tres: String::new(),
+            ..Default::default()
+        };
+        let row = format_user_row(&u);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert!(cols.contains(&"carol"));
+        assert!(cols.contains(&"4"));
+        assert!(cols.contains(&"8"));
+        assert!(cols.contains(&"1440"));
+        assert!(cols.contains(&"cpu=64"));
+        // grp_submit_jobs is the INFINITE sentinel: it must render as a blank
+        // cell. The header and row share the same fixed-width layout, so the
+        // GrpSubmit column occupies the same byte range in both; assert that
+        // slice of the row is all whitespace.
+        let start = header.find("GrpSubmit").expect("header has GrpSubmit");
+        let cell = &row[start..start + "GrpSubmit".len()];
+        assert!(
+            cell.trim().is_empty(),
+            "GrpSubmit cell should be blank, got {cell:?}"
+        );
+    }
+
+    #[test]
+    fn parse_limit_minus_one_clears_to_infinite() {
+        assert_eq!(
+            parse_limit("maxjobs", "-1").unwrap(),
+            spur_core::accounting::INFINITE
+        );
+    }
+
+    #[test]
+    fn parse_limit_zero_is_literal_block_all() {
+        assert_eq!(parse_limit("maxjobs", "0").unwrap(), 0);
     }
 
     #[test]
@@ -1717,6 +2117,81 @@ mod tests {
 
         assert!(account.is_empty());
         assert_eq!(user, "testuser");
+    }
+
+    #[test]
+    fn build_txn_request_maps_filters_and_lowercases_action() {
+        let p = parse_params(&[
+            "actor=alice".into(),
+            "action=Delete".into(),
+            "entity=reservation".into(),
+            "name=maint".into(),
+            "outcome=Denied".into(),
+            "start=2024-01-01".into(),
+            "limit=50".into(),
+        ]);
+
+        let req = build_txn_request(&p);
+
+        assert_eq!(req.actor, "alice");
+        assert_eq!(req.action, "delete");
+        assert_eq!(req.entity_type, "reservation");
+        assert_eq!(req.entity_name, "maint");
+        assert_eq!(req.outcome, "denied");
+        assert_eq!(req.limit, 50);
+        assert!(req.start_after.is_some());
+        assert!(req.start_before.is_none());
+    }
+
+    #[test]
+    fn resolve_txn_field_renders_where_and_verified() {
+        let t = TransactionRecord {
+            id: 7,
+            timestamp: None,
+            actor: "bob".into(),
+            actor_uid: 1000,
+            verified: true,
+            source: "api".into(),
+            action: "create".into(),
+            entity_type: "reservation".into(),
+            entity_name: "daily".into(),
+            outcome: "success".into(),
+            details: "{}".into(),
+        };
+        assert_eq!(resolve_txn_field(&t, 'w'), "reservation:daily");
+        assert_eq!(resolve_txn_field(&t, 'v'), "yes");
+        assert_eq!(resolve_txn_field(&t, 'A'), "bob");
+        assert_eq!(resolve_txn_field(&t, 'd'), "7");
+        assert_eq!(resolve_txn_field(&t, 'u'), "1000");
+    }
+
+    #[test]
+    fn resolve_txn_field_blanks_uid_when_unverified() {
+        // Unverified rows carry an unknown uid (stored NULL, 0 on the wire); it
+        // must render blank so it can't be mistaken for root (uid 0).
+        let t = TransactionRecord {
+            actor: "vm".into(),
+            actor_uid: 0,
+            verified: false,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&t, 'u'), "");
+        assert_eq!(resolve_txn_field(&t, 'v'), "no");
+    }
+
+    #[test]
+    fn fmt_txn_ts_sanitizes_bad_nanos() {
+        let bad = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: -1,
+        };
+        let good = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        };
+        // A negative nanos must not wrap via `as u32` and blank the timestamp.
+        assert!(!fmt_txn_ts(&bad).is_empty());
+        assert_eq!(fmt_txn_ts(&bad), fmt_txn_ts(&good));
     }
 
     fn stub_account() -> AccountInfo {
@@ -1810,12 +2285,20 @@ mod tests {
     }
 
     #[test]
-    fn account_resolve_zero_maxjobs_is_blank() {
-        let a = AccountInfo {
+    fn account_resolve_unset_maxjobs_is_blank_and_zero_is_shown() {
+        // Post sentinel-flip: INFINITE renders blank (no limit); a literal 0
+        // renders "0" (block all).
+        let unset = AccountInfo {
+            max_running_jobs: spur_core::accounting::INFINITE,
+            ..stub_account()
+        };
+        assert_eq!(resolve_account_field(&unset, 'J'), "");
+
+        let blocking = AccountInfo {
             max_running_jobs: 0,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&a, 'J'), "");
+        assert_eq!(resolve_account_field(&blocking, 'J'), "0");
     }
 
     #[test]
@@ -1935,6 +2418,286 @@ mod tests {
         assert!(
             build_modify_qos_request(&p).is_err(),
             "malformed preemptexempttime should error"
+        );
+    }
+
+    #[test]
+    fn scripted_query_with_header_and_delimiter_flags_parses() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "-n",
+            "-P",
+            "show",
+            "qos",
+            "format=Name,Priority,MaxWall",
+        ])
+        .expect("-n -P must parse");
+
+        assert!(args.noheader);
+        assert!(args.parsable2);
+        assert!(!args.parsable);
+    }
+
+    #[test]
+    fn delimiter_flag_long_names_match_slurm() {
+        let trailing =
+            SacctmgrArgs::try_parse_from(["sacctmgr", "--noheader", "--parsable", "show", "qos"])
+                .expect("--parsable must parse");
+        assert!(trailing.noheader);
+        assert!(trailing.parsable);
+        assert!(!trailing.parsable2);
+
+        let no_trailing = SacctmgrArgs::try_parse_from(["sacctmgr", "--parsable2", "show", "qos"])
+            .expect("--parsable2 must parse");
+        assert!(no_trailing.parsable2);
+        assert!(!no_trailing.parsable);
+    }
+
+    #[test]
+    fn header_and_delimiter_flags_leave_other_arguments_alone() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "-i",
+            "-n",
+            "-P",
+            "show",
+            "qos",
+            "format=Name,Priority",
+        ])
+        .expect("flags must compose with existing globals");
+
+        assert!(args.immediate);
+        assert_eq!(args.controller, "http://localhost:6817");
+
+        let SacctmgrCommand::Show { entity, params } = args.command else {
+            panic!("expected a show command");
+        };
+        assert_eq!(entity, "qos");
+        assert_eq!(params, vec!["format=Name,Priority".to_string()]);
+    }
+
+    #[test]
+    fn a_delimiter_flag_after_a_param_is_still_parsed() {
+        let args =
+            SacctmgrArgs::try_parse_from(["sacctmgr", "show", "qos", "format=Name,Priority", "-P"])
+                .expect("a flag after a param must parse");
+
+        assert!(args.parsable2);
+        let SacctmgrCommand::Show { params, .. } = args.command else {
+            panic!("expected a show command");
+        };
+        assert_eq!(params, vec!["format=Name,Priority".to_string()]);
+    }
+
+    #[test]
+    fn a_delimiter_flag_between_params_does_not_swallow_the_next() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "show",
+            "qos",
+            "name=gpu",
+            "-P",
+            "format=Name",
+        ])
+        .expect("a flag between params must parse");
+
+        assert!(args.parsable2);
+        let SacctmgrCommand::Show { params, .. } = args.command else {
+            panic!("expected a show command");
+        };
+        assert_eq!(
+            params,
+            vec!["name=gpu".to_string(), "format=Name".to_string()],
+            "the flag must not consume the following filter as its value"
+        );
+    }
+
+    #[test]
+    fn a_flag_among_modify_params_does_not_swallow_an_update() {
+        let args = SacctmgrArgs::try_parse_from([
+            "sacctmgr",
+            "modify",
+            "qos",
+            "gpu",
+            "set",
+            "-i",
+            "priority=10",
+        ])
+        .expect("a flag among modify params must parse");
+
+        assert!(args.immediate);
+        let SacctmgrCommand::Modify { params, .. } = args.command else {
+            panic!("expected a modify command");
+        };
+        assert_eq!(
+            parse_params(&params).get("priority").map(String::as_str),
+            Some("10"),
+            "a swallowed flag would consume the update and silently apply nothing"
+        );
+    }
+
+    fn style_from(flags: &[&str]) -> format_engine::OutputStyle {
+        let mut argv = vec!["sacctmgr"];
+        argv.extend_from_slice(flags);
+        argv.extend_from_slice(&["show", "qos"]);
+
+        SacctmgrArgs::try_parse_from(argv)
+            .expect("flags must parse")
+            .output_style()
+    }
+
+    /// A `show qos` row for the given flags, rendered through the real QOS resolver.
+    fn qos_row(flags: &[&str], format: &str) -> String {
+        let fields = format_engine::parse_named_format(format, &qos_field_spec, &qos_header);
+        style_from(flags).row(&fields, &|spec| resolve_qos_field(&stub_qos(), spec))
+    }
+
+    #[test]
+    fn parsable2_row_has_no_trailing_delimiter() {
+        assert_eq!(qos_row(&["-P"], "Name,Priority"), "gpuqos|100");
+    }
+
+    #[test]
+    fn parsable_row_has_a_trailing_delimiter() {
+        assert_eq!(qos_row(&["-p"], "Name,Priority"), "gpuqos|100|");
+    }
+
+    #[test]
+    fn delimited_values_containing_commas_stay_unambiguous() {
+        // TRES values are comma-separated internally, which is why Slurm's parsable output
+        // uses '|' rather than ','.
+        assert_eq!(qos_row(&["-P"], "Name,GrpTRES"), "gpuqos|node=4,cpu=256");
+    }
+
+    #[test]
+    fn format_ordering_is_preserved_in_delimited_output() {
+        assert_eq!(qos_row(&["-P"], "Priority,Name"), "100|gpuqos");
+    }
+
+    #[test]
+    fn both_delimiter_flags_resolve_to_parsable2() {
+        assert_eq!(qos_row(&["-p", "-P"], "Name,Priority"), "gpuqos|100");
+    }
+
+    #[test]
+    fn without_a_delimiter_flag_rows_are_byte_identical_to_today() {
+        let fields =
+            format_engine::parse_named_format(QOS_DEFAULT_FORMAT, &qos_field_spec, &qos_header);
+        let q = stub_qos();
+        let expected = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+
+        assert_eq!(
+            style_from(&[]).row(&fields, &|spec| resolve_qos_field(&q, spec)),
+            expected
+        );
+        assert_eq!(
+            style_from(&["-n"]).row(&fields, &|spec| resolve_qos_field(&q, spec)),
+            expected
+        );
+    }
+
+    #[test]
+    fn noheader_flag_resolves_into_the_style() {
+        assert!(style_from(&[]).shows_header());
+        assert!(!style_from(&["-n"]).shows_header());
+    }
+
+    fn stub_txn() -> TransactionRecord {
+        TransactionRecord {
+            id: 7,
+            timestamp: None,
+            actor: "bob".into(),
+            actor_uid: 1000,
+            verified: true,
+            source: "api".into(),
+            action: "create".into(),
+            entity_type: "qos".into(),
+            entity_name: "gpu".into(),
+            outcome: "success".into(),
+            details: "{}".into(),
+        }
+    }
+
+    /// A `show txn` header block and row for the given flags, mirroring the arm's rendering.
+    fn txn_render(flags: &[&str], format: &str) -> (Vec<String>, String) {
+        let fields = txn_format_fields(Some(format)).expect("txn format must parse");
+        let style = SacctmgrArgs::try_parse_from(
+            ["sacctmgr"]
+                .iter()
+                .chain(flags)
+                .chain(&["show", "txn"])
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .expect("flags must parse")
+        .output_style();
+        let row = style.row(&fields, &|spec| resolve_txn_field(&stub_txn(), spec));
+        (style.header_lines(&fields), row)
+    }
+
+    #[test]
+    fn txn_honours_noheader_and_delimited_output() {
+        let (header, row) = txn_render(&["-n", "-P"], "Action,Actor");
+        assert!(header.is_empty(), "-n must suppress the txn header");
+        assert_eq!(row, "create|bob");
+
+        let (header, _) = txn_render(&[], "Action,Actor");
+        assert!(!header.is_empty(), "the txn header must print by default");
+    }
+
+    #[test]
+    fn delimited_output_is_refused_only_where_columns_are_not_modelled() {
+        let delimited = style_from(&["-P"]);
+        for entity in [
+            "account",
+            "accounts",
+            "qos",
+            "txn",
+            "transaction",
+            "transactions",
+        ] {
+            assert!(
+                reject_unsupported_delimiter(entity, delimited).is_ok(),
+                "{entity} should support delimited output"
+            );
+        }
+        for entity in FIXED_WIDTH_ENTITIES {
+            assert!(
+                reject_unsupported_delimiter(entity, delimited).is_err(),
+                "{entity} should refuse delimited output"
+            );
+        }
+
+        // Padded output stays available for every entity.
+        let padded = style_from(&[]);
+        for entity in FIXED_WIDTH_ENTITIES {
+            assert!(reject_unsupported_delimiter(entity, padded).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_delimiter_fails_before_contacting_the_controller() {
+        // Port 1 is unroutable: reaching the network at all would surface a connect error
+        // instead, so this also pins that the check runs first.
+        let err = show("user", &[], "http://127.0.0.1:1", style_from(&["-P"]))
+            .await
+            .expect_err("delimited show user must fail");
+
+        assert!(
+            err.to_string().contains("not supported for 'user'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_entity_reports_itself_rather_than_the_delimiter() {
+        let err = show("wombat", &[], "http://127.0.0.1:1", style_from(&["-P"]))
+            .await
+            .expect_err("unknown entity must fail");
+
+        assert!(
+            err.to_string().contains("unknown entity 'wombat'"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -105,8 +105,105 @@ impl Default for QosCache {
     }
 }
 
+/// Per-QOS wall-clock consumption for `GrpWall`, derived from job history in the
+/// accounting database. Reads return `None` until a first successful load, leaving
+/// the limit unapplied while accounting is unavailable. A later failed refresh
+/// keeps the last figure rather than reverting to `None`, so spend cannot run
+/// unbounded through a database blip.
+pub struct GrpWallCache {
+    snapshot: RwLock<Option<Arc<HashMap<String, u64>>>>,
+}
+
+/// A scheduling pass's view of consumption, taken once so a pass over thousands of
+/// candidates does not re-acquire the cache lock per job. `None` means no figure has
+/// been read yet, which is what leaves budgets unapplied.
+pub type GrpWallUsage = Option<Arc<HashMap<String, u64>>>;
+
+/// Minutes consumed by `qos_name` within a pass's snapshot. A loaded snapshot
+/// reports zero for a QOS with no job history; an unloaded one reports `None`.
+pub fn consumed_minutes(usage: &GrpWallUsage, qos_name: &str) -> Option<u64> {
+    let consumed = usage.as_ref()?;
+    Some(consumed.get(qos_name).copied().unwrap_or(0))
+}
+
+impl GrpWallCache {
+    pub fn new() -> Self {
+        Self {
+            snapshot: RwLock::new(None),
+        }
+    }
+
+    /// Snapshot for one scheduling pass. Read [`consumed_minutes`] from it per job.
+    pub fn usage(&self) -> GrpWallUsage {
+        self.snapshot.read().clone()
+    }
+
+    fn replace(&self, consumed: HashMap<String, u64>) -> bool {
+        let mut snap = self.snapshot.write();
+        let first = snap.is_none();
+        *snap = Some(Arc::new(consumed));
+        first
+    }
+
+    /// Test-only seam: populates consumption without a database.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, consumed: HashMap<String, u64>) {
+        let _ = self.replace(consumed);
+    }
+
+    pub fn spawn_refresh_loop(
+        self: &Arc<Self>,
+        pool: PgPool,
+        refresh_interval_secs: u64,
+        window_days: u32,
+    ) {
+        let cache = Arc::clone(self);
+        let interval = Duration::from_secs(refresh_interval_secs.max(10));
+
+        tokio::spawn(async move {
+            // Short first attempt, as `QosCache` does: a slow or failed startup
+            // read must not leave the budget unapplied for a whole interval.
+            Self::refresh_once(&cache, &pool, window_days, Duration::from_secs(5)).await;
+
+            loop {
+                tokio::time::sleep(interval).await;
+                Self::refresh_once(&cache, &pool, window_days, Duration::from_secs(10)).await;
+            }
+        });
+    }
+
+    async fn refresh_once(cache: &Arc<Self>, pool: &PgPool, window_days: u32, timeout: Duration) {
+        match tokio::time::timeout(
+            timeout,
+            crate::accounting::db::consumed_wall_minutes_by_qos(pool, window_days),
+        )
+        .await
+        {
+            Ok(Ok(consumed)) => {
+                let qos_count = consumed.len();
+                if cache.replace(consumed) {
+                    // Until this line appears, no GrpWall budget is being applied.
+                    // Operators need a positive signal for that, not just silence.
+                    info!(
+                        qos_count,
+                        window_days, "grpwall usage cache initialized, budgets now enforced"
+                    );
+                }
+            }
+            Ok(Err(e)) => warn!(error = %e, "grpwall usage refresh failed, retaining last figure"),
+            Err(_) => warn!("grpwall usage refresh timed out, retaining last figure"),
+        }
+    }
+}
+
+impl Default for GrpWallCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
-    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    use spur_core::accounting::limit_from_db;
     // Values are validated by `create_qos` before being stored, so a parse
     // failure here means the DB row predates that check or was edited
     // out-of-band; treat it as unset rather than poisoning the whole refresh.
@@ -131,17 +228,30 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             .map(str::to_string)
             .collect(),
         limits: QosLimits {
-            max_jobs_per_user: opt_u32(r.max_jobs_per_user),
-            max_submit_jobs_per_user: opt_u32(r.max_submit_per_user),
+            max_jobs_per_user: limit_from_db(r.max_jobs_per_user),
+            max_submit_jobs_per_user: limit_from_db(r.max_submit_per_user),
+            max_submit_jobs_per_account: limit_from_db(r.max_submit_per_account),
+            grp_submit_jobs: limit_from_db(r.grp_submit_jobs),
             max_tres_per_job: opt_tres(r.max_tres_per_job),
             max_tres_per_user: opt_tres(r.max_tres_per_user),
             grp_tres: opt_tres(r.grp_tres),
-            max_wall_minutes: opt_u32(r.max_wall_min),
-            grp_wall_minutes: opt_u32(r.grp_wall_min),
+            max_wall_minutes: limit_from_db(r.max_wall_min),
+            grp_wall_minutes: limit_from_db(r.grp_wall_min),
             preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
         },
         usage_factor: r.usage_factor,
+        deny_on_limit: parse_deny_on_limit(&r.flags),
     }
+}
+
+/// Parse the QOS `flags` column (comma-separated) for the `DenyOnLimit` flag.
+/// Unknown flags are ignored on read (writes reject them via
+/// `canonicalize_qos_flags`); this tolerates rows imported from Slurm dumps that
+/// carry flags Spur does not model yet.
+fn parse_deny_on_limit(flags: &str) -> bool {
+    flags
+        .split(',')
+        .any(|f| f.trim().eq_ignore_ascii_case("denyonlimit"))
 }
 
 #[cfg(test)]
@@ -189,7 +299,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_qos_limits(&job, &qos, 0, 2, &TresRecord::new(), &TresRecord::new());
+        let result = check_qos_limits(
+            &job,
+            &qos,
+            0,
+            2,
+            &TresRecord::new(),
+            &TresRecord::new(),
+            None,
+        );
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit)
@@ -217,7 +335,7 @@ mod tests {
         );
         let mut running = TresRecord::new();
         running.set(TresType::Cpu, 6);
-        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new(), None);
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)
@@ -237,15 +355,21 @@ mod tests {
             max_wall_min: Some(60),
             max_tres_per_job: Some("cpu=32,mem=131072".into()),
             max_submit_per_user: Some(50),
+            max_submit_per_account: Some(40),
+            grp_submit_jobs: Some(30),
             max_tres_per_user: Some("cpu=64".into()),
             grp_tres: Some("gpu=8".into()),
             grp_wall_min: Some(120),
             preempt_exempt_time: None,
+            flags: "DenyOnLimit".into(),
         };
 
         let qos = qos_from_record(record);
 
         assert_eq!(qos.name, "high");
+        assert!(qos.deny_on_limit);
+        assert_eq!(qos.limits.max_submit_jobs_per_account, Some(40));
+        assert_eq!(qos.limits.grp_submit_jobs, Some(30));
         assert_eq!(qos.priority, 100);
         assert_eq!(qos.preempt_mode, QosPreemptMode::Cancel);
         assert_eq!(qos.usage_factor, 2.0);
@@ -275,7 +399,9 @@ mod tests {
     }
 
     #[test]
-    fn test_qos_from_record_zero_and_none_are_none() {
+    fn test_qos_from_record_zero_is_literal_negative_and_null_are_unset() {
+        // Post sentinel-flip: a stored 0 is a real "block all" value; NULL and a
+        // stray negative are "no limit" (unset).
         let record = crate::accounting::db::QosRecord {
             name: "minimal".into(),
             description: String::new(),
@@ -287,20 +413,25 @@ mod tests {
             max_wall_min: None,
             max_tres_per_job: Some(String::new()),
             max_submit_per_user: Some(-1),
+            max_submit_per_account: None,
+            grp_submit_jobs: Some(0),
             max_tres_per_user: None,
             grp_tres: None,
-            grp_wall_min: Some(0),
+            grp_wall_min: None,
             preempt_exempt_time: None,
+            flags: String::new(),
         };
 
         let qos = qos_from_record(record);
 
-        assert_eq!(qos.limits.max_jobs_per_user, None);
+        assert_eq!(qos.limits.max_jobs_per_user, Some(0));
         assert_eq!(qos.limits.max_wall_minutes, None);
         assert!(qos.limits.max_tres_per_job.is_none());
         assert_eq!(qos.limits.max_submit_jobs_per_user, None);
+        assert_eq!(qos.limits.grp_submit_jobs, Some(0));
         assert!(qos.limits.max_tres_per_user.is_none());
         assert!(qos.limits.grp_tres.is_none());
         assert_eq!(qos.limits.grp_wall_minutes, None);
+        assert!(!qos.deny_on_limit);
     }
 }

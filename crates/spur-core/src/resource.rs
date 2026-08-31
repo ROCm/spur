@@ -617,3 +617,195 @@ mod tests {
         assert_eq!(parse_gres("   "), None);
     }
 }
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    fn gpu(device_id: u32, gpu_type: &str) -> GpuResource {
+        GpuResource {
+            device_id,
+            gpu_type: gpu_type.into(),
+            memory_mb: 65536,
+            peer_gpus: Vec::new(),
+            link_type: GpuLinkType::XGMI,
+        }
+    }
+
+    fn inventory() -> ResourceSet {
+        ResourceSet {
+            cpus: 64,
+            memory_mb: 131_072,
+            gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
+            generic: HashMap::from([("bandwidth".to_string(), 100u64)]),
+        }
+    }
+
+    /// Releasing more than is held must clamp at zero rather than wrap, and a
+    /// device drained to zero must leave the map so `has_devices` goes false.
+    #[test]
+    fn subtract_clamps_at_zero_and_prunes_drained_devices() {
+        let mut held = ResourceAllocations::with_scalar(8, 1024);
+        held.devices.insert(
+            "gpu".into(),
+            vec![
+                AllocatedDevice::injectable(0),
+                AllocatedDevice::injectable(1),
+            ],
+        );
+
+        let mut release = ResourceAllocations::with_scalar(100, 99_999);
+        release
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
+        held.subtract(&release);
+
+        assert_eq!(held.cpus, 0, "over-release clamps instead of wrapping");
+        assert_eq!(held.memory_mb, 0);
+        assert_eq!(held.device_ids("gpu"), [1], "drained device 0 is pruned");
+
+        let mut drain_rest = ResourceAllocations::default();
+        drain_rest
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(1)]);
+        held.subtract(&drain_rest);
+
+        assert!(!held.devices.contains_key("gpu"), "emptied gres is removed");
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn subtract_ignores_gres_that_was_never_held() {
+        let mut held = ResourceAllocations::with_scalar(4, 512);
+        let mut release = ResourceAllocations::default();
+        release
+            .devices
+            .insert("nic".into(), vec![AllocatedDevice::injectable(7)]);
+
+        held.subtract(&release);
+
+        assert_eq!(held.cpus, 4);
+        assert!(held.devices.is_empty());
+    }
+
+    #[test]
+    fn allocated_count_filters_gpus_by_type() {
+        let inv = inventory();
+        let mut alloc = ResourceAllocations::default();
+        alloc.devices.insert(
+            "gpu".into(),
+            vec![
+                AllocatedDevice::injectable(0),
+                AllocatedDevice::injectable(2),
+            ],
+        );
+
+        assert_eq!(alloc.allocated_count("gpu", Some("mi300x"), &inv), 1);
+        assert_eq!(alloc.allocated_count("gpu", Some("mi210"), &inv), 1);
+        assert_eq!(alloc.allocated_count("gpu", Some("any"), &inv), 2);
+        assert_eq!(alloc.allocated_count("gpu", None, &inv), 2);
+        assert_eq!(alloc.allocated_count("gpu", Some("mi100"), &inv), 0);
+        assert_eq!(alloc.allocated_count("nic", None, &inv), 0);
+    }
+
+    /// Non-GPU gres is countable, so a single entry carries a count instead of
+    /// one entry per device.
+    #[test]
+    fn allocated_count_sums_countable_non_gpu_gres() {
+        let inv = inventory();
+        let mut alloc = ResourceAllocations::default();
+        alloc.devices.insert(
+            "bandwidth".into(),
+            vec![AllocatedDevice {
+                device_id: 0,
+                count: 40,
+            }],
+        );
+
+        assert_eq!(alloc.allocated_count("bandwidth", None, &inv), 40);
+        assert_eq!(alloc.generic_count("bandwidth"), 40);
+        assert_eq!(alloc.total_device_count("bandwidth"), 40);
+        assert_eq!(alloc.generic_count("absent"), 0);
+    }
+
+    /// `is_empty` inspects the map while `has_devices` inspects inside it, so a
+    /// leftover empty vector reads as non-empty yet holds nothing.
+    #[test]
+    fn is_empty_and_has_devices_disagree_on_empty_device_vec() {
+        let mut alloc = ResourceAllocations::default();
+        assert!(alloc.is_empty());
+        assert!(!alloc.has_devices());
+
+        alloc.devices.insert("gpu".into(), Vec::new());
+        assert!(!alloc.is_empty());
+        assert!(!alloc.has_devices());
+
+        alloc
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(3)]);
+        assert!(alloc.has_devices());
+        assert_eq!(alloc.total_device_count("gpu"), 1);
+    }
+
+    #[test]
+    fn build_exclusive_allocation_takes_every_cpu_and_gpu() {
+        let inv = inventory();
+        let alloc = build_exclusive_allocation(&inv, 4096);
+
+        assert_eq!(alloc.cpus, inv.cpus, "exclusive claims every CPU");
+        assert_eq!(alloc.memory_mb, 4096, "memory comes from the caller");
+        let mut ids = alloc.device_ids("gpu");
+        ids.sort_unstable();
+        assert_eq!(ids, [0, 1, 2], "every GPU is claimed");
+        assert_eq!(alloc.generic_count("bandwidth"), 100);
+    }
+
+    #[test]
+    fn build_exclusive_allocation_omits_absent_gpus_and_zero_counts() {
+        let inv = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: Vec::new(),
+            generic: HashMap::from([("licenses".to_string(), 0u64)]),
+        };
+        let alloc = build_exclusive_allocation(&inv, 1024);
+
+        assert!(!alloc.devices.contains_key("gpu"));
+        assert!(!alloc.devices.contains_key("licenses"));
+        assert!(!alloc.has_devices());
+    }
+
+    /// Aggregation folds nodes with `add`, which merges on device_id, so two
+    /// nodes both reporting device 0 collapse to one entry with count 2.
+    #[test]
+    fn aggregate_allocations_sums_scalars_and_merges_matching_device_ids() {
+        let mut node_a = ResourceAllocations::with_scalar(16, 2048);
+        node_a
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
+        let mut node_b = ResourceAllocations::with_scalar(16, 2048);
+        node_b
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
+
+        let total = aggregate_allocations([node_a, node_b]);
+
+        assert_eq!(total.cpus, 32);
+        assert_eq!(total.memory_mb, 4096);
+        assert_eq!(total.device_ids("gpu"), [0]);
+        assert_eq!(total.total_device_count("gpu"), 2);
+    }
+
+    #[test]
+    fn aggregate_allocations_of_nothing_is_empty() {
+        assert!(aggregate_allocations(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn total_gpus_counts_devices_not_types() {
+        let inv = inventory();
+        assert_eq!(inv.total_gpus(), 3);
+        assert_eq!(inv.gpu_counts().get("mi300x"), Some(&2));
+        assert_eq!(ResourceSet::default().total_gpus(), 0);
+    }
+}

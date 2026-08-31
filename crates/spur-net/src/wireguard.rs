@@ -258,6 +258,45 @@ pub fn list_peers(interface: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Map each peer's pubkey to its known underlay endpoint (`wg show <iface> endpoints`); peers with
+/// `(none)` are skipped. Lets the controller re-advertise worker↔worker endpoints in membership.
+pub fn peer_endpoints(
+    interface: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let output = Command::new("wg")
+        .args(["show", interface, "endpoints"])
+        .output()
+        .context("failed to run `wg show endpoints`")?;
+    if !output.status.success() {
+        bail!(
+            "wg show {interface} endpoints failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(parse_peer_endpoints(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Parse `wg show <iface> endpoints` stdout (tab-separated `<pubkey>\t<endpoint>` per line) into a
+/// pubkey→endpoint map. Peers with an empty or `(none)` endpoint are skipped. Split out from
+/// [`peer_endpoints`] so the parsing is unit-testable without invoking `wg`.
+fn parse_peer_endpoints(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split('\t');
+        let (Some(key), Some(endpoint)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (key, endpoint) = (key.trim(), endpoint.trim());
+        if key.is_empty() || endpoint.is_empty() || endpoint == "(none)" {
+            continue;
+        }
+        map.insert(key.to_string(), endpoint.to_string());
+    }
+    map
+}
+
 /// The public key of an existing WireGuard interface (`wg show <iface> public-key`).
 pub fn interface_public_key(interface: &str) -> anyhow::Result<String> {
     let output = Command::new("wg")
@@ -309,5 +348,49 @@ mod tests {
         };
         let ini = config.to_ini();
         assert!(!ini.contains("ListenPort"));
+    }
+
+    // Canned `wg show <iface> endpoints` stdout modeled on real testbed output
+    // (tab-separated `<pubkey>\t<endpoint>` per line), with keys/addresses replaced by
+    // placeholders and the documentation endpoint range (203.0.113.0/24, TEST-NET-3).
+    #[test]
+    fn test_parse_peer_endpoints_happy_path() {
+        let stdout = "peerAAA=\t203.0.113.1:51820\n\
+                      peerBBB=\t203.0.113.2:51820\n\
+                      peerCCC=\t203.0.113.3:51820\n";
+        let map = parse_peer_endpoints(stdout);
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.get("peerAAA=").map(String::as_str),
+            Some("203.0.113.1:51820")
+        );
+        assert_eq!(
+            map.get("peerCCC=").map(String::as_str),
+            Some("203.0.113.3:51820")
+        );
+    }
+
+    #[test]
+    fn test_parse_peer_endpoints_skips_none_and_malformed() {
+        // A peer with no established endpoint reports `(none)`; blank lines and lines
+        // without a tab separator must be ignored, not panic or produce empty entries.
+        let stdout = "peerAAA=\t203.0.113.1:51820\n\
+                      peerBBB=\t(none)\n\
+                      \n\
+                      malformed-no-tab\n\
+                      peerCCC=\t\n";
+        let map = parse_peer_endpoints(stdout);
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get("peerAAA=").map(String::as_str),
+            Some("203.0.113.1:51820")
+        );
+        assert!(!map.contains_key("peerBBB="));
+        assert!(!map.contains_key("peerCCC="));
+    }
+
+    #[test]
+    fn test_parse_peer_endpoints_empty() {
+        assert!(parse_peer_endpoints("").is_empty());
     }
 }

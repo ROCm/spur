@@ -6,11 +6,15 @@ mod fairshare;
 mod grpc;
 mod notifier;
 mod reconcile;
+pub(crate) mod txn;
 
+pub use db::JobStartRecord;
 pub(crate) use grpc::{accounting_server, AccountingService};
-pub use notifier::{AccountingNotifier, JobStartRecord};
+pub use notifier::AccountingNotifier;
 pub use reconcile::spawn_loop as spawn_reconcile_loop;
+pub use reconcile::spawn_txn_purge_loop;
 pub use reconcile::RECONCILE_INTERVAL_SECS;
+pub(crate) use txn::{TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource};
 
 use std::collections::{HashMap, HashSet};
 
@@ -50,15 +54,36 @@ pub async fn fairshare_factors(
     ))
 }
 
-/// Fold one user-row's admin_level into the per-user map, keeping the highest: `Admin` wins over
-/// any lower level so a later non-admin row for a multi-account user can't clobber it.
+/// Canonicalize an `adminlevel` to Slurm's spelling, or `None` if it is not a level.
+///
+/// Slurm prints `Administrator` for the highest level and its parser also takes `Admin` and
+/// `SuperUser`, so all three must resolve to the same thing — recognising only one spelling would
+/// leave a stored level that looks like a privilege and confers nothing.
+pub fn canonical_admin_level(raw: &str) -> Option<&'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "none" => Some("None"),
+        "operator" => Some("Operator"),
+        "admin" | "administrator" | "superuser" => Some("Administrator"),
+        _ => None,
+    }
+}
+
+/// Whether a stored `admin_level` is the level that confers control-plane privilege.
+pub fn admin_level_is_admin(raw: &str) -> bool {
+    canonical_admin_level(raw) == Some("Administrator")
+}
+
+/// Fold one user-row's admin_level into the per-user map, keeping the highest: admin wins over
+/// any lower level so a later non-admin row for a multi-account user can't clobber it. Stored
+/// canonical, so rows predating the column's normalization cannot leave several spellings of one
+/// level in the cache; a value that is no level at all is kept verbatim, to stay visible.
 fn merge_admin_level(map: &mut HashMap<String, String>, user: &str, level: &str) {
     if level.is_empty() || level.eq_ignore_ascii_case("none") {
         return;
     }
     let entry = map.entry(user.to_owned()).or_default();
-    if entry.is_empty() || level.eq_ignore_ascii_case("admin") {
-        *entry = level.to_owned();
+    if entry.is_empty() || admin_level_is_admin(level) {
+        *entry = canonical_admin_level(level).unwrap_or(level).to_owned();
     }
 }
 
@@ -124,7 +149,7 @@ pub async fn association_maps(
 }
 
 fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
-    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    use spur_core::accounting::limit_from_db;
     // Values are validated by `add_user` before being stored, so a parse
     // failure here means the DB row predates that check or was edited
     // out-of-band; treat it as unset rather than poisoning the whole load.
@@ -139,11 +164,12 @@ fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
     };
 
     AccountLimits {
-        max_running_jobs: opt_u32(r.max_running_jobs),
-        max_submit_jobs: opt_u32(r.max_submit_jobs),
+        max_running_jobs: limit_from_db(r.max_running_jobs),
+        max_submit_jobs: limit_from_db(r.max_submit_jobs),
+        grp_submit_jobs: limit_from_db(r.grp_submit_jobs),
         max_tres_per_job: opt_tres(r.max_tres_per_job),
         grp_tres: opt_tres(r.grp_tres),
-        max_wall_minutes: opt_u32(r.max_wall_min),
+        max_wall_minutes: limit_from_db(r.max_wall_min),
     }
 }
 
@@ -158,13 +184,32 @@ mod tests {
         let mut m = HashMap::new();
         merge_admin_level(&mut m, "carol", "Admin");
         merge_admin_level(&mut m, "carol", "Operator");
-        assert_eq!(m.get("carol").map(String::as_str), Some("Admin"));
+        assert_eq!(m.get("carol").map(String::as_str), Some("Administrator"));
 
         // Operator then Admin: Admin must still win.
         let mut m = HashMap::new();
         merge_admin_level(&mut m, "carol", "Operator");
         merge_admin_level(&mut m, "carol", "Admin");
-        assert_eq!(m.get("carol").map(String::as_str), Some("Admin"));
+        assert_eq!(m.get("carol").map(String::as_str), Some("Administrator"));
+    }
+
+    /// Rows written before the column was normalized must not leave several spellings of one level
+    /// in the cache.
+    #[test]
+    fn legacy_spellings_fold_to_one_canonical_level() {
+        for raw in ["admin", "Admin", "Administrator", "SuperUser"] {
+            let mut m = HashMap::new();
+            merge_admin_level(&mut m, "carol", raw);
+            assert_eq!(
+                m.get("carol").map(String::as_str),
+                Some("Administrator"),
+                "raw {raw:?}"
+            );
+        }
+
+        let mut m = HashMap::new();
+        merge_admin_level(&mut m, "dave", "operator");
+        assert_eq!(m.get("dave").map(String::as_str), Some("Operator"));
     }
 
     #[test]
@@ -173,5 +218,40 @@ mod tests {
         merge_admin_level(&mut m, "dave", "none");
         merge_admin_level(&mut m, "dave", "");
         assert!(!m.contains_key("dave"));
+    }
+
+    fn record_with_submit(grp_submit_jobs: Option<i32>) -> super::db::AssociationRecord {
+        super::db::AssociationRecord {
+            user_name: "alice".into(),
+            account: "research".into(),
+            max_running_jobs: None,
+            max_submit_jobs: None,
+            grp_submit_jobs,
+            max_tres_per_job: None,
+            grp_tres: None,
+            max_wall_min: None,
+        }
+    }
+
+    #[test]
+    fn account_limits_preserve_zero_as_block_all() {
+        let limits = super::account_limits_from_record(record_with_submit(Some(0)));
+        assert_eq!(limits.grp_submit_jobs, Some(0));
+    }
+
+    #[test]
+    fn account_limits_map_null_and_negative_to_unset() {
+        let from_null = super::account_limits_from_record(record_with_submit(None));
+        assert_eq!(from_null.grp_submit_jobs, None);
+
+        // A stray negative predates the sentinel flip; treat it as unset.
+        let from_negative = super::account_limits_from_record(record_with_submit(Some(-1)));
+        assert_eq!(from_negative.grp_submit_jobs, None);
+    }
+
+    #[test]
+    fn account_limits_pass_through_positive() {
+        let limits = super::account_limits_from_record(record_with_submit(Some(5)));
+        assert_eq!(limits.grp_submit_jobs, Some(5));
     }
 }

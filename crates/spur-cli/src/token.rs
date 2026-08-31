@@ -3,7 +3,7 @@
 
 //! `spur token` subcommands for admission token management.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use spur_proto::proto::{CreateTokenRequest, ListTokensRequest, RevokeTokenRequest};
@@ -117,17 +117,21 @@ fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &st
 
 fn parse_ttl(s: &str) -> Result<u32> {
     let s = s.trim();
-    if let Some(days) = s.strip_suffix('d') {
-        Ok(days.parse::<u32>()? * 86400)
+    let (value, unit_secs) = if let Some(days) = s.strip_suffix('d') {
+        (days, 86400)
     } else if let Some(hours) = s.strip_suffix('h') {
-        Ok(hours.parse::<u32>()? * 3600)
+        (hours, 3600)
     } else if let Some(mins) = s.strip_suffix('m') {
-        Ok(mins.parse::<u32>()? * 60)
+        (mins, 60)
     } else if let Some(secs) = s.strip_suffix('s') {
-        Ok(secs.parse::<u32>()?)
+        (secs, 1)
     } else {
-        Ok(s.parse::<u32>()?)
-    }
+        (s, 1)
+    };
+    value
+        .parse::<u32>()?
+        .checked_mul(unit_secs)
+        .with_context(|| format!("TTL {} exceeds {} seconds", s, u32::MAX))
 }
 
 async fn cmd_create(controller: &str, ttl: Option<String>) -> Result<()> {
@@ -177,4 +181,42 @@ async fn cmd_revoke(controller: &str, token_id: &str) -> Result<()> {
         .await?;
     println!("Token {} revoked.", token_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ttl_expands_each_suffix() {
+        assert_eq!(parse_ttl("30s").unwrap(), 30);
+        assert_eq!(parse_ttl("5m").unwrap(), 300);
+        assert_eq!(parse_ttl("2h").unwrap(), 7_200);
+        assert_eq!(parse_ttl("1d").unwrap(), 86_400);
+        assert_eq!(parse_ttl("90").unwrap(), 90, "bare value is seconds");
+        assert_eq!(parse_ttl("  7h  ").unwrap(), 25_200, "padding is trimmed");
+    }
+
+    /// 50000d is 4.32e9 seconds, past u32, where the unchecked multiply wrapped
+    /// to roughly 290 days and silently issued a shorter-lived token.
+    #[test]
+    fn parse_ttl_rejects_values_that_overflow() {
+        assert!(parse_ttl("50000d").is_err());
+        assert!(parse_ttl("2000000h").is_err());
+        assert!(parse_ttl("100000000m").is_err());
+        assert_eq!(
+            parse_ttl("4294967295").unwrap(),
+            u32::MAX,
+            "the ceiling still parses"
+        );
+    }
+
+    #[test]
+    fn parse_ttl_rejects_non_numeric_values() {
+        assert!(parse_ttl("").is_err());
+        assert!(parse_ttl("abc").is_err());
+        assert!(parse_ttl("-1h").is_err());
+        assert!(parse_ttl("1.5h").is_err());
+        assert!(parse_ttl("h").is_err());
+    }
 }

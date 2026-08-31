@@ -19,6 +19,12 @@ pub struct NodePlacement<'a> {
     job: &'a Job,
     /// Expanded, deduplicated `--nodelist`, whose cardinality determines
     /// whether the request is a candidate pool or an additive requirement.
+    /// Falls back to `job.preferred_nodes` (a QOS/account grp-node admission
+    /// credit) when the job didn't request one explicitly and this instance
+    /// was built via [`new`](NodePlacement::new), so placement honors the
+    /// same reuse assumption admission made. Instances built via
+    /// [`new_ignoring_preferred_nodes`](NodePlacement::new_ignoring_preferred_nodes)
+    /// never see that fallback.
     nodelist: Option<HashSet<String>>,
     /// `--exclude` deny-list (expanded from hostlist).
     exclude: HashSet<String>,
@@ -31,12 +37,36 @@ pub struct NodePlacement<'a> {
 impl<'a> NodePlacement<'a> {
     /// Parse a job's placement constraints once.
     pub fn new(job: &'a Job) -> Self {
+        Self::build(job, true)
+    }
+
+    /// Like [`new`](Self::new), but never falls back to `job.preferred_nodes`.
+    ///
+    /// Admission's own reuse-credit computation (the QOS and account
+    /// grp-node gates in spurctld) calls this while it is still in the
+    /// middle of *computing* `job.preferred_nodes` for the same job: the
+    /// account gate runs first and may already have written its own credited
+    /// nodes into the field before the QOS gate runs. If that gate's own
+    /// `NodePlacement` fell back to the field, the account's credit would
+    /// leak in as a spurious nodelist restriction on the QOS's independent
+    /// reuse computation. Use `new` (which intentionally honors
+    /// `preferred_nodes`) for actual scheduling/placement, once both gates
+    /// have finished computing their credits for the job.
+    pub fn new_ignoring_preferred_nodes(job: &'a Job) -> Self {
+        Self::build(job, false)
+    }
+
+    fn build(job: &'a Job, use_preferred_nodes: bool) -> Self {
         let nodelist = job
             .spec
             .nodelist
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)));
+            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
+            .or_else(|| {
+                (use_preferred_nodes && !job.preferred_nodes.is_empty())
+                    .then(|| job.preferred_nodes.clone())
+            });
 
         let exclude = job
             .spec
@@ -154,6 +184,17 @@ impl<'a> NodePlacement<'a> {
             return false;
         }
         true
+    }
+
+    /// Like [`matches`](Self::matches), but admits a busy-yet-up node as a
+    /// candidate for a *future* reservation instead of excluding it outright.
+    pub fn matches_for_reservation(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
+        !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.state.is_up()
     }
 
     fn reservation_ok(
@@ -281,6 +322,38 @@ mod tests {
     }
 
     #[test]
+    fn matches_for_reservation_admits_a_fully_busy_but_healthy_node() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut n = node("n1");
+        n.state = NodeState::Allocated;
+        n.alloc_resources = spur_core::resource::ResourceAllocations::with_scalar(64, 256_000);
+
+        assert!(!p.matches(&n, &[], now), "matches() still excludes it");
+        assert!(
+            p.matches_for_reservation(&n, &[], now),
+            "a fully-busy Allocated node is still a valid future-reservation candidate"
+        );
+    }
+
+    #[test]
+    fn matches_for_reservation_still_excludes_down_and_k0s_nodes() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut down = node("n1");
+        down.state = NodeState::Down;
+        assert!(!p.matches_for_reservation(&down, &[], now));
+
+        let mut k0s = node("n2");
+        k0s.k0s_role = Some(spur_core::k0s::K0sRole::Worker);
+        assert!(!p.matches_for_reservation(&k0s, &[], now));
+    }
+
+    #[test]
     fn malformed_hostlist_falls_back_to_comma_split() {
         // Reversed range is invalid; fallback returns the literal as one token.
         assert_eq!(
@@ -316,6 +389,100 @@ mod tests {
         assert!(p.allows_name("node001"));
         assert!(p.allows_name("node003"));
         assert!(!p.allows_name("node004"));
+    }
+
+    #[test]
+    fn preferred_nodes_restricts_when_it_fully_covers_num_nodes() {
+        let mut job = job_with(JobSpec {
+            num_nodes: 1,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string(), "node002".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(!p.nodelist_is_additive());
+        assert!(p.allows_name("node001"));
+        assert!(p.allows_name("node002"));
+        assert!(!p.allows_name("node003"));
+    }
+
+    #[test]
+    fn preferred_nodes_is_additive_when_it_falls_short_of_num_nodes() {
+        let mut job = job_with(JobSpec {
+            num_nodes: 3,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(p.nodelist_is_additive());
+        assert!(p.allows_name("node001"));
+        assert!(
+            p.allows_name("node002"),
+            "additive: nodes outside the credited set are still allowed"
+        );
+        assert!(p.is_listed("node001"));
+        assert!(!p.is_listed("node002"));
+    }
+
+    #[test]
+    fn explicit_nodelist_takes_priority_over_preferred_nodes() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node001".into()),
+            num_nodes: 1,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node002".to_string()]);
+        let p = NodePlacement::new(&job);
+        assert!(p.allows_name("node001"), "user's own nodelist must win");
+        assert!(
+            !p.allows_name("node002"),
+            "preferred_nodes must not override an explicit nodelist"
+        );
+    }
+
+    #[test]
+    fn new_ignoring_preferred_nodes_never_falls_back_to_the_field() {
+        // Admission calls this while it is still incrementally computing
+        // job.preferred_nodes across two independent gates (account, then
+        // QOS) for the same job. If the second gate's own placement view
+        // fell back to a value the first gate already wrote, that credit
+        // would leak in as a spurious restriction on the second gate's own,
+        // independent reuse computation.
+        let mut job = job_with(JobSpec {
+            num_nodes: 1,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node001".to_string()]);
+        let p = NodePlacement::new_ignoring_preferred_nodes(&job);
+        assert!(
+            !p.nodelist_is_additive(),
+            "no nodelist at all means additive() must report false (no restriction), \
+             just like a job with no --nodelist and no preferred_nodes"
+        );
+        assert!(
+            p.allows_name("node001"),
+            "not restricted to the credited set"
+        );
+        assert!(
+            p.allows_name("node999"),
+            "preferred_nodes must be completely ignored: any node is allowed"
+        );
+    }
+
+    #[test]
+    fn new_ignoring_preferred_nodes_still_honors_an_explicit_nodelist() {
+        let mut job = job_with(JobSpec {
+            nodelist: Some("node001".into()),
+            num_nodes: 1,
+            ..base_spec()
+        });
+        job.preferred_nodes = HashSet::from(["node002".to_string()]);
+        let p = NodePlacement::new_ignoring_preferred_nodes(&job);
+        assert!(
+            p.allows_name("node001"),
+            "the user's own nodelist still applies"
+        );
+        assert!(!p.allows_name("node002"));
+        assert!(!p.allows_name("node003"));
     }
 
     #[test]

@@ -155,6 +155,7 @@ fn parse_rest_gpu(
 fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
     match err {
         crate::cluster::SubmitError::InvalidArgument(m) => bad_request_response(&m),
+        crate::cluster::SubmitError::Unavailable(m) => unavailable_response(&m),
         crate::cluster::SubmitError::Internal(m) => error_response(&format!("submit failed: {m}")),
     }
 }
@@ -188,7 +189,10 @@ pub async fn get_nodes(
     State(state): State<Arc<RestState>>,
 ) -> Result<Json<ApiResponse<NodesData>>, RestError> {
     let nodes = state.cluster.get_nodes();
-    let json_nodes: Vec<serde_json::Value> = nodes.iter().map(node_to_json).collect();
+    let json_nodes: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|n| node_to_json(n, planned_reservation_if_idle(&state.cluster, n)))
+        .collect();
 
     Ok(ApiResponse::ok(NodesData { nodes: json_nodes }))
 }
@@ -202,9 +206,22 @@ pub async fn get_node(
         .get_node(&name)
         .ok_or_else(|| not_found_response(&format!("node {name} not found")))?;
 
+    let planned = planned_reservation_if_idle(&state.cluster, &node);
     Ok(ApiResponse::ok(NodesData {
-        nodes: vec![node_to_json(&node)],
+        nodes: vec![node_to_json(&node, planned)],
     }))
+}
+
+/// Only meaningful while idle — a node that has since gone
+/// Allocated/Down must not report a stale planned reservation.
+fn planned_reservation_if_idle(
+    cluster: &crate::cluster::ClusterManager,
+    node: &spur_core::node::Node,
+) -> Option<(spur_core::job::JobId, chrono::DateTime<chrono::Utc>)> {
+    if node.state != spur_core::node::NodeState::Idle {
+        return None;
+    }
+    cluster.planned_reservation(&node.name)
 }
 
 pub async fn get_partitions(

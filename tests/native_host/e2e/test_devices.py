@@ -107,7 +107,6 @@ def _render_video_user(cluster: SpurCluster) -> str | None:
     return both[0] if both else None
 
 
-
 class TestCdiAutoDetect:
     def test_autodetect_and_metadata(self, gpu_cluster):
         cluster = gpu_cluster
@@ -133,7 +132,6 @@ class TestCdiAutoDetect:
         cluster.assert_spurd_registry(0, min_gpus=before)
         after = cluster.spurd_registry_gpu_count(0)
         assert after == before, f"GPU count changed after restart: {before} -> {after}"
-
 
 
 class TestGresScheduling:
@@ -223,7 +221,6 @@ class TestGresScheduling:
 
         _, _, content2 = _submit_probe(cluster, probe, f"gpu:{n}", job_name="gres-rel-2")
         assert "PROBE_OK" in content2
-
 
 
 class TestNativeInjection:
@@ -331,7 +328,6 @@ echo "SPUR_JOB_GPUS=$SPUR_JOB_GPUS" > '{rd}/hook-out/prolog-gpu.log'
         assert "SPUR_JOB_GPUS=" in hook_log, hook_log
         spur_gpus = hook_log.strip().split("=", 1)[1]
         assert len(spur_gpus.split(",")) == 2, hook_log
-
 
 
 class TestConcurrentAllocation:
@@ -447,7 +443,6 @@ class TestConcurrentAllocation:
         cluster.scancel(str(id_c))
 
 
-
 @pytest.fixture
 def gpu_container_cluster(gpu_cluster, tmp_path):
     cluster = gpu_cluster
@@ -490,8 +485,6 @@ class TestContainerInjection:
         assert parsed.get("RENDER_COUNT") == "2", (
             f"expected RENDER_COUNT=2 in container\n{content}"
         )
-
-
 
 
 class TestMultiNodeSpread:
@@ -571,7 +564,10 @@ class TestMultiNodeSpread:
         assert content.count("PROBE_OK") >= 4, content
 
 
-
+# Every case asserts a real GPU device registry but uses the generic
+# unstarted_cluster fixture, so fixture-based auto-marking misses them; mark
+# the whole class explicitly.
+@pytest.mark.gpu
 class TestConfigModes:
     def test_config_autodetect_default(self, unstarted_cluster):
         cluster = unstarted_cluster

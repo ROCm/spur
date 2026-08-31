@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from cluster import parse_job_id, job_state, SpurCluster
+from cluster import parse_job_id, job_state
 
 
 def _wait_job_terminal(cluster, job_id, timeout=120):
@@ -88,7 +88,6 @@ class TestDrainAndRemove:
     def test_drain_and_remove(self, multi_node_cluster):
         cluster = multi_node_cluster
         node0 = cluster.node_names[0]
-        node1 = cluster.node_names[1]
 
         cluster.cli(["spur", "node", "drain", node0, "--reason", "maintenance"])
         _wait_node_state(cluster, node0, ["drain"])

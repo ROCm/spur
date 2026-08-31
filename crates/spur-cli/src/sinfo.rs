@@ -45,6 +45,10 @@ pub struct SinfoArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
+    /// Accepted for Slurm compatibility; has no effect
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -329,13 +333,16 @@ fn resolve_partition_field(
 }
 
 fn effective_state_str(node: &NodeInfo) -> String {
-    if !node.active_reservation.is_empty()
-        && node.state == spur_proto::proto::NodeState::NodeIdle as i32
-    {
-        if node.reservation_maint {
-            return "maint".into();
+    if node.state == spur_proto::proto::NodeState::NodeIdle as i32 {
+        if !node.active_reservation.is_empty() {
+            if node.reservation_maint {
+                return "maint".into();
+            }
+            return "resv".into();
         }
-        return "resv".into();
+        if node.planned_job_id != 0 {
+            return "plnd".into();
+        }
     }
     spur_core::node::NodeState::from_proto_i32(node.state)
         .map(|s| s.short().to_string())
@@ -347,7 +354,7 @@ mod tests {
     use super::*;
     use spur_proto::proto as pb;
     use spur_proto::proto::slurm_controller_server::SlurmController;
-    use spur_proto::proto::NodeState;
+    use spur_proto::proto::{NodeState, ResourceSet};
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status};
 
@@ -387,6 +394,45 @@ mod tests {
         let args = parse_sinfo_args(&["sinfo", "-t", "idle"]);
         let req = build_get_nodes_request(&args).unwrap();
         assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
+    }
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = parse_sinfo_args(&["sinfo", "--noconvert"]);
+        assert!(args.noconvert);
+    }
+
+    #[test]
+    fn memory_columns_render_as_raw_megabytes_with_and_without_noconvert() {
+        // Pins that %m/%e are raw MB today; humanizing them later turns this red.
+        let mut node = make_node("gpu001", NodeState::NodeIdle, "gpu");
+        node.total_resources = Some(ResourceSet {
+            memory_mb: 2_321_924,
+            ..Default::default()
+        });
+        node.free_memory_mb = 11_077;
+        let partitions = vec![make_partition("gpu", true)];
+
+        for argv in [
+            ["sinfo", "-N", "-h", "-o", "%m %e"].as_slice(),
+            ["sinfo", "-N", "-h", "-o", "%m %e", "--noconvert"].as_slice(),
+        ] {
+            let args = parse_sinfo_args(argv);
+            let fields = format_engine::parse_format(
+                args.format.as_deref().expect("-o sets format"),
+                &format_engine::sinfo_header,
+            );
+
+            let lines = render_sinfo_output(
+                &fields,
+                &partitions,
+                std::slice::from_ref(&node),
+                args.node_oriented,
+            );
+
+            assert_eq!(lines, ["2321924 11077"], "argv: {argv:?}");
+        }
     }
 
     #[test]
@@ -805,6 +851,27 @@ mod tests {
     #[test]
     fn test_effective_state_mixed_reserved() {
         let node = make_reserved_node("n1", NodeState::NodeMixed, "p", "maint");
+        assert_eq!(effective_state_str(&node), "mix");
+    }
+
+    #[test]
+    fn test_effective_state_idle_with_planned_reservation_shows_plnd() {
+        let mut node = make_node("n1", NodeState::NodeIdle, "p");
+        node.planned_job_id = 42;
+        assert_eq!(effective_state_str(&node), "plnd");
+    }
+
+    #[test]
+    fn test_effective_state_active_reservation_wins_over_planned() {
+        let mut node = make_reserved_node("n1", NodeState::NodeIdle, "p", "resv1");
+        node.planned_job_id = 42;
+        assert_eq!(effective_state_str(&node), "resv");
+    }
+
+    #[test]
+    fn test_effective_state_planned_only_applies_when_idle() {
+        let mut node = make_node("n1", NodeState::NodeMixed, "p");
+        node.planned_job_id = 42;
         assert_eq!(effective_state_str(&node), "mix");
     }
 
