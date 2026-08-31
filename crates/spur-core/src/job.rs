@@ -264,6 +264,7 @@ pub enum PendingReason {
     /// time limit. Sibling of `DeadLine`, which fires before the job ever starts.
     TimeLimit,
     Licenses,
+    JobArrayTaskLimit,
     NonZeroExitCode,
     RaisedSignal,
     JobLaunchFailure,
@@ -366,6 +367,7 @@ impl PendingReason {
             Self::DeadLine => "DeadLine",
             Self::TimeLimit => "TimeLimit",
             Self::Licenses => "Licenses",
+            Self::JobArrayTaskLimit => "JobArrayTaskLimit",
             Self::NonZeroExitCode => "NonZeroExitCode",
             Self::RaisedSignal => "RaisedSignal",
             Self::JobLaunchFailure => "JobLaunchFailure",
@@ -2220,6 +2222,7 @@ mod tests {
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
         (PendingReason::TimeLimit, "TimeLimit"),
+        (PendingReason::JobArrayTaskLimit, "JobArrayTaskLimit"),
         (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
         (
             PendingReason::AssocMaxSubmitJobLimit,
@@ -2263,6 +2266,16 @@ mod tests {
             assert_eq!(reason.display(), *expected, "Display for {reason:?}");
             assert_eq!(format!("{reason}"), *expected, "fmt for {reason:?}");
         }
+    }
+
+    #[test]
+    fn job_array_task_limit_reason_serializes_by_name() {
+        let encoded = serde_json::to_string(&PendingReason::JobArrayTaskLimit).unwrap();
+        assert_eq!(encoded, r#""JobArrayTaskLimit""#);
+        assert_eq!(
+            serde_json::from_str::<PendingReason>(&encoded).unwrap(),
+            PendingReason::JobArrayTaskLimit
+        );
     }
 
     #[test]
