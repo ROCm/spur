@@ -1042,11 +1042,29 @@ impl<E: Into<anyhow::Error>> From<E> for DispatchError {
     }
 }
 
+/// Ceiling on one agent RPC in a fan-out that is drained to completion. `0` disables it, matching
+/// the sibling `dispatch_reject_cooldown_secs` knob.
+fn dispatch_deadline(cluster: &ClusterManager) -> Option<Duration> {
+    match cluster.config().controller.dispatch_timeout_secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
 /// Send a LaunchJob RPC to a node agent.
 async fn dispatch_to_agent(
     agent_addr: &str,
     params: &AgentDispatchParams<'_>,
 ) -> Result<LaunchOutcome, DispatchError> {
+    // Logged before the call, not just on its outcome: a launch that never returns is otherwise
+    // invisible for as long as it hangs, which is exactly when an operator needs to see it.
+    info!(
+        job_id = params.job_id,
+        node = params.target_node,
+        agent = agent_addr,
+        run_attempt = params.run_attempt,
+        "dispatching job to agent"
+    );
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
         .map_err(|e| DispatchError::Unreachable(e.into()))?
@@ -1318,6 +1336,7 @@ async fn register_allocation_on_nodes(
     let mut failures = 0u32;
     let mut succeeded_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
+    let dispatch_timeout = dispatch_deadline(&cluster);
 
     let mut set = tokio::task::JoinSet::new();
     for node_name in &dispatch_nodes {
@@ -1360,7 +1379,17 @@ async fn register_allocation_on_nodes(
             work_dir: spec.work_dir.clone(),
         };
         set.spawn(async move {
-            let result = register_allocation_to_agent(&agent_addr, &params).await;
+            let register = register_allocation_to_agent(&agent_addr, &params);
+            let result = match dispatch_timeout {
+                Some(limit) => match tokio::time::timeout(limit, register).await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "allocation register RPC exceeded {}s",
+                        limit.as_secs()
+                    )),
+                },
+                None => register.await,
+            };
             (result_node, result)
         });
     }
@@ -1508,6 +1537,7 @@ async fn confirm_dispatch_on_nodes(
     let modex_connect_timeout_secs = cluster.config().mpi.modex_connect_timeout_secs;
     let modex_fence_timeout_secs = cluster.config().mpi.modex_fence_timeout_secs;
     let modex_verify_timeout_secs = cluster.config().mpi.modex_verify_timeout_secs;
+    let dispatch_timeout = dispatch_deadline(&cluster);
 
     let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
         spec.mpi.as_deref(),
@@ -1654,28 +1684,37 @@ async fn confirm_dispatch_on_nodes(
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
         set.spawn(async move {
-            let result = dispatch_to_agent(
-                &agent_addr,
-                &AgentDispatchParams {
-                    job_id,
-                    spec: &spec,
-                    peer_nodes: &peer_addrs,
-                    peer_hosts: &peer_hosts,
-                    node_index,
-                    task_offset,
-                    target_node: &target_node,
-                    allocated: &allocated,
-                    allocated_nodelist: &allocated_nodelist,
-                    run_attempt,
-                    pmix_tmpdir: &pmix_tmpdir,
-                    task_fanout,
-                    modex_connect_timeout_secs,
-                    modex_fence_timeout_secs,
-                    modex_verify_timeout_secs,
-                    pmix_prepared: needs_pmix_prepare,
+            let params = AgentDispatchParams {
+                job_id,
+                spec: &spec,
+                peer_nodes: &peer_addrs,
+                peer_hosts: &peer_hosts,
+                node_index,
+                task_offset,
+                target_node: &target_node,
+                allocated: &allocated,
+                allocated_nodelist: &allocated_nodelist,
+                run_attempt,
+                pmix_tmpdir: &pmix_tmpdir,
+                task_fanout,
+                modex_connect_timeout_secs,
+                modex_fence_timeout_secs,
+                modex_verify_timeout_secs,
+                pmix_prepared: needs_pmix_prepare,
+            };
+            let dispatch = dispatch_to_agent(&agent_addr, &params);
+            // The join below drains every node, so one agent that accepts the call and never answers
+            // would otherwise hold the whole scheduler loop, not just this job.
+            let result = match dispatch_timeout {
+                Some(limit) => match tokio::time::timeout(limit, dispatch).await {
+                    Ok(result) => result,
+                    Err(_) => Err(DispatchError::Unreachable(anyhow::anyhow!(
+                        "launch RPC exceeded {}s",
+                        limit.as_secs()
+                    ))),
                 },
-            )
-            .await;
+                None => dispatch.await,
+            };
             (result_node, is_primary, result)
         });
     }
@@ -1697,10 +1736,12 @@ async fn confirm_dispatch_on_nodes(
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
                     }
-                    DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
-                    DispatchError::Unreachable(_)
-                    | DispatchError::AgentRejected(_)
-                    | DispatchError::Other(_) => {}
+                    // An unreachable node stays a candidate otherwise, so the next job pays the same
+                    // dispatch timeout again and the queue walks itself into max-requeue holds.
+                    DispatchError::ResourcesUnavailable | DispatchError::Unreachable(_) => {
+                        cluster.cool_down_node(&node_name)
+                    }
+                    DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
             Err(e) => {
@@ -1751,11 +1792,9 @@ async fn confirm_dispatch_on_nodes(
     };
     let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
-    // Stop whatever DID launch before the job settles anywhere: a node that
-    // never confirmed will never report completion, and letting it keep
-    // running while the job as a whole is aborted back to Pending would
-    // orphan it.
-    cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+    // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
+    // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
+    cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 9).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -4328,6 +4367,59 @@ mod tests {
 
             assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed));
             elapsed
+        }
+
+        /// The node that timed out is the one most likely to have launched anyway, so it is the one
+        /// that must be cancelled — cancelling only the confirmed nodes orphans it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_whose_launch_times_out_is_still_cancelled() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_timeout_secs = 1;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (fast_addr, fast_cancels) = spawn_mock_agent().await;
+            let (slow_addr, slow_cancels) =
+                spawn_mock_agent_with_delay(Duration::from_secs(30)).await;
+            register_node_at(&cm, "n-fast", fast_addr);
+            register_node_at(&cm, "n-slow", slow_addr);
+
+            let nodes = vec!["n-fast".to_string(), "n-slow".to_string()];
+            let spec = batch_spec("timeout-cancel", 2);
+            let job_id = submit_and_wait(&cm, spec);
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let nodelist = nodes.join(",");
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(
+                !matches!(outcome, DispatchConfirmOutcome::Confirmed),
+                "a node that never answered must not count as confirmed"
+            );
+            assert!(
+                slow_cancels.load(Ordering::SeqCst) > 0,
+                "the timed-out node received no cancel and would keep running the job"
+            );
+            assert!(
+                fast_cancels.load(Ordering::SeqCst) > 0,
+                "the confirmed node must still be cancelled when admission aborts"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 16)]

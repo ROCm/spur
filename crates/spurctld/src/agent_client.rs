@@ -29,6 +29,15 @@ use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 /// enough to tolerate clock skew between the controller and a node.
 const CREDENTIAL_TTL_SECS: u64 = 300;
 
+/// Dial budget only. A request budget belongs at the call site, where the operation's real duration
+/// is known — a launch runs the node prolog, a k0s start downloads a binary.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Liveness for an established channel: a peer that accepts TCP then stops answering is torn down
+/// after roughly the interval plus the timeout, without capping a legitimately slow RPC.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Subject the agent sees for controller-issued credentials. Shared with the agent (which gates
 /// controller-only RPCs on it) via `spur_core::auth` so the two cannot drift apart.
 use spur_core::auth::CONTROLLER_SUBJECT;
@@ -112,10 +121,11 @@ fn credential() -> ControllerCredential {
 pub async fn connect(
     endpoint: String,
 ) -> Result<SlurmAgentClient<AgentChannel>, tonic::transport::Error> {
-    let timeout = Duration::from_secs(5);
     let channel = tonic::transport::Endpoint::from_shared(endpoint)?
-        .connect_timeout(timeout)
-        .timeout(timeout)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
         .connect()
         .await?;
     Ok(SlurmAgentClient::new(InterceptedService::new(
@@ -190,14 +200,11 @@ mod tests {
         assert_eq!(id1.is_admin, id2.is_admin);
     }
 
-    #[tokio::test]
-    async fn agent_request_is_bounded() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let mut client = connect(endpoint).await.unwrap();
-
-        let result = client.get_node_resources(()).await;
-
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Cancelled);
+    /// A dial budget is the only deadline this layer may impose: a request budget here would cap
+    /// launch, which legitimately runs the node prolog.
+    #[test]
+    fn connect_budget_is_a_dial_budget_only() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert!(KEEP_ALIVE_INTERVAL + KEEP_ALIVE_TIMEOUT < Duration::from_secs(60));
     }
 }

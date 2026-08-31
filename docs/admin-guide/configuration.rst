@@ -252,6 +252,15 @@ and Raft high-availability topology.
      - Live
      - How long a node is skipped for dispatch after rejecting a launch as
        resources-unavailable.
+   * - ``dispatch_timeout_secs``
+     - integer
+     - ``300``
+     - Live
+     - Ceiling on a single launch or allocation-register RPC to an agent. The
+       agent runs the node prolog and any container image unpack before it
+       answers, so this must exceed your slowest prolog. ``0`` disables it. A
+       node that accepts the connection and then stops responding is detected
+       by channel keepalive within roughly 20 seconds regardless of this value.
    * - ``job_info_visibility``
      - string
      - ``redacted``

@@ -342,6 +342,12 @@ pub struct ControllerConfig {
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
 
+    /// Ceiling on a single launch RPC, which runs the node prolog and any image unpack before it
+    /// answers (default 300, 0 disables). Generous by design: a silent peer is caught by channel
+    /// keepalive, not by this.
+    #[serde(default = "default_dispatch_timeout_secs")]
+    pub dispatch_timeout_secs: u64,
+
     /// How much of another user's job a non-owner may see via `get_job` /
     /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
     /// the full record; this governs everyone else. Default: `redacted`.
@@ -383,6 +389,10 @@ fn default_terminal_job_retention_secs() -> u64 {
 
 fn default_dispatch_reject_cooldown_secs() -> u64 {
     30
+}
+
+fn default_dispatch_timeout_secs() -> u64 {
+    300
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -445,6 +455,7 @@ impl Default for ControllerConfig {
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
             terminal_job_retention_secs: default_terminal_job_retention_secs(),
             dispatch_reject_cooldown_secs: default_dispatch_reject_cooldown_secs(),
+            dispatch_timeout_secs: default_dispatch_timeout_secs(),
             job_info_visibility: JobInfoVisibility::default(),
         }
     }
