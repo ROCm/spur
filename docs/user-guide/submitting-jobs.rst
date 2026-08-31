@@ -264,6 +264,10 @@ A job array submits many near-identical tasks from one script. Use ``--array``
    sbatch --array=0-99%10 train.sh
 
 This submits 100 tasks (indices ``0``–``99``) with at most 10 running at a time.
+Tasks held back by the ``%10`` cap show ``Reason=JobArrayTaskLimit`` in
+``squeue``/``scontrol show job`` until a running task completes and frees a
+slot.
+
 Each task sees its array identity through these variables (each with a
 ``SLURM_*`` twin):
 

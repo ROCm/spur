@@ -171,8 +171,9 @@ For a pending job the ``NODELIST(REASON)`` column shows why it is waiting.
 Common reasons include ``Priority`` (waiting its turn), ``Resources`` (waiting
 for nodes to free up), ``Dependency`` (waiting on another job), ``Reservation``
 (waiting for a reservation window), ``Preempted`` (requeue-preempted and held
-until its eligibility window reopens), and various QOS or association limit
-reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
+until its eligibility window reopens), ``JobArrayTaskLimit`` (held back by the
+array's own ``%N`` concurrency cap, see :ref:`submit-arrays`), and various QOS
+or association limit reasons (``QOSMax*``, ``AssocMax*``, ``AssocGrp*``).
 
 View Nodes & Partitions — ``sinfo``
 -----------------------------------
