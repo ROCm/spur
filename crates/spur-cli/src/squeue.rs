@@ -109,15 +109,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         None => default_sort_keys(),
     };
 
-    // Parse job ID filter
     let job_ids = args
         .jobs
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|j| j.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+        .as_deref()
+        .map(crate::job_id_arg::parse_job_ids)
         .unwrap_or_default();
 
     // Expand the -w node filter before any network I/O so a bad hostlist

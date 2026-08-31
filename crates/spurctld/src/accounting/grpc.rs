@@ -257,17 +257,17 @@ impl SlurmAccounting for AccountingService {
             Some(req.account.as_str())
         };
 
-        let job_ids: Vec<i32> = req.job_ids.iter().map(|id| *id as i32).collect();
-
         let records = db::get_job_history(
             pool,
-            user,
-            account,
-            start_after,
-            start_before,
-            &states,
-            &job_ids,
-            req.limit,
+            &db::JobHistoryQuery {
+                user,
+                account,
+                start_after,
+                start_before,
+                states: &states,
+                job_ids: &req.job_ids,
+                limit: req.limit,
+            },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;

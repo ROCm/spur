@@ -274,6 +274,9 @@ Flags:
        ``COMPLETED``/``CD``, ``FAILED``/``F``, ``CANCELLED``/``CA``,
        ``TIMEOUT``/``TO``, ``NODE_FAIL``/``NF``, ``PREEMPTED``/``PR``,
        ``DEADLINE``/``DL``, ``RUNNING``/``R``, ``PENDING``/``PD``.
+   * - ``--jobs``
+     - ``-j``
+     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base job).
    * - ``--format``
      - ``-o``
      - Comma-separated field names (see below).
