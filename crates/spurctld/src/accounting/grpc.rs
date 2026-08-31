@@ -259,12 +259,15 @@ impl SlurmAccounting for AccountingService {
 
         let records = db::get_job_history(
             pool,
-            user,
-            account,
-            start_after,
-            start_before,
-            &states,
-            req.limit,
+            &db::JobHistoryQuery {
+                user,
+                account,
+                start_after,
+                start_before,
+                states: &states,
+                job_ids: &req.job_ids,
+                limit: req.limit,
+            },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
