@@ -76,6 +76,12 @@ def _require_cores(cluster, needed: int) -> None:
         pytest.skip(f"need a node with at least {needed} cores (node 0 has {cores})")
 
 
+def _spurd_logs(cluster) -> str:
+    """Every agent log joined: an unpinned job lands on whichever node the
+    scheduler picked, so node 0 alone is not where the evidence has to be."""
+    return "\n".join(cluster.spurd_log(i) for i in range(len(cluster.nodes)))
+
+
 def _run_probe(
     cluster, sbatch_args: list[str], name: str, *, expect_enforced: bool = True
 ) -> _Probe:
@@ -267,20 +273,21 @@ class TestCgroupRequired:
         job_id = parse_job_id(sb)
         assert job_id is not None, f"sbatch failed: {sb}"
 
-        # A refused launch is retried, so the job stays pending rather than failing.
-        # What matters is that the body never runs and the agent says why.
+        # A refused launch is retried, so the job stays pending: poll the log, not state.
+        # Match the refusal itself — the startup banner also says `required`.
+        refusal = "required but"
         deadline = time.time() + 45
         while time.time() < deadline:
-            if "required" in cluster.spurd_log(0):
+            if refusal in _spurd_logs(cluster):
                 break
             time.sleep(2)
 
         assert "RAN" not in cluster.read_output_on_any_node(out_path), (
             f"job body executed despite [cgroup] required\n{cluster.debug_job(job_id)}"
         )
-        assert "required but" in cluster.spurd_log(0), (
+        assert refusal in _spurd_logs(cluster), (
             "agent must log why it refused the launch\n"
-            f"{cluster.spurd_log(0)[-2000:]}"
+            f"{_spurd_logs(cluster)[-2000:]}"
         )
         cluster.scancel(str(job_id))
 

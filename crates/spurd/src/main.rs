@@ -56,6 +56,38 @@ fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
     }
 }
 
+/// Record the enforcement posture at startup: `[cgroup]` decides whether a job is
+/// bounded at all, and the agent log is the only place that shows what it booted with.
+fn log_cgroup_status(cgroup: &spur_core::config::CgroupConfig) {
+    if !cgroup.enabled {
+        warn!("[cgroup] enforcement disabled; jobs run with no cpu or memory bound");
+        return;
+    }
+    info!(
+        required = cgroup.required,
+        constrain_cores = cgroup.constrain_cores,
+        cpu_quota = cgroup.cpu_quota,
+        constrain_ram_space = cgroup.constrain_ram_space,
+        allowed_ram_percent = cgroup.allowed_ram_percent,
+        constrain_swap = cgroup.constrain_swap,
+        allowed_swap_percent = cgroup.allowed_swap_percent,
+        min_ram_mb = cgroup.min_ram_mb,
+        oom_kill_job = cgroup.oom_kill_job,
+        "cgroup enforcement"
+    );
+    // An unprivileged agent cannot create the cgroup root, so `required` turns every
+    // launch into a refusal. Say so now rather than once per rejected job.
+    if cgroup.required && unsafe { libc::geteuid() } != 0 {
+        warn!("[cgroup] required = true but spurd is not root; every job launch will be refused");
+    }
+    if cgroup.constrain_swap && cgroup.allowed_swap_percent == 0 {
+        info!(
+            "[cgroup] swap denied outright (allowed_swap_percent = 0); a job that outgrows \
+             its allocation is OOM-killed rather than paging out"
+        );
+    }
+}
+
 /// Whether a best-effort config load failed only because no file exists at the default
 /// path, which is the expected shape for an agent configured entirely by flags.
 ///
@@ -334,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|c| c.cgroup.clone())
         .unwrap_or_default();
+    log_cgroup_status(&cgroup_config);
     let cluster_config = config
         .as_ref()
         .map(|c| c.cluster.clone())
