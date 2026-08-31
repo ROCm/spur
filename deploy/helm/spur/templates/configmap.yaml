@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spur.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.labels" . | nindent 4 }}
+data:
+  spur.conf: |
+    cluster_name = {{ .Values.clusterName | quote }}
+
+    [controller]
+    # Raft peers — derived from controller.replicaCount.
+    # node_id is auto-detected from the pod hostname ordinal (spurctld-N → N+1).
+    peers = [
+      {{- include "spur.raftPeers" . | nindent 6 }}
+    ]
+
+    [scheduler]
+    interval_secs = {{ .Values.config.scheduler.intervalSecs }}
+    max_jobs_per_cycle = {{ .Values.config.scheduler.maxJobsPerCycle }}
+    plugin = {{ .Values.config.scheduler.plugin | quote }}
+
+    {{- if .Values.accounting.enabled }}
+
+    [accounting]
+    host = {{ include "spur.accountingHost" . | quote }}
+    {{- end }}
+
+    {{- range .Values.config.partitions }}
+
+    [[partitions]]
+    name = {{ .name | quote }}
+    state = {{ .state | quote }}
+    default = {{ .default }}
+    nodes = {{ .nodes | quote }}
+    max_time = {{ .maxTime | quote }}
+    default_time = {{ .defaultTime | quote }}
+    {{- end }}
+
+    {{- with .Values.config.extraToml }}
+
+    {{ . | nindent 4 }}
+    {{- end }}
