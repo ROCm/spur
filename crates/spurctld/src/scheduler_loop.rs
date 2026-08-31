@@ -349,8 +349,10 @@ async fn process_assignment(
                 }
                 return false;
             }
-            AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
-                cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+            AllocationRegisterOutcome::PartialFailed => {
+                // Same reasoning as the dispatch abort: a node that timed out may have registered
+                // anyway, and it is the one node cancelling only the successes would miss.
+                cancel_job_on_nodes(&cluster, job_id, &all_nodes, 9).await;
                 if let Err(e) = cluster.requeue_job(job_id) {
                     error!(job_id, error = %e, "failed to requeue after partial registration");
                 }
@@ -1002,6 +1004,9 @@ enum DispatchError {
     /// Connect failed, or the RPC timed out without a response, as opposed to
     /// the agent responding with an explicit rejection.
     Unreachable(anyhow::Error),
+    /// The agent held the call for the whole dispatch deadline. Distinct from `Unreachable`, which
+    /// a refused connection also produces in milliseconds and must not earn the same long cooldown.
+    TimedOut(Duration),
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
@@ -1016,6 +1021,7 @@ impl DispatchError {
             Self::PrologFailed(_) => "prolog failure",
             Self::ResourcesUnavailable => "gpu/resource allocation mismatch",
             Self::Unreachable(_) => "agent unreachable",
+            Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
             Self::Other(_) => "dispatch error",
         }
@@ -1030,6 +1036,9 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent rejected job: allocated resources unavailable")
             }
             Self::Unreachable(e) => write!(f, "agent unreachable: {e:#}"),
+            Self::TimedOut(limit) => {
+                write!(f, "agent did not answer within {}s", limit.as_secs())
+            }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
@@ -1266,7 +1275,7 @@ fn build_pmix_plan_proto(
 pub(crate) enum AllocationRegisterOutcome {
     AllSucceeded,
     AllFailed,
-    PartialFailed { succeeded_nodes: Vec<String> },
+    PartialFailed,
 }
 
 /// Parameters for registering a srun-only allocation on a single node agent.
@@ -1334,7 +1343,6 @@ async fn register_allocation_on_nodes(
 ) -> AllocationRegisterOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
-    let mut succeeded_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
     let dispatch_timeout = dispatch_deadline(&cluster);
 
@@ -1396,9 +1404,8 @@ async fn register_allocation_on_nodes(
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((node_name, Ok(()))) => {
+            Ok((_node_name, Ok(()))) => {
                 successes += 1;
-                succeeded_nodes.push(node_name);
             }
             Ok((node_name, Err(e))) => {
                 error!(
@@ -1424,7 +1431,7 @@ async fn register_allocation_on_nodes(
             job_id,
             successes, failures, "partial allocation registration failure"
         );
-        AllocationRegisterOutcome::PartialFailed { succeeded_nodes }
+        AllocationRegisterOutcome::PartialFailed
     } else {
         AllocationRegisterOutcome::AllSucceeded
     }
@@ -1523,7 +1530,6 @@ async fn confirm_dispatch_on_nodes(
 ) -> DispatchConfirmOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
-    let mut succeeded_nodes: Vec<String> = Vec::new();
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
@@ -1708,10 +1714,7 @@ async fn confirm_dispatch_on_nodes(
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, dispatch).await {
                     Ok(result) => result,
-                    Err(_) => Err(DispatchError::Unreachable(anyhow::anyhow!(
-                        "launch RPC exceeded {}s",
-                        limit.as_secs()
-                    ))),
+                    Err(_) => Err(DispatchError::TimedOut(limit)),
                 },
                 None => dispatch.await,
             };
@@ -1721,9 +1724,8 @@ async fn confirm_dispatch_on_nodes(
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((node_name, is_primary, Ok(outcome))) => {
+            Ok((_node_name, is_primary, Ok(outcome))) => {
                 successes += 1;
-                succeeded_nodes.push(node_name);
                 if is_primary {
                     primary_outcome = Some(outcome);
                 }
@@ -1736,13 +1738,12 @@ async fn confirm_dispatch_on_nodes(
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
                     }
-                    DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
-                    // Held for the deadline it just burned, not the much shorter reject cooldown:
-                    // while assignments are processed serially, re-picking it stalls every job.
-                    DispatchError::Unreachable(_) => match dispatch_timeout {
-                        Some(limit) => cluster.cool_down_node_for(&node_name, limit),
-                        None => cluster.cool_down_node(&node_name),
-                    },
+                    DispatchError::ResourcesUnavailable | DispatchError::Unreachable(_) => {
+                        cluster.cool_down_node(&node_name)
+                    }
+                    // Held for the deadline it actually burned: while assignments are processed
+                    // serially, re-picking this node stalls every job behind it, not just this one.
+                    DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
                     DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
@@ -4369,6 +4370,66 @@ mod tests {
 
             assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed));
             elapsed
+        }
+
+        /// A refused connection fails in milliseconds and must not buy the long deadline cooldown,
+        /// or a rolling agent restart sidelines the whole cluster at once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_fast_dispatch_failure_does_not_earn_the_deadline_cooldown() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            // Disabling the short cooldown makes the two paths distinguishable: only
+            // cool_down_node_for can put a node in the map now.
+            config.controller.dispatch_reject_cooldown_secs = 0;
+            config.controller.dispatch_timeout_secs = 300;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            register_node_at(&cm, "n-dead", unreachable_addr().await);
+
+            let nodes = vec!["n-dead".to_string()];
+            let spec = batch_spec("fast-fail", 1);
+            let job_id = submit_and_wait(&cm, spec);
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let nodelist = nodes.join(",");
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(
+                !cm.nodes_on_dispatch_cooldown().contains("n-dead"),
+                "a connect failure must use the reject cooldown, not the dispatch deadline"
+            );
+        }
+
+        #[test]
+        fn a_zero_dispatch_timeout_disables_the_deadline() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_timeout_secs = 0;
+            let cm = ClusterManager::new(config, dir.path()).unwrap();
+            assert_eq!(dispatch_deadline(&cm), None);
+
+            let dir2 = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_timeout_secs = 7;
+            let cm = ClusterManager::new(config, dir2.path()).unwrap();
+            assert_eq!(dispatch_deadline(&cm), Some(Duration::from_secs(7)));
         }
 
         /// The node that timed out is the one most likely to have launched anyway, so it is the one

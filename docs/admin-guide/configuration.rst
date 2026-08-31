@@ -258,9 +258,12 @@ and Raft high-availability topology.
      - Live
      - Ceiling on a single launch or allocation-register RPC to an agent. The
        agent runs the node prolog and any container image unpack before it
-       answers, so this must exceed your slowest prolog. ``0`` disables it. A
-       node that accepts the connection and then stops responding is detected
-       by channel keepalive within roughly 20 seconds regardless of this value.
+       answers, so this must exceed your slowest prolog. ``0`` disables it.
+       A node that has died or become unreachable is detected sooner, by
+       channel keepalive; an agent that is still running but whose launch
+       never completes is bounded only by this value. A node that exceeds it
+       is skipped for new dispatch for the same span, and is not marked down,
+       so it still appears available in ``sinfo`` while being skipped.
    * - ``job_info_visibility``
      - string
      - ``redacted``

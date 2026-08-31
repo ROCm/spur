@@ -342,9 +342,8 @@ pub struct ControllerConfig {
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
 
-    /// Ceiling on a single launch RPC, which runs the node prolog and any image unpack before it
-    /// answers (default 300, 0 disables). Generous by design: a silent peer is caught by channel
-    /// keepalive, not by this.
+    /// Ceiling on a single launch or allocation-register RPC to an agent (default 300, 0 disables).
+    /// Must exceed the slowest node prolog, which runs inside the launch call.
     #[serde(default = "default_dispatch_timeout_secs")]
     pub dispatch_timeout_secs: u64,
 
@@ -1513,6 +1512,17 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be at most {})",
                     self.controller.dispatch_reject_cooldown_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // A timed-out node is cooled down for this span, so it feeds the same map and needs the
+        // same ceiling.
+        if self.controller.dispatch_timeout_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.dispatch_timeout_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.dispatch_timeout_secs, MAX_LAUNCH_BACKOFF_SECS
                 ),
             });
         }

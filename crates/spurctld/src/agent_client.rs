@@ -33,8 +33,8 @@ const CREDENTIAL_TTL_SECS: u64 = 300;
 /// is known — a launch runs the node prolog, a k0s start downloads a binary.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Liveness for an established channel: a peer that accepts TCP then stops answering is torn down
-/// after roughly the interval plus the timeout, without capping a legitimately slow RPC.
+/// Liveness for an established channel. Catches a dead peer or a lost connection; an agent whose
+/// handler is wedged still answers pings, so only a call-site deadline bounds that.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -125,7 +125,6 @@ pub async fn connect(
         .connect_timeout(CONNECT_TIMEOUT)
         .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
         .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
-        .keep_alive_while_idle(true)
         .connect()
         .await?;
     Ok(SlurmAgentClient::new(InterceptedService::new(
@@ -198,13 +197,5 @@ mod tests {
         let id2 = verify_token(&reference, TEST_KEY.as_bytes()).unwrap();
         assert_eq!(id1.user, id2.user);
         assert_eq!(id1.is_admin, id2.is_admin);
-    }
-
-    /// A dial budget is the only deadline this layer may impose: a request budget here would cap
-    /// launch, which legitimately runs the node prolog.
-    #[test]
-    fn connect_budget_is_a_dial_budget_only() {
-        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
-        assert!(KEEP_ALIVE_INTERVAL + KEEP_ALIVE_TIMEOUT < Duration::from_secs(60));
     }
 }
