@@ -1736,11 +1736,13 @@ async fn confirm_dispatch_on_nodes(
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
                     }
-                    // An unreachable node stays a candidate otherwise, so the next job pays the same
-                    // dispatch timeout again and the queue walks itself into max-requeue holds.
-                    DispatchError::ResourcesUnavailable | DispatchError::Unreachable(_) => {
-                        cluster.cool_down_node(&node_name)
-                    }
+                    DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
+                    // Held for the deadline it just burned, not the much shorter reject cooldown:
+                    // while assignments are processed serially, re-picking it stalls every job.
+                    DispatchError::Unreachable(_) => match dispatch_timeout {
+                        Some(limit) => cluster.cool_down_node_for(&node_name, limit),
+                        None => cluster.cool_down_node(&node_name),
+                    },
                     DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }

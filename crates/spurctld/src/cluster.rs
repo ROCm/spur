@@ -556,7 +556,16 @@ impl ClusterManager {
         if secs == 0 {
             return;
         }
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.cool_down_node_for(name, std::time::Duration::from_secs(secs));
+    }
+
+    /// Cool down for an explicit span. A node that burned a whole dispatch deadline must not be
+    /// re-picked after the much shorter reject cooldown, or it spends most of every cycle stalling.
+    pub fn cool_down_node_for(&self, name: &str, span: std::time::Duration) {
+        if span.is_zero() {
+            return;
+        }
+        let until = std::time::Instant::now() + span;
         self.node_dispatch_cooldowns
             .write()
             .insert(name.to_string(), until);
