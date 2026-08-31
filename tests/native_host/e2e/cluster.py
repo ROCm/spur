@@ -593,6 +593,18 @@ class SpurCluster:
                 return len(members)
         return 0
 
+    def wait_etcd_members(self, count: int, timeout: int = 120) -> int:
+        """Poll until etcd reports `count` members. The `ready` phase only means every
+        k0scontroller unit is systemd-active; etcd quorum converges shortly after."""
+        deadline = time.time() + timeout
+        last = 0
+        while time.time() < deadline:
+            last = self.etcd_member_count()
+            if last >= count:
+                return last
+            time.sleep(3)
+        return last
+
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
 
