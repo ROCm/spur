@@ -28,7 +28,6 @@ use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 /// How long a controller credential is valid. Short because it is minted per connection; long
 /// enough to tolerate clock skew between the controller and a node.
 const CREDENTIAL_TTL_SECS: u64 = 300;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Subject the agent sees for controller-issued credentials. Shared with the agent (which gates
 /// controller-only RPCs on it) via `spur_core::auth` so the two cannot drift apart.
@@ -113,13 +112,7 @@ fn credential() -> ControllerCredential {
 pub async fn connect(
     endpoint: String,
 ) -> Result<SlurmAgentClient<AgentChannel>, tonic::transport::Error> {
-    connect_with_timeout(endpoint, CONNECT_TIMEOUT).await
-}
-
-pub(crate) async fn connect_with_timeout(
-    endpoint: String,
-    timeout: Duration,
-) -> Result<SlurmAgentClient<AgentChannel>, tonic::transport::Error> {
+    let timeout = Duration::from_secs(5);
     let channel = tonic::transport::Endpoint::from_shared(endpoint)?
         .connect_timeout(timeout)
         .timeout(timeout)
@@ -198,35 +191,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_agent_connection_succeeds() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let accept = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-
-        let result = connect(endpoint).await;
-
-        accept.abort();
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
     async fn agent_request_is_bounded() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let accept = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
+        let mut client = connect(endpoint).await.unwrap();
 
-        let mut client = connect_with_timeout(endpoint, Duration::from_millis(10))
-            .await
-            .unwrap();
         let result = client.get_node_resources(()).await;
 
-        accept.abort();
         assert_eq!(result.unwrap_err().code(), tonic::Code::Cancelled);
     }
 }
