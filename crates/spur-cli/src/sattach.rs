@@ -74,11 +74,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let user = crate::interactive::job_caller_user(&mut client, job_id, Some(&job.user)).await?;
 
-    // Connect to the first node's agent. The controller reports a compressed
-    // hostlist (e.g. `node[001-002]`), so expand it rather than comma-splitting.
-    let first_node = crate::nodelist::first_allocated_node(nodelist).with_context(|| {
-        format!("sattach: could not resolve a node from allocation '{nodelist}'")
-    })?;
+    // The controller reports a hostlist, so `node[1-3]` has to be expanded
+    // before a name is usable as an address.
+    let nodes = spur_core::hostlist::expand(nodelist)
+        .with_context(|| format!("sattach: job {} has an unreadable nodelist", job_id))?;
+    let first_node = nodes
+        .first()
+        .with_context(|| format!("sattach: job {} has no allocated nodes", job_id))?;
     let agent_addr = format!("http://{}:6818", first_node);
     let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 

@@ -34,6 +34,7 @@ pub fn load_spur_config() -> SlurmConfig {
             devices: Default::default(),
             admission: Default::default(),
             rlimits: Default::default(),
+            cgroup: Default::default(),
             mpi: Default::default(),
         },
     }

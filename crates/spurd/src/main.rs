@@ -121,6 +121,19 @@ struct Args {
     log_level: String,
 }
 
+fn log_swap_status(swap: spur_core::config::SwapLimit) {
+    use spur_core::config::SwapLimit;
+    match swap {
+        SwapLimit::Unconstrained => info!(
+            "job swap unconstrained; --mem bounds resident memory only \
+             (see cgroup.constrain_swap_space)"
+        ),
+        SwapLimit::Percent(percent) => {
+            info!(allowed_swap_space = percent, "job swap constrained")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args_os()
@@ -323,11 +336,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
-    let memlock = match config.as_ref() {
-        Some(c) => c.rlimits.memlock_limit()?,
-        None => spur_core::config::MemlockLimit::Unlimited,
+    let limits = match config.as_ref() {
+        Some(c) => spur_core::config::JobLimits {
+            memlock: c.rlimits.memlock_limit()?,
+            swap: c.cgroup.swap_limit()?,
+        },
+        None => spur_core::config::JobLimits::default(),
     };
-    log_memlock_status(memlock);
+    log_memlock_status(limits.memlock);
+    log_swap_status(limits.swap);
     let cluster_config = config
         .as_ref()
         .map(|c| c.cluster.clone())
@@ -359,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
         hooks_config,
         registry.clone(),
         &cluster_config,
-        memlock,
+        limits,
         mpi_config,
         running_jobs,
         allow_root_jobs,

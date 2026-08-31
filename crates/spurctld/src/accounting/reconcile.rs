@@ -93,15 +93,10 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
         .map(|j| (j.job_id, accounting_expected_state(j.state)))
         .collect();
 
-    let job_ids: Vec<i32> = candidates.iter().map(|j| j.job_id as i32).collect();
+    let job_ids: Vec<JobId> = candidates.iter().map(|j| j.job_id).collect();
     let (accounting_states, unknown): (HashMap<JobId, AccountingRowState>, HashSet<JobId>) =
         match db::job_accounting_states(pool, &job_ids).await {
-            Ok(rows) => (
-                rows.into_iter()
-                    .map(|(id, row)| (id as JobId, row))
-                    .collect(),
-                HashSet::new(),
-            ),
+            Ok(rows) => (rows, HashSet::new()),
             Err(e) => {
                 // A failed read is not evidence the rows are absent. Treating
                 // it as "missing" would make resync_job call write_start,
@@ -252,13 +247,13 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
     let end_time = job.end_time.unwrap_or_else(Utc::now);
     db::record_job_end(
         conn,
-        job.job_id as i32,
+        job.job_id,
         job.state.display(),
         job.exit_code.unwrap_or(0),
         end_time,
         job.exit_signal,
         job.derived_exit_code,
-        job.preempted_by.map(|id| id as i32),
+        job.preempted_by,
         job.preempt_mode.as_deref().unwrap_or(""),
         job.preempt_qos.as_deref().unwrap_or(""),
     )
@@ -453,9 +448,9 @@ mod tests {
         Ok(pool)
     }
 
-    async fn delete_job(pool: &PgPool, job_id: i32) {
+    async fn delete_job(pool: &PgPool, job_id: JobId) {
         let _ = sqlx::query("DELETE FROM jobs WHERE job_id = $1")
-            .bind(job_id)
+            .bind(job_id as i64)
             .execute(pool)
             .await;
     }
@@ -469,7 +464,7 @@ mod tests {
     async fn resync_job_backfills_bare_row_left_by_a_missed_job_start() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let job_id = test_job_id(0);
-        delete_job(&pool, job_id as i32).await;
+        delete_job(&pool, job_id).await;
 
         let job = test_job(job_id, JobState::Completed);
 
@@ -477,7 +472,7 @@ mod tests {
         let mut conn = pool.acquire().await?;
         db::record_job_end(
             &mut conn,
-            job_id as i32,
+            job_id,
             job.state.display(),
             0,
             job.end_time.unwrap(),
@@ -490,9 +485,9 @@ mod tests {
         .await?;
         drop(conn);
 
-        let bare = db::job_accounting_states(&pool, &[job_id as i32])
+        let bare = db::job_accounting_states(&pool, &[job_id])
             .await?
-            .remove(&(job_id as i32))
+            .remove(&job_id)
             .expect("bare row exists");
         assert!(bare.needs_start_backfill);
         assert_eq!(bare.state, "COMPLETED");
@@ -507,7 +502,7 @@ mod tests {
         resync_job(&pool, &job, false, true).await;
 
         let row = sqlx::query("SELECT user_name, start_time, state FROM jobs WHERE job_id = $1")
-            .bind(job_id as i32)
+            .bind(job_id as i64)
             .fetch_one(&pool)
             .await?;
         let user_name: String = row.get("user_name");
@@ -532,7 +527,7 @@ mod tests {
             "usage must be backfilled along with the row"
         );
 
-        delete_job(&pool, job_id as i32).await;
+        delete_job(&pool, job_id).await;
         sqlx::query("DELETE FROM usage WHERE user_name = $1")
             .bind(&job.spec.user)
             .execute(&pool)
@@ -548,15 +543,15 @@ mod tests {
     async fn suspended_job_is_not_flagged_stale_against_a_running_row() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let job_id = test_job_id(1);
-        delete_job(&pool, job_id as i32).await;
+        delete_job(&pool, job_id).await;
 
         let running_job = test_job(job_id, JobState::Running);
         resync_job(&pool, &running_job, true, false).await;
 
         let suspended_job = test_job(job_id, JobState::Suspended);
-        let row = db::job_accounting_states(&pool, &[job_id as i32])
+        let row = db::job_accounting_states(&pool, &[job_id])
             .await?
-            .remove(&(job_id as i32))
+            .remove(&job_id)
             .expect("row exists");
         let expected = vec![(job_id, accounting_expected_state(suspended_job.state))];
         let mut accounting = HashMap::new();
@@ -568,7 +563,7 @@ mod tests {
             "a suspended job matching a RUNNING row must not be flagged stale"
         );
 
-        delete_job(&pool, job_id as i32).await;
+        delete_job(&pool, job_id).await;
         Ok(())
     }
 
@@ -591,7 +586,7 @@ mod tests {
     async fn resync_job_transaction_rolls_back_a_partial_backfill() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let job_id = test_job_id(2);
-        delete_job(&pool, job_id as i32).await;
+        delete_job(&pool, job_id).await;
 
         // Seed a correct, complete terminal record, as if a prior pass had
         // already recorded it successfully.
@@ -619,7 +614,7 @@ mod tests {
             .await?;
             db::record_job_end(
                 &mut conn,
-                job_id as i32,
+                job_id,
                 "COMPLETED",
                 0,
                 job.end_time.unwrap(),
@@ -641,7 +636,7 @@ mod tests {
         // corrupted shape the pre-fix bug used to leave committed: RUNNING
         // with end_time wiped out.
         let mid_row = sqlx::query("SELECT state, end_time FROM jobs WHERE job_id = $1")
-            .bind(job_id as i32)
+            .bind(job_id as i64)
             .fetch_one(&mut *tx)
             .await?;
         let mid_state: String = mid_row.get("state");
@@ -655,7 +650,7 @@ mod tests {
         drop(tx); // never committed: sqlx issues ROLLBACK
 
         let row = sqlx::query("SELECT state, end_time FROM jobs WHERE job_id = $1")
-            .bind(job_id as i32)
+            .bind(job_id as i64)
             .fetch_one(&pool)
             .await?;
         let state: String = row.get("state");
@@ -669,7 +664,7 @@ mod tests {
             "a rolled-back backfill must never wipe out end_time"
         );
 
-        delete_job(&pool, job_id as i32).await;
+        delete_job(&pool, job_id).await;
         Ok(())
     }
 }

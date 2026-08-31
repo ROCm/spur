@@ -206,7 +206,7 @@ impl SlurmAccounting for AccountingService {
             .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_end(
             &mut conn,
-            req.job_id as i32,
+            req.job_id,
             state_str,
             req.exit_code,
             end_time,
@@ -272,7 +272,7 @@ impl SlurmAccounting for AccountingService {
         let jobs = records
             .iter()
             .map(|r| JobInfo {
-                job_id: r.job_id as u32,
+                job_id: r.job_id,
                 name: r.name.clone(),
                 user: r.user_name.clone(),
                 uid: 0,
@@ -323,7 +323,7 @@ impl SlurmAccounting for AccountingService {
                 srun_step_dispatch: false,
                 req_gpus: 0,
                 req_gpus_detail: String::new(),
-                preempted_by: r.preempted_by.unwrap_or(0) as u32,
+                preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
             })

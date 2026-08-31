@@ -92,6 +92,12 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     );
     register_counter(
         registry,
+        "spur_scheduler_jobs_preempted",
+        "Jobs preempted (cancel or requeue mode) since reset; suspend-mode preemptions are excluded",
+        snap.jobs_preempted,
+    );
+    register_counter(
+        registry,
         "spur_scheduler_exit_end",
         "Cycles that considered every pending job",
         snap.exit_end,
@@ -124,6 +130,7 @@ mod tests {
             jobs_submitted: 42,
             jobs_started: 30,
             jobs_finalized: 28,
+            jobs_preempted: 5,
             jobs_started_last_cycle: 3,
             exit_end: 8,
             exit_max_depth: 2,
@@ -151,6 +158,11 @@ mod tests {
         assert!(body.contains("spur_scheduler_jobs_started_last_cycle 3"));
         assert!(body.contains("spur_scheduler_exit_end_total 8"));
         assert!(body.contains("spur_scheduler_exit_max_depth_total 2"));
+        assert!(body.contains("spur_scheduler_jobs_preempted_total 5"));
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_jobs_preempted"),
+            "counter"
+        );
         assert_eq!(metric_type(&body, "spur_scheduler_cycles"), "counter");
         assert_eq!(
             metric_type(&body, "spur_scheduler_jobs_submitted"),

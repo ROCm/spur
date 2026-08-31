@@ -106,6 +106,9 @@ impl std::error::Error for ReservationError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
     InvalidArgument(String),
+    /// A transient condition the client should retry (maps to gRPC `Unavailable`,
+    /// REST 503), e.g. a cold association cache right after controller start.
+    Unavailable(String),
     Internal(String),
 }
 
@@ -166,7 +169,7 @@ impl std::error::Error for SrunCompleteError {}
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidArgument(m) | Self::Internal(m) => f.write_str(m),
+            Self::InvalidArgument(m) | Self::Unavailable(m) | Self::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -176,6 +179,10 @@ impl std::error::Error for SubmitError {}
 impl SubmitError {
     pub fn invalid(msg: impl Into<String>) -> Self {
         Self::InvalidArgument(msg.into())
+    }
+
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self::Unavailable(msg.into())
     }
 
     pub fn internal(msg: impl Into<String>) -> Self {
@@ -583,11 +590,6 @@ impl ClusterManager {
             }
         }
 
-        apply_default_time_limit(
-            &mut spec,
-            &partitions,
-            config.scheduler.default_time_limit_minutes,
-        );
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache, &config.accounting)?;
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
@@ -655,6 +657,17 @@ impl ClusterManager {
         check_submission_size(&spec)?;
 
         self.run_job_submit_hook(&mut spec, &partitions)?;
+
+        // Every input to wall-time defaulting — partition, account, QOS — is a field
+        // the hook may rewrite, so defaulting follows the hook and reads the scope
+        // that actually governs the job. A limit the hook set is left alone.
+        let wall_caps = self.wall_caps(&spec);
+        apply_default_time_limit(
+            &mut spec,
+            &partitions,
+            config.scheduler.default_time_limit_minutes,
+            wall_caps,
+        );
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -1818,6 +1831,11 @@ impl ClusterManager {
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
         if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
+            // JobPreemptCancel and JobPreemptRequeue are the only WAL
+            // operations that set state=Preempted; Suspend does not.
+            if finalized.state == JobState::Preempted {
+                stats.record_preempted();
+            }
         }
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
@@ -4660,6 +4678,33 @@ impl ClusterManager {
         }
     }
 
+    /// The wall-clock ceilings that already govern this submission, for defaulting.
+    /// An unloaded cache reports nothing rather than holding the job, matching how
+    /// `enforce_submit_limits` treats limits it cannot read yet.
+    fn wall_caps(&self, spec: &JobSpec) -> WallCaps {
+        let qos_minutes = spec
+            .qos
+            .as_deref()
+            .filter(|n| !n.is_empty() && self.qos_cache.is_loaded())
+            .and_then(|name| self.qos_cache.get(name))
+            .and_then(|qos| qos.limits.max_wall_minutes);
+
+        let account_minutes = spec
+            .account
+            .as_deref()
+            .filter(|a| !a.is_empty() && self.association_cache.is_loaded())
+            .and_then(|account| {
+                self.association_cache
+                    .limits(&spec.user, account)
+                    .max_wall_minutes
+            });
+
+        WallCaps {
+            qos_minutes,
+            account_minutes,
+        }
+    }
+
     /// Submit-time limit gate (Slurm's `acct_policy_validate`). Submit-count
     /// limits and the association per-job wall deny unconditionally; stand-alone
     /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
@@ -7263,37 +7308,64 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
     }
 }
 
-/// Fill in a job's wall-time when none was requested. Each requested partition
-/// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
-/// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
-/// so the default fits every requested partition; if any requested partition
-/// resolves to no bound the job stays unbounded (unchanged upgrade behavior).
-fn apply_default_time_limit(
-    spec: &mut JobSpec,
-    partitions: &[Partition],
-    cluster_default_minutes: u32,
-) {
-    if spec.time_limit.is_some() {
-        return;
-    }
-
-    // A job may list several partitions (e.g. "gpu,cpu"); fall back to the
-    // default/first partition when the field is unset or names nothing known.
+/// The partitions a job's wall-time defaulting has to satisfy. A job may list
+/// several (e.g. "gpu,cpu"); fall back to the default/first partition when the
+/// field is unset or names nothing known.
+fn partitions_for_defaulting<'a>(
+    spec: &JobSpec,
+    partitions: &'a [Partition],
+) -> Vec<&'a Partition> {
     let matched = spec
         .partition
         .as_deref()
         .map(|p| spur_core::partition::matched_partitions(Some(p), partitions))
         .unwrap_or_default();
-    let requested: Vec<&Partition> = if matched.is_empty() {
-        partitions
-            .iter()
-            .find(|p| p.is_default)
-            .or_else(|| partitions.first())
-            .into_iter()
-            .collect()
-    } else {
-        matched
-    };
+    if !matched.is_empty() {
+        return matched;
+    }
+    partitions
+        .iter()
+        .find(|p| p.is_default)
+        .or_else(|| partitions.first())
+        .into_iter()
+        .collect()
+}
+
+/// The per-job wall-clock ceilings a submission is already subject to, in minutes.
+/// `None` means no figure applies — the limit is unset, or its cache has not loaded
+/// yet, in which case defaulting proceeds as if the limit did not exist rather than
+/// holding the submission. A ceiling of `0` is the "block all" sentinel, not a
+/// zero-length budget, so it is never a value to default to.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WallCaps {
+    qos_minutes: Option<u32>,
+    account_minutes: Option<u32>,
+}
+
+impl WallCaps {
+    fn usable(minutes: Option<u32>) -> Option<u32> {
+        minutes.filter(|m| *m > 0)
+    }
+}
+
+/// Fill in a job's wall-time when none was requested. Each requested partition
+/// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
+/// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
+/// so the default fits every requested partition; if any requested partition
+/// resolves to no bound the governing QOS's or account's `MaxWall` supplies the
+/// limit instead, and a job with neither stays unbounded (unchanged upgrade
+/// behavior).
+fn apply_default_time_limit(
+    spec: &mut JobSpec,
+    partitions: &[Partition],
+    cluster_default_minutes: u32,
+    caps: WallCaps,
+) {
+    if spec.time_limit.is_some() {
+        return;
+    }
+
+    let requested = partitions_for_defaulting(spec, partitions);
     if requested.is_empty() {
         return;
     }
@@ -7312,15 +7384,44 @@ fn apply_default_time_limit(
     let mut chosen: Option<u32> = None;
     for part in &requested {
         match resolve(part) {
-            // An unbounded requested partition means the job may run unlimited
-            // there, so don't impose a default.
-            None => return,
+            // A requested partition that imposes no default leaves the job's wall
+            // ceiling as the only source of one.
+            None => {
+                chosen = wall_cap_default(&requested, caps);
+                break;
+            }
             Some(minutes) => chosen = Some(chosen.map_or(minutes, |c| c.min(minutes))),
         }
     }
     if let Some(minutes) = chosen {
         spec.time_limit = Some(chrono::Duration::minutes(i64::from(minutes)));
     }
+}
+
+/// The per-job wall ceiling as a default. A job has to satisfy the QOS's and the
+/// account's `MaxWall` both, so the smaller of the two is the limit it is really
+/// held to. That value is then kept under the requested partitions' `MaxTime`,
+/// above which the job would pend forever on a limit it never asked for — where
+/// today it simply runs unbounded.
+fn wall_cap_default(requested: &[&Partition], caps: WallCaps) -> Option<u32> {
+    let cap = [
+        WallCaps::usable(caps.qos_minutes),
+        WallCaps::usable(caps.account_minutes),
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
+
+    // The limit has to stay schedulable somewhere: a requested partition with no
+    // `MaxTime` takes any, otherwise the most permissive one is the ceiling. With
+    // no partition in play nothing caps the ceiling, so the wall cap stands.
+    let partition_ceiling = if requested.iter().any(|p| p.max_time_minutes.is_none()) {
+        None
+    } else {
+        requested.iter().filter_map(|p| p.max_time_minutes).max()
+    };
+
+    [Some(cap), partition_ceiling].into_iter().flatten().min()
 }
 
 /// Resolve the submitting user's default account from the association cache
@@ -7348,6 +7449,16 @@ fn validate_user_account(
 ) -> Result<(), SubmitError> {
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
         if accounting.require_association {
+            // Cold cache: the user's default account may still resolve once the refresh
+            // loop populates associations, so this is transient (retryable), not permanent.
+            if accounting.enabled() && !assoc_cache.is_loaded() {
+                return Err(SubmitError::unavailable(format!(
+                    "account associations are temporarily unavailable (accounting cache not loaded); \
+                     no default account resolved for user '{}' yet. Try again once the accounting \
+                     database is reachable.",
+                    spec.user
+                )));
+            }
             let hint = if assoc_cache.is_loaded() {
                 ""
             } else {
@@ -7373,7 +7484,9 @@ fn validate_user_account(
                 "association cache not loaded while accounting is enabled — denying account-scoped \
                  submission (fail closed). Check the accounting database is reachable."
             );
-            Err(SubmitError::invalid(format!(
+            // Transient: the refresh loop populates the cache shortly after start, so
+            // this must be retryable (Unavailable), not a permanent rejection.
+            Err(SubmitError::unavailable(format!(
                 "account associations are temporarily unavailable (accounting cache not loaded); \
                  cannot verify user '{}' is associated with account '{account}'. Try again once \
                  the accounting database is reachable.",
@@ -7620,6 +7733,7 @@ mod tests {
             devices: Default::default(),
             admission: Default::default(),
             rlimits: Default::default(),
+            cgroup: Default::default(),
             mpi: Default::default(),
         }
     }
@@ -8314,6 +8428,84 @@ mod tests {
         assert!(
             err.to_string().contains("outside partition"),
             "expected a node-bounds rejection, got: {err:?}"
+        );
+    }
+
+    // A hook-set QOS governs the job, so its MaxWall has to reach an untimed job
+    // as the default; caps read before the hook would be the wrong QOS's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_set_qos_supplies_the_wall_default() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"capped"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("hook-qos-wall");
+        spec.time_limit = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(30))
+        );
+    }
+
+    // The partition also decides the default, so a hook that reroutes the job
+    // must be defaulted from the partition it ends up on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_set_partition_supplies_the_wall_default() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let mut timed = config.partitions[0].clone();
+        timed.name = "timed".into();
+        timed.default = false;
+        timed.default_time = Some("00:15:00".into());
+        config.partitions.push(timed);
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"timed"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("hook-part-wall");
+        spec.time_limit = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(15))
+        );
+    }
+
+    // Defaulting only fills an absent limit: one the hook set itself stands,
+    // even where a cap would have produced a different value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_set_time_limit_survives_defaulting() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"qos":"capped","time_limit_minutes":45}'"#,
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("hook-own-limit");
+        spec.time_limit = None;
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(45))
         );
     }
 
@@ -9631,6 +9823,45 @@ mod tests {
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();
         settle(&cm, job_id, JobState::Completed);
         assert_eq!(stats.snapshot().jobs_finalized, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sched_stats_track_preempted_jobs() {
+        use std::sync::Arc;
+
+        use crate::sched_stats::SchedStatsCollector;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job1 = run_job_on(&cm, "victim-1", "worker1");
+        cm.preempt_job(job1, PreemptMode::Requeue, 99, None)
+            .unwrap();
+        settle(&cm, job1, JobState::Pending);
+        assert_eq!(
+            stats.snapshot().jobs_preempted,
+            1,
+            "requeue preemption counted"
+        );
+
+        let job2 = run_job_on(&cm, "victim-2", "worker1");
+        cm.preempt_job(job2, PreemptMode::Cancel, 99, None).unwrap();
+        settle(&cm, job2, JobState::Cancelled);
+        assert_eq!(
+            stats.snapshot().jobs_preempted,
+            2,
+            "cancel preemption counted"
+        );
+
+        assert_eq!(
+            stats.snapshot().jobs_finalized,
+            2,
+            "both preemptions counted as finalized"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13141,6 +13372,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_gives_a_job_that_asked_for_no_wall_time_the_qos_max_wall() {
+        // Without this the job runs unbounded and shows UNLIMITED, since the
+        // time-limit watchdog has no deadline to enforce.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["burst"]);
+        cm.qos_cache().insert(qos_with_limits(
+            "burst",
+            spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(720),
+                ..Default::default()
+            },
+            false,
+        ));
+
+        let mut spec = basic_spec("nolimit");
+        spec.account = Some("research".into());
+        spec.qos = Some("burst".into());
+        spec.time_limit = None;
+
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(720))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_denies_qos_grp_submit_jobs() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -13513,8 +13773,8 @@ mod tests {
         spec.account = Some("tenant-b".into());
         let err = validate_user_account(&spec, &cache, &acct_cfg_enabled(true)).unwrap_err();
         assert!(
-            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("temporarily unavailable")),
-            "cold cache with accounting enabled must fail closed, got {err:?}"
+            matches!(&err, SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache with accounting enabled must fail closed (retryable), got {err:?}"
         );
     }
 
@@ -13572,8 +13832,8 @@ mod tests {
         spec.account = Some("tenant-b".into());
         let err = cm.submit_job(spec).unwrap_err();
         assert!(
-            matches!(&err, SubmitError::InvalidArgument(m) if m.contains("temporarily unavailable")),
-            "cold cache must fail closed end-to-end, got {err:?}"
+            matches!(&err, SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache must fail closed end-to-end (retryable), got {err:?}"
         );
     }
 
@@ -19949,6 +20209,11 @@ mod tests {
         assert_eq!(spec.partition.as_deref(), Some("gpu"));
     }
 
+    /// Defaulting with no QOS or account wall ceiling in play.
+    fn default_time_limit(spec: &mut JobSpec, partitions: &[Partition], cluster_minutes: u32) {
+        super::apply_default_time_limit(spec, partitions, cluster_minutes, WallCaps::default());
+    }
+
     #[test]
     fn apply_default_time_limit_uses_partition_default() {
         let mut spec = basic_spec("j");
@@ -19959,7 +20224,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
     }
 
@@ -19972,7 +20237,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
     }
 
@@ -19986,7 +20251,7 @@ mod tests {
             default_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
@@ -20002,7 +20267,7 @@ mod tests {
             max_time_minutes: Some(120),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(120)));
     }
 
@@ -20019,7 +20284,7 @@ mod tests {
             max_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
     }
 
@@ -20036,7 +20301,7 @@ mod tests {
             max_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
@@ -20061,7 +20326,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
     }
 
@@ -20085,7 +20350,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
@@ -20102,7 +20367,7 @@ mod tests {
             max_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        default_time_limit(&mut spec, &partitions, 60);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(45)));
     }
 
@@ -20125,8 +20390,189 @@ mod tests {
                 ..Default::default()
             },
         ];
-        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(20)));
+    }
+
+    /// A job that asked for no wall-time, in a partition that imposes no default.
+    fn unbounded_spec_and_partition() -> (JobSpec, Vec<Partition>) {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            ..Default::default()
+        }];
+        (spec, partitions)
+    }
+
+    fn qos_wall(minutes: u32) -> WallCaps {
+        WallCaps {
+            qos_minutes: Some(minutes),
+            account_minutes: None,
+        }
+    }
+
+    // No partition in play means nothing caps the wall ceiling. Folding over an
+    // empty slice from a zero seed would instead collapse the cap to a zero-length
+    // limit, so the ceiling is computed without relying on a non-empty caller.
+    #[test]
+    fn wall_cap_default_without_partitions_keeps_the_cap() {
+        assert_eq!(super::wall_cap_default(&[], qos_wall(720)), Some(720));
+    }
+
+    #[test]
+    fn apply_default_time_limit_uses_qos_max_wall_when_partitions_impose_none() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_leaves_a_requested_limit_below_max_wall_alone() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        spec.time_limit = Some(chrono::Duration::minutes(30));
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_prefers_the_partition_default_over_max_wall() {
+        // MaxWall is a ceiling, not a default: a partition that supplies one keeps it.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_stays_unbounded_without_any_wall_cap() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        super::apply_default_time_limit(&mut spec, &partitions, 0, WallCaps::default());
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_ignores_a_zero_max_wall() {
+        // `0` is the block-all sentinel; defaulting to it would submit a job that
+        // its own limit kills on the first watchdog tick.
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(0));
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_holds_max_wall_under_the_account_wall() {
+        // An account MaxWall rejects the submission outright, so a default above it
+        // would turn a job that runs today into one that cannot be submitted.
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        let caps = WallCaps {
+            qos_minutes: Some(720),
+            account_minutes: Some(360),
+        };
+        super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(360)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_uses_the_account_wall_when_the_qos_has_none() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        let caps = WallCaps {
+            qos_minutes: None,
+            account_minutes: Some(90),
+        };
+        super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(90)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_ignores_a_zero_account_wall() {
+        let (mut spec, partitions) = unbounded_spec_and_partition();
+        let caps = WallCaps {
+            qos_minutes: Some(720),
+            account_minutes: Some(0),
+        };
+        super::apply_default_time_limit(&mut spec, &partitions, 0, caps);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_holds_max_wall_under_the_partition_max_time() {
+        // Above MaxTime the job would pend forever on PartitionTimeLimit, for a
+        // limit it never asked for.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            max_time_minutes: Some(240),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(240)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_takes_the_most_permissive_partition_max_time() {
+        // The job only has to be schedulable somewhere, so the widest requested
+        // MaxTime is the ceiling — not the narrowest.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("small,big".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "small".into(),
+                max_time_minutes: Some(60),
+                ..Default::default()
+            },
+            Partition {
+                name: "big".into(),
+                max_time_minutes: Some(240),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(240)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_ignores_partition_max_time_when_one_is_unlimited() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("capped,unlimited".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "capped".into(),
+                max_time_minutes: Some(60),
+                ..Default::default()
+            },
+            Partition {
+                name: "unlimited".into(),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0, qos_wall(720));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(720)));
+    }
+
+    #[test]
+    fn wall_caps_reports_nothing_until_the_caches_load() {
+        // Fail-open: an unread limit must not decide a job's deadline.
+        let dir = TempDir::new().unwrap();
+        let cluster = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut spec = basic_spec("j");
+        spec.qos = Some("burst".into());
+        spec.account = Some("eng".into());
+
+        let caps = cluster.wall_caps(&spec);
+        assert!(caps.qos_minutes.is_none());
+        assert!(caps.account_minutes.is_none());
     }
 
     #[test]
@@ -20452,7 +20898,8 @@ mod tests {
     #[test]
     fn validate_user_account_fails_closed_on_cold_cache_with_explicit_account_and_require_association(
     ) {
-        // require_association=true doesn't bypass the cold-cache fence for an explicit account.
+        // require_association=true doesn't bypass the cold-cache fence for an explicit
+        // account. The fence is transient (cache still loading), so it must be retryable.
         let assoc = AssociationCache::new(); // never loaded
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
@@ -20463,7 +20910,30 @@ mod tests {
         };
 
         let err = super::validate_user_account(&spec, &assoc, &cfg).unwrap_err();
-        assert!(err.to_string().contains("temporarily unavailable"));
+        assert!(
+            matches!(&err, super::SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache must be retryable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_user_account_cold_cache_no_account_require_association_is_retryable() {
+        // A user's default account may still be loading; rejecting it permanently would
+        // fail a job that would succeed once the refresh loop populates the cache.
+        let assoc = AssociationCache::new(); // never loaded
+        let spec = basic_spec("j");
+        assert!(spec.account.is_none());
+        let cfg = spur_core::config::AccountingConfig {
+            database_url: "postgresql://test".into(),
+            require_association: true,
+            ..Default::default()
+        };
+
+        let err = super::validate_user_account(&spec, &assoc, &cfg).unwrap_err();
+        assert!(
+            matches!(&err, super::SubmitError::Unavailable(m) if m.contains("temporarily unavailable")),
+            "cold cache must be retryable, got {err:?}"
+        );
     }
 
     #[test]

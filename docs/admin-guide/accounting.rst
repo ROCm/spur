@@ -356,7 +356,8 @@ User keys
      - Aggregate TRES cap across the association's jobs.
    * - ``maxwall`` (alias ``maxwallduration``)
      - unset (no limit)
-     - Maximum wall-clock time per job.
+     - Maximum wall-clock time per job. Also supplies the time limit for a job
+       that requests none — see :ref:`maxwall-default`.
 
 .. note::
 
@@ -490,7 +491,8 @@ QOS keys
      - Maximum running jobs per user under this QOS. See :ref:`limit-values`.
    * - ``maxwall``
      - unset (no limit)
-     - Maximum wall-clock time per job.
+     - Maximum wall-clock time per job. Also supplies the time limit for a job
+       that requests none — see :ref:`maxwall-default`.
    * - ``maxtresperjob``
      - ``""``
      - TRES cap for a single job (see `TRES`_).
@@ -563,6 +565,50 @@ Set ``DenyOnLimit`` through the QOS ``flags`` key:
 .. code-block:: bash
 
    sacctmgr modify qos name=highprio set flags=DenyOnLimit
+
+.. _maxwall-default:
+
+MaxWall as the default time limit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job that requests no wall-time takes its ``maxwall`` cap as its time limit, as
+in Slurm. Without this a ``-t``-less job would carry no limit at all: it would
+report ``UNLIMITED``, and the running-job watchdog — which acts on a job's own
+limit — would have no deadline to enforce, so the cap would hold only for jobs
+that named a limit themselves.
+
+Both the QOS and the association carry ``maxwall``, and a job has to satisfy
+both, so the smaller of the two is what it inherits.
+
+The limit is filled in at submit, so ``squeue`` and ``scontrol show job`` report
+it, and it is the job's own limit from then on: a later change to the QOS does
+not move it.
+
+Precedence for a job that requests nothing, first match winning:
+
+1. The partition's ``DefaultTime``, or the chain described under
+   ``default_time_limit_minutes`` in :doc:`configuration`.
+2. The smaller of the QOS and association ``maxwall``.
+3. Otherwise the job stays unbounded.
+
+So a partition ``DefaultTime`` shorter than ``maxwall`` still wins — ``maxwall``
+is a ceiling, and only supplies a default where nothing else does. The value
+filled in is also held under the requested partition's ``MaxTime``, above which
+the job would pend indefinitely on ``PartitionTimeLimit`` for a limit it never
+asked for. A ``maxwall`` of ``0`` blocks every job it governs
+(:ref:`limit-values`) and is never used as a default.
+
+A ``job_submit`` hook may reassign the partition, account or QOS, so the default
+is resolved after the hook runs and reflects the scope the job ends up in. A
+hook that sets ``time_limit`` itself supplies the job's limit, and no default is
+applied over it.
+
+.. note::
+
+   Jobs already running when this behaviour arrives keep the unbounded limit they
+   were submitted with; the QOS cap applies to submissions from then on. To bound
+   an existing job, set its limit directly with
+   ``scontrol update job <id> TimeLimit=<time>``.
 
 .. _grpwall-budgets:
 
@@ -938,9 +984,12 @@ How a job's account is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 At submit, Spur resolves the job's account in this order, matching Slurm.
-This validation is skipped (fail-open) while the association cache has not
-yet loaded, e.g. at controller startup or while the accounting database is
-unreachable:
+When accounting is enabled but the association cache has not yet loaded
+(e.g. just after controller startup, or while the accounting database is
+unreachable), account validation cannot run yet: an account-scoped submit is
+refused with a *transient* error (gRPC ``Unavailable`` / REST ``503``) rather
+than a permanent rejection, so clients retry once the cache is populated. With
+accounting disabled there are no associations to check:
 
 1. **Explicit** ``--account`` on the job. Once the association cache has
    loaded, it must name an account the user is associated with, or the job
@@ -949,11 +998,12 @@ unreachable:
    if the user has none at all.
 2. Otherwise the **user's default account**, if the user has one on file.
 3. Otherwise, if ``accounting.require_association`` is ``true``, the job is
-   **rejected** (``no account resolved for user 'X'``) — even if the user
-   does have associations, just none flagged as their default. This step is
-   unconditional, unlike step 1: it applies even before the association
-   cache has loaded. If ``require_association`` is ``false`` (the default),
-   the job runs with no account.
+   **rejected** (``no account resolved for user 'X'``) once the cache has
+   loaded and the user has no default on file — even if the user does have
+   associations, just none flagged as their default. Before the cache loads
+   this is transient (as above), since the default may still resolve. If
+   ``require_association`` is ``false`` (the default), the job runs with no
+   account.
 
 TRES
 ----
@@ -1025,6 +1075,60 @@ in the cluster and silently exceeding the cap. ``MaxTRESPerJob``'s and
 ``MaxTRESPerUser``'s own ``node=`` caps are unaffected by this and always use
 a job's actual requested node count, since they bound a single job's or
 user's own footprint rather than group-wide capacity reuse.
+
+Scripted output
+---------------
+
+``sacctmgr show`` prints a column-aligned table for reading. For scripts, three
+Slurm flags change that rendering; they are global, so they may appear anywhere on
+the command line, including after the entity and its ``key=value`` filters. The
+same holds for ``add``, ``delete``, and ``modify``: a global flag among their
+``key=value`` pairs is parsed as a flag, not absorbed as a pair. An
+**unrecognised** token there is now an error naming the argument, where earlier
+releases silently absorbed it — and, if a ``key=value`` pair followed, dropped
+that pair too.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 74
+
+   * - Flag
+     - Effect
+   * - ``-n``, ``--noheader``
+     - Omit the header line and its dashed rule.
+   * - ``-p``, ``--parsable``
+     - Print fields ``|`` delimited, **with** a trailing ``|``.
+   * - ``-P``, ``--parsable2``
+     - Print fields ``|`` delimited, **without** a trailing ``|``.
+
+.. code-block:: bash
+
+   sacctmgr -n -P show qos format=Name,Priority,MaxWall
+   sacctmgr -n -P show qos format=Name,Priority | cut -d'|' -f1
+
+The trailing delimiter is the only difference between ``-p`` and ``-P``, and it
+changes the field count that ``cut``, ``awk``, and ``IFS`` splitting see. Choose
+one deliberately. Delimited output keeps empty fields as empty, so a row whose
+last columns are unset still carries its separators and the field count stays
+stable across rows.
+
+Delimited output ignores column widths and truncation, so a long value is printed
+in full rather than clipped to fit a column.
+
+Field values are not escaped. A free-text field carrying a literal ``|`` (an
+account ``Descr``/``Org``, or a transaction's ``Info``) shifts every field after
+it, so ``cut -d'|'`` reads the wrong column. Slurm behaves identically; treat
+delimited output as unambiguous only when the fields you select cannot contain ``|``.
+
+.. note::
+
+   ``-p`` and ``-P`` work for ``show account``, ``show qos``, and ``show txn``.
+   For ``show user``, ``show association``, and ``show tres``, Spur does not model
+   the columns, so it refuses the flag with an error naming the entity rather than
+   printing padded text a script cannot parse. ``-n`` works for every entity.
+
+   Passing both ``-p`` and ``-P`` gives ``-P``. Slurm applies whichever came
+   last; the flag order is not visible here, so the no-trailing form wins.
 
 Managing nodes at runtime
 -------------------------

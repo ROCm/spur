@@ -22,6 +22,15 @@ pub const MAX_GRPC_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 /// while allowing large outbound responses.
 pub const MAX_GRPC_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
+/// Only transient RPC failures are retried; a spec rejection would repeat forever.
+pub fn controller_rpc_retryable(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+    )
+}
+
 /// Controller client with asymmetric size limits: requests capped at
 /// `MAX_GRPC_REQUEST_SIZE`, responses up to `MAX_GRPC_MESSAGE_SIZE`.
 pub fn controller_client<T>(channel: T) -> proto::slurm_controller_client::SlurmControllerClient<T>
@@ -81,4 +90,35 @@ pub fn accounting_server<T: proto::slurm_accounting_server::SlurmAccounting>(
     proto::slurm_accounting_server::SlurmAccountingServer::new(service)
         .max_decoding_message_size(MAX_GRPC_REQUEST_SIZE)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::controller_rpc_retryable;
+
+    #[test]
+    fn a_spec_rejection_is_not_retried() {
+        // What spurctld returns for an unknown partition or a denied account.
+        assert!(!controller_rpc_retryable(&tonic::Status::invalid_argument(
+            "partition 'gpu' not found"
+        )));
+        assert!(!controller_rpc_retryable(
+            &tonic::Status::permission_denied("account denied")
+        ));
+        assert!(!controller_rpc_retryable(&tonic::Status::not_found("x")));
+    }
+
+    #[test]
+    fn a_controller_that_did_not_answer_is_retried() {
+        // "not the Raft leader" and a failed Raft propose are both transient.
+        assert!(controller_rpc_retryable(&tonic::Status::unavailable(
+            "not the Raft leader"
+        )));
+        assert!(controller_rpc_retryable(&tonic::Status::internal(
+            "raft propose failed"
+        )));
+        assert!(controller_rpc_retryable(&tonic::Status::deadline_exceeded(
+            "timed out"
+        )));
+    }
 }

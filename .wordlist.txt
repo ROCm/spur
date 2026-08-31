@@ -5,6 +5,7 @@ backfilling
 CDI
 CIDR
 Cargo
+cgroup
 config
 cron
 crontab
@@ -169,6 +170,7 @@ libpmix
 lifecycle
 MaxTRESPerJob
 MaxTRESPerUser
+MaxWall
 msg
 NNodes
 NODELIST
@@ -277,3 +279,13 @@ drivable
 enablement
 AllowedIPs
 Deregister
+datapath
+passwordless
+preflight
+rootful
+userspace
+InternalIPs
+Scaffolded
+ClusterIP
+DNATs
+kube

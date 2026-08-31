@@ -550,6 +550,20 @@ class SpurCluster:
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
 
+    def sdiag(self) -> str:
+        return self.cli(["spur", "diag"])
+
+    def sdiag_jobs_preempted(self) -> int:
+        """Return the jobs_preempted counter from spur diag scheduler stats."""
+        import re
+        output = self.sdiag()
+        match = re.search(r"Jobs preempted\s+:\s+(\d+)", output)
+        if match is None:
+            raise AssertionError(
+                f"'Jobs preempted' not found in spur diag output:\n{output}"
+            )
+        return int(match.group(1))
+
     # --- Native k0s cluster (spur k8s) wrappers ---
 
     def k8s_up(self, args: list[str] | None = None) -> str:
@@ -1073,7 +1087,10 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
         node = self.nodes[0]
-        node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
+        node.exec_allow_fail(
+            "c=$(docker ps -aq --filter name=spur-e2e-pg-); "
+            "[ -n \"$c\" ] && docker rm -f $c || true"
+        )
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "

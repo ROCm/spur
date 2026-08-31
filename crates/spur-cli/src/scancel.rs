@@ -64,16 +64,19 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = ScancelArgs::try_parse_from(&args)?;
 
-    if args.job_ids.is_empty() && args.user.is_none() && args.name.is_none() {
+    if !has_selection(&args) {
         bail!("scancel: no job IDs or filters specified");
     }
 
     let signal = parse_signal(args.signal.as_deref())?;
 
-    let user = match args.user {
-        Some(user) => user,
+    // Requester identity for authorization on each cancel. The server checks
+    // this against the job owner (root/empty bypass), so it must be the caller.
+    let requester = match &args.user {
+        Some(user) => user.clone(),
         None => crate::interactive::current_user()?,
     };
+    let filter_user = filter_user(&args, &requester);
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -87,7 +90,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .cancel_job(CancelJobRequest {
                     job_id: *job_id,
                     signal,
-                    user: user.clone(),
+                    user: requester.clone(),
                 })
                 .await
             {
@@ -108,11 +111,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let response = client
             .get_jobs(spur_proto::proto::GetJobsRequest {
                 states,
-                user: user.clone(),
-                partition: args.partition.unwrap_or_default(),
-                account: args.account.unwrap_or_default(),
+                user: filter_user,
+                partition: args.partition.clone().unwrap_or_default(),
+                account: args.account.clone().unwrap_or_default(),
                 job_ids: Vec::new(),
-                name: args.name.unwrap_or_default(),
+                name: args.name.clone().unwrap_or_default(),
                 nodes: Vec::new(),
             })
             .await
@@ -132,7 +135,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .cancel_job(CancelJobRequest {
                     job_id: job.job_id,
                     signal,
-                    user: user.clone(),
+                    user: requester.clone(),
                 })
                 .await
             {
@@ -158,6 +161,29 @@ fn is_cancellable(proto_state: i32) -> bool {
     match spur_core::job::JobState::from_proto_i32(proto_state) {
         Some(state) => !state.is_terminal(),
         None => true,
+    }
+}
+
+/// Whether the caller named anything to cancel. `--state` alone does not
+/// count: it narrows a selection rather than making one.
+fn has_selection(args: &ScancelArgs) -> bool {
+    !args.job_ids.is_empty()
+        || args.user.is_some()
+        || args.name.is_some()
+        || args.partition.is_some()
+        || args.account.is_some()
+}
+
+/// The `user` filter for get_jobs. `-u` wins; otherwise scope to the caller only
+/// when no other selector was named, so `scancel -A acct` spans the whole account
+/// instead of silently narrowing to self. The server still authorizes each cancel.
+fn filter_user(args: &ScancelArgs, requester: &str) -> String {
+    match &args.user {
+        Some(user) => user.clone(),
+        None if args.partition.is_some() || args.account.is_some() || args.name.is_some() => {
+            String::new()
+        }
+        None => requester.to_string(),
     }
 }
 
@@ -223,6 +249,61 @@ fn parse_state(s: &str) -> Option<spur_proto::proto::JobState> {
 mod tests {
     use super::*;
     use spur_proto::proto::JobState;
+
+    fn parse(args: &[&str]) -> ScancelArgs {
+        let mut argv = vec!["scancel"];
+        argv.extend_from_slice(args);
+        ScancelArgs::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn every_selection_flag_counts_as_a_selection() {
+        for args in [
+            vec!["123"],
+            vec!["-u", "alice"],
+            vec!["-n", "myjob"],
+            vec!["-p", "default"],
+            vec!["-A", "acct"],
+        ] {
+            assert!(
+                has_selection(&parse(&args)),
+                "{args:?} should select jobs to cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn no_arguments_selects_nothing() {
+        assert!(!has_selection(&parse(&[])));
+    }
+
+    #[test]
+    fn state_alone_selects_nothing() {
+        assert!(!has_selection(&parse(&["-t", "RUNNING"])));
+    }
+
+    #[test]
+    fn explicit_user_is_always_the_filter() {
+        assert_eq!(filter_user(&parse(&["-u", "alice"]), "bob"), "alice");
+        assert_eq!(
+            filter_user(&parse(&["-u", "alice", "-A", "gpu"]), "bob"),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn account_or_partition_without_user_spans_all_users() {
+        assert_eq!(filter_user(&parse(&["-A", "gpu"]), "bob"), "");
+        assert_eq!(filter_user(&parse(&["-p", "batch"]), "bob"), "");
+        assert_eq!(filter_user(&parse(&["-n", "train"]), "bob"), "");
+    }
+
+    #[test]
+    fn no_selector_defaults_to_the_caller() {
+        // Reachable via the job-id path, where the filter user is unused but the
+        // fallback must stay the caller rather than an empty (owner-bypass) value.
+        assert_eq!(filter_user(&parse(&["123"]), "bob"), "bob");
+    }
 
     #[test]
     fn active_states_are_cancellable() {

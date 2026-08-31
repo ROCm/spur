@@ -468,6 +468,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         devices: Default::default(),
         admission: Default::default(),
         rlimits: Default::default(),
+        cgroup: Default::default(),
         mpi: Default::default(),
     }
 }

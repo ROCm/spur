@@ -77,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -332,7 +332,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4.37.7
+        uses: github/codeql-action/upload-sarif@v4.37.8
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
@@ -360,7 +360,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4.37.7
+        uses: github/codeql-action/upload-sarif@v4.37.8
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config

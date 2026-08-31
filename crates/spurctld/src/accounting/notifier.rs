@@ -97,13 +97,13 @@ impl AccountingNotifier {
                 let mut conn = pool.acquire().await?;
                 super::db::record_job_end(
                     &mut conn,
-                    job_id as i32,
+                    job_id,
                     &state_str,
                     exit_code,
                     end_time,
                     exit_signal,
                     derived_exit_code,
-                    preempted_by.map(|id| id as i32),
+                    preempted_by,
                     preempt_mode.as_deref().unwrap_or(""),
                     preempt_qos.as_deref().unwrap_or(""),
                 )
