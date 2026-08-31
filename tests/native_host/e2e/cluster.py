@@ -30,6 +30,21 @@ ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 
+# Extracts just the numeric host port for 5432/tcp. inspect returns structured
+# data, so this sidesteps parsing the multi-line, IPv4/IPv6-variant `docker port`
+# output. Dual-stack publishes both families on the same port, so index 0 suffices.
+DOCKER_PORT_INSPECT_FMT = (
+    '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}'
+)
+
+
+def parse_published_port(inspect_output: str) -> int:
+    """Host port from ``docker inspect --format DOCKER_PORT_INSPECT_FMT`` output."""
+    port = inspect_output.strip()
+    if not port.isdigit():
+        raise RuntimeError(f"no published port in docker inspect output: {inspect_output!r}")
+    return int(port)
+
 
 def make_remote_dir() -> str:
     """Generate a unique remote working directory path."""
@@ -209,10 +224,16 @@ class SpurCluster:
         self.agent_token: str | None = None
         self.accounting_enabled: bool = False
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
-        self._pg_port = int(os.environ.get("SPUR_TEST_PG_PORT", "55432"))
-        self._db_url = (
-            f"postgresql://spur:spur@127.0.0.1:{self._pg_port}/spur"
-        )
+        self._pg_port: int | None = None
+
+    @property
+    def _db_url(self) -> str:
+        if self._pg_port is None:
+            raise RuntimeError(
+                "Postgres host port unresolved: _start_postgres() must run before "
+                "the controller config is written"
+            )
+        return f"postgresql://spur:spur@127.0.0.1:{self._pg_port}/spur"
 
     # --- Lifecycle ---
 
@@ -1056,8 +1077,15 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
-            f"-p {self._pg_port}:5432 postgres:16-alpine"
+            f"-p 0:5432 postgres:16-alpine"
         )
+        self._pg_port = parse_published_port(
+            node.exec(
+                f"docker inspect --format '{DOCKER_PORT_INSPECT_FMT}' "
+                f"'{self._pg_container}'"
+            )
+        )
+        logger.info("postgres published on host port %d", self._pg_port)
         self._wait_pg(node)
         logger.info("postgres ready on %s, spurctld handles accounting", self.node_names[0])
 
@@ -1076,6 +1104,8 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
     def _stop_postgres(self):
         node = self.nodes[0]
         node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
+        # Next container gets a fresh ephemeral port; drop the resolved one.
+        self._pg_port = None
 
     def _sudo_prefix(self) -> str:
         pw = os.environ.get("SPUR_TEST_SSH_PASSWORD", "")
