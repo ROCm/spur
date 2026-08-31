@@ -333,20 +333,14 @@ fn resolve_partition_field(
 }
 
 fn effective_state_str(node: &NodeInfo) -> String {
-    if node.state == spur_proto::proto::NodeState::NodeIdle as i32 {
-        if !node.active_reservation.is_empty() {
-            if node.reservation_maint {
-                return "maint".into();
-            }
-            return "resv".into();
-        }
-        if node.planned_job_id != 0 {
-            return "plnd".into();
-        }
+    match spur_core::node::node_overlay(node) {
+        Some(spur_core::node::NodeOverlay::Reserved { maint: true }) => "maint".into(),
+        Some(spur_core::node::NodeOverlay::Reserved { maint: false }) => "resv".into(),
+        Some(spur_core::node::NodeOverlay::Planned) => "plnd".into(),
+        None => spur_core::node::NodeState::from_proto_i32(node.state)
+            .map(|s| s.short().to_string())
+            .unwrap_or_else(|| "unk".into()),
     }
-    spur_core::node::NodeState::from_proto_i32(node.state)
-        .map(|s| s.short().to_string())
-        .unwrap_or_else(|| "unk".into())
 }
 
 #[cfg(test)]

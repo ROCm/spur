@@ -659,7 +659,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!("NodeName={}", node.name);
                 println!(
                     "   State={} Reason={}",
-                    node_state_name(node.state),
+                    node_state_display(&node),
                     node.state_reason
                 );
                 if !node.partitions.is_empty() {
@@ -694,6 +694,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 }
                 if !node.active_reservation.is_empty() {
                     println!("   ActiveReservation={}", node.active_reservation);
+                }
+                if let Some(line) = planned_reservation_line(&node) {
+                    println!("   {line}");
                 }
                 println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
                 println!();
@@ -911,6 +914,22 @@ fn node_state_name(state: i32) -> &'static str {
         .unwrap_or("UNKNOWN")
 }
 
+/// `State=` value for `scontrol show node`, composited the way real Slurm
+/// does (`IDLE+RESERVED`, `IDLE+MAINTENANCE+RESERVED`, `IDLE+PLANNED`).
+fn node_state_display(node: &spur_proto::proto::NodeInfo) -> String {
+    let base = node_state_name(node.state);
+    match spur_core::node::node_overlay(node) {
+        Some(spur_core::node::NodeOverlay::Reserved { maint: true }) => {
+            format!("{base}+MAINTENANCE+RESERVED")
+        }
+        Some(spur_core::node::NodeOverlay::Reserved { maint: false }) => {
+            format!("{base}+RESERVED")
+        }
+        Some(spur_core::node::NodeOverlay::Planned) => format!("{base}+PLANNED"),
+        None => base.to_string(),
+    }
+}
+
 fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
     match ts {
         Some(t) if t.seconds > 0 => {
@@ -920,6 +939,19 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
         }
         _ => "N/A".into(),
     }
+}
+
+/// `PlannedJobId=/PlannedStartTime=` line for `scontrol show node` (`None` if
+/// unset, `N/A` start if unknown); server only sets it while Idle, like sinfo's `plnd`.
+fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String> {
+    if node.planned_job_id == 0 {
+        return None;
+    }
+    Some(format!(
+        "PlannedJobId={} PlannedStartTime={}",
+        node.planned_job_id,
+        format_ts(node.planned_start.as_ref()),
+    ))
 }
 
 async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
@@ -1734,6 +1766,83 @@ mod tests {
     fn gpu_tres_label_total() {
         assert_eq!(gpu_tres_label("gpu:8"), "TresPerJob");
         assert_eq!(gpu_tres_label("gpu:mi300x:4"), "TresPerJob");
+    }
+
+    #[test]
+    fn planned_reservation_line_none_when_no_planned_job() {
+        let node = spur_proto::proto::NodeInfo::default();
+        assert_eq!(planned_reservation_line(&node), None);
+    }
+
+    #[test]
+    fn planned_reservation_line_shows_job_and_start() {
+        let node = spur_proto::proto::NodeInfo {
+            planned_job_id: 42,
+            planned_start: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            planned_reservation_line(&node).unwrap(),
+            "PlannedJobId=42 PlannedStartTime=2023-11-14T22:13:20"
+        );
+    }
+
+    #[test]
+    fn planned_reservation_line_start_na_when_unset() {
+        let node = spur_proto::proto::NodeInfo {
+            planned_job_id: 42,
+            planned_start: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            planned_reservation_line(&node).unwrap(),
+            "PlannedJobId=42 PlannedStartTime=N/A"
+        );
+    }
+
+    fn idle_node() -> spur_proto::proto::NodeInfo {
+        spur_proto::proto::NodeInfo {
+            state: spur_proto::proto::NodeState::NodeIdle as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn node_state_display_plain_idle() {
+        assert_eq!(node_state_display(&idle_node()), "IDLE");
+    }
+
+    #[test]
+    fn node_state_display_reserved() {
+        let mut node = idle_node();
+        node.active_reservation = "r1".into();
+        assert_eq!(node_state_display(&node), "IDLE+RESERVED");
+    }
+
+    #[test]
+    fn node_state_display_maintenance_reserved() {
+        let mut node = idle_node();
+        node.active_reservation = "r1".into();
+        node.reservation_maint = true;
+        assert_eq!(node_state_display(&node), "IDLE+MAINTENANCE+RESERVED");
+    }
+
+    #[test]
+    fn node_state_display_planned() {
+        let mut node = idle_node();
+        node.planned_job_id = 42;
+        assert_eq!(node_state_display(&node), "IDLE+PLANNED");
+    }
+
+    #[test]
+    fn node_state_display_non_idle_state_ignores_overlay_fields() {
+        let mut node = idle_node();
+        node.state = spur_proto::proto::NodeState::NodeAllocated as i32;
+        node.planned_job_id = 42;
+        assert_eq!(node_state_display(&node), "ALLOCATED");
     }
 
     #[test]

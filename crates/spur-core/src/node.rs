@@ -212,6 +212,34 @@ impl std::fmt::Display for NodeState {
     }
 }
 
+/// A display-only condition layered on top of an Idle node — CLI-facing
+/// (sinfo/scontrol), not part of the persisted [`NodeState`] machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeOverlay {
+    /// Held by an active reservation; `maint` also carries the MAINT flag.
+    Reserved { maint: bool },
+    /// Idle now, but earmarked by backfill for a future job's start.
+    Planned,
+}
+
+/// Resolve the overlay for a node, matching Slurm's own precedence: an
+/// active reservation wins over a backfill plan, and both only apply while
+/// the node is otherwise Idle.
+pub fn node_overlay(node: &spur_proto::proto::NodeInfo) -> Option<NodeOverlay> {
+    if node.state != spur_proto::proto::NodeState::NodeIdle as i32 {
+        return None;
+    }
+    if !node.active_reservation.is_empty() {
+        return Some(NodeOverlay::Reserved {
+            maint: node.reservation_maint,
+        });
+    }
+    if node.planned_job_id != 0 {
+        return Some(NodeOverlay::Planned);
+    }
+    None
+}
+
 /// Where a node originates from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -687,5 +715,64 @@ mod tests {
     fn node_state_from_short_or_name_rejects_unknown() {
         assert_eq!(NodeState::from_short_or_name("bogus"), None);
         assert_eq!(NodeState::from_short_or_name(""), None);
+    }
+
+    fn idle_node_info() -> spur_proto::proto::NodeInfo {
+        spur_proto::proto::NodeInfo {
+            state: spur_proto::proto::NodeState::NodeIdle as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn node_overlay_none_when_plain_idle() {
+        assert_eq!(node_overlay(&idle_node_info()), None);
+    }
+
+    #[test]
+    fn node_overlay_none_when_not_idle_even_with_reservation() {
+        let mut node = idle_node_info();
+        node.state = spur_proto::proto::NodeState::NodeAllocated as i32;
+        node.active_reservation = "r1".into();
+        assert_eq!(node_overlay(&node), None);
+    }
+
+    #[test]
+    fn node_overlay_reserved_without_maint() {
+        let mut node = idle_node_info();
+        node.active_reservation = "r1".into();
+        assert_eq!(
+            node_overlay(&node),
+            Some(NodeOverlay::Reserved { maint: false })
+        );
+    }
+
+    #[test]
+    fn node_overlay_reserved_with_maint() {
+        let mut node = idle_node_info();
+        node.active_reservation = "r1".into();
+        node.reservation_maint = true;
+        assert_eq!(
+            node_overlay(&node),
+            Some(NodeOverlay::Reserved { maint: true })
+        );
+    }
+
+    #[test]
+    fn node_overlay_planned() {
+        let mut node = idle_node_info();
+        node.planned_job_id = 42;
+        assert_eq!(node_overlay(&node), Some(NodeOverlay::Planned));
+    }
+
+    #[test]
+    fn node_overlay_reservation_wins_over_planned() {
+        let mut node = idle_node_info();
+        node.active_reservation = "r1".into();
+        node.planned_job_id = 42;
+        assert_eq!(
+            node_overlay(&node),
+            Some(NodeOverlay::Reserved { maint: false })
+        );
     }
 }
