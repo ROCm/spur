@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.10.0](https://github.com/ROCm/spur/compare/v0.9.1...v0.10.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurctld:** store job ids as 64-bit in the accounting database ([#753](https://github.com/ROCm/spur/issues/753))
+
+### Features
+
+* **spur-cli:** read cluster name from controller in scontrol show config ([#786](https://github.com/ROCm/spur/issues/786)) ([ddfb9ed](https://github.com/ROCm/spur/commit/ddfb9ed4b45b92f493bbc34f65dc4ba1d7755427))
+* **spur-cli:** report requested placement and scheduling provenance in scontrol show job ([#761](https://github.com/ROCm/spur/issues/761)) ([9dbe37b](https://github.com/ROCm/spur/commit/9dbe37bb14b25f503fad4108747ae51adfc4a484))
+* **spurctld:** add jobs_preempted event counter to scheduler stats ([#765](https://github.com/ROCm/spur/issues/765)) ([3bf032a](https://github.com/ROCm/spur/commit/3bf032a2cd4af0391f9cf7d31a626832ea4e29bf))
+
+
+### Bug Fixes
+
+* **auth:** align step RPC caller identity with JWT-bound job owner ([#760](https://github.com/ROCm/spur/issues/760)) ([19ff46a](https://github.com/ROCm/spur/commit/19ff46ab0d414ed63c1ce32ccd75ac86edbdc84b))
+* fail rejected k8s jobs and enforce swap, burst-buffer, and scancel semantics ([#611](https://github.com/ROCm/spur/issues/611)) ([199488b](https://github.com/ROCm/spur/commit/199488be8a208bdf66efd259762b84fbd88218b1))
+* **spur-cli:** accept Slurm's -n, -p and -P output flags on sacctmgr ([#669](https://github.com/ROCm/spur/issues/669)) ([dbe22bf](https://github.com/ROCm/spur/commit/dbe22bf9f01167daf81c2af9383453561231e410))
+* **spur-cli:** show planned job/start and composite State= for plnd nodes ([#755](https://github.com/ROCm/spur/issues/755)) ([c92d0dd](https://github.com/ROCm/spur/commit/c92d0dd13a4541c8390133baa28166a13ecea256))
+* **spur-cli:** stop sprio and sshare panicking on every invocation ([#697](https://github.com/ROCm/spur/issues/697)) ([233029a](https://github.com/ROCm/spur/commit/233029a66acd6654a1c5a878e99f161ed6f1ee55))
+* **spurctld:** address review comments on jobs_preempted counter ([#766](https://github.com/ROCm/spur/issues/766)) ([4dc6710](https://github.com/ROCm/spur/commit/4dc67106cd1bbd899f95fba116fbe5d1852798d9))
+* **spurctld:** apply MaxWall as the default time limit for a job with no -t ([#728](https://github.com/ROCm/spur/issues/728)) ([4039d68](https://github.com/ROCm/spur/commit/4039d68c197d46e7a4edfe4d07e4d6cfdd57d729))
+* **spurctld:** categorize dispatch confirmation failure reasons ([#717](https://github.com/ROCm/spur/issues/717)) ([87787ae](https://github.com/ROCm/spur/commit/87787ae8d55dfbdde46bb685f696e07b4f56955d))
+* **spurctld:** keep one unresponsive node from stalling all scheduling ([#776](https://github.com/ROCm/spur/issues/776)) ([4f933b3](https://github.com/ROCm/spur/commit/4f933b3f278bf42b3e5bd3c75b55a2f4eb92a8e2))
+* **spurctld:** report array task throttle reason ([#720](https://github.com/ROCm/spur/issues/720)) ([b5c6ece](https://github.com/ROCm/spur/commit/b5c6ece6579d25be8bf28e26a4875494bd0beacd))
+* **spurctld:** store job ids as 64-bit in the accounting database ([#753](https://github.com/ROCm/spur/issues/753)) ([180c896](https://github.com/ROCm/spur/commit/180c896d8a1fdfe74ffe3a63c18d978a4a89dc2d))
+* **spurctld:** type the EXPLAIN fixture's job id as JobId ([#769](https://github.com/ROCm/spur/issues/769)) ([5c1f662](https://github.com/ROCm/spur/commit/5c1f6620e60db3262c3d9fcbedfd08987f73f417))
+
+
+### Performance
+
+* **spurctld:** index the GrpWall consumption window ([#752](https://github.com/ROCm/spur/issues/752)) ([cf9d0a9](https://github.com/ROCm/spur/commit/cf9d0a9a83c59e5dd5be58847f40bac251662076))
+
 ## [0.9.1](https://github.com/ROCm/spur/compare/v0.9.0...v0.9.1) (2026-08-25)
 
 
