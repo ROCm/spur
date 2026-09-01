@@ -79,13 +79,11 @@ struct Unplaced {
     planned_start: Option<chrono::DateTime<Utc>>,
 }
 
-/// `planned_start` drifts by seconds every cycle, so it is excluded from the
-/// comparison that decides whether the situation actually changed.
-impl PartialEq for Unplaced {
-    fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && self.needed_nodes == other.needed_nodes
-            && self.candidates == other.candidates
+impl Unplaced {
+    /// `candidates` and `planned_start` both track live node state, so including
+    /// them would re-log every waiting job whenever any one node changed.
+    fn same_situation(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.needed_nodes == other.needed_nodes
     }
 }
 
@@ -107,13 +105,33 @@ impl BackfillScheduler {
         }
     }
 
+    /// Discard the logged-outcome memory so the next cycle re-reports every
+    /// still-stuck job. Used when a cycle is skipped and the memory goes stale.
+    pub fn clear_outcomes(&mut self) {
+        self.last_outcome.clear();
+    }
+
+    /// Jobs whose situation differs from what was last logged for them.
+    fn newly_unplaced<'a>(
+        &self,
+        current: &'a HashMap<JobId, Unplaced>,
+    ) -> Vec<(JobId, &'a Unplaced)> {
+        current
+            .iter()
+            .filter(|(job_id, outcome)| {
+                !self
+                    .last_outcome
+                    .get(job_id)
+                    .is_some_and(|prev| prev.same_situation(outcome))
+            })
+            .map(|(job_id, outcome)| (*job_id, outcome))
+            .collect()
+    }
+
     /// Emit one line per job whose placement outcome changed since the last
     /// cycle, then adopt this cycle's set (which also drops jobs that started).
     fn log_unplaced(&mut self, current: HashMap<JobId, Unplaced>) {
-        for (job_id, outcome) in &current {
-            if self.last_outcome.get(job_id) == Some(outcome) {
-                continue;
-            }
+        for (job_id, outcome) in self.newly_unplaced(&current) {
             info!(
                 job_id = job_id,
                 reason = outcome.kind.as_str(),
@@ -954,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn unplaced_outcome_ignores_planned_start_drift() {
+    fn unplaced_outcome_ignores_live_node_state_drift() {
         let now = Utc::now();
         let base = Unplaced {
             kind: UnplacedKind::FutureSlotReserved,
@@ -966,16 +984,121 @@ mod tests {
             planned_start: Some(now + Duration::seconds(30)),
             ..base
         };
-        assert_eq!(
-            base, drifted,
+        assert!(
+            base.same_situation(&drifted),
             "a drifting start must not re-log every cycle"
         );
+
+        // One unrelated node draining changes the candidate count for every
+        // waiting job; that must not re-log the whole queue.
+        let recounted = Unplaced {
+            candidates: 1,
+            ..base
+        };
+        assert!(base.same_situation(&recounted));
 
         let changed = Unplaced {
             kind: UnplacedKind::TooFewCandidates,
             ..base
         };
-        assert_ne!(base, changed);
+        assert!(!base.same_situation(&changed));
+    }
+
+    #[test]
+    fn an_unchanged_job_is_logged_once_across_cycles() {
+        let mut sched = BackfillScheduler::new(100);
+        let stuck = HashMap::from([(
+            1,
+            Unplaced {
+                kind: UnplacedKind::TooFewCandidates,
+                needed_nodes: 4,
+                candidates: 2,
+                planned_start: None,
+            },
+        )]);
+
+        assert_eq!(sched.newly_unplaced(&stuck).len(), 1);
+        sched.log_unplaced(stuck.clone());
+
+        // Second cycle, same situation: nothing new to say.
+        assert!(sched.newly_unplaced(&stuck).is_empty());
+
+        // A node draining moves the candidate count but not the situation.
+        let recounted = HashMap::from([(
+            1,
+            Unplaced {
+                candidates: 1,
+                ..stuck[&1]
+            },
+        )]);
+        assert!(sched.newly_unplaced(&recounted).is_empty());
+
+        // A genuinely different reason re-logs.
+        let different = HashMap::from([(
+            1,
+            Unplaced {
+                kind: UnplacedKind::NoSuitableNodes,
+                ..stuck[&1]
+            },
+        )]);
+        assert_eq!(sched.newly_unplaced(&different).len(), 1);
+    }
+
+    #[test]
+    fn a_skipped_cycle_clears_the_logged_outcomes() {
+        let mut sched = BackfillScheduler::new(100);
+        let stuck = HashMap::from([(
+            1,
+            Unplaced {
+                kind: UnplacedKind::TooFewCandidates,
+                needed_nodes: 4,
+                candidates: 2,
+                planned_start: None,
+            },
+        )]);
+        sched.log_unplaced(stuck.clone());
+        assert!(sched.newly_unplaced(&stuck).is_empty());
+
+        sched.clear_outcomes();
+        assert_eq!(
+            sched.newly_unplaced(&stuck).len(),
+            1,
+            "a still-stuck job must re-report after a skipped cycle"
+        );
+    }
+
+    #[test]
+    fn unplaced_job_holding_a_future_slot_records_its_projected_start() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(3);
+        nodes[0].alloc_resources.cpus = nodes[0].total_resources.cpus;
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node001".to_string(), Utc::now() + Duration::minutes(90));
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let job = make_job_with_nodelist(1, 1, Some("node001"), None);
+        assert!(sched.schedule(&[job], &cluster).is_empty());
+        let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
+        assert_eq!(outcome.kind, UnplacedKind::FutureSlotReserved);
+        assert!(
+            outcome.planned_start.is_some(),
+            "a reserved future slot must carry the projected start"
+        );
+        assert_eq!(
+            sched.planned_job_starts().get(&1).map(|(_, when)| *when),
+            outcome.planned_start,
+            "the job-keyed view must publish the same projection that was logged"
+        );
     }
 
     #[test]

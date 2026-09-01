@@ -126,6 +126,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // from before it lost leadership.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
             continue;
         }
 
@@ -149,6 +150,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
             continue;
         }
         let hit_depth_limit = pending.len() > max_jobs;
@@ -161,6 +163,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             debug!("no schedulable nodes, skipping scheduling cycle");
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
             continue;
         }
 
@@ -199,6 +202,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // to have produced a valid plan, planned or otherwise.
                 cluster.set_planned_reservations(HashMap::new());
                 cluster.set_planned_job_starts(HashMap::new());
+                sched_ref.clear_outcomes();
                 continue;
             }
         };
