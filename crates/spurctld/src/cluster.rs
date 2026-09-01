@@ -3989,6 +3989,9 @@ impl ClusterManager {
         // so a mid-reconfigure failure leaves the previous config in place.
         // Readers pick up the new sections on their next `config()` snapshot.
         *self.config.write() = Arc::new(new_config);
+        // Agent channels are built per call, so new tunables apply to the next RPC. Unlike the
+        // jwt key, these carry no security posture, so adopting them live is safe.
+        crate::agent_client::set_channel_tuning(&self.config.read().controller);
 
         // Re-derive per-node `[[nodes]]` policy (features/weight) and partition
         // membership against the freshly-swapped config. This is a local derived

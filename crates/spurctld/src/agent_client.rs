@@ -29,14 +29,41 @@ use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 /// enough to tolerate clock skew between the controller and a node.
 const CREDENTIAL_TTL_SECS: u64 = 300;
 
-/// Dial budget only. A request budget belongs at the call site, where the operation's real duration
-/// is known — a launch runs the node prolog, a k0s start downloads a binary.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Channel tunables. A dial budget and liveness pings only — a request budget belongs at the call
+/// site, where the operation's real duration is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentChannelTuning {
+    pub connect_secs: u64,
+    pub keepalive_interval_secs: u64,
+    pub keepalive_timeout_secs: u64,
+}
 
-/// Liveness for an established channel. Catches a dead peer or a lost connection; an agent whose
-/// handler is wedged still answers pings, so only a call-site deadline bounds that.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+impl Default for AgentChannelTuning {
+    fn default() -> Self {
+        Self {
+            connect_secs: spur_core::config::DEFAULT_AGENT_CONNECT_TIMEOUT_SECS,
+            keepalive_interval_secs: spur_core::config::DEFAULT_AGENT_KEEPALIVE_INTERVAL_SECS,
+            keepalive_timeout_secs: spur_core::config::DEFAULT_AGENT_KEEPALIVE_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Swapped by `reconfigure`. Read per `connect()`, which builds a fresh channel every call, so a
+/// change applies to the next RPC with nothing to invalidate.
+static TUNING: parking_lot::RwLock<Option<AgentChannelTuning>> = parking_lot::RwLock::new(None);
+
+/// Install channel tunables from config. Called at startup and on every reconfigure.
+pub fn set_channel_tuning(controller: &spur_core::config::ControllerConfig) {
+    *TUNING.write() = Some(AgentChannelTuning {
+        connect_secs: controller.agent_connect_timeout_secs,
+        keepalive_interval_secs: controller.agent_keepalive_interval_secs,
+        keepalive_timeout_secs: controller.agent_keepalive_timeout_secs,
+    });
+}
+
+fn tuning() -> AgentChannelTuning {
+    TUNING.read().unwrap_or_default()
+}
 
 /// Subject the agent sees for controller-issued credentials. Shared with the agent (which gates
 /// controller-only RPCs on it) via `spur_core::auth` so the two cannot drift apart.
@@ -121,12 +148,18 @@ fn credential() -> ControllerCredential {
 pub async fn connect(
     endpoint: String,
 ) -> Result<SlurmAgentClient<AgentChannel>, tonic::transport::Error> {
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
-        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
-        .connect()
-        .await?;
+    let tuning = tuning();
+    let mut builder = tonic::transport::Endpoint::from_shared(endpoint)?;
+    if tuning.connect_secs > 0 {
+        builder = builder.connect_timeout(Duration::from_secs(tuning.connect_secs));
+    }
+    // Zero interval leaves keepalive off entirely; the timeout alone would have nothing to time.
+    if tuning.keepalive_interval_secs > 0 {
+        builder = builder
+            .http2_keep_alive_interval(Duration::from_secs(tuning.keepalive_interval_secs))
+            .keep_alive_timeout(Duration::from_secs(tuning.keepalive_timeout_secs));
+    }
+    let channel = builder.connect().await?;
     Ok(SlurmAgentClient::new(InterceptedService::new(
         channel,
         credential(),
@@ -139,6 +172,32 @@ mod tests {
     use spur_core::auth::{generate_token, verify_token};
 
     const TEST_KEY: &str = "test-cluster-key";
+
+    /// One test, not two: the tuning global is process-wide, so parallel tests racing on it
+    /// would be flaky.
+    #[test]
+    fn channel_tuning_follows_config_and_is_swapped_on_reload() {
+        let defaults = spur_core::config::ControllerConfig::default();
+        set_channel_tuning(&defaults);
+        assert_eq!(tuning(), AgentChannelTuning::default());
+
+        let reloaded = spur_core::config::ControllerConfig {
+            agent_connect_timeout_secs: 11,
+            agent_keepalive_interval_secs: 22,
+            agent_keepalive_timeout_secs: 33,
+            ..Default::default()
+        };
+        set_channel_tuning(&reloaded);
+        assert_eq!(
+            tuning(),
+            AgentChannelTuning {
+                connect_secs: 11,
+                keepalive_interval_secs: 22,
+                keepalive_timeout_secs: 33,
+            },
+            "a later call must replace the previous tuning, not be ignored"
+        );
+    }
 
     #[test]
     fn empty_key_produces_no_credential() {
