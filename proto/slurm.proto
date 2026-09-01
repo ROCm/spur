@@ -277,7 +277,7 @@ message JobInfo {
   uint64 min_memory_node_mb = 67;
   bool min_memory_is_per_cpu = 79;
 
-  // Earliest start (--begin, else submit), when age priority began accruing,
+  // Earliest start (--begin, else submit), when age priority began accruing (Spur accrues from submit even while held),
   // and when the scheduler last considered the job (unset until evaluated).
   google.protobuf.Timestamp eligible_time = 68;
   google.protobuf.Timestamp accrue_time = 69;

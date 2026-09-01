@@ -16915,7 +16915,23 @@ mod tests {
             stamped.is_some(),
             "scheduling pass must record LastSchedEval"
         );
-        assert!(stamped.unwrap() >= cm.get_job(job_id).unwrap().submit_time);
+
+        cm.pending_jobs_and_tag_reasons();
+        let restamped = cm.get_job(job_id).unwrap().last_sched_eval;
+        assert!(
+            restamped > stamped,
+            "each cycle must advance LastSchedEval, got {stamped:?} then {restamped:?}"
+        );
+
+        // A job that started between the read snapshot and the write lock must
+        // not gain a stamp — the re-check inside mark_scheduler_evaluated.
+        cm.jobs.write().get_mut(&job_id).unwrap().state = JobState::Running;
+        cm.mark_scheduler_evaluated(&[job_id]);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().last_sched_eval,
+            restamped,
+            "a running job must not be stamped as scheduler-evaluated"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

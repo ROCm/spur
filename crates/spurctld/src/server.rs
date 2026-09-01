@@ -3853,10 +3853,8 @@ fn job_info_disclosure(
     }
 }
 
-/// Blank the fields of a `JobInfo` that a non-owner should not see: the working directory, the first
-/// command line, the submit line, the stdio paths, the comment, the resource detail, and — most
-/// importantly for cross-tenant targeting — the allocated, requested, and planned node lists. The
-/// identity/state/timing/account fields are left intact so the Slurm-standard queue view works.
+/// Blank what a non-owner should not see, keeping identity/state/timing/account
+/// so the Slurm-standard queue view still works.
 fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.work_dir = String::new();
     info.command = String::new();
@@ -3872,6 +3870,12 @@ fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.req_nodelist = String::new();
     info.exc_nodelist = String::new();
     info.sched_nodelist = String::new();
+    // The requested shape restates the resource detail blanked above.
+    info.req_tres = String::new();
+    info.features = String::new();
+    info.min_cpus_node = 0;
+    info.min_memory_node_mb = 0;
+    info.min_memory_is_per_cpu = false;
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -4004,7 +4008,9 @@ fn sanitize_submit_line(raw: &str) -> Option<String> {
 fn is_format_char(c: char) -> bool {
     matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
         | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
-        | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Tasks landing on one node, for the per-node minima Slurm reports. Nothing
@@ -7035,11 +7041,25 @@ mod tests {
     }
 
     #[test]
-    fn proto_to_job_spec_maps_an_empty_submit_line_to_none() {
-        assert_eq!(sanitize_submit_line(""), None);
+    fn proto_to_job_spec_sanitizes_the_submit_line_it_stores() {
+        let spec = |submit_line: &str| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            submit_line: submit_line.into(),
+            ..Default::default()
+        };
+
+        let stored = |line: &str| {
+            proto_to_job_spec(spec(line))
+                .expect("valid spec")
+                .submit_line
+        };
+
+        assert_eq!(stored(""), None);
+        assert_eq!(stored("sbatch job.sh"), Some("sbatch job.sh".to_string()));
+        // The escape must be neutralized on the way in, not just by the printer.
         assert_eq!(
-            sanitize_submit_line("sbatch job.sh"),
-            Some("sbatch job.sh".to_string())
+            stored("sbatch \u{1b}[2Kjob.sh"),
+            Some("sbatch  [2Kjob.sh".to_string())
         );
     }
 
@@ -7122,10 +7142,21 @@ mod tests {
         // must not reappear on a redacted record.
         let mut info = JobInfo {
             sched_nodelist: "gpu-b-[01-04]".into(),
+            req_tres: "cpu=16,mem=64G,gres/gpu=8".into(),
+            features: "mi300x".into(),
+            min_cpus_node: 16,
+            min_memory_node_mb: 65536,
+            min_memory_is_per_cpu: true,
             ..Default::default()
         };
         redact_sensitive_job_info(&mut info);
         assert!(info.sched_nodelist.is_empty());
+        // The requested shape restates the allocated detail, so it goes too.
+        assert!(info.req_tres.is_empty());
+        assert!(info.features.is_empty());
+        assert_eq!(info.min_cpus_node, 0);
+        assert_eq!(info.min_memory_node_mb, 0);
+        assert!(!info.min_memory_is_per_cpu);
     }
 
     #[test]
