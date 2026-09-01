@@ -1015,7 +1015,7 @@ fn render_assoc_mgr(
             spur_core::config::format_time(Some(r.max_wall_minutes))
         };
         out.push_str(&format!(
-            "{}={} MaxWall={} MaxTRES={}",
+            "{}={} MaxWall={} MaxTRESPJ={}",
             section.scope,
             r.scope,
             max_wall,
@@ -2302,9 +2302,9 @@ mod tests {
         // scripts parse this, so the layout is a contract.
         let out = render_assoc_mgr(QOS_SECTION, &[assoc_mgr_record()]);
         assert!(out.starts_with("QOS Records\n"));
-        // MaxTRES is the per-job cap, reading distinctly from the per-user MaxTRESPU.
+        // MaxTRESPJ is the per-job cap, reading distinctly from the per-user MaxTRESPU.
         assert!(out.contains(
-            "QOS=highprio MaxWall=01:00:00 MaxTRES=cpu=8 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=N\n"
+            "QOS=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=8 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=N\n"
         ));
         assert!(out.contains(
             "   GrpJobs=N(9) GrpSubmitJobs=N(11) GrpTRES=cpu=N(36),node=16(9) GrpWall=N(N)\n"
@@ -2328,7 +2328,9 @@ mod tests {
         record.users[0].over_limit = vec!["MaxJobs".into()];
         let out = render_assoc_mgr(ASSOC_SECTION, &[record]);
         // The per-job TRES cap still shows, but the QOS-only MaxSubmitJobsPA does not.
-        assert!(out.contains("Account=highprio MaxWall=01:00:00 MaxTRES=cpu=8\n"));
+        // An association names its own per-user cap `MaxTRES`, so the per-job cap must
+        // stay `MaxTRESPJ` for the two to be told apart within one record.
+        assert!(out.contains("Account=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=8\n"));
         assert!(!out.contains("MaxJobsPU"));
         assert!(!out.contains("MaxSubmitJobsPA"));
         assert!(!out.contains("GrpWall"));
@@ -2426,7 +2428,7 @@ mod tests {
         record.grp_wall_consumed_minutes = 360; // 6h spent
         let out = render_assoc_mgr(QOS_SECTION, &[record]);
         assert!(out.contains(
-            "QOS=highprio MaxWall=01:00:00 MaxTRES=cpu=8,node=2 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=40\n"
+            "QOS=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=8,node=2 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=40\n"
         ));
         assert!(out.contains("GrpWall=10:00:00(06:00:00)\n"));
     }
@@ -2441,7 +2443,7 @@ mod tests {
         record.grp_wall_minutes = 600;
         record.grp_wall_consumed_minutes = spur_core::accounting::INFINITE;
         let out = render_assoc_mgr(QOS_SECTION, &[record]);
-        assert!(out.contains("QOS=highprio MaxWall=01:00:00 MaxTRES=N "));
+        assert!(out.contains("QOS=highprio MaxWall=01:00:00 MaxTRESPJ=N "));
         assert!(out.contains("GrpWall=10:00:00(N)\n"));
     }
 
