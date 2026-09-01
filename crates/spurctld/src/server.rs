@@ -1508,6 +1508,7 @@ impl SlurmController for ControllerService {
             server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             version: env!("CARGO_PKG_VERSION").into(),
             federation_peers,
+            cluster_name: self.cluster.config().cluster_name.clone(),
         }))
     }
 
@@ -5269,6 +5270,16 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key: String::new(),
         }
+    }
+
+    // Ping carries the configured cluster name so `scontrol show config` can
+    // report it without reading the login node's local config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_reports_configured_cluster_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
+        assert_eq!(resp.cluster_name, "test");
     }
 
     // Exercises the requeue RPC boundary: gRPC status mapping (auth vs. state

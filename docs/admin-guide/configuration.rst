@@ -137,8 +137,9 @@ Top-level keys
      - **(required)**
      - Live
      - Cluster name. An empty value fails to load with ``missing required field:
-       cluster_name``. Changing it live re-labels metrics mid-series; prefer a
-       restart.
+       cluster_name``. Reported by ``scontrol show config``, which reads it from
+       the live controller rather than the login node's local config. Changing it
+       live re-labels metrics mid-series; prefer a restart.
    * - ``licenses``
      - table<string, integer>
      - ``{}``
