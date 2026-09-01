@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -7055,29 +7055,51 @@ fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::
     None
 }
 
-fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
-    let mut tres = TresRecord::new();
-    // Node TRES is the count of distinct nodes occupied (union of `allocated_nodes`), not summed
-    // `num_nodes` — a node packed by two jobs counts once. CPU/Memory/GPU stay additive.
-    let mut distinct_nodes: HashSet<&str> = HashSet::new();
-    let mut unplaced_nodes: u64 = 0;
-    for j in jobs.values() {
-        if j.state != JobState::Running || !pred(j) {
-            continue;
-        }
-        tres.add(&job_tres(j));
-        if j.allocated_nodes.is_empty() {
-            // Running job without recorded placement (transient/edge): fall back
-            // to its requested count so the limit is never under-counted.
-            unplaced_nodes += j.spec.num_nodes as u64;
+/// Running-TRES accumulation with the distinct-node rule applied once at the
+/// end. Node TRES is the count of distinct nodes occupied (union of
+/// `allocated_nodes`), not summed `num_nodes` — a node packed by two jobs counts
+/// once; CPU/Memory/GPU stay additive. A running job without recorded placement
+/// falls back to its requested `num_nodes` so the limit is never under-counted.
+///
+/// Shared by `sum_running_tres` and the per-scope/per-user aggregation in
+/// `scope_usage` so a running job's footprint is counted identically whether it
+/// feeds a group total or a single user's, and the distinct-node union is taken
+/// per aggregate rather than summed across jobs.
+#[derive(Default)]
+struct RunningTresAccumulator<'a> {
+    tres: TresRecord,
+    distinct_nodes: HashSet<&'a str>,
+    unplaced_nodes: u64,
+}
+
+impl<'a> RunningTresAccumulator<'a> {
+    fn add(&mut self, job: &'a Job) {
+        self.tres.add(&job_tres(job));
+        if job.allocated_nodes.is_empty() {
+            self.unplaced_nodes += job.spec.num_nodes as u64;
         } else {
-            distinct_nodes.extend(j.allocated_nodes.iter().map(String::as_str));
+            self.distinct_nodes
+                .extend(job.allocated_nodes.iter().map(String::as_str));
         }
     }
-    // `job_tres` set Node to the summed `num_nodes` above; replace it with the
-    // real distinct-node occupancy.
-    tres.set(TresType::Node, distinct_nodes.len() as u64 + unplaced_nodes);
-    tres
+
+    fn finish(mut self) -> TresRecord {
+        self.tres.set(
+            TresType::Node,
+            self.distinct_nodes.len() as u64 + self.unplaced_nodes,
+        );
+        self.tres
+    }
+}
+
+fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
+    let mut acc = RunningTresAccumulator::default();
+    for j in jobs.values() {
+        if j.state == JobState::Running && pred(j) {
+            acc.add(j);
+        }
+    }
+    acc.finish()
 }
 
 /// The limits-versus-usage snapshot behind `scontrol show assoc_mgr`. Usage is
@@ -7129,6 +7151,17 @@ fn queued_scopes(
         .collect()
 }
 
+/// One user's running/submitted tallies within a single scope, accumulated in
+/// the same pass that builds the group totals. The node dimension of
+/// `running_tres` is deduped per user, so a node two of this user's jobs share
+/// counts once — the same distinct-node rule the group total uses.
+#[derive(Default)]
+struct UserAgg<'a> {
+    running_jobs: u32,
+    submitted_jobs: u32,
+    running_tres: RunningTresAccumulator<'a>,
+}
+
 /// One scope's consumption from the job table, with an entry per user holding
 /// work in it. `defined_users` are users the accounting definitions know of; they
 /// get an entry at zero usage so a cap on an idle association is still reported.
@@ -7148,44 +7181,56 @@ fn scope_usage(
 ) -> Option<ScopeLimitUsage> {
     let in_scope = |j: &Job| scope_of(j) == Some(scope);
 
-    let mut users: BTreeSet<&str> = jobs
-        .values()
-        .filter(|j| is_submitted(j) && in_scope(j))
-        .map(|j| j.spec.user.as_str())
-        .collect();
-    users.extend(defined_users.iter().map(String::as_str));
-    users.retain(|u| only_user.is_none() || only_user == Some(u));
+    let mut grp_running_jobs = 0u32;
+    let mut grp_submitted_jobs = 0u32;
+    let mut grp_tres = RunningTresAccumulator::default();
+    let mut per_user: BTreeMap<&str, UserAgg> = BTreeMap::new();
 
-    if only_user.is_some() && users.is_empty() {
+    for job in jobs.values() {
+        if !(is_submitted(job) && in_scope(job)) {
+            continue;
+        }
+        let running = job.state == JobState::Running;
+        // Group figures are the scope's own and are never narrowed by `only_user`.
+        grp_submitted_jobs += 1;
+        if running {
+            grp_running_jobs += 1;
+            grp_tres.add(job);
+        }
+        let user = job.spec.user.as_str();
+        if only_user.is_none() || only_user == Some(user) {
+            let agg = per_user.entry(user).or_default();
+            agg.submitted_jobs += 1;
+            if running {
+                agg.running_jobs += 1;
+                agg.running_tres.add(job);
+            }
+        }
+    }
+
+    for user in defined_users {
+        if only_user.is_none() || only_user == Some(user.as_str()) {
+            per_user.entry(user.as_str()).or_default();
+        }
+    }
+
+    if only_user.is_some() && per_user.is_empty() {
         return None;
     }
 
     Some(ScopeLimitUsage {
         scope: scope.to_owned(),
-        grp_running_jobs: jobs
-            .values()
-            .filter(|j| j.state == JobState::Running && in_scope(j))
-            .count() as u32,
-        grp_submitted_jobs: jobs
-            .values()
-            .filter(|j| is_submitted(j) && in_scope(j))
-            .count() as u32,
-        grp_running_tres: sum_running_tres(jobs, in_scope),
-        users: users
+        grp_running_jobs,
+        grp_submitted_jobs,
+        grp_running_tres: grp_tres.finish(),
+        users: per_user
             .into_iter()
-            .map(|user| {
-                let mine = |j: &Job| in_scope(j) && j.spec.user == user;
-                UserLimitUsage {
-                    user: user.to_owned(),
-                    running_jobs: jobs
-                        .values()
-                        .filter(|j| j.state == JobState::Running && mine(j))
-                        .count() as u32,
-                    submitted_jobs: jobs.values().filter(|j| is_submitted(j) && mine(j)).count()
-                        as u32,
-                    running_tres: sum_running_tres(jobs, mine),
-                    caps: caps_for(user),
-                }
+            .map(|(user, agg)| UserLimitUsage {
+                user: user.to_owned(),
+                running_jobs: agg.running_jobs,
+                submitted_jobs: agg.submitted_jobs,
+                running_tres: agg.running_tres.finish(),
+                caps: caps_for(user),
             })
             .collect(),
         ..Default::default()
@@ -17235,6 +17280,145 @@ mod tests {
         let tres = sum_running_tres(&jobs, |_| true);
         // Unplaced fallback 3 + placed distinct {n1,n2,n3}=3 = 6, not summed 3+2+2=7.
         assert_eq!(tres.get(TresType::Node), 6);
+    }
+
+    #[test]
+    fn scope_usage_single_pass_matches_per_statistic_computation() {
+        fn scoped_job(
+            id: JobId,
+            user: &str,
+            qos: Option<&str>,
+            state: JobState,
+            nodes: &[&str],
+            num_nodes: u32,
+        ) -> Job {
+            let mut spec = basic_spec("scope-usage");
+            spec.user = user.into();
+            spec.qos = qos.map(str::to_owned);
+            spec.num_nodes = num_nodes;
+            let mut job = Job::new(id, spec);
+            job.state = state;
+            job.allocated_nodes = nodes.iter().map(|n| (*n).to_string()).collect();
+            job
+        }
+
+        // alice: two running jobs sharing n2 (distinct union {n1,n2,n3}=3, not summed 4).
+        // bob: one running job with no recorded placement (falls back to num_nodes=2).
+        // carol: only a pending job (submitted, never running).
+        // The last job is in a different QOS and must be excluded entirely.
+        let mut jobs: HashMap<JobId, Job> = HashMap::new();
+        jobs.insert(
+            1,
+            scoped_job(
+                1,
+                "alice",
+                Some("normal"),
+                JobState::Running,
+                &["n1", "n2"],
+                2,
+            ),
+        );
+        jobs.insert(
+            2,
+            scoped_job(
+                2,
+                "alice",
+                Some("normal"),
+                JobState::Running,
+                &["n2", "n3"],
+                2,
+            ),
+        );
+        jobs.insert(
+            3,
+            scoped_job(3, "bob", Some("normal"), JobState::Running, &[], 2),
+        );
+        jobs.insert(
+            4,
+            scoped_job(4, "carol", Some("normal"), JobState::Pending, &[], 1),
+        );
+        jobs.insert(
+            5,
+            scoped_job(5, "alice", Some("high"), JobState::Running, &["n9"], 1),
+        );
+
+        let scope = "normal";
+        let in_scope = |j: &Job| qos_of(j) == Some(scope);
+
+        // Reference: the pre-refactor shape, each figure from an independent walk
+        // over the whole jobs map. If the single pass ever diverges, this differs.
+        let ref_users: BTreeSet<&str> = jobs
+            .values()
+            .filter(|j| is_submitted(j) && in_scope(j))
+            .map(|j| j.spec.user.as_str())
+            .collect();
+        let expected = ScopeLimitUsage {
+            scope: scope.to_owned(),
+            grp_running_jobs: jobs
+                .values()
+                .filter(|j| j.state == JobState::Running && in_scope(j))
+                .count() as u32,
+            grp_submitted_jobs: jobs
+                .values()
+                .filter(|j| is_submitted(j) && in_scope(j))
+                .count() as u32,
+            grp_running_tres: sum_running_tres(&jobs, in_scope),
+            users: ref_users
+                .into_iter()
+                .map(|user| {
+                    let mine = |j: &Job| in_scope(j) && j.spec.user == user;
+                    UserLimitUsage {
+                        user: user.to_owned(),
+                        running_jobs: jobs
+                            .values()
+                            .filter(|j| j.state == JobState::Running && mine(j))
+                            .count() as u32,
+                        submitted_jobs: jobs.values().filter(|j| is_submitted(j) && mine(j)).count()
+                            as u32,
+                        running_tres: sum_running_tres(&jobs, mine),
+                        caps: PerUserCaps::default(),
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let got = scope_usage(&jobs, scope, qos_of, None, &[], |_| PerUserCaps::default())
+            .expect("scope with queued work is always reported");
+        assert_eq!(
+            got, expected,
+            "single-pass aggregation must equal the per-statistic computation field for field"
+        );
+
+        // Pin the distinct-node semantics with literal expectations so a naive
+        // rewrite that sums num_nodes is caught even if the reference above were
+        // ever loosened to match it.
+        let user = |name: &str| got.users.iter().find(|u| u.user == name).unwrap();
+        assert_eq!(
+            user("alice").running_tres.get(TresType::Node),
+            3,
+            "alice shares n2 across two jobs: distinct {{n1,n2,n3}}=3, not summed 4"
+        );
+        assert_eq!(
+            user("bob").running_tres.get(TresType::Node),
+            2,
+            "bob's only running job is unplaced: fallback to num_nodes=2"
+        );
+        assert_eq!(
+            got.grp_running_tres.get(TresType::Node),
+            5,
+            "group is placed distinct {{n1,n2,n3}}=3 + unplaced 2 = 5, not summed 6"
+        );
+        assert_eq!(user("carol").running_jobs, 0);
+        assert_eq!(user("carol").submitted_jobs, 1);
+        assert_eq!(got.grp_running_jobs, 3);
+        assert_eq!(got.grp_submitted_jobs, 4);
+        assert!(
+            !got.users
+                .iter()
+                .any(|u| u.running_tres.get(TresType::Node) > 3),
+            "no user in the excluded 'high' scope should appear"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
