@@ -125,12 +125,42 @@ SUSPENDED, COMPLETING**.
      - NODES
      - ``%e``
      - END_TIME
+   * - ``%Y``
+     - SCHEDNODES
+     -
+     -
 
 .. code-block:: bash
 
    spur queue -u alice -t R
    squeue -p gpu -o "%.18i %.9P %.8T %.10M %R"
    squeue --states=PD,R --noheader
+
+Projected Start Times — ``squeue --start``
+-------------------------------------------
+
+``--start`` answers "when will my job run, and where" for the whole queue at
+once, rather than one job at a time through ``scontrol show job``:
+
+.. code-block:: console
+
+   $ squeue --start
+        JOBID PARTITION     NAME     USER ST          START_TIME  NODES           SCHEDNODES NODELIST(REASON)
+         1024       gpu  train.sh    alice PD 2026-08-27T17:09:56      2          node[07-08] (Resources)
+         1031       gpu   eval.sh      bob PD                 N/A      1               (null) (Priority)
+
+It restricts the view to pending jobs and orders them by projected start,
+soonest first; jobs with no reserved slot report ``N/A`` and sort last. Each of
+those defaults is overridable by passing ``-t``, ``-S``, or ``-o`` explicitly.
+
+``%S`` and ``%e`` carry the same projection in any format string, so
+``squeue -o "%.18i %.19S %.19e"`` works without ``--start``.
+
+.. note::
+
+   Projections come from the backfill pass on the controller's leader, and
+   assume every running job uses its full time limit. A job that finishes early
+   moves every projection behind it earlier.
 
 **Job state codes.** The ``ST`` column uses these short codes:
 
@@ -344,11 +374,121 @@ Detailed Records — ``scontrol show``
 ``spur show`` (Slurm ``scontrol show``) prints the full ``Key=Value`` record for
 an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
 
+.. note::
+
+   The diagnostic fields below are printed on every job, with ``(null)`` for an
+   unset string, so a parser must key on the field name rather than on a line
+   being absent. Some fields still appear only when set (``Comment``,
+   ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, ``StdIn``, the GPU line,
+   and the preemption line), and ``MinMemoryNode`` is spelled ``MinMemoryCPU``
+   for a ``--mem-per-cpu`` job.
+
 .. code-block:: bash
 
    scontrol show job 1024
    spur show node node01
    scontrol show partition gpu
+
+Diagnosing a job that will not start
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job pending on ``Reason=Resources`` looks the same whether the cluster is full
+or the job is pinned to a busy subset of it. ``scontrol show job`` reports the
+request as submitted, which distinguishes the two:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Field
+     - Meaning
+   * - ``ReqNodeList``
+     - Nodes requested with ``-w/--nodelist``. ``(null)`` when unrestricted.
+   * - ``ExcNodeList``
+     - Nodes excluded with ``-x/--exclude``.
+   * - ``NodeList``
+     - Nodes actually **allocated**. Empty (``(null)``) while pending — do not
+       confuse it with ``ReqNodeList``.
+   * - ``Features``
+     - Node feature constraint from ``-C/--constraint``.
+   * - ``ReqTRES``
+     - Requested resource totals, e.g. ``cpu=16,mem=32000M,node=2,gres/gpu=8``.
+   * - ``MinCPUsNode`` / ``MinMemoryNode``
+     - Per-node minima implied by the request. Memory is in MB with an ``M``
+       suffix; a bare ``0`` means none was requested. A ``--mem-per-cpu`` job
+       reports ``MinMemoryCPU`` instead, as Slurm does.
+   * - ``Dependency``, ``Requeue``, ``Restarts``, ``BatchFlag``, ``Exclusive``
+     - Submission flags and the requeue count for this job.
+   * - ``RunTime`` / ``TimeLimit`` / ``TimeMin`` / ``Deadline``
+     - Elapsed and requested wall time. ``TimeLimit`` reads ``UNLIMITED`` when
+       none was set; ``TimeMin`` and ``Deadline`` read ``N/A`` when unset.
+   * - ``Command``
+     - First executable line of the batch script.
+   * - ``SubmitLine``
+     - The submit command as invoked, so any submission-flag question is
+       answerable from one command.
+   * - ``EligibleTime``
+     - Earliest the job may start (``--begin``, otherwise submit time).
+   * - ``AccrueTime``
+     - When the job began accruing age priority.
+   * - ``StartTime`` / ``SchedNodeList``
+     - While pending, the slot the scheduler is holding: when it projects the
+       job will start, and on which nodes. With no slot reserved, ``StartTime``
+       reads ``N/A`` and ``SchedNodeList`` is omitted. ``StartTime`` becomes the
+       real start once the job runs.
+   * - ``EndTime``
+     - The recorded end once the job finishes, otherwise its start plus its
+       time limit. ``N/A`` for an unlimited job, or a pending one with no
+       projected start.
+   * - ``LastSchedEval``
+     - The last scheduling cycle that considered this job, so it advances even
+       on a cycle that places nothing. ``N/A`` before the first cycle, frozen
+       once the job starts, and reset by a controller restart or failover.
+       On a deep queue it also covers jobs classified but left untried past
+       ``scheduler.max_jobs_per_cycle``.
+
+.. note::
+
+   ``StartTime``, ``SchedNodeList``, and ``LastSchedEval`` live only on the
+   leader and are never replicated, so a read served by a follower reports them
+   unset even in a healthy cluster.
+
+So a job pinned to a busy node reads (excerpt — the full record has more
+fields between these lines):
+
+.. code-block:: text
+
+      JobState=PENDING Reason=Resources Dependency=(null)
+      ...
+      StartTime=2026-08-27T17:09:56 EndTime=2026-08-27T17:14:56 Deadline=N/A
+      ...
+      ReqNodeList=node07 ExcNodeList=(null)
+      NodeList=(null) SchedNodeList=node07
+      ...
+      SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
+
+The controller logs the matching scheduler-side view at ``info`` level, one line
+per job when its placement outcome changes (not every cycle). A cycle with no
+schedulable nodes at all is skipped before this runs, so it logs nothing. Jobs beyond the
+per-cycle scheduling depth limit are not reported:
+
+.. code-block:: text
+
+   backfill did not start job job_id=1024 reason=no_suitable_nodes needed_nodes=1 candidate_nodes=0
+
+``reason`` is one of ``het_group_incomplete``, ``no_suitable_nodes``,
+``requested_nodes_unavailable``, ``too_few_candidates``, ``no_capacity_at_start``,
+or ``future_slot_reserved``. The last means the job can be placed and the
+scheduler is holding a future slot for it, reported with ``planned_start``.
+
+.. note::
+
+   Spur accrues age priority from submit time for every pending job, including
+   held and dependency-blocked ones. Slurm suspends accrual for those, so
+   ``AccrueTime`` can read earlier here than on an equivalent Slurm job.
+
+Preemption provenance
+~~~~~~~~~~~~~~~~~~~~~
 
 When a job has been preempted, ``scontrol show job`` includes three additional
 fields:

@@ -6,6 +6,7 @@ use clap::Parser;
 use spur_proto::proto::GetJobsRequest;
 
 use crate::format_engine;
+use crate::timefmt::format_timestamp;
 
 /// View information about jobs in the scheduling queue.
 #[derive(Parser, Debug)]
@@ -69,6 +70,10 @@ pub struct SqueueArgs {
     #[arg(short = 'S', long, allow_hyphen_values = true)]
     pub sort: Option<String>,
 
+    /// Report pending jobs' projected start times, soonest first
+    #[arg(long)]
+    pub start: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -78,36 +83,66 @@ pub struct SqueueArgs {
     pub controller: String,
 }
 
+/// Slurm's `--start` layout, trading the runtime column for the projected
+/// start and the nodes the scheduler is holding.
+const START_FORMAT: &str = "%.18i %.9P %.8j %.8u %.2t %.19S %.6D %20Y %R";
+
 pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SqueueArgs::try_parse_from(&args)?;
+/// The format, state filter, and sort order a run resolves to, before any
+/// network I/O so a bad spec surfaces its own error rather than a connect failure.
+struct QueryPlan {
+    fmt: String,
+    states: Vec<spur_proto::proto::JobState>,
+    sort_keys: Vec<SortKey>,
+}
 
-    // Determine format
+/// `--start` supplies a default format, state filter, and sort order; each is
+/// still overridable by passing the corresponding flag explicitly.
+fn plan_query(args: &SqueueArgs) -> Result<QueryPlan> {
     let fmt = if let Some(ref f) = args.format {
         f.clone()
+    } else if args.start {
+        START_FORMAT.to_string()
     } else if args.long {
         "%.18i %.9P %.8j %.8u %.8T %.10M %.9l %.6D %R".to_string()
     } else {
         format_engine::SQUEUE_DEFAULT_FORMAT.to_string()
     };
 
-    let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
-
-    // Parse state filter — default to Pending+Running+Completing when no filter specified (Slurm default)
     let states = match args.states.as_deref() {
         Some(s) => parse_states_arg(s)?,
+        None if args.start => vec![spur_proto::proto::JobState::JobPending],
         None => default_squeue_states(),
     };
 
-    // Parse the sort spec before any network I/O so an invalid -S surfaces its own error
-    // rather than a downstream connect failure.
     let sort_keys = match args.sort.as_deref() {
         Some(s) => parse_sort_arg(s)?,
+        None if args.start => vec![SortKey {
+            spec: 'S',
+            descending: false,
+        }],
         None => default_sort_keys(),
     };
+
+    Ok(QueryPlan {
+        fmt,
+        states,
+        sort_keys,
+    })
+}
+
+pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let args = SqueueArgs::try_parse_from(&args)?;
+
+    let QueryPlan {
+        fmt,
+        states,
+        sort_keys,
+    } = plan_query(&args)?;
+    let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
 
     // Parse job ID filter
     let job_ids = args
@@ -189,10 +224,17 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'r' => crate::exit_fmt::render_reason(&job.state_reason, job.exit_signal),
         'Z' => job.work_dir.clone(),
         'o' => job.command.clone(),
-        'S' => format_timestamp(job.start_time.as_ref()),
+        'S' => format_timestamp(crate::jobtime::effective_start(job)),
         'V' => format_timestamp(job.submit_time.as_ref()),
         'v' => job.reservation.clone(),
-        'e' => format_timestamp(job.end_time.as_ref()),
+        'e' => format_timestamp(crate::jobtime::effective_end(job).as_ref()),
+        'Y' => {
+            if job.sched_nodelist.is_empty() {
+                "(null)".into()
+            } else {
+                job.sched_nodelist.clone()
+            }
+        }
         'k' => job.comment.clone(),
         'A' => job.job_id.to_string(),
         // Generic resources (GRES) requested, e.g. "gpu:8" or "gpu:mi300x:4/node".
@@ -291,9 +333,11 @@ fn compare_field(
         'M' => run_time_secs(a).cmp(&run_time_secs(b)),
         'l' => time_limit_secs(a).cmp(&time_limit_secs(b)),
         'L' => time_left_secs(a).cmp(&time_left_secs(b)),
-        'S' => ts_secs(a.start_time.as_ref()).cmp(&ts_secs(b.start_time.as_ref())),
+        // An unprojected job sorts last rather than at the epoch, so `--start`
+        // leads with the jobs the scheduler can actually place.
+        'S' => start_sort_secs(a).cmp(&start_sort_secs(b)),
         'V' => ts_secs(a.submit_time.as_ref()).cmp(&ts_secs(b.submit_time.as_ref())),
-        'e' => ts_secs(a.end_time.as_ref()).cmp(&ts_secs(b.end_time.as_ref())),
+        'e' => end_sort_secs(a).cmp(&end_sort_secs(b)),
         'P' => a.partition.cmp(&b.partition),
         'u' => a.user.cmp(&b.user),
         'j' | 'n' => a.name.cmp(&b.name),
@@ -322,6 +366,18 @@ fn time_limit_secs(job: &spur_proto::proto::JobInfo) -> i64 {
 
 fn ts_secs(ts: Option<&prost_types::Timestamp>) -> i64 {
     ts.map(|t| t.seconds).unwrap_or(0)
+}
+
+fn start_sort_secs(job: &spur_proto::proto::JobInfo) -> i64 {
+    crate::jobtime::effective_start(job)
+        .map(|t| t.seconds)
+        .unwrap_or(i64::MAX)
+}
+
+fn end_sort_secs(job: &spur_proto::proto::JobInfo) -> i64 {
+    crate::jobtime::effective_end(job)
+        .map(|t| t.seconds)
+        .unwrap_or(i64::MAX)
 }
 
 /// Unlimited time limit sorts last, matching `-S L`.
@@ -434,21 +490,128 @@ fn format_duration_hms(total_seconds: i64) -> String {
     }
 }
 
-fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
-    match ts {
-        Some(t) if t.seconds > 0 => {
-            let dt =
-                chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default();
-            dt.format("%Y-%m-%dT%H:%M:%S").to_string()
-        }
-        _ => "N/A".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use spur_proto::proto::JobState as P;
+
+    fn plan_from(argv: &[&str]) -> QueryPlan {
+        plan_query(&SqueueArgs::try_parse_from(argv).unwrap()).unwrap()
+    }
+
+    fn ts(seconds: i64) -> prost_types::Timestamp {
+        prost_types::Timestamp { seconds, nanos: 0 }
+    }
+
+    fn pending(job_id: u32) -> spur_proto::proto::JobInfo {
+        spur_proto::proto::JobInfo {
+            job_id,
+            state: P::JobPending as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn start_flag_selects_pending_jobs_sorted_by_projected_start() {
+        let plan = plan_from(&["squeue", "--start"]);
+        assert_eq!(plan.states, vec![P::JobPending]);
+        assert_eq!(
+            plan.sort_keys,
+            vec![SortKey {
+                spec: 'S',
+                descending: false
+            }]
+        );
+        assert_eq!(plan.fmt, START_FORMAT);
+    }
+
+    #[test]
+    fn start_flag_renders_a_schednodes_column() {
+        let plan = plan_from(&["squeue", "--start"]);
+        let fields = format_engine::parse_format(&plan.fmt, &format_engine::squeue_header);
+        assert!(format_engine::format_header(&fields).contains("SCHEDNODES"));
+    }
+
+    #[test]
+    fn explicit_flags_override_what_start_implies() {
+        let plan = plan_from(&["squeue", "--start", "-t", "R", "-S", "i", "-o", "%i"]);
+        assert_eq!(plan.states, vec![P::JobRunning]);
+        assert_eq!(
+            plan.sort_keys,
+            vec![SortKey {
+                spec: 'i',
+                descending: false
+            }]
+        );
+        assert_eq!(plan.fmt, "%i");
+    }
+
+    #[test]
+    fn without_start_the_defaults_are_unchanged() {
+        let plan = plan_from(&["squeue"]);
+        assert_eq!(plan.states, default_squeue_states());
+        assert_eq!(plan.sort_keys, default_sort_keys());
+        assert_eq!(plan.fmt, format_engine::SQUEUE_DEFAULT_FORMAT);
+    }
+
+    #[test]
+    fn start_time_field_falls_back_to_the_projection_while_pending() {
+        let job = spur_proto::proto::JobInfo {
+            planned_start_time: Some(ts(1_756_281_787)),
+            ..pending(1)
+        };
+        assert_eq!(resolve_job_field(&job, 'S'), "2025-08-27T08:03:07");
+        assert_eq!(resolve_job_field(&pending(2), 'S'), "N/A");
+    }
+
+    #[test]
+    fn end_time_field_projects_from_the_time_limit() {
+        let job = spur_proto::proto::JobInfo {
+            planned_start_time: Some(ts(1_756_281_787)),
+            time_limit: Some(prost_types::Duration {
+                seconds: 3600,
+                nanos: 0,
+            }),
+            ..pending(1)
+        };
+        assert_eq!(resolve_job_field(&job, 'e'), "2025-08-27T09:03:07");
+    }
+
+    #[test]
+    fn schednodes_field_reports_null_when_no_slot_is_held() {
+        assert_eq!(resolve_job_field(&pending(1), 'Y'), "(null)");
+        let job = spur_proto::proto::JobInfo {
+            sched_nodelist: "node[01-02]".into(),
+            ..pending(1)
+        };
+        assert_eq!(resolve_job_field(&job, 'Y'), "node[01-02]");
+    }
+
+    #[test]
+    fn unprojected_jobs_sort_after_projected_ones() {
+        let mut jobs = vec![
+            pending(1),
+            spur_proto::proto::JobInfo {
+                planned_start_time: Some(ts(3_000)),
+                ..pending(2)
+            },
+            spur_proto::proto::JobInfo {
+                planned_start_time: Some(ts(2_000)),
+                ..pending(3)
+            },
+        ];
+        sort_jobs(
+            &mut jobs,
+            &[SortKey {
+                spec: 'S',
+                descending: false,
+            }],
+        );
+        assert_eq!(
+            jobs.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
 
     #[test]
     fn sort_flag_accepts_hyphen_prefixed_value() {

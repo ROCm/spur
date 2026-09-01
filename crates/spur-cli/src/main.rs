@@ -8,6 +8,7 @@ mod exit_fmt;
 mod format_engine;
 mod image;
 mod interactive;
+mod jobtime;
 mod k8s;
 #[cfg(test)]
 mod mock_controller;
@@ -34,7 +35,9 @@ mod srun;
 mod sshare;
 mod sstat;
 mod strigger;
+mod submitline;
 mod timearg;
+mod timefmt;
 mod token;
 
 use std::path::Path;

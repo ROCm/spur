@@ -112,13 +112,14 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let submit_line = crate::submitline::render(&args);
     let matches = SallocArgs::command().try_get_matches_from(&args)?;
     let mut args = SallocArgs::from_arg_matches(&matches)?;
     resolve_salloc_env(&matches, &mut args);
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     let controller = args.controller.clone();
-    let job_spec = build_salloc_job_spec(&args, nodelist)?;
+    let job_spec = build_salloc_job_spec(&args, nodelist, &submit_line)?;
     let submit_user = job_spec.user.clone();
 
     let channel = crate::authclient::connect(&controller)
@@ -280,7 +281,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     std::process::exit(status.code().unwrap_or(0));
 }
 
-fn build_salloc_job_spec(args: &SallocArgs, nodelist: Option<String>) -> Result<JobSpec> {
+fn build_salloc_job_spec(
+    args: &SallocArgs,
+    nodelist: Option<String>,
+    submit_line: &str,
+) -> Result<JobSpec> {
     let gres = args.gres.clone();
     let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
     let gpus_per_node = crate::sbatch::parse_gpu_flag(args.gpus_per_node.as_deref())?;
@@ -328,6 +333,7 @@ fn build_salloc_job_spec(args: &SallocArgs, nodelist: Option<String>) -> Result<
         time_limit,
         exclusive: args.exclusive,
         constraint: args.constraint.clone().unwrap_or_default(),
+        submit_line: submit_line.to_string(),
         nodelist: nodelist.unwrap_or_default(),
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
@@ -428,6 +434,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_salloc_job_spec_records_the_submit_line() {
+        let args = SallocArgs::parse_from(["salloc", "-N", "2"]);
+        let spec = build_salloc_job_spec(&args, None, "salloc -N 2").expect("build spec");
+        assert_eq!(spec.submit_line, "salloc -N 2");
+    }
+
+    #[test]
     fn parses_nodelist_and_exclude_short() {
         let args = SallocArgs::try_parse_from(["salloc", "-w", "node001,node002", "-x", "node003"])
             .expect("parse failed");
@@ -456,7 +469,7 @@ mod tests {
     #[test]
     fn build_job_spec_sets_qos() {
         let args = SallocArgs::try_parse_from(["salloc", "--qos", "high"]).expect("parse");
-        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        let spec = build_salloc_job_spec(&args, None, "salloc --test").expect("build spec");
         assert_eq!(spec.qos, "high");
         assert!(spec.interactive);
     }
@@ -464,7 +477,7 @@ mod tests {
     #[test]
     fn build_job_spec_qos_defaults_empty() {
         let args = SallocArgs::try_parse_from(["salloc"]).expect("parse");
-        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        let spec = build_salloc_job_spec(&args, None, "salloc --test").expect("build spec");
         assert!(spec.qos.is_empty());
     }
 
@@ -550,7 +563,7 @@ mod tests {
         let env = EnvGuard::new();
         env.set("SALLOC_QOS", "burst");
         let args = resolve_from(&["salloc"]);
-        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        let spec = build_salloc_job_spec(&args, None, "salloc --test").expect("build spec");
         assert_eq!(spec.qos, "burst");
     }
 

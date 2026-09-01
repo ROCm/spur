@@ -590,6 +590,11 @@ pub struct JobSpec {
     // Interactive PTY
     #[serde(default)]
     pub pty: bool,
+
+    /// Submit command line as invoked, shell-quoted by the CLI so word
+    /// boundaries survive. Client-asserted, so advisory rather than audit.
+    #[serde(default)]
+    pub submit_line: Option<String>,
 }
 
 impl Default for JobSpec {
@@ -665,6 +670,7 @@ impl Default for JobSpec {
             extra_resources: std::collections::HashMap::new(),
             open_mode: None,
             pty: false,
+            submit_line: None,
         }
     }
 }
@@ -867,6 +873,11 @@ pub struct Job {
     /// only, meaningless once the pass that computed it ends.
     #[serde(skip)]
     pub preferred_nodes: HashSet<String>,
+
+    /// When the scheduler last evaluated this job for placement. Not persisted:
+    /// replicating a per-cycle timestamp would be a Raft write storm.
+    #[serde(skip)]
+    pub last_sched_eval: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -921,6 +932,7 @@ impl Job {
             preempt_mode: None,
             preempt_qos: None,
             preferred_nodes: HashSet::new(),
+            last_sched_eval: None,
         }
     }
 
@@ -1015,6 +1027,20 @@ impl Job {
     pub fn all_nodes_completed(&self) -> bool {
         !self.allocated_nodes.is_empty()
             && self.node_completions.len() == self.allocated_nodes.len()
+    }
+
+    /// Earliest time the job may start: `--begin` when it falls after submit.
+    pub fn eligible_time(&self) -> DateTime<Utc> {
+        match self.spec.begin_time {
+            Some(begin) if begin > self.submit_time => begin,
+            _ => self.submit_time,
+        }
+    }
+
+    /// When the job began accruing age priority. Spur ages every pending job
+    /// from submit; Slurm suspends accrual for held and dependency-blocked ones.
+    pub fn accrue_time(&self) -> DateTime<Utc> {
+        self.submit_time
     }
 
     /// Compute the run time.
@@ -2553,5 +2579,38 @@ mod tests {
         ranks.sort_unstable();
         ranks.dedup();
         assert_eq!(ranks.len(), JobState::ALL.len());
+    }
+
+    #[test]
+    fn eligible_time_is_submit_time_without_a_begin_constraint() {
+        let job = Job::new(1, JobSpec::default());
+        assert_eq!(job.eligible_time(), job.submit_time);
+        assert_eq!(job.accrue_time(), job.submit_time);
+    }
+
+    #[test]
+    fn eligible_time_follows_a_future_begin_time() {
+        let begin = Utc::now() + chrono::Duration::hours(2);
+        let job = Job::new(
+            1,
+            JobSpec {
+                begin_time: Some(begin),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.eligible_time(), begin);
+    }
+
+    #[test]
+    fn eligible_time_ignores_a_begin_time_already_past() {
+        let begin = Utc::now() - chrono::Duration::hours(2);
+        let job = Job::new(
+            1,
+            JobSpec {
+                begin_time: Some(begin),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.eligible_time(), job.submit_time);
     }
 }

@@ -435,6 +435,9 @@ pub struct ClusterManager {
     /// Node -> (job_id, start_time) for a future backfill reservation,
     /// refreshed every cycle. Ephemeral: never persisted, cheap to recompute.
     planned_reservations: RwLock<HashMap<String, (JobId, DateTime<Utc>)>>,
+    /// Same scheduler plan keyed by job, including slots on busy nodes that
+    /// `planned_reservations` (an idle-node view for sinfo) leaves out.
+    planned_job_starts: RwLock<spur_sched::backfill::PlannedJobStarts>,
     /// Last keepalive time per interactive allocation, used by the InactiveLimit
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
@@ -533,6 +536,7 @@ impl ClusterManager {
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             planned_reservations: RwLock::new(HashMap::new()),
+            planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
         };
@@ -3212,9 +3216,33 @@ impl ClusterManager {
     /// stage-in for selected candidates, and return the jobs eligible for scheduling.
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
         let classification = self.classify_pending_jobs();
+        let evaluated: Vec<JobId> = classification
+            .jobs
+            .iter()
+            .map(|job| job.job_id)
+            .chain(classification.reason_updates.iter().map(|(id, _)| *id))
+            .collect();
         self.apply_pending_reason_updates(classification.reason_updates);
         self.advance_bb_staging_for(&classification.bb_stage_candidates);
+        self.mark_scheduler_evaluated(&evaluated);
         classification.jobs
+    }
+
+    /// Record that this cycle considered these jobs, for `LastSchedEval`. Keyed
+    /// by id rather than scanning every job, to bound the write lock.
+    fn mark_scheduler_evaluated(&self, job_ids: &[JobId]) {
+        if job_ids.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let mut jobs = self.jobs.write();
+        for id in job_ids {
+            // Re-check under the write lock: the read snapshot was released, so
+            // the job may have started since and must not gain a stamp.
+            if let Some(job) = jobs.get_mut(id).filter(|j| j.state == JobState::Pending) {
+                job.last_sched_eval = Some(now);
+            }
+        }
     }
 
     fn classify_pending_jobs(&self) -> PendingJobClassification {
@@ -4677,6 +4705,19 @@ impl ClusterManager {
     /// holds a future reservation for a specific pending job on it.
     pub fn planned_reservation(&self, node: &str) -> Option<(JobId, DateTime<Utc>)> {
         self.planned_reservations.read().get(node).copied()
+    }
+
+    pub(crate) fn set_planned_job_starts(&self, planned: spur_sched::backfill::PlannedJobStarts) {
+        *self.planned_job_starts.write() = planned;
+    }
+
+    /// Borrow the plan under the read lock; cloning it per job-info response
+    /// would be avoidable per-request work as the pending queue grows.
+    pub(crate) fn with_planned_job_starts<R>(
+        &self,
+        f: impl FnOnce(&spur_sched::backfill::PlannedJobStarts) -> R,
+    ) -> R {
+        f(&self.planned_job_starts.read())
     }
 
     pub(crate) fn record_sched_cycle(
@@ -16874,6 +16915,45 @@ mod tests {
             *cm.license_pool.read().get("fluent").unwrap(),
             2,
             "configured total must never be mutated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduling_pass_stamps_last_sched_eval() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let job_id = cm.submit_job(basic_spec("last-eval")).unwrap().job_id;
+        wait_for("job visible", || cm.get_job(job_id).is_some());
+        assert!(
+            cm.get_job(job_id).unwrap().last_sched_eval.is_none(),
+            "a job must not claim to have been evaluated before any cycle ran"
+        );
+
+        cm.pending_jobs_and_tag_reasons();
+
+        let stamped = cm.get_job(job_id).unwrap().last_sched_eval;
+        assert!(
+            stamped.is_some(),
+            "scheduling pass must record LastSchedEval"
+        );
+
+        cm.pending_jobs_and_tag_reasons();
+        let restamped = cm.get_job(job_id).unwrap().last_sched_eval;
+        assert!(
+            restamped > stamped,
+            "each cycle must advance LastSchedEval, got {stamped:?} then {restamped:?}"
+        );
+
+        // A job that started between the read snapshot and the write lock must
+        // not gain a stamp — the re-check inside mark_scheduler_evaluated.
+        cm.jobs.write().get_mut(&job_id).unwrap().state = JobState::Running;
+        cm.mark_scheduler_evaluated(&[job_id]);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().last_sched_eval,
+            restamped,
+            "a running job must not be stamped as scheduler-evaluated"
         );
     }
 

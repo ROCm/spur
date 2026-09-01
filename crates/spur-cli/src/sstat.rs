@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::timefmt::format_duration_dhms as format_duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use spur_proto::proto::GetJobRequest;
@@ -245,20 +246,6 @@ fn state_name(state: i32) -> &'static str {
         .unwrap_or("UNKNOWN")
 }
 
-fn format_duration(total_seconds: i64) -> String {
-    let total_seconds = total_seconds.unsigned_abs();
-    let days = total_seconds / 86400;
-    let hours = (total_seconds % 86400) / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    if days > 0 {
-        format!("{}-{:02}:{:02}:{:02}", days, hours, minutes, seconds)
-    } else {
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,23 +270,6 @@ mod tests {
             [StatField::JobId, StatField::Elapsed]
         );
         assert!(parse_field_list("bogus").is_empty());
-    }
-
-    #[test]
-    fn format_duration_rolls_over_into_days() {
-        assert_eq!(format_duration(0), "00:00:00");
-        assert_eq!(format_duration(59), "00:00:59");
-        assert_eq!(format_duration(3_600), "01:00:00");
-        assert_eq!(format_duration(86_399), "23:59:59");
-        assert_eq!(format_duration(86_400), "1-00:00:00");
-        assert_eq!(format_duration(90_061), "1-01:01:01");
-    }
-
-    /// Run time arrives as a signed proto duration, so clock skew that yields a
-    /// negative value must still format as a sane magnitude.
-    #[test]
-    fn format_duration_treats_negative_as_magnitude() {
-        assert_eq!(format_duration(-1), "00:00:01");
     }
 
     #[test]

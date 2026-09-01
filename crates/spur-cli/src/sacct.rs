@@ -8,6 +8,7 @@ use spur_proto::proto::GetJobHistoryRequest;
 use crate::exit_fmt::format_exit;
 use crate::format_engine;
 use crate::timearg::{datetime_to_proto, parse_time_arg};
+use crate::timefmt::format_duration_dhms as format_duration;
 
 /// Display accounting data for jobs.
 #[derive(Parser, Debug)]
@@ -274,20 +275,6 @@ fn format_elapsed(job: &spur_proto::proto::JobInfo) -> String {
         format_duration(rt.seconds)
     } else {
         "00:00:00".into()
-    }
-}
-
-fn format_duration(total_seconds: i64) -> String {
-    let total_seconds = total_seconds.unsigned_abs();
-    let days = total_seconds / 86400;
-    let hours = (total_seconds % 86400) / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    if days > 0 {
-        format!("{}-{:02}:{:02}:{:02}", days, hours, minutes, seconds)
-    } else {
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
     }
 }
 

@@ -208,6 +208,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let submit_line = crate::submitline::render(&args);
     let matches = SrunArgs::command().try_get_matches_from(&args)?;
     let mut args = SrunArgs::from_arg_matches(&matches)?;
 
@@ -286,7 +287,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi).await
+    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi, &submit_line).await
 }
 
 /// Resolve `--mpi` for standalone srun vs step mode inside an allocation.
@@ -536,6 +537,7 @@ fn build_srun_job_spec(
     work_dir: &str,
     io: &ResolvedIoPaths,
     mpi: &str,
+    submit_line: &str,
 ) -> Result<JobSpec> {
     // GPU requests use dedicated proto fields; --gres=gpu:* stays in gres.
     let gres = args.gres.clone();
@@ -595,6 +597,7 @@ fn build_srun_job_spec(
         environment,
         time_limit,
         constraint: args.constraint.clone().unwrap_or_default(),
+        submit_line: submit_line.to_string(),
         nodelist: args.nodelist.clone().unwrap_or_default(),
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
@@ -856,13 +859,14 @@ async fn run_standalone_srun(
     hooks: &HooksConfig,
     work_dir: &str,
     mpi: &str,
+    submit_line: &str,
 ) -> Result<()> {
     let io = resolve_io_paths(args);
     let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
-    let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
+    let job_spec = build_srun_job_spec(args, work_dir, &io, mpi, submit_line)?;
     let submit_user = job_spec.user.clone();
     let submit_resp = client
         .submit_job(SubmitJobRequest {
@@ -1606,6 +1610,15 @@ mod tests {
     }
 
     #[test]
+    fn build_srun_job_spec_records_the_submit_line() {
+        let args = SrunArgs::parse_from(["srun", "-w", "node1", "hostname"]);
+        let io = resolve_io_paths(&args);
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun -w node1 hostname")
+            .expect("spec");
+        assert_eq!(spec.submit_line, "srun -w node1 hostname");
+    }
+
+    #[test]
     fn build_srun_job_spec_sets_srun_job_and_command_script() {
         let args =
             SrunArgs::try_parse_from(["srun", "-N", "2", "-n", "4", "hostname"]).expect("parse");
@@ -1614,7 +1627,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none").expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
         assert!(spec.srun_job);
         assert_eq!(spec.num_nodes, 2);
         assert_eq!(spec.num_tasks, 4);
@@ -1648,8 +1662,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert_eq!(spec.tasks_per_node, 4);
     }
 
@@ -1661,8 +1681,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert_eq!(spec.tasks_per_node, 0);
     }
 
@@ -1675,8 +1701,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert_eq!(spec.num_tasks, 4);
     }
 
@@ -1689,8 +1721,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert_eq!(spec.num_tasks, 2);
     }
 
@@ -1713,8 +1751,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert_eq!(spec.qos, "high");
     }
 
@@ -1726,8 +1770,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert!(spec.exclusive);
     }
 
@@ -1739,8 +1789,14 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec =
-            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        let spec = build_srun_job_spec(
+            &args,
+            "/tmp/work",
+            &io,
+            spur_core::mpi::MPI_NONE,
+            "srun --test",
+        )
+        .expect("spec");
         assert!(spec.qos.is_empty());
     }
 

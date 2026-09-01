@@ -564,22 +564,38 @@ impl ControllerService {
     /// callers (see [`viewer_is_privileged`]) get the full record; an identified non-owner gets
     /// `Full` (legacy), `None` → `NOT_FOUND` (`OwnerOnly`), or the targeting-sensitive fields blanked
     /// (`Redacted`, the default).
+    /// Disclosure level for one job. Split out so the single-job and list handlers share one policy
+    /// decision; the list path annotates in a single batch and so cannot reuse `scoped_job_info`.
+    fn disclosure_for(
+        &self,
+        owner: &str,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> JobInfoDisclosure {
+        let privileged = viewer_is_privileged(identity, owner, self.caller_is_admin(identity));
+        job_info_disclosure(
+            privileged,
+            self.cluster.config().controller.job_info_visibility,
+        )
+    }
+
     fn scoped_job_info(
         &self,
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
-        let privileged =
-            viewer_is_privileged(identity, &job.spec.user, self.caller_is_admin(identity));
-        match job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        ) {
-            JobInfoDisclosure::Full => Some(job_to_proto(job)),
+        match self.disclosure_for(&job.spec.user, identity) {
             JobInfoDisclosure::Hidden => None,
-            JobInfoDisclosure::Redacted => {
+            disclosure => {
                 let mut info = job_to_proto(job);
-                redact_sensitive_job_info(&mut info);
+                // Annotate before redacting, so the redacted branch strips the
+                // planned nodelist rather than having it added back after.
+                annotate_jobs_with_planned_reservations(
+                    std::slice::from_mut(&mut info),
+                    &self.cluster,
+                );
+                if disclosure == JobInfoDisclosure::Redacted {
+                    redact_sensitive_job_info(&mut info);
+                }
                 Some(info)
             }
         }
@@ -846,7 +862,26 @@ impl SlurmController for ControllerService {
             nodes: &req.nodes,
         });
 
-        let proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
+        let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
+        annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
+
+        // An identified caller is already scoped to their own jobs by the user filter above, so
+        // this only bites if that scoping is ever loosened — but it keeps the two read paths from
+        // disagreeing about what a non-owner may see.
+        let proto_jobs: Vec<JobInfo> = jobs
+            .iter()
+            .zip(proto_jobs)
+            .filter_map(|(job, mut info)| {
+                match self.disclosure_for(&job.spec.user, __identity.as_ref()) {
+                    JobInfoDisclosure::Hidden => None,
+                    JobInfoDisclosure::Redacted => {
+                        redact_sensitive_job_info(&mut info);
+                        Some(info)
+                    }
+                    JobInfoDisclosure::Full => Some(info),
+                }
+            })
+            .collect();
 
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
@@ -3774,6 +3809,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.open_mode)
         },
         pty: spec.pty,
+        submit_line: sanitize_submit_line(&spec.submit_line),
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -3849,10 +3885,8 @@ fn job_info_disclosure(
     }
 }
 
-/// Blank the fields of a `JobInfo` that a non-owner should not see: the working directory, the first
-/// command line, the stdio paths, the comment, the resource detail, and — most importantly for
-/// cross-tenant targeting — the allocated nodelist. The identity/state/timing/account fields are
-/// left intact so the Slurm-standard cluster-visible queue view still works.
+/// Blank what a non-owner should not see, keeping identity/state/timing/account
+/// so the Slurm-standard queue view still works.
 fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.work_dir = String::new();
     info.command = String::new();
@@ -3862,6 +3896,18 @@ fn redact_sensitive_job_info(info: &mut JobInfo) {
     info.comment = String::new();
     info.nodelist = String::new();
     info.resources = None;
+    // The submit line re-exposes most of the above, and the requested lists are
+    // the same targeting oracle as the allocated one.
+    info.submit_line = String::new();
+    info.req_nodelist = String::new();
+    info.exc_nodelist = String::new();
+    info.sched_nodelist = String::new();
+    // The requested shape restates the resource detail blanked above.
+    info.req_tres = String::new();
+    info.features = String::new();
+    info.min_cpus_node = 0;
+    info.min_memory_node_mb = 0;
+    info.min_memory_is_per_cpu = false;
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -3932,7 +3978,127 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         preempted_by: job.preempted_by.unwrap_or(0),
         preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
         preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+        req_nodelist: job.spec.nodelist.clone().unwrap_or_default(),
+        exc_nodelist: job.spec.exclude.clone().unwrap_or_default(),
+        features: job.spec.constraint.clone().unwrap_or_default(),
+        dependency: job.spec.dependency.clone(),
+        submit_line: job.spec.submit_line.clone().unwrap_or_default(),
+        req_tres: requested_tres(&job.spec),
+        min_cpus_node: min_cpus_per_node(&job.spec).try_into().unwrap_or(u32::MAX),
+        min_memory_node_mb: min_memory_requested_mb(&job.spec),
+        min_memory_is_per_cpu: job.spec.memory_per_node_mb.is_none()
+            && job.spec.memory_per_cpu_mb.is_some(),
+        eligible_time: Some(datetime_to_proto(job.eligible_time())),
+        accrue_time: Some(datetime_to_proto(job.accrue_time())),
+        last_sched_eval: job.last_sched_eval.map(datetime_to_proto),
+        deadline: job.spec.deadline.map(datetime_to_proto),
+        time_min: job.spec.time_min.map(|d| prost_types::Duration {
+            seconds: d.num_seconds(),
+            nanos: 0,
+        }),
+        requeue: job.spec.requeue,
+        restarts: job
+            .requeue_count
+            .saturating_add(job.preempt_requeue_count)
+            .saturating_add(job.user_requeue_count),
+        // srun and salloc synthesize a script too, so its presence alone does not
+        // mean the batch submission Slurm's flag denotes.
+        batch_flag: job.spec.script.is_some() && !job.spec.srun_job && !job.spec.interactive,
+        exclusive: job.spec.exclusive,
+        // Filled by annotate_jobs_with_planned_reservations: the scheduler's
+        // plan lives on the cluster, not the job record.
+        planned_start_time: None,
+        sched_nodelist: String::new(),
     }
+}
+
+/// Client-asserted, replicated in every Raft entry, and printed to a terminal,
+/// so it is bounded in bytes and stripped of terminal-controlling characters.
+const MAX_SUBMIT_LINE_BYTES: usize = 1024;
+
+/// Neutralize characters that would rewrite an operator's terminal or reorder
+/// the rendered text, and bound the length. Controls become spaces rather than
+/// vanishing, so `--wrap $'a\nb'` cannot silently render as one token.
+fn sanitize_submit_line(raw: &str) -> Option<String> {
+    let mut cleaned = String::new();
+    for c in raw.chars() {
+        let c = if c.is_control() || is_format_char(c) {
+            ' '
+        } else {
+            c
+        };
+        if cleaned.len() + c.len_utf8() > MAX_SUBMIT_LINE_BYTES {
+            cleaned.push('…');
+            break;
+        }
+        cleaned.push(c);
+    }
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Unicode `Cf`: bidi overrides and zero-width joiners render deceptively but
+/// are not `char::is_control`.
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e007f}')
+}
+
+/// Tasks landing on one node, for the per-node minima Slurm reports. Nothing
+/// bounds the inputs at submit, so this family saturates rather than overflows.
+fn tasks_per_node(spec: &spur_core::job::JobSpec) -> u64 {
+    spec.tasks_per_node.map(u64::from).unwrap_or_else(|| {
+        let nodes = u64::from(spec.num_nodes.max(1));
+        u64::from(spec.num_tasks.max(1)).div_ceil(nodes)
+    })
+}
+
+fn min_cpus_per_node(spec: &spur_core::job::JobSpec) -> u64 {
+    tasks_per_node(spec).saturating_mul(u64::from(spec.cpus_per_task.max(1)))
+}
+
+/// The memory floor as requested. A `--mem-per-cpu` job reports the per-CPU
+/// figure verbatim; Slurm labels that MinMemoryCPU rather than converting it.
+fn min_memory_requested_mb(spec: &spur_core::job::JobSpec) -> u64 {
+    spec.memory_per_node_mb
+        .or(spec.memory_per_cpu_mb)
+        .unwrap_or(0)
+}
+
+/// Total per-node memory the job implies, for the TRES roll-up.
+fn min_memory_per_node_mb(spec: &spur_core::job::JobSpec) -> u64 {
+    if let Some(mb) = spec.memory_per_node_mb {
+        return mb;
+    }
+    spec.memory_per_cpu_mb
+        .map(|per_cpu| per_cpu.saturating_mul(min_cpus_per_node(spec)))
+        .unwrap_or(0)
+}
+
+/// Slurm-style requested TRES summary. `billing` is omitted: Spur has no TRES
+/// billing weights, and emitting a made-up value would misreport usage.
+fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
+    let nodes = u64::from(spec.num_nodes.max(1));
+    // The CPU total is the job's real ask, not the per-node minimum scaled up:
+    // an uneven split (-N2 -n7) would otherwise round the total upward.
+    let cpu_total =
+        u64::from(spec.num_tasks.max(1)).saturating_mul(u64::from(spec.cpus_per_task.max(1)));
+    let mut parts = vec![format!("cpu={cpu_total}"), format!("node={nodes}")];
+
+    let mem_mb = min_memory_per_node_mb(spec).saturating_mul(nodes);
+    if mem_mb > 0 {
+        parts.insert(1, format!("mem={mem_mb}M"));
+    }
+
+    let gpus = spur_core::job::effective_gpus(spec, nodes as u32);
+    if gpus > 0 {
+        parts.push(format!("gres/gpu={gpus}"));
+    }
+
+    parts.join(",")
 }
 
 /// Human-readable summary of a job's GPU request for display.
@@ -4158,6 +4324,29 @@ fn annotate_nodes_with_reservations(
                 }
             }
         }
+    }
+}
+
+/// Surface the future slot the scheduler is holding for a pending job, so
+/// `StartTime` answers "when" instead of staying N/A while the job waits.
+fn annotate_jobs_with_planned_reservations(jobs: &mut [JobInfo], cluster: &ClusterManager) {
+    if jobs.is_empty() {
+        return;
+    }
+    cluster.with_planned_job_starts(|by_job| apply_planned_reservations(jobs, by_job));
+}
+
+fn apply_planned_reservations(
+    jobs: &mut [JobInfo],
+    by_job: &spur_sched::backfill::PlannedJobStarts,
+) {
+    let pending = spur_core::job::JobState::Pending.to_proto_i32();
+    for job in jobs.iter_mut().filter(|j| j.state == pending) {
+        let Some((nodes, start)) = by_job.get(&job.job_id) else {
+            continue;
+        };
+        job.planned_start_time = Some(datetime_to_proto(*start));
+        job.sched_nodelist = spur_core::hostlist::compress(nodes);
     }
 }
 
@@ -4479,6 +4668,9 @@ mod tests {
             stdin_path: "/home/bob/in".into(),
             comment: "internal".into(),
             nodelist: "gpu-b-[01-04]".into(),
+            submit_line: "sbatch --wrap 'python train.py --secret'".into(),
+            req_nodelist: "gpu-b-[01-04]".into(),
+            exc_nodelist: "gpu-b-05".into(),
             ..Default::default()
         };
         redact_sensitive_job_info(&mut info);
@@ -4491,6 +4683,9 @@ mod tests {
         assert!(info.comment.is_empty());
         assert!(info.nodelist.is_empty());
         assert!(info.resources.is_none());
+        assert!(info.submit_line.is_empty());
+        assert!(info.req_nodelist.is_empty());
+        assert!(info.exc_nodelist.is_empty());
         // Non-sensitive identity/state fields survive so the queue view still works.
         assert_eq!(info.job_id, 42);
         assert_eq!(info.name, "train");
@@ -4715,6 +4910,63 @@ mod tests {
             .jobs;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_id, 1);
+    }
+
+    /// `scontrol show job` and `squeue` both read through `get_jobs`, so this — not the
+    /// `get_job` redaction — is what stops one user reading another's submit line and
+    /// requested nodes. Spoofing the wire `user` field, and naming the job id outright,
+    /// must both come back empty.
+    #[tokio::test]
+    async fn get_jobs_never_returns_another_users_job_to_an_identified_caller() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "alice-job".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    submit_line: Some("sbatch --nodelist=secret-node run.sh".into()),
+                    ..Default::default()
+                }),
+            },
+        );
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        for (label, req_fields) in [
+            (
+                "a spoofed --user",
+                GetJobsRequest {
+                    user: "alice".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "an explicit job id",
+                GetJobsRequest {
+                    job_ids: vec![1],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut req = Request::new(req_fields);
+            req.extensions_mut().insert(viewer("bob", false));
+            let jobs = service.get_jobs(req).await.unwrap().into_inner().jobs;
+            assert!(
+                jobs.is_empty(),
+                "{label} let bob read alice's job: {jobs:?}"
+            );
+        }
     }
 
     /// The write side of the contract: with no leader, writes must fail rather
@@ -6877,6 +7129,302 @@ mod tests {
     fn select_step_node_rejects_comma_joined_request() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
         assert!(select_step_node(&allocated, "node001,node002").is_err());
+    }
+
+    #[test]
+    fn proto_to_job_spec_sanitizes_the_submit_line_it_stores() {
+        let spec = |submit_line: &str| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            submit_line: submit_line.into(),
+            ..Default::default()
+        };
+
+        let stored = |line: &str| {
+            proto_to_job_spec(spec(line))
+                .expect("valid spec")
+                .submit_line
+        };
+
+        assert_eq!(stored(""), None);
+        assert_eq!(stored("sbatch job.sh"), Some("sbatch job.sh".to_string()));
+        // The escape must be neutralized on the way in, not just by the printer.
+        assert_eq!(
+            stored("sbatch \u{1b}[2Kjob.sh"),
+            Some("sbatch  [2Kjob.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_submit_line_neutralizes_terminal_control_characters() {
+        // A client-asserted field printed straight to an operator's terminal.
+        assert_eq!(
+            sanitize_submit_line("sbatch \u{1b}[2Kjob.sh"),
+            Some("sbatch  [2Kjob.sh".to_string())
+        );
+        // Bidi override renders deceptively but is not char::is_control.
+        assert_eq!(
+            sanitize_submit_line("sbatch \u{202e}job.sh"),
+            Some("sbatch  job.sh".to_string())
+        );
+        assert_eq!(sanitize_submit_line("\u{1b}\u{7}"), None);
+    }
+
+    #[test]
+    fn sanitize_submit_line_replaces_controls_rather_than_joining_tokens() {
+        // Deleting the newline would render `a b` as the single token `ab`.
+        assert_eq!(
+            sanitize_submit_line("sbatch --wrap 'a\nb'"),
+            Some("sbatch --wrap 'a b'".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_submit_line_bounds_bytes_not_chars() {
+        let ascii = "x".repeat(MAX_SUBMIT_LINE_BYTES * 2);
+        let out = sanitize_submit_line(&ascii).unwrap();
+        assert!(out.len() <= MAX_SUBMIT_LINE_BYTES + '\u{2026}'.len_utf8());
+        assert!(out.ends_with('\u{2026}'), "truncation must be visible");
+
+        // Multibyte input is where a char-based bound silently stores ~4x the
+        // budget into every Raft entry.
+        let wide = "\u{4e16}".repeat(MAX_SUBMIT_LINE_BYTES);
+        let out = sanitize_submit_line(&wide).unwrap();
+        assert!(
+            out.len() <= MAX_SUBMIT_LINE_BYTES + '\u{2026}'.len_utf8(),
+            "bounded in bytes, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn annotate_jobs_fills_only_pending_jobs_from_the_planned_map() {
+        use std::collections::HashMap;
+
+        let start = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let by_job = HashMap::from([
+            (7u32, (vec!["n1".to_string(), "n2".to_string()], start)),
+            (9u32, (vec!["n3".to_string()], start)),
+        ]);
+
+        let mut jobs = vec![
+            JobInfo {
+                job_id: 7,
+                state: spur_core::job::JobState::Pending.to_proto_i32(),
+                ..Default::default()
+            },
+            JobInfo {
+                job_id: 9,
+                state: spur_core::job::JobState::Running.to_proto_i32(),
+                ..Default::default()
+            },
+        ];
+        apply_planned_reservations(&mut jobs, &by_job);
+
+        assert!(jobs[0].planned_start_time.is_some());
+        assert_eq!(jobs[0].sched_nodelist, "n[1-2]");
+        // A running job holds no future slot; a leftover entry must not surface.
+        assert!(jobs[1].planned_start_time.is_none());
+        assert!(jobs[1].sched_nodelist.is_empty());
+    }
+
+    #[test]
+    fn redaction_strips_the_planned_nodelist() {
+        // Ordering guard: annotation runs before redaction, so the planned list
+        // must not reappear on a redacted record.
+        let mut info = JobInfo {
+            sched_nodelist: "gpu-b-[01-04]".into(),
+            req_tres: "cpu=16,mem=64G,gres/gpu=8".into(),
+            features: "mi300x".into(),
+            min_cpus_node: 16,
+            min_memory_node_mb: 65536,
+            min_memory_is_per_cpu: true,
+            ..Default::default()
+        };
+        redact_sensitive_job_info(&mut info);
+        assert!(info.sched_nodelist.is_empty());
+        // The requested shape restates the allocated detail, so it goes too.
+        assert!(info.req_tres.is_empty());
+        assert!(info.features.is_empty());
+        assert_eq!(info.min_cpus_node, 0);
+        assert_eq!(info.min_memory_node_mb, 0);
+        assert!(!info.min_memory_is_per_cpu);
+    }
+
+    #[test]
+    fn batch_flag_marks_only_batch_submissions() {
+        use spur_core::job::{Job, JobSpec};
+
+        let with = |spec: JobSpec| job_to_proto(&Job::new(1, spec)).batch_flag;
+        let script = || Some("#!/bin/bash\nhostname\n".to_string());
+
+        assert!(with(JobSpec {
+            script: script(),
+            ..Default::default()
+        }));
+        // srun and salloc synthesize a script, so it cannot be the sole signal.
+        assert!(!with(JobSpec {
+            script: script(),
+            srun_job: true,
+            ..Default::default()
+        }));
+        assert!(!with(JobSpec {
+            script: script(),
+            interactive: true,
+            ..Default::default()
+        }));
+        assert!(!with(JobSpec::default()));
+    }
+
+    #[test]
+    fn job_to_proto_reports_requested_placement_and_submit_line() {
+        use spur_core::job::{Job, JobSpec};
+
+        let job = Job::new(
+            7,
+            JobSpec {
+                nodelist: Some("node[1-2]".into()),
+                exclude: Some("node9".into()),
+                constraint: Some("mi300x".into()),
+                dependency: vec!["afterok:5".into()],
+                submit_line: Some("sbatch -w node[1-2] job.sh".into()),
+                ..Default::default()
+            },
+        );
+
+        let info = job_to_proto(&job);
+        assert_eq!(info.req_nodelist, "node[1-2]");
+        assert_eq!(info.exc_nodelist, "node9");
+        assert_eq!(info.features, "mi300x");
+        assert_eq!(info.dependency, vec!["afterok:5".to_string()]);
+        assert_eq!(info.submit_line, "sbatch -w node[1-2] job.sh");
+        // The allocated list stays empty while pending: this is exactly the
+        // distinction that made a pinned pending job undiagnosable.
+        assert!(info.nodelist.is_empty());
+    }
+
+    #[test]
+    fn job_to_proto_leaves_last_sched_eval_unset_until_evaluated() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(7, JobSpec::default());
+        assert!(job_to_proto(&job).last_sched_eval.is_none());
+
+        job.last_sched_eval = Some(job.submit_time);
+        assert!(job_to_proto(&job).last_sched_eval.is_some());
+    }
+
+    #[test]
+    fn requested_tres_summarizes_cpu_memory_nodes_and_gpus() {
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 8,
+            memory_per_node_mb: Some(16000),
+            gres: vec!["gpu:4".into()],
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=16,mem=32000M,node=2,gres/gpu=8");
+        assert_eq!(min_cpus_per_node(&spec), 8);
+        assert_eq!(min_memory_per_node_mb(&spec), 16000);
+    }
+
+    #[test]
+    fn requested_tres_cpu_total_is_the_real_ask_not_the_rounded_per_node_minimum() {
+        use spur_core::job::JobSpec;
+
+        // -N2 -n7 -c1: the per-node minimum rounds up to 4, but the job asked
+        // for 7 CPUs, and that is what ReqTRES must report.
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 7,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=7,node=2");
+        assert_eq!(min_cpus_per_node(&spec), 4);
+    }
+
+    #[test]
+    fn requested_tres_saturates_instead_of_overflowing() {
+        use spur_core::job::JobSpec;
+
+        // Nothing bounds these at submit, and they feed every GetJobs.
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: u32::MAX,
+            cpus_per_task: u32::MAX,
+            memory_per_cpu_mb: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(
+            requested_tres(&spec),
+            format!("cpu=18446744065119617025,mem={}M,node=1", u64::MAX)
+        );
+        assert_eq!(min_memory_per_node_mb(&spec), u64::MAX);
+    }
+
+    #[test]
+    fn requested_tres_omits_memory_when_none_requested() {
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=1,node=1");
+        assert_eq!(min_memory_per_node_mb(&spec), 0);
+    }
+
+    #[test]
+    fn mem_per_cpu_is_reported_verbatim_under_the_slurm_cpu_label() {
+        use spur_core::job::{Job, JobSpec};
+
+        // Slurm prints MinMemoryCPU=1000M here; converting to a per-node
+        // figure would report a request the user never made.
+        let job = Job::new(
+            1,
+            JobSpec {
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 4,
+                memory_per_cpu_mb: Some(1000),
+                ..Default::default()
+            },
+        );
+        let info = job_to_proto(&job);
+        assert_eq!(info.min_memory_node_mb, 1000);
+        assert!(info.min_memory_is_per_cpu);
+
+        // A per-node request keeps the node label and its own value.
+        let job = Job::new(
+            2,
+            JobSpec {
+                memory_per_node_mb: Some(16000),
+                ..Default::default()
+            },
+        );
+        let info = job_to_proto(&job);
+        assert_eq!(info.min_memory_node_mb, 16000);
+        assert!(!info.min_memory_is_per_cpu);
+    }
+
+    #[test]
+    fn min_memory_per_node_scales_a_mem_per_cpu_request() {
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 1,
+            num_tasks: 4,
+            cpus_per_task: 2,
+            memory_per_cpu_mb: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(min_cpus_per_node(&spec), 8);
+        assert_eq!(min_memory_per_node_mb(&spec), 8000);
     }
 
     #[test]

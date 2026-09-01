@@ -125,6 +125,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
             cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
             continue;
         }
 
@@ -147,6 +149,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         if pending.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
             continue;
         }
         let hit_depth_limit = pending.len() > max_jobs;
@@ -158,6 +162,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         if nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
             cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
             continue;
         }
 
@@ -195,11 +201,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // Fail safe: a scheduler that just panicked can't be trusted
                 // to have produced a valid plan, planned or otherwise.
                 cluster.set_planned_reservations(HashMap::new());
+                cluster.set_planned_job_starts(HashMap::new());
+                sched_ref.clear_outcomes();
                 continue;
             }
         };
         let schedule_time_us = schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         cluster.set_planned_reservations(sched_ref.planned_starts());
+        cluster.set_planned_job_starts(sched_ref.planned_job_starts());
 
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
@@ -954,6 +963,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         open_mode: s.open_mode.clone().unwrap_or_default(),
         pty: s.pty,
         initial_winsize: None,
+        submit_line: s.submit_line.clone().unwrap_or_default(),
     }
 }
 
@@ -1189,6 +1199,7 @@ async fn dispatch_to_agent(
         open_mode: spec.open_mode.clone().unwrap_or_default(),
         pty: spec.pty,
         initial_winsize: None,
+        submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
     let response = client

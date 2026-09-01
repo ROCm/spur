@@ -188,6 +188,10 @@ message JobSpec {
   // Interactive PTY session (srun --pty)
   bool pty = 83;
   WindowSize initial_winsize = 84;
+
+  // Submit command line as invoked, shell-quoted so word boundaries survive.
+  // Client-asserted: the controller bounds and sanitizes it but cannot verify it.
+  string submit_line = 85;
 }
 
 message JobInfo {
@@ -254,6 +258,43 @@ message JobInfo {
   uint32 preempted_by = 57;
   string preempt_mode = 58;
   string preempt_qos = 59;
+
+  // Requested placement, as submitted. Distinct from `nodelist` (field 23),
+  // the *allocated* list, which stays empty while the job is pending.
+  string req_nodelist = 60;
+  string exc_nodelist = 61;
+  string features = 62;
+  repeated string dependency = 63;
+
+  string submit_line = 64;
+
+  // Requested TRES ("cpu=8,mem=32000M,node=2,gres/gpu=8") and the per-node
+  // minima Slurm reports alongside it.
+  string req_tres = 65;
+  uint32 min_cpus_node = 66;
+  // Per-node memory floor. `min_memory_is_per_cpu` marks a --mem-per-cpu
+  // request, which Slurm reports as MinMemoryCPU rather than MinMemoryNode.
+  uint64 min_memory_node_mb = 67;
+
+  // Earliest start (--begin, else submit), age-priority accrual start (from
+  // submit even while held, unlike Slurm), and last scheduling evaluation.
+  google.protobuf.Timestamp eligible_time = 68;
+  google.protobuf.Timestamp accrue_time = 69;
+  google.protobuf.Timestamp last_sched_eval = 70;
+
+  google.protobuf.Timestamp deadline = 71;
+  google.protobuf.Duration time_min = 72;
+  bool requeue = 73;
+  uint32 restarts = 74;
+  bool batch_flag = 75;
+  bool exclusive = 76;
+
+  // Future slot the scheduler is holding for a pending job: when it projects
+  // the job will start, and on which nodes. Unset when no slot is reserved.
+  google.protobuf.Timestamp planned_start_time = 77;
+  string sched_nodelist = 78;
+
+  bool min_memory_is_per_cpu = 79;
 }
 
 message NodeInfo {

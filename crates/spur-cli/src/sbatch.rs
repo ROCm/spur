@@ -787,29 +787,11 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
     script.unwrap_or("sbatch").to_string()
 }
 
-pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
-    let script_content =
-        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(&p).ok());
-
-    let directive_args = script_content
-        .as_deref()
-        .map(parse_sbatch_directives)
-        .unwrap_or_default();
-
-    let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
-    let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
-
-    if args.mpi == "list" {
-        let plugin_dir = crate::spur_config::load_spur_config().mpi.plugin_dir;
-        for line in spur_core::mpi::mpi_list_lines(&plugin_dir) {
-            println!("{line}");
-        }
-        return Ok(());
-    }
-    args.mpi = spur_core::mpi::parse_mpi_option(&args.mpi)
-        .map_err(|e| anyhow::anyhow!(e))?
-        .expect("list handled above");
-
+fn build_sbatch_job_spec(
+    mut args: SbatchArgs,
+    nodelist: Option<String>,
+    submit_line: &str,
+) -> Result<JobSpec> {
     // Build the job spec
     let is_wrap = args.wrap.is_some();
     if is_wrap && !args.script_args.is_empty() {
@@ -886,7 +868,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .map(|d| d.split(',').map(String::from).collect())
         .unwrap_or_default();
 
-    let job_spec = JobSpec {
+    Ok(JobSpec {
         name,
         partition: args.partition.unwrap_or_default(),
         account: args.account.unwrap_or_default(),
@@ -982,10 +964,39 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         srun_job: false,
         pty: false,
         initial_winsize: None,
-    };
+        submit_line: submit_line.to_string(),
+    })
+}
+
+pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
+    let script_content =
+        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(&p).ok());
+
+    let directive_args = script_content
+        .as_deref()
+        .map(parse_sbatch_directives)
+        .unwrap_or_default();
+
+    let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
+    let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+
+    if args.mpi == "list" {
+        let plugin_dir = crate::spur_config::load_spur_config().mpi.plugin_dir;
+        for line in spur_core::mpi::mpi_list_lines(&plugin_dir) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    args.mpi = spur_core::mpi::parse_mpi_option(&args.mpi)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .expect("list handled above");
+
+    let controller = args.controller.clone();
+    let parsable = args.parsable;
+    let job_spec = build_sbatch_job_spec(args, nodelist, &crate::submitline::render(&cli_args))?;
 
     // Submit to controller
-    let channel = crate::authclient::connect(&args.controller)
+    let channel = crate::authclient::connect(&controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1002,7 +1013,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         eprintln!("sbatch: warning: {warning}");
     }
     let job_id = response.job_id;
-    if args.parsable {
+    if parsable {
         println!("{}", job_id);
     } else {
         println!("Submitted batch job {}", job_id);
@@ -1014,6 +1025,20 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_sbatch_job_spec_records_the_submit_line() {
+        // --wrap keeps the script in memory, so the test needs no fixture file.
+        let argv = ["sbatch", "-w", "node1", "--exclusive", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let spec = build_sbatch_job_spec(args, None, &line).expect("spec");
+        assert_eq!(spec.submit_line, line);
+        assert_eq!(
+            spec.submit_line,
+            "sbatch -w node1 --exclusive --wrap hostname"
+        );
+    }
 
     #[test]
     fn test_parse_sbatch_directives() {
