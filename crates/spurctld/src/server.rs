@@ -564,17 +564,26 @@ impl ControllerService {
     /// callers (see [`viewer_is_privileged`]) get the full record; an identified non-owner gets
     /// `Full` (legacy), `None` → `NOT_FOUND` (`OwnerOnly`), or the targeting-sensitive fields blanked
     /// (`Redacted`, the default).
+    /// Disclosure level for one job. Split out so the single-job and list handlers share one policy
+    /// decision; the list path annotates in a single batch and so cannot reuse `scoped_job_info`.
+    fn disclosure_for(
+        &self,
+        owner: &str,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> JobInfoDisclosure {
+        let privileged = viewer_is_privileged(identity, owner, self.caller_is_admin(identity));
+        job_info_disclosure(
+            privileged,
+            self.cluster.config().controller.job_info_visibility,
+        )
+    }
+
     fn scoped_job_info(
         &self,
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
-        let privileged =
-            viewer_is_privileged(identity, &job.spec.user, self.caller_is_admin(identity));
-        match job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        ) {
+        match self.disclosure_for(&job.spec.user, identity) {
             JobInfoDisclosure::Hidden => None,
             disclosure => {
                 let mut info = job_to_proto(job);
@@ -855,6 +864,24 @@ impl SlurmController for ControllerService {
 
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
+
+        // An identified caller is already scoped to their own jobs by the user filter above, so
+        // this only bites if that scoping is ever loosened — but it keeps the two read paths from
+        // disagreeing about what a non-owner may see.
+        let proto_jobs: Vec<JobInfo> = jobs
+            .iter()
+            .zip(proto_jobs)
+            .filter_map(|(job, mut info)| {
+                match self.disclosure_for(&job.spec.user, __identity.as_ref()) {
+                    JobInfoDisclosure::Hidden => None,
+                    JobInfoDisclosure::Redacted => {
+                        redact_sensitive_job_info(&mut info);
+                        Some(info)
+                    }
+                    JobInfoDisclosure::Full => Some(info),
+                }
+            })
+            .collect();
 
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
@@ -4878,6 +4905,63 @@ mod tests {
             .jobs;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_id, 1);
+    }
+
+    /// `scontrol show job` and `squeue` both read through `get_jobs`, so this — not the
+    /// `get_job` redaction — is what stops one user reading another's submit line and
+    /// requested nodes. Spoofing the wire `user` field, and naming the job id outright,
+    /// must both come back empty.
+    #[tokio::test]
+    async fn get_jobs_never_returns_another_users_job_to_an_identified_caller() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "alice-job".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    submit_line: Some("sbatch --nodelist=secret-node run.sh".into()),
+                    ..Default::default()
+                }),
+            },
+        );
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        for (label, req_fields) in [
+            (
+                "a spoofed --user",
+                GetJobsRequest {
+                    user: "alice".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "an explicit job id",
+                GetJobsRequest {
+                    job_ids: vec![1],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut req = Request::new(req_fields);
+            req.extensions_mut().insert(viewer("bob", false));
+            let jobs = service.get_jobs(req).await.unwrap().into_inner().jobs;
+            assert!(
+                jobs.is_empty(),
+                "{label} let bob read alice's job: {jobs:?}"
+            );
+        }
     }
 
     /// The write side of the contract: with no leader, writes must fail rather
