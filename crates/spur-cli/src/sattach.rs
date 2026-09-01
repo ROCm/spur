@@ -72,6 +72,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         anyhow::bail!("sattach: job {} has no allocated nodes", job_id);
     }
 
+    let user = crate::interactive::job_caller_user(&mut client, job_id, Some(&job.user)).await?;
+
     // The controller reports a hostlist, so `node[1-3]` has to be expanded
     // before a name is usable as an address.
     let nodes = spur_core::hostlist::expand(nodelist)
@@ -83,9 +85,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 
     if args.output_only {
-        stream_output_only(&mut agent, job_id, &args.output).await
+        stream_output_only(&mut agent, job_id, &args.output, &user).await
     } else {
-        let exit_code = interactive_attach(&mut agent, job_id).await?;
+        let exit_code = interactive_attach(&mut agent, job_id, &user).await?;
         std::process::exit(exit_code);
     }
 }
@@ -95,12 +97,13 @@ async fn stream_output_only(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     stream_name: &str,
+    user: &str,
 ) -> Result<()> {
     let mut stream = agent
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: stream_name.to_string(),
-            user: crate::interactive::current_user()?,
+            user: user.to_string(),
         })
         .await
         .context("failed to start output stream")?
@@ -137,9 +140,11 @@ async fn stream_output_only(
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
+    user: &str,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();
-    crate::interactive::run_interactive_session(agent, job_id, 0, Vec::new(), winsize, true).await
+    crate::interactive::run_interactive_session(agent, job_id, 0, Vec::new(), winsize, true, user)
+        .await
 }
 
 fn state_name(state: i32) -> &'static str {

@@ -1519,6 +1519,7 @@ message CreateJobStepRequest {
   WindowSize winsize = 7;     // Initial terminal dimensions
   string node = 8;            // Target node (-w); empty = first allocated node
   string user = 9;            // Requesting user; verified identity must own the job; the controller/admin credential overrides
+  uint32 uid = 10;            // Caller Unix uid for Munge-like ownership when unauthenticated; 0 = absent
 }
 
 message CreateJobStepResponse {

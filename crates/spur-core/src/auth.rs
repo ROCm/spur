@@ -144,6 +144,51 @@ pub fn check_job_owner(
     })
 }
 
+/// Ownership gate for user-initiated RPCs that may carry a Unix uid (e.g. `RunStep`).
+///
+/// When a verified identity is present, only that subject (or an admin/internal caller) may
+/// act on the job — a matching uid alone cannot bypass a mismatched JWT. When unauthenticated
+/// (`auth.mode = permissive` without a credential), the owner username or a matching `caller_uid`
+/// against the job's submit-time uid is accepted (Slurm Munge-like same-session semantics).
+pub fn check_job_caller(
+    user: &str,
+    caller_uid: Option<u32>,
+    is_internal: bool,
+    owner: &str,
+    owner_uid: u32,
+    identity: Option<&Identity>,
+    action: &str,
+) -> Result<(), AuthError> {
+    if is_internal {
+        return Ok(());
+    }
+    if let Some(id) = identity {
+        if id.is_admin || id.user == owner {
+            return Ok(());
+        }
+        return Err(AuthError::NotJobOwner {
+            user: id.user.clone(),
+            owner: owner.into(),
+            action: action.into(),
+        });
+    }
+    if !user.is_empty() && user == owner {
+        return Ok(());
+    }
+    // Proto defaults and RPCs without a uid field (keepalive) send 0; treat that as
+    // absent rather than a root-caller match.
+    if let Some(uid) = caller_uid.filter(|&u| u != 0) {
+        if uid == owner_uid {
+            return Ok(());
+        }
+    }
+    Err(AuthError::NotJobOwner {
+        user: user.into(),
+        owner: owner.into(),
+        action: action.into(),
+    })
+}
+
 /// JWT token claims.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenClaims {
@@ -394,6 +439,73 @@ mod tests {
             check_job_owner("alice", false, "k8s", "exec").is_err(),
             "a placeholder owner denies every named user; record the real \
              submitter or leave the owner empty instead"
+        );
+    }
+
+    #[test]
+    fn check_job_caller_uid_fallback_when_unauthenticated() {
+        assert!(check_job_caller(
+            "localname",
+            Some(1000),
+            false,
+            "jwt-subject",
+            1000,
+            None,
+            "run a step in"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_job_caller_jwt_subject_must_match_owner() {
+        let id = Identity {
+            user: "jwt-subject".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
+        assert!(check_job_caller(
+            "jwt-subject",
+            Some(1000),
+            false,
+            "jwt-subject",
+            1000,
+            Some(&id),
+            "run a step in"
+        )
+        .is_ok());
+        let other = Identity {
+            user: "other-jwt-user".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
+        assert!(
+            check_job_caller(
+                "localname",
+                Some(1000),
+                false,
+                "jwt-subject",
+                1000,
+                Some(&other),
+                "run a step in"
+            )
+            .is_err(),
+            "uid alone must not bypass a JWT for a different owner"
+        );
+    }
+
+    #[test]
+    fn check_job_caller_rejects_mismatched_unauthenticated_user_and_uid() {
+        assert!(
+            check_job_caller("bob", Some(2000), false, "alice", 1000, None, "attach to").is_err()
+        );
+    }
+
+    #[test]
+    fn check_job_caller_uid_zero_does_not_bypass_username_check() {
+        assert!(
+            check_job_caller("bob", Some(0), false, "alice", 0, None, "run a step in").is_err()
         );
     }
 

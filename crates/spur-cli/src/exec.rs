@@ -42,11 +42,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to connect to controller")?;
     let mut client = spur_proto::controller_client(channel);
 
+    let user = crate::interactive::job_caller_user(&mut client, args.job_id, None).await?;
+
     let resp = client
         .exec_in_job(ExecInJobRequest {
             job_id: args.job_id,
             command: args.command.clone(),
-            user: crate::interactive::current_user()?,
+            user,
         })
         .await
         .context("exec failed")?;

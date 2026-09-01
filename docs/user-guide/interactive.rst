@@ -15,7 +15,11 @@ live. It operates in two modes:
 
 - **Standalone** — when run outside an allocation, it submits a new job, waits
   for the allocation, streams output from the node agent, and exits with the
-  job's exit code. Pressing Ctrl-C cancels the job.
+  job's exit code. Pressing Ctrl-C cancels the job. After the allocation is
+  granted, standalone ``srun`` (including ``--pty``) resolves the job owner from
+  the controller for step, keepalive, and cancel RPCs, the same way
+  ``srun`` does
+  inside an ``salloc`` shell via ``SPUR_JOB_USER``.
 - **Step mode** — when run inside an existing allocation (``SPUR_JOB_ID`` is set,
   as under ``salloc`` or in a batch script), it creates a *job step* against the
   parent allocation instead of submitting a new job.
@@ -97,10 +101,16 @@ Interactive Allocation — ``salloc``
 
 ``spur alloc`` (Slurm ``salloc``) requests an interactive allocation, waits for
 it to start (up to 300 seconds), then spawns your ``$SHELL`` with the allocation
-environment exported (``SPUR_JOB_ID``, ``SPUR_NODELIST``, ``SPUR_NNODES``,
-``SPUR_NTASKS``, ``SPUR_CPUS_PER_TASK``, the partition/account/QOS variables, and
-their ``SLURM_*`` twins). When you exit the shell, the allocation is released.
-Ctrl-C cancels it.
+environment exported (``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_NODELIST``,
+``SPUR_NNODES``, ``SPUR_NTASKS``, ``SPUR_CPUS_PER_TASK``, the
+partition/account/QOS variables, and their ``SLURM_*`` twins). When you exit the
+shell, the allocation is released. Ctrl-C cancels it.
+
+When authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN`` (or
+``~/.spur/token``) into the allocation shell so step commands can authenticate
+to the controller. ``SPUR_JOB_USER`` records the job owner bound at submit time
+(for example the JWT subject); ``srun`` inside the shell uses it when step RPCs
+run without a token.
 
 Inside that shell, ``srun`` runs as a job step sized to the allocation.
 
@@ -123,7 +133,9 @@ Attach to a Running Job — ``sattach``
 ``spur attach`` (Slurm ``sattach``) connects to a running job's I/O. The
 positional argument is ``JOB_ID`` or ``JOB_ID.STEP_ID``; the step-id component is
 accepted, but only the job id is used to route the attach. By default it opens a
-full interactive raw-mode terminal attached through the node agent.
+full interactive raw-mode terminal attached through the node agent. Attach RPCs
+use the job owner from ``SPUR_JOB_USER`` (when set), the controller job record, or
+the local login name, matching step-mode ``srun`` under JWT authentication.
 
 .. list-table::
    :header-rows: 1

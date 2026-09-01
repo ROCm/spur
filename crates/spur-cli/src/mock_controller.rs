@@ -31,6 +31,9 @@ pub(crate) const MOCK_EXIT_CODE: i32 = 7;
 /// What the mock controller actually received, shared with the test body.
 #[derive(Clone, Default)]
 pub(crate) struct StepCapture {
+    get_job_calls: Arc<AtomicU32>,
+    /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
+    get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
     create_step_num_tasks: Arc<AtomicU32>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
@@ -44,6 +47,18 @@ pub(crate) struct StepCapture {
 }
 
 impl StepCapture {
+    pub(crate) fn get_job_calls(&self) -> u32 {
+        self.get_job_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_get_job_user(&self, user: impl Into<String>) {
+        *self.get_job_response.lock().unwrap() = Some(Ok(user.into()));
+    }
+
+    pub(crate) fn set_get_job_error(&self, code: tonic::Code) {
+        *self.get_job_response.lock().unwrap() = Some(Err(code));
+    }
+
     /// Task count carried by the most recent `CreateJobStep`.
     pub(crate) fn create_step_num_tasks(&self) -> u32 {
         self.create_step_num_tasks.load(Ordering::SeqCst)
@@ -126,6 +141,21 @@ mock_controller_impl! {
                 step_id: MOCK_STEP_ID,
                 node_addr: String::new(),
             }))
+        }
+
+        async fn get_job(
+            &self,
+            _request: tonic::Request<proto::GetJobRequest>,
+        ) -> Result<tonic::Response<proto::JobInfo>, tonic::Status> {
+            self.capture.get_job_calls.fetch_add(1, Ordering::SeqCst);
+            match self.capture.get_job_response.lock().unwrap().clone() {
+                Some(Ok(user)) => Ok(tonic::Response::new(proto::JobInfo {
+                    user,
+                    ..Default::default()
+                })),
+                Some(Err(code)) => Err(tonic::Status::new(code, "mock get_job failure")),
+                None => Err(tonic::Status::unimplemented("get_job")),
+            }
         }
 
         async fn run_step(
@@ -214,7 +244,6 @@ mock_controller_impl! {
     unimplemented {
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
-        get_job(proto::GetJobRequest) -> proto::JobInfo;
         cancel_job(proto::CancelJobRequest) -> ();
         complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
