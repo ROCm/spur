@@ -447,11 +447,11 @@ request as submitted, which distinguishes the two:
        On a deep queue it also covers jobs classified but left untried past
        ``scheduler.max_jobs_per_cycle``.
 
-   .. note::
+.. note::
 
-      ``StartTime``, ``SchedNodeList``, and ``LastSchedEval`` live only on the
-      leader and are never replicated, so a read served by a follower reports
-      them unset even in a healthy cluster.
+   ``StartTime``, ``SchedNodeList``, and ``LastSchedEval`` live only on the
+   leader and are never replicated, so a read served by a follower reports them
+   unset even in a healthy cluster.
 
 So a job pinned to a busy node reads (excerpt — the full record has more
 fields between these lines):
@@ -460,7 +460,7 @@ fields between these lines):
 
       JobState=PENDING Reason=Resources Dependency=(null)
       ...
-      StartTime=2026-08-27T17:09:56 EndTime=N/A Deadline=N/A
+      StartTime=2026-08-27T17:09:56 EndTime=2026-08-27T17:14:56 Deadline=N/A
       ...
       ReqNodeList=node07 ExcNodeList=(null)
       NodeList=(null) SchedNodeList=node07

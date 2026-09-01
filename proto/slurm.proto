@@ -275,10 +275,9 @@ message JobInfo {
   // Per-node memory floor. `min_memory_is_per_cpu` marks a --mem-per-cpu
   // request, which Slurm reports as MinMemoryCPU rather than MinMemoryNode.
   uint64 min_memory_node_mb = 67;
-  bool min_memory_is_per_cpu = 79;
 
-  // Earliest start (--begin, else submit), when age priority began accruing (Spur accrues from submit even while held),
-  // and when the scheduler last considered the job (unset until evaluated).
+  // Earliest start (--begin, else submit), age-priority accrual start (from
+  // submit even while held, unlike Slurm), and last scheduling evaluation.
   google.protobuf.Timestamp eligible_time = 68;
   google.protobuf.Timestamp accrue_time = 69;
   google.protobuf.Timestamp last_sched_eval = 70;
@@ -294,6 +293,8 @@ message JobInfo {
   // the job will start, and on which nodes. Unset when no slot is reserved.
   google.protobuf.Timestamp planned_start_time = 77;
   string sched_nodelist = 78;
+
+  bool min_memory_is_per_cpu = 79;
 }
 
 message NodeInfo {
