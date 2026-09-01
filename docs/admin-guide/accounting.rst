@@ -66,6 +66,9 @@ page:
 
 ``show`` renders an unset limit as a blank cell and a literal ``0`` as ``0``.
 
+The ``0`` rule above covers job counts and wall time. A ``0`` inside a TRES
+value behaves differently — see :ref:`tres-zero-dimension`.
+
 Limit changes are not instant: the controller reads accounting and QOS limits
 from a cache that refreshes every ``fairshare_refresh_secs`` (default 300s,
 floored at 10s), so a ``sacctmgr modify`` can take up to one refresh interval
@@ -1097,6 +1100,22 @@ The three TRES caps differ by scope:
 - **MaxTRESPerJob** (``maxtresperjob``) caps a **single job**.
 - **MaxTRESPerUser** (``maxtresperuser``) caps a **single user's** total across
   their jobs.
+
+.. _tres-zero-dimension:
+
+A TRES dimension of 0 is ignored, not "block all"
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Unlike a ``0`` job-count or wall limit (:ref:`limit-values`), a TRES dimension
+set to ``0`` does not block: the gate compares only dimensions whose cap is
+above zero, so ``maxtresperjob=cpu=0`` leaves CPU uncapped rather than rejecting
+every job. This holds for all three TRES caps, on both QOS and account
+associations, and other dimensions in the same value are still enforced —
+``maxtresperjob=cpu=0,gres/gpu=4`` caps GPUs and ignores CPUs.
+
+A resource therefore cannot be denied by capping it at ``0``. To keep jobs off a
+resource, leave it out of what they request; to stop a scope from running
+anything, use ``maxsubmitjobs=0``.
 
 .. _grptres-node-packing:
 
