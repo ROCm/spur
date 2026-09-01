@@ -3969,7 +3969,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             .requeue_count
             .saturating_add(job.preempt_requeue_count)
             .saturating_add(job.user_requeue_count),
-        batch_flag: job.spec.script.is_some(),
+        // srun and salloc synthesize a script too, so its presence alone does not
+        // mean the batch submission Slurm's flag denotes.
+        batch_flag: job.spec.script.is_some() && !job.spec.srun_job && !job.spec.interactive,
         exclusive: job.spec.exclusive,
         // Filled by annotate_jobs_with_planned_reservations: the scheduler's
         // plan lives on the cluster, not the job record.
@@ -7157,6 +7159,31 @@ mod tests {
         assert_eq!(info.min_cpus_node, 0);
         assert_eq!(info.min_memory_node_mb, 0);
         assert!(!info.min_memory_is_per_cpu);
+    }
+
+    #[test]
+    fn batch_flag_marks_only_batch_submissions() {
+        use spur_core::job::{Job, JobSpec};
+
+        let with = |spec: JobSpec| job_to_proto(&Job::new(1, spec)).batch_flag;
+        let script = || Some("#!/bin/bash\nhostname\n".to_string());
+
+        assert!(with(JobSpec {
+            script: script(),
+            ..Default::default()
+        }));
+        // srun and salloc synthesize a script, so it cannot be the sole signal.
+        assert!(!with(JobSpec {
+            script: script(),
+            srun_job: true,
+            ..Default::default()
+        }));
+        assert!(!with(JobSpec {
+            script: script(),
+            interactive: true,
+            ..Default::default()
+        }));
+        assert!(!with(JobSpec::default()));
     }
 
     #[test]
