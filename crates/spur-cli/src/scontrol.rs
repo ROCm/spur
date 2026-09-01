@@ -556,6 +556,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 }
 
+/// Render `scontrol show config` from a controller ping. The cluster name and
+/// version follow the live controller, not the login node's local config.
+fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> String {
+    format!(
+        "ClusterName={}\nSlurmctldAddr={}\nVersion={}\n",
+        ping.cluster_name, controller, ping.version
+    )
+}
+
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
     let channel = crate::authclient::connect(controller)
         .await
@@ -787,9 +796,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             }
         }
         "config" => {
-            println!("ClusterName=spur");
-            println!("SlurmctldAddr={}", controller);
-            println!("Version={}", env!("CARGO_PKG_VERSION"));
+            let inner = client
+                .ping(())
+                .await
+                .context("failed to ping controller")?
+                .into_inner();
+            print!("{}", format_config(controller, &inner));
         }
         "federation" => {
             let resp = client.ping(()).await.context("failed to ping controller")?;
@@ -2002,6 +2014,20 @@ mod tests {
     fn job_detail_reports_unlimited_when_no_time_limit_is_set() {
         let out = format_job_detail(&pending_pinned_job());
         assert!(out.contains("TimeLimit=UNLIMITED"), "{out}");
+    }
+
+    #[test]
+    fn config_reports_cluster_name_from_ping() {
+        let ping = spur_proto::proto::PingResponse {
+            cluster_name: "prod-west".into(),
+            version: "9.9.9".into(),
+            ..Default::default()
+        };
+        let out = format_config("http://ctld:6817", &ping);
+        assert!(out.contains("ClusterName=prod-west"), "{out}");
+        assert!(!out.contains("ClusterName=spur"), "{out}");
+        assert!(out.contains("SlurmctldAddr=http://ctld:6817"), "{out}");
+        assert!(out.contains("Version=9.9.9"), "{out}");
     }
 
     #[test]

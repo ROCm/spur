@@ -677,6 +677,7 @@ message PingResponse {
   google.protobuf.Timestamp server_time = 2;
   string version = 3;
   repeated string federation_peers = 4;
+  string cluster_name = 5;
 }
 
 message JobStateCount {
