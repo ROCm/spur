@@ -4206,6 +4206,7 @@ impl AssocMgrScope {
             (Self::Association, Cap::MaxTres) => "MaxTRES",
             (_, Cap::GrpTres) => "GrpTRES",
             (_, Cap::GrpSubmitJobs) => "GrpSubmitJobs",
+            (_, Cap::GrpWall) => "GrpWall",
         }
     }
 }
@@ -4230,6 +4231,10 @@ fn assoc_mgr_to_proto(
         grp_tres: opt_tres(&usage.grp_tres),
         grp_submit_jobs: opt_cap(usage.grp_submit_jobs),
         max_wall_minutes: opt_cap(usage.max_wall_minutes),
+        max_tres_per_job: opt_tres(&usage.max_tres_per_job),
+        max_submit_jobs_per_account: opt_cap(usage.max_submit_jobs_per_account),
+        grp_wall_minutes: opt_cap(usage.grp_wall_minutes),
+        grp_wall_consumed_minutes: opt_consumed(usage.grp_wall_consumed_minutes),
         scope_caps: usage.user_caps.as_ref().map(|caps| AssocMgrCaps {
             max_jobs: opt_cap(caps.max_jobs),
             max_submit_jobs: opt_cap(caps.max_submit_jobs),
@@ -4259,6 +4264,17 @@ fn opt_cap(v: Option<u32>) -> u32 {
 
 fn opt_tres(t: &Option<spur_core::accounting::TresRecord>) -> String {
     t.as_ref().map(|t| t.format()).unwrap_or_default()
+}
+
+/// A consumption figure onto the wire. `None` (the GrpWall cache holds no
+/// snapshot) becomes `INFINITE` so a client can tell "unknown" from a real zero;
+/// a genuine value is clamped just below the sentinel so it can never be mistaken
+/// for it, which realistic wall-minute spend never reaches anyway.
+fn opt_consumed(v: Option<u64>) -> u32 {
+    match v {
+        None => spur_core::accounting::INFINITE,
+        Some(m) => m.min(u64::from(spur_core::accounting::INFINITE - 1)) as u32,
+    }
 }
 
 fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec<String> {

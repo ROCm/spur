@@ -553,13 +553,13 @@ it:
 .. code-block:: text
 
    QOS Records
-   QOS=highprio MaxWall=01:00:00 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4
-      GrpJobs=N(9) GrpSubmitJobs=N(11) GrpTRES=cpu=N(36),node=16(9)
+   QOS=highprio MaxWall=01:00:00 MaxTRES=cpu=32 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=20
+      GrpJobs=N(9) GrpSubmitJobs=N(11) GrpTRES=cpu=N(36),node=16(9) GrpWall=7-00:00:00(2-12:00:00)
       User=alice MaxJobsPU=2(6) MaxSubmitJobsPU=N(7) MaxTRESPU=cpu=N(24),node=4(6) OverLimit=MaxJobsPU,MaxTRESPU
       User=bob MaxJobsPU=2(1) MaxSubmitJobsPU=N(1) MaxTRESPU=cpu=N(4),node=4(1)
 
    Association Records
-   Account=tenant-a MaxWall=N
+   Account=tenant-a MaxWall=N MaxTRES=node=4
       GrpJobs=N(1) GrpSubmitJobs=N(1) GrpTRES=node=N(1)
       User=alice MaxJobs=4(1) MaxSubmitJobs=N(1) MaxTRES=cpu=N(4),node=N(1)
 
@@ -567,8 +567,13 @@ Reading it:
 
 * On the ``Grp*`` line and the ``User=`` lines every cap is printed as
   **``Limit(Consumed)``**, as in Slurm: ``node=4(6)`` is a cap of four nodes with
-  six in use, and ``N`` marks no cap. ``MaxWall`` and the per-user caps on the
-  scope line print bare, with no consumption beside them.
+  six in use, and ``N`` marks no cap. ``GrpWall`` follows the same shape as a
+  wall-clock time, ``budget(spent)``; an ``N`` in its consumed slot means the
+  controller has not read spend yet (its usage cache holds no snapshot), which is
+  not the same as none spent. The scope-line per-job and per-account caps
+  (``MaxWall``, ``MaxTRES``, ``MaxSubmitJobsPA``) and the per-user caps print
+  bare, with no consumption beside them, because they bound each job, account, or
+  user rather than a total the scope accrues.
 * For the count caps a literal ``0`` is a real cap that blocks every job it
   governs. A TRES dimension is the exception: ``0`` there is treated as *unset* —
   it renders as ``N`` and is not enforced, so ``GrpTRES=node=0`` does not block a
@@ -577,18 +582,29 @@ Reading it:
   admits a job. Node counts are distinct occupied nodes, so two jobs sharing a
   node hold one node, not two. A TRES dimension appears when either the cap or
   the usage has something to say about it.
-* The scope line carries what belongs to the scope: its ``MaxWall``, and — for a
-  QOS, which caps every user identically — the per-user caps it enforces. An
-  association's caps are per ``(user, account)``, so they appear on each user's
-  line instead.
+* The scope line carries what belongs to the scope: its per-job caps
+  (``MaxWall`` and ``MaxTRES``, the ceiling on any one job), and — for a QOS,
+  which caps every user identically — the per-user caps it enforces
+  (``MaxJobsPU``, ``MaxSubmitJobsPU``, ``MaxTRESPU``) plus the per-account submit
+  cap ``MaxSubmitJobsPA``. Read ``MaxTRES`` (one job) and ``MaxTRESPU`` (one
+  user's total) as distinct caps. A QOS carries ``MaxSubmitJobsPA`` and
+  ``GrpWall``; an association cannot, so those never appear in its records, but
+  the per-job ``MaxTRES`` a QOS and an association both enforce shows in both. An
+  association's per-user caps are per ``(user, account)``, so they appear on each
+  user's line instead.
 * ``Grp*`` figures are the whole scope's, summed across every user, and stay on
-  the scope line. Filtering to one user narrows the ``User=`` lines but never the
-  group figures, since a group cap cannot be judged from one user's share.
+  the scope line. ``GrpWall`` is the QOS's wall-clock budget beside the spend
+  measured over ``grp_wall_window_days`` (see :doc:`/admin-guide/accounting`);
+  it applies to a QOS only. Filtering to one user narrows the ``User=`` lines but
+  never the group figures, since a group cap cannot be judged from one user's
+  share.
 * ``OverLimit`` lists caps that are **already exceeded**, on the scope line for
-  group caps and on a user's line for that user's caps. It is absent when
-  everything is within its cap. Usage over a cap is not a contradiction: caps are
-  applied when a job is admitted and running jobs are never re-checked, so
-  tightening a cap under running work leaves exactly this state.
+  group caps — including ``GrpWall`` once spend reaches the budget, the state
+  behind a ``QOSGrpWallLimit`` hold — and on a user's line for that user's caps.
+  It is absent when everything is within its cap. Usage over a cap is not a
+  contradiction: caps are applied when a job is admitted and running jobs are
+  never re-checked, so tightening a cap under running work leaves exactly this
+  state.
 
 Records come from the accounting definitions as well as from the queue, so a QOS
 nobody is using still appears with its caps and no ``User=`` lines — an

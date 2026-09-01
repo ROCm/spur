@@ -4770,6 +4770,7 @@ impl ClusterManager {
     /// non-admin caller cannot enumerate the cluster-wide QOS/account inventory.
     pub(crate) fn assoc_mgr_info(&self, only_user: Option<&str>) -> AssocMgrInfo {
         let jobs = self.jobs.read();
+        let grp_wall_usage = self.grp_wall_cache.usage();
 
         let defined_qos: HashMap<String, Qos> = self
             .qos_cache
@@ -4794,6 +4795,11 @@ impl ClusterManager {
                     user_caps.clone().unwrap_or_default()
                 })?;
                 record.max_wall_minutes = limits.as_ref().and_then(|l| l.max_wall_minutes);
+                record.max_tres_per_job = limits.as_ref().and_then(|l| l.max_tres_per_job.clone());
+                record.max_submit_jobs_per_account =
+                    limits.as_ref().and_then(|l| l.max_submit_jobs_per_account);
+                record.grp_wall_minutes = limits.as_ref().and_then(|l| l.grp_wall_minutes);
+                record.grp_wall_consumed_minutes = consumed_minutes(&grp_wall_usage, &scope);
                 record.grp_tres = limits.as_ref().and_then(|l| l.grp_tres.clone());
                 record.grp_submit_jobs = limits.as_ref().and_then(|l| l.grp_submit_jobs);
                 record.user_caps = user_caps;
@@ -4845,6 +4851,7 @@ impl ClusterManager {
                 // rather than inventing a merge across rows that disagree.
                 if let Some((_, limits)) = rows.and_then(|rows| rows.first()) {
                     record.max_wall_minutes = limits.max_wall_minutes;
+                    record.max_tres_per_job = limits.max_tres_per_job.clone();
                     record.grp_tres = limits.grp_tres.clone();
                     record.grp_submit_jobs = limits.grp_submit_jobs;
                 }
@@ -11213,6 +11220,100 @@ mod tests {
         let bob = &record.users[1];
         assert_eq!(bob.running_jobs, 1);
         assert!(bob.exceeded_caps().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_surfaces_the_new_qos_caps_and_grp_wall_spend() {
+        // The three caps the record could not previously explain: the per-job TRES
+        // cap, the per-account submit cap, and the group wall budget with its spend
+        // read from the GrpWall cache. Spend has reached the budget, so the scope
+        // record must also name GrpWall as a live breach.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(capped_qos(
+            "full",
+            spur_core::accounting::QosLimits {
+                max_tres_per_job: Some(spur_core::accounting::TresRecord::parse("cpu=8").unwrap()),
+                max_submit_jobs_per_account: Some(40),
+                grp_wall_minutes: Some(600),
+                ..Default::default()
+            },
+        ));
+        cm.grp_wall_cache()
+            .seed(HashMap::from([("full".to_string(), 600)]));
+
+        let record = cm
+            .assoc_mgr_info(None)
+            .qos_records
+            .into_iter()
+            .find(|r| r.scope == "full")
+            .expect("the defined QOS is reported");
+        assert_eq!(
+            record
+                .max_tres_per_job
+                .as_ref()
+                .map(|t| t.get(TresType::Cpu)),
+            Some(8)
+        );
+        assert_eq!(record.max_submit_jobs_per_account, Some(40));
+        assert_eq!(record.grp_wall_minutes, Some(600));
+        assert_eq!(record.grp_wall_consumed_minutes, Some(600));
+        assert_eq!(
+            record.exceeded_caps(),
+            vec![spur_core::accounting::Cap::GrpWall]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_leaves_the_new_caps_unset_when_the_qos_has_none() {
+        // A QOS without the new caps reports them unset (None → INFINITE on the
+        // wire), and a cold GrpWall cache reports unknown spend, not zero.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache()
+            .insert(capped_qos("bare", Default::default()));
+
+        let record = &cm.assoc_mgr_info(None).qos_records[0];
+        assert!(record.max_tres_per_job.is_none());
+        assert!(record.max_submit_jobs_per_account.is_none());
+        assert!(record.grp_wall_minutes.is_none());
+        assert!(record.grp_wall_consumed_minutes.is_none());
+        assert!(record.exceeded_caps().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_surfaces_the_association_per_job_tres_cap_only() {
+        // An association enforces a per-job TRES cap too, so its record carries it,
+        // but it has no per-account submit cap or group wall budget to report.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache()
+            .insert_association("alice", "tenant-a");
+        cm.association_cache().insert_limits(
+            "alice",
+            "tenant-a",
+            AccountLimits {
+                max_tres_per_job: Some(spur_core::accounting::TresRecord::parse("node=2").unwrap()),
+                ..Default::default()
+            },
+        );
+
+        let record = cm
+            .assoc_mgr_info(None)
+            .assoc_records
+            .into_iter()
+            .find(|r| r.scope == "tenant-a")
+            .expect("the defined association is reported");
+        assert_eq!(
+            record
+                .max_tres_per_job
+                .as_ref()
+                .map(|t| t.get(TresType::Node)),
+            Some(2)
+        );
+        assert!(record.max_submit_jobs_per_account.is_none());
+        assert!(record.grp_wall_minutes.is_none());
+        assert!(record.grp_wall_consumed_minutes.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

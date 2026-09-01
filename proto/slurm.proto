@@ -808,6 +808,21 @@ message AssocMgrRecord {
   // Scope-wide caps already exceeded, named as `sacctmgr` names them.
   repeated string over_limit = 9;
   AssocMgrCaps scope_caps = 10;
+  // The scope's per-job TRES cap (`sacctmgr`'s MaxTRESPerJob), bounding one job
+  // rather than a user's aggregate (`scope_caps.max_tres`) or the group total
+  // (`grp_tres`). A QOS and an association both enforce it. Empty when unset,
+  // matching the other TRES fields; `<name>=<value>` otherwise.
+  string max_tres_per_job = 11;
+  // Caps a QOS holds that an association has no equivalent for, so they carry the
+  // INFINITE sentinel in association records. `max_submit_jobs_per_account` bounds
+  // pending+running jobs per account within the QOS; `grp_wall_minutes` is the
+  // group wall-clock budget, with `grp_wall_consumed_minutes` its consumption from
+  // the controller's GrpWall cache. Consumption is INFINITE when that cache holds
+  // no snapshot yet — distinct from a real zero — so a consumer does not read
+  // "unknown" as "none spent".
+  uint32 max_submit_jobs_per_account = 12;
+  uint32 grp_wall_minutes = 13;
+  uint32 grp_wall_consumed_minutes = 14;
 }
 
 message GetAssocMgrInfoRequest {
