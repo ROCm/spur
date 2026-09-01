@@ -79,8 +79,10 @@ class TestStandaloneSrun:
         assert int(num_nodes_match.group(1)) == 2, (
             f"expected 2-node allocation while srun sleep runs:\n{show}"
         )
-        assert re.search(r"(?<![A-Za-z])NodeList=\S+", show), (
-            f"missing NodeList in scontrol output:\n{show}"
+        nodelist_match = re.search(r"(?<![A-Za-z])NodeList=(\S+)", show)
+        assert nodelist_match, f"missing NodeList in scontrol output:\n{show}"
+        assert nodelist_match.group(1) != "(null)", (
+            f"expected an allocated nodelist while srun sleep runs:\n{show}"
         )
         assert not cluster._cluster_is_ready(), (
             f"expected allocated nodes while srun sleep runs, sinfo:\n{cluster.sinfo()}"

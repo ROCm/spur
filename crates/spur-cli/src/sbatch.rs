@@ -1024,6 +1024,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn build_sbatch_job_spec_records_the_submit_line() {
@@ -1038,7 +1039,6 @@ mod tests {
             "sbatch -w node1 --exclusive --wrap hostname"
         );
     }
-    use super::*;
 
     #[test]
     fn test_parse_sbatch_directives() {

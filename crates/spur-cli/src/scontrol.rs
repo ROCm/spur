@@ -1717,17 +1717,11 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_ts(job.eligible_time.as_ref()),
         format_ts(job.accrue_time.as_ref()),
     );
-    // Slurm reports a pending job's projected start under StartTime; Spur has
-    // the same figure from the scheduler's held future slot.
-    let start = match (job.start_time.as_ref(), job.planned_start_time.as_ref()) {
-        (None, Some(planned)) => format_ts(Some(planned)),
-        (actual, _) => format_ts(actual),
-    };
     let _ = writeln!(
         out,
         "   StartTime={} EndTime={} Deadline={}",
-        start,
-        format_ts(job.end_time.as_ref()),
+        format_ts(crate::jobtime::effective_start(job)),
+        format_ts(crate::jobtime::effective_end(job).as_ref()),
         format_ts(job.deadline.as_ref()),
     );
     let _ = writeln!(

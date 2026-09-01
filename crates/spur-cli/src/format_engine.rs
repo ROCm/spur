@@ -401,6 +401,7 @@ pub fn squeue_header(spec: char) -> &'static str {
         'v' => "RESERVATION",
         'k' => "COMMENT",
         'A' => "ARRAY_JOB_ID",
+        'Y' => "SCHEDNODES",
         _ => "?",
     }
 }

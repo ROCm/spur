@@ -2,13 +2,15 @@
 
 //! Shared Slurm-style time rendering for the CLI printers.
 
-/// Slurm timestamp form (`2026-08-27T07:03:07`), or `N/A` when unset.
+/// Slurm timestamp form (`2025-08-27T08:03:07`), or `N/A` when unset.
 pub fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
     match ts {
         Some(t) if t.seconds > 0 => {
-            let dt =
-                chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default();
-            dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+            let nanos = t.nanos.try_into().unwrap_or(0);
+            match chrono::DateTime::from_timestamp(t.seconds, nanos) {
+                Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                None => "N/A".into(),
+            }
         }
         _ => "N/A".into(),
     }

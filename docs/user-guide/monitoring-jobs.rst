@@ -125,12 +125,42 @@ SUSPENDED, COMPLETING**.
      - NODES
      - ``%e``
      - END_TIME
+   * - ``%Y``
+     - SCHEDNODES
+     -
+     -
 
 .. code-block:: bash
 
    spur queue -u alice -t R
    squeue -p gpu -o "%.18i %.9P %.8T %.10M %R"
    squeue --states=PD,R --noheader
+
+Projected Start Times — ``squeue --start``
+-------------------------------------------
+
+``--start`` answers "when will my job run, and where" for the whole queue at
+once, rather than one job at a time through ``scontrol show job``:
+
+.. code-block:: console
+
+   $ squeue --start
+        JOBID PARTITION     NAME     USER ST          START_TIME  NODES           SCHEDNODES NODELIST(REASON)
+         1024       gpu  train.sh    alice PD 2026-08-27T17:09:56      2          node[07-08] (Resources)
+         1031       gpu   eval.sh      bob PD                 N/A      1               (null) (Priority)
+
+It restricts the view to pending jobs and orders them by projected start,
+soonest first; jobs with no reserved slot report ``N/A`` and sort last. Each of
+those defaults is overridable by passing ``-t``, ``-S``, or ``-o`` explicitly.
+
+``%S`` and ``%e`` carry the same projection in any format string, so
+``squeue -o "%.18i %.19S %.19e"`` works without ``--start``.
+
+.. note::
+
+   Projections come from the backfill pass on the controller's leader, and
+   assume every running job uses its full time limit. A job that finishes early
+   moves every projection behind it earlier.
 
 **Job state codes.** The ``ST`` column uses these short codes:
 
@@ -349,8 +379,9 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
    The diagnostic fields below are printed on every job, with ``(null)`` for an
    unset string, so a parser must key on the field name rather than on a line
    being absent. Some fields still appear only when set (``Comment``,
-   ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, the GPU line, and the
-   preemption line).
+   ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, ``StdIn``, the GPU line,
+   and the preemption line), and ``MinMemoryNode`` is spelled ``MinMemoryCPU``
+   for a ``--mem-per-cpu`` job.
 
 .. code-block:: bash
 
@@ -405,11 +436,22 @@ request as submitted, which distinguishes the two:
        job will start, and on which nodes. With no slot reserved, ``StartTime``
        reads ``N/A`` and ``SchedNodeList`` is omitted. ``StartTime`` becomes the
        real start once the job runs.
+   * - ``EndTime``
+     - The recorded end once the job finishes, otherwise its start plus its
+       time limit. ``N/A`` for an unlimited job, or a pending one with no
+       projected start.
    * - ``LastSchedEval``
-     - The last scheduling cycle that considered this job. Stamped during
-       classification, so it advances even on a cycle that places nothing.
-       ``N/A`` before the first cycle, frozen once the job starts, and reset by
-       a controller restart or failover.
+     - The last scheduling cycle that considered this job, so it advances even
+       on a cycle that places nothing. ``N/A`` before the first cycle, frozen
+       once the job starts, and reset by a controller restart or failover.
+       On a deep queue it also covers jobs classified but left untried past
+       ``scheduler.max_jobs_per_cycle``.
+
+   .. note::
+
+      ``StartTime``, ``SchedNodeList``, and ``LastSchedEval`` live only on the
+      leader and are never replicated, so a read served by a follower reports
+      them unset even in a healthy cluster.
 
 So a job pinned to a busy node reads (excerpt — the full record has more
 fields between these lines):
@@ -426,7 +468,8 @@ fields between these lines):
       SubmitLine=sbatch -w node07 --exclusive -t 5 job.sh
 
 The controller logs the matching scheduler-side view at ``info`` level, one line
-per job when its placement outcome changes (not every cycle). Jobs beyond the
+per job when its placement outcome changes (not every cycle). A cycle with no
+schedulable nodes at all is skipped before this runs, so it logs nothing. Jobs beyond the
 per-cycle scheduling depth limit are not reported:
 
 .. code-block:: text

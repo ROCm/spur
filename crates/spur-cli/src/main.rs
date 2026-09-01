@@ -8,6 +8,7 @@ mod exit_fmt;
 mod format_engine;
 mod image;
 mod interactive;
+mod jobtime;
 mod k8s;
 #[cfg(test)]
 mod mock_controller;
