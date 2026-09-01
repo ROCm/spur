@@ -549,8 +549,8 @@ impl ClusterManager {
         self.config.read().clone()
     }
 
-    /// Skip a node for new dispatch for the configured cooldown after it rejected
-    /// one as resources-unavailable, so the scheduler stops re-picking it each tick.
+    /// Skip a node for new dispatch for the configured cooldown after it rejected a
+    /// launch or could not be reached, so the scheduler stops re-picking it each tick.
     pub fn cool_down_node(&self, name: &str) {
         let secs = self.config().controller.dispatch_reject_cooldown_secs;
         if secs == 0 {

@@ -202,6 +202,9 @@ mod tests {
             },
             "a later call must replace the previous tuning, not be ignored"
         );
+
+        // Leaving 11/22/33 in the process-wide global would leak into every later connect().
+        set_channel_tuning(&defaults);
     }
 
     #[test]

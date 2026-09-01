@@ -337,8 +337,8 @@ pub struct ControllerConfig {
     #[serde(default = "default_terminal_job_retention_secs")]
     pub terminal_job_retention_secs: u64,
 
-    /// Seconds a node is skipped for new dispatch after rejecting one as
-    /// resources-unavailable, so it isn't re-picked every tick (default 30, 0 disables).
+    /// Seconds a node is skipped for new dispatch after rejecting a launch or failing to
+    /// be reached, so it isn't re-picked every tick (default 30, 0 disables).
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
 

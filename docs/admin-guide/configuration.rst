@@ -250,8 +250,8 @@ and Raft high-availability topology.
      - integer
      - ``30``
      - Live
-     - How long a node is skipped for dispatch after rejecting a launch as
-       resources-unavailable.
+     - How long a node is skipped for dispatch after rejecting a launch or
+       failing to be reached.
    * - ``agent_connect_timeout_secs``
      - integer
      - ``5``
@@ -282,9 +282,10 @@ and Raft high-availability topology.
      - integer
      - ``300``
      - Live
-     - Ceiling on a single launch or allocation-register RPC to an agent. The
-       agent runs the node prolog and any container image unpack before it
-       answers, so this must exceed your slowest prolog. Range 0-86400;
+     - Ceiling on a single launch, allocation-register, or multi-node PMIx
+       prepare RPC to an agent. The agent runs the node prolog and any
+       container image unpack before it answers, so this must exceed your
+       slowest prolog. Range 0-86400;
        ``0`` disables it. A node that has died or become unreachable is
        detected sooner by channel keepalive, when keepalive is enabled; an
        agent that is still running but whose launch never completes is
