@@ -17413,11 +17413,18 @@ mod tests {
         assert_eq!(user("carol").submitted_jobs, 1);
         assert_eq!(got.grp_running_jobs, 3);
         assert_eq!(got.grp_submitted_jobs, 4);
-        assert!(
-            !got.users
+        assert_eq!(
+            got.users
                 .iter()
-                .any(|u| u.running_tres.get(TresType::Node) > 3),
-            "no user in the excluded 'high' scope should appear"
+                .map(|u| u.user.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob", "carol"],
+            "only users holding work in this scope, in sorted order"
+        );
+        assert_eq!(
+            user("alice").running_jobs,
+            2,
+            "alice's third running job is in the 'high' scope and must not be counted"
         );
     }
 
