@@ -343,16 +343,14 @@ async fn process_assignment(
         )
         .await
         {
-            AllocationRegisterOutcome::AllFailed => {
-                if let Err(e) = cluster.requeue_job(job_id) {
-                    error!(job_id, error = %e, "failed to requeue after registration failure");
-                }
-                return false;
-            }
-            AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
-                cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
-                if let Err(e) = cluster.requeue_job(job_id) {
-                    error!(job_id, error = %e, "failed to requeue after partial registration");
+            // Both arms tear down identically: with a deadline in play, even "all failed" can mean
+            // every node registered and answered too late, so none of them may be left holding one.
+            AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
+                cancel_job_on_nodes(&cluster, job_id, &all_nodes, 9).await;
+                // The job never left Pending, so plain requeue is a no-op here — the same
+                // Pending-aware backoff the launch path uses is what actually throttles a retry.
+                if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+                    error!(job_id, error = %e, "failed to back off after registration failure");
                 }
                 return false;
             }
@@ -1002,6 +1000,9 @@ enum DispatchError {
     /// Connect failed, or the RPC timed out without a response, as opposed to
     /// the agent responding with an explicit rejection.
     Unreachable(anyhow::Error),
+    /// The agent held the call for the whole dispatch deadline. Distinct from `Unreachable`, which
+    /// a refused connection also produces in milliseconds and must not earn the same long cooldown.
+    TimedOut(Duration),
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
@@ -1016,6 +1017,7 @@ impl DispatchError {
             Self::PrologFailed(_) => "prolog failure",
             Self::ResourcesUnavailable => "gpu/resource allocation mismatch",
             Self::Unreachable(_) => "agent unreachable",
+            Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
             Self::Other(_) => "dispatch error",
         }
@@ -1030,6 +1032,9 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent rejected job: allocated resources unavailable")
             }
             Self::Unreachable(e) => write!(f, "agent unreachable: {e:#}"),
+            Self::TimedOut(limit) => {
+                write!(f, "agent did not answer within {}s", limit.as_secs())
+            }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
@@ -1042,11 +1047,29 @@ impl<E: Into<anyhow::Error>> From<E> for DispatchError {
     }
 }
 
+/// Ceiling on one agent RPC in a fan-out that is drained to completion. `0` disables it, matching
+/// the sibling `dispatch_reject_cooldown_secs` knob.
+pub(crate) fn dispatch_deadline(cluster: &ClusterManager) -> Option<Duration> {
+    match cluster.config().controller.dispatch_timeout_secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
 /// Send a LaunchJob RPC to a node agent.
 async fn dispatch_to_agent(
     agent_addr: &str,
     params: &AgentDispatchParams<'_>,
 ) -> Result<LaunchOutcome, DispatchError> {
+    // Logged before the call, not just on its outcome: a launch that never returns is otherwise
+    // invisible for as long as it hangs, which is exactly when an operator needs to see it.
+    info!(
+        job_id = params.job_id,
+        node = params.target_node,
+        agent = agent_addr,
+        run_attempt = params.run_attempt,
+        "dispatching job to agent"
+    );
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
         .map_err(|e| DispatchError::Unreachable(e.into()))?
@@ -1248,7 +1271,25 @@ fn build_pmix_plan_proto(
 pub(crate) enum AllocationRegisterOutcome {
     AllSucceeded,
     AllFailed,
-    PartialFailed { succeeded_nodes: Vec<String> },
+    PartialFailed,
+}
+
+/// Why one RegisterJobAllocation RPC did not succeed. Split so the caller can tell a node that
+/// burned the whole deadline from one that failed fast, and cool each for the span it earned.
+enum RegisterError {
+    Failed(anyhow::Error),
+    TimedOut(Duration),
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(e) => write!(f, "{e}"),
+            Self::TimedOut(limit) => {
+                write!(f, "allocation register RPC exceeded {}s", limit.as_secs())
+            }
+        }
+    }
 }
 
 /// Parameters for registering a srun-only allocation on a single node agent.
@@ -1316,8 +1357,8 @@ async fn register_allocation_on_nodes(
 ) -> AllocationRegisterOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
-    let mut succeeded_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
+    let dispatch_timeout = dispatch_deadline(&cluster);
 
     let mut set = tokio::task::JoinSet::new();
     for node_name in &dispatch_nodes {
@@ -1360,16 +1401,23 @@ async fn register_allocation_on_nodes(
             work_dir: spec.work_dir.clone(),
         };
         set.spawn(async move {
-            let result = register_allocation_to_agent(&agent_addr, &params).await;
+            let register = register_allocation_to_agent(&agent_addr, &params);
+            let result = match dispatch_timeout {
+                Some(limit) => match tokio::time::timeout(limit, register).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(RegisterError::Failed(e)),
+                    Err(_) => Err(RegisterError::TimedOut(limit)),
+                },
+                None => register.await.map_err(RegisterError::Failed),
+            };
             (result_node, result)
         });
     }
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((node_name, Ok(()))) => {
+            Ok((_node_name, Ok(()))) => {
                 successes += 1;
-                succeeded_nodes.push(node_name);
             }
             Ok((node_name, Err(e))) => {
                 error!(
@@ -1378,6 +1426,12 @@ async fn register_allocation_on_nodes(
                     error = %e,
                     "allocation registration on agent failed"
                 );
+                // Mirrors the launch fan-out: an unreachable node is cooled briefly, one that
+                // burned a deadline is held for it, so neither is re-picked on the next tick.
+                match e {
+                    RegisterError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
+                    RegisterError::Failed(_) => cluster.cool_down_node(&node_name),
+                }
                 failures += 1;
             }
             Err(e) => {
@@ -1395,7 +1449,7 @@ async fn register_allocation_on_nodes(
             job_id,
             successes, failures, "partial allocation registration failure"
         );
-        AllocationRegisterOutcome::PartialFailed { succeeded_nodes }
+        AllocationRegisterOutcome::PartialFailed
     } else {
         AllocationRegisterOutcome::AllSucceeded
     }
@@ -1494,7 +1548,6 @@ async fn confirm_dispatch_on_nodes(
 ) -> DispatchConfirmOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
-    let mut succeeded_nodes: Vec<String> = Vec::new();
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
@@ -1508,6 +1561,7 @@ async fn confirm_dispatch_on_nodes(
     let modex_connect_timeout_secs = cluster.config().mpi.modex_connect_timeout_secs;
     let modex_fence_timeout_secs = cluster.config().mpi.modex_fence_timeout_secs;
     let modex_verify_timeout_secs = cluster.config().mpi.modex_verify_timeout_secs;
+    let dispatch_timeout = dispatch_deadline(&cluster);
 
     let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
         spec.mpi.as_deref(),
@@ -1622,8 +1676,13 @@ async fn confirm_dispatch_on_nodes(
             });
         }
 
-        if let Err(detail) =
-            pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+        if let Err(detail) = pmix_dispatch::prepare_pmix_on_nodes(
+            job_id,
+            run_attempt,
+            prepare_nodes,
+            dispatch_timeout,
+        )
+        .await
         {
             error!(job_id, error = %detail, "PMIx prepare failed — aborting dispatch");
             return abort_pending_pmix_dispatch(
@@ -1654,37 +1713,42 @@ async fn confirm_dispatch_on_nodes(
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
         set.spawn(async move {
-            let result = dispatch_to_agent(
-                &agent_addr,
-                &AgentDispatchParams {
-                    job_id,
-                    spec: &spec,
-                    peer_nodes: &peer_addrs,
-                    peer_hosts: &peer_hosts,
-                    node_index,
-                    task_offset,
-                    target_node: &target_node,
-                    allocated: &allocated,
-                    allocated_nodelist: &allocated_nodelist,
-                    run_attempt,
-                    pmix_tmpdir: &pmix_tmpdir,
-                    task_fanout,
-                    modex_connect_timeout_secs,
-                    modex_fence_timeout_secs,
-                    modex_verify_timeout_secs,
-                    pmix_prepared: needs_pmix_prepare,
+            let params = AgentDispatchParams {
+                job_id,
+                spec: &spec,
+                peer_nodes: &peer_addrs,
+                peer_hosts: &peer_hosts,
+                node_index,
+                task_offset,
+                target_node: &target_node,
+                allocated: &allocated,
+                allocated_nodelist: &allocated_nodelist,
+                run_attempt,
+                pmix_tmpdir: &pmix_tmpdir,
+                task_fanout,
+                modex_connect_timeout_secs,
+                modex_fence_timeout_secs,
+                modex_verify_timeout_secs,
+                pmix_prepared: needs_pmix_prepare,
+            };
+            let dispatch = dispatch_to_agent(&agent_addr, &params);
+            // The join below drains every node, so one agent that accepts the call and never answers
+            // would otherwise hold the whole scheduler loop, not just this job.
+            let result = match dispatch_timeout {
+                Some(limit) => match tokio::time::timeout(limit, dispatch).await {
+                    Ok(result) => result,
+                    Err(_) => Err(DispatchError::TimedOut(limit)),
                 },
-            )
-            .await;
+                None => dispatch.await,
+            };
             (result_node, is_primary, result)
         });
     }
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((node_name, is_primary, Ok(outcome))) => {
+            Ok((_node_name, is_primary, Ok(outcome))) => {
                 successes += 1;
-                succeeded_nodes.push(node_name);
                 if is_primary {
                     primary_outcome = Some(outcome);
                 }
@@ -1697,10 +1761,13 @@ async fn confirm_dispatch_on_nodes(
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
                     }
-                    DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
-                    DispatchError::Unreachable(_)
-                    | DispatchError::AgentRejected(_)
-                    | DispatchError::Other(_) => {}
+                    DispatchError::ResourcesUnavailable | DispatchError::Unreachable(_) => {
+                        cluster.cool_down_node(&node_name)
+                    }
+                    // Held for the deadline it actually burned: while assignments are processed
+                    // serially, re-picking this node stalls every job behind it, not just this one.
+                    DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
+                    DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
             Err(e) => {
@@ -1751,11 +1818,9 @@ async fn confirm_dispatch_on_nodes(
     };
     let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
-    // Stop whatever DID launch before the job settles anywhere: a node that
-    // never confirmed will never report completion, and letting it keep
-    // running while the job as a whole is aborted back to Pending would
-    // orphan it.
-    cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+    // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
+    // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
+    cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 9).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -2977,6 +3042,7 @@ mod tests {
             release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
+            register_delay: Duration,
             /// launch_job returns a ResourceExhausted status, standing in for a
             /// node whose local allocation table already holds the GPUs.
             reject_resources: bool,
@@ -3107,6 +3173,9 @@ mod tests {
                 tonic::Response<spur_proto::proto::RegisterJobAllocationResponse>,
                 tonic::Status,
             > {
+                if !self.register_delay.is_zero() {
+                    tokio::time::sleep(self.register_delay).await;
+                }
                 Ok(tonic::Response::new(Default::default()))
             }
 
@@ -3219,12 +3288,27 @@ mod tests {
             spawn_mock_agent_full(None, delay).await
         }
 
+        /// Like [`spawn_mock_agent_with_delay`], but the delay lands on
+        /// `register_job_allocation` — the srun allocation path, not the batch launch.
+        async fn spawn_mock_agent_with_register_delay(
+            delay: Duration,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let (addr, cancel_calls, _, _) =
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, delay, false).await;
+            (addr, cancel_calls)
+        }
+
         async fn spawn_mock_agent_full(
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
-            let (addr, cancel_calls, _, _) =
-                spawn_mock_agent_capturing_fanout(reject_launch_as, launch_delay, false).await;
+            let (addr, cancel_calls, _, _) = spawn_mock_agent_capturing_fanout(
+                reject_launch_as,
+                launch_delay,
+                Duration::ZERO,
+                false,
+            )
+            .await;
             (addr, cancel_calls)
         }
 
@@ -3236,6 +3320,7 @@ mod tests {
         async fn spawn_mock_agent_capturing_fanout(
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
+            register_delay: Duration,
             capture: bool,
         ) -> (
             std::net::SocketAddr,
@@ -3253,6 +3338,7 @@ mod tests {
                 release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
+                register_delay,
                 reject_resources: false,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
             };
@@ -3275,6 +3361,7 @@ mod tests {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
                 reject_resources: true,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
@@ -3814,9 +3901,11 @@ mod tests {
             let cm = test_cluster(&dir).await;
 
             let (good_addr, cancel_calls, release_pmix_good, _) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, false).await;
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, false)
+                    .await;
             let (bad_addr, _, release_pmix_bad, _) = spawn_mock_agent_capturing_fanout(
                 Some(spur_proto::proto::LaunchFailureKind::LaunchFailureUnspecified),
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
             )
@@ -4330,6 +4419,170 @@ mod tests {
             elapsed
         }
 
+        /// A refused connection fails in milliseconds and must not buy the long deadline cooldown,
+        /// or a rolling agent restart sidelines the whole cluster at once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_fast_dispatch_failure_does_not_earn_the_deadline_cooldown() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            // Disabling the short cooldown makes the two paths distinguishable: only
+            // cool_down_node_for can put a node in the map now.
+            // Non-zero so the assertion is two-sided: the node must land on the SHORT cooldown,
+            // not merely stay off the long one (which "cools nothing at all" would also satisfy).
+            config.controller.dispatch_reject_cooldown_secs = 30;
+            config.controller.dispatch_timeout_secs = 300;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            register_node_at(&cm, "n-dead", unreachable_addr().await);
+
+            let nodes = vec!["n-dead".to_string()];
+            let spec = batch_spec("fast-fail", 1);
+            let job_id = submit_and_wait(&cm, spec);
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let nodelist = nodes.join(",");
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(
+                cm.nodes_on_dispatch_cooldown().contains("n-dead"),
+                "a connect failure must still cool the node down"
+            );
+            assert!(
+                cm.dispatch_cooldown_remaining("n-dead")
+                    .is_some_and(|left| left <= Duration::from_secs(30)),
+                "it must use the 30s reject cooldown, not the 300s dispatch deadline"
+            );
+        }
+
+        #[test]
+        fn a_zero_dispatch_timeout_disables_the_deadline() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_timeout_secs = 0;
+            let cm = ClusterManager::new(config, dir.path()).unwrap();
+            assert_eq!(dispatch_deadline(&cm), None);
+
+            let dir2 = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_timeout_secs = 7;
+            let cm = ClusterManager::new(config, dir2.path()).unwrap();
+            assert_eq!(dispatch_deadline(&cm), Some(Duration::from_secs(7)));
+        }
+
+        /// The node that timed out is the one most likely to have launched anyway, so it is the one
+        /// that must be cancelled — cancelling only the confirmed nodes orphans it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_whose_launch_times_out_is_still_cancelled() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_timeout_secs = 1;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (fast_addr, fast_cancels) = spawn_mock_agent().await;
+            let (slow_addr, slow_cancels) =
+                spawn_mock_agent_with_delay(Duration::from_secs(30)).await;
+            register_node_at(&cm, "n-fast", fast_addr);
+            register_node_at(&cm, "n-slow", slow_addr);
+
+            let nodes = vec!["n-fast".to_string(), "n-slow".to_string()];
+            let spec = batch_spec("timeout-cancel", 2);
+            let job_id = submit_and_wait(&cm, spec);
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let nodelist = nodes.join(",");
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(
+                !matches!(outcome, DispatchConfirmOutcome::Confirmed),
+                "a node that never answered must not count as confirmed"
+            );
+            assert!(
+                slow_cancels.load(Ordering::SeqCst) > 0,
+                "the timed-out node received no cancel and would keep running the job"
+            );
+            assert!(
+                fast_cancels.load(Ordering::SeqCst) > 0,
+                "the confirmed node must still be cancelled when admission aborts"
+            );
+        }
+
+        /// Counterpart to [`a_fast_dispatch_failure_does_not_earn_the_deadline_cooldown`]: with the
+        /// reject cooldown off, only the deadline path can put the node on cooldown at all.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_burns_the_launch_deadline_is_held_for_it() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_reject_cooldown_secs = 0;
+            config.controller.dispatch_timeout_secs = 1;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (slow_addr, _) = spawn_mock_agent_with_delay(Duration::from_secs(30)).await;
+            register_node_at(&cm, "n-slow", slow_addr);
+
+            let nodes = vec!["n-slow".to_string()];
+            let spec = batch_spec("launch-deadline-cooldown", 1);
+            let job_id = submit_and_wait(&cm, spec);
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let nodelist = nodes.join(",");
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(
+                cm.dispatch_cooldown_remaining("n-slow").is_some(),
+                "a node that burned the whole deadline must not be re-picked on the next tick"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
         async fn confirm_dispatch_latency_tracks_the_slowest_node_not_the_node_count() {
             let dir = TempDir::new().unwrap();
@@ -4535,7 +4788,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
             let (addr, _, _, fanout_calls) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, true).await;
             register_node_at(&cm, "n1", addr);
 
             let mut spec = batch_spec("plain-batch-fanout", 1);
@@ -4556,7 +4809,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
             let (addr, _, _, fanout_calls) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, true).await;
             register_k8s_node_at(&cm, "k1", addr);
 
             let mut spec = batch_spec("srun-fanout-with-script", 1);
@@ -4626,6 +4879,12 @@ mod tests {
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+            assert!(
+                cm.dispatch_cooldown_remaining("n1")
+                    .is_some_and(|left| left <= Duration::from_secs(30)),
+                "an unreachable node must take the short reject cooldown — not be re-picked \
+                 every tick, and not be held for the whole dispatch deadline"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4649,6 +4908,50 @@ mod tests {
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
             wait_for("n1 registration rolled back with a cancel", || {
                 cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+        }
+
+        /// Every node answering just past the deadline is the production shape of "all failed":
+        /// each may still be holding the allocation it registered, so none can be left uncancelled,
+        /// and none may be re-picked on the next tick to burn the deadline again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn every_node_timing_out_on_register_is_cancelled_cooled_and_backed_off() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.dispatch_reject_cooldown_secs = 0;
+            config.controller.dispatch_timeout_secs = 1;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr1, cancel1) =
+                spawn_mock_agent_with_register_delay(Duration::from_secs(30)).await;
+            let (addr2, cancel2) =
+                spawn_mock_agent_with_register_delay(Duration::from_secs(30)).await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let mut spec = batch_spec("srun-alloc-all-timeout", 2);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+
+            assert!(!started);
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > Utc::now()),
+                "a registration failure must back the job off, not retry it on the next tick"
+            );
+            for name in ["n1", "n2"] {
+                assert!(
+                    cm.dispatch_cooldown_remaining(name).is_some(),
+                    "{name} burned the deadline and must be skipped for it"
+                );
+            }
+            wait_for("both timed-out nodes were cancelled", || {
+                cancel1.load(Ordering::SeqCst) >= 1 && cancel2.load(Ordering::SeqCst) >= 1
             });
         }
 

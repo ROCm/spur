@@ -2843,8 +2843,13 @@ impl SlurmController for ControllerService {
                     "multi-node PMIx step missing launch plan for one or more nodes",
                 ));
             }
-            if let Err(detail) =
-                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+            if let Err(detail) = pmix_dispatch::prepare_pmix_on_nodes(
+                job_id,
+                run_attempt,
+                prepare_nodes,
+                crate::scheduler_loop::dispatch_deadline(&self.cluster),
+            )
+            .await
             {
                 return Err(Status::failed_precondition(format!(
                     "PMIx prepare failed: {detail}"

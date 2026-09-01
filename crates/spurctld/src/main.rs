@@ -378,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = listen_addr.parse()?;
     // The controller presents this key as its credential to agents (spurd authenticates callers).
     crate::agent_client::set_signing_key(config.auth.jwt_key.clone().unwrap_or_default());
+    crate::agent_client::set_channel_tuning(&config.controller);
 
     // State the authentication posture explicitly at startup: it determines whether the listening
     // port is the trust boundary or merely the transport.

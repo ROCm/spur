@@ -337,10 +337,29 @@ pub struct ControllerConfig {
     #[serde(default = "default_terminal_job_retention_secs")]
     pub terminal_job_retention_secs: u64,
 
-    /// Seconds a node is skipped for new dispatch after rejecting one as
-    /// resources-unavailable, so it isn't re-picked every tick (default 30, 0 disables).
+    /// Seconds a node is skipped for new dispatch after rejecting a launch or failing to
+    /// be reached, so it isn't re-picked every tick (default 30, 0 disables).
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
+
+    /// Ceiling on a single launch or allocation-register RPC to an agent (default 300, 0 disables).
+    /// Must exceed the slowest node prolog, which runs inside the launch call.
+    #[serde(default = "default_dispatch_timeout_secs")]
+    pub dispatch_timeout_secs: u64,
+
+    /// Budget for establishing a controller-to-agent connection (default 5, 0 falls back to the
+    /// OS TCP timeout).
+    #[serde(default = "default_agent_connect_timeout_secs")]
+    pub agent_connect_timeout_secs: u64,
+
+    /// HTTP/2 ping interval on an open agent connection (default 10, 0 disables keepalive).
+    /// Detection of a silent peer takes roughly this plus `agent_keepalive_timeout_secs`.
+    #[serde(default = "default_agent_keepalive_interval_secs")]
+    pub agent_keepalive_interval_secs: u64,
+
+    /// How long to wait for a ping response before dropping the connection (default 10).
+    #[serde(default = "default_agent_keepalive_timeout_secs")]
+    pub agent_keepalive_timeout_secs: u64,
 
     /// How much of another user's job a non-owner may see via `get_job` /
     /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
@@ -383,6 +402,30 @@ fn default_terminal_job_retention_secs() -> u64 {
 
 fn default_dispatch_reject_cooldown_secs() -> u64 {
     30
+}
+
+fn default_dispatch_timeout_secs() -> u64 {
+    300
+}
+
+/// Shared with `spurctld`'s agent channel builder, which needs these before any config is loaded.
+/// A dial budget or ping interval beyond this is indistinguishable from disabling it.
+pub const MAX_AGENT_CHANNEL_TIMEOUT_SECS: u64 = 600;
+
+pub const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_AGENT_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+pub const DEFAULT_AGENT_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+
+fn default_agent_connect_timeout_secs() -> u64 {
+    DEFAULT_AGENT_CONNECT_TIMEOUT_SECS
+}
+
+fn default_agent_keepalive_interval_secs() -> u64 {
+    DEFAULT_AGENT_KEEPALIVE_INTERVAL_SECS
+}
+
+fn default_agent_keepalive_timeout_secs() -> u64 {
+    DEFAULT_AGENT_KEEPALIVE_TIMEOUT_SECS
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -445,6 +488,10 @@ impl Default for ControllerConfig {
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
             terminal_job_retention_secs: default_terminal_job_retention_secs(),
             dispatch_reject_cooldown_secs: default_dispatch_reject_cooldown_secs(),
+            dispatch_timeout_secs: default_dispatch_timeout_secs(),
+            agent_connect_timeout_secs: default_agent_connect_timeout_secs(),
+            agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
+            agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
             job_info_visibility: JobInfoVisibility::default(),
         }
     }
@@ -1502,6 +1549,51 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be at most {})",
                     self.controller.dispatch_reject_cooldown_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // Keepalive detection is interval + timeout, so an hour-long interval silently disables
+        // the liveness this exists to provide.
+        for (field, value) in [
+            (
+                "controller.agent_connect_timeout_secs",
+                self.controller.agent_connect_timeout_secs,
+            ),
+            (
+                "controller.agent_keepalive_interval_secs",
+                self.controller.agent_keepalive_interval_secs,
+            ),
+            (
+                "controller.agent_keepalive_timeout_secs",
+                self.controller.agent_keepalive_timeout_secs,
+            ),
+        ] {
+            if value > MAX_AGENT_CHANNEL_TIMEOUT_SECS {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: format!("{value} (must be at most {MAX_AGENT_CHANNEL_TIMEOUT_SECS})"),
+                });
+            }
+        }
+        // Zero is "already overdue" to hyper, so it would tear down every channel that goes quiet
+        // — the opposite of the liveness keepalive exists to provide.
+        if self.controller.agent_keepalive_interval_secs > 0
+            && self.controller.agent_keepalive_timeout_secs == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.agent_keepalive_timeout_secs".into(),
+                value: "0 (must be greater than 0 unless agent_keepalive_interval_secs is 0)"
+                    .into(),
+            });
+        }
+        // A timed-out node is cooled down for this span, so it feeds the same map and needs the
+        // same ceiling.
+        if self.controller.dispatch_timeout_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.dispatch_timeout_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.dispatch_timeout_secs, MAX_LAUNCH_BACKOFF_SECS
                 ),
             });
         }
@@ -2899,6 +2991,51 @@ terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
             MAX_TERMINAL_JOB_RETENTION_SECS,
             "the bound itself must be accepted"
         );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_agent_channel_timeouts() {
+        for field in [
+            "agent_connect_timeout_secs",
+            "agent_keepalive_interval_secs",
+            "agent_keepalive_timeout_secs",
+        ] {
+            let toml = format!(
+                "cluster_name = \"test\"\n\n[controller]\n{field} = {}\n",
+                MAX_AGENT_CHANNEL_TIMEOUT_SECS + 1
+            );
+            let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "{field} past the ceiling must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_config_rejects_a_zero_keepalive_timeout_while_keepalive_is_on() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+agent_keepalive_interval_secs = 10
+agent_keepalive_timeout_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("agent_keepalive_timeout_secs"),
+            "a zero ping timeout marks every ping overdue; it must be rejected: {err}"
+        );
+
+        // Harmless once keepalive itself is off.
+        let ok = r#"
+cluster_name = "test"
+
+[controller]
+agent_keepalive_interval_secs = 0
+agent_keepalive_timeout_secs = 0
+"#;
+        assert!(SlurmConfig::load_from_str(ok).is_ok());
     }
 
     #[test]

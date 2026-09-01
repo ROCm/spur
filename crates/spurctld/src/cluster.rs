@@ -549,17 +549,37 @@ impl ClusterManager {
         self.config.read().clone()
     }
 
-    /// Skip a node for new dispatch for the configured cooldown after it rejected
-    /// one as resources-unavailable, so the scheduler stops re-picking it each tick.
+    /// Skip a node for new dispatch for the configured cooldown after it rejected a
+    /// launch or could not be reached, so the scheduler stops re-picking it each tick.
     pub fn cool_down_node(&self, name: &str) {
         let secs = self.config().controller.dispatch_reject_cooldown_secs;
         if secs == 0 {
             return;
         }
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.cool_down_node_for(name, std::time::Duration::from_secs(secs));
+    }
+
+    /// Cool down for an explicit span. A node that burned a whole dispatch deadline must not be
+    /// re-picked after the much shorter reject cooldown, or it spends most of every cycle stalling.
+    pub fn cool_down_node_for(&self, name: &str, span: std::time::Duration) {
+        if span.is_zero() {
+            return;
+        }
+        let until = std::time::Instant::now() + span;
         self.node_dispatch_cooldowns
             .write()
             .insert(name.to_string(), until);
+    }
+
+    /// How long a node's dispatch cooldown still has to run, for tests that need to tell the
+    /// reject cooldown apart from the longer dispatch-deadline one.
+    #[cfg(test)]
+    pub fn dispatch_cooldown_remaining(&self, name: &str) -> Option<std::time::Duration> {
+        let now = std::time::Instant::now();
+        self.node_dispatch_cooldowns
+            .read()
+            .get(name)
+            .map(|&until| until.saturating_duration_since(now))
     }
 
     /// Names still within their dispatch cooldown, pruning any that have expired.
@@ -3980,6 +4000,9 @@ impl ClusterManager {
         // so a mid-reconfigure failure leaves the previous config in place.
         // Readers pick up the new sections on their next `config()` snapshot.
         *self.config.write() = Arc::new(new_config);
+        // Agent channels are built per call, so new tunables apply to the next RPC. Unlike the
+        // jwt key, these carry no security posture, so adopting them live is safe.
+        crate::agent_client::set_channel_tuning(&self.config.read().controller);
 
         // Re-derive per-node `[[nodes]]` policy (features/weight) and partition
         // membership against the freshly-swapped config. This is a local derived

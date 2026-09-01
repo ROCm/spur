@@ -3,6 +3,8 @@
 
 //! Shared multi-node PMIx prepare / release helpers for batch launch and srun steps.
 
+use std::time::Duration;
+
 use tracing::{error, warn};
 
 use spur_core::node::NodeSource;
@@ -10,6 +12,10 @@ use spur_proto::proto::{PreparePmixRequest, ReleasePmixRequest};
 
 pub const MULTI_NODE_PMIX_K8S_UNSUPPORTED: &str =
     "multi-node PMIx is not supported on K8s virtual agents";
+
+/// Rollback is best-effort, so it gets its own short bound rather than the caller's
+/// dispatch deadline — an agent wedged in `server_stop` must not hold the loop.
+const RELEASE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reject multi-node PMIx at submit when the user pins a K8s virtual agent.
 pub fn validate_multi_node_pmix_nodelist(
@@ -56,6 +62,24 @@ pub async fn prepare_pmix_on_agent(
     job_id: u32,
     run_attempt: u32,
     pmix_plan: spur_proto::proto::PmixLaunchPlan,
+    deadline: Option<Duration>,
+) -> Result<(), String> {
+    // The agent runs PMIx `server_start` inline in this handler, so it keeps answering
+    // HTTP/2 pings while wedged — only a call-site deadline bounds it.
+    let prepare = prepare_pmix_on_agent_inner(agent_addr, job_id, run_attempt, pmix_plan);
+    match deadline {
+        Some(limit) => tokio::time::timeout(limit, prepare)
+            .await
+            .unwrap_or_else(|_| Err(format!("PreparePmix RPC exceeded {}s", limit.as_secs()))),
+        None => prepare.await,
+    }
+}
+
+async fn prepare_pmix_on_agent_inner(
+    agent_addr: &str,
+    job_id: u32,
+    run_attempt: u32,
+    pmix_plan: spur_proto::proto::PmixLaunchPlan,
 ) -> Result<(), String> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
@@ -89,10 +113,15 @@ pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32) {
             .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
         client.release_pmix(ReleasePmixRequest { job_id }).await?;
         Ok::<(), tonic::Status>(())
-    }
-    .await;
-    if let Err(e) = result {
-        warn!(job_id, agent = %agent_addr, error = %e, "ReleasePmix rollback failed");
+    };
+    match tokio::time::timeout(RELEASE_RPC_TIMEOUT, result).await {
+        Ok(Err(e)) => {
+            warn!(job_id, agent = %agent_addr, error = %e, "ReleasePmix rollback failed")
+        }
+        Err(_) => {
+            warn!(job_id, agent = %agent_addr, "ReleasePmix rollback timed out")
+        }
+        Ok(Ok(())) => {}
     }
 }
 
@@ -112,6 +141,7 @@ pub async fn prepare_pmix_on_nodes(
     job_id: u32,
     run_attempt: u32,
     nodes: Vec<PmixPrepareNode>,
+    deadline: Option<Duration>,
 ) -> Result<(), String> {
     if nodes.is_empty() {
         return Ok(());
@@ -125,7 +155,7 @@ pub async fn prepare_pmix_on_nodes(
         let node_name = node.node_name.clone();
         let pmix_plan = node.pmix_plan;
         prepare_set.spawn(async move {
-            prepare_pmix_on_agent(&agent_addr, job_id, run_attempt, pmix_plan)
+            prepare_pmix_on_agent(&agent_addr, job_id, run_attempt, pmix_plan, deadline)
                 .await
                 .map(|()| agent_addr)
                 .map_err(|e| format!("{node_name}: {e}"))
@@ -190,6 +220,55 @@ impl Drop for PmixPreparedReleaseGuard {
 mod tests {
     use super::*;
     use spur_core::node::NodeSource;
+
+    /// A listener that completes the TCP handshake and then never serves HTTP/2. Keepalive alone
+    /// needs ~20s to give up on it, so an elapsed bound below that pins the deadline as the cause.
+    async fn silent_agent() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                accepted.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_pmix_gives_up_on_a_silent_agent_once_the_deadline_passes() {
+        let agent = silent_agent().await;
+        let started = std::time::Instant::now();
+
+        let err = prepare_pmix_on_agent(
+            &agent,
+            1,
+            0,
+            spur_proto::proto::PmixLaunchPlan::default(),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect_err("a silent agent must not report a successful prepare");
+
+        assert!(err.contains("exceeded"), "unexpected error: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the prepare fan-out held the assignment loop well past its deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_pmix_gives_up_on_a_silent_agent() {
+        let agent = silent_agent().await;
+        let started = std::time::Instant::now();
+
+        release_pmix_on_agent(&agent, 1).await;
+
+        assert!(
+            started.elapsed() < RELEASE_RPC_TIMEOUT * 3,
+            "a best-effort rollback must never be what blocks the caller"
+        );
+    }
 
     #[test]
     fn multi_node_pmix_unsupported_on_k8s_agents() {
