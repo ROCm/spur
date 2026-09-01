@@ -15,7 +15,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use spur_core::config::{MemlockLimit, SwapLimit};
+use spur_core::config::{CgroupConfig, CgroupLimits, MemlockLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
@@ -162,8 +162,8 @@ pub struct JobLaunchConfig {
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
-    /// Swap budget for the job's cgroup.
-    pub swap_limit: SwapLimit,
+    /// cgroup-v2 enforcement settings from `[cgroup]`.
+    pub cgroup: CgroupConfig,
     /// I/O mode for the job.
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
@@ -505,7 +505,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
+    let cgroup_path = CgroupGuard(setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -663,7 +663,7 @@ async fn spawn_job_process(
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io).await?;
+        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, cgroup_path).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
@@ -758,7 +758,7 @@ async fn spawn_job_process(
     // Join pre-exec, not parent-side after spawn: under `unshare --fork` a
     // parent-side move races the fork and misses the workload's cgroup.
     let cgroup_procs = cgroup_path
-        .as_ref()
+        .path()
         .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
     // fd 2 is redirected to the job's stdio before pre_exec runs, so hand the
     // child a dup of spurd's stderr (CLOEXEC) to report a join failure.
@@ -873,8 +873,20 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Cgroup placement already happened pre-exec (join_cgroup_self); a move here
-    // would race the wrapper's fork.
+    // The child joined its own cgroup pre-exec; confirm it landed so `required`
+    // can refuse a job that would otherwise run outside every limit.
+    if cfg.cgroup.required {
+        if let (Some(cgroup), Some(pid)) = (cgroup_path.path(), child.id()) {
+            if !cgroup_has_pid(cgroup, pid) {
+                // Reaps as well as kills, so the guard finds the cgroup empty.
+                let _ = child.kill().await;
+                return Err(anyhow::anyhow!(
+                    "[cgroup] required but the job did not join its cgroup"
+                )
+                .into());
+            }
+        }
+    }
 
     debug!(
         job_id,
@@ -884,30 +896,82 @@ async fn spawn_job_process(
     );
 
     Ok(LaunchResult {
-        job: RunningJob::Managed { child, cgroup_path },
+        job: RunningJob::Managed {
+            child,
+            cgroup_path: cgroup_path.into_inner(),
+        },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
         pty_master,
     })
 }
 
+/// Render a job's cgroup-v2 control files as (filename, content) pairs. Pure so
+/// the layout is testable without a cgroupfs; values come from `limits_for`.
+fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = Vec::new();
+    if let Some(quota) = limits.cpu_quota_us {
+        files.push(("cpu.max", format!("{} {}", quota, limits.cpu_period_us)));
+    }
+    if let Some(bytes) = limits.memory_max_bytes {
+        files.push(("memory.max", bytes.to_string()));
+    }
+    if let Some(bytes) = limits.memory_high_bytes {
+        files.push(("memory.high", bytes.to_string()));
+    }
+    if let Some(bytes) = limits.swap_max_bytes {
+        files.push(("memory.swap.max", bytes.to_string()));
+    }
+    if limits.oom_kill_job {
+        files.push(("memory.oom.group", "1".to_string()));
+    }
+    files.push(("pids.max", limits.pids_max.to_string()));
+    if !limits.cpuset_cpus.is_empty() {
+        let cpuset = limits
+            .cpuset_cpus
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        files.push(("cpuset.cpus", cpuset));
+    }
+    files
+}
+
 /// Set up a cgroups v2 hierarchy for a job.
 fn setup_cgroup(
     job_id: JobId,
+    cgroup: &CgroupConfig,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
-    swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
+    let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
+        debug!(job_id, "cgroup enforcement disabled by config");
+        return Ok(None);
+    };
+
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
     // without this the per-job memory limit is never enforced. Root failure fatal.
+    // Steps below degrade to a warning by default; `required` turns the first
+    // degrade into a refusal so a node that cannot enforce stops pretending.
+    let mut degraded: Option<String> = None;
+    let mut degrade = |what: &str| {
+        if degraded.is_none() {
+            degraded = Some(what.to_string());
+        }
+    };
+
     if let Err(e) = std::fs::create_dir_all(&cgroup_root) {
         if nix::unistd::geteuid().is_root() {
             anyhow::bail!("cgroup root creation failed as root: {}", e);
+        }
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the cgroup root is unavailable: {e}");
         }
         warn!(job_id, error = %e, "cgroup creation failed (not root), running without isolation");
         return Ok(None);
@@ -916,11 +980,15 @@ fn setup_cgroup(
     for ctrl in ["+memory", "+cpu", "+pids", "+cpuset"] {
         if let Err(e) = std::fs::write(&subtree, ctrl) {
             warn!(job_id, controller = ctrl, error = %e, "failed to delegate cgroup controller");
+            degrade(&format!("controller {ctrl} not delegated"));
         }
     }
     if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
         if nix::unistd::geteuid().is_root() {
             anyhow::bail!("cgroup creation failed as root: {}", e);
+        }
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the job cgroup could not be created: {e}");
         }
         warn!(
             job_id,
@@ -930,54 +998,59 @@ fn setup_cgroup(
         return Ok(None);
     }
 
-    // Set CPU limit (cpu.max: quota period)
-    // e.g., 4 CPUs → "400000 100000" (400ms out of 100ms period)
-    let quota = cpus as u64 * 100_000;
-    let cpu_max = format!("{} 100000", quota);
-    if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), &cpu_max) {
-        warn!(job_id, error = %e, "failed to set cpu.max");
-    }
-
-    // Set memory limit
-    if memory_mb > 0 {
-        let memory_bytes = memory_mb * 1024 * 1024;
-        if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
-            warn!(job_id, error = %e, "failed to set memory.max");
-        }
-        // memory.max bounds resident memory only: with swap available the
-        // kernel pages the overflow out instead of OOM-killing. Opt-in, since
-        // capping swap starts killing jobs that used to survive.
-        if let Some(swap_bytes) = swap_limit.bytes_for(memory_bytes) {
-            if let Err(e) =
-                std::fs::write(cgroup_path.join("memory.swap.max"), swap_bytes.to_string())
-            {
-                warn!(job_id, error = %e, "failed to set memory.swap.max");
+    // Core ids come from a synthesized 0..n range, which can name cores this
+    // cgroup may not hold. Drop those rather than let the whole write fail.
+    if !limits.cpuset_cpus.is_empty() {
+        match std::fs::read_to_string(cgroup_root.join("cpuset.cpus.effective")) {
+            Ok(effective) => {
+                let permitted = permitted_cores(&limits.cpuset_cpus, effective.trim());
+                if permitted.len() != limits.cpuset_cpus.len() {
+                    warn!(
+                        job_id,
+                        allocated = ?limits.cpuset_cpus,
+                        permitted = ?permitted,
+                        effective = effective.trim(),
+                        "some allocated cores lie outside the cgroup's permitted set"
+                    );
+                }
+                limits.cpuset_cpus = permitted;
+            }
+            Err(e) => {
+                warn!(job_id, error = %e, "cannot read cpuset.cpus.effective; writing the allocated set unchecked");
             }
         }
     }
 
-    // OOM isolation: kill entire cgroup on OOM, not a random process
-    if let Err(e) = std::fs::write(cgroup_path.join("memory.oom.group"), "1") {
-        warn!(job_id, error = %e, "failed to set memory.oom.group");
+    for (name, content) in cgroup_limit_files(&limits) {
+        if let Err(e) = std::fs::write(cgroup_path.join(name), &content) {
+            warn!(job_id, file = name, error = %e, "failed to write cgroup control file");
+            degrade(&format!("{name} not applied"));
+        }
     }
 
-    // Fork bomb protection: limit total processes per job
-    let max_pids = (cpus as u64 * 256).max(1024);
-    if let Err(e) = std::fs::write(cgroup_path.join("pids.max"), max_pids.to_string()) {
-        warn!(job_id, error = %e, "failed to set pids.max");
+    // The cpuset is the only CPU bound once the quota is off, and a rejected write
+    // reads back empty — i.e. inherit everything. Verify rather than trust.
+    if cgroup.constrain_cores && !limits.cpuset_cpus.is_empty() {
+        let applied = std::fs::read_to_string(cgroup_path.join("cpuset.cpus")).unwrap_or_default();
+        let applied = parse_cpu_list(applied.trim());
+        if applied.is_empty() {
+            warn!(job_id, allocated = ?limits.cpuset_cpus, "cpuset not applied; job runs without a CPU bound");
+            degrade("cpuset not applied");
+        } else if applied != limits.cpuset_cpus.iter().copied().collect() {
+            warn!(job_id, expected = ?limits.cpuset_cpus, applied = ?applied, "cpuset differs from the allocated cores");
+            degrade("cpuset differs from the allocated cores");
+        }
+    } else if cgroup.constrain_cores {
+        // No cpuset is written at all in this case, so the job is free to run on
+        // every core on the node — the clamp above can empty a non-empty set.
+        warn!(job_id, "no cores to pin; job runs without a CPU bound");
+        degrade("no cores to pin");
     }
 
-    // Pin to specific CPU cores via cpuset
-    if !cpu_ids.is_empty() {
-        let cpuset_str: String = cpu_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        if let Err(e) = std::fs::write(cgroup_path.join("cpuset.cpus"), &cpuset_str) {
-            warn!(job_id, error = %e, "failed to set cpuset.cpus");
-        } else {
-            debug!(job_id, cpuset = %cpuset_str, "cpuset pinning configured");
+    if let Some(reason) = degraded {
+        if cgroup.required {
+            let _ = std::fs::remove_dir(&cgroup_path);
+            anyhow::bail!("[cgroup] required but enforcement is incomplete: {reason}");
         }
     }
 
@@ -990,6 +1063,41 @@ fn setup_cgroup(
     );
 
     Ok(Some(cgroup_path))
+}
+
+/// Parse a cgroup cpu list (`"0-3"`, `"0-1,4"`, `""`) into core ids.
+fn parse_cpu_list(spec: &str) -> std::collections::BTreeSet<u32> {
+    let mut ids = std::collections::BTreeSet::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                if let (Ok(lo), Ok(hi)) = (lo.parse::<u32>(), hi.parse::<u32>()) {
+                    ids.extend(lo..=hi);
+                }
+            }
+            None => {
+                if let Ok(id) = part.parse::<u32>() {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Cores from `requested` the parent cgroup permits. A child cpuset must be a
+/// subset: an id the parent lacks fails ERANGE and leaves the job unpinned.
+fn permitted_cores(requested: &[u32], parent_effective: &str) -> Vec<u32> {
+    let allowed = parse_cpu_list(parent_effective);
+    requested
+        .iter()
+        .copied()
+        .filter(|id| allowed.contains(id))
+        .collect()
 }
 
 /// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
@@ -1042,6 +1150,15 @@ fn dup_cloexec(fd: RawFd) -> RawFd {
     unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }
 }
 
+/// Whether `pid` is in the job's cgroup. The child joins itself pre-exec, so
+/// this verifies the join rather than performing it.
+fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
+    let Ok(procs) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) else {
+        return false;
+    };
+    procs.lines().any(|line| line.trim() == pid.to_string())
+}
+
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
 /// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
 pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
@@ -1052,6 +1169,29 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
         let mut it = line.split_whitespace();
         matches!((it.next(), it.next()), (Some("oom_kill"), Some(n)) if n != "0")
     })
+}
+
+/// Owns a job's cgroup between creation and the point the running job takes it
+/// over. Every error return in between would otherwise strand the directory.
+struct CgroupGuard(Option<PathBuf>);
+
+impl CgroupGuard {
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+
+    /// Hand the cgroup to the caller; dropping the guard no longer removes it.
+    fn into_inner(mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            cleanup_cgroup(&path);
+        }
+    }
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
@@ -1475,15 +1615,9 @@ async fn launch_container_job(
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
     job_io: JobIo,
+    cgroup_path: CgroupGuard,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(
-        job_id,
-        cfg.cpus,
-        cfg.memory_mb,
-        &cfg.cpu_ids,
-        cfg.swap_limit,
-    )?;
 
     // Sync pipe: child writes status, parent reads.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
@@ -1510,7 +1644,7 @@ async fn launch_container_job(
 
     // Precomputed before fork; the forked child joins the cgroup itself (below).
     let cgroup_procs = cgroup_path
-        .as_ref()
+        .path()
         .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
     // Dup spurd's stderr (CLOEXEC) so the child can report a join failure; its
     // own stderr is wired to the job before the join runs.
@@ -1625,9 +1759,6 @@ async fn launch_container_job(
 
             let child_pid = child.as_raw();
 
-            // Cgroup placement already happened in the child before exec; a
-            // parent-side write here would race the container's execve.
-
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();
             if pidfd.is_none() {
@@ -1644,6 +1775,21 @@ async fn launch_container_job(
                 bail!("container init failed for job {}: {}", job_id, msg);
             }
 
+            // Only now is the child's self-join guaranteed to have run. Verify
+            // rather than write (DC2): the container tree inherits this membership.
+            if cfg.cgroup.required {
+                let joined = cgroup_path
+                    .path()
+                    .is_none_or(|cgroup| cgroup_has_pid(cgroup, child_pid as u32));
+                if !joined {
+                    signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL).ok();
+                    // Reap before returning: the guard's rmdir races an exit
+                    // that has been signalled but not yet completed.
+                    let _ = nix::sys::wait::waitpid(child, None);
+                    anyhow::bail!("[cgroup] required but the container did not join its cgroup");
+                }
+            }
+
             info!(
                 job_id,
                 pid = child_pid,
@@ -1655,7 +1801,7 @@ async fn launch_container_job(
                 RunningJob::Forked {
                     pid: child_pid,
                     _pidfd: pidfd,
-                    cgroup_path,
+                    cgroup_path: cgroup_path.into_inner(),
                     reaped: false,
                 },
                 pty_master,
@@ -1774,6 +1920,155 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 
     wrapper.push_str("exit $SPUR_BB_EXIT\n");
     wrapper
+}
+
+#[cfg(test)]
+mod cpuset_tests {
+    use super::{parse_cpu_list, permitted_cores};
+
+    #[test]
+    fn parses_ranges_lists_and_empty() {
+        assert_eq!(parse_cpu_list("0-3"), [0, 1, 2, 3].into_iter().collect());
+        assert_eq!(parse_cpu_list("0,2,4"), [0, 2, 4].into_iter().collect());
+        assert_eq!(
+            parse_cpu_list("0-1,4-5"),
+            [0, 1, 4, 5].into_iter().collect()
+        );
+        assert!(parse_cpu_list("").is_empty());
+        assert!(parse_cpu_list("\n").is_empty());
+    }
+
+    #[test]
+    fn drops_cores_the_parent_cgroup_does_not_hold() {
+        // Core ids are synthesized from a count, so a sparse online mask can name
+        // cores that do not exist. Writing one fails ERANGE, leaving it unbounded.
+        assert_eq!(permitted_cores(&[0, 1, 99], "0-3"), vec![0, 1]);
+        assert_eq!(permitted_cores(&[64, 65], "0-63"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn keeps_the_full_set_when_the_parent_permits_it() {
+        assert_eq!(permitted_cores(&[0, 1, 2, 3], "0-3"), vec![0, 1, 2, 3]);
+        assert_eq!(permitted_cores(&[2, 3], "0-1,2-3"), vec![2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod cgroup_guard_tests {
+    use super::CgroupGuard;
+
+    #[test]
+    fn dropping_the_guard_removes_the_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_1");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        drop(CgroupGuard(Some(cgroup.clone())));
+        assert!(
+            !cgroup.exists(),
+            "a failed launch must not strand its cgroup"
+        );
+    }
+
+    #[test]
+    fn releasing_the_guard_keeps_the_cgroup() {
+        // The running job owns the cgroup once a launch succeeds; removing it
+        // here would unbound the job it was created for.
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_2");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let released = CgroupGuard(Some(cgroup.clone())).into_inner();
+        assert_eq!(released.as_deref(), Some(cgroup.as_path()));
+        assert!(cgroup.exists());
+    }
+
+    #[test]
+    fn a_disabled_cgroup_is_a_no_op() {
+        drop(CgroupGuard(None));
+    }
+}
+
+#[cfg(test)]
+mod cgroup_files_tests {
+    use super::cgroup_limit_files;
+    use spur_core::config::CgroupConfig;
+
+    fn files_for(
+        cfg: &CgroupConfig,
+        cpus: u32,
+        memory_mb: u64,
+        cpu_ids: &[u32],
+    ) -> Vec<(&'static str, String)> {
+        cgroup_limit_files(&cfg.limits_for(cpus, memory_mb, cpu_ids).expect("enabled"))
+    }
+
+    #[test]
+    fn writes_defaults_without_a_cfs_quota() {
+        let files = files_for(&CgroupConfig::default(), 4, 2048, &[0, 1, 2, 3]);
+        let get = |k: &str| files.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        let expect_mem = (2048u64 * 1024 * 1024).to_string();
+        assert_eq!(get("cpu.max"), None);
+        assert_eq!(get("memory.max"), Some(expect_mem.as_str()));
+        // AllowedRAMSpace=100 collapses the soft limit onto the hard one.
+        assert_eq!(get("memory.high"), Some(expect_mem.as_str()));
+        // Swap is unconstrained by default, as in Slurm.
+        assert_eq!(get("memory.swap.max"), None);
+        assert_eq!(get("memory.oom.group"), Some("1"));
+        assert_eq!(get("pids.max"), Some("1024")); // max(4*256, 1024)
+        assert_eq!(get("cpuset.cpus"), Some("0,1,2,3"));
+    }
+
+    #[test]
+    fn cpu_quota_knob_emits_cpu_max() {
+        let cfg = CgroupConfig {
+            cpu_quota: true,
+            ..CgroupConfig::default()
+        };
+        let files = files_for(&cfg, 4, 0, &[]);
+        assert_eq!(
+            files
+                .iter()
+                .find(|(n, _)| *n == "cpu.max")
+                .map(|(_, v)| v.as_str()),
+            Some("400000 100000")
+        );
+    }
+
+    #[test]
+    fn headroom_emits_a_lower_memory_high_than_memory_max() {
+        let cfg = CgroupConfig {
+            allowed_ram_percent: 150,
+            ..CgroupConfig::default()
+        };
+        let files = files_for(&cfg, 1, 1024, &[]);
+        let get = |k: &str| files.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        let high = (1024u64 * 1024 * 1024).to_string();
+        let max = (1536u64 * 1024 * 1024).to_string();
+        assert_eq!(get("memory.high"), Some(high.as_str()));
+        assert_eq!(get("memory.max"), Some(max.as_str()));
+    }
+
+    #[test]
+    fn omits_memory_and_swap_for_an_unbounded_job() {
+        let files = files_for(&CgroupConfig::default(), 1, 0, &[]);
+        let has = |k: &str| files.iter().any(|(n, _)| *n == k);
+        assert!(!has("memory.max"));
+        assert!(!has("memory.high"));
+        assert!(!has("memory.swap.max"));
+        assert!(!has("cpuset.cpus"));
+        assert!(has("pids.max"));
+    }
+
+    #[test]
+    fn oom_kill_job_can_be_turned_off() {
+        let cfg = CgroupConfig {
+            oom_kill_job: false,
+            ..CgroupConfig::default()
+        };
+        let files = files_for(&cfg, 1, 1024, &[]);
+        assert!(!files.iter().any(|(n, _)| *n == "memory.oom.group"));
+    }
 }
 
 #[cfg(test)]
@@ -2248,7 +2543,7 @@ mod tests {
             nodelist: String::new(),
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
-            swap_limit: SwapLimit::Unconstrained,
+            cgroup: CgroupConfig::default(),
             io_mode: LaunchIo::File,
             pmix_multi_task: false,
         }

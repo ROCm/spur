@@ -20,7 +20,7 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
-use spur_core::config::{HooksConfig, MpiConfig};
+use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
@@ -114,6 +114,33 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
             warn!(job_id, error = %e, "PMIx batch ref release failed");
         }
     }
+}
+
+/// Enforced per-node budget: the controller's allocation wins, the spec is the
+/// fallback (every task on this node, and `--mem-per-cpu` when `--mem` is unset).
+fn resolve_cgroup_budget(
+    alloc: Option<&ResourceAllocations>,
+    spec: &JobSpec,
+    tasks_per_node: u32,
+) -> (u32, u64) {
+    let (alloc_cpus, alloc_mem_mb) = alloc.map(|a| (a.cpus, a.memory_mb)).unwrap_or((0, 0));
+    // Saturating: the spec is caller-supplied, and a wrapped product would set
+    // limits from a budget bearing no relation to what the job asked for.
+    let cpus = if alloc_cpus > 0 {
+        alloc_cpus
+    } else {
+        tasks_per_node
+            .max(1)
+            .saturating_mul(spec.cpus_per_task.max(1))
+    };
+    let memory_mb = if alloc_mem_mb > 0 {
+        alloc_mem_mb
+    } else if spec.memory_per_node_mb > 0 {
+        spec.memory_per_node_mb
+    } else {
+        spec.memory_per_cpu_mb.saturating_mul(cpus as u64)
+    };
+    (cpus, memory_mb)
 }
 
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
@@ -213,6 +240,67 @@ fn signal_step_process_group(pid: u32, signal: i32) {
     }
 }
 
+#[cfg(test)]
+mod budget_tests {
+    use super::resolve_cgroup_budget;
+    // Explicit path: `spur_core::resource::ResourceAllocations` is a different
+    // type with the same name, and the module glob-imports the proto one.
+    use spur_proto::proto::{JobSpec, ResourceAllocations};
+
+    fn spec(cpus_per_task: u32, mem_node: u64, mem_per_cpu: u64) -> JobSpec {
+        JobSpec {
+            cpus_per_task,
+            memory_per_node_mb: mem_node,
+            memory_per_cpu_mb: mem_per_cpu,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn allocation_wins_when_present() {
+        // Spec asks 2 cpus / 1024 MB per task; the node allocation grants 8/32G.
+        let alloc = ResourceAllocations {
+            cpus: 8,
+            memory_mb: 32_768,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_cgroup_budget(Some(&alloc), &spec(2, 1024, 0), 4),
+            (8, 32_768)
+        );
+    }
+
+    #[test]
+    fn spec_fallback_counts_every_task_on_the_node() {
+        // The G1 undercount: 4 tasks x 2 cpus is 8 cores, not 2.
+        assert_eq!(resolve_cgroup_budget(None, &spec(2, 1024, 0), 4), (8, 1024));
+    }
+
+    #[test]
+    fn spec_fallback_honors_mem_per_cpu() {
+        // --mem-per-cpu=512 with 8 cores on this node.
+        assert_eq!(resolve_cgroup_budget(None, &spec(2, 0, 512), 4), (8, 4096));
+    }
+
+    #[test]
+    fn an_absurd_spec_saturates_instead_of_wrapping() {
+        // A spec reaches the agent unvalidated, and a wrapped product would
+        // hand limits_for a budget unrelated to the request.
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec(100_000, 0, 0), 100_000);
+        assert_eq!(cpus, u32::MAX);
+        assert_eq!(memory_mb, 0, "no memory request stays unbounded");
+
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec(u32::MAX, 0, u64::MAX), 2);
+        assert_eq!(cpus, u32::MAX);
+        assert_eq!(memory_mb, u64::MAX);
+    }
+
+    #[test]
+    fn floors_cpus_at_one() {
+        assert_eq!(resolve_cgroup_budget(None, &spec(0, 0, 0), 0), (1, 0));
+    }
+}
+
 async fn step_cancel_requested(
     steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     key: (u32, u32),
@@ -234,6 +322,7 @@ pub struct AgentService {
     mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
     limits: spur_core::config::JobLimits,
+    cgroup: CgroupConfig,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
@@ -262,10 +351,8 @@ impl AgentService {
             hooks,
             device_registry,
             &spur_core::config::ClusterConfig::default(),
-            spur_core::config::JobLimits {
-                memlock,
-                ..Default::default()
-            },
+            spur_core::config::JobLimits { memlock },
+            CgroupConfig::default(),
             MpiConfig::default(),
             new_running_jobs(),
             spur_core::config::AuthConfig::default().allow_root_jobs,
@@ -284,6 +371,7 @@ impl AgentService {
         device_registry: Arc<Mutex<DeviceRegistry>>,
         cluster: &spur_core::config::ClusterConfig,
         limits: spur_core::config::JobLimits,
+        cgroup: CgroupConfig,
         mpi: MpiConfig,
         running: RunningJobs,
         allow_root_jobs: bool,
@@ -347,6 +435,7 @@ impl AgentService {
             mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
             limits,
+            cgroup,
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
@@ -1156,7 +1245,7 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPURD_NODENAME", &hostname);
         senv.set_with_slurm_twin(
             "SPUR_CPUS_ON_NODE",
-            tasks_per_node * spec.cpus_per_task.max(1),
+            tasks_per_node.saturating_mul(spec.cpus_per_task.max(1)),
         );
 
         if array_job_id != 0 {
@@ -1366,8 +1455,11 @@ impl SlurmAgent for AgentService {
                 launch_script
             };
 
+        let (cpus, memory_mb) =
+            resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
+
         let (alloc_result, allocated_device_ids) = self
-            .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
+            .allocate_local_resources(job_id, &spec, req.allocated.as_ref(), cpus, memory_mb)
             .await?;
 
         // Release the reservation on any exit before commit, including a
@@ -1405,8 +1497,8 @@ impl SlurmAgent for AgentService {
                 nodelist: spec.nodelist.clone(),
                 script_context: "prolog_slurmd".into(),
                 gpu_devices: allocated_device_ids.clone(),
-                cpus: spec.cpus_per_task.max(1),
-                memory_mb: spec.memory_per_node_mb,
+                cpus,
+                memory_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
                 // No completion report and no self-drain: the controller owns
@@ -1473,8 +1565,8 @@ impl SlurmAgent for AgentService {
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
             stdin_path: spec.stdin_path.clone(),
-            cpus: spec.cpus_per_task.max(1),
-            memory_mb: spec.memory_per_node_mb,
+            cpus,
+            memory_mb,
             gpu_devices: allocated_device_ids,
             cpu_ids,
             open_mode: if spec.open_mode.is_empty() {
@@ -1490,7 +1582,7 @@ impl SlurmAgent for AgentService {
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
             memlock: self.limits.memlock,
-            swap_limit: self.limits.swap,
+            cgroup: self.cgroup.clone(),
             io_mode: if spec.pty {
                 executor::LaunchIo::Pty
             } else {
@@ -2666,12 +2758,15 @@ impl AgentService {
         }
     }
 
-    /// Record controller-allocated GPUs and allocate local CPU/memory resources.
+    /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
+    /// `cpus`/`memory_mb` are the resolved grant, so the core IDs match it.
     async fn allocate_local_resources(
         &self,
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
+        cpus: u32,
+        memory_mb: u64,
     ) -> Result<(AllocationResult, Vec<u32>), Status> {
         let controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
@@ -2695,17 +2790,7 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        let cpus = if spec.cpus_per_task > 0 {
-            spec.cpus_per_task
-        } else {
-            0
-        };
-        let result = match alloc.allocate_for_job(
-            job_id,
-            cpus,
-            spec.memory_per_node_mb,
-            &controller_gpu_ids,
-        ) {
+        let result = match alloc.allocate_for_job(job_id, cpus, memory_mb, &controller_gpu_ids) {
             Ok(result) => result,
             Err(AllocError::GpusUnavailable) => {
                 // A conflicting owner absent from the live set is stale (the
@@ -2726,12 +2811,7 @@ impl AgentService {
                         alloc.release_job(*owner);
                     }
                 }
-                match alloc.allocate_for_job(
-                    job_id,
-                    cpus,
-                    spec.memory_per_node_mb,
-                    &controller_gpu_ids,
-                ) {
+                match alloc.allocate_for_job(job_id, cpus, memory_mb, &controller_gpu_ids) {
                     Ok(result) => result,
                     Err(_) => {
                         warn!(
@@ -2765,6 +2845,20 @@ impl AgentService {
 
         let gpu_ids = controller_gpu_ids;
         Ok((result, gpu_ids))
+    }
+
+    /// Resolve the per-node budget the way `launch_job` does, then reserve, so
+    /// GPU-path tests exercise the real resolution instead of fixed numbers.
+    #[cfg(test)]
+    async fn allocate_local_for_test(
+        &self,
+        job_id: u32,
+        spec: &JobSpec,
+        allocated: Option<&ResourceAllocations>,
+    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+        let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
+        self.allocate_local_resources(job_id, spec, allocated, cpus, memory_mb)
+            .await
     }
 
     fn parse_gpu_gres(gres: &[String]) -> (u32, Option<String>) {
@@ -4387,6 +4481,63 @@ mod tests {
         assert!(!status.success());
     }
 
+    // G1: the enforced budget — and therefore the cpuset — must cover every task
+    // the controller placed here, not just one task's `--cpus-per-task`.
+    #[tokio::test]
+    async fn cpuset_covers_every_task_on_the_node() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // 2 tasks x 2 cpus each, on the 4-cpu test node.
+        let spec = JobSpec {
+            cpus_per_task: 2,
+            tasks_per_node: 2,
+            ..Default::default()
+        };
+        let (cpus, memory_mb) = resolve_cgroup_budget(None, &spec, 2);
+        assert_eq!(cpus, 4, "budget must count both tasks");
+
+        let (result, _) = svc
+            .allocate_local_resources(7, &spec, None, cpus, memory_mb)
+            .await
+            .expect("allocation succeeds");
+        assert_eq!(result.cpu_ids, vec![0, 1, 2, 3]);
+    }
+
+    // The allocation is authoritative even when it disagrees with the spec.
+    #[tokio::test]
+    async fn cpuset_follows_the_controller_allocation_over_the_spec() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let allocated = ResourceAllocations {
+            cpus: 3,
+            memory_mb: 2048,
+            ..Default::default()
+        };
+        let (cpus, memory_mb) = resolve_cgroup_budget(Some(&allocated), &spec, 1);
+        assert_eq!((cpus, memory_mb), (3, 2048));
+
+        let (result, _) = svc
+            .allocate_local_resources(7, &spec, Some(&allocated), cpus, memory_mb)
+            .await
+            .expect("allocation succeeds");
+        assert_eq!(result.cpu_ids, vec![0, 1, 2]);
+        assert_eq!(result.memory_mb, 2048);
+    }
+
     fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
         use spur_core::resource::{GpuLinkType, GpuResource};
         let gpus = device_ids
@@ -4865,7 +5016,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
         assert!(
             res.is_ok(),
@@ -4914,7 +5065,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -4959,7 +5110,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -5015,7 +5166,7 @@ mod tests {
             ..Default::default()
         };
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
         assert!(
             res.is_ok(),
@@ -5050,7 +5201,7 @@ mod tests {
             ..Default::default()
         };
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
         let err = res.expect_err("must reject: GPU 1's owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -5140,6 +5291,7 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             &spur_core::config::ClusterConfig::default(),
             spur_core::config::JobLimits::default(),
+            CgroupConfig::default(),
             MpiConfig::default(),
             running,
             false, // allow_root_jobs

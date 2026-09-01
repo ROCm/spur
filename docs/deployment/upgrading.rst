@@ -249,6 +249,74 @@ Follow this order for any cluster upgrade:
    32-bit and its accounting queries fail against a migrated database. Take a database
    backup before upgrading if you need a recovery path.
 
+Behavior Changes Between Releases
+---------------------------------
+
+Some releases change how an existing ``spur.conf`` behaves without that file being
+edited. Review these before rolling binaries out.
+
+.. _cgroup-upgrade-notes:
+
+Job resource enforcement (``[cgroup]``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing the ``[cgroup]`` section changed what ``spurd`` writes for
+a config that has **no** ``[cgroup]`` section. The first two can affect jobs that
+ran fine before the upgrade; the rest relax an existing bound.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Control file
+     - Before
+     - After
+     - Effect
+   * - ``memory.max``
+     - unset for ``--mem-per-cpu`` jobs
+     - the memory the scheduler allocated
+     - **A ``--mem-per-cpu`` job that ran unbounded is now capped, and is
+       OOM-killed if it overruns.** Only the per-node request was read before,
+       which those jobs do not set.
+   * - ``memory.high``
+     - unset
+     - equal to ``memory.max``
+     - **Memory-heavy jobs stall in reclaim before the OOM kill**, costing
+       throughput.
+   * - ``cpu.max``
+     - CFS quota sized from ``--cpus-per-task``
+     - unset
+     - Relaxed: the cpuset is the CPU bound, as in Slurm.
+   * - ``cpuset.cpus``
+     - sized from ``--cpus-per-task``
+     - sized from the node allocation
+     - Relaxed: a multi-task job gets all the cores it was granted, not one
+       task's worth.
+
+To keep the previous behavior, put this in ``spur.conf`` on every compute node
+**before** restarting ``spurd``:
+
+.. code-block:: toml
+
+   [cgroup]
+   cpu_quota = true  # restore the CFS quota
+
+``spurd`` reads ``[cgroup]`` only at startup, so this has to be in place before the
+restart — ``scontrol reconfigure`` will not apply it afterwards.
+
+.. note::
+
+   Neither memory change has a knob of its own: ``memory.max`` and ``memory.high``
+   are both written whenever ``constrain_ram_space`` is on, matching Slurm's
+   ``cgroup/v2`` plugin. Setting ``constrain_ram_space = false`` restores the old
+   behaviour but drops the memory ceiling for *every* job, not just the
+   ``--mem-per-cpu`` ones. Prefer raising ``allowed_ram_percent`` (for example
+   ``125``), which gives jobs headroom above their allocation and starts reclaim
+   there, over turning memory constraints off.
+
+Rolling back is safe with the section left in place: older binaries do not know
+``[cgroup]`` and ignore it.
+
 See Also
 --------
 
