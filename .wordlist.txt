@@ -73,6 +73,7 @@ salloc
 sattach
 sbatch
 scancel
+schedulable
 scontrol
 scrontab
 sdiag
