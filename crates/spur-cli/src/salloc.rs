@@ -98,6 +98,10 @@ pub struct SallocArgs {
     #[arg(long)]
     pub exclusive: bool,
 
+    /// Exit if resources are not available within this many seconds
+    #[arg(short = 'I', long, num_args = 0..=1, default_missing_value = "1")]
+    pub immediate: Option<u64>,
+
     /// Controller address
     #[arg(
         long,
@@ -165,32 +169,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     });
 
-    // Wait for the job to start running (with timeout and progress)
     let job_info;
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(300);
+    let wait_started = std::time::Instant::now();
     let mut last_reason = String::new();
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        if start.elapsed() > timeout {
-            eprintln!(
-                "salloc: timed out waiting for job {} to start (last reason: {})",
-                job_id, last_reason
-            );
-            let cancel_user =
-                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
-                    .await;
-            let _ = client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: cancel_user,
-                })
-                .await;
-            std::process::exit(1);
-        }
-
         match client.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
@@ -218,6 +200,26 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 eprintln!("salloc: warning: {}", e.message());
             }
         }
+
+        if immediate_wait_expired(args.immediate, wait_started.elapsed()) {
+            eprintln!(
+                "salloc: job {} has not started within the requested time (last reason: {})",
+                job_id, last_reason
+            );
+            let cancel_user =
+                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
+                    .await;
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 0,
+                    user: cancel_user,
+                })
+                .await;
+            std::process::exit(1);
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 
     let nodelist = &job_info.nodelist;
@@ -429,6 +431,10 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
     }
 }
 
+fn immediate_wait_expired(immediate: Option<u64>, elapsed: std::time::Duration) -> bool {
+    immediate.is_some_and(|seconds| elapsed >= std::time::Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +470,54 @@ mod tests {
 
         let long = SallocArgs::try_parse_from(["salloc", "--qos=normal"]).expect("parse long qos");
         assert_eq!(long.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn parses_immediate_with_slurm_compatible_defaults() {
+        assert_eq!(
+            SallocArgs::try_parse_from(["salloc"])
+                .expect("parse without immediate")
+                .immediate,
+            None
+        );
+        assert_eq!(
+            SallocArgs::try_parse_from(["salloc", "--immediate"])
+                .expect("parse bare immediate")
+                .immediate,
+            Some(1)
+        );
+        assert_eq!(
+            SallocArgs::try_parse_from(["salloc", "--immediate=30"])
+                .expect("parse long immediate")
+                .immediate,
+            Some(30)
+        );
+        assert_eq!(
+            SallocArgs::try_parse_from(["salloc", "-I15"])
+                .expect("parse short immediate")
+                .immediate,
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn pending_allocation_has_no_default_deadline() {
+        assert!(!immediate_wait_expired(
+            None,
+            std::time::Duration::from_secs(301)
+        ));
+    }
+
+    #[test]
+    fn immediate_allocation_expires_at_requested_deadline() {
+        assert!(!immediate_wait_expired(
+            Some(30),
+            std::time::Duration::from_secs(29)
+        ));
+        assert!(immediate_wait_expired(
+            Some(30),
+            std::time::Duration::from_secs(30)
+        ));
     }
 
     #[test]

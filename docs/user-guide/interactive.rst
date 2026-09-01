@@ -99,12 +99,12 @@ Examples:
 Interactive Allocation — ``salloc``
 ------------------------------------
 
-``spur alloc`` (Slurm ``salloc``) requests an interactive allocation, waits for
-it to start (up to 300 seconds), then spawns your ``$SHELL`` with the allocation
-environment exported (``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_NODELIST``,
-``SPUR_NNODES``, ``SPUR_NTASKS``, ``SPUR_CPUS_PER_TASK``, the
-partition/account/QOS variables, and their ``SLURM_*`` twins). When you exit the
-shell, the allocation is released. Ctrl-C cancels it.
+``spur alloc`` (Slurm ``salloc``) requests an interactive allocation and waits
+until it starts, then spawns your ``$SHELL`` with the allocation environment
+exported (``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_NODELIST``, ``SPUR_NNODES``,
+``SPUR_NTASKS``, ``SPUR_CPUS_PER_TASK``, the partition/account/QOS variables, and
+their ``SLURM_*`` twins). Pending reason changes are displayed while waiting.
+When you exit the shell, the allocation is released. Ctrl-C cancels it.
 
 When authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN`` (or
 ``~/.spur/token``) into the allocation shell so step commands can authenticate
@@ -118,7 +118,9 @@ Common options: ``--nodes``/``-N`` (default ``1``), ``--ntasks``/``-n`` (default
 ``1``), ``--cpus-per-task``/``-c`` (default ``1``), ``--mem``, ``--time``/``-t``
 (default ``1:00:00``), ``--gres``, ``--gpus``/``-G``, ``--partition``/``-p``,
 ``--constraint``/``-C``, ``--nodelist``/``-w``, ``--exclude``/``-x``,
-``--reservation``, and ``--exclusive``.
+``--reservation``, ``--exclusive``, and ``--immediate[=seconds]``/``-I[seconds]``.
+Use ``--immediate`` to cancel if the allocation does not start within one second,
+or provide a number of seconds for a longer bounded wait.
 
 Examples:
 
