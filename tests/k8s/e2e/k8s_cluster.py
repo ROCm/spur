@@ -28,7 +28,11 @@ _DEFAULT_IMAGE = "ghcr.io/rocm/spur:ci"
 SPUR_JOB_GROUP = "spur.amd.com"
 SPUR_JOB_VERSION = "v1alpha1"
 SPUR_JOB_PLURAL = "spurjobs"
-DEFAULT_TIMEOUT = 60
+# Shared self-hosted runners get loaded enough that both cluster bring-up (cold
+# image pulls, pod scheduling) and job scheduling legitimately need minutes: 60s
+# failed on a SHA that had passed 75 minutes earlier. A wrong terminal state
+# still fails immediately, so the ceiling only costs a real hang.
+DEFAULT_TIMEOUT = 180
 WAIT_INTERVAL = 2
 HA_TIMEOUT = 90
 CLUSTER_SCOPED_KINDS = frozenset({"ClusterRole", "ClusterRoleBinding"})
@@ -401,7 +405,7 @@ class ClusterFixture:
         self._apply_yaml_docs(_MANIFESTS_DIR / "operator.yaml", None)
         logger.info("operator Deployment applied (image=%s)", self.config.image)
 
-    def wait_ready(self, timeout: int = 120) -> None:
+    def wait_ready(self, timeout: int = DEFAULT_TIMEOUT) -> None:
         wait_until(
             lambda: self._operator_available(),
             timeout,
@@ -496,7 +500,7 @@ class ClusterFixture:
             "spur.amd.com/job-name", timeout=30, raise_on_timeout=False
         )
 
-    def ensure_controllers_ready(self, timeout: int = 90) -> None:
+    def ensure_controllers_ready(self, timeout: int = DEFAULT_TIMEOUT) -> None:
         expected = self.config.replicas
         wait_until(
             lambda: self._ready_controller_count() >= expected,
@@ -600,22 +604,54 @@ def wait_spurjob_state(
     ns = namespace or fixture.namespace
     terminal = {"Completed", "Failed", "Cancelled", "Timeout", "NodeFail"}
     result: dict = {}
+    last_state = ""
 
     def check() -> bool:
-        nonlocal result
+        nonlocal result, last_state
         job = fixture.get_spurjob(name, namespace=ns)
-        state = (job.get("status") or {}).get("state", "")
-        if state == target:
+        last_state = (job.get("status") or {}).get("state", "")
+        if last_state == target:
             result = job
             return True
-        if state in terminal and state != target:
+        if last_state in terminal:
             raise RuntimeError(
-                f"SpurJob {name} reached terminal state '{state}', wanted '{target}'"
+                f"SpurJob {name} reached terminal state '{last_state}', wanted '{target}'"
             )
         return False
 
-    wait_until(check, timeout, f"SpurJob {name} did not reach state '{target}'")
+    try:
+        wait_until(check, timeout, f"SpurJob {name} did not reach state '{target}'")
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"{exc}; last state {last_state or '<unset>'}; "
+            f"{spurjob_diagnostics(fixture, name, namespace=ns)}"
+        ) from exc
     return result
+
+
+def spurjob_diagnostics(
+    fixture: ClusterFixture,
+    name: str,
+    namespace: str | None = None,
+    limit: int = 6,
+) -> str:
+    """Pod phases and recent events for a SpurJob, to describe a stuck wait."""
+    ns = namespace or fixture.namespace
+    try:
+        pods = fixture.core_v1.list_namespaced_pod(
+            ns, label_selector=f"spur.amd.com/job-name={name}"
+        ).items
+        subjects = {p.metadata.name for p in pods} | {name}
+        events = [
+            f"{e.involved_object.name}: {e.reason}: {e.message}"
+            for e in fixture.core_v1.list_namespaced_event(ns).items
+            if getattr(e.involved_object, "name", None) in subjects
+        ]
+        phases = [f"{p.metadata.name}={p.status.phase}" for p in pods]
+        parts = phases + events[-limit:]
+        return "; ".join(parts) if parts else "no pods or events found"
+    except Exception as exc:  # never let diagnostics mask the original failure
+        return f"diagnostics unavailable: {exc}"
 
 
 def read_spurjob_pod_logs(
