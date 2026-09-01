@@ -1575,6 +1575,17 @@ impl SlurmConfig {
                 });
             }
         }
+        // Zero is "already overdue" to hyper, so it would tear down every channel that goes quiet
+        // — the opposite of the liveness keepalive exists to provide.
+        if self.controller.agent_keepalive_interval_secs > 0
+            && self.controller.agent_keepalive_timeout_secs == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.agent_keepalive_timeout_secs".into(),
+                value: "0 (must be greater than 0 unless agent_keepalive_interval_secs is 0)"
+                    .into(),
+            });
+        }
         // A timed-out node is cooled down for this span, so it feeds the same map and needs the
         // same ceiling.
         if self.controller.dispatch_timeout_secs > MAX_LAUNCH_BACKOFF_SECS {
@@ -2980,6 +2991,51 @@ terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
             MAX_TERMINAL_JOB_RETENTION_SECS,
             "the bound itself must be accepted"
         );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_agent_channel_timeouts() {
+        for field in [
+            "agent_connect_timeout_secs",
+            "agent_keepalive_interval_secs",
+            "agent_keepalive_timeout_secs",
+        ] {
+            let toml = format!(
+                "cluster_name = \"test\"\n\n[controller]\n{field} = {}\n",
+                MAX_AGENT_CHANNEL_TIMEOUT_SECS + 1
+            );
+            let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "{field} past the ceiling must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_config_rejects_a_zero_keepalive_timeout_while_keepalive_is_on() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+agent_keepalive_interval_secs = 10
+agent_keepalive_timeout_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("agent_keepalive_timeout_secs"),
+            "a zero ping timeout marks every ping overdue; it must be rejected: {err}"
+        );
+
+        // Harmless once keepalive itself is off.
+        let ok = r#"
+cluster_name = "test"
+
+[controller]
+agent_keepalive_interval_secs = 0
+agent_keepalive_timeout_secs = 0
+"#;
+        assert!(SlurmConfig::load_from_str(ok).is_ok());
     }
 
     #[test]

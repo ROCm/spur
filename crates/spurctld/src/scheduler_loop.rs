@@ -343,18 +343,12 @@ async fn process_assignment(
         )
         .await
         {
-            AllocationRegisterOutcome::AllFailed => {
-                if let Err(e) = cluster.requeue_job(job_id) {
-                    error!(job_id, error = %e, "failed to requeue after registration failure");
-                }
-                return false;
-            }
-            AllocationRegisterOutcome::PartialFailed => {
-                // Same reasoning as the dispatch abort: a node that timed out may have registered
-                // anyway, and it is the one node cancelling only the successes would miss.
+            // Both arms tear down identically: with a deadline in play, even "all failed" can mean
+            // every node registered and answered too late, so none of them may be left holding one.
+            AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
                 cancel_job_on_nodes(&cluster, job_id, &all_nodes, 9).await;
                 if let Err(e) = cluster.requeue_job(job_id) {
-                    error!(job_id, error = %e, "failed to requeue after partial registration");
+                    error!(job_id, error = %e, "failed to requeue after registration failure");
                 }
                 return false;
             }
@@ -1386,15 +1380,21 @@ async fn register_allocation_on_nodes(
             allocated,
             work_dir: spec.work_dir.clone(),
         };
+        let cooldown_cluster = cluster.clone();
         set.spawn(async move {
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
                     Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "allocation register RPC exceeded {}s",
-                        limit.as_secs()
-                    )),
+                    Err(_) => {
+                        // Same reasoning as the launch fan-out: without this the node is re-picked
+                        // next tick and burns another full deadline.
+                        cooldown_cluster.cool_down_node_for(&result_node, limit);
+                        Err(anyhow::anyhow!(
+                            "allocation register RPC exceeded {}s",
+                            limit.as_secs()
+                        ))
+                    }
                 },
                 None => register.await,
             };
@@ -4380,7 +4380,9 @@ mod tests {
             let mut config = test_config();
             // Disabling the short cooldown makes the two paths distinguishable: only
             // cool_down_node_for can put a node in the map now.
-            config.controller.dispatch_reject_cooldown_secs = 0;
+            // Non-zero so the assertion is two-sided: the node must land on the SHORT cooldown,
+            // not merely stay off the long one (which "cools nothing at all" would also satisfy).
+            config.controller.dispatch_reject_cooldown_secs = 30;
             config.controller.dispatch_timeout_secs = 300;
             let cm = test_cluster_with_config(&dir, config).await;
 
@@ -4412,8 +4414,13 @@ mod tests {
 
             assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed));
             assert!(
-                !cm.nodes_on_dispatch_cooldown().contains("n-dead"),
-                "a connect failure must use the reject cooldown, not the dispatch deadline"
+                cm.nodes_on_dispatch_cooldown().contains("n-dead"),
+                "a connect failure must still cool the node down"
+            );
+            assert!(
+                cm.dispatch_cooldown_remaining("n-dead")
+                    .is_some_and(|left| left <= Duration::from_secs(30)),
+                "it must use the 30s reject cooldown, not the 300s dispatch deadline"
             );
         }
 

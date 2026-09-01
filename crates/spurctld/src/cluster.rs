@@ -571,6 +571,17 @@ impl ClusterManager {
             .insert(name.to_string(), until);
     }
 
+    /// How long a node's dispatch cooldown still has to run, for tests that need to tell the
+    /// reject cooldown apart from the longer dispatch-deadline one.
+    #[cfg(test)]
+    pub fn dispatch_cooldown_remaining(&self, name: &str) -> Option<std::time::Duration> {
+        let now = std::time::Instant::now();
+        self.node_dispatch_cooldowns
+            .read()
+            .get(name)
+            .map(|&until| until.saturating_duration_since(now))
+    }
+
     /// Names still within their dispatch cooldown, pruning any that have expired.
     pub fn nodes_on_dispatch_cooldown(&self) -> HashSet<String> {
         let now = std::time::Instant::now();

@@ -155,9 +155,14 @@ pub async fn connect(
     }
     // Zero interval leaves keepalive off entirely; the timeout alone would have nothing to time.
     if tuning.keepalive_interval_secs > 0 {
-        builder = builder
-            .http2_keep_alive_interval(Duration::from_secs(tuning.keepalive_interval_secs))
-            .keep_alive_timeout(Duration::from_secs(tuning.keepalive_timeout_secs));
+        builder =
+            builder.http2_keep_alive_interval(Duration::from_secs(tuning.keepalive_interval_secs));
+        // A zero ping timeout is already overdue the moment it is set, which would kill every
+        // channel that goes quiet. Validation rejects it; skip it here so a stale value cannot.
+        if tuning.keepalive_timeout_secs > 0 {
+            builder =
+                builder.keep_alive_timeout(Duration::from_secs(tuning.keepalive_timeout_secs));
+        }
     }
     let channel = builder.connect().await?;
     Ok(SlurmAgentClient::new(InterceptedService::new(

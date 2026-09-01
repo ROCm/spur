@@ -256,15 +256,15 @@ and Raft high-availability topology.
      - integer
      - ``5``
      - Live
-     - Budget for establishing a controller-to-agent connection. ``0`` falls
-       back to the operating system's TCP timeout, which is typically around
-       two minutes and is not configurable from here.
+     - Budget for establishing a controller-to-agent connection. Range 0-600.
+       ``0`` falls back to the operating system's TCP timeout, which is
+       typically around two minutes and is not configurable from here.
    * - ``agent_keepalive_interval_secs``
      - integer
      - ``10``
      - Live
-     - HTTP/2 ping interval on an open agent connection. ``0`` disables
-       keepalive entirely. Pings are sent while a request is in flight, so
+     - HTTP/2 ping interval on an open agent connection. Range 0-600. ``0``
+       disables keepalive entirely. Pings are sent while a request is in flight, so
        this is what detects a node that accepted the connection and then went
        silent — total detection time is roughly this plus
        ``agent_keepalive_timeout_secs``. Lower it for faster detection at the
@@ -275,19 +275,22 @@ and Raft high-availability topology.
      - ``10``
      - Live
      - How long to wait for a ping response before dropping the connection.
-       Ignored when ``agent_keepalive_interval_secs`` is ``0``.
+       Range 1-600 whenever keepalive is on; ``0`` is rejected because it
+       marks every ping overdue the moment it is sent. Ignored entirely when
+       ``agent_keepalive_interval_secs`` is ``0``.
    * - ``dispatch_timeout_secs``
      - integer
      - ``300``
      - Live
      - Ceiling on a single launch or allocation-register RPC to an agent. The
        agent runs the node prolog and any container image unpack before it
-       answers, so this must exceed your slowest prolog. ``0`` disables it.
-       A node that has died or become unreachable is detected sooner, by
-       channel keepalive; an agent that is still running but whose launch
-       never completes is bounded only by this value. A node that exceeds it
-       is skipped for new dispatch for the same span, and is not marked down,
-       so it still appears available in ``sinfo`` while being skipped.
+       answers, so this must exceed your slowest prolog. Range 0-86400;
+       ``0`` disables it. A node that has died or become unreachable is
+       detected sooner by channel keepalive, when keepalive is enabled; an
+       agent that is still running but whose launch never completes is
+       bounded only by this value. A node that exceeds it is skipped for new
+       dispatch for the same span, and is not marked down, so it still
+       appears available in ``sinfo`` while being skipped.
    * - ``job_info_visibility``
      - string
      - ``redacted``

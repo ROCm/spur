@@ -1177,7 +1177,7 @@ async fn stop_component_now(
     let endpoint = agent_endpoint(cluster, node)
         .ok_or_else(|| anyhow::anyhow!("{node} has no agent address"))?;
     let fut = async {
-        let mut client = SlurmAgentClient::connect(endpoint)
+        let mut client = crate::agent_client::connect(endpoint)
             .await
             .map_err(|e| anyhow::anyhow!("connect to agent {node} failed: {e}"))?;
         client
