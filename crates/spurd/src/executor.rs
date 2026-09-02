@@ -1243,7 +1243,7 @@ impl CgroupGuard {
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
         if let Some(path) = self.0.take() {
-            cleanup_cgroup(&path);
+            cleanup_cgroup_blocking(&path);
         }
     }
 }
@@ -1253,16 +1253,7 @@ impl Drop for CgroupGuard {
 /// need to know the job's process is actually gone (not just signaled)
 /// should gate on this rather than assuming the kill took effect.
 pub async fn cleanup_cgroup(cgroup_path: &Path) -> bool {
-    if cgroup_kill(cgroup_path).is_err() {
-        // No cgroup.kill (e.g. cgroup v1): fall back to a manual per-pid sweep.
-        if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-            for pid_str in pids.lines() {
-                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-                }
-            }
-        }
-    }
+    kill_cgroup_members(cgroup_path);
 
     // SIGKILL delivery/reaping is async; a v2 rmdir fails until the cgroup is
     // empty, so retry briefly instead of leaking the directory on one miss.
@@ -1277,6 +1268,31 @@ pub async fn cleanup_cgroup(cgroup_path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Single-shot cleanup for drop paths, which cannot await the retrying variant.
+/// A cgroup still draining is left behind for the next reconcile to reap.
+fn cleanup_cgroup_blocking(cgroup_path: &Path) {
+    kill_cgroup_members(cgroup_path);
+    if let Err(e) = std::fs::remove_dir(cgroup_path) {
+        debug!(error = %e, path = %cgroup_path.display(), "cgroup not removable yet");
+    }
+}
+
+fn kill_cgroup_members(cgroup_path: &Path) {
+    // Probe for cgroup.kill rather than writing blind: outside a real v2 tree
+    // the write creates a stray file that then blocks the directory's removal.
+    if cgroup_path.join("cgroup.kill").exists() && cgroup_kill(cgroup_path).is_ok() {
+        return;
+    }
+    // cgroup v1, or a v2 kernel too old for cgroup.kill: sweep the pids by hand.
+    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+        for pid_str in pids.lines() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Recursively signal a process and all its descendants (children first).
