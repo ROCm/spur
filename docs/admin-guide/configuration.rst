@@ -1438,6 +1438,36 @@ OpenMetrics HTTP export from ``spurctld``.
      - Serve the per-job/user/account metrics route. While ``false`` that route
        returns 404. High cardinality on a busy cluster; enable deliberately.
 
+``[health]``
+------------
+
+Liveness and readiness HTTP from ``spurctld``. Separate from ``[metrics]`` on
+purpose: metrics bind to loopback by default and can be turned off, and a probe
+that cannot reach the process makes every replica unready for good.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 10 18 14 36
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``enabled``
+     - bool
+     - ``true``
+     - Restart
+     - Start the health HTTP server.
+   * - ``listen_addr``
+     - string
+     - ``"[::]:6823"``
+     - Restart
+     - Health HTTP listen address. Bound as given, with no loopback policy.
+
+The two routes are ``/healthz`` and ``/readyz``. See
+:doc:`/user-guide/monitoring-jobs`.
+
 ``[rest_api]``
 --------------
 

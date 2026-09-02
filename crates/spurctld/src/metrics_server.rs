@@ -64,13 +64,43 @@ pub async fn serve(
     Ok(())
 }
 
+/// Start the health HTTP server. Runs until the listener is closed.
+///
+/// A listener of its own, because an orchestrator must reach `/readyz` whatever
+/// the metrics settings say. `[metrics]` defaults to loopback and can be turned
+/// off; either one would make every replica fail its probe for good.
+pub async fn serve_health(listen: SocketAddr, raft: Arc<RaftHandle>) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/healthz", get(health_only_healthz))
+        .route("/readyz", get(health_only_readyz))
+        .with_state(raft);
+
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let bound = listener.local_addr()?;
+    info!(%bound, "health HTTP server listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn health_only_healthz(State(raft): State<Arc<RaftHandle>>) -> Response {
+    liveness(&raft)
+}
+
+async fn health_only_readyz(State(raft): State<Arc<RaftHandle>>) -> Response {
+    readiness(&raft)
+}
+
 /// Liveness: is this process still a working Raft node?
 ///
 /// A TCP probe on the gRPC port cannot answer that. RaftCore is its own task,
 /// and when it dies the listener keeps accepting connections, so the container
 /// looks healthy while it can replicate nothing.
 async fn healthz(State(state): State<Arc<MetricsState>>) -> Response {
-    if state.raft.is_core_running() {
+    liveness(&state.raft)
+}
+
+fn liveness(raft: &RaftHandle) -> Response {
+    if raft.is_core_running() {
         (StatusCode::OK, "ok\n").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response()
@@ -83,10 +113,14 @@ async fn healthz(State(state): State<Arc<MetricsState>>) -> Response {
 /// one cannot serve a read that means anything, and it must stay out of the
 /// Service until it has.
 async fn readyz(State(state): State<Arc<MetricsState>>) -> Response {
-    if !state.raft.is_core_running() {
+    readiness(&state.raft)
+}
+
+fn readiness(raft: &RaftHandle) -> Response {
+    if !raft.is_core_running() {
         return (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response();
     }
-    if state.raft.current_leader().is_none() {
+    if raft.current_leader().is_none() {
         return (StatusCode::SERVICE_UNAVAILABLE, "no leader elected\n").into_response();
     }
     (StatusCode::OK, "ok\n").into_response()
@@ -220,6 +254,7 @@ mod tests {
             isolation: Default::default(),
             licenses: HashMap::new(),
             update: Default::default(),
+            health: Default::default(),
             metrics: Default::default(),
             rest_api: Default::default(),
             hooks: Default::default(),

@@ -78,7 +78,7 @@ spec:
               name: rest
             - containerPort: 6821
               name: raft
-            - containerPort: 6822
+            - containerPort: 6823
               name: health
           volumeMounts:
             - name: config
@@ -92,13 +92,13 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 6822
+              port: 6823
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 6822
+              port: 6823
             initialDelaySeconds: 15
             periodSeconds: 20
       volumes:

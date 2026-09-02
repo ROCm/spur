@@ -607,11 +607,16 @@ restart rather than a process that serves stale reads.
 the load balancer. Both are unauthenticated and carry no cluster data, which is
 what a kubelet probe needs.
 
-.. note::
+Both listen on their own port, ``6823``, set by ``health.listen_addr``, and they
+bind every interface. They are also mounted on the metrics port for a local
+check.
 
-   ``metrics.bind`` defaults to ``loopback``. A probe from outside the host, a
-   Kubernetes kubelet for example, needs ``bind = "all"``. See
-   :doc:`/deployment/kubernetes`.
+.. important::
+
+   Configure the probe against port ``6823`` and not the metrics port. Metrics
+   bind to loopback by default and ``metrics.enabled`` can turn them off, so a
+   probe on that port answers nothing and every replica stays unready for good.
+   ``[health]`` is separate for exactly this reason.
 
 Job metrics — ``/metrics/jobs``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
