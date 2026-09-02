@@ -179,6 +179,7 @@ Networking / CNI
 
 **kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
 on the node's primary interface and workers join over it. No mesh required.
+``pod_cidr``/``service_cidr`` are applied the same as under ``calico``.
 
 **calico** (``cni = "calico"``) — mesh-native routing. ``spur k8s up`` generates a
 k0s config that advertises the API on the control-plane's **mesh IP** and runs
