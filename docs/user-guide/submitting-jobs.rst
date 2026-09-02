@@ -226,11 +226,16 @@ variables the job inherits. Default is ``ALL``.
 - ``ALL`` — forward the submitter's full environment.
 - ``NONE`` — forward nothing from the submitter.
 - ``VAR1,VAR2`` — forward only the named variables.
+- ``VAR=value`` — set an explicit value instead of copying it from the
+  submitter. Overrides an inherited value.
+- ``ALL,VAR=value`` — combine the two: forward the full environment and set (or
+  override) the named variables on top.
 
 .. code-block:: bash
 
    sbatch --export=NONE train.sh
    sbatch --export=DATA_DIR,MODEL_DIR train.sh
+   sbatch --export=ALL,MASTER_PORT=29999,WORLD_SIZE=16 train.sh
 
 .. _submit-gpus:
 
