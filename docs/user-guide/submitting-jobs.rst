@@ -338,11 +338,47 @@ works unchanged. The most useful are below.
    * - ``SPUR_ARRAY_TASK_ID``
      - Array task index (array jobs only).
 
-For MPI and distributed-training frameworks, the agent also sets the variables
-those runtimes expect — ``LOCAL_RANK``, ``LOCAL_WORLD_SIZE``, ``NODE_RANK``, the
-``PMI_*``/``PMIX_*`` ranks (the latter with ``--mpi=pmix``), the
-``OMPI_COMM_WORLD_*`` ranks, and ``SPUR_PEER_NODES`` — so ``torchrun``, MPI, and
-PMI/PMIx launchers run without extra wiring.
+For MPI, the agent sets the ``PMI_*``/``PMIX_*`` ranks (the latter with
+``--mpi=pmix``) and ``SPUR_PEER_NODES``, so PMI/PMIx launchers run without extra
+wiring.
+
+Distributed-training rendezvous variables
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Like Slurm, Spur does **not** set the PyTorch/torchrun rendezvous variables
+(``MASTER_ADDR``, ``MASTER_PORT``, ``WORLD_SIZE``, ``RANK``, ``LOCAL_RANK``,
+``LOCAL_WORLD_SIZE``, ``NODE_RANK``, ``NPROC_PER_NODE``). Any value you forward
+with ``--export`` is preserved. Derive them from the ``SPUR_*``/``SLURM_*``
+variables in your batch script, or let ``torchrun`` compute them:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Torch / ``env://`` variable
+     - Spur source
+   * - ``WORLD_SIZE``
+     - ``SPUR_NTASKS`` / ``SLURM_NTASKS``
+   * - ``RANK``
+     - ``SPUR_PROCID`` / ``SLURM_PROCID``
+   * - ``LOCAL_RANK``
+     - ``SPUR_LOCALID`` / ``SLURM_LOCALID``
+   * - ``NODE_RANK``
+     - ``SPUR_NODEID`` / ``SPUR_NODE_RANK``
+   * - ``NPROC_PER_NODE`` / ``LOCAL_WORLD_SIZE``
+     - ``SPUR_TASKS_PER_NODE``
+   * - ``MASTER_ADDR`` / ``MASTER_PORT``
+     - First host of ``SPUR_JOB_NODELIST`` / ``SPUR_PEER_NODES``, plus a port you choose
+
+.. code-block:: bash
+
+   # Respect anything forwarded with --export; otherwise derive from the
+   # allocation. The port is derived per job to avoid collisions between
+   # concurrent jobs on shared nodes.
+   export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SPUR_JOB_NODELIST" | head -n1)}"
+   export MASTER_PORT="${MASTER_PORT:-$((20000 + SPUR_JOB_ID % 20000))}"
+   export WORLD_SIZE="${WORLD_SIZE:-$SPUR_NTASKS}"
+   export RANK="${RANK:-$SPUR_PROCID}"
 
 See Also
 --------

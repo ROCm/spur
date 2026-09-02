@@ -324,7 +324,7 @@ fn mask_cpu_bind_bash_prefix(masks: &[&str]) -> String {
         let entries = masks.join(" ");
         format!(
             "_CPU_MASK=({entries})\n  \
-             _CPU_IDX=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n  \
+             _CPU_IDX=$((SPUR_TASK_OFFSET + SPUR_LOCALID))\n  \
              if [ \"$_CPU_IDX\" -ge ${{#_CPU_MASK[@]}} ]; then\n    \
                echo \"mask_cpu: rank $_CPU_IDX exceeds CPU mask list (len ${{#_CPU_MASK[@]}})\" >&2\n    \
                exit 1\n  \
@@ -388,12 +388,12 @@ pub fn mask_cpu_bind_error(source: &HashMap<String, String>, num_tasks: u32) -> 
 /// Bash prefix that pins a task to CPUs per `map_cpu`, `mask_cpu`, or `rank`.
 fn cpu_bind_bash_prefix(bind: &CpuBind, map_cpus: &[&str]) -> String {
     match bind {
-        CpuBind::Rank => "taskset -c $((SPUR_TASK_OFFSET + LOCAL_RANK)) ".to_string(),
+        CpuBind::Rank => "taskset -c $((SPUR_TASK_OFFSET + SPUR_LOCALID)) ".to_string(),
         CpuBind::Map(_) if !map_cpus.is_empty() => {
             let entries = map_cpus.join(" ");
             format!(
                 "_CPU_MAP=({entries})\n  \
-                 _CPU_IDX=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n  \
+                 _CPU_IDX=$((SPUR_TASK_OFFSET + SPUR_LOCALID))\n  \
                  if [ \"$_CPU_IDX\" -ge ${{#_CPU_MAP[@]}} ]; then\n    \
                    echo \"map_cpu: rank $_CPU_IDX exceeds CPU map (len ${{#_CPU_MAP[@]}})\" >&2\n    \
                    exit 1\n  \
@@ -575,10 +575,10 @@ pub fn build_multi_task_pmix_wrapper(
     wrapper.push_str(&format!(
         "_TASKS_ON_NODE={tasks_on_node}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n"
     ));
-    wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
-    wrapper.push_str("  export LOCAL_RANK\n");
+    wrapper.push_str("for SPUR_LOCALID in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
+    wrapper.push_str("  export SPUR_LOCALID\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
-    wrapper.push_str("  case $LOCAL_RANK in\n");
+    wrapper.push_str("  case $SPUR_LOCALID in\n");
     for (local_rank, rank_env) in per_local_rank_env.iter().enumerate() {
         wrapper.push_str(&format!("  {local_rank})\n"));
         wrapper.push_str(&mpi_direct_task_preamble("    "));
@@ -591,7 +591,7 @@ pub fn build_multi_task_pmix_wrapper(
     wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
     wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
     wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
-    wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
+    wrapper.push_str("      _START=$((SPUR_LOCALID * _GPUS_PER_TASK))\n");
     wrapper.push_str(
         "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
     );
@@ -613,7 +613,7 @@ pub fn build_multi_task_pmix_wrapper(
 }
 
 /// Build a bash wrapper that forks `tasks_on_node` copies of `user_script_path`,
-/// assigning distinct `LOCAL_RANK` / `SLURM_PROCID` values in each fork.
+/// assigning distinct `SPUR_LOCALID` / `SLURM_PROCID` values in each fork.
 ///
 /// Output labeling is controlled at runtime via the `SPUR_LABEL=1` environment
 /// variable (matching batch `launch_job` and srun `-l`).
@@ -642,15 +642,15 @@ pub fn build_multi_task_wrapper(
     wrapper.push_str(&format!(
         "_TASKS_ON_NODE={tasks_on_node}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n"
     ));
-    wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
-    wrapper.push_str("  export LOCAL_RANK\n");
+    wrapper.push_str("for SPUR_LOCALID in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
+    wrapper.push_str("  export SPUR_LOCALID\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
 
     wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
     wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
     wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
     wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
-    wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
+    wrapper.push_str("      _START=$((SPUR_LOCALID * _GPUS_PER_TASK))\n");
     wrapper.push_str(
         "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
     );
@@ -901,7 +901,7 @@ mod tests {
         assert!(script.contains("_TASKS_ON_NODE=4"));
         assert!(script.contains("PMIX_SERVER_URI4"));
         assert!(script.contains("'/tmp/hello_mpi'"));
-        assert!(!script.contains("for LOCAL_RANK in"));
+        assert!(!script.contains("for SPUR_LOCALID in"));
     }
 
     #[test]
@@ -930,11 +930,11 @@ mod tests {
         rank1.insert("PMIX_SIZE".into(), "4".into());
         let script =
             build_multi_task_pmix_wrapper("/tmp/hello_mpi", 2, &[rank0, rank1], None).unwrap();
-        assert!(script.contains("case $LOCAL_RANK in"));
+        assert!(script.contains("case $SPUR_LOCALID in"));
         assert!(script.contains("0)\n"));
         assert!(script.contains("export PMIX_RANK='0'"));
         assert!(script.contains("export PMIX_RANK='1'"));
-        assert!(script.contains("for LOCAL_RANK in"));
+        assert!(script.contains("for SPUR_LOCALID in"));
         assert!(!script.contains("mpirun"));
         assert!(script.contains("export SLURM_STEP_ID=${SLURM_STEP_ID:-0}"));
         assert!(script.contains("OMPI_MCA_ess='^singleton,^slurm,^srun'"));

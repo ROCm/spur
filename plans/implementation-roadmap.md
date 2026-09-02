@@ -108,19 +108,18 @@ Jobs that can scale up/down while running. When nodes become available, add them
 
 Integration points:
 - **PyTorch Elastic (torchrun)**: Spur manages the rdzv backend, dynamically updates `--nnodes` range
-- **DeepSpeed**: Spur sets `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK` per node
+- **DeepSpeed / torchrun**: the launcher derives rendezvous from `SPUR_*`/`SLURM_*`; Spur does not own `MASTER_ADDR`/`MASTER_PORT`/`WORLD_SIZE`/`RANK` (matching Slurm)
 - **JAX**: Spur provides the coordinator address and device mesh info
 
-Environment variables injected by Spur (already partially implemented):
+Environment variables injected by Spur (the launcher maps these to torch's `MASTER_ADDR`/`MASTER_PORT`/`WORLD_SIZE`/`RANK`):
 ```
 SPUR_NNODES=4
 SPUR_TASK_OFFSET=0
 SPUR_PEER_NODES=10.44.0.2:6818,10.44.0.3:6818,...
-MASTER_ADDR=10.44.0.2       # first node in allocation
-MASTER_PORT=29500
-WORLD_SIZE=32                # num_nodes * tasks_per_node
-RANK=0                       # global rank (task_offset based)
-LOCAL_RANK=0                 # rank within this node
+SPUR_NTASKS=32               # -> WORLD_SIZE (total tasks)
+SPUR_PROCID=0                # -> RANK (global rank)
+SPUR_LOCALID=0               # -> LOCAL_RANK (rank within this node)
+SPUR_TASKS_PER_NODE=8        # -> NPROC_PER_NODE / LOCAL_WORLD_SIZE
 ```
 
 ### 12.2 Checkpoint-Aware Scheduling (L)

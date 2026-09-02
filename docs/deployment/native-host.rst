@@ -765,10 +765,10 @@ Submitting Jobs
 
    torchrun \
        --nnodes=$SPUR_NNODES \
-       --node_rank=$SPUR_TASK_OFFSET \
+       --node_rank=$SPUR_NODE_RANK \
        --master_addr=$(echo $SPUR_PEER_NODES | cut -d: -f1) \
        --master_port=29500 \
-       --nproc_per_node=8 \
+       --nproc_per_node=$SPUR_TASKS_PER_NODE \
        train.py
    EOF
 
