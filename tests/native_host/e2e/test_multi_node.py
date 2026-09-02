@@ -96,19 +96,21 @@ class TestMultiNodeDispatch:
     def test_export_all_combined_inline_assignments(self, multi_node_cluster):
         # Slurm's combined form --export=ALL,VAR=val propagates the full
         # submission environment and sets the inline assignments on top. The
-        # inline values must reach every node of the job.
+        # inline values must reach every node of the job. Custom variable names
+        # are used so the assertion isolates --export parsing from any variables
+        # the agent injects on its own.
         cluster = multi_node_cluster
         out_path = f"{cluster.remote_dir}/export-combined.out"
         script = cluster.write_file(
             "export-combined.sh",
             "#!/bin/bash\n"
-            'echo "MASTER_PORT=${MASTER_PORT}"\n'
-            'echo "WORLD_SIZE=${WORLD_SIZE}"\n'
+            'echo "E2E_EXPORT_A=${E2E_EXPORT_A}"\n'
+            'echo "E2E_EXPORT_B=${E2E_EXPORT_B}"\n'
             "echo EXPORT_COMBINED_OK\n",
         )
         sb = cluster.sbatch([
             "-J", "export-combined", "-N", "2", "-o", out_path,
-            "--export=ALL,MASTER_PORT=29999,WORLD_SIZE=16", script,
+            "--export=ALL,E2E_EXPORT_A=alpha,E2E_EXPORT_B=beta", script,
         ])
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -118,11 +120,11 @@ class TestMultiNodeDispatch:
         assert "EXPORT_COMBINED_OK" in all_output, (
             f"missing EXPORT_COMBINED_OK:\n{all_output}"
         )
-        assert all_output.count("MASTER_PORT=29999") >= 2, (
-            f"inline MASTER_PORT should reach both nodes:\n{all_output}"
+        assert all_output.count("E2E_EXPORT_A=alpha") >= 2, (
+            f"inline E2E_EXPORT_A should reach both nodes:\n{all_output}"
         )
-        assert all_output.count("WORLD_SIZE=16") >= 2, (
-            f"inline WORLD_SIZE should reach both nodes:\n{all_output}"
+        assert all_output.count("E2E_EXPORT_B=beta") >= 2, (
+            f"inline E2E_EXPORT_B should reach both nodes:\n{all_output}"
         )
 
 
