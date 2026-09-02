@@ -221,26 +221,51 @@ impl WgConfig {
         out
     }
 
-    /// Write config to a file (e.g. `/etc/wireguard/spur0.conf`), atomically: this file is what
-    /// `wg-quick` reads on every future boot, so a crash mid-write must never leave it truncated.
-    /// Writes to a sibling temp file (unique per process) and `rename`s over the target — atomic on
-    /// the same filesystem.
+    /// Write config to a file (e.g. `/etc/wireguard/spur0.conf`), durably: this file is what
+    /// `wg-quick` reads on every future boot, so a crash mid-write must never leave it truncated,
+    /// and the write must survive a power loss, not just look atomic. Writes to a sibling temp file
+    /// (unique per process), fsyncs it, `rename`s over the target, then fsyncs the directory too
+    /// (a rename is itself just a directory-entry update, which can be lost on its own).
     pub fn write_to(&self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
         let content = self.to_ini();
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("wg");
         let tmp_path = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
 
-        std::fs::write(&tmp_path, &content).with_context(|| {
+        let mut tmp_file = std::fs::File::create(&tmp_path).with_context(|| {
+            format!(
+                "failed to create temp WireGuard config at {}",
+                tmp_path.display()
+            )
+        })?;
+        tmp_file.write_all(content.as_bytes()).with_context(|| {
             format!("failed to write WireGuard config to {}", tmp_path.display())
         })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("failed to fsync {}", tmp_path.display()))?;
+        drop(tmp_file);
+
         std::fs::rename(&tmp_path, path)
             .with_context(|| format!("failed to install WireGuard config at {}", path.display()))?;
+
+        // Best-effort: not every filesystem supports fsync on a directory fd.
+        match std::fs::File::open(dir) {
+            Ok(dir_file) => {
+                if let Err(e) = dir_file.sync_all() {
+                    tracing::warn!(dir = %dir.display(), error = %e, "failed to fsync WireGuard config directory");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "failed to open WireGuard config directory for fsync");
+            }
+        }
 
         Ok(())
     }
