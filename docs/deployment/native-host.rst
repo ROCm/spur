@@ -416,17 +416,20 @@ The default can be changed in ``spur.conf``:
 CPU, Memory, and Device Limits (cgroups)
 ----------------------------------------
 
-``spurd`` puts the payload it launches for a job into a cgroup-v2 group at
+``spurd`` puts the processes it starts for a job into a cgroup-v2 group at
 ``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
 allocated** — the cores and memory the scheduler actually granted this node, not
 what the job asked for.
 
-This covers the batch payload: ``sbatch`` scripts, ``--pty`` jobs, and
-containerized jobs (a container's process tree inherits the job cgroup). It does
-**not** yet cover every process a job can start — see
-:ref:`cgroup-containment-gaps` below.
+This covers every process the agent starts for a job: ``sbatch`` scripts,
+``--pty`` jobs, containerized jobs (a container's process tree inherits the job
+cgroup), ``srun`` steps, ``spur exec``, and interactive attach. An interactive
+allocation (``salloc``, standalone ``srun``) launches no payload of its own, so
+its cgroup is created when the allocation is registered — the first step to
+arrive then has one to join. What is left outside it is narrow, and is described
+under :ref:`cgroup-containment-gaps` below.
 
-Out of the box the batch payload gets:
+Out of the box the job's cgroup gets:
 
 - ``cpuset.cpus`` pinned to its allocated cores.
 - ``memory.max`` at its allocated memory, with ``memory.high`` at the same value so
@@ -467,42 +470,53 @@ Slurm's ``cgroup.conf``.
 What is not contained yet
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Only the payload launched through the agent's ``LaunchJob`` path joins
-``job_<id>``. These paths start processes that stay outside it, in ``spurd``'s own
-cgroup, and are therefore **not** bounded by the job's limits and **not** subject
-to its device filter:
+Every process the agent starts for a job joins ``job_<id>`` — the batch payload,
+``srun`` steps, ``spur exec``, and interactive attach alike — so all of them are
+bounded by the job's limits and checked against its device filter. What remains
+is a granularity gap *inside* the job rather than a hole between jobs:
 
 .. list-table::
    :header-rows: 1
    :widths: 32 68
 
-   * - Path
-     - Why it escapes
-   * - ``srun`` steps inside a job
-     - Steps are spawned directly by the agent rather than through the batch
-       launch path.
-   * - ``spur exec`` into a running job
-     - Enters the job's *namespaces* via ``nsenter``; namespaces are not cgroups,
-       so the process keeps ``spurd``'s cgroup.
-   * - Interactive attach to a running job
-     - Same namespace-entry path as ``spur exec``. Note this is distinct from a
-       ``--pty`` job, which *is* contained because it launches as a batch payload.
-   * - Standalone ``srun`` allocations
-     - The allocation is recorded for accounting, but its steps run through the
-       ``srun`` step path above.
+   * - What is missing
+     - Where it stands
+   * - Per-step limits and accounting
+     - Steps join the **job's** cgroup, not one of their own, so every step in a
+       job draws on one shared budget and there is no per-step CPU or memory
+       reading to attribute. Nested ``job_<id>/step_<n>`` cgroups are planned; a
+       BPF device filter attached at ``job_<id>`` is inherited by descendant
+       cgroups, so the filter will keep working unchanged when they arrive.
+   * - Precise kill-by-step
+     - Cancelling one step signals its process group rather than a cgroup of its
+       own, so a step process that leaves that group (``setsid``) is missed.
+       Cancelling the whole *job* is exact, because that is a cgroup operation.
+   * - ``task_prolog`` / ``task_epilog``
+     - Run by ``spurd`` around each step, as root and in ``spurd``'s own cgroup.
+       They are site-supplied rather than user code, but they are neither
+       resource-bounded nor device-filtered.
 
-Device isolation shares this gap exactly, and it is worth stating plainly because
-the enforcement is otherwise kernel-level and absolute. The filter is attached to
-the **cgroup**, not to the job's processes, so a process that never joins
-``job_<id>`` is never checked against it and can open **any** device node on the
-host — including a GPU allocated to another user's job. A user who runs ``srun``
-inside their own job, or who enters it with ``spur exec``, is not device-filtered.
+Node-level ``prolog`` and ``epilog`` also run uncontained, and that is by design:
+they run before the job's cgroup exists and after it is gone, and their purpose is
+node-wide setup and teardown.
 
-Practically: a job cannot exceed its memory or core budget, or reach a GPU it was
-not allocated, through its batch script — but it can through ``srun`` steps or an
-interactive shell. Closing this needs per-step cgroups nested under the job, which
-is planned but not implemented. Until then, do not rely on these limits or on the
-device filter as a security boundary between users on a shared node.
+.. note::
+
+   **A step now counts against the job's budget.** An ``srun`` step used to run
+   outside ``job_<id>``, with no memory ceiling and no CPU pinning of its own; it
+   now shares the job's ``memory.max``, ``memory.high``, and ``cpuset.cpus``. A
+   site whose steps routinely overrun what the job asked for will start seeing
+   OOM kills where the same workload previously ran. Size ``--mem`` for the whole
+   job — steps included — or raise ``allowed_ram_percent`` to open a headroom
+   band above the allocation.
+
+Practically: a user cannot exceed their job's memory or core budget, or reach a
+GPU the job was not allocated, from *any* process the agent starts for them —
+batch script, step, or interactive shell. That holds only where enforcement
+actually applied, though: an unprivileged agent, or one that could not create the
+cgroup, runs the job unenforced with a warning. Set ``[cgroup] required = true``
+to refuse the work instead, which is what makes these limits a boundary you can
+rely on between users on a shared node.
 
 MPI (PMIx)
 ----------

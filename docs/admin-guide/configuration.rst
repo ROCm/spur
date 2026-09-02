@@ -1212,8 +1212,11 @@ unaffected: there the kubelet owns the cgroups.
    * - ``required``
      - bool
      - ``false``
-     - Refuse to launch a job when a requested constraint cannot be applied,
-       instead of warning and running it unconstrained. See the note below.
+     - Refuse the work when a requested constraint cannot be applied, instead of
+       warning and running it unconstrained. This gates a batch launch, the
+       registration of an interactive allocation (``salloc``, standalone
+       ``srun``), and a step that did not end up in its job's cgroup. See the
+       note below.
    * - ``constrain_cores``
      - bool
      - ``true``
@@ -1367,11 +1370,15 @@ agent log for these to find silently-unenforced nodes:
    failed to write cgroup control file
    cpuset not applied; job runs without a CPU bound
    device filter not installed; job runs without device isolation
-   failed to move process to cgroup
+   allocation registered without cgroup enforcement
+   failed to join cgroup; job runs without resource limits
 
-Set ``required = true`` to refuse the launch instead. The job fails rather than
-running outside its limits, which is the right trade on a shared node where the
-limits are the isolation boundary. It also means a host that cannot enforce
+Set ``required = true`` to refuse the work instead. A batch launch fails, an
+interactive allocation is refused at registration (so ``salloc`` and standalone
+``srun`` error out rather than handing back an unenforceable allocation), and a
+step that did not join its job's cgroup is killed and refused. Each fails rather
+than running outside its limits, which is the right trade on a shared node where
+the limits are the isolation boundary. It also means a host that cannot enforce
 stops accepting work, so roll it out only once the agent runs as root and the
 cgroup tree is confirmed writable.
 

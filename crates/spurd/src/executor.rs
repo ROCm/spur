@@ -178,6 +178,9 @@ pub struct LaunchResult {
     pub stderr_path: String,
     /// Master fd of the PTY (only set when `io_mode == LaunchIo::Pty`).
     pub pty_master: Option<OwnedFd>,
+    /// The job's cgroup, released to the caller now that the launch succeeded.
+    /// The caller owns its removal from here on.
+    pub cgroup_path: Option<PathBuf>,
 }
 
 /// Owns the resolved fds for a job's stdio, built once and consumed by both
@@ -301,16 +304,12 @@ impl JobIoRaw {
 /// A running job process — either a tokio-managed child or a raw-forked container.
 pub enum RunningJob {
     /// Non-container jobs managed by tokio::process::Child.
-    Managed {
-        child: tokio::process::Child,
-        cgroup_path: Option<PathBuf>,
-    },
+    Managed { child: tokio::process::Child },
     /// Container jobs: raw fork with optional pidfd for PID-recycling safety.
     Forked {
         pid: i32,
         /// Holds a kernel reference preventing PID recycling. None on kernels < 5.3.
         _pidfd: Option<OwnedFd>,
-        cgroup_path: Option<PathBuf>,
         reaped: bool,
     },
     /// Allocation registered without a batch process (standalone srun).
@@ -438,14 +437,6 @@ impl RunningJob {
                 Ok(())
             }
             RunningJob::AllocationOnly => Ok(()),
-        }
-    }
-
-    pub fn take_cgroup(&mut self) -> Option<PathBuf> {
-        match self {
-            RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
-            RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
-            RunningJob::AllocationOnly => None,
         }
     }
 }
@@ -673,12 +664,13 @@ async fn spawn_job_process(
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, cgroup_path).await?;
+        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, &cgroup_path).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
             pty_master,
+            cgroup_path: cgroup_path.into_inner(),
         });
     }
 
@@ -906,13 +898,11 @@ async fn spawn_job_process(
     );
 
     Ok(LaunchResult {
-        job: RunningJob::Managed {
-            child,
-            cgroup_path: cgroup_path.into_inner(),
-        },
+        job: RunningJob::Managed { child },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
         pty_master,
+        cgroup_path: cgroup_path.into_inner(),
     })
 }
 
@@ -955,7 +945,7 @@ fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
-fn setup_cgroup(
+pub(crate) fn setup_cgroup(
     job_id: JobId,
     cgroup: &CgroupConfig,
     cpus: u32,
@@ -1178,9 +1168,47 @@ fn dup_cloexec(fd: RawFd) -> RawFd {
     unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }
 }
 
+/// A child's pre-built cgroup join, ready to run from `pre_exec`. Built
+/// parent-side because nothing between fork and exec may allocate.
+pub(crate) struct CgroupJoin {
+    procs: CString,
+    log_fd: RawFd,
+}
+
+impl CgroupJoin {
+    /// `None` when the job has no cgroup, which leaves the child uncontained
+    /// rather than unlaunched — the degrade a non-root agent already produces.
+    pub(crate) fn for_cgroup(cgroup_path: Option<&Path>) -> Option<Self> {
+        let procs = CString::new(cgroup_path?.join("cgroup.procs").as_os_str().as_bytes()).ok()?;
+        // fd 2 is the child's own stdio by the time pre_exec runs, so warn on a
+        // dup of spurd's stderr instead of into the job's output.
+        let log_fd = dup_cloexec(libc::STDERR_FILENO);
+        Some(Self { procs, log_fd })
+    }
+
+    /// Call from `pre_exec`, while the child is still root: an unprivileged
+    /// process cannot write another cgroup's `cgroup.procs`.
+    pub(crate) fn join(&self) {
+        join_cgroup_self(&self.procs, self.log_fd);
+    }
+
+    #[cfg(test)]
+    fn procs_path(&self) -> &std::ffi::CStr {
+        &self.procs
+    }
+}
+
+impl Drop for CgroupJoin {
+    fn drop(&mut self) {
+        if self.log_fd >= 0 {
+            unsafe { libc::close(self.log_fd) };
+        }
+    }
+}
+
 /// Whether `pid` is in the job's cgroup. The child joins itself pre-exec, so
 /// this verifies the join rather than performing it.
-fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
+pub(crate) fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
     let Ok(procs) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) else {
         return false;
     };
@@ -1199,8 +1227,9 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
     })
 }
 
-/// Owns a job's cgroup between creation and the point the running job takes it
-/// over. Every error return in between would otherwise strand the directory.
+/// Owns a job's cgroup between creation and the point a successful launch hands
+/// it to the caller. Every error return in between would otherwise strand the
+/// directory.
 struct CgroupGuard(Option<PathBuf>);
 
 impl CgroupGuard {
@@ -1643,7 +1672,7 @@ async fn launch_container_job(
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
     job_io: JobIo,
-    cgroup_path: CgroupGuard,
+    cgroup_path: &CgroupGuard,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
 
@@ -1829,7 +1858,6 @@ async fn launch_container_job(
                 RunningJob::Forked {
                     pid: child_pid,
                     _pidfd: pidfd,
-                    cgroup_path: cgroup_path.into_inner(),
                     reaped: false,
                 },
                 pty_master,
@@ -1992,6 +2020,29 @@ mod cpuset_tests {
     fn keeps_the_full_set_when_the_parent_permits_it() {
         assert_eq!(permitted_cores(&[0, 1, 2, 3], "0-3"), vec![0, 1, 2, 3]);
         assert_eq!(permitted_cores(&[2, 3], "0-1,2-3"), vec![2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod cgroup_join_tests {
+    use super::CgroupJoin;
+    use std::path::Path;
+
+    #[test]
+    fn a_job_with_a_cgroup_is_wired_to_join_its_procs_file() {
+        let join = CgroupJoin::for_cgroup(Some(Path::new("/sys/fs/cgroup/spur/job_7")))
+            .expect("a job with a cgroup must be wired to join it");
+        assert_eq!(
+            join.procs_path().to_bytes(),
+            b"/sys/fs/cgroup/spur/job_7/cgroup.procs"
+        );
+    }
+
+    #[test]
+    fn a_job_without_a_cgroup_has_nothing_to_join() {
+        // Degraded, not fatal: a non-root agent creates no cgroup, and the
+        // child still has to run.
+        assert!(CgroupJoin::for_cgroup(None).is_none());
     }
 }
 
