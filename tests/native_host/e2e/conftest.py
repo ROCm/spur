@@ -272,6 +272,37 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
+def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
+    """Native k0s, calico CNI, WireGuard mesh OFF (`network.wg_enabled` unset ->
+    False). A single control plane needs no etcd quorum, so this only needs 2
+    nodes — unlike ``k8s_multicp_cluster``'s HA scenarios."""
+    if len(ssh_nodes) < 2:
+        pytest.skip(
+            f"a single-CP k0s cluster needs at least 2 nodes (got {len(ssh_nodes)})"
+        )
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.provision()
+    c.root_agent_preflight()
+    _reset_k0s_all_nodes(c)
+    try:
+        c.start(
+            config_overrides={"cluster": {"enabled": True, "cni": "calico"}},
+            agent_as_root=True,
+        )
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    try:
+        c.k8s_down(reset=True)
+        c.wait_k8s_phase("down", timeout=180)
+    except Exception:
+        pass
+    c.teardown()
+    _reset_k0s_all_nodes(c)
+
+
+@pytest.fixture
 def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture: a running cluster with Postgres on node 0.
