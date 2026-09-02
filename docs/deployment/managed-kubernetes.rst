@@ -180,17 +180,30 @@ Networking / CNI
 **kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
 on the node's primary interface and workers join over it. No mesh required.
 
-**calico** (``cni = "calico"``) — mesh-native routing. ``spur k8s up`` generates a
-k0s config that advertises the API on the control-plane's **mesh IP** and runs
-Calico in ``bird`` (BGP, no overlay) mode, and sets each worker's kubelet
-``--node-ip`` to its mesh IP. Pod traffic then routes over the WireGuard mesh.
-This requires the ``spur0`` mesh to be up first (``spur net join``); membership
-reconciliation only maintains the peer set + ``AllowedIPs``, it does not create
-the tunnel.
+**calico** (``cni = "calico"``) — with the WireGuard mesh enabled
+(``network.wg_enabled = true``), ``spur k8s up`` generates a k0s config that
+advertises the API on the control-plane's **mesh IP** and runs Calico in
+``bird`` (BGP, no overlay) mode, setting each worker's kubelet ``--node-ip`` to
+its mesh IP so pod traffic routes over the WireGuard mesh. This requires the
+``spur0`` mesh to be up first (``spur net join``); membership reconciliation
+only maintains the peer set + ``AllowedIPs``, it does not create the tunnel.
 
 The controller continuously reconciles the full-mesh membership to every node
 (pruning peers for departed nodes), so a reboot, a WireGuard restart, or a
 control-plane failover self-heals.
+
+With the mesh disabled (``network.wg_enabled = false``), Calico instead
+advertises the API on each node's real underlay address and runs in ``vxlan``
+mode — Calico's own overlay, requiring no mesh. Standard VXLAN (UDP 4789)
+between nodes; open that port if a host firewall default-denies it.
+
+.. note::
+
+   Like ``nodeLocalLoadBalancing`` above, this is rendered once per control
+   plane and does not hot-reload: toggling ``network.wg_enabled`` after a
+   cluster's nodes are already ``active`` does not retroactively switch them
+   between ``bird`` and ``vxlan``. Reprovision (``spur k8s down --reset`` then
+   ``spur k8s up``) to pick up the change.
 
 Storage
 ~~~~~~~
@@ -417,7 +430,7 @@ Configuration reference (``[cluster]``)
      - Service network.
    * - ``cni``
      - ``kuberouter``
-     - ``kuberouter`` or ``calico`` (mesh-native bird routing).
+     - ``kuberouter`` or ``calico`` (``bird`` over the mesh if enabled, else ``vxlan``).
    * - ``cni_mtu``
      - ``1450``
      - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom).
