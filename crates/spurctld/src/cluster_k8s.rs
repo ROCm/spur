@@ -53,7 +53,7 @@ pub struct ClusterNetworking {
     pub service_cidr: String,
     /// CNI MTU (cluster.cni_mtu) — emitted into the generated Calico config.
     pub cni_mtu: u16,
-    /// CNI mode (cluster.cni): "kuberouter" (default) or "calico" (mesh-native config + node-ip).
+    /// CNI mode (cluster.cni): "kuberouter" (default) or "calico" (adds mesh-native config + node-ip).
     pub cni: String,
     /// Operator-pinned control-plane node (cluster.control_plane_node), if any.
     pub control_plane_node: Option<String>,
@@ -830,9 +830,7 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
         .map(|(state, _)| state)
 }
 
-/// The k0s controller config for `node`: always carries `pod_cidr`/`service_cidr` so either CNI
-/// honors the configured ranges. Calico additionally gets the API on its mesh IP + Calico bird,
-/// once the node has one; `cp_count > 1` also enables node-local load balancing for konnectivity.
+/// `node`'s k0s controller config: CIDRs for either CNI, plus calico's mesh-IP API once known.
 fn controller_k0s_config(
     net: &ClusterNetworking,
     node: &spur_core::node::Node,

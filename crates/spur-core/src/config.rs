@@ -979,10 +979,8 @@ pub struct ClusterConfig {
     /// Filesystem path to the k0s binary (install target + what the systemd unit runs).
     #[serde(default = "default_k0s_binary")]
     pub k0s_binary: String,
-    /// CNI / network mode. "kuberouter" (k0s default) or "calico" (Calico in bird native-routing
-    /// mode with the API advertised on the mesh IP, so pods route over the WireGuard mesh). Either
-    /// way `spur k8s up` generates a k0s config carrying `pod_cidr`/`service_cidr`; "calico"
-    /// additionally sets each worker's kubelet `--node-ip` to its mesh IP.
+    /// CNI mode: "kuberouter" (k0s default) or "calico" (mesh-native, kubelet `--node-ip` on the
+    /// mesh IP). Both carry `pod_cidr`/`service_cidr` into the generated k0s config.
     #[serde(default = "default_cni")]
     pub cni: String,
     /// Storage provisioner SPUR ships so PVC workloads work out of the box (k0s bundles none).

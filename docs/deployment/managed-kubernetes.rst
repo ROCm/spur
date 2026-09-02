@@ -179,11 +179,7 @@ Networking / CNI
 
 **kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
 on the node's primary interface and workers join over it. No mesh required.
-``pod_cidr``/``service_cidr`` are applied the same as under ``calico``. As with
-node-local load balancing above, k0s only applies network config while a
-controller is being brought up, so an **existing** cluster does not pick up a
-changed CIDR on upgrade alone — reprovision with ``spur k8s down --reset``
-followed by ``spur k8s up``.
+``pod_cidr``/``service_cidr`` are applied the same as under ``calico``.
 
 **calico** (``cni = "calico"``) — mesh-native routing. ``spur k8s up`` generates a
 k0s config that advertises the API on the control-plane's **mesh IP** and runs
@@ -192,6 +188,14 @@ Calico in ``bird`` (BGP, no overlay) mode, and sets each worker's kubelet
 This requires the ``spur0`` mesh to be up first (``spur net join``); membership
 reconciliation only maintains the peer set + ``AllowedIPs``, it does not create
 the tunnel.
+
+.. note::
+
+   As with node-local load balancing above, k0s only applies network config
+   (including ``pod_cidr``/``service_cidr``) while a controller is being
+   brought up, for either CNI — an **existing** cluster does not pick up a
+   changed CIDR on upgrade alone. Reprovision with ``spur k8s down --reset``
+   followed by ``spur k8s up``.
 
 The controller continuously reconciles the full-mesh membership to every node
 (pruning peers for departed nodes), so a reboot, a WireGuard restart, or a

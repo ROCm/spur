@@ -59,18 +59,8 @@ mod local_path_tests {
     }
 }
 
-/// Generate a k0s controller config (YAML) carrying `pod_cidr`/`service_cidr` for either supported
-/// `cni` ("kuberouter" or "calico") — without this, k0s falls back to its own built-in CIDRs and
-/// silently ignores what's configured. `calico` additionally advertises the API on `api_address`
-/// (the control-plane's WireGuard mesh IP, when known) and runs Calico in `bird` mode (native
-/// routing, no overlay) so pod traffic rides the mesh; `cni_mtu` sets Calico's MTU (typically below
-/// the underlay to leave room for WireGuard's ~50-byte overhead, avoiding fragmentation). `sans` are
-/// extra API-server certificate SANs (e.g. the control-plane's mesh + underlay IPs), used only when
-/// `api_address` is set.
-///
-/// For a multi-CP Calico cluster (`cp_count > 1`) no VIP can float over WireGuard cryptokey routing,
-/// so node-local load balancing (EnvoyProxy) is enabled to give konnectivity a cluster-wide balanced
-/// endpoint instead of pinning every agent to one controller.
+/// Generates the k0s controller config: `pod_cidr`/`service_cidr` apply to either `cni`; the
+/// `api`/`sans`/Calico/load-balancing blocks are calico-only, and `sans` further needs `api_address`.
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,
@@ -203,8 +193,7 @@ mod k0s_config_tests {
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
     }
 
-    /// The bug this module fixes: kuberouter used to get no config at all, so a configured
-    /// pod/service CIDR was silently ignored and k0s fell back to its own built-in default.
+    /// kuberouter must carry the configured CIDRs, not k0s's own built-in default.
     #[test]
     fn kuberouter_carries_configured_pod_and_service_cidr() {
         let y = k0s_controller_config_yaml(
