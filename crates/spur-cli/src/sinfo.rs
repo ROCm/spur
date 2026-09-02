@@ -562,6 +562,7 @@ mod tests {
         get_rpc_stats(()) -> pb::RpcStats;
         reset_diag_stats(()) -> ();
         get_sched_stats(()) -> pb::SchedStats;
+        get_assoc_mgr_info(pb::GetAssocMgrInfoRequest) -> pb::GetAssocMgrInfoResponse;
         register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
         heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
         create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;

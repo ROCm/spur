@@ -1197,7 +1197,7 @@ fn account_format_fields(
 
 /// Render a numeric limit, blank when unset/unlimited (the INFINITE sentinel);
 /// Slurm shows "no limit" as an empty cell. A literal 0 renders as "0".
-fn blank_if_unset(v: u32) -> String {
+pub(crate) fn blank_if_unset(v: u32) -> String {
     if v == spur_core::accounting::INFINITE {
         String::new()
     } else {

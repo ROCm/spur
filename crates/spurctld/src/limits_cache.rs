@@ -45,6 +45,15 @@ impl QosCache {
         self.snapshot.read().loaded
     }
 
+    /// Every cached QOS, name-sorted. Lets the operator view report a QOS that no
+    /// job is using, which is where a misconfigured cap is easiest to miss.
+    pub fn all(&self) -> Vec<Qos> {
+        let snap = self.snapshot.read();
+        let mut all: Vec<Qos> = snap.qos.values().cloned().collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
+    }
+
     fn replace(&self, new_qos: HashMap<String, Qos>) {
         let mut snap = self.snapshot.write();
         snap.qos = new_qos;
