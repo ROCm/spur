@@ -1479,15 +1479,12 @@ pub struct CgroupConfig {
     /// `OOMKillStep` defaults off; on here, since partial kills fail murkily.
     #[serde(default = "default_true_fn")]
     pub oom_kill_job: bool,
-    /// Restrict the job to its allocated device nodes (`ConstrainDevices`) with a
-    /// cgroup-v2 BPF device filter. Default-deny: a job allocated no devices keeps
-    /// only the base pseudo-devices (`/dev/null`, ptys, ...).
+    /// Restrict the job to its allocated device nodes (`ConstrainDevices`) via a
+    /// cgroup-v2 BPF device filter. Default-deny: no allocation, pseudo-devices only.
     #[serde(default = "default_true_fn")]
     pub constrain_devices: bool,
-    /// Extra device node paths every job on this node may open, on top of its
-    /// allocation and the built-in host-infrastructure list. The escape hatch for a
-    /// site device the defaults miss, short of turning the filter off. Paths that
-    /// are not device nodes are ignored.
+    /// Extra device paths every job may open, on top of its allocation and the
+    /// host-infrastructure list: the escape hatch for a site device the defaults miss.
     #[serde(default)]
     pub extra_device_paths: Vec<String>,
 }
@@ -2396,9 +2393,8 @@ mod tests {
 
     #[test]
     fn devices_are_constrained_unless_a_config_opts_out() {
-        // A `spur.conf` deployed before the field existed must still load, and must
-        // land on device isolation rather than silently skipping it. The `Default`
-        // impl and the serde default are separate paths that have to agree.
+        // A `spur.conf` deployed before the field existed must still load, and land
+        // on isolation; the `Default` impl and the serde default must agree.
         assert!(CgroupConfig::default().constrain_devices);
 
         let upgraded =

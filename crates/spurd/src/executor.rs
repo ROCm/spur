@@ -948,9 +948,8 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
     files
 }
 
-/// Device nodes the job's allocation granted. No injection plan means no devices
-/// were allocated, which must stay an empty list: the device filter allows exactly
-/// what it is handed, so anything else here would hand a zero-GPU job a GPU.
+/// No injection plan means no devices were allocated, and must stay an empty list:
+/// the filter allows exactly what it is handed.
 fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>) -> &[String] {
     plan.map(|p| p.device_paths.as_slice()).unwrap_or(&[])
 }
@@ -1874,9 +1873,8 @@ fn build_namespace_wrapper(
         .map(|b| format!("  cp -a /dev/dri/{b} $SPUR_HOST_DRI/{b} 2>/dev/null || true\n"))
         .collect::<String>();
 
-    // The restore is gated on the mount: without the tmpfs it would land on the
-    // host's real /dev/dri, and `cp` unlinks a special file before recreating it.
-    // A failed mount stays non-fatal — it just skips the restore.
+    // Gated on the mount: without the tmpfs the restore lands on the host's real
+    // /dev/dri, where `cp` unlinks the node before recreating it.
     const MOUNT_DRI: &str = "mount -t tmpfs tmpfs /dev/dri 2>/dev/null";
     let mount_and_restore_dri = if dri_nodes.is_empty() {
         format!("  {MOUNT_DRI} || true\n")
@@ -2771,9 +2769,8 @@ mod tests {
         assert!(!wrapper.contains("nvidia"));
     }
 
-    /// A bulk `cp -a /dev/dri/.` recreates every host node with `mknod(2)`, which
-    /// the device filter denies for nodes this job does not hold — and a failure
-    /// there must never be able to skip the tmpfs that hides them.
+    /// A bulk `cp -a /dev/dri/.` recreates every host node with `mknod(2)`, which the
+    /// filter denies — and that failure must not skip the tmpfs that hides them.
     #[test]
     fn test_namespace_wrapper_stages_only_allocated_dri_nodes() {
         let script = PathBuf::from("/work/.spur_job_9.sh");
