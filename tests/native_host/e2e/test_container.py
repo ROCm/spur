@@ -231,15 +231,16 @@ class TestContainerMultiNode:
         assert "SPUR_NNODES=2" in all_output, f"must see SPUR_NNODES=2\noutput:\n{all_output}"
 
     def test_two_node_container_env_vars(self, multi_container_cluster):
+        # Spur exposes allocation topology through SPUR_* inside containers; it
+        # does not inject the PyTorch rendezvous vars (matching Slurm).
         cluster = multi_container_cluster
         img = cluster.container_image
         out_path = f"{cluster.remote_dir}/ct-2n-env.out"
         script = cluster.write_file(
             "ct-2n-env.sh",
             "#!/bin/bash\n"
-            'echo "RANK=${RANK}"\n'
-            'echo "WORLD_SIZE=${WORLD_SIZE}"\n'
-            'echo "MASTER_ADDR=${MASTER_ADDR}"\n'
+            'echo "SPUR_NNODES=${SPUR_NNODES}"\n'
+            'echo "SPUR_NODE_RANK=${SPUR_NODE_RANK}"\n'
             'echo "SPUR_JOB_ID=${SPUR_JOB_ID}"\n'
             "echo CT_ENV_OK\n",
         )
@@ -253,13 +254,9 @@ class TestContainerMultiNode:
         wait_job(cluster, job_id, timeout=90)
         all_output = cluster.read_output_all_nodes(out_path)
         assert "CT_ENV_OK" in all_output, f"missing CT_ENV_OK:\n{all_output}"
-        assert "WORLD_SIZE=2" in all_output, f"missing WORLD_SIZE=2:\n{all_output}"
-        assert "RANK=0" in all_output, f"missing RANK=0:\n{all_output}"
-        assert "RANK=1" in all_output, f"missing RANK=1:\n{all_output}"
-        assert any(
-            line.startswith("MASTER_ADDR=") and line != "MASTER_ADDR="
-            for line in all_output.splitlines()
-        ), f"MASTER_ADDR should be non-empty:\n{all_output}"
+        assert "SPUR_NNODES=2" in all_output, f"missing SPUR_NNODES=2:\n{all_output}"
+        assert "SPUR_NODE_RANK=0" in all_output, f"missing rank 0:\n{all_output}"
+        assert "SPUR_NODE_RANK=1" in all_output, f"missing rank 1:\n{all_output}"
 
     def test_two_node_container_dns(self, multi_container_cluster):
         cluster = multi_container_cluster

@@ -1266,12 +1266,9 @@ impl SlurmAgent for AgentService {
             senv.set_with_slurm_twin("SPUR_MPI_TYPE", MPI_PMIX);
             senv.set("SPUR_TASK_OFFSET", task_offset);
         } else if tasks_per_node == 1 {
-            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1);
+            SpurEnv::apply_task_rank(&mut senv, task_offset, 0);
         } else {
             senv.set("SPUR_TASK_OFFSET", task_offset);
-            senv.set("LOCAL_RANK", "0");
-            senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
-            senv.set("NPROC_PER_NODE", tasks_per_node);
         }
         if !peer_nodes.is_empty() {
             senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
@@ -1281,30 +1278,6 @@ impl SlurmAgent for AgentService {
         }
         if !spec.burst_buffer.is_empty() {
             senv.set("SPUR_BURST_BUFFER", &spec.burst_buffer);
-        }
-
-        if !pmix_multi_task {
-            // Third-party distributed training / MPI env vars
-            if tasks_per_node > 1 {
-                senv.set("LOCAL_RANK", "0");
-                senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
-                senv.set("NPROC_PER_NODE", tasks_per_node);
-            }
-            senv.set("NODE_RANK", node_rank);
-
-            if peer_nodes.len() > 1 {
-                if let Some(first_peer) = peer_nodes.first() {
-                    let master_addr = first_peer
-                        .rsplit(':')
-                        .nth(1)
-                        .or_else(|| first_peer.split(':').next())
-                        .unwrap_or(first_peer);
-                    senv.set("MASTER_ADDR", master_addr);
-                }
-                senv.set("MASTER_PORT", "29500");
-                senv.set("WORLD_SIZE", peer_nodes.len());
-                senv.set("RANK", node_rank);
-            }
         }
 
         let mut env = senv.into_map();
@@ -2231,12 +2204,12 @@ impl SlurmAgent for AgentService {
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
             } else {
-                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0);
             }
             let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
             ("bash".to_string(), vec![wrapper_path_string], Some(guard))
         } else {
-            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0);
             let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
                 &req.command[0],
                 &req.command[1..],

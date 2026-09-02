@@ -64,15 +64,20 @@ class TestMultiNodeDispatch:
         assert "SLURM_JOB_ID=" in all_output, f"missing SLURM_JOB_ID:\n{all_output}"
 
     def test_distributed_env_vars(self, multi_node_cluster):
+        # Spur does not inject the PyTorch rendezvous variables (MASTER_ADDR,
+        # MASTER_PORT, WORLD_SIZE, RANK) — Slurm never sets them either. It
+        # exposes the allocation topology through SPUR_*/SLURM_* instead.
         cluster = multi_node_cluster
         out_path = f"{cluster.remote_dir}/dist-env.out"
         script = cluster.write_file(
             "dist-env.sh",
             "#!/bin/bash\n"
-            'echo "RANK=${RANK}"\n'
-            'echo "WORLD_SIZE=${WORLD_SIZE}"\n'
-            'echo "MASTER_ADDR=${MASTER_ADDR}"\n'
-            'echo "MASTER_PORT=${MASTER_PORT}"\n'
+            'echo "SPUR_NNODES=${SPUR_NNODES}"\n'
+            'echo "SPUR_NODE_RANK=${SPUR_NODE_RANK}"\n'
+            'echo "SPUR_PEER_NODES=${SPUR_PEER_NODES}"\n'
+            'echo "TORCH_RANK=[${RANK}]"\n'
+            'echo "TORCH_WORLD_SIZE=[${WORLD_SIZE}]"\n'
+            'echo "TORCH_MASTER_PORT=[${MASTER_PORT}]"\n'
             "echo DIST_ENV_OK\n",
         )
         sb = cluster.sbatch(["-J", "dist-env", "-N", "2", "-o", out_path, script])
@@ -81,16 +86,53 @@ class TestMultiNodeDispatch:
 
         wait_job(cluster, job_id, timeout=90)
         all_output = cluster.read_output_all_nodes(out_path)
-        assert "WORLD_SIZE=2" in all_output
-        assert "RANK=0" in all_output
-        assert "RANK=1" in all_output
-        assert "MASTER_PORT=29500" in all_output
-        master_addr_lines = [
-            line for line in all_output.splitlines()
-            if line.startswith("MASTER_ADDR=") and line != "MASTER_ADDR="
-        ]
-        assert len(master_addr_lines) >= 2, (
-            f"MASTER_ADDR should be set on both ranks:\n{all_output}"
+        assert "SPUR_NNODES=2" in all_output, f"missing SPUR_NNODES=2:\n{all_output}"
+        assert "SPUR_NODE_RANK=0" in all_output, f"missing rank 0:\n{all_output}"
+        assert "SPUR_NODE_RANK=1" in all_output, f"missing rank 1:\n{all_output}"
+        assert any(
+            line.startswith("SPUR_PEER_NODES=") and len(line) > len("SPUR_PEER_NODES=")
+            for line in all_output.splitlines()
+        ), f"SPUR_PEER_NODES should be non-empty:\n{all_output}"
+        # The torch names must be empty because Spur no longer injects them.
+        assert "TORCH_RANK=[]" in all_output, f"RANK should be unset:\n{all_output}"
+        assert "TORCH_WORLD_SIZE=[]" in all_output, (
+            f"WORLD_SIZE should be unset:\n{all_output}"
+        )
+        assert "TORCH_MASTER_PORT=[]" in all_output, (
+            f"MASTER_PORT should be unset:\n{all_output}"
+        )
+
+    def test_user_rendezvous_env_preserved(self, multi_node_cluster):
+        # Regression for #783: a user-exported MASTER_PORT/WORLD_SIZE must
+        # survive on a multi-node job, not be overwritten by Spur.
+        cluster = multi_node_cluster
+        out_path = f"{cluster.remote_dir}/user-rdzv.out"
+        script = cluster.write_file(
+            "user-rdzv.sh",
+            "#!/bin/bash\n"
+            'echo "MASTER_PORT=${MASTER_PORT}"\n'
+            'echo "WORLD_SIZE=${WORLD_SIZE}"\n'
+            "echo USER_RDZV_OK\n",
+        )
+        cmd = (
+            f"SPUR_CONTROLLER_ADDR='{cluster.controller_addr}' "
+            f"PATH='{cluster.bin_dir}':$PATH "
+            f"MASTER_PORT=29999 WORLD_SIZE=16 "
+            f"'{cluster.bin_dir}/sbatch' -J user-rdzv -N 2 "
+            f"-o '{out_path}' --export=ALL '{script}'"
+        )
+        sb = cluster.nodes[0].exec(cmd)
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        wait_job(cluster, job_id, timeout=90)
+        all_output = cluster.read_output_all_nodes(out_path)
+        assert "USER_RDZV_OK" in all_output, f"missing USER_RDZV_OK:\n{all_output}"
+        assert "MASTER_PORT=29999" in all_output, (
+            f"user MASTER_PORT was overwritten:\n{all_output}"
+        )
+        assert "WORLD_SIZE=16" in all_output, (
+            f"user WORLD_SIZE was overwritten:\n{all_output}"
         )
 
 

@@ -55,13 +55,12 @@ impl SpurEnv {
     /// Generate bash `export` lines for per-task variables (`PROCID`, `LOCALID`).
     ///
     /// These are interpolated inside the multi-task wrapper loop where
-    /// `$LOCAL_RANK` and `$SPUR_TASK_OFFSET` are shell variables, not Rust values.
+    /// `$SPUR_LOCALID` and `$SPUR_TASK_OFFSET` are shell variables, not Rust values.
     pub fn per_task_bash_exports() -> &'static str {
         concat!(
-            "  export SPUR_LOCALID=$LOCAL_RANK\n",
-            "  export SLURM_LOCALID=$LOCAL_RANK\n",
-            "  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n",
-            "  export SLURM_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n",
+            "  export SLURM_LOCALID=$SPUR_LOCALID\n",
+            "  export SPUR_PROCID=$((SPUR_TASK_OFFSET + SPUR_LOCALID))\n",
+            "  export SLURM_PROCID=$((SPUR_TASK_OFFSET + SPUR_LOCALID))\n",
         )
     }
 
@@ -87,17 +86,9 @@ impl SpurEnv {
     }
 
     /// Per-task rank variables for a single-process step or batch launch.
-    pub fn apply_task_rank(
-        senv: &mut SpurEnv,
-        task_offset: u32,
-        local_rank: u32,
-        tasks_on_node: u32,
-    ) {
+    pub fn apply_task_rank(senv: &mut SpurEnv, task_offset: u32, local_rank: u32) {
         let procid = task_offset + local_rank;
         senv.set("SPUR_TASK_OFFSET", task_offset);
-        senv.set("LOCAL_RANK", local_rank);
-        senv.set("LOCAL_WORLD_SIZE", tasks_on_node);
-        senv.set("NPROC_PER_NODE", tasks_on_node);
         senv.set_with_slurm_twin("SPUR_LOCALID", local_rank);
         senv.set_with_slurm_twin("SPUR_PROCID", procid);
     }
@@ -201,12 +192,32 @@ mod tests {
     #[test]
     fn apply_task_rank_sets_procid_twins() {
         let mut env = SpurEnv::new();
-        SpurEnv::apply_task_rank(&mut env, 1, 0, 1);
+        SpurEnv::apply_task_rank(&mut env, 1, 0);
         let map = env.into_map();
         assert_eq!(map["SPUR_PROCID"], "1");
         assert_eq!(map["SLURM_PROCID"], "1");
         assert_eq!(map["SPUR_LOCALID"], "0");
         assert_eq!(map["SLURM_LOCALID"], "0");
+    }
+
+    #[test]
+    fn apply_task_rank_omits_torchrun_names() {
+        let mut env = SpurEnv::new();
+        SpurEnv::apply_task_rank(&mut env, 8, 2);
+        let map = env.into_map();
+        for key in [
+            "LOCAL_RANK",
+            "LOCAL_WORLD_SIZE",
+            "NPROC_PER_NODE",
+            "NODE_RANK",
+            "RANK",
+            "WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+        ] {
+            assert!(!map.contains_key(key), "should not set {key}");
+        }
+        assert_eq!(map["SPUR_PROCID"], "10");
     }
 
     #[test]

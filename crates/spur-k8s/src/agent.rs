@@ -256,19 +256,6 @@ impl SlurmAgent for VirtualAgent {
             senv.set("SPUR_TARGET_NODE", &target_node);
         }
 
-        senv.set("LOCAL_RANK", "0");
-        senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
-        senv.set("NPROC_PER_NODE", tasks_per_node);
-        senv.set("NODE_RANK", node_rank);
-
-        if num_peers > 1 {
-            let master_addr = format!("spur-job-{}.{}.svc.cluster.local", job_id, ns);
-            senv.set("MASTER_ADDR", master_addr);
-            senv.set("MASTER_PORT", "29500");
-            senv.set("WORLD_SIZE", num_peers);
-            senv.set("RANK", node_rank);
-        }
-
         let mut env_vars: Vec<EnvVar> = senv
             .into_map()
             .into_iter()
