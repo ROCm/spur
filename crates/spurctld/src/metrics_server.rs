@@ -53,6 +53,8 @@ pub async fn serve(
         .route("/metrics/scheduler", get(metrics_scheduler))
         .route("/metrics/k8s", get(metrics_k8s))
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -60,6 +62,34 @@ pub async fn serve(
     info!(%bound, "metrics HTTP server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Liveness: is this process still a working Raft node?
+///
+/// A TCP probe on the gRPC port cannot answer that. RaftCore is its own task,
+/// and when it dies the listener keeps accepting connections, so the container
+/// looks healthy while it can replicate nothing.
+async fn healthz(State(state): State<Arc<MetricsState>>) -> Response {
+    if state.raft.is_core_running() {
+        (StatusCode::OK, "ok\n").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response()
+    }
+}
+
+/// Readiness: may this replica take traffic?
+///
+/// Adds a known leader to the liveness check. A replica that has not yet found
+/// one cannot serve a read that means anything, and it must stay out of the
+/// Service until it has.
+async fn readyz(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_core_running() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response();
+    }
+    if state.raft.current_leader().is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no leader elected\n").into_response();
+    }
+    (StatusCode::OK, "ok\n").into_response()
 }
 
 async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
@@ -460,5 +490,113 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             CONTENT_TYPE
         );
+    }
+
+    /// The probes must answer from Raft state. A running core with a leader is
+    /// both live and ready; a follower whose core is running is ready too,
+    /// because a follower serves reads and forwards writes.
+    #[tokio::test]
+    async fn healthz_and_readyz_report_a_running_core() {
+        let dir = TempDir::new().unwrap();
+        let (leader, follower) = two_node_raft(&dir).await;
+
+        for handle in [&leader, &follower] {
+            assert!(handle.is_core_running(), "core must be running");
+            // current_leader is a cached value that a follower can briefly report
+            // as None between terms. Wait for the settled view rather than race it.
+            handle
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .metrics(|m| m.current_leader.is_some(), "leader known to this node")
+                .await
+                .expect("both nodes must settle on a leader");
+            let state = Arc::new(MetricsState {
+                cluster: Arc::new(
+                    ClusterManager::new(test_config(), &dir.path().join("probe")).unwrap(),
+                ),
+                raft: handle.clone(),
+                rpc_stats: Arc::new(RpcStatsCollector::new()),
+                sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            });
+            let app = Router::new()
+                .route("/healthz", get(healthz))
+                .route("/readyz", get(readyz))
+                .with_state(state);
+
+            let live = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get("/healthz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(live.status(), StatusCode::OK);
+
+            let ready = app
+                .oneshot(
+                    axum::http::Request::get("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ready.status(), StatusCode::OK);
+        }
+    }
+
+    /// The whole point of the endpoint: a node with no leader is NOT ready, so
+    /// the Service stops sending it reads it cannot answer. A TCP probe on the
+    /// gRPC port reported such a node healthy.
+    #[tokio::test]
+    async fn readyz_refuses_while_no_leader_is_known() {
+        let dir = TempDir::new().unwrap();
+        // Two voters, only one started: no quorum, so no leader is ever elected.
+        let peers = vec!["[::1]:1".to_string(), "[::1]:2".to_string()];
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle = Arc::new(
+            crate::raft::start_raft(1, &peers, dir.path(), cm)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            handle.current_leader().is_none(),
+            "no leader without quorum"
+        );
+
+        let state = Arc::new(MetricsState {
+            cluster: Arc::new(ClusterManager::new(test_config(), &dir.path().join("c")).unwrap()),
+            raft: handle.clone(),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/readyz", get(readyz))
+            .with_state(state);
+
+        // Live: the process and its core are fine.
+        let live = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        // Not ready: it has no leader to answer for.
+        let ready = app
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

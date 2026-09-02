@@ -17,6 +17,13 @@ data:
       "spurctld-2.spurctld.spur.svc.cluster.local:6821",
     ]
 
+    [metrics]
+    # The kubelet reaches /healthz and /readyz on this port from outside the
+    # Pod's loopback, so the default "loopback" bind would fail every probe.
+    # This publishes the metrics endpoints to the Pod network as well.
+    bind = "all"
+    listen_addr = "[::]:6822"
+
     [scheduler]
     interval_secs = 2
     max_jobs_per_cycle = 100

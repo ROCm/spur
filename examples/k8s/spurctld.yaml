@@ -17,6 +17,10 @@ spec:
       port: 6821
       targetPort: 6821
   clusterIP: None  # headless for StatefulSet peer DNS
+  # Peer DNS must resolve BEFORE a pod is ready: the replicas need each other to
+  # elect a leader, and readiness below waits for that leader. Without this the
+  # two conditions deadlock and the cluster never starts.
+  publishNotReadyAddresses: true
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -51,19 +55,27 @@ spec:
               name: rest
             - containerPort: 6821
               name: raft
+            - containerPort: 6822
+              name: health
           volumeMounts:
             - name: config
               mountPath: /etc/spur
             - name: spool
               mountPath: /var/spool/spur
+          # A TCP probe on 6817 only proves the listener is up. RaftCore is a
+          # separate task: when it dies the listener still accepts connections,
+          # so the replica served stale reads and failed every write while
+          # Kubernetes reported it healthy. These read Raft instead.
           readinessProbe:
-            tcpSocket:
-              port: 6817
+            httpGet:
+              path: /readyz
+              port: 6822
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            tcpSocket:
-              port: 6817
+            httpGet:
+              path: /healthz
+              port: 6822
             initialDelaySeconds: 15
             periodSeconds: 20
       volumes:
