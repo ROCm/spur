@@ -31,8 +31,12 @@ pub enum ImageCommand {
         ///   podman://image:tag              — local Podman
         image: String,
 
-        /// Target architecture (default: amd64)
-        #[arg(short = 'a', long, default_value = "amd64")]
+        /// Target architecture (default: host architecture)
+        #[arg(
+            short = 'a',
+            long,
+            default_value_t = std::env::consts::ARCH.to_string()
+        )]
         arch: String,
     },
     /// List imported images.
@@ -86,7 +90,7 @@ async fn cmd_import(image: &str, arch: &str) -> Result<()> {
     );
 
     let image_dir = resolve_image_dir();
-    let path = spur_net::pull_image(image, &image_dir).await?;
+    let path = spur_net::pull_image(image, &image_dir, arch).await?;
 
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -351,6 +355,7 @@ fn cmd_remove(name: &str) -> Result<()> {
     }
 
     std::fs::remove_file(&path)?;
+    let _ = std::fs::remove_file(path.with_extension("sqsh.arch"));
     eprintln!("Removed: {}", name);
     Ok(())
 }
@@ -631,5 +636,28 @@ mod tests {
         assert!(!rootfs.join("escaped.txt").exists());
         assert_eq!(std::fs::read(&outside_layer).unwrap(), layer_data);
         assert!(!rootfs.join(".docker_save").exists());
+    }
+
+    #[test]
+    fn import_defaults_to_host_arch() {
+        let args = ImageArgs::try_parse_from(["image", "import", "ubuntu:22.04"])
+            .expect("parse image import");
+
+        let ImageCommand::Import { arch, .. } = args.command else {
+            panic!("expected image import command");
+        };
+        assert_eq!(arch, std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn import_accepts_explicit_arch() {
+        let args =
+            ImageArgs::try_parse_from(["image", "import", "ubuntu:22.04", "--arch", "arm64"])
+                .expect("parse image import");
+
+        let ImageCommand::Import { arch, .. } = args.command else {
+            panic!("expected image import command");
+        };
+        assert_eq!(arch, "arm64");
     }
 }
