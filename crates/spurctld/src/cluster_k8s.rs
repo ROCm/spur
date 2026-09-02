@@ -830,9 +830,11 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
         .map(|(state, _)| state)
 }
 
-/// The address Calico/kubelet should use for `node`: its mesh IP when the mesh is actually up
+/// The address Calico/kubelet should use for `node`: its mesh IP when the mesh is configured
 /// (`net.wg_enabled`), else its real underlay address — a `k0s_mesh_ip` handed out with the mesh
 /// disabled is a pool-allocated address never bound to any interface, so it must not be used.
+/// `kubelet --node-ip` requires a literal IP (unlike `Node.address`, which may be an FQDN), so the
+/// underlay branch only returns a value that parses as one.
 fn calico_node_address<'a>(
     net: &ClusterNetworking,
     node: &'a spur_core::node::Node,
@@ -840,7 +842,9 @@ fn calico_node_address<'a>(
     if net.wg_enabled {
         node.k0s_mesh_ip.as_deref()
     } else {
-        node.address.as_deref()
+        node.address
+            .as_deref()
+            .filter(|addr| addr.parse::<std::net::IpAddr>().is_ok())
     }
 }
 
@@ -1933,6 +1937,16 @@ mod tests {
         n.k0s_mesh_ip = Some("10.44.0.1".into());
         n.address = Some("203.0.113.9".into());
         assert_eq!(calico_node_address(&net, &n), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn calico_node_address_rejects_an_fqdn_underlay_address() {
+        let net = test_net(false, "calico");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        // Node.address may be an FQDN (docs/deployment/native-host.rst), but kubelet --node-ip
+        // requires a literal IP -- must defer rather than pass a hostname through.
+        n.address = Some("cp.example.internal".into());
+        assert_eq!(calico_node_address(&net, &n), None);
     }
 
     #[test]

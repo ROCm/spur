@@ -67,9 +67,9 @@ mod local_path_tests {
 /// fragmentation). Returns `None` for any `cni` other than `"calico"` (the k0s default, kube-router,
 /// needs no config file). `sans` are extra API-server certificate SANs.
 ///
-/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over Calico's cryptokey/overlay routing,
-/// so node-local load balancing (EnvoyProxy) is enabled to give konnectivity a cluster-wide balanced
-/// endpoint instead of pinning every agent to one controller.
+/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over the mesh's cryptokey routing (`bird`
+/// mode) or Calico's own overlay (`vxlan` mode), so node-local load balancing (EnvoyProxy) is enabled
+/// to give konnectivity a cluster-wide balanced endpoint instead of pinning every agent to one controller.
 #[allow(clippy::too_many_arguments)]
 pub fn k0s_controller_config_yaml(
     cni: &str,
