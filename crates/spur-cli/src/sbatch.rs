@@ -796,6 +796,10 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
 /// contain `=`.
 fn resolve_export_env(spec: &str, source: HashMap<String, String>) -> HashMap<String, String> {
     let tokens: Vec<&str> = spec.split(',').filter(|t| !t.is_empty()).collect();
+    // Fast path for the default: forward the environment as-is, no copy.
+    if tokens.as_slice() == ["ALL"] {
+        return source;
+    }
     let (mut env, rest) = match tokens.first() {
         Some(&"ALL") => (source.clone(), &tokens[1..]),
         Some(&"NONE") => (HashMap::new(), &tokens[1..]),
