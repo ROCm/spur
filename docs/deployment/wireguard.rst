@@ -96,6 +96,12 @@ Enable the ``wg-quick@<iface>`` unit so the interface is recreated on reboot fro
 The Ansible toolkit does this automatically when ``spur_wg_persist=true`` (the
 default).
 
+``add-peer``, ``remove-peer``, and ``mesh`` also persist their result to
+``/etc/wireguard/<iface>.conf`` (in addition to applying it live), so a peer
+added this way survives the interface being recreated on reboot. Point
+``--config-dir`` at the same directory used for ``init``/``join`` if it isn't
+the default ``/etc/wireguard``.
+
 Removing a node from the mesh
 =============================
 

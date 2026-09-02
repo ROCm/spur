@@ -95,6 +95,9 @@ pub enum NetCommand {
         /// WireGuard interface name
         #[arg(long, default_value = "spur0")]
         interface: String,
+        /// Config directory the peer is also persisted to, so it survives an interface reload
+        #[arg(long, default_value = "/etc/wireguard")]
+        config_dir: PathBuf,
     },
     /// Remove a peer from the running WireGuard interface by its public key (the counterpart to
     /// add-peer; e.g. when a node leaves the mesh). Idempotent — removing an absent peer succeeds.
@@ -105,6 +108,9 @@ pub enum NetCommand {
         /// WireGuard interface name
         #[arg(long, default_value = "spur0")]
         interface: String,
+        /// Config directory the peer is also removed from, so it does not reappear on reload
+        #[arg(long, default_value = "/etc/wireguard")]
+        config_dir: PathBuf,
     },
     /// Apply a full-mesh peering from a membership file on the local node.
     ///
@@ -131,6 +137,10 @@ pub enum NetCommand {
         /// WireGuard interface name
         #[arg(long, default_value = "spur0")]
         interface: String,
+        /// Config directory the resulting peers are also persisted to, so the mesh survives an
+        /// interface reload (there is no daemon to re-push it, unlike the k0s reconcile loop)
+        #[arg(long, default_value = "/etc/wireguard")]
+        config_dir: PathBuf,
         /// Print the computed peers/routes without applying them.
         #[arg(long)]
         dry_run: bool,
@@ -174,6 +184,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             program_routes,
             endpoint,
             interface,
+            config_dir,
         } => cmd_add_peer(
             &key,
             &allowed_ip,
@@ -181,15 +192,28 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             program_routes,
             endpoint.as_deref(),
             &interface,
+            &config_dir,
         ),
-        NetCommand::RemovePeer { key, interface } => cmd_remove_peer(&key, &interface),
+        NetCommand::RemovePeer {
+            key,
+            interface,
+            config_dir,
+        } => cmd_remove_peer(&key, &interface, &config_dir),
         NetCommand::Mesh {
             config,
             self_ip,
             program_routes,
             interface,
+            config_dir,
             dry_run,
-        } => cmd_mesh(&config, &self_ip, &interface, program_routes, dry_run),
+        } => cmd_mesh(
+            &config,
+            &self_ip,
+            &interface,
+            program_routes,
+            &config_dir,
+            dry_run,
+        ),
     }
 }
 
@@ -318,6 +342,7 @@ fn cmd_add_peer(
     program_routes: bool,
     endpoint: Option<&str>,
     interface: &str,
+    config_dir: &Path,
 ) -> Result<()> {
     // Validate CIDRs before shelling out to `wg`/`ip` so bad input fails fast.
     mesh::validate_cidr(allowed_ip).context("--allowed-ip")?;
@@ -325,6 +350,9 @@ fn cmd_add_peer(
     if let Some(pod) = pod_cidr {
         mesh::validate_cidr(pod).context("--pod-cidr")?;
     }
+    // Trimmed so a trailing newline/space from shell substitution (e.g. `--key "$(wg pubkey)"`)
+    // doesn't fail the persisted config's exact-match peer lookup and duplicate the entry.
+    let key = key.trim();
 
     // When a pod CIDR is given, fold it into AllowedIPs so WireGuard forwards
     // the peer's pod traffic (native-routing CNI over the mesh).
@@ -340,7 +368,8 @@ fn cmd_add_peer(
         persistent_keepalive: Some(25),
     };
 
-    wireguard::add_peer(interface, &peer)?;
+    let config_path = config_dir.join(format!("{}.conf", interface));
+    wireguard::add_peer_durable(interface, &config_path, &peer)?;
 
     // AllowedIPs (above) is all WireGuard needs. The kernel FIB route is the
     // CNI's job in native-routing mode; only program it when asked (no CNI).
@@ -370,8 +399,10 @@ fn cmd_add_peer(
     Ok(())
 }
 
-fn cmd_remove_peer(key: &str, interface: &str) -> Result<()> {
-    wireguard::remove_peer(interface, key)?;
+fn cmd_remove_peer(key: &str, interface: &str, config_dir: &Path) -> Result<()> {
+    let key = key.trim();
+    let config_path = config_dir.join(format!("{}.conf", interface));
+    wireguard::remove_peer_durable(interface, &config_path, key)?;
     eprintln!("Peer removed from {}:", interface);
     eprintln!("  Public key: {}", key);
     Ok(())
@@ -382,6 +413,7 @@ fn cmd_mesh(
     self_ip: &str,
     interface: &str,
     program_routes: bool,
+    config_dir: &Path,
     dry_run: bool,
 ) -> Result<()> {
     let self_ip = self_ip.trim();
@@ -453,7 +485,14 @@ fn cmd_mesh(
          the membership file must list every live node."
     );
 
-    let applied = mesh::apply_mesh(interface, self_ip, &membership.nodes, program_routes)?;
+    let config_path = config_dir.join(format!("{}.conf", interface));
+    let applied = mesh::apply_mesh_durable(
+        interface,
+        self_ip,
+        &membership.nodes,
+        program_routes,
+        &config_path,
+    )?;
     eprintln!(
         "Mesh applied on {}: {} peer(s){} for {}.",
         interface,
@@ -523,9 +562,14 @@ mod tests {
     fn parses_remove_peer_with_key_and_iface_default() {
         let args = NetArgs::try_parse_from(["net", "remove-peer", "--key", "abc="]).unwrap();
         match args.command {
-            NetCommand::RemovePeer { key, interface } => {
+            NetCommand::RemovePeer {
+                key,
+                interface,
+                config_dir,
+            } => {
                 assert_eq!(key, "abc=");
                 assert_eq!(interface, "spur0");
+                assert_eq!(config_dir, PathBuf::from("/etc/wireguard"));
             }
             _ => panic!("wrong command"),
         }
