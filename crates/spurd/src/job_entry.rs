@@ -1,8 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/// Namespace and isolation metadata for a tracked job, used to build the
-/// correct `nsenter` arguments for entering the job's execution context.
+use std::path::PathBuf;
+
+/// Namespace, cgroup, and isolation metadata for a tracked job, used to build
+/// the correct `nsenter` arguments for entering the job's execution context.
 #[derive(Debug, Clone)]
 pub struct JobEntry {
     pub pid: i32,
@@ -12,6 +14,9 @@ pub struct JobEntry {
     pub uid: u32,
     pub gid: u32,
     pub work_dir: String,
+    /// The job's cgroup, when one exists. It carries the job's resource limits
+    /// and device filter, so anything launched into the job belongs in it.
+    pub cgroup_path: Option<PathBuf>,
 }
 
 impl JobEntry {
@@ -74,6 +79,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/home/user".into(),
+            cgroup_path: None,
         };
         let args = entry.nsenter_args();
         assert_eq!(
@@ -97,6 +103,7 @@ mod tests {
             uid: 0,
             gid: 0,
             work_dir: "/".into(),
+            cgroup_path: None,
         };
         let args = entry.nsenter_args();
         assert_eq!(
@@ -121,6 +128,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/tmp".into(),
+            cgroup_path: None,
         };
         assert!(!entry.has_namespaces());
         let args = entry.nsenter_args();
@@ -137,6 +145,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/".into(),
+            cgroup_path: None,
         };
         let args = entry.nsenter_args();
         assert_eq!(

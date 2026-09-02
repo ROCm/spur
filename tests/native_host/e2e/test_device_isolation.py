@@ -15,7 +15,7 @@ from typing import NamedTuple
 
 import pytest
 
-from cluster import parse_job_id, wait_job
+from cluster import parse_job_id, wait_job, wait_job_state
 
 KFD = "/dev/kfd"
 
@@ -68,6 +68,24 @@ def _run_probe(cluster, name: str, body: str, sbatch_args: list[str]) -> _Probe:
         f"output:\n{content}"
     )
     return _Probe(content, job_id)
+
+
+def _hold_job(cluster, name: str, sbatch_args: list[str]) -> int:
+    """Submit a long-lived job pinned to node 0 and return its id once RUNNING.
+
+    Steps and ``spur exec`` need a job that is still running to enter, which the
+    run-to-completion shape of :func:`_run_probe` cannot give them. Pinned for
+    the same reason: the allow-list is per node.
+    """
+    hold = cluster.write_file(f"{name}-hold.sh", "#!/bin/bash\nsleep 300\n")
+    sb = cluster.sbatch(
+        ["-J", name, "-N", "1", "-w", cluster.node_names[0]] + sbatch_args + [hold]
+    )
+    job_id = parse_job_id(sb)
+    assert job_id is not None, f"sbatch failed: {sb}"
+
+    wait_job_state(cluster, job_id, "R", timeout=120)
+    return job_id
 
 
 def _require_rootful(cluster) -> None:
@@ -163,6 +181,145 @@ class TestDeviceIsolation:
         assert f"{KFD}=EPERM" in content, (
             f"re-exporting the GPU selectors must not restore access to {KFD}\n"
             f"output:\n{content}"
+        )
+
+
+@pytest.mark.rootful
+class TestStepAndExecDeviceIsolation:
+    """The filter is attached to the job's cgroup, so it only reaches a process
+    that is in it. ``srun`` steps and ``spur exec`` are not batch payloads and
+    have to join it themselves; each of these opened ``/dev/kfd`` freely from
+    inside a zero-GPU job before that join existed.
+    """
+
+    def test_step_in_a_zero_gpu_job_is_denied_the_gpu_control_node(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+
+        job_id = _hold_job(cluster, "dev-iso-step-zero", [])
+        probe = cluster.write_file(
+            "dev-iso-step-zero-probe.sh", _probe_script(f"probe_open {KFD}\n")
+        )
+        try:
+            code, out = cluster.srun_in_allocation(job_id, [probe])
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the step did not run to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert f"{KFD}=EPERM" in out, (
+            f"a step in a zero-GPU job must be denied {KFD} by the kernel\n"
+            f"output:\n{out}"
+        )
+
+    def test_step_in_an_allocated_gpu_job_can_open_the_control_node(self, gpu_cluster):
+        # Isolation must not cost a step the hardware its job was granted.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+
+        job_id = _hold_job(cluster, "dev-iso-step-alloc", ["--gres=gpu:1"])
+        probe = cluster.write_file(
+            "dev-iso-step-alloc-probe.sh", _probe_script(f"probe_open {KFD}\n")
+        )
+        try:
+            code, out = cluster.srun_in_allocation(job_id, [probe])
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert f"{KFD}=OPEN" in out, (
+            f"a step in a job allocated a GPU must be able to open {KFD} "
+            f"(exit {code})\noutput:\n{out}"
+        )
+
+    def test_step_in_a_zero_gpu_interactive_allocation_is_denied_the_control_node(
+        self, gpu_cluster
+    ):
+        # An interactive allocation launches no payload, so its cgroup exists
+        # only because registration created one — nothing later would.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+
+        probe = cluster.write_file(
+            "dev-iso-salloc-probe.sh", _probe_script(f"probe_open {KFD}\n")
+        )
+        out_path = f"{cluster.remote_dir}/dev-iso-salloc.out"
+        code, out = cluster.salloc_run(
+            f"'{cluster.bin_dir}/srun' '{probe}' > '{out_path}' 2>&1",
+            salloc_args=["-N", "1", "-w", cluster.node_names[0], "-t", "0:05"],
+        )
+        assert code == 0, f"salloc failed (exit {code}):\n{out}"
+
+        content = cluster.nodes[0].read_file(out_path)
+        assert "DEVICE_PROBE_OK" in content, (
+            f"the step did not run to completion\noutput:\n{content}\nsalloc:\n{out}"
+        )
+        assert f"{KFD}=EPERM" in content, (
+            f"a step in a zero-GPU interactive allocation must be denied {KFD}\n"
+            f"output:\n{content}"
+        )
+
+    def test_exec_into_a_zero_gpu_job_is_denied_the_gpu_control_node(self, gpu_cluster):
+        # `spur exec` enters the job's namespaces, and namespaces are not
+        # cgroups: entry alone would leave it holding spurd's own cgroup.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+
+        job_id = _hold_job(cluster, "dev-iso-exec-zero", [])
+        probe = cluster.write_file(
+            "dev-iso-exec-zero-probe.sh", _probe_script(f"probe_open {KFD}\n")
+        )
+        try:
+            out = cluster.cli_allow_fail(["spur", "exec", str(job_id), "bash", probe])
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"spur exec did not run the probe\n{cluster.debug_job(job_id)}\n"
+            f"output:\n{out}"
+        )
+        assert f"{KFD}=EPERM" in out, (
+            f"spur exec into a zero-GPU job must be denied {KFD} by the kernel\n"
+            f"output:\n{out}"
+        )
+
+    def test_a_step_lands_in_the_job_cgroup(self, gpu_cluster):
+        # Membership is the mechanism every deny above rests on, so assert it
+        # directly. Read from inside the step: a read from the test would race
+        # the step's exit, which drops the pid from cgroup.procs.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+
+        job_id = _hold_job(cluster, "dev-iso-step-cgroup", [])
+        procs = f"/sys/fs/cgroup/spur/job_{job_id}/cgroup.procs"
+        probe = cluster.write_file(
+            "dev-iso-step-cgroup-probe.sh",
+            f"""#!/bin/bash
+if grep -qx "$$" {procs} 2>/dev/null; then
+  echo STEP_CGROUP=JOINED
+else
+  echo STEP_CGROUP=OUTSIDE
+fi
+echo "STEP_PID=$$ PROCS=$(tr '\\n' ' ' < {procs} 2>/dev/null)"
+""",
+        )
+        try:
+            code, out = cluster.srun_in_allocation(job_id, [probe])
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "STEP_CGROUP=JOINED" in out, (
+            f"the step's pid must appear in {procs} (exit {code})\noutput:\n{out}"
         )
 
 
