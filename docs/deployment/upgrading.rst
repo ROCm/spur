@@ -248,6 +248,11 @@ Follow this order for any cluster upgrade:
    controller is not supported** — an older controller reads the widened columns as
    32-bit and its accounting queries fail against a migrated database. Take a database
    backup before upgrading if you need a recovery path.
+7. **Roll forward, not back.** The Raft log gains entries — new job states, pending
+   reasons, operations — as Spur evolves, and a controller replaying a log written by a
+   newer build cannot parse them. A newer controller reads older logs fine, so the
+   supported recovery from a bad upgrade is to roll forward, not to reinstall the
+   previous version over a log the new one has already written.
 
 Behavior Changes Between Releases
 ---------------------------------

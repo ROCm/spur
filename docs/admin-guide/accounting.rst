@@ -610,6 +610,50 @@ applied over it.
    an existing job, set its limit directly with
    ``scontrol update job <id> TimeLimit=<time>``.
 
+.. _limits-unreadable:
+
+When limits cannot be read
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Limits are served from caches that ``spurctld`` refreshes from the accounting
+database, and a freshly started controller has none until its first fetch
+completes. The job queue, by contrast, is durable — a controller that restarts or
+takes over as leader inherits its predecessor's pending jobs immediately.
+
+While accounting is enabled and a cache holds no snapshot, jobs that name a QOS
+or an account are **not scheduled**. They pend with reason
+``AccountingUnavailable`` and start on their own once the cache loads. The
+alternative is worse: a running job is never re-checked against limits, so a job
+admitted during that window stays over the cap for its entire run.
+
+The hold is **self-clearing**, including on a cold start. If the accounting
+database is unreachable when ``spurctld`` starts, the controller does not give
+up: it retries the connection in the background with backoff and, once the
+database returns, connects, migrates, and starts the cache-refresh loops. The
+next scheduling pass then reads a loaded cache and admits the held jobs. No
+operator action is needed — there is deliberately no manual override, because
+``AccountingUnavailable`` is not an administrative hold (``scontrol release``
+does not apply to it) and clearing it by hand would admit jobs against the very
+limits that could not be read. The only operator lever is the configuration
+itself: fix ``database_url`` so the retry succeeds, or clear it to disable
+accounting — the latter is read at startup, so it takes a controller restart.
+
+Related cases:
+
+- A job whose QOS no longer exists — deleted or renamed while the job sat in the
+  queue — pends with ``InvalidQOS``, as in Slurm.
+- With accounting disabled (an empty ``database_url``) there are no limits to
+  read, so an empty cache means "no caps exist" and nothing is held.
+- The hold covers QOS and association limits. Consumption figures for
+  :ref:`grpwall-budgets` load separately, and a ``grpwall`` cap is unapplied
+  until the first figure is read — so do not assume every accounting limit fails
+  closed on restart.
+
+``AccountingUnavailable`` has no Slurm counterpart, because Slurm keeps its
+association state on disk and declines to schedule without it rather than
+reaching this state. Jobs pending with it point at one thing: ``spurctld`` cannot
+reach the accounting database. The controller log carries the fetch failure.
+
 .. _grpwall-budgets:
 
 Group wall-clock budgets (GrpWall)

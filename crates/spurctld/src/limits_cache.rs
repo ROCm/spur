@@ -59,6 +59,16 @@ impl QosCache {
         snap.loaded = true;
     }
 
+    /// Test-only seam: returns the cache to its pre-first-fetch state, as a
+    /// freshly started controller sees it while jobs submitted by its
+    /// predecessor are already queued.
+    #[cfg(test)]
+    pub(crate) fn reset(&self) {
+        let mut snap = self.snapshot.write();
+        snap.qos.clear();
+        snap.loaded = false;
+    }
+
     pub fn spawn_refresh_loop(self: &Arc<Self>, pool: PgPool, refresh_interval_secs: u64) {
         let cache = Arc::clone(self);
         let interval = Duration::from_secs(refresh_interval_secs.max(10));

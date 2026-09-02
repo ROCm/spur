@@ -329,6 +329,12 @@ pub enum PendingReason {
     /// Replaces `BeginTime` as the pending reason for preempted-requeued jobs so the
     /// reason string is unambiguous.
     Preempted,
+
+    /// Accounting is enabled but its caches hold no snapshot, so the job's QOS or
+    /// association limits cannot be read. Has no Slurm counterpart: Slurm keeps its
+    /// association state on disk and refuses to start without it, so it never
+    /// schedules in this state to begin with.
+    AccountingUnavailable,
 }
 
 impl PendingReason {
@@ -417,6 +423,7 @@ impl PendingReason {
             Self::QosMaxSubmitJobPerAccountLimit => "MaxSubmitJobsPerAccount",
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
             Self::Preempted => "Preempted",
+            Self::AccountingUnavailable => "AccountingUnavailable",
         }
     }
 
@@ -2337,6 +2344,21 @@ mod tests {
             PendingReason::Preempted.explains_begin_hold(),
             "Preempted must be treated as a begin-time hold so it is not clobbered"
         );
+    }
+
+    // The variant reaches the Raft log through `WalOperation`, so its serialized
+    // name is a compatibility surface: renaming or reordering must fail here rather
+    // than on a controller replaying a log it cannot parse.
+    #[test]
+    fn accounting_unavailable_reason_displays_and_roundtrips() {
+        assert_eq!(
+            PendingReason::AccountingUnavailable.display(),
+            "AccountingUnavailable"
+        );
+        let json = serde_json::to_string(&PendingReason::AccountingUnavailable).unwrap();
+        assert_eq!(json, "\"AccountingUnavailable\"");
+        let back: PendingReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PendingReason::AccountingUnavailable);
     }
 
     #[test]

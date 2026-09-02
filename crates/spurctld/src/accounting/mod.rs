@@ -17,10 +17,175 @@ pub use reconcile::RECONCILE_INTERVAL_SECS;
 pub(crate) use txn::{TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource};
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::PgPool;
 
 use spur_core::accounting::{AccountLimits, TresRecord};
+use spur_core::config::SlurmConfig;
+
+use crate::cluster::ClusterManager;
+use crate::raft::RaftHandle;
+
+/// Start accounting for the controller.
+///
+/// Returns the gRPC service to register (`None` when accounting is disabled).
+/// The database connect, migration, and everything downstream of them — the
+/// job notifier, the reconcile and purge loops, and the four cache-refresh
+/// loops — run in a background task so startup never blocks on the database and,
+/// crucially, so a controller that boots while the database is unreachable
+/// keeps retrying and wires everything up once it returns. Without that retry a
+/// cold start with the database down would leave every cache unloaded for the
+/// life of the process, holding every inherited job that names a QOS or account
+/// (see `ClusterManager::accounting_block`).
+pub(crate) fn start(
+    config: &SlurmConfig,
+    cluster: Arc<ClusterManager>,
+    raft: Arc<RaftHandle>,
+) -> Option<AccountingService> {
+    if config.accounting.database_url.is_empty() {
+        tracing::info!("accounting disabled (database_url not configured)");
+        return None;
+    }
+
+    let service = AccountingService::unavailable("connecting to accounting database");
+    let bringup = service.clone();
+    let url = config.accounting.database_url.clone();
+    let params = ActivationParams::from_config(config);
+    tokio::spawn(async move {
+        let pool = connect_with_retry(&url, &bringup).await;
+        activate(pool, &bringup, &cluster, &raft, &params);
+    });
+    Some(service)
+}
+
+/// The config values `activate` needs, copied out so the bring-up task does not
+/// have to hold the whole `SlurmConfig`.
+struct ActivationParams {
+    fairshare_halflife_days: u32,
+    refresh_secs: u64,
+    grp_wall_window_days: u32,
+    txn_retention_days: Option<u32>,
+}
+
+impl ActivationParams {
+    fn from_config(config: &SlurmConfig) -> Self {
+        Self {
+            fairshare_halflife_days: config.scheduler.fairshare_halflife_days,
+            refresh_secs: config.accounting.fairshare_refresh_secs as u64,
+            grp_wall_window_days: config.accounting.grp_wall_window_days,
+            txn_retention_days: config.accounting.txn_retention_days.filter(|d| *d > 0),
+        }
+    }
+}
+
+/// Which phase of bring-up failed, so the service can report a specific cause
+/// while it keeps retrying.
+enum BringupError {
+    Connect(sqlx::Error),
+    Migrate(anyhow::Error),
+}
+
+impl BringupError {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Connect(_) => "database connection failed",
+            Self::Migrate(_) => "database migration failed",
+        }
+    }
+}
+
+impl std::fmt::Display for BringupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "{e}"),
+            Self::Migrate(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+async fn connect_and_migrate(url: &str) -> Result<PgPool, BringupError> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(url)
+        .await
+        .map_err(BringupError::Connect)?;
+    db::migrate(&pool).await.map_err(BringupError::Migrate)?;
+    Ok(pool)
+}
+
+/// Connect and migrate, retrying with capped exponential backoff until it
+/// succeeds. Each failure updates the service's unavailability reason so a
+/// client hitting accounting mid-outage sees the current cause.
+async fn connect_with_retry(url: &str, service: &AccountingService) -> PgPool {
+    const FIRST_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        match connect_and_migrate(url).await {
+            Ok(pool) => {
+                tracing::info!("accounting database connected");
+                return pool;
+            }
+            Err(e) => {
+                service.mark_unavailable(e.reason());
+                tracing::warn!(
+                    error = %e,
+                    retry_in_secs = backoff.as_secs(),
+                    "accounting database unavailable; retrying in background"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Wire a freshly connected pool into the controller: install it into the gRPC
+/// service, set the job notifier, and spawn the reconcile, purge, and
+/// cache-refresh loops. Runs once per successful connect — at startup when the
+/// database is up, or later when a cold-start outage clears.
+fn activate(
+    pool: PgPool,
+    service: &AccountingService,
+    cluster: &Arc<ClusterManager>,
+    raft: &Arc<RaftHandle>,
+    params: &ActivationParams,
+) {
+    service.install_pool(pool.clone());
+    cluster.set_accounting(AccountingNotifier::new(pool.clone()));
+
+    spawn_reconcile_loop(
+        pool.clone(),
+        cluster.clone(),
+        raft.clone(),
+        Duration::from_secs(RECONCILE_INTERVAL_SECS),
+    );
+
+    if let Some(days) = params.txn_retention_days {
+        spawn_txn_purge_loop(pool.clone(), raft.clone(), days, Duration::from_secs(3600));
+    }
+
+    cluster.fairshare_cache().spawn_refresh_loop(
+        pool.clone(),
+        params.fairshare_halflife_days,
+        params.refresh_secs,
+    );
+    cluster
+        .qos_cache()
+        .spawn_refresh_loop(pool.clone(), params.refresh_secs);
+    cluster
+        .association_cache()
+        .spawn_refresh_loop(pool.clone(), params.refresh_secs);
+    cluster.grp_wall_cache().spawn_refresh_loop(
+        pool,
+        params.refresh_secs,
+        params.grp_wall_window_days,
+    );
+}
 
 /// Compute fairshare factors directly from the database.
 ///
@@ -253,5 +418,13 @@ mod tests {
     fn account_limits_pass_through_positive() {
         let limits = super::account_limits_from_record(record_with_submit(Some(5)));
         assert_eq!(limits.grp_submit_jobs, Some(5));
+    }
+
+    #[test]
+    fn bringup_error_reason_names_the_failed_phase() {
+        let connect = super::BringupError::Connect(sqlx::Error::PoolClosed);
+        assert_eq!(connect.reason(), "database connection failed");
+        let migrate = super::BringupError::Migrate(anyhow::anyhow!("bad migration"));
+        assert_eq!(migrate.reason(), "database migration failed");
     }
 }

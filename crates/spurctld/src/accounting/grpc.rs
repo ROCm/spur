@@ -97,26 +97,61 @@ fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
     }
 }
 
-pub(crate) enum AccountingService {
-    Available(PgPool),
-    Unavailable { reason: &'static str },
+/// The accounting gRPC service. The pool is held behind a shared, swappable
+/// slot so a controller that boots while the database is unreachable can
+/// install the pool later, once the background bring-up connects — the same
+/// handle keeps serving `Unavailable` until then. Cloning shares that slot, so
+/// the copy handed to the gRPC server and the copy the bring-up keeps see each
+/// other's writes.
+pub(crate) struct AccountingService {
+    inner: std::sync::Arc<AccountingInner>,
+}
+
+struct AccountingInner {
+    pool: parking_lot::RwLock<Option<PgPool>>,
+    reason: parking_lot::RwLock<&'static str>,
+}
+
+impl Clone for AccountingService {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl AccountingService {
-    pub(crate) fn available(pool: PgPool) -> Self {
-        Self::Available(pool)
-    }
-
     pub(crate) fn unavailable(reason: &'static str) -> Self {
-        Self::Unavailable { reason }
+        Self {
+            inner: std::sync::Arc::new(AccountingInner {
+                pool: parking_lot::RwLock::new(None),
+                reason: parking_lot::RwLock::new(reason),
+            }),
+        }
     }
 
-    fn pool(&self) -> Result<&PgPool, Status> {
-        match self {
-            Self::Available(pool) => Ok(pool),
-            Self::Unavailable { reason } => Err(Status::unavailable(format!(
-                "accounting service is not available ({reason})"
-            ))),
+    /// Install the pool once the background bring-up connects, flipping every
+    /// clone of this service from `Unavailable` to serving live queries.
+    pub(crate) fn install_pool(&self, pool: PgPool) {
+        *self.inner.pool.write() = Some(pool);
+    }
+
+    /// Record why the service is still unavailable, so a client hitting it
+    /// during the connect-retry window sees the latest cause rather than a
+    /// stale one.
+    pub(crate) fn mark_unavailable(&self, reason: &'static str) {
+        *self.inner.reason.write() = reason;
+    }
+
+    fn pool(&self) -> Result<PgPool, Status> {
+        match self.inner.pool.read().as_ref() {
+            Some(pool) => Ok(pool.clone()),
+            None => {
+                let reason = *self.inner.reason.read();
+                Err(Status::unavailable(format!(
+                    "accounting service is not available ({reason})"
+                )))
+            }
         }
     }
 }
@@ -135,6 +170,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<RecordJobStartRequest>,
     ) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         let start_time = req
             .start_time
@@ -184,6 +220,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<RecordJobEndRequest>,
     ) -> Result<Response<()>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         let end_time = req
             .end_time
@@ -227,6 +264,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<GetJobHistoryRequest>,
     ) -> Result<Response<GetJobHistoryResponse>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
 
         let start_after = timestamp_to_utc(req.start_after)?;
@@ -359,6 +397,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<GetUsageRequest>,
     ) -> Result<Response<GetUsageResponse>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
 
         let since = req
@@ -416,6 +455,7 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<()>, Status> {
         require_admin(&request, "create account")?;
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
@@ -440,6 +480,7 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<()>, Status> {
         require_admin(&request, "delete account")?;
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         db::delete_account(pool, &req.name)
             .await
@@ -452,6 +493,7 @@ impl SlurmAccounting for AccountingService {
         _request: Request<ListAccountsRequest>,
     ) -> Result<Response<ListAccountsResponse>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let records = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -475,6 +517,7 @@ impl SlurmAccounting for AccountingService {
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         require_admin(&request, "add user")?;
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         let admin_level = req
             .admin_level
@@ -563,6 +606,7 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<()>, Status> {
         require_admin(&request, "remove user")?;
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         let deleted = db::remove_user(pool, &req.user, &req.account)
             .await
@@ -583,6 +627,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         let account = if req.account.is_empty() {
             None
@@ -622,6 +667,7 @@ impl SlurmAccounting for AccountingService {
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         require_admin(&request, "create qos")?;
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         if let Some(t) = &req.max_tres_per_job {
             validate_tres("maxtresperjob", t)?;
@@ -697,6 +743,7 @@ impl SlurmAccounting for AccountingService {
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
         require_admin(&request, "delete qos")?;
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         db::delete_qos(pool, &req.name)
             .await
@@ -709,6 +756,7 @@ impl SlurmAccounting for AccountingService {
         _request: Request<ListQosRequest>,
     ) -> Result<Response<ListQosResponse>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let records = db::list_qos(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -744,6 +792,7 @@ impl SlurmAccounting for AccountingService {
         request: Request<GetFairshareFactorsRequest>,
     ) -> Result<Response<GetFairshareFactorsResponse>, Status> {
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
         let halflife_days = if req.halflife_days == 0 {
             14
@@ -789,6 +838,7 @@ impl SlurmAccounting for AccountingService {
         // Ungated, consistent with get_job_history and the rest of this service.
         // Confidentiality of the audit log requires auth.mode = required.
         let pool = self.pool()?;
+        let pool = &pool;
         let req = request.into_inner();
 
         let start_after = timestamp_to_utc(req.start_after)?;
@@ -944,6 +994,43 @@ mod tests {
         assert_eq!(
             status.message(),
             "accounting service is not available (database migration failed at startup)"
+        );
+    }
+
+    // The core of the cold-start recovery: a service that boots unavailable must
+    // start serving once the background bring-up installs the pool, and every
+    // clone must see that install through the shared slot (the gRPC server holds
+    // one clone, the bring-up task another). `connect_lazy` yields a real
+    // `PgPool` without touching a database, so this exercises the actual
+    // install/read path rather than a stand-in.
+    #[tokio::test]
+    async fn install_pool_recovers_a_cloned_unavailable_service() {
+        let service = AccountingService::unavailable("connecting to accounting database");
+        let server_copy = service.clone();
+        assert!(
+            server_copy.pool().is_err(),
+            "must report unavailable before the pool is installed"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://spur:spur@127.0.0.1:5433/does-not-connect")
+            .expect("lazy pool builds without connecting");
+        service.install_pool(pool);
+
+        assert!(
+            server_copy.pool().is_ok(),
+            "the server's clone must observe the pool the bring-up installed"
+        );
+    }
+
+    #[test]
+    fn mark_unavailable_updates_the_reported_reason() {
+        let service = AccountingService::unavailable("connecting to accounting database");
+        service.mark_unavailable("database migration failed");
+        let status = service.pool().unwrap_err();
+        assert_eq!(
+            status.message(),
+            "accounting service is not available (database migration failed)"
         );
     }
 

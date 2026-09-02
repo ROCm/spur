@@ -187,82 +187,12 @@ async fn main() -> anyhow::Result<()> {
     cluster.set_sched_stats(sched_stats.clone());
 
     // Accounting stays best-effort so a database outage does not stop scheduling.
-    let accounting_service = if config.accounting.database_url.is_empty() {
-        info!("accounting disabled (database_url not configured)");
-        None
-    } else {
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(8)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .connect(&config.accounting.database_url)
-            .await
-        {
-            Ok(pool) => {
-                if let Err(e) = accounting::db::migrate(&pool).await {
-                    tracing::error!(
-                        error = %e,
-                        "accounting migration failed; accounting service will report unavailable"
-                    );
-                    Some(accounting::AccountingService::unavailable(
-                        "database migration failed at startup",
-                    ))
-                } else {
-                    info!("accounting database connected");
-                    let notifier = accounting::AccountingNotifier::new(pool.clone());
-                    cluster.set_accounting(notifier);
-
-                    accounting::spawn_reconcile_loop(
-                        pool.clone(),
-                        cluster.clone(),
-                        raft_handle.clone(),
-                        std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
-                    );
-
-                    if let Some(days) = config.accounting.txn_retention_days.filter(|d| *d > 0) {
-                        accounting::spawn_txn_purge_loop(
-                            pool.clone(),
-                            raft_handle.clone(),
-                            days,
-                            std::time::Duration::from_secs(3600),
-                        );
-                    }
-
-                    cluster.fairshare_cache().spawn_refresh_loop(
-                        pool.clone(),
-                        config.scheduler.fairshare_halflife_days,
-                        config.accounting.fairshare_refresh_secs as u64,
-                    );
-
-                    cluster.qos_cache().spawn_refresh_loop(
-                        pool.clone(),
-                        config.accounting.fairshare_refresh_secs as u64,
-                    );
-
-                    cluster.association_cache().spawn_refresh_loop(
-                        pool.clone(),
-                        config.accounting.fairshare_refresh_secs as u64,
-                    );
-
-                    cluster.grp_wall_cache().spawn_refresh_loop(
-                        pool.clone(),
-                        config.accounting.fairshare_refresh_secs as u64,
-                        config.accounting.grp_wall_window_days,
-                    );
-
-                    Some(accounting::AccountingService::available(pool))
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to connect to accounting database; accounting service will report unavailable"
-                );
-                Some(accounting::AccountingService::unavailable(
-                    "database connection failed at startup",
-                ))
-            }
-        }
-    };
+    // The connect, migration, notifier, and refresh loops are brought up in a
+    // background task that retries until the database is reachable, so a
+    // controller that boots with the database down converges on its own — its
+    // caches load once the database returns and the fail-closed hold on
+    // QOS/account jobs clears without operator action.
+    let accounting_service = accounting::start(&config, cluster.clone(), raft_handle.clone());
 
     // Start scheduler loop (only schedules when this node is Raft leader)
     let sched_cluster = cluster.clone();
