@@ -226,6 +226,10 @@ async fn main() -> anyhow::Result<()> {
             .map(|c| c.network.wg_interface.clone())
             .unwrap_or_else(|| "spur0".into())
     });
+    // Directory holding `<wg_iface>.conf`, matching `spur net init/join/add-peer`'s own default.
+    let wg_config_dir: std::path::PathBuf = std::env::var("SPUR_WG_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/etc/wireguard"));
 
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(
@@ -341,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
         labels,
         args.token.unwrap_or_default(),
         wg_iface,
+        wg_config_dir,
         running_jobs.clone(),
     ));
 

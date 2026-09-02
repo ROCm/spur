@@ -177,11 +177,15 @@ pub fn apply_mesh_durable(
 }
 
 /// Of the interface's `current` peer public keys, those NOT in the desired member set (self
-/// excluded) — i.e. peers for nodes that have left the mesh and should be removed. Pure + tested.
+/// excluded) and NOT in `protected` — i.e. peers for nodes that have left the mesh and should be
+/// removed. `protected` is a peer's exemption from this reconcile entirely: a key present in the
+/// node's own persisted config (added via `spur net add-peer`, outside this membership) is never
+/// this reconcile's to remove, no matter the membership it was pushed. Pure + tested.
 pub fn peers_to_prune<'a>(
     current: &'a [String],
     self_mesh_ip: &str,
     members: &[MeshNode],
+    protected: &std::collections::HashSet<String>,
 ) -> Vec<&'a str> {
     let desired: std::collections::HashSet<String> = mesh_peers_for(self_mesh_ip, members)
         .into_iter()
@@ -189,7 +193,7 @@ pub fn peers_to_prune<'a>(
         .collect();
     current
         .iter()
-        .filter(|k| !desired.contains(k.as_str()))
+        .filter(|k| !desired.contains(k.as_str()) && !protected.contains(k.as_str()))
         .map(String::as_str)
         .collect()
 }
@@ -197,16 +201,18 @@ pub fn peers_to_prune<'a>(
 /// Reconcile the full mesh: prune peers no longer in `members`, then add/update the desired peers.
 /// Unlike [`apply_mesh`] (additive only), this converges — a node dropped from `members` has its
 /// WireGuard peer removed. `current_peers` is the interface's live peer keys (from
-/// [`wireguard::list_peers`]). Returns `(added, pruned)`. `program_routes` as in [`apply_mesh`].
+/// [`wireguard::list_peers`]); `protected` peers are exempt (see [`peers_to_prune`]). Returns
+/// `(added, pruned)`. `program_routes` as in [`apply_mesh`].
 pub fn reconcile_mesh(
     interface: &str,
     self_mesh_ip: &str,
     members: &[MeshNode],
     current_peers: &[String],
+    protected: &std::collections::HashSet<String>,
     program_routes: bool,
 ) -> anyhow::Result<(usize, usize)> {
     let mut pruned = 0;
-    for key in peers_to_prune(current_peers, self_mesh_ip, members) {
+    for key in peers_to_prune(current_peers, self_mesh_ip, members, protected) {
         wireguard::remove_peer(interface, key)?;
         pruned += 1;
     }
@@ -327,12 +333,29 @@ mod tests {
             "pk-10.44.0.4".to_string(), // departed -> prune
             "pk-10.44.0.2".to_string(), // self (never a desired peer) -> prune
         ];
-        let prune = peers_to_prune(&current, "10.44.0.2", &members);
+        let prune = peers_to_prune(&current, "10.44.0.2", &members, &Default::default());
         assert_eq!(prune.len(), 2);
         assert!(prune.contains(&"pk-10.44.0.4"));
         assert!(prune.contains(&"pk-10.44.0.2"));
         assert!(!prune.contains(&"pk-10.44.0.1"));
         assert!(!prune.contains(&"pk-10.44.0.3"));
+    }
+
+    /// A peer absent from `members` is normally pruned (previous test) — but not if it's in
+    /// `protected`: a human explicitly added it via `spur net add-peer` for something outside this
+    /// membership (e.g. a non-k0s node), and this reconcile pass was never responsible for it.
+    #[test]
+    fn peers_to_prune_exempts_protected_peers() {
+        let members = vec![node("10.44.0.1", None), node("10.44.0.2", None)];
+        let current = vec![
+            "pk-10.44.0.1".to_string(),
+            "pk-manually-added".to_string(), // not in members, but protected -> must survive
+            "pk-truly-departed".to_string(), // not in members, not protected -> pruned
+        ];
+        let protected: std::collections::HashSet<String> =
+            ["pk-manually-added".to_string()].into_iter().collect();
+        let prune = peers_to_prune(&current, "10.44.0.2", &members, &protected);
+        assert_eq!(prune, vec!["pk-truly-departed"]);
     }
 
     /// `apply_mesh_durable` persists every computed peer to the config file before touching the
