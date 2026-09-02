@@ -183,6 +183,26 @@ async fn main() -> anyhow::Result<()> {
     let raft_handle = Arc::new(handle);
     cluster.set_raft(raft_handle.raft.clone());
 
+    // A panic inside RaftCore ends that task alone. Every other task, the gRPC
+    // listener included, keeps running, so the controller goes on accepting
+    // connections and serving reads from a state machine that can no longer be
+    // replicated to, and writes fail. Kubernetes cannot see it either: the
+    // readiness probe reaches the listener, not Raft. Leave instead, so the
+    // supervisor restarts a controller that is whole.
+    {
+        let supervised = raft_handle.clone();
+        tokio::spawn(async move {
+            supervised.core_stopped().await;
+            tracing::error!(
+                "RaftCore has stopped; this controller can no longer replicate. Exiting so the \
+                 supervisor restarts it."
+            );
+            // The state machine is behind an Arc that other tasks still hold, so
+            // a graceful unwind cannot be relied on here.
+            std::process::exit(70);
+        });
+    }
+
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
