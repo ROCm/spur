@@ -837,7 +837,7 @@ fn controller_k0s_config(
     net: &ClusterNetworking,
     node: &spur_core::node::Node,
     cp_count: usize,
-) -> Option<String> {
+) -> String {
     let api = node.k0s_mesh_ip.as_deref();
     // SANs: the mesh IP (advertised) + the underlay address (so `kubectl` over either works).
     let mut sans = Vec::new();
@@ -849,7 +849,7 @@ fn controller_k0s_config(
             }
         }
     }
-    Some(spur_core::k0s::k0s_controller_config_yaml(
+    spur_core::k0s::k0s_controller_config_yaml(
         &net.cni,
         &net.pod_cidr,
         &net.service_cidr,
@@ -857,7 +857,7 @@ fn controller_k0s_config(
         api,
         &sans,
         cp_count,
-    ))
+    )
 }
 
 /// One convergence pass: start any assigned component not yet active and, once the control-plane
@@ -906,7 +906,7 @@ async fn converge_provisioning(
         }
         // Generate the k0s config (CIDRs for either CNI; api on the mesh IP + Calico bird when
         // cni=calico). The bootstrap seeds etcd — no join token.
-        let k0s_config = controller_k0s_config(net, node, cp_count);
+        let k0s_config = Some(controller_k0s_config(net, node, cp_count));
         spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
     }
     // Don't mint join tokens for secondary CPs / workers until the bootstrap's etcd is seeded and its
@@ -946,7 +946,7 @@ async fn converge_provisioning(
         };
         // A secondary control-plane also needs its own generated k0s config (API SANs on its mesh IP).
         let k0s_config = if role == K0sRole::Controller {
-            controller_k0s_config(net, node, cp_count)
+            Some(controller_k0s_config(net, node, cp_count))
         } else {
             None
         };
@@ -1823,7 +1823,7 @@ mod tests {
             Some("198.51.100.1"),
             None,
         );
-        let y = controller_k0s_config(&net, &node, 1).expect("config always generated now");
+        let y = controller_k0s_config(&net, &node, 1);
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
         assert!(y.contains("provider: kuberouter"));
@@ -1840,7 +1840,7 @@ mod tests {
             Some("198.51.100.1"),
             None,
         );
-        let y = controller_k0s_config(&net, &node, 1).expect("config always generated now");
+        let y = controller_k0s_config(&net, &node, 1);
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
         assert!(y.contains("address: 10.44.0.1"));
@@ -1850,7 +1850,7 @@ mod tests {
     fn controller_k0s_config_carries_cidr_even_without_a_mesh_ip_yet() {
         let net = net_with_cni("calico");
         let node = mesh_node("cp", None, None, None, None);
-        let y = controller_k0s_config(&net, &node, 1).expect("config always generated now");
+        let y = controller_k0s_config(&net, &node, 1);
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(!y.contains("api:"));
     }

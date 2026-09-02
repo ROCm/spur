@@ -87,15 +87,13 @@ pub fn k0s_controller_config_yaml(
     y.push_str("metadata:\n");
     y.push_str("  name: k0s\n");
     y.push_str("spec:\n");
-    if mesh_native {
-        if let Some(api_address) = api_address {
-            y.push_str("  api:\n");
-            y.push_str(&format!("    address: {api_address}\n"));
-            if !sans.is_empty() {
-                y.push_str("    sans:\n");
-                for san in sans {
-                    y.push_str(&format!("      - {san}\n"));
-                }
+    if let Some(api_address) = api_address.filter(|_| mesh_native) {
+        y.push_str("  api:\n");
+        y.push_str(&format!("    address: {api_address}\n"));
+        if !sans.is_empty() {
+            y.push_str("    sans:\n");
+            for san in sans {
+                y.push_str(&format!("      - {san}\n"));
             }
         }
     }
@@ -239,6 +237,9 @@ mod k0s_config_tests {
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
         assert!(!y.contains("api:"));
+        assert!(y.contains("calico:"));
+        assert!(y.contains("mode: bird"));
+        assert!(y.contains("mtu: 1450"));
     }
 
     #[test]
