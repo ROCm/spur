@@ -112,7 +112,8 @@ impl PeerBuilder {
 
 impl WgConfig {
     /// Parse a wg-quick compatible config file previously written by [`Self::to_ini`]. Tolerates
-    /// blank lines and `#`/`;` comments so a manually-annotated file still round-trips.
+    /// blank lines and `#`/`;` comments so a manually-annotated file still parses — but [`Self::to_ini`]
+    /// always regenerates a normalized file, so those annotations do not survive a subsequent write.
     pub fn parse(content: &str) -> anyhow::Result<Self> {
         let mut private_key = None;
         let mut address = None;
@@ -393,9 +394,9 @@ pub fn add_peer_durable(interface: &str, config_path: &Path, peer: &WgPeer) -> a
             )
         })?;
         config.upsert_peer(peer.clone());
-        config.write_to(config_path)
-    })?;
-    add_peer(interface, peer)
+        config.write_to(config_path)?;
+        add_peer(interface, peer)
+    })
 }
 
 /// Remove a peer both live and from the persisted config at `config_path` — the counterpart to
@@ -408,14 +409,13 @@ pub fn remove_peer_durable(
     public_key: &str,
 ) -> anyhow::Result<()> {
     with_config_lock(config_path, || {
-        if !config_path.exists() {
-            return Ok(());
+        if config_path.exists() {
+            let mut config = WgConfig::read_from(config_path)?;
+            config.remove_peer_by_key(public_key);
+            config.write_to(config_path)?;
         }
-        let mut config = WgConfig::read_from(config_path)?;
-        config.remove_peer_by_key(public_key);
-        config.write_to(config_path)
-    })?;
-    remove_peer(interface, public_key)
+        remove_peer(interface, public_key)
+    })
 }
 
 /// Add (or replace) a kernel route for `cidr` via the WireGuard interface.
@@ -697,6 +697,58 @@ mod tests {
             "expected only the live wg step to fail, got: {err}"
         );
         assert!(dir.path().join("never-created-subdir").is_dir());
+    }
+
+    /// `add_peer_durable`/`remove_peer_durable`/`apply_mesh_durable` all run their live `wg` call
+    /// INSIDE the `with_config_lock` closure now (not after it returns), so two concurrent CLI
+    /// invocations can't have their live and persisted state land in different orders. This proves
+    /// the underlying primitive those callers depend on: two threads racing for the same lock path
+    /// never interleave their critical sections.
+    #[test]
+    fn with_config_lock_serializes_concurrent_critical_sections() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur0.conf");
+        let events: Arc<Mutex<Vec<(u32, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let handles: Vec<_> = (0..4)
+            .map(|id| {
+                let path = path.clone();
+                let events = events.clone();
+                std::thread::spawn(move || {
+                    with_config_lock(&path, || {
+                        events.lock().unwrap().push((id, "enter"));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        events.lock().unwrap().push((id, "exit"));
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let events = events.lock().unwrap();
+        let mut open: Option<u32> = None;
+        for (id, kind) in events.iter() {
+            match *kind {
+                "enter" => {
+                    assert!(
+                        open.is_none(),
+                        "thread {id} entered while {open:?} was still inside"
+                    );
+                    open = Some(*id);
+                }
+                "exit" => assert_eq!(open, Some(*id)),
+                _ => unreachable!(),
+            }
+            if *kind == "exit" {
+                open = None;
+            }
+        }
     }
 
     #[test]

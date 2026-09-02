@@ -18,8 +18,9 @@
 //!    mesh address), and a matching kernel route must exist over the interface.
 //!
 //! This module computes the per-node peer set (pure, tested) and applies it to
-//! a running interface via `wg set`. `AllowedIPs` is all WireGuard needs to
-//! forward pod traffic; the kernel FIB routes are owned by the CNI in
+//! a running interface via `wg set` (`apply_mesh`) or `wg set` plus a persisted
+//! config-file write (`apply_mesh_durable`). `AllowedIPs` is all WireGuard needs
+//! to forward pod traffic; the kernel FIB routes are owned by the CNI in
 //! native-routing mode, so spur only programs them on request (`program_routes`,
 //! for the no-CNI case). Applying is **additive** — it does not prune peers for
 //! nodes removed from the membership.
@@ -162,17 +163,17 @@ pub fn apply_mesh_durable(
         for peer in &peers {
             config.upsert_peer(peer.clone());
         }
-        config.write_to(config_path)
-    })?;
-    for peer in &peers {
-        wireguard::add_peer(interface, peer)?;
-    }
-    if program_routes {
-        for cidr in mesh_pod_routes(self_mesh_ip, members) {
-            wireguard::add_route(interface, cidr)?;
+        config.write_to(config_path)?;
+        for peer in &peers {
+            wireguard::add_peer(interface, peer)?;
         }
-    }
-    Ok(peers.len())
+        if program_routes {
+            for cidr in mesh_pod_routes(self_mesh_ip, members) {
+                wireguard::add_route(interface, cidr)?;
+            }
+        }
+        Ok(peers.len())
+    })
 }
 
 /// Of the interface's `current` peer public keys, those NOT in the desired member set (self
