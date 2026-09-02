@@ -115,9 +115,17 @@ impl VirtualAgent {
         let job = match result {
             Ok(Ok(job)) => job,
             Ok(Err(status)) => return Err(status),
+            // The retry above swallows NotFound while it waits for a label that
+            // may still be propagating. When the budget runs out the answer is
+            // that no SpurJob exists, which is an explicit rejection and not a
+            // transport failure: deadline_exceeded here made the controller
+            // report "agent unreachable" for a running, reachable operator.
             Err(_elapsed) => {
-                return Err(Status::deadline_exceeded(format!(
-                    "namespace lookup for spur.amd.com/job-id={job_id} timed out after {}s",
+                return Err(Status::not_found(format!(
+                    "no SpurJob carries the label spur.amd.com/job-id={job_id} after {}s. In Pod \
+                     mode the operator makes Pods only for a SpurJob custom resource, so a job \
+                     submitted with the CLI (sbatch, spur submit) has nothing to launch. Submit \
+                     it with `kubectl apply` of a SpurJob instead.",
                     NS_LOOKUP_BUDGET.as_secs()
                 )))
             }

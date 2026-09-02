@@ -1224,6 +1224,11 @@ async fn dispatch_to_agent(
             tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
                 DispatchError::Unreachable(s.into())
             }
+            // The agent answered and refused. Reporting this as unreachable sent
+            // the operator looking for a network fault that does not exist.
+            tonic::Code::NotFound | tonic::Code::FailedPrecondition => {
+                DispatchError::AgentRejected(s.message().to_string())
+            }
             _ => DispatchError::Other(s.into()),
         })?;
 
