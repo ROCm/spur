@@ -389,8 +389,32 @@ The default can be changed in ``spur.conf``:
    the ``spurd`` systemd unit is no longer required. The agent raises the limit
    itself while still privileged.
 
-CPU and Memory Limits (cgroups)
--------------------------------
+.. note::
+
+   ``spurd`` also raises its **own** ``RLIMIT_MEMLOCK`` at startup, because kernels
+   before 5.11 charge the memory for a job's BPF device filter against it rather
+   than against the memory cgroup.
+
+   This raise is **unconditional**: it happens before the configuration is read, so
+   a node with ``constrain_devices = false``, or with ``[cgroup]`` off entirely,
+   still gets it. That is deliberate — the agent's limit is then the same value
+   whether or not a BPF load ever happens — but it does mean that deferring the
+   device filter does **not** defer the change described next.
+
+   This changes what ``memlock = "inherit"`` yields. ``"inherit"`` means "do not
+   call ``setrlimit``, keep whatever ``spurd`` has", so an ``inherit`` job now
+   inherits the raised limit instead of the one the systemd unit granted. The
+   default ``"unlimited"`` sets the job's limit outright and is unaffected, so only
+   a site that explicitly chose ``"inherit"`` sees a difference.
+
+   A site that would rather own the value can set ``LimitMEMLOCK=infinity`` on the
+   ``spurd`` unit and get the same effective limit from systemd. That is also the
+   fallback when ``spurd`` cannot raise it itself: lifting the *hard* limit needs
+   ``CAP_SYS_RESOURCE``, and without it the agent can only raise the soft limit to
+   meet the existing hard one and logs that it could not go further.
+
+CPU, Memory, and Device Limits (cgroups)
+----------------------------------------
 
 ``spurd`` puts the payload it launches for a job into a cgroup-v2 group at
 ``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
@@ -412,6 +436,12 @@ Out of the box the batch payload gets:
   ``--mem`` a hard cap.
 - ``memory.oom.group`` set, so an OOM kills the whole job rather than one process.
 - ``pids.max`` as a fork-bomb guard.
+- A default-deny BPF device filter attached to the cgroup, so the job can open its
+  allocated device nodes, the base pseudo-devices, and the shared host-infrastructure
+  nodes (RDMA verbs and vendor control nodes) listed under
+  :ref:`device-filter-implicit-allow` — and nothing else. Name any device the list
+  misses in ``extra_device_paths``, or turn the filter off with
+  ``constrain_devices``.
 
 A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
 left unset.
@@ -424,6 +454,7 @@ Inspect what a running job actually got:
    cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus
    cat /sys/fs/cgroup/spur/job_1234/memory.max
    cat /sys/fs/cgroup/spur/job_1234/memory.swap.max
+   bpftool cgroup show /sys/fs/cgroup/spur/job_1234   # the device filter, if attached
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -438,7 +469,8 @@ What is not contained yet
 
 Only the payload launched through the agent's ``LaunchJob`` path joins
 ``job_<id>``. These paths start processes that stay outside it, in ``spurd``'s own
-cgroup, and are therefore **not** bounded by the job's limits:
+cgroup, and are therefore **not** bounded by the job's limits and **not** subject
+to its device filter:
 
 .. list-table::
    :header-rows: 1
@@ -459,11 +491,18 @@ cgroup, and are therefore **not** bounded by the job's limits:
      - The allocation is recorded for accounting, but its steps run through the
        ``srun`` step path above.
 
-Practically: a job cannot exceed its memory or core budget through its batch
-script, but it can through ``srun`` steps or an interactive shell. Closing this
-needs per-step cgroups nested under the job, which is planned but not implemented.
-Until then, do not rely on these limits as a security boundary between users on a
-shared node.
+Device isolation shares this gap exactly, and it is worth stating plainly because
+the enforcement is otherwise kernel-level and absolute. The filter is attached to
+the **cgroup**, not to the job's processes, so a process that never joins
+``job_<id>`` is never checked against it and can open **any** device node on the
+host — including a GPU allocated to another user's job. A user who runs ``srun``
+inside their own job, or who enters it with ``spur exec``, is not device-filtered.
+
+Practically: a job cannot exceed its memory or core budget, or reach a GPU it was
+not allocated, through its batch script — but it can through ``srun`` steps or an
+interactive shell. Closing this needs per-step cgroups nested under the job, which
+is planned but not implemented. Until then, do not rely on these limits or on the
+device filter as a security boundary between users on a shared node.
 
 MPI (PMIx)
 ----------
@@ -804,9 +843,24 @@ Each node in a multi-node job receives:
 GPU Isolation
 -------------
 
-Spur automatically restricts GPU visibility per job by exporting the allocated
-device ordinals into the standard GPU runtime variables:
-``ROCR_VISIBLE_DEVICES``, ``CUDA_VISIBLE_DEVICES``, and ``GPU_DEVICE_ORDINAL``.
+Spur restricts a job to its allocated GPUs in two layers:
+
+- **Visibility.** The allocated device ordinals are exported into the standard GPU
+  runtime variables — ``ROCR_VISIBLE_DEVICES``, ``CUDA_VISIBLE_DEVICES``, and
+  ``GPU_DEVICE_ORDINAL``. This layer is advisory: a job that overwrites them sees
+  every GPU on the node again. A root ``spurd`` additionally runs the batch payload
+  in a mount namespace where ``/dev/dri`` is replaced by a tmpfs carrying only the
+  job's own render nodes, so a job allocated no GPUs finds that directory empty.
+  Every mount there is best-effort and none of it is a boundary — that is the next
+  layer's job.
+- **Access.** With ``[cgroup] constrain_devices`` (on by default) the job's cgroup
+  carries a default-deny BPF device filter, so opening the device node of a GPU the
+  job was not allocated fails with ``EPERM`` in the kernel, whatever the
+  environment says.
+
+The filter is attached to the job cgroup, so it bounds the batch payload only:
+``srun`` steps and ``spur exec`` shells run outside that cgroup and keep host-wide
+device access. See :ref:`cgroup-containment-gaps`.
 
 See Also
 --------

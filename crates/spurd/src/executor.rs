@@ -19,6 +19,8 @@ use spur_core::config::{CgroupConfig, CgroupLimits, MemlockLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
+use crate::device_cgroup;
+
 /// Typed launch errors so callers can distinguish a broken node from a job that
 /// simply cannot run here.
 pub enum LaunchError {
@@ -505,7 +507,15 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = CgroupGuard(setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?);
+    let device_paths = allocated_device_paths(cfg.host_device_plan.as_ref());
+    let cgroup_path = CgroupGuard(setup_cgroup(
+        job_id,
+        &cfg.cgroup,
+        cpus,
+        memory_mb,
+        cpu_ids,
+        device_paths,
+    )?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -938,6 +948,13 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
     files
 }
 
+/// Device nodes the job's allocation granted. No injection plan means no devices
+/// were allocated, which must stay an empty list: the device filter allows exactly
+/// what it is handed, so anything else here would hand a zero-GPU job a GPU.
+fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>) -> &[String] {
+    plan.map(|p| p.device_paths.as_slice()).unwrap_or(&[])
+}
+
 /// Set up a cgroups v2 hierarchy for a job.
 fn setup_cgroup(
     job_id: JobId,
@@ -945,6 +962,7 @@ fn setup_cgroup(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
+    device_paths: &[String],
 ) -> anyhow::Result<Option<PathBuf>> {
     let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
         debug!(job_id, "cgroup enforcement disabled by config");
@@ -1045,6 +1063,17 @@ fn setup_cgroup(
         // every core on the node — the clamp above can empty a non-empty set.
         warn!(job_id, "no cores to pin; job runs without a CPU bound");
         degrade("no cores to pin");
+    }
+
+    // Attach before any of the job's processes join: the filter is consulted at
+    // open(2), so a device a process already holds open stays readable regardless.
+    if cgroup.constrain_devices {
+        let paths = device_cgroup::device_paths_for_job(device_paths, &cgroup.extra_device_paths);
+        let rules = device_cgroup::rules_for_device_paths(&paths, device_cgroup::stat_device_node);
+        if let Err(e) = device_cgroup::install_device_filter(&cgroup_path, &rules) {
+            warn!(job_id, error = %e, "device filter not installed; job runs without device isolation");
+            degrade("device filter not installed");
+        }
     }
 
     if let Some(reason) = degraded {
@@ -1834,18 +1863,30 @@ fn build_namespace_wrapper(
     visible_device_paths: &[String],
     script_path: &Path,
 ) -> String {
-    let gpu_mounts = visible_device_paths
+    let dri_nodes: Vec<&str> = visible_device_paths
         .iter()
         .filter(|p| p.starts_with("/dev/dri/"))
-        .map(|path| {
-            let basename = path.rsplit('/').next().unwrap_or("");
-            format!(
-                "  if [ -e $SPUR_HOST_DRI/{b} ]; then\n    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n  fi\n",
-                b = basename,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+        .filter_map(|p| p.rsplit('/').next())
+        .filter(|b| !b.is_empty())
+        .collect();
+    let stash_dri = dri_nodes
+        .iter()
+        .map(|b| format!("  cp -a /dev/dri/{b} $SPUR_HOST_DRI/{b} 2>/dev/null || true\n"))
+        .collect::<String>();
+
+    // The restore is gated on the mount: without the tmpfs it would land on the
+    // host's real /dev/dri, and `cp` unlinks a special file before recreating it.
+    // A failed mount stays non-fatal — it just skips the restore.
+    const MOUNT_DRI: &str = "mount -t tmpfs tmpfs /dev/dri 2>/dev/null";
+    let mount_and_restore_dri = if dri_nodes.is_empty() {
+        format!("  {MOUNT_DRI} || true\n")
+    } else {
+        let restore = dri_nodes
+            .iter()
+            .map(|b| format!("    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n"))
+            .collect::<String>();
+        format!("  if {MOUNT_DRI}; then\n{restore}  fi\n")
+    };
 
     let final_exec = if uid > 0 {
         format!(
@@ -1864,16 +1905,19 @@ fn build_namespace_wrapper(
             "# Namespace isolation wrapper — all mounts best-effort\n",
             "mount -t proc proc /proc 2>/dev/null || true\n",
             "mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\n",
-            "# GPU device restriction: save original /dev/dri, replace with\n",
-            "# tmpfs, then selectively copy only allocated devices back.\n",
+            "# GPU device restriction: stash the allocated /dev/dri nodes, replace\n",
+            "# the directory with a tmpfs, then copy only those back. Staging any\n",
+            "# other node would mknod a device the cgroup device filter denies.\n",
             "SPUR_HOST_DRI=$(mktemp -d /tmp/.spur_dri_XXXXXX 2>/dev/null || echo /tmp/.spur_dri)\n",
-            "if [ -d /dev/dri ] && cp -a /dev/dri/. $SPUR_HOST_DRI/ 2>/dev/null; then\n",
-            "  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n",
-            "{gpu_mounts}",
+            "if [ -d /dev/dri ]; then\n",
+            "  mkdir -p $SPUR_HOST_DRI 2>/dev/null || true\n",
+            "{stash_dri}",
+            "{mount_and_restore_dri}",
             "fi\n",
             "{final_exec}",
         ),
-        gpu_mounts = gpu_mounts,
+        stash_dri = stash_dri,
+        mount_and_restore_dri = mount_and_restore_dri,
         final_exec = final_exec,
     )
 }
@@ -2725,6 +2769,78 @@ mod tests {
 
         assert!(wrapper.contains("renderD128"));
         assert!(!wrapper.contains("nvidia"));
+    }
+
+    /// A bulk `cp -a /dev/dri/.` recreates every host node with `mknod(2)`, which
+    /// the device filter denies for nodes this job does not hold — and a failure
+    /// there must never be able to skip the tmpfs that hides them.
+    #[test]
+    fn test_namespace_wrapper_stages_only_allocated_dri_nodes() {
+        let script = PathBuf::from("/work/.spur_job_9.sh");
+        let paths = vec!["/dev/dri/renderD128".into()];
+        let wrapper = build_namespace_wrapper(1000, 1000, &paths, &script);
+
+        assert!(
+            !wrapper.contains("/dev/dri/."),
+            "no bulk copy of the host directory:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("cp -a /dev/dri/renderD128 $SPUR_HOST_DRI/renderD128"),
+            "the job's own node is staged:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("cp -a $SPUR_HOST_DRI/renderD128 /dev/dri/renderD128"),
+            "and restored onto the tmpfs:\n{wrapper}"
+        );
+        let mount = wrapper
+            .find("mount -t tmpfs tmpfs /dev/dri")
+            .expect("missing /dev/dri tmpfs mount");
+        let restore = wrapper
+            .find("cp -a $SPUR_HOST_DRI/")
+            .expect("missing restore");
+        assert!(
+            mount < restore,
+            "the tmpfs must be mounted before nodes are restored onto it:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("if mount -t tmpfs tmpfs /dev/dri 2>/dev/null; then"),
+            "and the restore must be gated on that mount: against the host's real \
+             /dev/dri, `cp` unlinks the node before recreating it:\n{wrapper}"
+        );
+    }
+
+    /// A job allocated no render nodes must still get the empty tmpfs; skipping the
+    /// mount would leave every GPU on the node visible in `/dev/dri`.
+    #[test]
+    fn test_namespace_wrapper_mounts_empty_dri_tmpfs_without_gpus() {
+        let script = PathBuf::from("/work/.spur_job_10.sh");
+        let wrapper = build_namespace_wrapper(1000, 1000, &[], &script);
+
+        assert!(
+            wrapper.contains("mount -t tmpfs tmpfs /dev/dri"),
+            "zero-GPU job must still hide the host's /dev/dri:\n{wrapper}"
+        );
+        assert!(
+            !wrapper.contains("cp -a"),
+            "nothing is staged for a job with no allocated nodes:\n{wrapper}"
+        );
+    }
+
+    /// The security-critical direction: a job launched without an injection plan
+    /// was allocated nothing, so the filter must be built from an empty list.
+    #[test]
+    fn no_injection_plan_yields_no_device_paths() {
+        assert!(allocated_device_paths(None).is_empty());
+
+        let plan = spur_devices::inject::HostInjectionPlan {
+            device_paths: vec!["/dev/dri/renderD128".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            allocated_device_paths(Some(&plan)),
+            ["/dev/dri/renderD128"],
+            "a plan's paths reach the filter unchanged"
+        );
     }
 
     #[tokio::test]
