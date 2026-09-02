@@ -31,9 +31,8 @@ use reporter::NodeReporter;
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
-/// Kernels before 5.11 charge a BPF program's memory against this limit instead
-/// of the memory cgroup, and the usual default admits only a handful of programs.
-/// Best-effort: on 5.11+ the limit does not gate BPF at all.
+/// Kernels before 5.11 charge BPF program memory against this limit instead of the
+/// memory cgroup, and the default admits only a handful. On 5.11+ it does not gate.
 fn raise_own_memlock_rlimit() {
     let unlimited = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -216,9 +215,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Raised before anything reads or inherits the limit, so a spawned helper and a
-    // `memlock = "inherit"` job both see the final value rather than depending on
-    // whether a BPF load happened to run first. Needs the subscriber for its log.
+    // Raised before anything reads or inherits it, so a `memlock = "inherit"` job
+    // does not depend on whether a BPF load ran first. Needs the subscriber to log.
     raise_own_memlock_rlimit();
 
     let hostname = args.hostname.unwrap_or_else(|| {

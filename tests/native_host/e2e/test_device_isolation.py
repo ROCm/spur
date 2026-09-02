@@ -4,20 +4,11 @@
 """E2E tests for kernel-enforced device isolation (cgroup-v2 BPF device filter).
 
 spurd attaches a default-deny ``BPF_PROG_TYPE_CGROUP_DEVICE`` program to each
-job's cgroup, so a job may open only the device nodes its allocation covers.
-Unlike the ``*_VISIBLE_DEVICES`` deny in ``test_gpu_deny.py``, which a job can
-undo by re-exporting the variable, this one is enforced by the kernel.
-
-These assert on ``/dev/kfd`` rather than on ``/dev/dri/renderD*``. It is the
-right probe for two reasons: it reaches a job's allow-list only through an
-actual GPU allocation (the injection plan adds it as a shared edit), and it
-lives outside ``/dev/dri``, which the namespace wrapper replaces with a tmpfs.
-A denial on a render node could therefore be the tmpfs hiding it, while a
-denial on ``/dev/kfd`` can only be the filter.
-
-The filter is installed by a rootful agent, so every test here is
-``@pytest.mark.rootful``; ``gpu_cluster`` skips the file entirely on nodes
-without GPU device nodes.
+job's cgroup, so unlike the ``*_VISIBLE_DEVICES`` deny in ``test_gpu_deny.py``
+no re-exported variable can undo it. ``/dev/kfd`` is the probe because it
+reaches a job's allow-list only through a real allocation and lives outside the
+``/dev/dri`` the namespace wrapper swaps for a tmpfs, so a denial there can
+only be the filter. Loading it needs root, hence ``@pytest.mark.rootful``.
 """
 
 from typing import NamedTuple
@@ -28,9 +19,8 @@ from cluster import parse_job_id, wait_job
 
 KFD = "/dev/kfd"
 
-# Opening a device reports one of these. EPERM is the filter denying the open;
-# EACCES is ordinary file permissions and would mask the filter, which is why
-# _require_unfiltered_access skips rather than letting a test pass vacuously.
+# EPERM is the filter denying the open; EACCES is ordinary file permissions, which
+# would mask it — hence the _require_unfiltered_access skip.
 _PROBE_HELPER = """\
 probe_open() {
   local p="$1" err
@@ -58,10 +48,8 @@ class _Probe(NamedTuple):
 
 
 def _run_probe(cluster, name: str, body: str, sbatch_args: list[str]) -> _Probe:
-    """Submit a probe pinned to node 0 and return its output and job id.
-
-    Pinned because the allocation, and therefore the allow-list, is per node;
-    an unpinned job could land somewhere the assertion was not written for.
+    """Submit a probe pinned to node 0: the allow-list is per node, so an unpinned
+    job could land somewhere the assertion was not written for.
     """
     script = cluster.write_file(f"{name}.sh", _probe_script(body))
     out_path = f"{cluster.remote_dir}/{name}.out"
@@ -91,10 +79,8 @@ def _require_rootful(cluster) -> None:
 
 
 def _require_unfiltered_access(cluster) -> None:
-    """Skip unless the node has /dev/kfd and the test user can already open it.
-
-    If file permissions alone deny the open, every deny assertion below would
-    pass for the wrong reason.
+    """Skip unless the test user can already open /dev/kfd: if file permissions
+    alone deny it, every deny assertion below passes for the wrong reason.
     """
     node = cluster.nodes[0]
     if not node.exec_allow_fail(f"ls {KFD} 2>/dev/null").strip():
@@ -112,8 +98,8 @@ def _require_unfiltered_access(cluster) -> None:
 @pytest.mark.rootful
 class TestDeviceIsolation:
     def test_zero_gpu_job_is_denied_the_gpu_control_node(self, gpu_cluster):
-        # The SPUR-192 case: a job that was allocated no GPU shares the node with
-        # jobs that were, and must not be able to reach the hardware.
+        # A job allocated no GPU shares the node with jobs that were, and must not
+        # be able to reach the hardware.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
         _require_rootful(cluster)
@@ -157,9 +143,8 @@ class TestDeviceIsolation:
         )
 
     def test_visible_devices_override_does_not_restore_access(self, gpu_cluster):
-        # What Phase 0's env-var deny could not provide: re-exporting the
-        # selector is how a job defeats an advisory sentinel, and it must not
-        # move a kernel filter.
+        # Re-exporting the selector is how a job defeats an advisory sentinel; it
+        # must not move a kernel filter.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
         _require_rootful(cluster)
@@ -227,11 +212,8 @@ class TestDeviceIsolationConfig:
 @pytest.mark.rootful
 class TestDeviceFilterLifecycle:
     def test_filter_is_released_when_the_job_cgroup_goes_away(self, gpu_cluster):
-        """Nothing detaches the filter explicitly.
-
-        The program is freed because removing the cgroup directory drops the
-        kernel's last reference to it, so a leak here would accumulate one
-        program per job for the lifetime of the agent.
+        """Nothing detaches the filter: removing the cgroup directory drops the
+        kernel's last reference. A leak would accumulate one program per job.
         """
         cluster = gpu_cluster
         cluster.gpu_preflight(1)

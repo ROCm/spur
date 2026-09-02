@@ -3,10 +3,8 @@
 
 //! cgroup-v2 device access control via a BPF_PROG_TYPE_CGROUP_DEVICE program.
 //!
-//! cgroup v2 dropped the `devices` controller; device access is filtered by an
-//! eBPF program attached to the cgroup. We build the program in-process and load
-//! it with the `bpf()` syscall, mirroring systemd's approach, so no eBPF build
-//! toolchain is needed.
+//! cgroup v2 dropped the `devices` controller. The program is built in-process and
+//! loaded with `bpf()`, as systemd does, so no eBPF build toolchain is needed.
 
 use std::ffi::CStr;
 use std::fs::File;
@@ -46,9 +44,8 @@ impl DeviceRule {
     }
 }
 
-/// Pseudo-devices every job must retain (mirrors systemd `DevicePolicy=closed`).
-/// Without these a default-deny filter would block `/dev/null`, ptys, etc. and
-/// break virtually every program.
+/// Pseudo-devices every job must retain (systemd's `DevicePolicy=closed`): without
+/// them a default-deny filter blocks `/dev/null` and ptys, breaking most programs.
 pub fn base_device_rules() -> Vec<DeviceRule> {
     vec![
         DeviceRule::char_dev(1, Some(3)), // /dev/null
@@ -63,9 +60,8 @@ pub fn base_device_rules() -> Vec<DeviceRule> {
     ]
 }
 
-/// Host-infrastructure device nodes: shared by every workload, owned by no
-/// allocation, so nothing puts them in a job's `device_paths`. Denying them breaks
-/// jobs that were never reaching for a GPU they do not hold.
+/// Shared by every workload and owned by no allocation, so nothing puts them in a
+/// job's `device_paths`; denying them breaks jobs not reaching for a GPU at all.
 const HOST_INFRA_DEVICE_NODES: &[&str] = &[
     "/dev/fuse", // Apptainer/Singularity run inside the batch job
     // CUDA initialization; enumerating a GPU still needs /dev/nvidia<N>.
@@ -75,20 +71,17 @@ const HOST_INFRA_DEVICE_NODES: &[&str] = &[
     "/dev/nvidia-modeset",
 ];
 
-/// Host-infra device directories. Entry names are per-host (`uverbs0`, `umad1`,
-/// `nvidia-cap2`, ...), so they are enumerated rather than listed.
+/// Entry names are per-host (`uverbs0`, `nvidia-cap2`, ...), so these are enumerated.
 ///
 /// `/dev/nvidia-caps` is granted wholesale only because a MIG instance is not
-/// individually allocatable here. Those nodes *are* NVIDIA's per-instance access
-/// control, so MIG allocation would have to move them behind the allocation.
+/// individually allocatable here; MIG support must move those behind allocation.
 const HOST_INFRA_DEVICE_DIRS: &[&str] = &[
     "/dev/infiniband",  // RDMA verbs: MPI, NCCL and RCCL over IB
     "/dev/nvidia-caps", // MIG capability nodes
 ];
 
-/// Every host-infra device path this node has. Majors for IB and NVIDIA are
-/// assigned dynamically, so these resolve by path like any allocated node; a node
-/// without that hardware simply has nothing to stat.
+/// IB and NVIDIA majors are assigned dynamically, so these resolve by path like any
+/// allocated node; a node without that hardware has nothing to stat.
 ///
 /// Per-GPU compute nodes (`/dev/nvidia<N>`, `/dev/kfd`, `/dev/dri/*`) are
 /// deliberately absent — gating those on the allocation is the security property.
@@ -103,9 +96,8 @@ pub fn host_infra_device_paths() -> Vec<String> {
     paths
 }
 
-/// Entries of a directory of device nodes, sorted so the rule order is the same on
-/// every launch. A directory that does not exist means the node has no such
-/// hardware, which is not an error.
+/// Sorted so the rule order is the same on every launch. A missing directory means
+/// the node has no such hardware, which is not an error.
 fn device_dir_entries(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -118,9 +110,8 @@ fn device_dir_entries(dir: &Path) -> Vec<String> {
     paths
 }
 
-/// Every path a job's filter should resolve: host infrastructure, the operator's
-/// additions, then the job's own allocation. Order only affects rule order, and
-/// each rule is an independent allow, so it does not change any verdict.
+/// Host infrastructure, the operator's additions, then the job's own allocation.
+/// Each rule is an independent allow, so the order changes no verdict.
 pub fn device_paths_for_job(allocated: &[String], extra: &[String]) -> Vec<String> {
     let mut paths = host_infra_device_paths();
     paths.extend(extra.iter().cloned());
@@ -128,9 +119,8 @@ pub fn device_paths_for_job(allocated: &[String], extra: &[String]) -> Vec<Strin
     paths
 }
 
-/// Build the job's device allow-list: base pseudo-devices plus the allocated
-/// device nodes. Paths that do not stat to a device node are skipped, so a
-/// zero-GPU job gets only the base rules and cannot open any GPU.
+/// Base pseudo-devices plus the allocated nodes. Paths that do not stat to a device
+/// node are skipped, so a zero-GPU job gets only the base rules.
 pub fn rules_for_device_paths(
     paths: &[String],
     stat_dev: impl Fn(&str) -> Option<(DevType, u32, u32)>,
@@ -184,9 +174,8 @@ pub struct BpfInsn {
 // the 8-byte size is ABI, not an implementation detail.
 const _: () = assert!(std::mem::size_of::<BpfInsn>() == 8);
 
-// Instruction classes, operand sizes, sources and ops (uapi/linux/bpf.h,
-// uapi/linux/bpf_common.h). BPF_W and BPF_K are 0 but stay explicit so each
-// opcode reads the way the kernel headers spell it.
+// BPF_W and BPF_K are 0 but stay explicit so each opcode reads the way the kernel
+// headers spell it.
 const BPF_LDX: u8 = 0x01;
 const BPF_ALU: u8 = 0x04;
 const BPF_JMP: u8 = 0x05;
@@ -295,10 +284,6 @@ fn exit() -> BpfInsn {
 }
 
 /// Default-deny `cgroup/dev` program: allow the listed rules, deny everything else.
-///
-/// Structure mirrors `samples/bpf/dev_cgroup` and systemd's `bpf-devices.c`: load
-/// the ctx fields once, then one compare-and-allow block per rule, then a
-/// trailing `return 0`.
 fn build_device_filter(rules: &[DeviceRule]) -> Vec<BpfInsn> {
     let mut prog = vec![
         // Both halves of access_type: R2 = device type, R5 = requested access.
@@ -334,9 +319,8 @@ fn rule_block(rule: &DeviceRule) -> Vec<BpfInsn> {
     if let Some(minor) = rule.minor {
         block.push(jne_imm(R4, minor as i32));
     }
-    // The rule matches only if the request is a subset of the access it grants:
-    // `requested & !granted == 0`. The complement spans the whole 16-bit access
-    // field, so an access bit a future kernel adds is denied, not ignored.
+    // Subset test: `requested & !granted == 0`. The complement spans the whole
+    // 16-bit access field, so an access bit a future kernel adds fails closed.
     block.push(mov_reg(R6, R5)); // scratch copy; R5 must survive for later rules
     block.push(and_imm(R6, i32::from(!u16::from(rule.access))));
     block.push(jne_imm(R6, 0));
@@ -363,20 +347,17 @@ const BPF_CGROUP_DEVICE: u32 = 6;
 /// in-tree device filter ships.
 const BPF_LICENSE: &CStr = c"GPL";
 
-/// Only allocated for the diagnostic retry after a load fails, so it can afford
-/// to be generous — a log the verifier overflows turns the real rejection into
-/// an opaque `ENOSPC`.
+/// Only allocated for the diagnostic retry after a failed load, so it can afford to
+/// be generous — an overflowed log turns the real rejection into an opaque `ENOSPC`.
 const VERIFIER_LOG_SIZE: usize = 64 * 1024;
 
-/// The prefix of the kernel's `union bpf_attr` (uapi/linux/bpf.h) that one
-/// `bpf(2)` command reads. `bpf()` passes `size_of::<Self>()` and the kernel
-/// zero-fills the rest of the union, so a command's unread tail is not modeled.
+/// The prefix of `union bpf_attr` that one `bpf(2)` command reads. `bpf()` passes
+/// `size_of::<Self>()` and the kernel zero-fills the rest, so the tail is unmodeled.
 ///
 /// # Safety
 ///
-/// Implementors must be `#[repr(C)]` with every field at the offset the kernel
-/// reads it from for that command, and must contain no padding, so all the bytes
-/// the kernel copies are initialized by writing the fields.
+/// Implementors must be `#[repr(C)]` and padding-free, with every field at the
+/// offset the kernel reads for that command, so writing them initializes all bytes.
 unsafe trait BpfAttr {}
 
 /// `BPF_PROG_LOAD`'s view of the union.
@@ -392,9 +373,8 @@ struct ProgLoadAttr {
     log_buf: u64,
 }
 
-// Offsets are ABI: the kernel reads each command's fields at a fixed offset from
-// the start of the union, and getting one wrong surfaces only as `EINVAL`. The
-// size assertion pins the absence of padding.
+// Offsets are ABI and getting one wrong surfaces only as `EINVAL`; the size
+// assertion pins the absence of padding.
 const _: () = {
     assert!(std::mem::align_of::<ProgLoadAttr>() == 8);
     assert!(std::mem::size_of::<ProgLoadAttr>() == 40);
@@ -411,9 +391,8 @@ const _: () = {
 // asserted size leaves no room for padding.
 unsafe impl BpfAttr for ProgLoadAttr {}
 
-/// `BPF_PROG_ATTACH`'s view of the union. `union bpf_attr` is 8-byte aligned in
-/// the uapi header, so the alignment is ABI even though every field here is four
-/// bytes wide.
+/// `BPF_PROG_ATTACH`'s view of the union. `union bpf_attr` is 8-byte aligned in the
+/// uapi header, so the alignment is ABI even though every field here is 4 bytes.
 #[repr(C, align(8))]
 struct ProgAttachAttr {
     target_fd: u32,
@@ -438,18 +417,14 @@ unsafe impl BpfAttr for ProgAttachAttr {}
 ///
 /// # Safety
 ///
-/// `A` must be the attr type the kernel reads for `cmd`. The kernel reinterprets
-/// the same bytes as whichever `union bpf_attr` member `cmd` selects, so pairing a
-/// command with another command's attr can make it read a flag as a pointer.
+/// `A` must be the attr type the kernel reads for `cmd`: the same bytes are
+/// reinterpreted per command, so a mismatch can make it read a flag as a pointer.
 ///
-/// Every pointer field set in `attr` must be valid for the access the kernel
-/// makes through it and must stay live for the duration of the call. The kernel
-/// dereferences those pointers directly and nothing ties them to `attr`.
+/// Every pointer field in `attr` must be valid and stay live for the call — the
+/// kernel dereferences them directly and nothing ties them to `attr`.
 unsafe fn bpf<A: BpfAttr>(cmd: i32, attr: &mut A) -> libc::c_long {
-    // SAFETY: `attr` is uniquely borrowed for the whole call, and `BpfAttr`
-    // guarantees the `size_of::<A>()` bytes the kernel is told to read are
-    // padding-free, hence fully initialized by the fields written into it.
-    // Validity of the buffers those fields point at is the caller's precondition.
+    // SAFETY: `attr` is uniquely borrowed for the call and padding-free per
+    // `BpfAttr`, so its bytes are initialized; the caller guarantees the buffers.
     unsafe {
         libc::syscall(
             libc::SYS_bpf,
@@ -460,13 +435,11 @@ unsafe fn bpf<A: BpfAttr>(cmd: i32, attr: &mut A) -> libc::c_long {
     }
 }
 
-/// One `BPF_PROG_LOAD` attempt. `log` is supplied only on the retry after a
-/// failure: with a log attached the verifier traces every instruction, and it
-/// fails the whole load if the trace does not fit.
+/// `log` is supplied only on the retry after a failure: with a log attached the
+/// verifier traces every instruction and fails the load if the trace does not fit.
 fn try_prog_load(prog: &[BpfInsn], log: Option<&mut [u8]>) -> std::io::Result<OwnedFd> {
-    // The kernel sizes its read through `insns` entirely from `insn_cnt`, so the
-    // count is derived here rather than passed in: the pointer and the length it
-    // is read with cannot then disagree.
+    // Derived here rather than passed in: the kernel sizes its read through `insns`
+    // entirely from `insn_cnt`, so pointer and length cannot disagree.
     let insn_cnt = u32::try_from(prog.len())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut attr = ProgLoadAttr {
@@ -486,10 +459,8 @@ fn try_prog_load(prog: &[BpfInsn], log: Option<&mut [u8]>) -> std::io::Result<Ow
         attr.log_buf = log.as_mut_ptr() as u64;
     }
 
-    // SAFETY: `ProgLoadAttr` is the union member BPF_PROG_LOAD reads, and `insn_cnt`
-    // is derived from `prog.len()`, so the kernel reads exactly that slice and no
-    // further. `prog` is borrowed for this whole function, `log_buf` points into the
-    // `Vec` the caller owns across the call, and the license is a `'static` `CStr`.
+    // SAFETY: `ProgLoadAttr` is BPF_PROG_LOAD's union member and `insn_cnt` comes
+    // from `prog.len()`; `prog`, `log` and the `'static` license all outlive the call.
     let fd = unsafe { bpf(BPF_PROG_LOAD, &mut attr) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -505,10 +476,8 @@ fn verifier_log_text(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).trim_end().to_string()
 }
 
-/// The `EPERM` diagnostic for a failed `bpf()` command. The kernel gates the load
-/// itself on `bpf_capable()`, so a capability-starved agent never reaches the
-/// attach and the hint has to be on both. `other_cause` names whatever else the
-/// command can return `EPERM` for, since the errno distinguishes neither.
+/// The load is gated on `bpf_capable()`, so both paths need the capability hint;
+/// `other_cause` names whatever else returns `EPERM`, since the errno cannot.
 fn eperm_hint(err: &std::io::Error, other_cause: Option<&str>) -> String {
     if err.raw_os_error() != Some(libc::EPERM) {
         return String::new();
@@ -526,9 +495,8 @@ fn bpf_prog_load(prog: &[BpfInsn]) -> anyhow::Result<OwnedFd> {
         Err(e) => e,
     };
 
-    // Re-run the failed load with a log attached: on a real node the verifier's
-    // rejection message is the only diagnostic anyone gets. Discarding the retry's
-    // result is safe either way — a surprise success drops its fd here unattached.
+    // The verifier's rejection message is the only diagnostic a real node gets.
+    // Discarding the retry is safe: a surprise success drops its fd unattached.
     let mut log = vec![0u8; VERIFIER_LOG_SIZE];
     drop(try_prog_load(prog, Some(&mut log)));
     let log = verifier_log_text(&log);
@@ -560,13 +528,12 @@ fn prog_attach_attr(prog_fd: RawFd, cgroup_fd: RawFd) -> ProgAttachAttr {
 /// neither descriptor can be closed while the syscall is in flight.
 fn bpf_prog_attach(prog_fd: &OwnedFd, cgroup_dir: &File) -> anyhow::Result<()> {
     let mut attr = prog_attach_attr(prog_fd.as_raw_fd(), cgroup_dir.as_raw_fd());
-    // SAFETY: `ProgAttachAttr` is the union member BPF_PROG_ATTACH reads, and it
-    // holds only descriptors and flags, so the kernel dereferences nothing and
-    // there is no buffer to keep alive.
+    // SAFETY: `ProgAttachAttr` is BPF_PROG_ATTACH's union member and holds only
+    // descriptors and flags, so the kernel dereferences nothing.
     if unsafe { bpf(BPF_PROG_ATTACH, &mut attr) } < 0 {
         let err = std::io::Error::last_os_error();
-        // The two causes need opposite responses: grant a capability, or find and
-        // relax the ancestor.
+        // The two causes need opposite responses: grant a capability, or relax the
+        // ancestor.
         let hint = eperm_hint(
             &err,
             Some("an ancestor cgroup already holds an exclusive device program"),
@@ -578,9 +545,8 @@ fn bpf_prog_attach(prog_fd: &OwnedFd, cgroup_dir: &File) -> anyhow::Result<()> {
 
 /// Compile `rules` into a default-deny device filter and attach it to `cgroup_dir`.
 ///
-/// Both descriptors are dropped before returning. The attachment holds its own
-/// kernel reference, so it is then the program's only owner and removing the
-/// cgroup directory at teardown detaches and frees it — there is nothing to detach.
+/// Both descriptors drop before returning, leaving the attachment the program's only
+/// owner: removing the cgroup at teardown frees it, so there is nothing to detach.
 pub fn install_device_filter(cgroup_dir: &Path, rules: &[DeviceRule]) -> anyhow::Result<()> {
     let prog = build_device_filter(rules);
     let prog_fd = bpf_prog_load(&prog)?;
@@ -812,9 +778,8 @@ mod tests {
         }
     }
 
-    /// Synthetic `struct bpf_cgroup_dev_ctx`. The type/access packing is spelled
-    /// out from the kernel ABI instead of reusing the codegen constants, so the
-    /// tests pin the layout independently of the code under test.
+    /// Synthetic `struct bpf_cgroup_dev_ctx`. The packing is spelled out from the
+    /// kernel ABI, not the codegen constants, so the layout is pinned independently.
     #[derive(Clone, Copy)]
     struct DevCtx {
         access_type: u32,
@@ -839,14 +804,11 @@ mod tests {
     const CTX_BASE: u64 = 0x1000;
     const STEP_LIMIT: usize = 4096;
 
-    /// Minimal BPF interpreter covering exactly the opcodes `build_device_filter`
-    /// emits, so the tests exercise the generated instruction stream rather than
-    /// trusting a hand-rolled encoding. Anything else panics: a mis-encoded
-    /// program that always allows would otherwise look like a healthy cluster.
+    /// Runs the generated instruction stream rather than a hand-rolled encoding. An
+    /// unhandled opcode panics: a mis-encoded always-allow program would look healthy.
     fn run_filter(prog: &[BpfInsn], ctx: DevCtx) -> u32 {
-        // Opcode bytes are written out from uapi/linux/bpf.h rather than reusing
-        // the module's constants, so a typo there cannot make codegen and
-        // interpreter agree on a wrong encoding.
+        // Re-derived from the kernel headers rather than the module's constants, so
+        // a typo cannot make codegen and interpreter agree on a wrong encoding.
         const LDX_W: u8 = 0x61; // BPF_LDX | BPF_MEM | BPF_W
         const MOV_IMM: u8 = 0xb4; // BPF_ALU | BPF_MOV | BPF_K
         const MOV_REG: u8 = 0xbc; // BPF_ALU | BPF_MOV | BPF_X
@@ -1014,9 +976,8 @@ mod tests {
         );
     }
 
-    /// The access complement must cover the full 16-bit access field: masking it
-    /// to the three bits that exist today would make an unknown bit AND to zero
-    /// and be allowed by every rule.
+    /// Masking the complement to the three bits that exist today would make an
+    /// unknown bit AND to zero and be allowed by every rule.
     #[test]
     fn filter_denies_an_access_bit_no_rule_can_grant() {
         const UNKNOWN_ACC: u8 = 8; // one past ACC_WRITE
@@ -1131,9 +1092,8 @@ mod tests {
         );
     }
 
-    /// The kernel rejects a capability-starved agent at load, so the load path is
-    /// where the hint is actually read — and there it must not send anyone hunting
-    /// for an ancestor cgroup that has nothing to do with it.
+    /// The load path is where the hint is actually read, and there it must not send
+    /// anyone hunting for an ancestor cgroup that has nothing to do with it.
     #[test]
     fn eperm_names_the_capability_on_every_path_and_the_ancestor_only_on_attach() {
         let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
