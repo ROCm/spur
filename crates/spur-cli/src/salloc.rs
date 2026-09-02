@@ -169,58 +169,21 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     });
 
-    let job_info;
-    let wait_started = std::time::Instant::now();
-    let mut last_reason = String::new();
-    loop {
-        match client.get_job(GetJobRequest { job_id }).await {
-            Ok(resp) => {
-                let job = resp.into_inner();
-                match job.state {
-                    1 => {
-                        // RUNNING
-                        job_info = job;
-                        break;
-                    }
-                    3..=7 => {
-                        // Terminal
-                        eprintln!("salloc: job {} ended before allocation was granted", job_id);
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        let reason = job.state_reason.clone();
-                        if reason != last_reason && !reason.is_empty() && reason != "None" {
-                            eprintln!("salloc: job {} pending ({})", job_id, reason);
-                            last_reason = reason;
-                        }
-                    }
-                }
+    let job_info =
+        match wait_for_allocation(&mut client, job_id, &submit_user, args.immediate).await {
+            AllocationWait::Granted(job) => job,
+            AllocationWait::Ended => {
+                eprintln!("salloc: job {} ended before allocation was granted", job_id);
+                std::process::exit(1);
             }
-            Err(e) => {
-                eprintln!("salloc: warning: {}", e.message());
+            AllocationWait::TimedOut(last_reason) => {
+                eprintln!(
+                    "salloc: job {} has not started within the requested time (last reason: {})",
+                    job_id, last_reason
+                );
+                std::process::exit(1);
             }
-        }
-
-        if immediate_wait_expired(args.immediate, wait_started.elapsed()) {
-            eprintln!(
-                "salloc: job {} has not started within the requested time (last reason: {})",
-                job_id, last_reason
-            );
-            let cancel_user =
-                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
-                    .await;
-            let _ = client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: cancel_user,
-                })
-                .await;
-            std::process::exit(1);
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
+        };
 
     let nodelist = &job_info.nodelist;
     eprintln!("salloc: Nodes {} are ready for job {}", nodelist, job_id);
@@ -431,6 +394,58 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
     }
 }
 
+enum AllocationWait {
+    Granted(Box<spur_proto::proto::JobInfo>),
+    Ended,
+    TimedOut(String),
+}
+
+async fn wait_for_allocation(
+    client: &mut spur_proto::proto::slurm_controller_client::SlurmControllerClient<
+        crate::authclient::AuthChannel,
+    >,
+    job_id: u32,
+    submit_user: &str,
+    immediate: Option<u64>,
+) -> AllocationWait {
+    let wait_started = std::time::Instant::now();
+    let mut last_reason = String::new();
+    loop {
+        match client.get_job(GetJobRequest { job_id }).await {
+            Ok(resp) => {
+                let job = resp.into_inner();
+                match job.state {
+                    1 => return AllocationWait::Granted(Box::new(job)),
+                    3..=7 => return AllocationWait::Ended,
+                    _ => {
+                        let reason = job.state_reason;
+                        if reason != last_reason && !reason.is_empty() && reason != "None" {
+                            eprintln!("salloc: job {} pending ({})", job_id, reason);
+                            last_reason = reason;
+                        }
+                    }
+                }
+            }
+            Err(error) => eprintln!("salloc: warning: {}", error.message()),
+        }
+
+        if immediate_wait_expired(immediate, wait_started.elapsed()) {
+            let cancel_user =
+                crate::interactive::resolve_job_owner_for_cancel(client, job_id, submit_user).await;
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 0,
+                    user: cancel_user,
+                })
+                .await;
+            return AllocationWait::TimedOut(last_reason);
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+}
+
 fn immediate_wait_expired(immediate: Option<u64>, elapsed: std::time::Duration) -> bool {
     immediate.is_some_and(|seconds| elapsed >= std::time::Duration::from_secs(seconds))
 }
@@ -518,6 +533,22 @@ mod tests {
             Some(30),
             std::time::Duration::from_secs(30)
         ));
+    }
+
+    #[tokio::test]
+    async fn immediate_timeout_cancels_pending_allocation() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_user("job-owner");
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let outcome = wait_for_allocation(&mut client, 42, "submit-user", Some(0)).await;
+
+        assert!(matches!(outcome, AllocationWait::TimedOut(reason) if reason.is_empty()));
+        let requests = capture.cancel_job_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].job_id, 42);
+        assert_eq!(requests[0].signal, 0);
+        assert_eq!(requests[0].user, "job-owner");
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub(crate) struct StepCapture {
     get_job_calls: Arc<AtomicU32>,
     /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
     get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
+    cancel_job_requests: Arc<Mutex<Vec<proto::CancelJobRequest>>>,
     create_step_num_tasks: Arc<AtomicU32>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
@@ -57,6 +58,10 @@ impl StepCapture {
 
     pub(crate) fn set_get_job_error(&self, code: tonic::Code) {
         *self.get_job_response.lock().unwrap() = Some(Err(code));
+    }
+
+    pub(crate) fn cancel_job_requests(&self) -> Vec<proto::CancelJobRequest> {
+        self.cancel_job_requests.lock().unwrap().clone()
     }
 
     /// Task count carried by the most recent `CreateJobStep`.
@@ -158,6 +163,18 @@ mock_controller_impl! {
             }
         }
 
+        async fn cancel_job(
+            &self,
+            request: tonic::Request<proto::CancelJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            self.capture
+                .cancel_job_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            Ok(tonic::Response::new(()))
+        }
+
         async fn run_step(
             &self,
             request: tonic::Request<proto::RunStepRequest>,
@@ -244,7 +261,6 @@ mock_controller_impl! {
     unimplemented {
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
-        cancel_job(proto::CancelJobRequest) -> ();
         complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
