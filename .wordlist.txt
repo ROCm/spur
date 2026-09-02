@@ -127,6 +127,7 @@ zstd
 AppArmor
 autouse
 BGP
+BPF
 checksums
 CIDRs
 CLI
@@ -310,3 +311,6 @@ backoff
 unapplied
 UDP
 VXLAN
+RCCL
+Apptainer
+tmpfs
