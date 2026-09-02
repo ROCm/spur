@@ -1997,11 +1997,13 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
     match parts.len() {
         1 => parts[0].parse().ok(),
         2 => {
-            // MM:SS — Slurm's two-field form is minutes:seconds. Sub-minute
-            // remainders round up, matching the suffixed-duration path.
-            let m: u32 = parts[0].parse().ok()?;
-            let sec: u32 = parts[1].parse().ok()?;
-            m.checked_add(if sec > 0 { 1 } else { 0 })
+            // MM:SS — Slurm's two-field form is minutes:seconds. Sum first, then
+            // round up, so an unnormalised seconds field like "1:90" carries into
+            // whole minutes rather than adding a flat one.
+            let m: u64 = parts[0].parse().ok()?;
+            let sec: u64 = parts[1].parse().ok()?;
+            let total = m.checked_mul(60)?.checked_add(sec)?;
+            u32::try_from(total.div_ceil(60)).ok()
         }
         3 => parse_hms(s),
         _ => None,
@@ -2116,8 +2118,10 @@ fn parse_hms_seconds(s: &str) -> Option<u64> {
     }
 }
 
-/// Parse the part after `days-`: bare hours, `hours:minutes`, or
-/// `hours:minutes:seconds`. The bare-hours case backs Slurm's `days-hours`.
+/// Parse an hours-first duration to minutes: bare hours, `hours:minutes`, or
+/// `hours:minutes:seconds`. Serves both the bare `hours:minutes:seconds` form
+/// and the part after `days-`, where the bare-hours case backs Slurm's
+/// `days-hours`. Any leftover seconds round up.
 fn parse_hms(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() > 3 {
@@ -2640,6 +2644,17 @@ cni_mtu = 1400
         assert_eq!(parse_time_minutes("1-0"), Some(1440));
         assert_eq!(parse_time_minutes("2-12:30"), Some(3630));
         assert_eq!(parse_time_minutes("2-12:30:15"), Some(3631));
+    }
+
+    /// The seconds field is not constrained to 0..59, so it must carry into
+    /// whole minutes rather than contributing a flat one-minute round-up.
+    #[test]
+    fn parse_time_minutes_carries_an_unnormalised_seconds_field() {
+        assert_eq!(parse_time_seconds("1:90"), Some(150));
+        assert_eq!(parse_time_minutes("1:90"), Some(3)); // 150s
+        assert_eq!(parse_time_minutes("0:59"), Some(1));
+        assert_eq!(parse_time_minutes("0:60"), Some(1));
+        assert_eq!(parse_time_minutes("0:61"), Some(2));
     }
 
     #[test]
