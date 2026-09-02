@@ -305,6 +305,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    if config.probes.enabled {
+        let probes_addr = config.probes.effective_listen_addr()?;
+        let health_raft = raft_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::serve_probes(probes_addr, health_raft).await {
+                tracing::error!(error = %e, "probe server failed");
+            }
+        });
+    }
+
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
         if !rest_addr.ip().is_loopback() {
@@ -381,6 +391,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         accounting: Default::default(),
         scheduler: Default::default(),
         auth: Default::default(),
+        probes: Default::default(),
         partitions: vec![spur_core::config::PartitionConfig {
             name: "default".into(),
             default: true,
