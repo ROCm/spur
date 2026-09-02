@@ -877,6 +877,12 @@ impl RaftHandle {
         live_leader_from_rx(&rx)
     }
 
+    /// Whether the RaftCore task is still running. openraft moves the metrics
+    /// sender into RaftCore, so the channel closes exactly when that task ends.
+    pub fn is_core_running(&self) -> bool {
+        self.raft.metrics().has_changed().is_ok()
+    }
+
     /// Resolves with the [`Fatal`] that stopped the Raft core.
     pub async fn wait_fatal(&self) -> Fatal<NodeId> {
         let mut rx = self.raft.metrics();
