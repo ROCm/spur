@@ -52,10 +52,12 @@ impl SpurEnv {
         self.vars
     }
 
-    /// Generate bash `export` lines for per-task variables (`PROCID`, `LOCALID`).
+    /// Generate bash `export` lines for the `PROCID` twins and `SLURM_LOCALID`.
     ///
-    /// These are interpolated inside the multi-task wrapper loop where
-    /// `$SPUR_LOCALID` and `$SPUR_TASK_OFFSET` are shell variables, not Rust values.
+    /// `SPUR_LOCALID` itself is exported by the wrapper loop; this derives the
+    /// `SLURM_LOCALID` twin and both `PROCID` variables from it. These lines are
+    /// interpolated inside the loop where `$SPUR_LOCALID` and `$SPUR_TASK_OFFSET`
+    /// are shell variables, not Rust values.
     pub fn per_task_bash_exports() -> &'static str {
         concat!(
             "  export SLURM_LOCALID=$SPUR_LOCALID\n",

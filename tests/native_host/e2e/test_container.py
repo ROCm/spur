@@ -242,6 +242,9 @@ class TestContainerMultiNode:
             'echo "SPUR_NNODES=${SPUR_NNODES}"\n'
             'echo "SPUR_NODE_RANK=${SPUR_NODE_RANK}"\n'
             'echo "SPUR_JOB_ID=${SPUR_JOB_ID}"\n'
+            'echo "TORCH_RANK=[${RANK}]"\n'
+            'echo "TORCH_WORLD_SIZE=[${WORLD_SIZE}]"\n'
+            'echo "TORCH_MASTER_ADDR=[${MASTER_ADDR}]"\n'
             "echo CT_ENV_OK\n",
         )
         sb = cluster.sbatch([
@@ -257,6 +260,15 @@ class TestContainerMultiNode:
         assert "SPUR_NNODES=2" in all_output, f"missing SPUR_NNODES=2:\n{all_output}"
         assert "SPUR_NODE_RANK=0" in all_output, f"missing rank 0:\n{all_output}"
         assert "SPUR_NODE_RANK=1" in all_output, f"missing rank 1:\n{all_output}"
+        # The torch names must be empty inside the container too. Spur no
+        # longer injects them (matching Slurm).
+        assert "TORCH_RANK=[]" in all_output, f"RANK should be unset:\n{all_output}"
+        assert "TORCH_WORLD_SIZE=[]" in all_output, (
+            f"WORLD_SIZE should be unset:\n{all_output}"
+        )
+        assert "TORCH_MASTER_ADDR=[]" in all_output, (
+            f"MASTER_ADDR should be unset:\n{all_output}"
+        )
 
     def test_two_node_container_dns(self, multi_container_cluster):
         cluster = multi_container_cluster

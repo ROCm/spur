@@ -372,10 +372,13 @@ variables in your batch script, or let ``torchrun`` compute them:
 
 .. code-block:: bash
 
-   export MASTER_ADDR=$(scontrol show hostnames "$SPUR_JOB_NODELIST" | head -n1)
-   export MASTER_PORT=29500
-   export WORLD_SIZE=$SPUR_NTASKS
-   export RANK=$SPUR_PROCID
+   # Respect anything forwarded with --export; otherwise derive from the
+   # allocation. The port is derived per job to avoid collisions between
+   # concurrent jobs on shared nodes.
+   export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SPUR_JOB_NODELIST" | head -n1)}"
+   export MASTER_PORT="${MASTER_PORT:-$((20000 + SPUR_JOB_ID % 20000))}"
+   export WORLD_SIZE="${WORLD_SIZE:-$SPUR_NTASKS}"
+   export RANK="${RANK:-$SPUR_PROCID}"
 
 See Also
 --------
