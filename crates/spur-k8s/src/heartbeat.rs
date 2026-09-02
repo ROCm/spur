@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{HeartbeatRequest, RegisterAgentRequest};
@@ -67,6 +67,28 @@ impl HeartbeatManager {
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
+                            // A controller that lost its state, for example a Raft
+                            // cluster that was built again, answers NOT_FOUND for a
+                            // node it once knew. The node watcher registers on its
+                            // initial list and on a change, and neither happens
+                            // again, so the node would stay unknown and the cluster
+                            // would schedule nothing. Register it again here.
+                            Err(e) if e.code() == tonic::Code::NotFound => {
+                                let stored = self.registry.read().await.get(name).cloned();
+                                match stored {
+                                    Some(reg) => match client.register_agent(reg).await {
+                                        Ok(_) => info!(
+                                            node = %name,
+                                            "spurctld did not know this node; registered it again"
+                                        ),
+                                        Err(e) => warn!(
+                                            node = %name, error = %e,
+                                            "failed to register the node again"
+                                        ),
+                                    },
+                                    None => warn!(node = %name, "node no longer tracked"),
+                                }
+                            }
                             Err(e) => warn!(node = %name, error = %e, "heartbeat failed"),
                         }
                     }
