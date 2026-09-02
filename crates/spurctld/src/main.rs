@@ -312,6 +312,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    if config.probes.enabled {
+        let probes_addr = config.probes.effective_listen_addr()?;
+        let health_raft = raft_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::serve_probes(probes_addr, health_raft).await {
+                tracing::error!(error = %e, "probe server failed");
+            }
+        });
+    }
+
     // The controller presents this key as its credential to agents (spurd authenticates callers).
     // Only the configured key: the admission fallback is a well-known constant, and presenting a
     // token signed with it makes every agent that has no key reject the call.
@@ -410,6 +420,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         accounting: Default::default(),
         scheduler: Default::default(),
         auth: Default::default(),
+        probes: Default::default(),
         partitions: vec![spur_core::config::PartitionConfig {
             name: "default".into(),
             default: true,

@@ -80,8 +80,8 @@ spec:
               name: rest
             - containerPort: 6821
               name: raft
-            - containerPort: 6822
-              name: health
+            - containerPort: 6823
+              name: probes
           volumeMounts:
             - name: config
               mountPath: /etc/spur
@@ -94,13 +94,13 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 6822
+              port: 6823
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /livez
-              port: 6822
+              port: 6823
             initialDelaySeconds: 15
             periodSeconds: 20
       volumes:
