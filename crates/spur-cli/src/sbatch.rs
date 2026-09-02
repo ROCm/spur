@@ -787,6 +787,39 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
     script.unwrap_or("sbatch").to_string()
 }
 
+/// Resolve `--export` per Slurm semantics against a submission environment.
+///
+/// A leading `ALL` seeds the full environment, `NONE` seeds an empty one, and
+/// any other leading token starts an empty environment. Remaining tokens are
+/// applied on top: `VAR` copies the current value from `source`, `VAR=value`
+/// sets an explicit value (overriding an inherited one). The value may itself
+/// contain `=`.
+fn resolve_export_env(spec: &str, source: HashMap<String, String>) -> HashMap<String, String> {
+    let tokens: Vec<&str> = spec.split(',').filter(|t| !t.is_empty()).collect();
+    // Fast path for the default: forward the environment as-is, no copy.
+    if tokens.as_slice() == ["ALL"] {
+        return source;
+    }
+    let (mut env, rest) = match tokens.first() {
+        Some(&"ALL") => (source.clone(), &tokens[1..]),
+        Some(&"NONE") => (HashMap::new(), &tokens[1..]),
+        _ => (HashMap::new(), &tokens[..]),
+    };
+    for tok in rest {
+        match tok.split_once('=') {
+            Some((k, v)) => {
+                env.insert(k.to_string(), v.to_string());
+            }
+            None => {
+                if let Some(v) = source.get(*tok) {
+                    env.insert(tok.to_string(), v.clone());
+                }
+            }
+        }
+    }
+    env
+}
+
 fn build_sbatch_job_spec(
     mut args: SbatchArgs,
     nodelist: Option<String>,
@@ -852,15 +885,7 @@ fn build_sbatch_job_spec(
         .transpose()?;
 
     // Build environment
-    let environment: HashMap<String, String> = if args.export == "ALL" {
-        std::env::vars().collect()
-    } else if args.export == "NONE" {
-        HashMap::new()
-    } else {
-        std::env::vars()
-            .filter(|(k, _)| args.export.split(',').any(|e| e == k))
-            .collect()
-    };
+    let environment = resolve_export_env(&args.export, std::env::vars().collect());
 
     // Parse dependencies
     let dependencies: Vec<String> = args
@@ -1025,6 +1050,66 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_env() -> HashMap<String, String> {
+        [
+            ("HOME", "/home/me"),
+            ("EDITOR", "vim"),
+            ("PATH", "/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn resolve_export_all_propagates_full_env() {
+        let env = resolve_export_env("ALL", source_env());
+        assert_eq!(env, source_env());
+    }
+
+    #[test]
+    fn resolve_export_none_propagates_nothing() {
+        assert!(resolve_export_env("NONE", source_env()).is_empty());
+    }
+
+    #[test]
+    fn resolve_export_plain_list_copies_named_vars_only() {
+        let env = resolve_export_env("HOME,EDITOR", source_env());
+        assert_eq!(env.len(), 2);
+        assert_eq!(env["HOME"], "/home/me");
+        assert_eq!(env["EDITOR"], "vim");
+    }
+
+    #[test]
+    fn resolve_export_bare_name_missing_from_source_is_skipped() {
+        let env = resolve_export_env("HOME,NOPE", source_env());
+        assert_eq!(env.len(), 1);
+        assert!(!env.contains_key("NOPE"));
+    }
+
+    #[test]
+    fn resolve_export_combined_all_adds_and_overrides() {
+        let env = resolve_export_env("ALL,EDITOR=emacs,WORLD_SIZE=16", source_env());
+        assert_eq!(env["HOME"], "/home/me");
+        assert_eq!(env["PATH"], "/usr/bin");
+        assert_eq!(env["EDITOR"], "emacs");
+        assert_eq!(env["WORLD_SIZE"], "16");
+    }
+
+    #[test]
+    fn resolve_export_inline_assignment_without_all() {
+        let env = resolve_export_env("MASTER_PORT=29999,HOME", source_env());
+        assert_eq!(env.len(), 2);
+        assert_eq!(env["MASTER_PORT"], "29999");
+        assert_eq!(env["HOME"], "/home/me");
+    }
+
+    #[test]
+    fn resolve_export_value_may_contain_equals() {
+        let env = resolve_export_env("KEY=a=b=c", source_env());
+        assert_eq!(env["KEY"], "a=b=c");
+    }
 
     #[test]
     fn build_sbatch_job_spec_records_the_submit_line() {
