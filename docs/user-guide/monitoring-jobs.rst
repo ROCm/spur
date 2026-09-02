@@ -372,7 +372,8 @@ Detailed Records — ``scontrol show``
 ------------------------------------
 
 ``spur show`` (Slurm ``scontrol show``) prints the full ``Key=Value`` record for
-an entity: ``job``, ``node``, ``partition``, ``reservation``, or ``step``.
+an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
+``assoc_mgr``.
 
 .. note::
 
@@ -530,6 +531,99 @@ The accounting database keeps the record permanently. In practice
    that run will show the final completion state only. Requeue and cancel modes
    are unaffected — both write an accounting end-record (``PREEMPTED``) at the
    time of preemption.
+
+Limits Against Usage — ``scontrol show assoc_mgr``
+--------------------------------------------------
+
+``scontrol show assoc_mgr`` answers the question ``squeue`` cannot: how much of a
+QOS or an association each user is holding *right now*, next to the caps that
+govern them. Without it an operator has to infer per-user totals by counting
+``squeue`` rows.
+
+.. code-block:: bash
+
+   scontrol show assoc_mgr
+   scontrol show assoc_mgr alice
+   scontrol show assoc_mgr users=alice
+
+Output is two sections of ``Key=Value`` blocks — QOS records, then association
+records. Each block opens with the scope itself and lists a line per user under
+it:
+
+.. code-block:: text
+
+   QOS Records
+   QOS=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=32 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=20
+      GrpJobs=N(9) GrpSubmitJobs=N(11) GrpTRES=cpu=N(36),node=16(9) GrpWall=7-00:00:00(2-12:00:00)
+      User=alice MaxJobsPU=2(6) MaxSubmitJobsPU=N(7) MaxTRESPU=cpu=N(24),node=4(6) OverLimit=MaxJobsPU,MaxTRESPU
+      User=bob MaxJobsPU=2(1) MaxSubmitJobsPU=N(1) MaxTRESPU=cpu=N(4),node=4(1)
+
+   Association Records
+   Account=tenant-a MaxWall=N MaxTRESPJ=node=4
+      GrpJobs=N(1) GrpSubmitJobs=N(1) GrpTRES=node=N(1)
+      User=alice MaxJobs=4(1) MaxSubmitJobs=N(1) MaxTRES=cpu=N(4),node=N(1)
+
+Reading it:
+
+* On the ``Grp*`` line and the ``User=`` lines every cap is printed as
+  **``Limit(Consumed)``**, as in Slurm: ``node=4(6)`` is a cap of four nodes with
+  six in use, and ``N`` marks no cap. ``GrpWall`` follows the same shape as a
+  wall-clock time, ``budget(spent)``; an ``N`` in its consumed slot means the
+  controller has not read spend yet (its usage cache holds no snapshot), which is
+  not the same as none spent. The scope-line per-job and per-account caps
+  (``MaxWall``, ``MaxTRESPJ``, ``MaxSubmitJobsPA``) and the per-user caps print
+  bare, with no consumption beside them, because they bound each job, account, or
+  user rather than a total the scope accrues.
+* For the count caps a literal ``0`` is a real cap that blocks every job it
+  governs. A TRES dimension is the exception: ``0`` there is treated as *unset* —
+  it renders as ``N`` and is not enforced, so ``GrpTRES=node=0`` does not block a
+  dimension the way ``MaxJobs=0`` blocks jobs.
+* Consumption is live, measured exactly as the scheduler measures it when it
+  admits a job. Node counts are distinct occupied nodes, so two jobs sharing a
+  node hold one node, not two. A TRES dimension appears when either the cap or
+  the usage has something to say about it.
+* The scope line carries what belongs to the scope: its per-job caps
+  (``MaxWall`` and ``MaxTRESPJ``, the ceiling on any one job), and — for a QOS,
+  which caps every user identically — the per-user caps it enforces
+  (``MaxJobsPU``, ``MaxSubmitJobsPU``, ``MaxTRESPU``) plus the per-account submit
+  cap ``MaxSubmitJobsPA``. The ``PJ``/``PU`` suffixes are Slurm's and matter here:
+  ``MaxTRESPJ`` bounds one job, ``MaxTRESPU`` one user's total, and an
+  association's own per-user cap is named plainly ``MaxTRES`` on each ``User=``
+  line — so within one association record ``MaxTRESPJ`` and ``MaxTRES`` are
+  different caps, not a contradiction. A QOS carries ``MaxSubmitJobsPA`` and
+  ``GrpWall``; an association cannot, so those never appear in its records, but
+  the per-job ``MaxTRESPJ`` a QOS and an association both enforce shows in both.
+  An association's per-user caps are per ``(user, account)``, so they appear on
+  each user's line instead.
+* ``Grp*`` figures are the whole scope's, summed across every user, and stay on
+  the scope line. ``GrpWall`` is the QOS's wall-clock budget beside the spend
+  measured over ``grp_wall_window_days`` (see :doc:`/admin-guide/accounting`);
+  it applies to a QOS only. Filtering to one user narrows the ``User=`` lines but
+  never the group figures, since a group cap cannot be judged from one user's
+  share.
+* ``OverLimit`` lists caps that are **already exceeded**, on the scope line for
+  group caps — including ``GrpWall`` once spend reaches the budget, the state
+  behind a ``QOSGrpWallLimit`` hold — and on a user's line for that user's caps.
+  It is absent when everything is within its cap. Usage over a cap is not a
+  contradiction: caps are applied when a job is admitted and running jobs are
+  never re-checked, so tightening a cap under running work leaves exactly this
+  state.
+
+Records come from the accounting definitions as well as from the queue, so a QOS
+nobody is using still appears with its caps and no ``User=`` lines — an
+over-tight cap on an idle QOS is exactly the kind of mistake that hides
+otherwise. A QOS deleted after its jobs queued also stays reported for as long as
+those jobs hold resources.
+
+A ``LimitsReadable=NO`` line above the sections means accounting is enabled but a
+cache has not loaded yet, so some caps below may be missing; the usage figures
+are still current. A cluster with accounting disabled has no caps to read and so
+never prints this line.
+
+An unprivileged caller sees only their own usage: ``scontrol show assoc_mgr``
+scopes the view to the caller and lists only the QOS and accounts they take part
+in. Administrators see every scope, and may pass ``users=<name>`` to inspect one
+user.
 
 Cluster Metrics — ``/metrics``
 ------------------------------

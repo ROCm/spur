@@ -1624,6 +1624,39 @@ impl SlurmController for ControllerService {
         )))
     }
 
+    async fn get_assoc_mgr_info(
+        &self,
+        request: Request<GetAssocMgrInfoRequest>,
+    ) -> Result<Response<GetAssocMgrInfoResponse>, Status> {
+        // Usage is read from the leader's job table, the same one admission reads.
+        if self.check_leader(&request).is_err() {
+            let proxy = &self.leader_proxy;
+            let mut client = proxy.get_leader_client().await?;
+            let fwd = Self::forward_request(request);
+            return client.get_assoc_mgr_info(fwd).await;
+        }
+
+        let identity = Self::verified_identity(&request).cloned();
+        let caller_is_admin = self.caller_is_admin(identity.as_ref());
+        let req = request.into_inner();
+        let filter = assoc_mgr_scope_user(identity.as_ref(), &req.user, caller_is_admin);
+        let info = self.cluster.assoc_mgr_info(filter.as_deref());
+
+        Ok(Response::new(GetAssocMgrInfoResponse {
+            qos_records: info
+                .qos_records
+                .iter()
+                .map(|u| assoc_mgr_to_proto(u, AssocMgrScope::Qos))
+                .collect(),
+            assoc_records: info
+                .assoc_records
+                .iter()
+                .map(|u| assoc_mgr_to_proto(u, AssocMgrScope::Association))
+                .collect(),
+            limits_readable: info.limits_readable,
+        }))
+    }
+
     async fn reset_diag_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
         if self.check_leader(&request).is_err() {
             {
@@ -3868,6 +3901,24 @@ fn viewer_is_privileged(
     }
 }
 
+/// The user an assoc-mgr read is scoped to. A privileged caller — an admin, or
+/// an unauthenticated one under `permissive`/`disabled`, the same treatment
+/// `viewer_is_privileged` gives — reads whichever user the request names, or
+/// every user when it names none. A non-admin authenticated caller is pinned to
+/// their own identity, so they can neither read another tenant's usage nor
+/// enumerate the cluster-wide scope inventory. Pure so the policy is testable
+/// without a live service.
+fn assoc_mgr_scope_user(
+    identity: Option<&spur_core::auth::Identity>,
+    requested: &str,
+    caller_is_admin: bool,
+) -> Option<String> {
+    if identity.is_none() || caller_is_admin {
+        return (!requested.is_empty()).then(|| requested.to_string());
+    }
+    identity.map(|id| id.user.clone())
+}
+
 /// Resolve the disclosure level for a job-info read. The owner and admins (`privileged`) always get
 /// the full record; everyone else is governed by the configured policy. Pure so the policy matrix is
 /// unit-testable without a live service.
@@ -4132,6 +4183,104 @@ fn requested_gpus_detail(spec: &spur_core::job::JobSpec) -> String {
             }
         }
     }
+}
+
+/// Which side of the hierarchy a usage record came from. A QOS names its
+/// per-user caps `MaxJobsPU`/`MaxTRESPU`, an association names its own
+/// `MaxJobs`/`MaxSubmitJobs`, so the same breach reads differently.
+#[derive(Clone, Copy)]
+enum AssocMgrScope {
+    Qos,
+    Association,
+}
+
+impl AssocMgrScope {
+    fn cap_name(self, cap: spur_core::accounting::Cap) -> &'static str {
+        use spur_core::accounting::Cap;
+        match (self, cap) {
+            (Self::Qos, Cap::MaxJobs) => "MaxJobsPU",
+            (Self::Qos, Cap::MaxSubmitJobs) => "MaxSubmitJobsPU",
+            (Self::Qos, Cap::MaxTres) => "MaxTRESPU",
+            (Self::Association, Cap::MaxJobs) => "MaxJobs",
+            (Self::Association, Cap::MaxSubmitJobs) => "MaxSubmitJobs",
+            (Self::Association, Cap::MaxTres) => "MaxTRES",
+            (_, Cap::GrpTres) => "GrpTRES",
+            (_, Cap::GrpSubmitJobs) => "GrpSubmitJobs",
+            (_, Cap::GrpWall) => "GrpWall",
+        }
+    }
+}
+
+/// One scope record onto the wire, users nested inside it. An unset cap carries
+/// the `INFINITE` sentinel, keeping it distinguishable from a literal `0` cap as
+/// `sacctmgr` already does, and TRES are `<name>=<value>` strings (e.g.
+/// `cpu=36,node=9`), empty when nothing is held or capped. Caps and consumption
+/// stay separate fields: composing Slurm's `Limit(Consumed)` display is the
+/// client's job, and a machine consumer should not have to take it apart again.
+/// Caps already exceeded are named here rather than in the client, so every
+/// consumer reads the same verdict.
+fn assoc_mgr_to_proto(
+    usage: &spur_core::accounting::ScopeLimitUsage,
+    scope: AssocMgrScope,
+) -> AssocMgrRecord {
+    AssocMgrRecord {
+        scope: usage.scope.clone(),
+        grp_running_jobs: usage.grp_running_jobs,
+        grp_submitted_jobs: usage.grp_submitted_jobs,
+        grp_running_tres: usage.grp_running_tres.format(),
+        grp_tres: opt_tres(&usage.grp_tres),
+        grp_submit_jobs: opt_cap(usage.grp_submit_jobs),
+        max_wall_minutes: opt_cap(usage.max_wall_minutes),
+        max_tres_per_job: opt_tres(&usage.max_tres_per_job),
+        max_submit_jobs_per_account: opt_cap(usage.max_submit_jobs_per_account),
+        grp_wall_minutes: opt_cap(usage.grp_wall_minutes),
+        grp_wall_consumed_minutes: opt_consumed(usage.grp_wall_consumed_minutes),
+        scope_caps: usage.user_caps.as_ref().map(|caps| AssocMgrCaps {
+            max_jobs: opt_cap(caps.max_jobs),
+            max_submit_jobs: opt_cap(caps.max_submit_jobs),
+            max_tres: opt_tres(&caps.max_tres),
+        }),
+        users: usage
+            .users
+            .iter()
+            .map(|user| AssocMgrUserRecord {
+                user: user.user.clone(),
+                running_jobs: user.running_jobs,
+                submitted_jobs: user.submitted_jobs,
+                running_tres: user.running_tres.format(),
+                max_jobs: opt_cap(user.caps.max_jobs),
+                max_submit_jobs: opt_cap(user.caps.max_submit_jobs),
+                max_tres: opt_tres(&user.caps.max_tres),
+                over_limit: cap_names(user.exceeded_caps(), scope),
+            })
+            .collect(),
+        over_limit: cap_names(usage.exceeded_caps(), scope),
+    }
+}
+
+fn opt_cap(v: Option<u32>) -> u32 {
+    v.unwrap_or(spur_core::accounting::INFINITE)
+}
+
+fn opt_tres(t: &Option<spur_core::accounting::TresRecord>) -> String {
+    t.as_ref().map(|t| t.format()).unwrap_or_default()
+}
+
+/// A consumption figure onto the wire. `None` (the GrpWall cache holds no
+/// snapshot) becomes `INFINITE` so a client can tell "unknown" from a real zero;
+/// a genuine value is clamped just below the sentinel so it can never be mistaken
+/// for it, which realistic wall-minute spend never reaches anyway.
+fn opt_consumed(v: Option<u64>) -> u32 {
+    match v {
+        None => spur_core::accounting::INFINITE,
+        Some(m) => m.min(u64::from(spur_core::accounting::INFINITE - 1)) as u32,
+    }
+}
+
+fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec<String> {
+    caps.into_iter()
+        .map(|c| scope.cap_name(c).to_string())
+        .collect()
 }
 
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
@@ -8385,6 +8534,55 @@ mod tests {
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "carol");
+    }
+
+    // --- assoc_mgr_scope_user (assoc-mgr read authorization) ---
+
+    fn ident(user: &str) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: user.to_string(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+        }
+    }
+
+    #[test]
+    fn assoc_mgr_scope_user_unauthenticated_honors_the_request() {
+        // permissive/disabled: no identity is privileged, so the request stands —
+        // empty means every user, a name means that user.
+        assert_eq!(assoc_mgr_scope_user(None, "", false), None);
+        assert_eq!(
+            assoc_mgr_scope_user(None, "alice", false).as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn assoc_mgr_scope_user_pins_a_non_admin_to_itself() {
+        // A non-admin cannot widen (empty request) or retarget (another user) the
+        // view: both collapse to their own identity.
+        let id = ident("bob");
+        assert_eq!(
+            assoc_mgr_scope_user(Some(&id), "", false).as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            assoc_mgr_scope_user(Some(&id), "alice", false).as_deref(),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn assoc_mgr_scope_user_lets_an_admin_target_anyone() {
+        // An admin keeps the request: every user when empty, an arbitrary user
+        // when named.
+        let id = ident("root");
+        assert_eq!(assoc_mgr_scope_user(Some(&id), "", true), None);
+        assert_eq!(
+            assoc_mgr_scope_user(Some(&id), "alice", true).as_deref(),
+            Some("alice")
+        );
     }
 
     // --- build_reservation_txn (audit attribution) ---

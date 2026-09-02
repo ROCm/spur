@@ -93,7 +93,22 @@ impl TresRecord {
         }
     }
 
-    /// Format as "cpu=N,mem=N,gres/gpu=N" string.
+    /// The TRES types carrying a value here, name-sorted so output is stable.
+    /// Lets a caller walk the dimensions a record actually uses instead of
+    /// assuming a fixed set. A dimension at 0 is omitted — 0 is not a cap.
+    pub fn types(&self) -> Vec<TresType> {
+        let mut types: Vec<TresType> = self
+            .values
+            .iter()
+            .filter(|(_, v)| **v > 0)
+            .map(|(k, _)| *k)
+            .collect();
+        types.sort_by_key(|t| t.name());
+        types
+    }
+
+    /// Format as a `cpu=36,node=9` string, dimensions name-sorted. Dimensions at
+    /// 0 are omitted, so an all-zero record formats to the empty string.
     pub fn format(&self) -> String {
         let mut parts: Vec<String> = self
             .values
@@ -128,6 +143,145 @@ impl TresRecord {
         }
         Ok(rec)
     }
+}
+
+/// A cap an operator view can report as already exceeded. Deliberately spelled
+/// neutrally: a QOS names its per-user caps `MaxJobsPU`/`MaxTRESPU` while an
+/// association names its own `MaxJobs`, so the wording is the caller's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cap {
+    MaxJobs,
+    MaxSubmitJobs,
+    MaxTres,
+    GrpTres,
+    GrpSubmitJobs,
+    GrpWall,
+}
+
+/// Caps that apply to a single user. A QOS sets one set of these for every user
+/// it governs; an association carries its own per (user, account) pair. `None` is
+/// unset.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PerUserCaps {
+    pub max_jobs: Option<u32>,
+    pub max_submit_jobs: Option<u32>,
+    pub max_tres: Option<TresRecord>,
+}
+
+/// One user's holdings under a scope, beside the caps that govern that user.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserLimitUsage {
+    pub user: String,
+    pub running_jobs: u32,
+    pub submitted_jobs: u32,
+    pub running_tres: TresRecord,
+    pub caps: PerUserCaps,
+}
+
+/// A scope — a QOS or an account — with the caps and consumption that belong to
+/// the scope as a whole, and the users holding work under it. Mirrors how Slurm's
+/// `assoc_mgr` nests per-user limits inside the record they qualify.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScopeLimitUsage {
+    pub scope: String,
+    pub grp_running_jobs: u32,
+    pub grp_submitted_jobs: u32,
+    pub grp_running_tres: TresRecord,
+    pub grp_tres: Option<TresRecord>,
+    pub grp_submit_jobs: Option<u32>,
+    pub max_wall_minutes: Option<u32>,
+    /// Per-job TRES cap the scope applies to a single job, distinct from the
+    /// per-user `user_caps.max_tres` and the aggregate `grp_tres`. Both a QOS and
+    /// an association enforce it.
+    pub max_tres_per_job: Option<TresRecord>,
+    /// Caps a QOS carries that an association does not, so they stay `None` in an
+    /// association record. `grp_wall_consumed_minutes` is the wall-clock spend
+    /// behind `grp_wall_minutes`; `None` means the controller's GrpWall cache has
+    /// not loaded, not zero spend.
+    pub max_submit_jobs_per_account: Option<u32>,
+    pub grp_wall_minutes: Option<u32>,
+    pub grp_wall_consumed_minutes: Option<u64>,
+    /// The caps every user of this scope is held to, where the scope defines them
+    /// once — a QOS does, an association does not, so it stays `None` there and
+    /// each user record carries its own instead. Without this a QOS nobody is
+    /// currently using would report no per-user caps at all, which is exactly
+    /// where a misconfigured cap hides.
+    pub user_caps: Option<PerUserCaps>,
+    pub users: Vec<UserLimitUsage>,
+}
+
+/// True when `used` is past `cap`, for a cap that may be unset.
+fn count_exceeds(used: u32, cap: Option<u32>) -> bool {
+    cap.is_some_and(|c| used > c)
+}
+
+/// True when `used` is past any dimension of a TRES cap that may be unset.
+fn tres_cap_exceeds(used: &TresRecord, cap: &Option<TresRecord>) -> bool {
+    cap.as_ref().is_some_and(|c| tres_exceeds(used, c))
+}
+
+impl UserLimitUsage {
+    /// The per-user caps this user is already over. A different question from the
+    /// admission checks in `qos`, which project a candidate job onto current
+    /// usage: this reports what stands over a cap *right now*, the state a cluster
+    /// is left in when caps are tightened under running work — running jobs are
+    /// never re-checked, so nothing else surfaces it.
+    pub fn exceeded_caps(&self) -> Vec<Cap> {
+        let mut exceeded = Vec::new();
+        if count_exceeds(self.running_jobs, self.caps.max_jobs) {
+            exceeded.push(Cap::MaxJobs);
+        }
+        if count_exceeds(self.submitted_jobs, self.caps.max_submit_jobs) {
+            exceeded.push(Cap::MaxSubmitJobs);
+        }
+        if tres_cap_exceeds(&self.running_tres, &self.caps.max_tres) {
+            exceeded.push(Cap::MaxTres);
+        }
+        exceeded
+    }
+}
+
+impl ScopeLimitUsage {
+    /// The scope-wide caps this scope is already over, on the same footing as
+    /// `UserLimitUsage::exceeded_caps`.
+    pub fn exceeded_caps(&self) -> Vec<Cap> {
+        let mut exceeded = Vec::new();
+        if tres_cap_exceeds(&self.grp_running_tres, &self.grp_tres) {
+            exceeded.push(Cap::GrpTres);
+        }
+        if count_exceeds(self.grp_submitted_jobs, self.grp_submit_jobs) {
+            exceeded.push(Cap::GrpSubmitJobs);
+        }
+        if self.grp_wall_exceeded() {
+            exceeded.push(Cap::GrpWall);
+        }
+        exceeded
+    }
+
+    /// Whether spend has reached the group wall budget. Uses `>=`, not `>`: the
+    /// gate blocks once consumption *reaches* the cap (see `check_qos_limits`),
+    /// so parity with enforcement means the same boundary counts as exceeded.
+    /// Unknown consumption (cache not loaded) is never a breach.
+    fn grp_wall_exceeded(&self) -> bool {
+        match (self.grp_wall_minutes, self.grp_wall_consumed_minutes) {
+            (Some(cap), Some(consumed)) => consumed >= cap as u64,
+            _ => false,
+        }
+    }
+}
+
+/// True when `usage` is over any dimension `cap` actually sets, following the
+/// same rule the QOS gate applies: a dimension capped at 0 is not a cap, and
+/// only the four dimensions the gate checks are compared.
+fn tres_exceeds(usage: &TresRecord, cap: &TresRecord) -> bool {
+    [
+        TresType::Cpu,
+        TresType::Node,
+        TresType::Memory,
+        TresType::Gpu,
+    ]
+    .into_iter()
+    .any(|t| cap.get(t) > 0 && usage.get(t) > cap.get(t))
 }
 
 /// An account in the accounting hierarchy.
@@ -281,6 +435,153 @@ mod tests {
     #[test]
     fn test_tres_parse_rejects_unknown_type() {
         assert!(TresRecord::parse("bogus=5").is_err());
+    }
+
+    fn tres(spec: &str) -> TresRecord {
+        TresRecord::parse(spec).unwrap()
+    }
+
+    #[test]
+    fn tres_types_are_name_sorted_and_skip_empty_dimensions() {
+        // Callers walk these to render one dimension at a time, so the order has
+        // to be stable and a zero dimension must not appear as a dimension in use.
+        let mut rec = TresRecord::new();
+        rec.set(TresType::Node, 2);
+        rec.set(TresType::Cpu, 8);
+        rec.set(TresType::Memory, 0);
+        assert_eq!(rec.types(), vec![TresType::Cpu, TresType::Node]);
+    }
+
+    #[test]
+    fn exceeded_caps_reports_a_user_over_the_job_count_cap() {
+        // The shape a cluster is left in when MaxJobsPU is tightened under
+        // running work, or when the cap went unenforced.
+        let usage = UserLimitUsage {
+            running_jobs: 6,
+            caps: PerUserCaps {
+                max_jobs: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(usage.exceeded_caps(), vec![Cap::MaxJobs]);
+    }
+
+    #[test]
+    fn exceeded_caps_is_empty_at_the_cap() {
+        // The cap is a ceiling, not a threshold: sitting exactly on it is legal.
+        let usage = UserLimitUsage {
+            running_jobs: 2,
+            submitted_jobs: 2,
+            caps: PerUserCaps {
+                max_jobs: Some(2),
+                max_submit_jobs: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn exceeded_caps_ignores_unset_caps() {
+        let usage = UserLimitUsage {
+            running_jobs: 99,
+            running_tres: tres("cpu=512"),
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn exceeded_caps_compares_each_tres_dimension_the_gate_compares() {
+        // node is over, cpu is under: the record is over its per-user TRES cap on
+        // the strength of the node dimension alone.
+        let usage = UserLimitUsage {
+            running_tres: tres("cpu=4,node=6"),
+            caps: PerUserCaps {
+                max_tres: Some(tres("cpu=64,node=4")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(usage.exceeded_caps(), vec![Cap::MaxTres]);
+    }
+
+    #[test]
+    fn exceeded_caps_treats_a_zero_tres_dimension_as_uncapped() {
+        // Matches the gate: a dimension capped at 0 is no cap, so a formatted
+        // record that simply omits a dimension cannot read as a breach.
+        let usage = UserLimitUsage {
+            running_tres: tres("cpu=8"),
+            caps: PerUserCaps {
+                max_tres: Some(tres("node=4")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn scope_exceeded_caps_covers_the_group_caps_only() {
+        // Group caps belong to the scope, not to any one user, so they are
+        // reported from the scope record and never duplicated onto its users.
+        // The user carries a per-user cap it is within (12 running jobs under a
+        // cap of 20), so an empty result proves the group caps were not leaked
+        // onto it rather than that the user had no caps to report.
+        let usage = ScopeLimitUsage {
+            grp_running_tres: tres("node=9"),
+            grp_tres: Some(tres("node=8")),
+            grp_submitted_jobs: 12,
+            grp_submit_jobs: Some(10),
+            users: vec![UserLimitUsage {
+                running_jobs: 12,
+                caps: PerUserCaps {
+                    max_jobs: Some(20),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            usage.exceeded_caps(),
+            vec![Cap::GrpTres, Cap::GrpSubmitJobs]
+        );
+        assert!(usage.users[0].exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn scope_exceeded_caps_reports_grp_wall_at_the_gate_boundary() {
+        // The gate blocks once spend *reaches* the budget (`>=`, see
+        // `check_qos_limits`), so 600 against a 600 cap is already exceeded, and a
+        // minute short is not.
+        let at_cap = ScopeLimitUsage {
+            grp_wall_minutes: Some(600),
+            grp_wall_consumed_minutes: Some(600),
+            ..Default::default()
+        };
+        assert_eq!(at_cap.exceeded_caps(), vec![Cap::GrpWall]);
+
+        let under_cap = ScopeLimitUsage {
+            grp_wall_minutes: Some(600),
+            grp_wall_consumed_minutes: Some(599),
+            ..Default::default()
+        };
+        assert!(under_cap.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn scope_exceeded_caps_never_flags_grp_wall_without_a_reading() {
+        // Unknown spend (the GrpWall cache has not loaded) must not read as a
+        // breach; enforcement leaves the budget unapplied in exactly that state.
+        let usage = ScopeLimitUsage {
+            grp_wall_minutes: Some(1),
+            grp_wall_consumed_minutes: None,
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
     }
 
     #[test]
