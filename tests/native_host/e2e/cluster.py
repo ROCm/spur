@@ -1127,7 +1127,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
-            f"-p 0:5432 postgres:16-alpine"
+            f"-p 0:5432 mirror.gcr.io/library/postgres:16-alpine"
         )
         self._pg_port = parse_published_port(
             node.exec(
