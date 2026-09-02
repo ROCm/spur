@@ -45,3 +45,32 @@ class TestMeshBringUp:
         assert peer.endpoint is not None, (
             f"worker↔worker peer has no endpoint (hub-and-spoke regression): {peer}"
         )
+
+
+class TestPeerPersistence:
+    """`net add-peer`/`join` must persist to the config file, not just the live
+    interface — otherwise a peer silently vanishes on the next interface reload
+    (host reboot, `wg-quick` restart), even though it's still live right now."""
+
+    def test_peers_survive_an_interface_reload(self, raw_wg_mesh):
+        indices = list(range(len(raw_wg_mesh.nodes)))
+        others = [i for i in indices if i != 0]
+        expected = {raw_wg_mesh.pubkeys[i] for i in others}
+
+        # The bring-up already ran net_join/net_add_peer, so every peer must be
+        # in node 0's persisted conf, not just its live wg state.
+        persisted = set(raw_wg_mesh.conf_peer_keys(0))
+        assert expected <= persisted, (
+            f"peers missing from the persisted config: {expected - persisted}"
+        )
+
+        # Simulate a reboot/service restart: the interface is torn down and
+        # rebuilt strictly from that conf file.
+        raw_wg_mesh.reload_interface(0)
+
+        live = set(raw_wg_mesh.wg_peer_keys(0))
+        assert expected <= live, (
+            f"peers dropped after an interface reload: {expected - live}"
+        )
+        # And connectivity actually still works, not just the peer table.
+        raw_wg_mesh.assert_all_to_all(indices)
