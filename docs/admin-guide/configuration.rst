@@ -911,8 +911,8 @@ JSON object with a fixed schema — ``timestamp`` (RFC 3339, nanoseconds),
 ``spur-k8s-operator``), ``target`` (Rust module path), ``message``, plus any
 structured fields the event carried (``job_id``, ``node``, ``error``, ...),
 each keeping its native JSON type. In ``text`` mode the output is the
-human-readable form. Logs always go to stderr; capture them with the service
-manager (for example systemd's journal).
+human-readable form. Logs always go to ``stderr``; capture them with the service
+manager (for example the systemd journal).
 
 .. list-table::
    :header-rows: 1
