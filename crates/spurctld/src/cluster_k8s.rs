@@ -830,16 +830,34 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
         .map(|(state, _)| state)
 }
 
-/// The mesh-native k0s controller config for `node` (api on its mesh IP + Calico bird), or None for
-/// the default kube-router mode (`cni != "calico"`) / a node without a mesh IP. `cp_count > 1` also
-/// enables node-local load balancing for konnectivity.
+/// The address Calico/kubelet should use for `node`: its mesh IP when the mesh is configured
+/// (`net.wg_enabled`), else its real underlay address — a `k0s_mesh_ip` handed out with the mesh
+/// disabled is a pool-allocated address never bound to any interface, so it must not be used.
+/// `kubelet --node-ip` requires a literal IP (unlike `Node.address`, which may be an FQDN), so the
+/// underlay branch only returns a value that parses as one.
+fn calico_node_address<'a>(
+    net: &ClusterNetworking,
+    node: &'a spur_core::node::Node,
+) -> Option<&'a str> {
+    if net.wg_enabled {
+        node.k0s_mesh_ip.as_deref()
+    } else {
+        node.address
+            .as_deref()
+            .filter(|addr| addr.parse::<std::net::IpAddr>().is_ok())
+    }
+}
+
+/// The k0s controller config for `node` (api on its Calico address + `bird`/`vxlan` mode per
+/// [`calico_node_address`]), or None for the default kube-router mode (`cni != "calico"`) / a node
+/// without a usable address yet. `cp_count > 1` also enables node-local load balancing.
 fn controller_k0s_config(
     net: &ClusterNetworking,
     node: &spur_core::node::Node,
     cp_count: usize,
 ) -> Option<String> {
-    let api = node.k0s_mesh_ip.as_deref()?;
-    // SANs: the mesh IP (advertised) + the underlay address (so `kubectl` over either works).
+    let api = calico_node_address(net, node)?;
+    // SANs: the advertised address + the underlay address (so `kubectl` over either works).
     let mut sans = vec![api.to_string()];
     if let Some(addr) = &node.address {
         if addr != api {
@@ -854,6 +872,7 @@ fn controller_k0s_config(
         api,
         &sans,
         cp_count,
+        net.wg_enabled,
     )
 }
 
@@ -901,8 +920,8 @@ async fn converge_provisioning(
             clear_node_error(cluster, node);
             continue;
         }
-        // Mesh-native cluster: generate the k0s config (api on the mesh IP + Calico bird) when
-        // cni=calico; None keeps the default kube-router. The bootstrap seeds etcd — no join token.
+        // Generate the k0s config when cni=calico; None keeps the default kube-router. The
+        // bootstrap seeds etcd — no join token.
         let k0s_config = controller_k0s_config(net, node, cp_count);
         spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
     }
@@ -935,13 +954,13 @@ async fn converge_provisioning(
         } else {
             "worker"
         };
-        // For a native-routing CNI, pin the node's kubelet node-ip to its mesh IP.
+        // For Calico, pin the node's kubelet node-ip to whichever address it's actually running on.
         let node_ip = if net.cni == "calico" {
-            node.k0s_mesh_ip.clone()
+            calico_node_address(net, node).map(String::from)
         } else {
             None
         };
-        // A secondary control-plane also needs its own generated k0s config (API SANs on its mesh IP).
+        // A secondary control-plane also needs its own generated k0s config (API SANs per calico_node_address).
         let k0s_config = if role == K0sRole::Controller {
             controller_k0s_config(net, node, cp_count)
         } else {
@@ -1884,5 +1903,77 @@ mod tests {
             spur_net::mesh::peer_allowed_ips(&m.nodes[0]),
             "10.44.0.1/32"
         );
+    }
+
+    fn test_net(wg_enabled: bool, cni: &str) -> ClusterNetworking {
+        ClusterNetworking {
+            wg_enabled,
+            mesh_cidr: "10.44.0.0/16".into(),
+            mesh_interface: "spur0".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: cni.into(),
+            control_plane_node: None,
+            provisioning_timeout: Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn calico_node_address_uses_mesh_ip_when_meshed() {
+        let net = test_net(true, "calico");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        n.k0s_mesh_ip = Some("10.44.0.1".into());
+        n.address = Some("203.0.113.9".into());
+        assert_eq!(calico_node_address(&net, &n), Some("10.44.0.1"));
+    }
+
+    #[test]
+    fn calico_node_address_falls_back_to_underlay_without_mesh() {
+        let net = test_net(false, "calico");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        // A pool-allocated mesh IP can still be present (assigned regardless of wg_enabled), but it's
+        // never bound to a real interface here, so it must not be used.
+        n.k0s_mesh_ip = Some("10.44.0.1".into());
+        n.address = Some("203.0.113.9".into());
+        assert_eq!(calico_node_address(&net, &n), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn calico_node_address_rejects_an_fqdn_underlay_address() {
+        let net = test_net(false, "calico");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        // Node.address may be an FQDN (docs/deployment/native-host.rst), but kubelet --node-ip
+        // requires a literal IP -- must defer rather than pass a hostname through.
+        n.address = Some("cp.example.internal".into());
+        assert_eq!(calico_node_address(&net, &n), None);
+    }
+
+    #[test]
+    fn controller_k0s_config_picks_vxlan_and_underlay_api_without_mesh() {
+        let net = test_net(false, "calico");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        n.k0s_mesh_ip = Some("10.44.0.1".into());
+        n.address = Some("203.0.113.9".into());
+        let y = controller_k0s_config(&net, &n, 1).unwrap();
+        assert!(y.contains("address: 203.0.113.9"));
+        assert!(y.contains("mode: vxlan"));
+        assert!(
+            !y.contains("10.44.0.1"),
+            "the unbound mesh IP must not leak into the config"
+        );
+    }
+
+    #[test]
+    fn controller_k0s_config_keeps_bird_and_mesh_api_when_meshed() {
+        let net = test_net(true, "calico");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        n.k0s_mesh_ip = Some("10.44.0.1".into());
+        n.address = Some("203.0.113.9".into());
+        let y = controller_k0s_config(&net, &n, 1).unwrap();
+        assert!(y.contains("address: 10.44.0.1"));
+        assert!(y.contains("mode: bird"));
+        // underlay still carried as an alternate SAN so kubectl works over either address.
+        assert!(y.contains("203.0.113.9"));
     }
 }
