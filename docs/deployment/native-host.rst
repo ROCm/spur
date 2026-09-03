@@ -872,9 +872,12 @@ Spur restricts a job to its allocated GPUs in two layers:
   job was not allocated fails with ``EPERM`` in the kernel, whatever the
   environment says.
 
-The filter is attached to the job cgroup, so it bounds the batch payload only:
-``srun`` steps and ``spur exec`` shells run outside that cgroup and keep host-wide
-device access. See :ref:`cgroup-containment-gaps`.
+The filter is attached to the job's cgroup, so it covers every process the agent
+starts for the job: the batch payload, ``srun`` steps, ``spur exec``, and
+interactive attach alike. Attaching it needs ``CAP_BPF`` or ``CAP_SYS_ADMIN`` — an
+agent without them logs a warning and runs the job with no device isolation,
+unless ``[cgroup] required`` is set, which refuses the job instead. See
+:ref:`cgroup-containment-gaps`.
 
 See Also
 --------

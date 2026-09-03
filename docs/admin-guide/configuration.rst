@@ -1174,19 +1174,22 @@ Job isolation layers.
 ``[cgroup]``
 ------------
 
-cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. The
-job's batch payload runs in a cgroup at ``/sys/fs/cgroup/spur/job_<id>``, and the
-limits are derived from the **per-node budget the controller allocated** — not
-from the ``--cpus-per-task`` / ``--mem`` the user requested. Kubernetes jobs are
-unaffected: there the kubelet owns the cgroups.
+cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
+process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
+exec``, and interactive attach — runs in a cgroup at
+``/sys/fs/cgroup/spur/job_<id>``, and the limits are derived from the **per-node
+budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
+the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
+cgroups.
 
 .. warning::
 
-   These settings bound the batch payload only. ``srun`` steps, ``spur exec``, and
-   interactive attaches into a running job currently run outside the job cgroup,
-   so they get neither the resource limits nor the device filter, and this section
-   is not a security boundary between users sharing a node. See
-   :ref:`cgroup-containment-gaps` for the full list.
+   These settings bound a job only when ``spurd`` runs as root, and with the
+   default ``required = false`` a host that cannot apply a constraint — no
+   ``CAP_BPF`` for the device filter, say — logs a warning and runs the work
+   unconstrained. Set ``required = true`` to make that case fail closed instead.
+   See :ref:`cgroup-containment-gaps` for what remains even then: per-step
+   granularity, and the site-supplied task hooks that run outside the job cgroup.
 
 .. note::
 
