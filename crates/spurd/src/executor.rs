@@ -990,6 +990,9 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
+    // A leaked dir keeps its device program, which a job installing no filter of
+    // its own would inherit. `rmdir` fails EBUSY on a live cgroup, so only stale ones go.
+    let _ = std::fs::remove_dir(&cgroup_path);
     if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
         if nix::unistd::geteuid().is_root() {
             anyhow::bail!("cgroup creation failed as root: {}", e);
@@ -1251,6 +1254,11 @@ impl Drop for CgroupGuard {
     }
 }
 
+/// Bounded to 200ms: the monitor loop holds the running-jobs lock across cleanup,
+/// and the next `setup_cgroup` clears any directory this gives up on.
+const CGROUP_REMOVE_ATTEMPTS: u32 = 20;
+const CGROUP_REMOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
     // Kill any remaining processes
@@ -1262,9 +1270,17 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
         }
     }
 
-    // Remove cgroup directory
-    if let Err(e) = std::fs::remove_dir(cgroup_path) {
-        warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
+    // `kill` returning does not mean the process has left the cgroup, and rmdir
+    // fails EBUSY until it has. An abandoned dir strands its device program.
+    for attempt in 1..=CGROUP_REMOVE_ATTEMPTS {
+        match std::fs::remove_dir(cgroup_path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if attempt == CGROUP_REMOVE_ATTEMPTS => {
+                warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
+            }
+            Err(_) => std::thread::sleep(CGROUP_REMOVE_INTERVAL),
+        }
     }
 }
 
@@ -2048,7 +2064,7 @@ mod cgroup_join_tests {
 
 #[cfg(test)]
 mod cgroup_guard_tests {
-    use super::CgroupGuard;
+    use super::{cleanup_cgroup, CgroupGuard};
 
     #[test]
     fn dropping_the_guard_removes_the_cgroup() {
@@ -2079,6 +2095,35 @@ mod cgroup_guard_tests {
     #[test]
     fn a_disabled_cgroup_is_a_no_op() {
         drop(CgroupGuard(None));
+    }
+
+    #[test]
+    fn cleanup_removes_an_empty_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_3");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        cleanup_cgroup(&cgroup);
+        assert!(!cgroup.exists());
+    }
+
+    #[test]
+    fn cleanup_gives_up_on_a_cgroup_that_never_empties() {
+        // A non-empty dir fails rmdir the way a busy cgroup does, so this exhausts
+        // the retry budget; reaching the assert at all is the property under test.
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_4");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), "not-a-pid\n").unwrap();
+
+        cleanup_cgroup(&cgroup);
+        assert!(cgroup.exists());
+    }
+
+    #[test]
+    fn cleanup_of_a_missing_cgroup_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        cleanup_cgroup(&dir.path().join("job_5"));
     }
 }
 
