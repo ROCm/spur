@@ -622,8 +622,9 @@ def wait_spurjob_state(
     try:
         wait_until(check, timeout, f"SpurJob {name} did not reach state '{target}'")
     except TimeoutError as exc:
+        observed = last_state or "<unset>"
         raise TimeoutError(
-            f"{exc}; last state {last_state or '<unset>'}; "
+            f"{exc}; last state '{observed}'; "
             f"{spurjob_diagnostics(fixture, name, namespace=ns)}"
         ) from exc
     return result
@@ -641,11 +642,15 @@ def spurjob_diagnostics(
         pods = fixture.core_v1.list_namespaced_pod(
             ns, label_selector=f"spur.amd.com/job-name={name}"
         ).items
-        subjects = {p.metadata.name for p in pods} | {name}
+        # Query per involved object rather than listing the namespace: on a loaded
+        # cluster an unfiltered list is large enough to be slow or rate-limited,
+        # which would lose the diagnostics exactly when they are wanted.
         events = [
-            f"{e.involved_object.name}: {e.reason}: {e.message}"
-            for e in fixture.core_v1.list_namespaced_event(ns).items
-            if getattr(e.involved_object, "name", None) in subjects
+            f"{subject}: {e.reason}: {e.message}"
+            for subject in ({p.metadata.name for p in pods} | {name})
+            for e in fixture.core_v1.list_namespaced_event(
+                ns, field_selector=f"involvedObject.name={subject}"
+            ).items
         ]
         phases = [f"{p.metadata.name}={p.status.phase}" for p in pods]
         parts = phases + events[-limit:]
