@@ -148,9 +148,14 @@ struct Args {
     #[arg(short = 'D', long)]
     foreground: bool,
 
-    /// Log level
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Overrides [logging].level.
+    #[arg(long)]
+    log_level: Option<String>,
+
+    /// Log format: json or text. Overrides [logging].format. Defaults to text
+    /// on a TTY and json otherwise.
+    #[arg(long)]
+    log_format: Option<String>,
 }
 
 #[tokio::main]
@@ -168,12 +173,21 @@ async fn main() -> anyhow::Result<()> {
     let explicit_config = matches.value_source("config") != Some(ValueSource::DefaultValue);
     let args = Args::from_arg_matches(&matches)?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.parse().unwrap()),
-        )
-        .init();
+    // Load config before initializing logging so the [logging] section can
+    // choose the format/level. Nothing may log before init or it is lost.
+    let config_load = SlurmConfig::load_from_file(&args.config);
+    let logging = config_load
+        .as_ref()
+        .ok()
+        .map(|c| c.logging.clone())
+        .unwrap_or_default();
+    spur_logging::init(
+        "spurd",
+        args.log_level.as_deref(),
+        args.log_format.as_deref(),
+        &logging.level,
+        &logging.format,
+    );
 
     let hostname = args.hostname.unwrap_or_else(|| {
         hostname::get()
@@ -197,8 +211,8 @@ async fn main() -> anyhow::Result<()> {
         "spurd starting"
     );
 
-    // Load config from spur.conf (best-effort: missing file is fine)
-    let config = match SlurmConfig::load_from_file(&args.config) {
+    // Surface the config load result now that logging is initialized.
+    let config = match config_load {
         Ok(config) => {
             info!(path = %args.config.display(), "loaded spur.conf");
             Some(config)

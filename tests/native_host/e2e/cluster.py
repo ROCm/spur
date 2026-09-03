@@ -1075,6 +1075,9 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             "cluster_name": "e2e-test",
             "scheduler": {"interval_secs": 1, "plugin": "backfill"},
             "auth": {"plugin": "none"},
+            # Daemons default to JSON off a TTY; pin text so log-scraping tests
+            # match key=value fields. JSON is covered by test_json_logging.
+            "logging": {"format": "text"},
             "network": {"wg_enabled": False, "agent_port": AGENT_PORT},
             "partitions": [
                 {
