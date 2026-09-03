@@ -771,6 +771,27 @@ impl RaftHandle {
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
     }
+
+    /// Whether the RaftCore task is still running.
+    ///
+    /// openraft moves the metrics sender INTO RaftCore and keeps only the
+    /// receiver on the handle, so the channel closes exactly when that task
+    /// ends, whether it returned or panicked. A panicked core leaves this
+    /// process otherwise untouched: the gRPC listener is a different task and
+    /// keeps accepting connections, so without this check a controller that
+    /// cannot replicate anything still looks healthy.
+    pub fn is_core_running(&self) -> bool {
+        self.raft.metrics().has_changed().is_ok()
+    }
+
+    /// Resolves when the RaftCore task ends, and never before.
+    ///
+    /// `changed()` fails only when the sender is dropped, which happens when
+    /// RaftCore is gone.
+    pub async fn core_stopped(&self) {
+        let mut rx = self.raft.metrics();
+        while rx.changed().await.is_ok() {}
+    }
 }
 
 /// The system hostname as a UTF-8 string.
