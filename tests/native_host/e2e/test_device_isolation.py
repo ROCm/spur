@@ -160,6 +160,40 @@ class TestDeviceIsolation:
             f"a job allocated a GPU must be able to open {KFD}\noutput:\n{content}"
         )
 
+    def test_partial_gpu_allocation_hides_the_other_gpus(self, gpu_cluster):
+        # The rootful tmpfs wrapper stages only the allocated render node; the device
+        # filter is the backstop, so the job sees and reaches just its own GPU.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+        if cluster.node_gpu_count(cluster.node_names[0]) < 2:
+            pytest.skip("need >= 2 GPUs on node 0 to prove the siblings are hidden")
+
+        content = _run_probe(
+            cluster,
+            "dev-iso-partial",
+            "n=0\n"
+            'for d in /dev/dri/renderD*; do [ -e "$d" ] || continue; '
+            'n=$((n+1)); probe_open "$d"; done\n'
+            'echo "RENDER_COUNT=$n"\n'
+            f"probe_open {KFD}\n",
+            ["--gres=gpu:1"],
+        ).output
+
+        assert "RENDER_COUNT=1" in content, (
+            f"a gpu:1 job on a multi-GPU node must see exactly its one render "
+            f"node, not the siblings\noutput:\n{content}"
+        )
+        assert not any("renderD" in ln and "EPERM" in ln for ln in content.splitlines()), (
+            f"the one render node the job was given must be usable, not denied\n"
+            f"output:\n{content}"
+        )
+        assert f"{KFD}=OPEN" in content, (
+            f"the allocated job must still reach the GPU control node\n"
+            f"output:\n{content}"
+        )
+
     def test_visible_devices_override_does_not_restore_access(self, gpu_cluster):
         # Re-exporting the selector is how a job defeats an advisory sentinel; it
         # must not move a kernel filter.
@@ -187,9 +221,9 @@ class TestDeviceIsolation:
 @pytest.mark.rootful
 class TestStepAndExecDeviceIsolation:
     """The filter is attached to the job's cgroup, so it only reaches a process
-    that is in it. ``srun`` steps and ``spur exec`` are not batch payloads and
-    have to join it themselves; each of these opened ``/dev/kfd`` freely from
-    inside a zero-GPU job before that join existed.
+    that is in it. ``srun`` steps, ``spur exec``, and interactive ``--pty``
+    attaches are not batch payloads and have to join it themselves; each of these
+    opened ``/dev/kfd`` freely from inside a zero-GPU job before that join existed.
     """
 
     def test_step_in_a_zero_gpu_job_is_denied_the_gpu_control_node(self, gpu_cluster):
@@ -290,6 +324,37 @@ class TestStepAndExecDeviceIsolation:
         assert f"{KFD}=EPERM" in out, (
             f"spur exec into a zero-GPU job must be denied {KFD} by the kernel\n"
             f"output:\n{out}"
+        )
+
+    def test_pty_attach_into_a_zero_gpu_job_is_denied_the_gpu_control_node(
+        self, gpu_cluster
+    ):
+        # `srun --pty` opens an interactive PTY step via spawn_pty_in_job, a path
+        # of its own — not a batch payload, a run_command step, or spur exec.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+
+        job_id = _hold_job(cluster, "dev-iso-pty-zero", [])
+        probe = cluster.write_file(
+            "dev-iso-pty-zero-probe.sh", _probe_script(f"probe_open {KFD}\n")
+        )
+        try:
+            code, out = cluster.srun_with_exit(
+                ["--jobid", str(job_id), "--overlap", "--pty", "bash", probe]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
+        # !r so the PTY's CRLFs and any control bytes are legible on failure.
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the pty attach did not run the probe to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out!r}"
+        )
+        assert f"{KFD}=EPERM" in out, (
+            f"a pty attach into a zero-GPU job must be denied {KFD} by the kernel\n"
+            f"output:\n{out!r}"
         )
 
     def test_a_step_lands_in_the_job_cgroup(self, gpu_cluster):
@@ -407,4 +472,41 @@ class TestDeviceFilterLifecycle:
         assert after == baseline, (
             f"cgroup_device programs went from {baseline} to {after}; the filter "
             f"is not being released with the job cgroup"
+        )
+
+
+@pytest.mark.rootful
+class TestContainerDeviceIsolation:
+    """A native container's process tree lives in the job's cgroup, so the filter
+    reaches it too. A zero-GPU container must not reach the GPU — whether the
+    control node is simply absent from its ``/dev`` or the filter denies the open.
+    """
+
+    def test_zero_gpu_container_cannot_reach_the_gpu(self, gpu_cluster, tmp_path):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+        cluster.container_preflight()
+        image = cluster.build_container_image(tmp_path)
+
+        content = _run_probe(
+            cluster,
+            "dev-iso-ctr-zero",
+            f"probe_open {KFD}\n"
+            "probe_open /dev/null\n",
+            [f"--container-image={image}"],
+        ).output
+
+        assert f"{KFD}=OPEN" not in content, (
+            f"a zero-GPU container must not be able to open {KFD}\noutput:\n{content}"
+        )
+        assert f"{KFD}=EPERM" in content or f"{KFD}=ENOENT" in content, (
+            f"{KFD} must be denied by the filter or absent from the container's "
+            f"/dev\noutput:\n{content}"
+        )
+        # Guards against a filter that just denies everything, which would also
+        # break a container that has no business losing its base devices.
+        assert "/dev/null=OPEN" in content, (
+            f"base devices must still work inside the container\noutput:\n{content}"
         )
