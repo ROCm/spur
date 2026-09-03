@@ -8,6 +8,14 @@ import time
 from cluster import parse_job_id, job_state, wait_job
 
 
+def test_job_state_normalizes_truncated_out_of_memory():
+    output = """\
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+                 1   default cg-oom-s       ci OO       0:01      1 node-1
+"""
+    assert job_state(output, 1) == "OOM"
+
+
 class TestClusterHealth:
     def test_sinfo_returns_output(self, cluster):
         out = cluster.sinfo()
