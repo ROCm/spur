@@ -1151,6 +1151,20 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             time.sleep(2)
         raise RuntimeError("Postgres did not become ready in time")
 
+    def psql(self, sql: str) -> str:
+        """Run *sql* against the accounting database and return stdout.
+
+        Lets a test plant accounting rows that would otherwise take real
+        workload hours to accumulate — fair-share usage in particular.
+        """
+        if not self.accounting_enabled:
+            raise RuntimeError("psql() requires the accounting_cluster fixture")
+        escaped = sql.replace("'", "'\"'\"'")
+        return self.nodes[0].exec(
+            f"docker exec '{self._pg_container}' "
+            f"psql -U spur -d spur -tAc '{escaped}'"
+        )
+
     def _stop_postgres(self):
         node = self.nodes[0]
         node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
