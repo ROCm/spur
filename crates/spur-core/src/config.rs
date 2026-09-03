@@ -955,7 +955,8 @@ pub struct ClusterConfig {
     /// Kubernetes distribution SPUR manages. Only "k0s" is supported today.
     #[serde(default = "default_cluster_distro")]
     pub distro: String,
-    /// Pod network CIDR. Calico bird native routing over the mesh carves per-node /24s from this.
+    /// Pod network CIDR, passed to k0s regardless of `cni`. Calico bird native routing over the
+    /// mesh also carves per-node /24s from this.
     #[serde(default = "default_pod_cidr")]
     pub pod_cidr: String,
     /// Service network CIDR.
@@ -978,10 +979,8 @@ pub struct ClusterConfig {
     /// Filesystem path to the k0s binary (install target + what the systemd unit runs).
     #[serde(default = "default_k0s_binary")]
     pub k0s_binary: String,
-    /// CNI / network mode. "kuberouter" (k0s default — no custom config) or "calico" (Calico in
-    /// bird native-routing mode with the API advertised on the mesh IP, so pods route over the
-    /// WireGuard mesh). Selecting "calico" makes `spur k8s up` generate the k0s config + set each
-    /// worker's kubelet `--node-ip` to its mesh IP.
+    /// CNI mode: "kuberouter" (k0s default) or "calico" (mesh-native, kubelet `--node-ip` on the
+    /// mesh IP). Both carry `pod_cidr`/`service_cidr` into the generated k0s config.
     #[serde(default = "default_cni")]
     pub cni: String,
     /// Storage provisioner SPUR ships so PVC workloads work out of the box (k0s bundles none).
@@ -1794,6 +1793,17 @@ impl SlurmConfig {
                         .into(),
                 });
             }
+            // An unrecognized value would ride into the generated k0s config's `network.provider`
+            // unchecked and only fail once k0s rejects it at bootstrap.
+            if !matches!(self.cluster.cni.as_str(), "kuberouter" | "calico") {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.cni".into(),
+                    value: format!(
+                        "{} (expected \"kuberouter\" or \"calico\")",
+                        self.cluster.cni
+                    ),
+                });
+            }
             // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
             // a valid IPv4 CIDR in the same pass — otherwise a malformed wg_cidr bypasses validate()
             // and fails every reconcile tick in AddressPool::new, leaving the cluster silently stuck.
@@ -2492,6 +2502,15 @@ cni_mtu = 1400
             "cluster_name=\"t\"\n[cluster]\nenabled=true\nk8s_provisioning_timeout_secs=0\n"
         )
         .is_err());
+        // Unknown cni is rejected; "kuberouter" and "calico" are accepted.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncni=\"flannel\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncni=\"calico\"\n"
+        )
+        .is_ok());
         // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
         assert!(SlurmConfig::load_from_str(
             "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"nfs\"\n"
