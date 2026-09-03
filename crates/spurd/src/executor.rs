@@ -1230,12 +1230,18 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
     })
 }
 
-/// Owns a job's cgroup between creation and the point a successful launch hands
-/// it to the caller. Every error return in between would otherwise strand the
-/// directory.
-struct CgroupGuard(Option<PathBuf>);
+/// Owns a job's cgroup until something else takes responsibility: a launch hands
+/// it to the caller, a teardown removes it. Error returns would strand it.
+#[must_use = "the cgroup is removed when this guard drops; bind it to choose when"]
+pub(crate) struct CgroupGuard(Option<PathBuf>);
 
 impl CgroupGuard {
+    /// Take over a cgroup already detached from its job. Removal is deferred to
+    /// the drop, so the holder picks a point where blocking is acceptable.
+    pub(crate) fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
     fn path(&self) -> Option<&Path> {
         self.0.as_deref()
     }
@@ -1254,8 +1260,8 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// Bounded to 200ms: the monitor loop holds the running-jobs lock across cleanup,
-/// and the next `setup_cgroup` clears any directory this gives up on.
+/// Bounded to 200ms: cleanup sits on the completion-reporting path, and the next
+/// `setup_cgroup` clears any directory this gives up on.
 const CGROUP_REMOVE_ATTEMPTS: u32 = 20;
 const CGROUP_REMOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 

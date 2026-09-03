@@ -127,6 +127,33 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
+/// Release what a finished run owned, once the monitor has dropped it from
+/// `running`. Skipped if the id is tracked again: it is all keyed by job id.
+async fn teardown_completed_job(
+    completed: &CompletedJob,
+    running: &RunningJobs,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    mpi_host: &MpiPluginHost,
+) {
+    let job_id = completed.job_id;
+    // Taken and released before `allocation`, the order commit_job uses.
+    if running.lock().await.contains_key(&job_id) {
+        warn!(
+            job_id,
+            "job id re-dispatched during teardown; leaving the new run's state alone"
+        );
+        return;
+    }
+
+    crate::container::cleanup_rootfs(job_id, &completed.rootfs_mode);
+    crate::executor::cleanup_job_spool(job_id);
+    if let Some(ref cgroup) = completed.cgroup {
+        crate::executor::cleanup_cgroup(cgroup);
+    }
+    allocation.lock().await.release_job(job_id);
+    cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
+}
+
 /// Enforced per-node budget: the controller's allocation wins, the spec is the
 /// fallback (every task on this node, and `--mem-per-cpu` when `--mem` is unset).
 fn resolve_cgroup_budget(
@@ -209,36 +236,43 @@ fn stat_shows_running(stat: &str) -> bool {
     !matches!(state, None | Some("Z" | "X"))
 }
 
-/// Drop a job from the running set and release the cgroup it still owns.
+/// Drop a job from the running set, handing back the cgroup it still owns.
 ///
 /// The single exit from `running` bar the monitor loop, which takes the cgroup
-/// itself to read `memory.events` first. Taking it here keeps the release single.
-fn remove_tracked_job(running: &mut HashMap<u32, TrackedJob>, job_id: u32) -> Option<TrackedJob> {
-    let mut tracked = running.remove(&job_id)?;
-    if let Some(cgroup) = tracked.take_cgroup() {
-        executor::cleanup_cgroup(&cgroup);
-    }
-    Some(tracked)
+/// itself to read `memory.events` first. Taking it here keeps the release
+/// single; the caller drops the guard once the `running` lock is gone, since
+/// removal SIGKILLs the cgroup's stragglers and then blocks retrying rmdir.
+fn remove_tracked_job(
+    running: &mut HashMap<u32, TrackedJob>,
+    job_id: u32,
+) -> (Option<TrackedJob>, executor::CgroupGuard) {
+    let Some(mut tracked) = running.remove(&job_id) else {
+        return (None, executor::CgroupGuard::new(None));
+    };
+    let cgroup = executor::CgroupGuard::new(tracked.take_cgroup());
+    (Some(tracked), cgroup)
 }
 
 /// Roll back a registration that cannot be enforced. Takes the held `running`
 /// map so the reservation is released under that lock, the order that keeps a
 /// reconcile pass from seeing the allocation committed with no tracked job.
+/// The refused job's cgroup comes back with the status for the caller to drop.
 fn refuse_allocation(
     job_id: u32,
     reservation: LaunchReservationGuard,
     running: &mut HashMap<u32, TrackedJob>,
     reason: &str,
-) -> Status {
+) -> (Status, executor::CgroupGuard) {
     error!(
         job_id,
         reason, "refusing an allocation that cannot be enforced"
     );
-    remove_tracked_job(running, job_id);
+    let (_, cgroup) = remove_tracked_job(running, job_id);
     drop(reservation);
-    Status::failed_precondition(format!(
+    let status = Status::failed_precondition(format!(
         "[cgroup] required but the allocation's cgroup could not be created: {reason}"
-    ))
+    ));
+    (status, cgroup)
 }
 
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
@@ -548,13 +582,45 @@ mod teardown_tests {
         let mut running = HashMap::new();
         running.insert(7, TrackedJob::allocation_only(Some(cgroup.clone())));
 
-        let removed = remove_tracked_job(&mut running, 7).expect("the job was tracked");
+        let (removed, release) = remove_tracked_job(&mut running, 7);
+        let removed = removed.expect("the job was tracked");
+        drop(release);
 
         assert!(!cgroup.exists(), "teardown must remove the job's cgroup");
         assert!(
             removed.cgroup_path.is_none(),
             "the released path must be taken off the job"
         );
+    }
+
+    // The removal is what blocks, so it belongs to the caller, to run once the
+    // map is unlocked. Taking the job out must not be what removes the cgroup.
+    #[tokio::test]
+    async fn the_cgroup_is_released_by_its_token_and_not_under_the_lock() {
+        let (_root, cgroup) = tracked_with_cgroup();
+        let running = super::new_running_jobs();
+        running
+            .lock()
+            .await
+            .insert(7, TrackedJob::allocation_only(Some(cgroup.clone())));
+
+        let (removed, release) = {
+            let mut jobs = running.lock().await;
+            let taken = remove_tracked_job(&mut jobs, 7);
+            assert!(
+                cgroup.exists(),
+                "the cgroup must outlive the removal that holds the lock"
+            );
+            taken
+        };
+
+        assert!(removed.is_some(), "the job was tracked");
+        assert!(
+            running.try_lock().is_ok(),
+            "the map must be unlocked before the cgroup is released"
+        );
+        drop(release);
+        assert!(!cgroup.exists(), "releasing the token removes the cgroup");
     }
 
     // A re-dispatched job derives the same job_<id> path, so a second teardown
@@ -564,11 +630,13 @@ mod teardown_tests {
         let (_root, cgroup) = tracked_with_cgroup();
         let mut running = HashMap::new();
         running.insert(7, TrackedJob::allocation_only(Some(cgroup.clone())));
-        let released = remove_tracked_job(&mut running, 7).expect("the job was tracked");
+        let (released, first) = remove_tracked_job(&mut running, 7);
+        drop(first);
 
         std::fs::create_dir_all(&cgroup).expect("successor cgroup");
-        running.insert(7, released);
-        remove_tracked_job(&mut running, 7);
+        running.insert(7, released.expect("the job was tracked"));
+        let (_, second) = remove_tracked_job(&mut running, 7);
+        drop(second);
 
         assert!(
             cgroup.exists(),
@@ -581,7 +649,9 @@ mod teardown_tests {
         let mut running = HashMap::new();
         running.insert(8, TrackedJob::allocation_only(None));
 
-        let removed = remove_tracked_job(&mut running, 8).expect("the job was tracked");
+        let (removed, release) = remove_tracked_job(&mut running, 8);
+        let removed = removed.expect("the job was tracked");
+        drop(release);
 
         assert!(removed.cgroup_path.is_none());
         assert!(running.is_empty(), "the job must still leave the map");
@@ -589,7 +659,9 @@ mod teardown_tests {
 
     #[test]
     fn removing_an_untracked_job_yields_nothing() {
-        assert!(remove_tracked_job(&mut HashMap::new(), 9).is_none());
+        let (removed, release) = remove_tracked_job(&mut HashMap::new(), 9);
+        drop(release);
+        assert!(removed.is_none());
     }
 }
 
@@ -809,25 +881,23 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
-                    crate::executor::cleanup_job_spool(c.job_id);
-                    if let Some(ref cgroup) = c.cgroup {
-                        crate::executor::cleanup_cgroup(cgroup);
-                    }
-                    allocation.lock().await.release_job(c.job_id);
-                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
+                }
+                // Teardown below SIGKILLs each cgroup and blocks retrying rmdir,
+                // then runs hooks and RPCs; none of it may hold this lock.
+                drop(jobs);
+
+                for c in &completed {
+                    teardown_completed_job(c, &running, &allocation, &mpi_host).await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `jobs` is held so the live set is a
-                // consistent snapshot that can't race a committing launch
-                // (commit_job takes the running lock first).
-                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
-
-                // Release lock BEFORE network I/O — holding the lock during
-                // report_completion blocks new job launches and can lose
-                // completions if the RPC times out.
-                drop(jobs);
+                // non-launching job. `running` is re-taken before `allocation`,
+                // the order commit_job uses, so the live set the reclaim reads
+                // can't race a committing launch.
+                {
+                    let jobs = running.lock().await;
+                    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+                }
 
                 let local_hostname = hostname::get()
                     .map(|h| h.to_string_lossy().to_string())
@@ -2382,12 +2452,12 @@ impl SlurmAgent for AgentService {
                 None
             }
             AllocationCgroup::Refuse(reason) => {
-                return Err(refuse_allocation(
-                    req.job_id,
-                    reservation_guard,
-                    &mut jobs,
-                    &reason,
-                ));
+                let (status, cgroup) =
+                    refuse_allocation(req.job_id, reservation_guard, &mut jobs, &reason);
+                // Guard first, then the cgroup: removing it blocks retrying rmdir.
+                drop(jobs);
+                drop(cgroup);
+                return Err(status);
             }
         };
 
@@ -3198,11 +3268,19 @@ impl SlurmAgent for AgentService {
 
 impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
-        if remove_tracked_job(&mut *self.running.lock().await, job_id).is_some() {
-            self.allocation.lock().await.release_job(job_id);
-            if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
-                warn!(job_id, error = %e, "PMIx stop failed on job drop");
-            }
+        // Scoped so the guard is gone before `cgroup` is dropped below: removing
+        // a cgroup SIGKILLs its stragglers and then blocks retrying rmdir.
+        let (tracked, cgroup) = {
+            let mut jobs = self.running.lock().await;
+            remove_tracked_job(&mut jobs, job_id)
+        };
+        drop(cgroup);
+        if tracked.is_none() {
+            return;
+        }
+        self.allocation.lock().await.release_job(job_id);
+        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+            warn!(job_id, error = %e, "PMIx stop failed on job drop");
         }
     }
 
@@ -5851,11 +5929,14 @@ mod tests {
             let mut jobs = svc.running.lock().await;
             // Inserted so the rollback has something to undo.
             jobs.insert(42, TrackedJob::allocation_only(None));
-            let status = refuse_allocation(42, reservation, &mut jobs, "cgroup root unavailable");
+            let (status, cgroup) =
+                refuse_allocation(42, reservation, &mut jobs, "cgroup root unavailable");
             assert!(
                 !jobs.contains_key(&42),
                 "a refused allocation must leave no tracked job"
             );
+            drop(jobs);
+            drop(cgroup);
             status
         };
 
@@ -6401,6 +6482,102 @@ mod tests {
         assert!(
             !cgroup.exists(),
             "completion must remove the finished job's cgroup"
+        );
+    }
+
+    fn completed_job(job_id: u32, cgroup: std::path::PathBuf) -> CompletedJob {
+        CompletedJob {
+            job_id,
+            exit_code: 0,
+            signal: 0,
+            run_attempt: 0,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            cgroup: Some(cgroup),
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
+            mpi: String::new(),
+        }
+    }
+
+    // The monitor drops the job from `running` before tearing it down, so the
+    // controller can re-dispatch the id into that window and own the same state.
+    #[tokio::test]
+    async fn teardown_spares_a_job_id_re_dispatched_during_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_907");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 907;
+        let completed = completed_job(job_id, cgroup.clone());
+
+        // The re-dispatch: tracked again under the same id, holding the GPU.
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
+            .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id);
+        }
+
+        teardown_completed_job(&completed, &svc.running, &svc.allocation, &svc.mpi_host).await;
+
+        assert!(
+            cgroup.exists(),
+            "teardown must not remove the cgroup the re-dispatched run is in"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "teardown must not release the re-dispatched run's reservation"
+        );
+    }
+
+    // The counterpart: with no live run under the id, the same teardown must
+    // still release everything, so the guard above cannot just skip always.
+    #[tokio::test]
+    async fn teardown_releases_a_job_id_nothing_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_908");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 908;
+        let completed = completed_job(job_id, cgroup.clone());
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id);
+        }
+
+        teardown_completed_job(&completed, &svc.running, &svc.allocation, &svc.mpi_host).await;
+
+        assert!(
+            !cgroup.exists(),
+            "teardown must remove the finished run's cgroup"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "teardown must release the finished run's reservation"
         );
     }
 
