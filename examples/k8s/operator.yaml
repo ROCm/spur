@@ -72,6 +72,11 @@ spec:
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 10
+            # /readyz makes two live round-trips (K8s API, then a fresh gRPC
+            # connect to spurctld), so the 1s default leaves no margin and the
+            # pod can never go Ready on a loaded cluster. The deadline is per
+            # probe, so a slow answer costs one interval, not readiness.
+            timeoutSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
