@@ -935,7 +935,7 @@ mod tests {
 
     /// Every documented squeue format letter must resolve to a real value, not
     /// the `?` fallback. Guards against a header/sort entry without a matching
-    /// render arm (the SPUR-245 %L regression).
+    /// render arm (for example, a %L time-left regression).
     #[test]
     fn every_header_letter_resolves() {
         let mut j = job(1, "default", P::JobRunning, 100);
