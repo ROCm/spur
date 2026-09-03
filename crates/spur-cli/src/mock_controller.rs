@@ -264,6 +264,7 @@ mock_controller_impl! {
         get_rpc_stats(()) -> proto::RpcStats;
         reset_diag_stats(()) -> ();
         get_sched_stats(()) -> proto::SchedStats;
+        get_assoc_mgr_info(proto::GetAssocMgrInfoRequest) -> proto::GetAssocMgrInfoResponse;
         register_agent(proto::RegisterAgentRequest) -> proto::RegisterAgentResponse;
         heartbeat(proto::HeartbeatRequest) -> proto::HeartbeatResponse;
         create_token(proto::CreateTokenRequest) -> proto::CreateTokenResponse;

@@ -174,6 +174,28 @@ impl AssociationCache {
             .unwrap_or_default()
     }
 
+    /// Every cached association as (account, user) with its limits, sorted. Built
+    /// from memberships rather than from the limits map so an association with no
+    /// limits set still appears — the operator view reports what exists, and an
+    /// association with nothing capped is a finding in itself.
+    pub fn all(&self) -> Vec<(String, String, AccountLimits)> {
+        let snap = self.snapshot.read();
+        let mut all: Vec<(String, String, AccountLimits)> = snap
+            .memberships
+            .iter()
+            .map(|(user, account)| {
+                let limits = snap
+                    .limits
+                    .get(&(user.clone(), account.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                (account.clone(), user.clone(), limits)
+            })
+            .collect();
+        all.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        all
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn replace(
         &self,
