@@ -2356,10 +2356,14 @@ impl SlurmAgent for AgentService {
 
     /// Record a standalone-srun allocation on this node without launching a
     /// batch script.
+    ///
+    /// Controller-only: `uid` and `user` reach the tracked job straight from the wire, and the exec
+    /// paths authorize against `user` while executing as `uid` — a caller setting both is anyone.
     async fn register_job_allocation(
         &self,
         request: Request<RegisterJobAllocationRequest>,
     ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
@@ -4789,6 +4793,38 @@ mod tests {
             .await
             .expect_err("a user token must not cancel jobs by dialing the agent directly");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// The impersonation this gate exists to stop: `user` decides who owns the allocation and `uid`
+    /// decides who its steps run as, so a caller who sets both reaches any account on the node.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_a_non_controller_caller() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut req = Request::new(RegisterJobAllocationRequest {
+            job_id: 49,
+            uid: 1234,
+            gid: 1234,
+            user: "attacker".into(),
+            cpus: 1,
+            ..Default::default()
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a user token must not register an allocation on the agent directly");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused registration must not leave a job the exec paths would trust"
+        );
     }
 
     /// A launch aimed at another node's name must be refused: the agent only runs allocations
