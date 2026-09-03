@@ -131,11 +131,15 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
 /// `running`. Skipped if the id is tracked again: it is all keyed by job id.
 async fn teardown_completed_job(
     completed: &CompletedJob,
+    lifecycle: &crate::job_lifecycle::JobLifecycle,
     running: &RunningJobs,
     allocation: &Arc<Mutex<NodeAllocation>>,
     mpi_host: &MpiPluginHost,
 ) {
     let job_id = completed.job_id;
+    // Held across the check below and every release under it, so a re-dispatch either
+    // lands before this and is seen, or waits and finds nothing of its own removed.
+    let _lifecycle = lifecycle.acquire(job_id).await;
     // Taken and released before `allocation`, the order commit_job uses.
     if running.lock().await.contains_key(&job_id) {
         warn!(
@@ -693,6 +697,8 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
+    lifecycle: crate::job_lifecycle::JobLifecycle,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
@@ -808,6 +814,7 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
         }
@@ -833,6 +840,7 @@ impl AgentService {
         let spank = self.spank.clone();
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
+        let lifecycle = self.lifecycle.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -887,7 +895,7 @@ impl AgentService {
                 drop(jobs);
 
                 for c in &completed {
-                    teardown_completed_job(c, &running, &allocation, &mpi_host).await;
+                    teardown_completed_job(c, &lifecycle, &running, &allocation, &mpi_host).await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
@@ -1286,6 +1294,9 @@ struct ChildContainment<'a> {
     /// `None` on the nsenter shape, which drops inside the namespace via
     /// `setpriv` — dropping here as well would break the namespace entry.
     priv_drop: Option<crate::privdrop::PrivDrop>,
+    /// Abort the exec if the cgroup join fails, rather than run the command
+    /// outside the job's device filter and limits.
+    cgroup_required: bool,
 }
 
 impl<'a> ChildContainment<'a> {
@@ -1293,6 +1304,7 @@ impl<'a> ChildContainment<'a> {
         plan: &LaunchPlan,
         entry: &'a crate::job_entry::JobEntry,
         priv_drop: Option<crate::privdrop::PrivDrop>,
+        cgroup_required: bool,
     ) -> Self {
         Self {
             cgroup: entry.cgroup_path.as_deref(),
@@ -1301,6 +1313,7 @@ impl<'a> ChildContainment<'a> {
             } else {
                 None
             },
+            cgroup_required,
         }
     }
 
@@ -1309,12 +1322,17 @@ impl<'a> ChildContainment<'a> {
     fn register(self, cmd: &mut tokio::process::Command) {
         let cgroup_join = executor::CgroupJoin::for_cgroup(self.cgroup);
         let priv_drop = self.priv_drop;
+        let required = self.cgroup_required;
         unsafe {
             cmd.pre_exec(move || {
-                // Before the drop below: an unprivileged process cannot write
-                // another cgroup's `cgroup.procs`.
+                // Before the drop: an unprivileged process cannot write another cgroup's
+                // `cgroup.procs`. Under `required` a failed join aborts rather than exec unfiltered.
                 if let Some(ref join) = cgroup_join {
-                    join.join();
+                    if !join.join() && required {
+                        return Err(std::io::Error::other(
+                            "[cgroup] required but the process did not join the job cgroup",
+                        ));
+                    }
                 }
                 if let Some(ref pd) = priv_drop {
                     pd.apply()
@@ -1353,7 +1371,7 @@ mod child_containment_tests {
         let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
         assert!(!plan.apply_priv_in_child, "expected the nsenter shape");
 
-        let containment = ChildContainment::for_plan(&plan, &entry, Some(pd));
+        let containment = ChildContainment::for_plan(&plan, &entry, Some(pd), false);
 
         assert_eq!(containment.cgroup, Some(std::path::Path::new(CGROUP)));
         // setpriv drops inside the namespace; dropping here too would leave the
@@ -1368,7 +1386,7 @@ mod child_containment_tests {
         let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
         assert!(plan.apply_priv_in_child, "expected the direct-spawn shape");
 
-        let containment = ChildContainment::for_plan(&plan, &entry, Some(pd));
+        let containment = ChildContainment::for_plan(&plan, &entry, Some(pd), false);
 
         assert_eq!(containment.cgroup, Some(std::path::Path::new(CGROUP)));
         assert!(containment.priv_drop.is_some());
@@ -1382,7 +1400,7 @@ mod child_containment_tests {
             let pd = PrivDrop::for_test(1000, 1000);
             let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
 
-            assert!(ChildContainment::for_plan(&plan, &entry, Some(pd))
+            assert!(ChildContainment::for_plan(&plan, &entry, Some(pd), false)
                 .cgroup
                 .is_none());
         }
@@ -1652,6 +1670,10 @@ impl SlurmAgent for AgentService {
             warn!(job_id, uid = spec.uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
+
+        // Held until this run is tracked (or its half-built state is cleaned up), so a
+        // re-dispatch of the id never builds on top of the previous run's teardown.
+        let lifecycle = self.lifecycle.acquire(job_id).await;
 
         info!(
             job_id,
@@ -2070,7 +2092,10 @@ impl SlurmAgent for AgentService {
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.cgroup_path.take();
                     let running = self.running.clone();
+                    // The guard moves into the task: reaping can outlive this call, and
+                    // the id must stay closed to a re-dispatch until the state is gone.
                     tokio::spawn(async move {
+                        let _lifecycle = lifecycle;
                         reap_killed_job(result.job).await;
                         // rootfs, spool and the job_<id> cgroup all derive from
                         // job_id, so a re-dispatch of that id reuses them: tearing
@@ -2339,7 +2364,8 @@ impl SlurmAgent for AgentService {
             // host's mount namespace, where a job's work_dir need not exist.
             cmd.current_dir(&entry.work_dir);
         }
-        ChildContainment::for_plan(&plan, &entry, priv_drop).register(&mut cmd);
+        ChildContainment::for_plan(&plan, &entry, priv_drop, self.cgroup.required)
+            .register(&mut cmd);
 
         let output = cmd
             .output()
@@ -2368,6 +2394,9 @@ impl SlurmAgent for AgentService {
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
+        // Creates this id's cgroup, so it must not run while a prior run's teardown
+        // still owns the directory.
+        let _lifecycle = self.lifecycle.acquire(req.job_id).await;
 
         let allocated = req.allocated.as_ref();
         let mut controller_gpu_ids: Vec<u32> = allocated
@@ -3035,8 +3064,13 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        let (master_fd, child, child_pid) =
-            Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
+        let (master_fd, child, child_pid) = Self::spawn_pty_in_job(
+            &entry,
+            &argv,
+            init.job_id,
+            winsize.as_ref(),
+            self.cgroup.required,
+        )?;
 
         info!(
             job_id = init.job_id,
@@ -3272,6 +3306,9 @@ impl SlurmAgent for AgentService {
 
 impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
+        // The cgroup removal and the release below both key off the id, so a launch
+        // reusing it must not interleave with them.
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
         // Scoped so the guard is gone before `cgroup` is dropped below: removing
         // a cgroup SIGKILLs its stragglers and then blocks retrying rmdir.
         let (tracked, cgroup) = {
@@ -3763,6 +3800,7 @@ impl AgentService {
         argv: &[String],
         job_id: u32,
         winsize: Option<&crate::pty::WindowSize>,
+        cgroup_required: bool,
     ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
         use std::os::fd::AsRawFd;
         use std::process::Stdio;
@@ -3788,7 +3826,7 @@ impl AgentService {
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
         let plan = build_launch_plan(entry, priv_drop.as_ref(), &shell);
-        let containment = ChildContainment::for_plan(&plan, entry, priv_drop);
+        let containment = ChildContainment::for_plan(&plan, entry, priv_drop, cgroup_required);
         let launch_cmd = plan.program;
         let launch_args = plan.args;
 
@@ -4119,8 +4157,53 @@ mod tests {
             cgroup_path: None,
         };
         let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None)
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
                 .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
+        assert!(pid > 0);
+        let status = child.wait().await.expect("child should be reapable");
+        assert!(status.success(), "`true` should exit 0");
+        drop(master);
+    }
+
+    // The device filter lives on the job cgroup, so a child that fails to join it runs
+    // unfiltered. Under `required` that must abort before exec, not exec and warn.
+    #[tokio::test]
+    async fn a_required_join_that_cannot_land_aborts_the_attach() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 0,
+            gid: 0,
+            work_dir: "/tmp".into(),
+            // A path with no cgroup.procs: the pre-exec open fails, so the join cannot land.
+            cgroup_path: Some("/nonexistent/spur-required/job_1".into()),
+        };
+
+        let err = AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, true)
+            .expect_err("a required join that cannot land must fail the spawn");
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    // The same unjoinable cgroup without `required` is the degraded non-root-agent path:
+    // it must still run rather than refuse the user their shell.
+    #[tokio::test]
+    async fn a_best_effort_join_failure_still_runs_the_command() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 0,
+            gid: 0,
+            work_dir: "/tmp".into(),
+            cgroup_path: Some("/nonexistent/spur-besteffort/job_1".into()),
+        };
+
+        let (master, mut child, pid) =
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, false)
+                .expect("a best-effort join failure must still spawn the command");
         assert!(pid > 0);
         let status = child.wait().await.expect("child should be reapable");
         assert!(status.success(), "`true` should exit 0");
@@ -4148,7 +4231,7 @@ mod tests {
         };
 
         let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None)
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
                 .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
         let status = child.wait().await.expect("child should be reapable");
         assert!(status.success(), "`true` should exit 0");
@@ -4641,6 +4724,45 @@ mod tests {
         );
     }
 
+    // The exec counterpart of the PTY required-join test: `spur exec` must refuse to
+    // run outside the job's device filter when `[cgroup] required` and the join fails.
+    #[tokio::test]
+    async fn a_required_join_that_cannot_land_aborts_the_exec() {
+        let svc = AgentService::with_cluster_config(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                required: true,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            new_running_jobs(),
+            false, // allow_root_jobs
+        )
+        .with_root_override(false);
+
+        // A path with no cgroup.procs: the pre-exec join open fails.
+        svc.insert_test_job(
+            47,
+            TrackedJob::allocation_only(Some("/nonexistent/spur-exec-required/job_47".into())),
+        )
+        .await;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id: 47,
+                command: vec!["true".into()],
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("a required join that cannot land must fail the exec");
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
     fn user_identity(name: &str) -> spur_core::auth::Identity {
         spur_core::auth::Identity {
             user: name.into(),
@@ -4793,6 +4915,62 @@ mod tests {
             .await
             .expect_err("a user token must not cancel jobs by dialing the agent directly");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // The check inside teardown is only meaningful if a launch cannot land after it: the
+    // id's cgroup, spool and rootfs are all derived names the successor would recreate.
+    #[tokio::test]
+    async fn teardown_cannot_start_while_a_launch_holds_the_job_id() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 910;
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_910");
+        std::fs::create_dir(&cgroup).unwrap();
+        let completed = completed_job(job_id, cgroup.clone());
+
+        // Stands in for a launch of the same id: it owns the id's state until it is done.
+        let launching = svc.lifecycle.acquire(job_id).await;
+
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let (lifecycle, running, allocation, mpi_host) = (
+                svc.lifecycle.clone(),
+                svc.running.clone(),
+                svc.allocation.clone(),
+                svc.mpi_host.clone(),
+            );
+            let flag = Arc::clone(&torn_down);
+            async move {
+                teardown_completed_job(&completed, &lifecycle, &running, &allocation, &mpi_host)
+                    .await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // Nudges rather than waits: the teardown body has no pending await of its own once
+        // it holds the id, so if it were not parked on the id it would finish in these.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "teardown must wait rather than run while the launch owns the id"
+        );
+        assert!(
+            cgroup.exists(),
+            "teardown must not remove state the launch is building on"
+        );
+
+        drop(launching);
+        task.await
+            .expect("teardown runs once the launch releases the id");
+        assert!(!cgroup.exists(), "teardown still runs after it waits");
     }
 
     /// The impersonation this gate exists to stop: `user` decides who owns the allocation and `uid`
@@ -6568,7 +6746,14 @@ mod tests {
             alloc.commit_job(job_id);
         }
 
-        teardown_completed_job(&completed, &svc.running, &svc.allocation, &svc.mpi_host).await;
+        teardown_completed_job(
+            &completed,
+            &svc.lifecycle,
+            &svc.running,
+            &svc.allocation,
+            &svc.mpi_host,
+        )
+        .await;
 
         assert!(
             cgroup.exists(),
@@ -6604,7 +6789,14 @@ mod tests {
             alloc.commit_job(job_id);
         }
 
-        teardown_completed_job(&completed, &svc.running, &svc.allocation, &svc.mpi_host).await;
+        teardown_completed_job(
+            &completed,
+            &svc.lifecycle,
+            &svc.running,
+            &svc.allocation,
+            &svc.mpi_host,
+        )
+        .await;
 
         assert!(
             !cgroup.exists(),

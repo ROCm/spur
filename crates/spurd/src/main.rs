@@ -8,6 +8,7 @@ pub mod container;
 mod device_cgroup;
 mod executor;
 pub(crate) mod job_entry;
+pub(crate) mod job_lifecycle;
 mod landlock;
 mod mpi_plugin;
 pub(crate) mod privdrop;

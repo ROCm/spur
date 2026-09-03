@@ -1185,8 +1185,8 @@ cgroups.
 .. warning::
 
    These settings bound a job only when ``spurd`` runs as root, and with the
-   default ``required = false`` a host that cannot apply a constraint — no
-   ``CAP_BPF`` for the device filter, say — logs a warning and runs the work
+   default ``required = false`` a host that cannot apply a constraint — missing
+   ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
    unconstrained. Set ``required = true`` to make that case fail closed instead.
    See :ref:`cgroup-containment-gaps` for what remains even then: per-step
    granularity, and the site-supplied task hooks that run outside the job cgroup.
@@ -1275,8 +1275,9 @@ cgroups.
        cgroup-v2 BPF device filter. Default-deny: a job allocated no GPUs can open
        only the nodes listed under :ref:`device-filter-implicit-allow` below, and
        opening an unallocated GPU fails with ``EPERM`` whatever the job sets
-       ``ROCR_VISIBLE_DEVICES`` to. Attaching the filter needs ``CAP_BPF`` or
-       ``CAP_SYS_ADMIN``; without them the job runs with no device isolation.
+       ``ROCR_VISIBLE_DEVICES`` to. Installing the filter needs ``CAP_BPF`` and
+       ``CAP_NET_ADMIN`` (or ``CAP_SYS_ADMIN``) — ``CAP_BPF`` alone is insufficient for a
+       cgroup-device program; without them the job runs with no device isolation.
    * - ``extra_device_paths``
      - [string]
      - ``[]``

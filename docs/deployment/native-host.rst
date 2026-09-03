@@ -874,9 +874,10 @@ Spur restricts a job to its allocated GPUs in two layers:
 
 The filter is attached to the job's cgroup, so it covers every process the agent
 starts for the job: the batch payload, ``srun`` steps, ``spur exec``, and
-interactive attach alike. Attaching it needs ``CAP_BPF`` or ``CAP_SYS_ADMIN`` — an
-agent without them logs a warning and runs the job with no device isolation,
-unless ``[cgroup] required`` is set, which refuses the job instead. See
+interactive attach alike. Installing it needs ``CAP_BPF`` and ``CAP_NET_ADMIN`` (or
+``CAP_SYS_ADMIN``) — a cgroup-device program is a net-admin program type, so ``CAP_BPF``
+alone is not enough. An agent without them logs a warning and runs the job with no
+device isolation, unless ``[cgroup] required`` is set, which refuses the job instead. See
 :ref:`cgroup-containment-gaps`.
 
 See Also

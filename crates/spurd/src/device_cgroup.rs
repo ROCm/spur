@@ -476,15 +476,18 @@ fn verifier_log_text(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).trim_end().to_string()
 }
 
-/// The load is gated on `bpf_capable()`, so both paths need the capability hint;
-/// `other_cause` names whatever else returns `EPERM`, since the errno cannot.
+/// Both the load and, on pre-CAP_BPF kernels, the attach gate on capabilities, so both
+/// paths carry this hint; `other_cause` names whatever else returns `EPERM`, as errno cannot.
 fn eperm_hint(err: &std::io::Error, other_cause: Option<&str>) -> String {
     if err.raw_os_error() != Some(libc::EPERM) {
         return String::new();
     }
+    // CGROUP_DEVICE is a net-admin program type, so the load needs CAP_BPF *and*
+    // CAP_NET_ADMIN, or CAP_SYS_ADMIN alone; older kernels also gate attach on CAP_NET_ADMIN.
+    const CAPS: &str = "CAP_BPF and CAP_NET_ADMIN, or CAP_SYS_ADMIN";
     match other_cause {
-        Some(cause) => format!(" (spurd needs CAP_BPF or CAP_SYS_ADMIN, or {cause})"),
-        None => " (spurd needs CAP_BPF or CAP_SYS_ADMIN)".to_string(),
+        Some(cause) => format!(" (spurd needs {CAPS}; or {cause})"),
+        None => format!(" (spurd needs {CAPS})"),
     }
 }
 
@@ -879,6 +882,29 @@ mod tests {
         );
     }
 
+    // The core of GPU isolation: render nodes share major 226 and differ only by minor,
+    // so a filter matching on major alone would hand a one-GPU job every GPU on the node.
+    #[test]
+    fn filter_denies_a_same_major_different_minor_device() {
+        let rules = rules_for_device_paths(&["/dev/dri/renderD128".to_string()], |_| {
+            Some((DevType::Char, 226, 128))
+        });
+        let prog = build_device_filter(&rules);
+        assert_eq!(
+            run_filter(
+                &prog,
+                dev_ctx(DevType::Char, ACC_READ | ACC_WRITE, 226, 128)
+            ),
+            1,
+            "the allocated render node (226:128) must be usable"
+        );
+        assert_eq!(
+            run_filter(&prog, dev_ctx(DevType::Char, ACC_READ, 226, 129)),
+            0,
+            "a sibling GPU on the same major (226:129) must be denied"
+        );
+    }
+
     #[test]
     fn filter_allows_base_pseudo_devices() {
         let prog = build_device_filter(&base_device_rules());
@@ -1100,13 +1126,18 @@ mod tests {
 
         let load = eperm_hint(&eperm, None);
         assert!(load.contains("CAP_BPF"), "load hint names the capability");
+        // CGROUP_DEVICE is a net-admin program type, so CAP_BPF on its own does not load it.
+        assert!(
+            load.contains("CAP_NET_ADMIN"),
+            "the hint must not imply CAP_BPF alone suffices: {load}"
+        );
         assert!(
             !load.contains("ancestor"),
             "the exclusive-attach conflict cannot cause a failed load: {load}"
         );
 
         let attach = eperm_hint(&eperm, Some("an ancestor cgroup already holds it"));
-        assert!(attach.contains("CAP_BPF"));
+        assert!(attach.contains("CAP_BPF") && attach.contains("CAP_NET_ADMIN"));
         assert!(attach.contains("an ancestor cgroup already holds it"));
 
         assert_eq!(

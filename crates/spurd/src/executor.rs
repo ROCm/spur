@@ -770,7 +770,8 @@ async fn spawn_job_process(
         let log_fd = cgroup_log_fd;
         unsafe {
             cmd.pre_exec(move || {
-                join_cgroup_self(&procs, log_fd);
+                // Best-effort here; `required` is enforced parent-side below via cgroup_has_pid.
+                let _ = join_cgroup_self(&procs, log_fd);
                 Ok(())
             });
         }
@@ -990,22 +991,19 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
-    // A leaked dir keeps its device program, which a job installing no filter of
-    // its own would inherit. `rmdir` fails EBUSY on a live cgroup, so only stale ones go.
-    let _ = std::fs::remove_dir(&cgroup_path);
-    if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
-        if nix::unistd::geteuid().is_root() {
-            anyhow::bail!("cgroup creation failed as root: {}", e);
+    if let Err(e) = claim_cgroup_dir(&cgroup_path) {
+        match classify_cgroup_claim_failure(
+            &e,
+            nix::unistd::geteuid().is_root(),
+            cgroup.required,
+            &cgroup_path,
+        ) {
+            CgroupClaim::Fatal(msg) => anyhow::bail!(msg),
+            CgroupClaim::Degrade => {
+                warn!(job_id, error = %e, "cgroup unavailable; job runs without isolation");
+                return Ok(None);
+            }
         }
-        if cgroup.required {
-            anyhow::bail!("[cgroup] required but the job cgroup could not be created: {e}");
-        }
-        warn!(
-            job_id,
-            error = %e,
-            "cgroup creation failed (not root), running without isolation"
-        );
-        return Ok(None);
     }
 
     // Core ids come from a synthesized 0..n range, which can name cores this
@@ -1121,9 +1119,10 @@ fn permitted_cores(requested: &[u32], parent_effective: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
-/// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
-fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
+/// Join the calling process to a cgroup (pid → `cgroup.procs`), returning whether it landed.
+/// Async-signal-safe (raw syscalls only) for post-fork pre-exec use; warns to `log_fd` on failure.
+#[must_use]
+fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) -> bool {
     let pid = unsafe { libc::getpid() };
 
     let mut buf = [0u8; 24];
@@ -1143,14 +1142,17 @@ fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
         let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
         if fd < 0 {
             warn_cgroup_join_failed(log_fd);
-            return;
+            return false;
         }
         let written = libc::write(fd, digits.as_ptr() as *const libc::c_void, digits.len());
         libc::close(fd);
-        if written < 0 {
+        // cgroup.procs takes the whole pid in one write or errors; a short count is a failure.
+        if written != digits.len() as isize {
             warn_cgroup_join_failed(log_fd);
+            return false;
         }
     }
+    true
 }
 
 /// Async-signal-safe warning for a failed cgroup join: a fixed message to
@@ -1189,10 +1191,10 @@ impl CgroupJoin {
         Some(Self { procs, log_fd })
     }
 
-    /// Call from `pre_exec`, while the child is still root: an unprivileged
-    /// process cannot write another cgroup's `cgroup.procs`.
-    pub(crate) fn join(&self) {
-        join_cgroup_self(&self.procs, self.log_fd);
+    /// Call from `pre_exec`, while the child is still root: an unprivileged process
+    /// cannot write another cgroup's `cgroup.procs`. Returns whether the join landed.
+    pub(crate) fn join(&self) -> bool {
+        join_cgroup_self(&self.procs, self.log_fd)
     }
 
     #[cfg(test)]
@@ -1264,6 +1266,48 @@ impl Drop for CgroupGuard {
 /// `setup_cgroup` clears any directory this gives up on.
 const CGROUP_REMOVE_ATTEMPTS: u32 = 20;
 const CGROUP_REMOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Take a job's cgroup directory, clearing a leftover one first. `AlreadyExists` means the
+/// leftover could not be removed, which the caller refuses to adopt: it may carry another
+/// run's processes, limits and device filter.
+fn claim_cgroup_dir(cgroup_path: &Path) -> std::io::Result<()> {
+    if cgroup_path.exists() {
+        cleanup_cgroup(cgroup_path);
+    }
+    std::fs::create_dir(cgroup_path)
+}
+
+/// Whether a failed cgroup claim must fail the launch or may run without isolation.
+enum CgroupClaim {
+    Fatal(String),
+    Degrade,
+}
+
+/// A surviving or uncreatable cgroup is never adopted; the choice is only fail vs. run
+/// unconstrained. Fail closed for root (a survival means live processes it should reap) or
+/// `required`; else degrade, so a root-owned leftover a non-root agent cannot remove never wedges.
+fn classify_cgroup_claim_failure(
+    err: &std::io::Error,
+    is_root: bool,
+    required: bool,
+    cgroup_path: &Path,
+) -> CgroupClaim {
+    if is_root {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return CgroupClaim::Fatal(format!(
+                "job cgroup {} could not be cleared for reuse (live processes still in it)",
+                cgroup_path.display()
+            ));
+        }
+        return CgroupClaim::Fatal(format!("cgroup creation failed as root: {err}"));
+    }
+    if required {
+        return CgroupClaim::Fatal(format!(
+            "[cgroup] required but the job cgroup could not be created: {err}"
+        ));
+    }
+    CgroupClaim::Degrade
+}
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
@@ -1754,9 +1798,10 @@ async fn launch_container_job(
             }
 
             // Join while still root, before pivot_root hides the host cgroupfs and
-            // before close_inherited_fds reaps the log fd.
+            // before close_inherited_fds reaps the log fd. `required` is verified
+            // parent-side after readiness, so a failure here is best-effort.
             if let Some(ref procs) = cgroup_procs {
-                join_cgroup_self(procs, cgroup_log_fd);
+                let _ = join_cgroup_self(procs, cgroup_log_fd);
             }
 
             crate::container::close_inherited_fds(ready_w);
@@ -2564,6 +2609,71 @@ mod tests {
     }
 
     #[test]
+    fn claiming_a_cgroup_dir_creates_it_when_nothing_is_there() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job_1");
+        claim_cgroup_dir(&path).expect("a fresh id must get its directory");
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn claiming_a_cgroup_dir_clears_an_empty_leftover() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job_1");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("marker"), "stale").unwrap();
+        std::fs::remove_file(path.join("marker")).unwrap();
+
+        claim_cgroup_dir(&path).expect("an empty leftover must be cleared and remade");
+        assert!(path.is_dir());
+    }
+
+    // A directory outliving its cleanup is how a live cgroup presents: rmdir fails while
+    // processes remain, and adopting it would hand them this run's limits and filter.
+    #[test]
+    fn claiming_refuses_a_leftover_that_survives_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job_1");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupant"), "still here").unwrap();
+
+        let err = claim_cgroup_dir(&path).expect_err("a surviving cgroup must not be adopted");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    // A non-root agent inheriting a root-owned leftover cgroup it cannot remove gets EEXIST from
+    // the claim. Under required=false that must degrade to no isolation, not refuse the launch.
+    #[test]
+    fn a_nonroot_agent_degrades_when_a_leftover_cgroup_cannot_be_cleared() {
+        let eexist = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eexist, false, false, Path::new("/x/job_1")),
+            CgroupClaim::Degrade
+        ));
+        // A plain creation error degrades the same way for a non-root, non-required agent.
+        let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eperm, false, false, Path::new("/x/job_1")),
+            CgroupClaim::Degrade
+        ));
+    }
+
+    // The safety directions the degrade must not weaken: a root agent that cannot clear a
+    // leftover has live processes to reckon with, and `required` means enforce or refuse.
+    #[test]
+    fn a_root_or_required_agent_still_fails_on_an_unclaimable_cgroup() {
+        let eexist = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eexist, true, false, Path::new("/x/job_1")),
+            CgroupClaim::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eexist, false, true, Path::new("/x/job_1")),
+            CgroupClaim::Fatal(_)
+        ));
+    }
+
+    #[test]
     fn write_job_scratch_is_executable_and_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -3105,18 +3215,24 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
 
-        join_cgroup_self(&c_path, -1);
+        assert!(
+            join_cgroup_self(&c_path, -1),
+            "a successful write must report joined"
+        );
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, std::process::id().to_string());
     }
 
     #[test]
-    fn join_cgroup_self_is_silent_when_the_path_is_missing() {
-        // Best-effort: a non-existent cgroup.procs must not panic, so a failed
-        // placement degrades to an unconstrained job instead of aborting launch.
+    fn join_cgroup_self_reports_failure_when_the_path_is_missing() {
+        // A non-existent cgroup.procs must not panic and must report the miss, so the
+        // caller can degrade (best-effort) or abort (`required`) as it chooses.
         let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
-        join_cgroup_self(&c_path, -1);
+        assert!(
+            !join_cgroup_self(&c_path, -1),
+            "a missing cgroup must report not joined"
+        );
     }
 
     #[test]
@@ -3128,7 +3244,10 @@ mod tests {
         let (read_fd, write_fd) = (fds[0], fds[1]);
         let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
 
-        join_cgroup_self(&c_path, write_fd);
+        assert!(
+            !join_cgroup_self(&c_path, write_fd),
+            "the failed join must be reported"
+        );
         unsafe { libc::close(write_fd) };
 
         let mut buf = [0u8; 128];
