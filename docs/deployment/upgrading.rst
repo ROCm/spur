@@ -362,9 +362,10 @@ To defer the change entirely:
    [cgroup]
    constrain_devices = false
 
-Attaching the filter needs ``CAP_BPF`` or ``CAP_SYS_ADMIN``. An agent without them
-logs ``device filter not installed`` and runs the job with no device isolation, so
-an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
+Installing the filter needs ``CAP_BPF`` and ``CAP_NET_ADMIN`` (or ``CAP_SYS_ADMIN``);
+a cgroup-device program is a net-admin program type, so ``CAP_BPF`` alone is not enough.
+An agent without them logs ``device filter not installed`` and runs the job with no
+device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
 
 See Also
