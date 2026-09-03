@@ -1,7 +1,9 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: spur-config
+  # A readable template only. spurctld.yaml mounts the Secret "spur-config"
+  # that you build from this file, because spur.conf carries a password.
+  name: spur-config-template
   namespace: spur
 data:
   spur.conf: |
@@ -23,7 +25,10 @@ data:
     plugin = "backfill"
 
     [accounting]
-    database_url = "postgresql://spur:spur@postgres.spur.svc.cluster.local/spur"
+    # Put the real URL, with its password, in a Secret named spur-config and
+    # mount that instead of this ConfigMap. See spurctld.yaml. Leave empty to
+    # run without accounting.
+    database_url = ""
 
     [[partitions]]
     name = "default"
