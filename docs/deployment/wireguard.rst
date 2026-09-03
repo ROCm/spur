@@ -96,6 +96,18 @@ Enable the ``wg-quick@<iface>`` unit so the interface is recreated on reboot fro
 The Ansible toolkit does this automatically when ``spur_wg_persist=true`` (the
 default).
 
+``add-peer``, ``remove-peer``, and ``mesh`` also persist their result to
+``/etc/wireguard/<iface>.conf`` (in addition to applying it live), so a peer
+added this way survives the interface being recreated on reboot. Point
+``--config-dir`` at the same directory used for ``init``/``join`` if it isn't
+the default ``/etc/wireguard``.
+
+Under a SPUR-managed k0s cluster, a peer added this way to a k0s-meshed node is
+also protected from the k0s reconcile loop's prune pass (see below): the
+reconcile only removes a peer that is both outside its own k0s membership *and*
+absent from that node's persisted config, so a peer you added by hand for
+something outside the k0s cluster is never pruned out from under you.
+
 Removing a node from the mesh
 =============================
 
