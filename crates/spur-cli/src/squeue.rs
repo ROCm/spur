@@ -208,6 +208,14 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'T' => state_name(job.state),
         'M' => format_runtime(job),
         'l' => format_time_limit(job),
+        'L' => {
+            let secs = time_left_secs(job);
+            if secs == i64::MAX {
+                "UNLIMITED".into()
+            } else {
+                format_duration_hms(secs.max(0))
+            }
+        }
         'D' => job.num_nodes.to_string(),
         'R' => {
             if job.state == spur_proto::proto::JobState::JobPending as i32 {
@@ -889,5 +897,66 @@ mod tests {
         let mut jobs = vec![a, b, c];
         sort_jobs(&mut jobs, &parse_sort_arg("L").unwrap());
         assert_eq!(ids(&jobs), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn time_left_renders_remaining_duration() {
+        let mut j = job(1, "default", P::JobRunning, 0);
+        j.time_limit = Some(prost_types::Duration {
+            seconds: 3600,
+            nanos: 0,
+        });
+        j.run_time = Some(prost_types::Duration {
+            seconds: 600,
+            nanos: 0,
+        });
+        assert_eq!(resolve_job_field(&j, 'L'), "50:00");
+    }
+
+    #[test]
+    fn time_left_unlimited_when_no_limit() {
+        let j = job(1, "default", P::JobRunning, 0);
+        assert_eq!(resolve_job_field(&j, 'L'), "UNLIMITED");
+    }
+
+    #[test]
+    fn time_left_clamps_overrun_to_zero() {
+        let mut j = job(1, "default", P::JobRunning, 0);
+        j.time_limit = Some(prost_types::Duration {
+            seconds: 600,
+            nanos: 0,
+        });
+        j.run_time = Some(prost_types::Duration {
+            seconds: 900,
+            nanos: 0,
+        });
+        assert_eq!(resolve_job_field(&j, 'L'), "0:00");
+    }
+
+    /// Every documented squeue format letter must resolve to a real value, not
+    /// the `?` fallback. Guards against a header/sort entry without a matching
+    /// render arm (the SPUR-245 %L regression).
+    #[test]
+    fn every_header_letter_resolves() {
+        let mut j = job(1, "default", P::JobRunning, 100);
+        j.time_limit = Some(prost_types::Duration {
+            seconds: 3600,
+            nanos: 0,
+        });
+        j.run_time = Some(prost_types::Duration {
+            seconds: 600,
+            nanos: 0,
+        });
+        for c in b'!'..=b'~' {
+            let spec = c as char;
+            if format_engine::squeue_header(spec) == "?" {
+                continue;
+            }
+            assert_ne!(
+                resolve_job_field(&j, spec),
+                "?",
+                "spec %{spec} has a header but no render arm"
+            );
+        }
     }
 }
