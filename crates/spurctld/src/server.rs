@@ -2768,6 +2768,41 @@ impl SlurmController for ControllerService {
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
+        // Step-level container override from srun --container-image; falls back
+        // to the parent job's container config (e.g. sbatch --container-image).
+        let step_container_image = if !req.container_image.is_empty() {
+            req.container_image.clone()
+        } else {
+            job.spec.container_image.clone().unwrap_or_default()
+        };
+        let step_container_mounts = if !req.container_mounts.is_empty() {
+            req.container_mounts.clone()
+        } else {
+            job.spec.container_mounts.clone()
+        };
+        let step_container_workdir = if !req.container_workdir.is_empty() {
+            req.container_workdir.clone()
+        } else {
+            job.spec.container_workdir.clone().unwrap_or_default()
+        };
+        let step_container_name = if !req.container_name.is_empty() {
+            req.container_name.clone()
+        } else {
+            job.spec.container_name.clone().unwrap_or_default()
+        };
+        let step_container_readonly = req.container_readonly || job.spec.container_readonly;
+        let step_container_mount_home = req.container_mount_home || job.spec.container_mount_home;
+        let step_container_env = if !req.container_env.is_empty() {
+            req.container_env.clone()
+        } else {
+            job.spec.container_env.clone()
+        };
+        let step_container_entrypoint = if !req.container_entrypoint.is_empty() {
+            req.container_entrypoint.clone()
+        } else {
+            job.spec.container_entrypoint.clone().unwrap_or_default()
+        };
+        let step_container_remap_root = req.container_remap_root || job.spec.container_remap_root;
         let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
         let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
         let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
@@ -2937,6 +2972,12 @@ impl SlurmController for ControllerService {
             let work_dir = work_dir.clone();
             let environment = environment.clone();
             let step_mpi = mpi.clone();
+            let container_image = step_container_image.clone();
+            let container_mounts = step_container_mounts.clone();
+            let container_workdir = step_container_workdir.clone();
+            let container_name = step_container_name.clone();
+            let container_env = step_container_env.clone();
+            let container_entrypoint = step_container_entrypoint.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -2962,6 +3003,15 @@ impl SlurmController for ControllerService {
                         pmix_plan,
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
+                        container_image,
+                        container_mounts,
+                        container_workdir,
+                        container_name,
+                        container_readonly: step_container_readonly,
+                        container_mount_home: step_container_mount_home,
+                        container_env,
+                        container_entrypoint,
+                        container_remap_root: step_container_remap_root,
                     })
                     .await
                     .map_err(|e| {
