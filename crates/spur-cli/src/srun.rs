@@ -1341,6 +1341,30 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
     )
 }
 
+/// Flags a step run inside an allocation accepts on the command line but does
+/// not yet honor. The batch and standalone-srun paths apply these; the step
+/// path (`dispatch_step` → `RunStep`) silently drops them, so warn rather than
+/// let a `--container-image`/`--pty` request quietly become a plain host run.
+/// Convergence tracked in spur#777 (container) and spur#780 (pty).
+fn step_mode_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if args.container_image.is_some() {
+        warnings.push(
+            "srun: warning: --container-image is not yet honored in step mode; \
+             the command runs on the host, not inside the image (spur#777)"
+                .to_string(),
+        );
+    }
+    if args.pty {
+        warnings.push(
+            "srun: warning: --pty is not yet honored in step mode; \
+             the command runs non-interactively without a terminal (spur#780)"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 async fn run_as_step(
     args: &SrunArgs,
     job_id: u32,
@@ -1355,6 +1379,9 @@ async fn run_as_step(
 
     if args.input.is_some() {
         eprintln!("srun: warning: --input is not supported in step mode, ignoring");
+    }
+    for warning in step_mode_unsupported_warnings(args) {
+        eprintln!("{warning}");
     }
 
     let io = resolve_io_paths(args);
@@ -1428,6 +1455,45 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_mode_warns_on_container_image() {
+        let args = SrunArgs::try_parse_from(["srun", "--container-image", "img.sqsh", "hostname"])
+            .expect("parse failed");
+        let warnings = step_mode_unsupported_warnings(&args);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--container-image"));
+        assert!(warnings[0].contains("spur#777"));
+    }
+
+    #[test]
+    fn step_mode_warns_on_pty() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "--pty", "bash"]).expect("parse failed");
+        let warnings = step_mode_unsupported_warnings(&args);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--pty"));
+        assert!(warnings[0].contains("spur#780"));
+    }
+
+    #[test]
+    fn step_mode_warns_on_both_flags_together() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "--container-image",
+            "img.sqsh",
+            "--pty",
+            "bash",
+        ])
+        .expect("parse failed");
+        assert_eq!(step_mode_unsupported_warnings(&args).len(), 2);
+    }
+
+    #[test]
+    fn step_mode_silent_without_unsupported_flags() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
+        assert!(step_mode_unsupported_warnings(&args).is_empty());
+    }
 
     #[test]
     fn first_node_reduces_comma_list_to_head() {
