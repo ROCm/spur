@@ -1259,6 +1259,49 @@ fn open_output_file(path: &str, use_append: bool) -> std::io::Result<std::fs::Fi
     opts.open(path)
 }
 
+/// A step's stdout/stderr spool files, open for the child to inherit and their
+/// paths for the agent to tail. Steps stream through these files (StreamJobOutput
+/// follows the growing file) instead of buffering their whole output in the RPC
+/// response, so a step's output is bounded on the compute node and visible before
+/// the step exits.
+pub(crate) struct StepOutputFiles {
+    pub stdout: std::fs::File,
+    pub stderr: std::fs::File,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+}
+
+/// Open a step's stdout/stderr spool files under the job spool dir, creating the
+/// dir if needed. The agent (root) opens the files and hands the write fds to the
+/// child via stdio redirection, so the child writes even after dropping to its
+/// uid; the files stay agent-readable so `stream_job_output` can tail them.
+/// Lives under the job spool tree so `cleanup_job_spool` reclaims it at job end.
+pub(crate) fn open_step_output_files(
+    job_id: JobId,
+    step_id: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<StepOutputFiles, LaunchError> {
+    let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
+    let stdout_path = spool_dir.join(format!("step{step_id}.out"));
+    let stderr_path = spool_dir.join(format!("step{step_id}.err"));
+    let open = |path: &Path| -> Result<std::fs::File, LaunchError> {
+        open_output_file(&path.to_string_lossy(), false).map_err(|e| {
+            LaunchError::NodeFault(
+                anyhow::Error::new(e).context(format!("open step output file {}", path.display())),
+            )
+        })
+    };
+    let stdout = open(&stdout_path)?;
+    let stderr = open(&stderr_path)?;
+    Ok(StepOutputFiles {
+        stdout,
+        stderr,
+        stdout_path,
+        stderr_path,
+    })
+}
+
 /// Send file descriptors to a peer over a Unix socket via SCM_RIGHTS.
 fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};

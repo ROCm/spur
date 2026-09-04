@@ -200,6 +200,10 @@ fn start_pmix_launch(
 struct ActiveStep {
     cancel_requested: bool,
     pid: Option<u32>,
+    /// Spool files the step's stdout/stderr are redirected to, so
+    /// `stream_job_output` can tail them live keyed on (job_id, step_id).
+    stdout_path: String,
+    stderr_path: String,
 }
 
 struct ActiveStepGuard {
@@ -2287,9 +2291,26 @@ impl SlurmAgent for AgentService {
 
         use std::process::Stdio;
 
+        // Redirect the step's stdout/stderr to per-step spool files rather than
+        // piping the whole output into memory: the child inherits the write fds,
+        // stream_job_output tails the files live, and output stays bounded on this
+        // node. Paths are recorded in active_steps so the tail can find them.
+        let step_files =
+            crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
+        let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
+        {
+            let mut steps = self.active_steps.lock().await;
+            if let Some(step) = steps.get_mut(&step_key) {
+                step.stdout_path = stdout_path.clone();
+                step.stderr_path = stderr_path.clone();
+            }
+        }
+
         let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(step_files.stdout))
+            .stderr(Stdio::from(step_files.stderr))
             .spawn()
             .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
         if let Some(pid) = child.id() {
@@ -2305,13 +2326,13 @@ impl SlurmAgent for AgentService {
             if cancel_now {
                 signal_step_process_group(pid, nix::sys::signal::Signal::SIGTERM as i32);
                 let _ = child.kill().await;
-                let _ = child.wait_with_output().await;
+                let _ = child.wait().await;
                 return Ok(Response::new(cancelled_step_response()));
             }
         }
 
-        let output = match child.wait_with_output().await {
-            Ok(output) => output,
+        let status = match child.wait().await {
+            Ok(status) => status,
             Err(e) => return Err(Status::internal(format!("command failed: {}", e))),
         };
 
@@ -2333,10 +2354,19 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        // Backward-compatible: the response still carries the step's output by
+        // reading the spool files back. #781 replaces this with a client-side
+        // StreamJobOutput tail and drops the read-back, removing the memory bound.
+        let read_back = |path: String| async move {
+            tokio::fs::read(&path)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
         Ok(Response::new(RunCommandResponse {
-            exit_code: spur_core::process::shell_exit_code(&output.status),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: spur_core::process::shell_exit_code(&status),
+            stdout: read_back(stdout_path).await,
+            stderr: read_back(stderr_path).await,
         }))
     }
 
@@ -3380,6 +3410,7 @@ impl AgentService {
             ActiveStep {
                 cancel_requested: false,
                 pid,
+                ..Default::default()
             },
         );
     }
@@ -3662,7 +3693,12 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let job_id = 100;
+        // A unique job_id per test so each gets its own step spool dir
+        // (temp/spur/job<id>/step0.out) and parallel tests do not clobber one
+        // another's step output. Production step_ids are unique per job via
+        // create_job_step; only these fixed-id tests would otherwise collide.
+        static NEXT_JOB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+        let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
         (svc, job_id)
     }
@@ -4326,6 +4362,33 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
         assert_eq!(observed_canonical, tmp_canonical);
+    }
+
+    #[tokio::test]
+    async fn run_command_writes_step_output_to_spool_file() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "spooled-marker".into()],
+            uid: 0,
+            gid: 0,
+            job_id,
+            ..Default::default()
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        // The step's stdout must live in a spool file the agent can tail, not
+        // only in the RPC response — this file is what StreamJobOutput follows
+        // (#781). step_id defaults to 0 here, so the file is step0.out.
+        let contents = [
+            std::path::PathBuf::from("/var/spool/spur"),
+            std::env::temp_dir().join("spur"),
+        ]
+        .iter()
+        .find_map(|base| {
+            std::fs::read_to_string(base.join(format!("job{job_id}")).join("step0.out")).ok()
+        })
+        .expect("step stdout spool file should exist on disk");
+        assert_eq!(contents.trim(), "spooled-marker");
     }
 
     #[tokio::test]
