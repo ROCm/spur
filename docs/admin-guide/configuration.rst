@@ -1174,19 +1174,22 @@ Job isolation layers.
 ``[cgroup]``
 ------------
 
-cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. The
-job's batch payload runs in a cgroup at ``/sys/fs/cgroup/spur/job_<id>``, and the
-limits are derived from the **per-node budget the controller allocated** — not
-from the ``--cpus-per-task`` / ``--mem`` the user requested. Kubernetes jobs are
-unaffected: there the kubelet owns the cgroups.
+cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
+process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
+exec``, and interactive attach — runs in a cgroup at
+``/sys/fs/cgroup/spur/job_<id>``, and the limits are derived from the **per-node
+budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
+the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
+cgroups.
 
 .. warning::
 
-   These limits bound the batch payload only. ``srun`` steps, ``spur exec``, and
-   interactive attaches into a running job currently run outside the job cgroup,
-   so they are not bounded by these settings and this section is not a security
-   boundary between users sharing a node. See
-   :ref:`cgroup-containment-gaps` for the full list.
+   These settings bound a job only when ``spurd`` runs as root, and with the
+   default ``required = false`` a host that cannot apply a constraint — missing
+   ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
+   unconstrained. Set ``required = true`` to make that case fail closed instead.
+   See :ref:`cgroup-containment-gaps` for what remains even then: per-step
+   granularity, and the site-supplied task hooks that run outside the job cgroup.
 
 .. note::
 
@@ -1212,8 +1215,11 @@ unaffected: there the kubelet owns the cgroups.
    * - ``required``
      - bool
      - ``false``
-     - Refuse to launch a job when a requested constraint cannot be applied,
-       instead of warning and running it unconstrained. See the note below.
+     - Refuse the work when a requested constraint cannot be applied, instead of
+       warning and running it unconstrained. This gates a batch launch, the
+       registration of an interactive allocation (``salloc``, standalone
+       ``srun``), and a step that did not end up in its job's cgroup. See the
+       note below.
    * - ``constrain_cores``
      - bool
      - ``true``
@@ -1262,6 +1268,24 @@ unaffected: there the kubelet owns the cgroups.
      - ``true``
      - On OOM, kill every process in the job (``memory.oom.group``) instead of
        letting the kernel pick one.
+   * - ``constrain_devices``
+     - bool
+     - ``true``
+     - Restrict the job to the device nodes its allocation granted, using a
+       cgroup-v2 BPF device filter. Default-deny: a job allocated no GPUs can open
+       only the nodes listed under :ref:`device-filter-implicit-allow` below, and
+       opening an unallocated GPU fails with ``EPERM`` whatever the job sets
+       ``ROCR_VISIBLE_DEVICES`` to. Installing the filter needs ``CAP_BPF`` and
+       ``CAP_NET_ADMIN`` (or ``CAP_SYS_ADMIN``) — ``CAP_BPF`` alone is insufficient for a
+       cgroup-device program; without them the job runs with no device isolation.
+   * - ``extra_device_paths``
+     - [string]
+     - ``[]``
+     - Additional device node paths **every** job on this node may open, on top of
+       its allocation and the implicit set below. The escape hatch for a site
+       device the defaults miss, short of turning the filter off. A path that is
+       not a device node is ignored, so an entry for hardware this node lacks is
+       harmless. Read once at agent startup, like the rest of ``[cgroup]``.
 
 A job submitted without ``--mem`` has no memory budget, so ``memory.max``,
 ``memory.high``, and ``memory.swap.max`` are all left at the kernel default.
@@ -1304,13 +1328,44 @@ combined RAM+swap total, so the sum a job can reach stays bounded.
 Every ceiling is floored at ``min_ram_mb``, and ``memory.high`` never exceeds
 ``memory.max``.
 
+.. _device-filter-implicit-allow:
+
+What the device filter allows without an allocation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job's allow-list is its allocated device nodes plus two fixed sets. Both are
+granted to every job, including one that requested no GPUs, so they are part of the
+isolation boundary and worth knowing:
+
+- **Base pseudo-devices**, which virtually every program needs: ``/dev/null``,
+  ``/dev/zero``, ``/dev/full``, ``/dev/random``, ``/dev/urandom``, ``/dev/tty``,
+  ``/dev/console``, ``/dev/ptmx`` and ``/dev/pts/*``.
+- **Host infrastructure** — device nodes shared by the whole node rather than handed
+  out per job, so no allocation can ever grant them: ``/dev/fuse`` (used by
+  Apptainer and Singularity, which run *inside* the batch job), everything under
+  ``/dev/infiniband/`` (RDMA verbs, for MPI and for NCCL or RCCL over InfiniBand),
+  the vendor control nodes a GPU runtime initializes through (``/dev/nvidiactl``,
+  ``/dev/nvidia-uvm``, ``/dev/nvidia-uvm-tools``, ``/dev/nvidia-modeset``), and the
+  MIG capability nodes under ``/dev/nvidia-caps/``. Every one is resolved by path
+  when the filter is built, so a node without that hardware grants nothing extra.
+
+Granting the vendor control nodes to a job with no GPUs is deliberate: they let a
+GPU runtime initialize, but enumerating an actual device still needs that device's
+own node, so the job still sees zero GPUs. This matches what container runtimes
+inject as shared edits.
+
+**The per-GPU compute nodes are not in that set.** ``/dev/nvidia<N>``, ``/dev/kfd``
+and the ``/dev/dri`` render and card nodes reach a job only through its allocation —
+that gating is the entire point of the filter. Putting one of them in
+``extra_device_paths`` hands every job on the node a GPU.
+
 When enforcement fails
 ~~~~~~~~~~~~~~~~~~~~~~
 
 By default every step degrades to a warning: a controller that could not be
-delegated, a rejected control-file write, a cpuset that did not apply, or a
-process that could not join the cgroup all leave the job **running
-unconstrained**. Grep the
+delegated, a rejected control-file write, a cpuset that did not apply, a device
+filter that could not be attached, or a process that could not join the cgroup
+all leave the job **running unconstrained**. Grep the
 agent log for these to find silently-unenforced nodes:
 
 .. code-block:: text
@@ -1318,11 +1373,16 @@ agent log for these to find silently-unenforced nodes:
    failed to delegate cgroup controller
    failed to write cgroup control file
    cpuset not applied; job runs without a CPU bound
-   failed to move process to cgroup
+   device filter not installed; job runs without device isolation
+   allocation registered without cgroup enforcement
+   failed to join cgroup; job runs without resource limits
 
-Set ``required = true`` to refuse the launch instead. The job fails rather than
-running outside its limits, which is the right trade on a shared node where the
-limits are the isolation boundary. It also means a host that cannot enforce
+Set ``required = true`` to refuse the work instead. A batch launch fails, an
+interactive allocation is refused at registration (so ``salloc`` and standalone
+``srun`` error out rather than handing back an unenforceable allocation), and a
+step that did not join its job's cgroup is killed and refused. Each fails rather
+than running outside its limits, which is the right trade on a shared node where
+the limits are the isolation boundary. It also means a host that cannot enforce
 stops accepting work, so roll it out only once the agent runs as root and the
 cgroup tree is confirmed writable.
 
@@ -1344,6 +1404,7 @@ Verify what a running job actually got:
    cat /sys/fs/cgroup/spur/job_1234/memory.max        # hard ceiling, bytes
    cat /sys/fs/cgroup/spur/job_1234/memory.high       # reclaim threshold
    cat /sys/fs/cgroup/spur/job_1234/memory.swap.max   # swap ceiling
+   bpftool cgroup show /sys/fs/cgroup/spur/job_1234   # attached device filter
 
 Migrating from ``cgroup.conf``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1361,6 +1422,11 @@ them, so a site's existing percentages carry over directly.
    * - ``ConstrainCores``
      - ``constrain_cores``
      -
+   * - ``ConstrainDevices``
+     - ``constrain_devices``
+     - Both deny by ``major:minor``. Slurm takes the allow-list from
+       ``gres.conf``; Spur takes it from the device registry's injection plan,
+       plus the implicit set above and ``extra_device_paths``.
    * - ``ConstrainRAMSpace``
      - ``constrain_ram_space``
      -
@@ -1382,11 +1448,12 @@ them, so a site's existing percentages carry over directly.
 
 Deliberate differences from Slurm:
 
-- **Spur constrains cores and RAM by default.** Every Slurm ``Constrain*``
-  defaults to ``no``, so a job that overran ``--mem`` under a stock Slurm
-  configuration will be reclaimed against, or killed, on Spur. Swap is the
-  exception and stays off, matching Slurm: bounding it turns a job that
-  completed slowly into one that is killed outright.
+- **Spur constrains cores, RAM, and devices by default.** Every Slurm
+  ``Constrain*`` defaults to ``no``, so a job that overran ``--mem`` under a stock
+  Slurm configuration will be reclaimed against, or killed, on Spur, and one that
+  reached a GPU it was not allocated now gets ``EPERM``. Swap is the exception and
+  stays off, matching Slurm: bounding it turns a job that completed slowly into
+  one that is killed outright.
 - **``allowed_ram_percent = 0`` is rejected**, where Slurm would accept it and
   floor every job at ``MinRAMSpace``. That silently caps a whole cluster at
   30 MiB per job, so Spur treats it as the typo it almost certainly is. Every

@@ -1262,17 +1262,38 @@ def parse_job_id(sbatch_output: str) -> int | None:
     return None
 
 
+# Every canonical ST code (mirrors JobState::code in spur-core).
+_JOB_STATE_CODES = frozenset(
+    {"PD", "R", "CG", "CD", "F", "CA", "TO", "NF", "PR", "S", "DL", "OOM", "RQ"}
+)
+
+# Codes that end a run for good (mirrors JobState::is_terminal). PR/RQ requeue
+# back to pending, so they are deliberately not terminal.
+_TERMINAL_STATE_CODES = frozenset({"CD", "F", "CA", "TO", "NF", "DL", "OOM"})
+
+# The default `%.2t` squeue column truncates the only three-character code.
+_TRUNCATED_STATE_CODES = {"OO": "OOM"}
+
+
 def job_state(squeue_output: str, job_id: int) -> str | None:
     """Parse job state from squeue -t all output."""
-    valid_states = {"PD", "R", "CD", "CG", "F", "CA", "TO", "NF", "PR", "S", "RQ"}
+    lines = squeue_output.splitlines()
+    if not lines:
+        return None
+    try:
+        state_index = lines[0].split().index("ST")
+    except ValueError:
+        return None
+
     id_str = str(job_id)
-    for line in squeue_output.splitlines()[1:]:
+    for line in lines[1:]:
         fields = line.split()
         if not fields or fields[0] != id_str:
             continue
-        for field in fields[1:]:
-            if field in valid_states:
-                return field
+        if state_index >= len(fields):
+            return None
+        state = _TRUNCATED_STATE_CODES.get(fields[state_index], fields[state_index])
+        return state if state in _JOB_STATE_CODES else None
     return None
 
 
@@ -1303,7 +1324,7 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     while time.time() < deadline:
         sq = cluster.squeue_all()
         state = job_state(sq, job_id)
-        if state in ("CD", "F", "CA", "TO"):
+        if state in _TERMINAL_STATE_CODES:
             return state
         if state is None:
             if seen:

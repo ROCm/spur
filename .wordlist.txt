@@ -119,6 +119,7 @@ zstd
 AppArmor
 autouse
 BGP
+BPF
 checksums
 CIDRs
 CLI
@@ -299,3 +300,8 @@ pluggable
 torchrun
 backoff
 unapplied
+RCCL
+Apptainer
+tmpfs
+uncontained
+cgroup's

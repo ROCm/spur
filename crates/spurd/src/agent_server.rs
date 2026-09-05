@@ -88,6 +88,17 @@ pub(crate) struct TrackedJob {
     mpi: String,
     /// Run epoch; echoed on completion and guards the grace-period SIGKILL.
     run_attempt: u32,
+    /// The job's cgroup, owned here so every launch path into the job can reach
+    /// it. `None` when cgroup enforcement is off or no cgroup was created.
+    cgroup_path: Option<std::path::PathBuf>,
+}
+
+impl TrackedJob {
+    /// Take the cgroup path, leaving `None`. Whichever teardown path reaches
+    /// the job first takes it, so the removal it authorizes happens once.
+    fn take_cgroup(&mut self) -> Option<std::path::PathBuf> {
+        self.cgroup_path.take()
+    }
 }
 
 struct CompletedJob {
@@ -116,6 +127,37 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
+/// Release what a finished run owned, once the monitor has dropped it from
+/// `running`. Skipped if the id is tracked again: it is all keyed by job id.
+async fn teardown_completed_job(
+    completed: &CompletedJob,
+    lifecycle: &crate::job_lifecycle::JobLifecycle,
+    running: &RunningJobs,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    mpi_host: &MpiPluginHost,
+) {
+    let job_id = completed.job_id;
+    // Held across the check below and every release under it, so a re-dispatch either
+    // lands before this and is seen, or waits and finds nothing of its own removed.
+    let _lifecycle = lifecycle.acquire(job_id).await;
+    // Taken and released before `allocation`, the order commit_job uses.
+    if running.lock().await.contains_key(&job_id) {
+        warn!(
+            job_id,
+            "job id re-dispatched during teardown; leaving the new run's state alone"
+        );
+        return;
+    }
+
+    crate::container::cleanup_rootfs(job_id, &completed.rootfs_mode);
+    crate::executor::cleanup_job_spool(job_id);
+    if let Some(ref cgroup) = completed.cgroup {
+        crate::executor::cleanup_cgroup(cgroup);
+    }
+    allocation.lock().await.release_job(job_id);
+    cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
+}
+
 /// Enforced per-node budget: the controller's allocation wins, the spec is the
 /// fallback (every task on this node, and `--mem-per-cpu` when `--mem` is unset).
 fn resolve_cgroup_budget(
@@ -141,6 +183,100 @@ fn resolve_cgroup_budget(
         spec.memory_per_cpu_mb.saturating_mul(cpus as u64)
     };
     (cpus, memory_mb)
+}
+
+/// What to do with an allocation once its cgroup setup has been attempted.
+enum AllocationCgroup {
+    /// Enforcement is in place, or off by config; record the allocation.
+    Record(Option<std::path::PathBuf>),
+    /// Enforcement failed but is not required; record it unenforced.
+    Degraded(String),
+    /// Enforcement is required and failed; refuse the registration.
+    Refuse(String),
+}
+
+/// Fail closed: an allocation whose cgroup could not be created is refused when
+/// `[cgroup] required` is set, rather than recorded as one nothing can enforce.
+fn allocation_cgroup(
+    setup: anyhow::Result<Option<std::path::PathBuf>>,
+    required: bool,
+) -> AllocationCgroup {
+    match setup {
+        Ok(path) => AllocationCgroup::Record(path),
+        Err(e) if required => AllocationCgroup::Refuse(format!("{e:#}")),
+        Err(e) => AllocationCgroup::Degraded(format!("{e:#}")),
+    }
+}
+
+/// Whether a spawned child missed the job's cgroup, and so runs outside its
+/// limits and device filter. Only `required` makes that fatal.
+fn escaped_job_cgroup(required: bool, cgroup: Option<&std::path::Path>, pid: Option<u32>) -> bool {
+    if !required {
+        return false;
+    }
+    let (Some(cgroup), Some(pid)) = (cgroup, pid) else {
+        return false;
+    };
+    // A step that exits between the spawn and this probe leaves `cgroup.procs`
+    // too, and has escaped nothing — the normal wait path collects it.
+    !executor::cgroup_has_pid(cgroup, pid) && pid_is_running(pid)
+}
+
+/// Whether `pid` is still executing. A signal-0 probe cannot tell: an
+/// exited-but-unreaped child is a valid signal target, so `/proc` decides.
+fn pid_is_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat_shows_running(&stat)
+}
+
+/// Whether a `/proc/<pid>/stat` line describes a still-executing process.
+/// Read from the last ')': `comm` may itself contain spaces and ')'.
+fn stat_shows_running(stat: &str) -> bool {
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next());
+    !matches!(state, None | Some("Z" | "X"))
+}
+
+/// Drop a job from the running set, handing back the cgroup it still owns.
+///
+/// The single exit from `running` bar the monitor loop, which takes the cgroup
+/// itself to read `memory.events` first. Taking it here keeps the release
+/// single; the caller drops the guard once the `running` lock is gone, since
+/// removal SIGKILLs the cgroup's stragglers and then blocks retrying rmdir.
+fn remove_tracked_job(
+    running: &mut HashMap<u32, TrackedJob>,
+    job_id: u32,
+) -> (Option<TrackedJob>, executor::CgroupGuard) {
+    let Some(mut tracked) = running.remove(&job_id) else {
+        return (None, executor::CgroupGuard::new(None));
+    };
+    let cgroup = executor::CgroupGuard::new(tracked.take_cgroup());
+    (Some(tracked), cgroup)
+}
+
+/// Roll back a registration that cannot be enforced. Takes the held `running`
+/// map so the reservation is released under that lock, the order that keeps a
+/// reconcile pass from seeing the allocation committed with no tracked job.
+/// The refused job's cgroup comes back with the status for the caller to drop.
+fn refuse_allocation(
+    job_id: u32,
+    reservation: LaunchReservationGuard,
+    running: &mut HashMap<u32, TrackedJob>,
+    reason: &str,
+) -> (Status, executor::CgroupGuard) {
+    error!(
+        job_id,
+        reason, "refusing an allocation that cannot be enforced"
+    );
+    let (_, cgroup) = remove_tracked_job(running, job_id);
+    drop(reservation);
+    let status = Status::failed_precondition(format!(
+        "[cgroup] required but the allocation's cgroup could not be created: {reason}"
+    ));
+    (status, cgroup)
 }
 
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
@@ -244,6 +380,15 @@ fn signal_step_process_group(pid: u32, signal: i32) {
     }
 }
 
+/// SIGKILL a step's whole process group, then reap the leader: every step shape
+/// runs the user's command in a descendant of the spawned wrapper.
+async fn kill_step_process_group(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        signal_step_process_group(pid, nix::sys::signal::Signal::SIGKILL as i32);
+    }
+    let _ = child.kill().await;
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::resolve_cgroup_budget;
@@ -305,6 +450,229 @@ mod budget_tests {
     }
 }
 
+#[cfg(test)]
+mod step_cgroup_tests {
+    use super::{escaped_job_cgroup, stat_shows_running};
+
+    fn cgroup_holding(pids: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cgroup.procs"), pids).expect("cgroup.procs");
+        dir
+    }
+
+    #[test]
+    fn a_step_that_joined_the_job_cgroup_runs() {
+        let cgroup = cgroup_holding("17\n4242\n");
+        assert!(!escaped_job_cgroup(true, Some(cgroup.path()), Some(4242)));
+    }
+
+    #[test]
+    fn a_required_cgroup_catches_a_live_step_that_did_not_join() {
+        // The test process: certainly running, and an empty cgroup cannot
+        // contain it whatever pid the runner handed us.
+        let cgroup = cgroup_holding("");
+        assert!(escaped_job_cgroup(
+            true,
+            Some(cgroup.path()),
+            Some(std::process::id())
+        ));
+    }
+
+    // A step can exit between `spawn` returning and this probe. The zombie is
+    // absent from `cgroup.procs` without ever having escaped it.
+    #[test]
+    fn a_step_that_exited_before_the_probe_has_not_escaped() {
+        let cgroup = cgroup_holding("");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+        // Blocks until the child exits, but WNOWAIT leaves it unreaped, so the
+        // assertion below runs against a genuine zombie.
+        nix::sys::wait::waitid(
+            nix::sys::wait::Id::Pid(nix_pid),
+            nix::sys::wait::WaitPidFlag::WEXITED | nix::sys::wait::WaitPidFlag::WNOWAIT,
+        )
+        .expect("child should reach a waitable state");
+        assert!(
+            nix::sys::signal::kill(nix_pid, None).is_ok(),
+            "a zombie answers a signal-0 probe, which is why liveness is read from /proc"
+        );
+
+        assert!(!escaped_job_cgroup(true, Some(cgroup.path()), Some(pid)));
+
+        child.wait().expect("reap the child");
+    }
+
+    #[test]
+    fn the_state_field_is_read_past_a_parenthesized_comm() {
+        assert!(stat_shows_running("4242 (weird ) name) S 1 4242 4242 0"));
+        assert!(!stat_shows_running("4242 (weird ) name) Z 1 4242 4242 0"));
+    }
+
+    #[test]
+    fn an_optional_cgroup_lets_an_unjoined_step_run() {
+        let cgroup = cgroup_holding("17\n");
+        assert!(!escaped_job_cgroup(false, Some(cgroup.path()), Some(4242)));
+    }
+
+    #[test]
+    fn a_job_with_no_cgroup_has_none_to_escape() {
+        // Config can disable enforcement outright; `required` then has no
+        // cgroup to check and must not refuse every step on the node.
+        assert!(!escaped_job_cgroup(true, None, Some(4242)));
+    }
+}
+
+#[cfg(test)]
+mod allocation_cgroup_tests {
+    use super::{allocation_cgroup, AllocationCgroup};
+
+    #[test]
+    fn a_created_cgroup_is_recorded_on_the_allocation() {
+        let path = std::path::PathBuf::from("/sys/fs/cgroup/spur/job_9");
+        let decision = allocation_cgroup(Ok(Some(path.clone())), true);
+        let AllocationCgroup::Record(recorded) = decision else {
+            panic!("a created cgroup must reach the tracked job");
+        };
+        assert_eq!(recorded, Some(path));
+    }
+
+    // `setup_cgroup` returns no path without an error only when `[cgroup]
+    // enabled` is off, which leaves `required` nothing to gate.
+    #[test]
+    fn a_cgroup_disabled_by_config_records_an_unenforced_allocation() {
+        assert!(matches!(
+            allocation_cgroup(Ok(None), true),
+            AllocationCgroup::Record(None)
+        ));
+    }
+
+    // Without a cgroup the allocation's steps escape the device filter, so a
+    // node that must enforce refuses the allocation rather than pretend.
+    #[test]
+    fn a_required_cgroup_refuses_an_allocation_it_cannot_enforce() {
+        let setup = Err(anyhow::anyhow!("cgroup root unavailable"));
+        let AllocationCgroup::Refuse(reason) = allocation_cgroup(setup, true) else {
+            panic!("required enforcement must refuse, not record");
+        };
+        assert!(reason.contains("cgroup root unavailable"));
+    }
+
+    #[test]
+    fn an_optional_cgroup_degrades_to_an_unenforced_allocation() {
+        let setup = Err(anyhow::anyhow!("cgroup creation failed (not root)"));
+        let AllocationCgroup::Degraded(reason) = allocation_cgroup(setup, false) else {
+            panic!("an optional cgroup must degrade, not refuse");
+        };
+        assert!(reason.contains("not root"));
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::{remove_tracked_job, TrackedJob};
+    use std::collections::HashMap;
+
+    // A temp directory stands in for the job's cgroup: cleanup takes a path, so
+    // the real removal runs without root or a cgroupfs.
+    fn tracked_with_cgroup() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cgroup = root.path().join("job_7");
+        std::fs::create_dir(&cgroup).expect("cgroup dir");
+        (root, cgroup)
+    }
+
+    #[test]
+    fn removing_a_job_releases_its_cgroup() {
+        let (_root, cgroup) = tracked_with_cgroup();
+        let mut running = HashMap::new();
+        running.insert(7, TrackedJob::allocation_only(Some(cgroup.clone())));
+
+        let (removed, release) = remove_tracked_job(&mut running, 7);
+        let removed = removed.expect("the job was tracked");
+        drop(release);
+
+        assert!(!cgroup.exists(), "teardown must remove the job's cgroup");
+        assert!(
+            removed.cgroup_path.is_none(),
+            "the released path must be taken off the job"
+        );
+    }
+
+    // The removal is what blocks, so it belongs to the caller, to run once the
+    // map is unlocked. Taking the job out must not be what removes the cgroup.
+    #[tokio::test]
+    async fn the_cgroup_is_released_by_its_token_and_not_under_the_lock() {
+        let (_root, cgroup) = tracked_with_cgroup();
+        let running = super::new_running_jobs();
+        running
+            .lock()
+            .await
+            .insert(7, TrackedJob::allocation_only(Some(cgroup.clone())));
+
+        let (removed, release) = {
+            let mut jobs = running.lock().await;
+            let taken = remove_tracked_job(&mut jobs, 7);
+            assert!(
+                cgroup.exists(),
+                "the cgroup must outlive the removal that holds the lock"
+            );
+            taken
+        };
+
+        assert!(removed.is_some(), "the job was tracked");
+        assert!(
+            running.try_lock().is_ok(),
+            "the map must be unlocked before the cgroup is released"
+        );
+        drop(release);
+        assert!(!cgroup.exists(), "releasing the token removes the cgroup");
+    }
+
+    // A re-dispatched job derives the same job_<id> path, so a second teardown
+    // pass over an already-released job would delete a live run's cgroup.
+    #[test]
+    fn a_released_cgroup_is_not_released_again() {
+        let (_root, cgroup) = tracked_with_cgroup();
+        let mut running = HashMap::new();
+        running.insert(7, TrackedJob::allocation_only(Some(cgroup.clone())));
+        let (released, first) = remove_tracked_job(&mut running, 7);
+        drop(first);
+
+        std::fs::create_dir_all(&cgroup).expect("successor cgroup");
+        running.insert(7, released.expect("the job was tracked"));
+        let (_, second) = remove_tracked_job(&mut running, 7);
+        drop(second);
+
+        assert!(
+            cgroup.exists(),
+            "a cgroup already released must not be released a second time"
+        );
+    }
+
+    #[test]
+    fn removing_a_job_without_a_cgroup_releases_nothing() {
+        let mut running = HashMap::new();
+        running.insert(8, TrackedJob::allocation_only(None));
+
+        let (removed, release) = remove_tracked_job(&mut running, 8);
+        let removed = removed.expect("the job was tracked");
+        drop(release);
+
+        assert!(removed.cgroup_path.is_none());
+        assert!(running.is_empty(), "the job must still leave the map");
+    }
+
+    #[test]
+    fn removing_an_untracked_job_yields_nothing() {
+        let (removed, release) = remove_tracked_job(&mut HashMap::new(), 9);
+        drop(release);
+        assert!(removed.is_none());
+    }
+}
+
 async fn step_cancel_requested(
     steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     key: (u32, u32),
@@ -333,6 +701,8 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
+    lifecycle: crate::job_lifecycle::JobLifecycle,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
@@ -356,7 +726,12 @@ impl AgentService {
             device_registry,
             &spur_core::config::ClusterConfig::default(),
             spur_core::config::JobLimits { memlock },
-            CgroupConfig::default(),
+            // Enforcement off: `/sys/fs/cgroup/spur` is a real path, so a root
+            // runner would otherwise have these tests creating real cgroups.
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
             MpiConfig::default(),
             new_running_jobs(),
             spur_core::config::AuthConfig::default().allow_root_jobs,
@@ -443,6 +818,7 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
         }
@@ -468,6 +844,7 @@ impl AgentService {
         let spank = self.spank.clone();
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
+        let lifecycle = self.lifecycle.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -481,7 +858,7 @@ impl AgentService {
                             // Disambiguate an OOM kill (cgroup memory.events) from
                             // a plain SIGKILL by OR'ing a sentinel into the reported
                             // signal; read before cleanup_cgroup removes the dir.
-                            let cgroup = tracked.job.take_cgroup();
+                            let cgroup = tracked.take_cgroup();
                             if let Some(ref cg) = cgroup {
                                 if crate::executor::cgroup_oom_killed(cg) {
                                     warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
@@ -516,25 +893,23 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
-                    crate::executor::cleanup_job_spool(c.job_id);
-                    if let Some(ref cgroup) = c.cgroup {
-                        crate::executor::cleanup_cgroup(cgroup);
-                    }
-                    allocation.lock().await.release_job(c.job_id);
-                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
+                }
+                // Teardown below SIGKILLs each cgroup and blocks retrying rmdir,
+                // then runs hooks and RPCs; none of it may hold this lock.
+                drop(jobs);
+
+                for c in &completed {
+                    teardown_completed_job(c, &lifecycle, &running, &allocation, &mpi_host).await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `jobs` is held so the live set is a
-                // consistent snapshot that can't race a committing launch
-                // (commit_job takes the running lock first).
-                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
-
-                // Release lock BEFORE network I/O — holding the lock during
-                // report_completion blocks new job launches and can lose
-                // completions if the RPC times out.
-                drop(jobs);
+                // non-launching job. `running` is re-taken before `allocation`,
+                // the order commit_job uses, so the live set the reclaim reads
+                // can't race a committing launch.
+                {
+                    let jobs = running.lock().await;
+                    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+                }
 
                 let local_hostname = hostname::get()
                     .map(|h| h.to_string_lossy().to_string())
@@ -914,6 +1289,128 @@ fn build_launch_plan(
     }
 }
 
+/// What a process launched into a running job applies to itself between fork
+/// and exec, for either spawn shape decided by [`build_launch_plan`].
+struct ChildContainment<'a> {
+    /// Both shapes join: on the nsenter shape the join lands before `nsenter`
+    /// execs, so the namespaces it enters inherit the membership.
+    cgroup: Option<&'a std::path::Path>,
+    /// `None` on the nsenter shape, which drops inside the namespace via
+    /// `setpriv` — dropping here as well would break the namespace entry.
+    priv_drop: Option<crate::privdrop::PrivDrop>,
+    /// Abort the exec if the cgroup join fails, rather than run the command
+    /// outside the job's device filter and limits.
+    cgroup_required: bool,
+}
+
+impl<'a> ChildContainment<'a> {
+    fn for_plan(
+        plan: &LaunchPlan,
+        entry: &'a crate::job_entry::JobEntry,
+        priv_drop: Option<crate::privdrop::PrivDrop>,
+        cgroup_required: bool,
+    ) -> Self {
+        Self {
+            cgroup: entry.cgroup_path.as_deref(),
+            priv_drop: if plan.apply_priv_in_child {
+                priv_drop
+            } else {
+                None
+            },
+            cgroup_required,
+        }
+    }
+
+    /// Register the child's hook. Both inputs are built parent-side: nothing
+    /// between fork and exec may allocate.
+    fn register(self, cmd: &mut tokio::process::Command) {
+        let cgroup_join = executor::CgroupJoin::for_cgroup(self.cgroup);
+        let priv_drop = self.priv_drop;
+        let required = self.cgroup_required;
+        unsafe {
+            cmd.pre_exec(move || {
+                // Before the drop: an unprivileged process cannot write another cgroup's
+                // `cgroup.procs`. Under `required` a failed join aborts rather than exec unfiltered.
+                if let Some(ref join) = cgroup_join {
+                    if !join.join() && required {
+                        return Err(std::io::Error::other(
+                            "[cgroup] required but the process did not join the job cgroup",
+                        ));
+                    }
+                }
+                if let Some(ref pd) = priv_drop {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod child_containment_tests {
+    use super::{build_launch_plan, ChildContainment};
+    use crate::privdrop::PrivDrop;
+
+    const CGROUP: &str = "/sys/fs/cgroup/spur/job_7";
+
+    fn entry(namespaced: bool, cgroup: Option<&str>) -> crate::job_entry::JobEntry {
+        crate::job_entry::JobEntry {
+            pid: if namespaced { 1234 } else { 0 },
+            has_pid_namespace: namespaced,
+            has_user_namespace: false,
+            has_mount_namespace: namespaced,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/home/user".into(),
+            cgroup_path: cgroup.map(std::path::PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn an_nsenter_launch_joins_the_cgroup_without_dropping_privilege_itself() {
+        let entry = entry(true, Some(CGROUP));
+        let pd = PrivDrop::for_test(1000, 1000);
+        let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
+        assert!(!plan.apply_priv_in_child, "expected the nsenter shape");
+
+        let containment = ChildContainment::for_plan(&plan, &entry, Some(pd), false);
+
+        assert_eq!(containment.cgroup, Some(std::path::Path::new(CGROUP)));
+        // setpriv drops inside the namespace; dropping here too would leave the
+        // child unable to enter it.
+        assert!(containment.priv_drop.is_none());
+    }
+
+    #[test]
+    fn a_direct_launch_joins_the_cgroup_and_drops_privilege_itself() {
+        let entry = entry(false, Some(CGROUP));
+        let pd = PrivDrop::for_test(1000, 1000);
+        let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
+        assert!(plan.apply_priv_in_child, "expected the direct-spawn shape");
+
+        let containment = ChildContainment::for_plan(&plan, &entry, Some(pd), false);
+
+        assert_eq!(containment.cgroup, Some(std::path::Path::new(CGROUP)));
+        assert!(containment.priv_drop.is_some());
+    }
+
+    #[test]
+    fn a_job_without_a_cgroup_leaves_the_child_nothing_to_join() {
+        // A non-root agent creates no cgroup, and the launch still has to run.
+        for namespaced in [true, false] {
+            let entry = entry(namespaced, None);
+            let pd = PrivDrop::for_test(1000, 1000);
+            let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
+
+            assert!(ChildContainment::for_plan(&plan, &entry, Some(pd), false)
+                .cgroup
+                .is_none());
+        }
+    }
+}
+
 fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
@@ -1177,6 +1674,10 @@ impl SlurmAgent for AgentService {
             warn!(job_id, uid = spec.uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
+
+        // Held until this run is tracked (or its half-built state is cleaned up), so a
+        // re-dispatch of the id never builds on top of the previous run's teardown.
+        let lifecycle = self.lifecycle.acquire(job_id).await;
 
         info!(
             job_id,
@@ -1593,22 +2094,22 @@ impl SlurmAgent for AgentService {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                    let cgroup = result.job.take_cgroup();
+                    let cgroup = result.cgroup_path.take();
                     let running = self.running.clone();
+                    // The guard moves into the task: reaping can outlive this call, and
+                    // the id must stay closed to a re-dispatch until the state is gone.
                     tokio::spawn(async move {
+                        let _lifecycle = lifecycle;
                         reap_killed_job(result.job).await;
-                        // rootfs/spool paths are derived from job_id, so the
-                        // controller re-dispatching the same id to this node
-                        // would reuse them. Skip that cleanup if a live run for
-                        // job_id reappeared, or this reap would delete its files.
-                        // The cgroup handle is this launch's own, so it is always
-                        // safe to release.
+                        // rootfs, spool and the job_<id> cgroup all derive from
+                        // job_id, so a re-dispatch of that id reuses them: tearing
+                        // any of them down now would destroy the live run.
                         if !running.lock().await.contains_key(&job_id) {
                             crate::container::cleanup_rootfs(job_id, &rootfs_mode);
                             crate::executor::cleanup_job_spool(job_id);
-                        }
-                        if let Some(ref cg) = cgroup {
-                            crate::executor::cleanup_cgroup(cg);
+                            if let Some(ref cg) = cgroup {
+                                crate::executor::cleanup_cgroup(cg);
+                            }
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {
@@ -1649,6 +2150,7 @@ impl SlurmAgent for AgentService {
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
+                        cgroup_path: result.cgroup_path,
                     },
                 );
                 drop(jobs);
@@ -1656,6 +2158,8 @@ impl SlurmAgent for AgentService {
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
                 // tracks it, so without this it would leak as an orphan/zombie.
+                // Its cgroup is deliberately left alone: the path is derived
+                // from job_id, so it is the cgroup the new run just joined.
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -1859,20 +2363,13 @@ impl SlurmAgent for AgentService {
         let plan = build_launch_plan(&entry, priv_drop.as_ref(), &req.command);
         let mut cmd = tokio::process::Command::new(&plan.program);
         cmd.args(&plan.args);
-        // Direct-spawn path drops privilege in the child; the nsenter path
-        // already does it inside the namespace via setpriv.
         if plan.apply_priv_in_child {
+            // Direct spawn only: the parent applies this before exec, in the
+            // host's mount namespace, where a job's work_dir need not exist.
             cmd.current_dir(&entry.work_dir);
-            if let Some(pd) = priv_drop {
-                unsafe {
-                    cmd.pre_exec(move || {
-                        pd.apply()
-                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                        Ok(())
-                    });
-                }
-            }
         }
+        ChildContainment::for_plan(&plan, &entry, priv_drop, self.cgroup.required)
+            .register(&mut cmd);
 
         let output = cmd
             .output()
@@ -1889,14 +2386,21 @@ impl SlurmAgent for AgentService {
 
     /// Record a standalone-srun allocation on this node without launching a
     /// batch script.
+    ///
+    /// Controller-only: `uid` and `user` reach the tracked job straight from the wire, and the exec
+    /// paths authorize against `user` while executing as `uid` — a caller setting both is anyone.
     async fn register_job_allocation(
         &self,
         request: Request<RegisterJobAllocationRequest>,
     ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
+        // Creates this id's cgroup, so it must not run while a prior run's teardown
+        // still owns the directory.
+        let _lifecycle = self.lifecycle.acquire(req.job_id).await;
 
         let allocated = req.allocated.as_ref();
         let mut controller_gpu_ids: Vec<u32> = allocated
@@ -1914,6 +2418,29 @@ impl SlurmAgent for AgentService {
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
 
+        // Resolved before the running lock and the reservation: this is the one
+        // step that awaits another lock, and failing here needs no release.
+        let device_paths = if controller_gpu_ids.is_empty() {
+            Vec::new()
+        } else {
+            let injection = self.device_registry.lock().await.build_job_injection_plans(
+                "gpu",
+                &controller_gpu_ids,
+                req.uid,
+                req.gid,
+            );
+            match injection {
+                Ok((host, _)) => host.device_paths,
+                Err(e) => {
+                    error!(job_id = req.job_id, error = %e, "device registry resolution failed");
+                    return Err(Status::failed_precondition(format!(
+                        "device resolution failed: {}",
+                        e
+                    )));
+                }
+            }
+        };
+
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
@@ -1924,9 +2451,9 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        {
+        let alloc_result = {
             let mut alloc = self.allocation.lock().await;
-            alloc
+            let result = alloc
                 .allocate_for_job(req.job_id, cpus, memory_mb, &controller_gpu_ids)
                 .map_err(|e| match e {
                     AllocError::GpusUnavailable => Status::resource_exhausted(
@@ -1938,7 +2465,38 @@ impl SlurmAgent for AgentService {
                     )),
                 })?;
             let _ = alloc.commit_job(req.job_id);
-        }
+            result
+        };
+        // Releases the allocation on any exit that does not record the job,
+        // including a cancelled future; disarmed once it reaches `running`.
+        let mut reservation_guard =
+            LaunchReservationGuard::new(self.allocation.clone(), req.job_id);
+
+        // This allocation launches nothing, so its cgroup has to be created
+        // here or the first step arriving has none to join.
+        let setup = executor::setup_cgroup(
+            req.job_id,
+            &self.cgroup,
+            cpus,
+            memory_mb,
+            &alloc_result.cpu_ids,
+            &device_paths,
+        );
+        let cgroup_path = match allocation_cgroup(setup, self.cgroup.required) {
+            AllocationCgroup::Record(path) => path,
+            AllocationCgroup::Degraded(reason) => {
+                warn!(job_id = req.job_id, reason = %reason, "allocation registered without cgroup enforcement");
+                None
+            }
+            AllocationCgroup::Refuse(reason) => {
+                let (status, cgroup) =
+                    refuse_allocation(req.job_id, reservation_guard, &mut jobs, &reason);
+                // Guard first, then the cgroup: removing it blocks retrying rmdir.
+                drop(jobs);
+                drop(cgroup);
+                return Err(status);
+            }
+        };
 
         info!(
             job_id = req.job_id,
@@ -1972,8 +2530,10 @@ impl SlurmAgent for AgentService {
                 // srun allocation-only jobs use their own cancel lifecycle;
                 // epoch 0 leaves the stale-report guard disabled for them.
                 run_attempt: 0,
+                cgroup_path,
             },
         );
+        reservation_guard.disarm();
         drop(jobs);
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
@@ -2035,7 +2595,7 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, cgroup_path) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -2054,6 +2614,7 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
+                tracked.cgroup_path.clone(),
             )
         };
 
@@ -2268,10 +2829,16 @@ impl SlurmAgent for AgentService {
         }
 
         let memlock = self.limits.memlock;
+        let cgroup_join = executor::CgroupJoin::for_cgroup(cgroup_path.as_deref());
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {
                 crate::executor::apply_memlock(memlock);
+                // Before the drop below: an unprivileged process cannot write
+                // another cgroup's `cgroup.procs`.
+                if let Some(ref join) = cgroup_join {
+                    join.join();
+                }
                 if let Some(ref pd) = priv_drop {
                     pd.apply()
                         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
@@ -2312,6 +2879,17 @@ impl SlurmAgent for AgentService {
             .stderr(Stdio::from(step_files.stderr))
             .spawn()
             .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
+        // `spawn` only borrows, so the pre-exec closure and its dup'd log fd
+        // would otherwise stay alive for the whole step.
+        drop(cmd);
+        if escaped_job_cgroup(self.cgroup.required, cgroup_path.as_deref(), child.id()) {
+            // The user's work runs in descendants of the wrapper, and an escaped
+            // step is in no cgroup, so the group is the only handle reaching them.
+            kill_step_process_group(&mut child).await;
+            return Err(Status::failed_precondition(
+                "[cgroup] required but the step did not join its cgroup",
+            ));
+        }
         if let Some(pid) = child.id() {
             let cancel_now = {
                 let mut steps = self.active_steps.lock().await;
@@ -2644,8 +3222,13 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        let (master_fd, child, child_pid) =
-            Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
+        let (master_fd, child, child_pid) = Self::spawn_pty_in_job(
+            &entry,
+            &argv,
+            init.job_id,
+            winsize.as_ref(),
+            self.cgroup.required,
+        )?;
 
         info!(
             job_id = init.job_id,
@@ -2881,11 +3464,22 @@ impl SlurmAgent for AgentService {
 
 impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
-        if self.running.lock().await.remove(&job_id).is_some() {
-            self.allocation.lock().await.release_job(job_id);
-            if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
-                warn!(job_id, error = %e, "PMIx stop failed on job drop");
-            }
+        // The cgroup removal and the release below both key off the id, so a launch
+        // reusing it must not interleave with them.
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        // Scoped so the guard is gone before `cgroup` is dropped below: removing
+        // a cgroup SIGKILLs its stragglers and then blocks retrying rmdir.
+        let (tracked, cgroup) = {
+            let mut jobs = self.running.lock().await;
+            remove_tracked_job(&mut jobs, job_id)
+        };
+        drop(cgroup);
+        if tracked.is_none() {
+            return;
+        }
+        self.allocation.lock().await.release_job(job_id);
+        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+            warn!(job_id, error = %e, "PMIx stop failed on job drop");
         }
     }
 
@@ -3180,6 +3774,7 @@ impl AgentService {
             uid: tracked.uid,
             gid: tracked.gid,
             work_dir: tracked.work_dir.clone(),
+            cgroup_path: tracked.cgroup_path.clone(),
         })
     }
 
@@ -3363,6 +3958,7 @@ impl AgentService {
         argv: &[String],
         job_id: u32,
         winsize: Option<&crate::pty::WindowSize>,
+        cgroup_required: bool,
     ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
         use std::os::fd::AsRawFd;
         use std::process::Stdio;
@@ -3388,9 +3984,9 @@ impl AgentService {
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
         let plan = build_launch_plan(entry, priv_drop.as_ref(), &shell);
+        let containment = ChildContainment::for_plan(&plan, entry, priv_drop, cgroup_required);
         let launch_cmd = plan.program;
         let launch_args = plan.args;
-        let apply_priv_in_child = plan.apply_priv_in_child;
 
         let mut cmd = tokio::process::Command::new(&launch_cmd);
         let work_dir = if entry.work_dir.is_empty() {
@@ -3428,17 +4024,12 @@ impl AgentService {
             master: master.as_raw_fd(),
             slave: slave.as_raw_fd(),
         };
-        let priv_drop_for_child = if apply_priv_in_child { priv_drop } else { None };
+        // Hooks run in registration order, so the child wires its PTY, then
+        // joins the job's cgroup, then drops privilege.
         unsafe {
-            cmd.pre_exec(move || {
-                raw.wire()?;
-                if let Some(ref pd) = priv_drop_for_child {
-                    pd.apply()
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                }
-                Ok(())
-            });
+            cmd.pre_exec(move || raw.wire());
         }
+        containment.register(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -3496,10 +4087,16 @@ impl TrackedJob {
             .spawn()
             .expect("failed to spawn dummy process");
         Self {
-            job: executor::RunningJob::Managed {
-                child,
-                cgroup_path: None,
-            },
+            job: executor::RunningJob::Managed { child },
+            ..Self::allocation_only(None)
+        }
+    }
+
+    /// An allocation with no batch process, as salloc and standalone srun
+    /// register it.
+    fn allocation_only(cgroup_path: Option<std::path::PathBuf>) -> Self {
+        Self {
+            job: executor::RunningJob::AllocationOnly,
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
@@ -3518,6 +4115,7 @@ impl TrackedJob {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            cgroup_path,
         }
     }
 }
@@ -3582,6 +4180,7 @@ mod tests {
             uid,
             gid,
             work_dir: "/home/user".into(),
+            cgroup_path: None,
         }
     }
 
@@ -3689,6 +4288,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/home/user".into(),
+            cgroup_path: None,
         };
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
         let plan = build_launch_plan(&entry, Some(&pd), &["echo".to_string(), "hi".to_string()]);
@@ -3713,14 +4313,96 @@ mod tests {
             uid: 0,
             gid: 0,
             work_dir: "/tmp".into(),
+            cgroup_path: None,
         };
         let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None)
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
                 .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
         assert!(pid > 0);
         let status = child.wait().await.expect("child should be reapable");
         assert!(status.success(), "`true` should exit 0");
         drop(master);
+    }
+
+    // The device filter lives on the job cgroup, so a child that fails to join it runs
+    // unfiltered. Under `required` that must abort before exec, not exec and warn.
+    #[tokio::test]
+    async fn a_required_join_that_cannot_land_aborts_the_attach() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 0,
+            gid: 0,
+            work_dir: "/tmp".into(),
+            // A path with no cgroup.procs: the pre-exec open fails, so the join cannot land.
+            cgroup_path: Some("/nonexistent/spur-required/job_1".into()),
+        };
+
+        let err = AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, true)
+            .expect_err("a required join that cannot land must fail the spawn");
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    // The same unjoinable cgroup without `required` is the degraded non-root-agent path:
+    // it must still run rather than refuse the user their shell.
+    #[tokio::test]
+    async fn a_best_effort_join_failure_still_runs_the_command() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 0,
+            gid: 0,
+            work_dir: "/tmp".into(),
+            cgroup_path: Some("/nonexistent/spur-besteffort/job_1".into()),
+        };
+
+        let (master, mut child, pid) =
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, false)
+                .expect("a best-effort join failure must still spawn the command");
+        assert!(pid > 0);
+        let status = child.wait().await.expect("child should be reapable");
+        assert!(status.success(), "`true` should exit 0");
+        drop(master);
+    }
+
+    // An attach that keeps spurd's cgroup reaches every device on the node,
+    // including ones the job was never allocated.
+    #[tokio::test]
+    async fn a_pty_attach_joins_the_job_cgroup() {
+        // A plain file stands in for `cgroup.procs`: the child opens and writes
+        // it exactly as it would the kernel's, so no root and no cgroupfs.
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("cgroup.procs");
+
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 0,
+            gid: 0,
+            work_dir: "/tmp".into(),
+            cgroup_path: Some(cgroup.path().to_path_buf()),
+        };
+
+        let (master, mut child, pid) =
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
+                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
+        let status = child.wait().await.expect("child should be reapable");
+        assert!(status.success(), "`true` should exit 0");
+        drop(master);
+
+        let joined =
+            std::fs::read_to_string(cgroup.path().join("cgroup.procs")).expect("read cgroup.procs");
+        assert_eq!(
+            joined.trim(),
+            pid.to_string(),
+            "the attached PTY child must join the job's cgroup"
+        );
     }
 
     #[test]
@@ -3735,6 +4417,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/home/user".into(),
+            cgroup_path: None,
         };
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
         let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
@@ -4241,6 +4924,86 @@ mod tests {
         assert_ne!(code, Some(tonic::Code::PermissionDenied));
     }
 
+    // `spur exec` enters the job's namespaces; without this it keeps spurd's
+    // cgroup and so escapes the job's device filter.
+    #[tokio::test]
+    async fn exec_into_a_job_joins_its_cgroup() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // A plain file stands in for `cgroup.procs`: the child opens and writes
+        // it exactly as it would the kernel's, so no root and no cgroupfs.
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("cgroup.procs");
+        svc.insert_test_job(
+            46,
+            TrackedJob::allocation_only(Some(cgroup.path().to_path_buf())),
+        )
+        .await;
+
+        // `$$` is the exec'd shell's own pid, which is the pid the child wrote.
+        let resp = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id: 46,
+                command: vec!["sh".into(), "-c".into(), "echo $$".into()],
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("the owner may exec into their own job")
+            .into_inner();
+        assert!(resp.success, "exec failed: {}", resp.stderr);
+
+        let joined =
+            std::fs::read_to_string(cgroup.path().join("cgroup.procs")).expect("read cgroup.procs");
+        assert_eq!(
+            joined.trim(),
+            resp.stdout.trim(),
+            "the exec'd child must join the job's cgroup"
+        );
+    }
+
+    // The exec counterpart of the PTY required-join test: `spur exec` must refuse to
+    // run outside the job's device filter when `[cgroup] required` and the join fails.
+    #[tokio::test]
+    async fn a_required_join_that_cannot_land_aborts_the_exec() {
+        let svc = AgentService::with_cluster_config(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                required: true,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            new_running_jobs(),
+            false, // allow_root_jobs
+        )
+        .with_root_override(false);
+
+        // A path with no cgroup.procs: the pre-exec join open fails.
+        svc.insert_test_job(
+            47,
+            TrackedJob::allocation_only(Some("/nonexistent/spur-exec-required/job_47".into())),
+        )
+        .await;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id: 47,
+                command: vec!["true".into()],
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("a required join that cannot land must fail the exec");
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
     fn user_identity(name: &str) -> spur_core::auth::Identity {
         spur_core::auth::Identity {
             user: name.into(),
@@ -4393,6 +5156,94 @@ mod tests {
             .await
             .expect_err("a user token must not cancel jobs by dialing the agent directly");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // The check inside teardown is only meaningful if a launch cannot land after it: the
+    // id's cgroup, spool and rootfs are all derived names the successor would recreate.
+    #[tokio::test]
+    async fn teardown_cannot_start_while_a_launch_holds_the_job_id() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 910;
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_910");
+        std::fs::create_dir(&cgroup).unwrap();
+        let completed = completed_job(job_id, cgroup.clone());
+
+        // Stands in for a launch of the same id: it owns the id's state until it is done.
+        let launching = svc.lifecycle.acquire(job_id).await;
+
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let (lifecycle, running, allocation, mpi_host) = (
+                svc.lifecycle.clone(),
+                svc.running.clone(),
+                svc.allocation.clone(),
+                svc.mpi_host.clone(),
+            );
+            let flag = Arc::clone(&torn_down);
+            async move {
+                teardown_completed_job(&completed, &lifecycle, &running, &allocation, &mpi_host)
+                    .await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // Nudges rather than waits: the teardown body has no pending await of its own once
+        // it holds the id, so if it were not parked on the id it would finish in these.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "teardown must wait rather than run while the launch owns the id"
+        );
+        assert!(
+            cgroup.exists(),
+            "teardown must not remove state the launch is building on"
+        );
+
+        drop(launching);
+        task.await
+            .expect("teardown runs once the launch releases the id");
+        assert!(!cgroup.exists(), "teardown still runs after it waits");
+    }
+
+    /// The impersonation this gate exists to stop: `user` decides who owns the allocation and `uid`
+    /// decides who its steps run as, so a caller who sets both reaches any account on the node.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_a_non_controller_caller() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut req = Request::new(RegisterJobAllocationRequest {
+            job_id: 49,
+            uid: 1234,
+            gid: 1234,
+            user: "attacker".into(),
+            cpus: 1,
+            ..Default::default()
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a user token must not register an allocation on the agent directly");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused registration must not leave a job the exec paths would trust"
+        );
     }
 
     /// A launch aimed at another node's name must be refused: the agent only runs allocations
@@ -4720,6 +5571,38 @@ mod tests {
             .expect("process group did not exit after signal")
             .expect("wait failed");
         assert!(!status.success());
+    }
+
+    // The cgroup-escape path relies on this: the wrapper's descendants hold the
+    // user's work, and an escaped step is in no cgroup that could reach them.
+    #[tokio::test]
+    async fn kill_step_process_group_takes_descendants_with_the_wrapper() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        // `echo` runs after both forks, so a read of it proves the descendants exist.
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 3600 & sleep 3600 & echo ready; wait")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn process group");
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut ready = [0u8; 6];
+        stdout
+            .read_exact(&mut ready)
+            .await
+            .expect("wrapper should report both children forked");
+
+        kill_step_process_group(&mut child).await;
+
+        // The `sleep`s inherited this pipe, so EOF means none of them is left.
+        let mut remaining = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut remaining))
+            .await
+            .expect("descendants outlived the wrapper")
+            .expect("read failed");
     }
 
     // G1: the enforced budget — and therefore the cpuset — must cover every task
@@ -5455,7 +6338,9 @@ mod tests {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
+            // Registration resolves the granted GPU against this registry and
+            // hard-fails when it cannot, so device 0 has to be known here.
+            Arc::new(Mutex::new(test_gpu_registry())),
             spur_core::config::MemlockLimit::Unlimited,
         );
 
@@ -5500,6 +6385,52 @@ mod tests {
         );
     }
 
+    // The refusal must undo the whole registration, not just return an error:
+    // a committed reservation with nothing in `running` reads as live to the
+    // node and as orphaned to the reconcile pass.
+    #[tokio::test]
+    async fn refusing_an_allocation_releases_it_and_drops_the_tracked_job() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // The state the handler is in when the cgroup setup fails: reserved,
+        // committed, guard armed, nothing recorded yet.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(42, 1, 0, &[0]).unwrap();
+            alloc.commit_job(42);
+        }
+        let reservation = LaunchReservationGuard::new(svc.allocation.clone(), 42);
+        assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
+
+        let status = {
+            let mut jobs = svc.running.lock().await;
+            // Inserted so the rollback has something to undo.
+            jobs.insert(42, TrackedJob::allocation_only(None));
+            let (status, cgroup) =
+                refuse_allocation(42, reservation, &mut jobs, "cgroup root unavailable");
+            assert!(
+                !jobs.contains_key(&42),
+                "a refused allocation must leave no tracked job"
+            );
+            drop(jobs);
+            drop(cgroup);
+            status
+        };
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("cgroup root unavailable"));
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a refusal must release the allocation it could not enforce"
+        );
+    }
+
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
     // job so the controller can reconcile it — the strand this fix addresses.
     #[tokio::test]
@@ -5532,7 +6463,12 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             &spur_core::config::ClusterConfig::default(),
             spur_core::config::JobLimits::default(),
-            CgroupConfig::default(),
+            // Registration now creates the job's cgroup; keep this test off the
+            // runner's real cgroupfs.
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
             MpiConfig::default(),
             running,
             false, // allow_root_jobs
@@ -5773,10 +6709,7 @@ mod tests {
             .spawn()
             .expect("failed to spawn SIGTERM-trapping process");
         let tracked = TrackedJob {
-            job: executor::RunningJob::Managed {
-                child,
-                cgroup_path: None,
-            },
+            job: executor::RunningJob::Managed { child },
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
@@ -5795,6 +6728,7 @@ mod tests {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            cgroup_path: None,
         };
         svc.insert_test_job(job_id, tracked).await;
 
@@ -5833,10 +6767,7 @@ mod tests {
                 .expect("spawn trap process");
             let pid = child.id().expect("pid") as i32;
             let t = TrackedJob {
-                job: executor::RunningJob::Managed {
-                    child,
-                    cgroup_path: None,
-                },
+                job: executor::RunningJob::Managed { child },
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
@@ -5855,6 +6786,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
+                cgroup_path: None,
             };
             (t, pid)
         }
@@ -5938,7 +6870,6 @@ mod tests {
         let job = executor::RunningJob::Forked {
             pid,
             _pidfd: None,
-            cgroup_path: None,
             reaped: false,
         };
         reap_killed_job(job).await;
@@ -6003,6 +6934,208 @@ mod tests {
         );
     }
 
+    // A finished job's cgroup must be released exactly once, by the monitor
+    // loop taking it off the tracked job.
+    #[tokio::test]
+    async fn monitor_removes_the_job_cgroup_on_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_904");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 904;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.cgroup_path = Some(cgroup.clone());
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.send_explicit_signal(job_id, 9).await; // SIGKILL
+
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "monitor should reap SIGKILL'd job within 5s"
+        );
+        assert!(
+            !cgroup.exists(),
+            "completion must remove the finished job's cgroup"
+        );
+    }
+
+    fn completed_job(job_id: u32, cgroup: std::path::PathBuf) -> CompletedJob {
+        CompletedJob {
+            job_id,
+            exit_code: 0,
+            signal: 0,
+            run_attempt: 0,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            cgroup: Some(cgroup),
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
+            mpi: String::new(),
+        }
+    }
+
+    // The monitor drops the job from `running` before tearing it down, so the
+    // controller can re-dispatch the id into that window and own the same state.
+    #[tokio::test]
+    async fn teardown_spares_a_job_id_re_dispatched_during_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_907");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 907;
+        let completed = completed_job(job_id, cgroup.clone());
+
+        // The re-dispatch: tracked again under the same id, holding the GPU.
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
+            .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id);
+        }
+
+        teardown_completed_job(
+            &completed,
+            &svc.lifecycle,
+            &svc.running,
+            &svc.allocation,
+            &svc.mpi_host,
+        )
+        .await;
+
+        assert!(
+            cgroup.exists(),
+            "teardown must not remove the cgroup the re-dispatched run is in"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "teardown must not release the re-dispatched run's reservation"
+        );
+    }
+
+    // The counterpart: with no live run under the id, the same teardown must
+    // still release everything, so the guard above cannot just skip always.
+    #[tokio::test]
+    async fn teardown_releases_a_job_id_nothing_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_908");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 908;
+        let completed = completed_job(job_id, cgroup.clone());
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id);
+        }
+
+        teardown_completed_job(
+            &completed,
+            &svc.lifecycle,
+            &svc.running,
+            &svc.allocation,
+            &svc.mpi_host,
+        )
+        .await;
+
+        assert!(
+            !cgroup.exists(),
+            "teardown must remove the finished run's cgroup"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "teardown must release the finished run's reservation"
+        );
+    }
+
+    // An allocation never completes, so the monitor loop's teardown never runs
+    // for it. Cancelling is its only chance to release the cgroup.
+    #[tokio::test]
+    async fn cancelling_an_allocation_removes_its_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_905");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 905;
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
+            .await;
+
+        svc.graceful_cancel(job_id).await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "cancelling an allocation must drop the tracked job"
+        );
+        assert!(
+            !cgroup.exists(),
+            "dropping an allocation must remove its cgroup"
+        );
+    }
+
+    // Re-dispatch inserts the new run under the same id and discards the
+    // displaced job. Both name the same job_<id> cgroup, which the new run has
+    // already joined, so discarding one must never release it.
+    #[tokio::test]
+    async fn displacing_a_tracked_job_leaves_its_cgroup_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_906");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 906;
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
+            .await;
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
+            .await;
+
+        assert!(
+            cgroup.exists(),
+            "displacing a run must not release the cgroup its successor is in"
+        );
+    }
+
     #[tokio::test]
     async fn job_entry_from_tracked_job() {
         let (svc, job_id) = run_command_test_setup().await;
@@ -6015,6 +7148,29 @@ mod tests {
         assert_eq!(entry.uid, 0);
         assert_eq!(entry.gid, 0);
         assert!(!entry.has_namespaces());
+    }
+
+    // An interactive allocation has no batch process, so its cgroup can only
+    // live on the tracked job — that is the one handle a step or exec has to
+    // reach the job's limits and device filter.
+    #[tokio::test]
+    async fn job_entry_carries_the_cgroup_of_an_allocation_only_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 4242;
+        let cgroup = std::path::PathBuf::from("/sys/fs/cgroup/spur/job_4242");
+        svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
+            .await;
+
+        let entry = svc
+            .job_entry(job_id)
+            .await
+            .expect("job_entry should succeed");
+        assert_eq!(entry.cgroup_path, Some(cgroup));
     }
 
     #[tokio::test]

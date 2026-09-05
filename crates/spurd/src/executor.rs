@@ -19,6 +19,8 @@ use spur_core::config::{CgroupConfig, CgroupLimits, MemlockLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
+use crate::device_cgroup;
+
 /// Typed launch errors so callers can distinguish a broken node from a job that
 /// simply cannot run here.
 pub enum LaunchError {
@@ -176,6 +178,9 @@ pub struct LaunchResult {
     pub stderr_path: String,
     /// Master fd of the PTY (only set when `io_mode == LaunchIo::Pty`).
     pub pty_master: Option<OwnedFd>,
+    /// The job's cgroup, released to the caller now that the launch succeeded.
+    /// The caller owns its removal from here on.
+    pub cgroup_path: Option<PathBuf>,
 }
 
 /// Owns the resolved fds for a job's stdio, built once and consumed by both
@@ -299,16 +304,12 @@ impl JobIoRaw {
 /// A running job process — either a tokio-managed child or a raw-forked container.
 pub enum RunningJob {
     /// Non-container jobs managed by tokio::process::Child.
-    Managed {
-        child: tokio::process::Child,
-        cgroup_path: Option<PathBuf>,
-    },
+    Managed { child: tokio::process::Child },
     /// Container jobs: raw fork with optional pidfd for PID-recycling safety.
     Forked {
         pid: i32,
         /// Holds a kernel reference preventing PID recycling. None on kernels < 5.3.
         _pidfd: Option<OwnedFd>,
-        cgroup_path: Option<PathBuf>,
         reaped: bool,
     },
     /// Allocation registered without a batch process (standalone srun).
@@ -438,14 +439,6 @@ impl RunningJob {
             RunningJob::AllocationOnly => Ok(()),
         }
     }
-
-    pub fn take_cgroup(&mut self) -> Option<PathBuf> {
-        match self {
-            RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
-            RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
-            RunningJob::AllocationOnly => None,
-        }
-    }
 }
 
 /// Launch a job script on this node.
@@ -505,7 +498,15 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = CgroupGuard(setup_cgroup(job_id, &cfg.cgroup, cpus, memory_mb, cpu_ids)?);
+    let device_paths = allocated_device_paths(cfg.host_device_plan.as_ref());
+    let cgroup_path = CgroupGuard(setup_cgroup(
+        job_id,
+        &cfg.cgroup,
+        cpus,
+        memory_mb,
+        cpu_ids,
+        device_paths,
+    )?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -663,12 +664,13 @@ async fn spawn_job_process(
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, cgroup_path).await?;
+        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, &cgroup_path).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
             pty_master,
+            cgroup_path: cgroup_path.into_inner(),
         });
     }
 
@@ -768,7 +770,8 @@ async fn spawn_job_process(
         let log_fd = cgroup_log_fd;
         unsafe {
             cmd.pre_exec(move || {
-                join_cgroup_self(&procs, log_fd);
+                // Best-effort here; `required` is enforced parent-side below via cgroup_has_pid.
+                let _ = join_cgroup_self(&procs, log_fd);
                 Ok(())
             });
         }
@@ -896,13 +899,11 @@ async fn spawn_job_process(
     );
 
     Ok(LaunchResult {
-        job: RunningJob::Managed {
-            child,
-            cgroup_path: cgroup_path.into_inner(),
-        },
+        job: RunningJob::Managed { child },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
         pty_master,
+        cgroup_path: cgroup_path.into_inner(),
     })
 }
 
@@ -938,13 +939,20 @@ fn cgroup_limit_files(limits: &CgroupLimits) -> Vec<(&'static str, String)> {
     files
 }
 
+/// No injection plan means no devices were allocated, and must stay an empty list:
+/// the filter allows exactly what it is handed.
+fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>) -> &[String] {
+    plan.map(|p| p.device_paths.as_slice()).unwrap_or(&[])
+}
+
 /// Set up a cgroups v2 hierarchy for a job.
-fn setup_cgroup(
+pub(crate) fn setup_cgroup(
     job_id: JobId,
     cgroup: &CgroupConfig,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
+    device_paths: &[String],
 ) -> anyhow::Result<Option<PathBuf>> {
     let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
         debug!(job_id, "cgroup enforcement disabled by config");
@@ -983,19 +991,19 @@ fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
-    if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
-        if nix::unistd::geteuid().is_root() {
-            anyhow::bail!("cgroup creation failed as root: {}", e);
+    if let Err(e) = claim_cgroup_dir(&cgroup_path) {
+        match classify_cgroup_claim_failure(
+            &e,
+            nix::unistd::geteuid().is_root(),
+            cgroup.required,
+            &cgroup_path,
+        ) {
+            CgroupClaim::Fatal(msg) => anyhow::bail!(msg),
+            CgroupClaim::Degrade => {
+                warn!(job_id, error = %e, "cgroup unavailable; job runs without isolation");
+                return Ok(None);
+            }
         }
-        if cgroup.required {
-            anyhow::bail!("[cgroup] required but the job cgroup could not be created: {e}");
-        }
-        warn!(
-            job_id,
-            error = %e,
-            "cgroup creation failed (not root), running without isolation"
-        );
-        return Ok(None);
     }
 
     // Core ids come from a synthesized 0..n range, which can name cores this
@@ -1045,6 +1053,17 @@ fn setup_cgroup(
         // every core on the node — the clamp above can empty a non-empty set.
         warn!(job_id, "no cores to pin; job runs without a CPU bound");
         degrade("no cores to pin");
+    }
+
+    // Attach before any of the job's processes join: the filter is consulted at
+    // open(2), so a device a process already holds open stays readable regardless.
+    if cgroup.constrain_devices {
+        let paths = device_cgroup::device_paths_for_job(device_paths, &cgroup.extra_device_paths);
+        let rules = device_cgroup::rules_for_device_paths(&paths, device_cgroup::stat_device_node);
+        if let Err(e) = device_cgroup::install_device_filter(&cgroup_path, &rules) {
+            warn!(job_id, error = %e, "device filter not installed; job runs without device isolation");
+            degrade("device filter not installed");
+        }
     }
 
     if let Some(reason) = degraded {
@@ -1100,9 +1119,10 @@ fn permitted_cores(requested: &[u32], parent_effective: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
-/// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
-fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
+/// Join the calling process to a cgroup (pid → `cgroup.procs`), returning whether it landed.
+/// Async-signal-safe (raw syscalls only) for post-fork pre-exec use; warns to `log_fd` on failure.
+#[must_use]
+fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) -> bool {
     let pid = unsafe { libc::getpid() };
 
     let mut buf = [0u8; 24];
@@ -1122,14 +1142,17 @@ fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
         let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
         if fd < 0 {
             warn_cgroup_join_failed(log_fd);
-            return;
+            return false;
         }
         let written = libc::write(fd, digits.as_ptr() as *const libc::c_void, digits.len());
         libc::close(fd);
-        if written < 0 {
+        // cgroup.procs takes the whole pid in one write or errors; a short count is a failure.
+        if written != digits.len() as isize {
             warn_cgroup_join_failed(log_fd);
+            return false;
         }
     }
+    true
 }
 
 /// Async-signal-safe warning for a failed cgroup join: a fixed message to
@@ -1150,9 +1173,47 @@ fn dup_cloexec(fd: RawFd) -> RawFd {
     unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }
 }
 
+/// A child's pre-built cgroup join, ready to run from `pre_exec`. Built
+/// parent-side because nothing between fork and exec may allocate.
+pub(crate) struct CgroupJoin {
+    procs: CString,
+    log_fd: RawFd,
+}
+
+impl CgroupJoin {
+    /// `None` when the job has no cgroup, which leaves the child uncontained
+    /// rather than unlaunched — the degrade a non-root agent already produces.
+    pub(crate) fn for_cgroup(cgroup_path: Option<&Path>) -> Option<Self> {
+        let procs = CString::new(cgroup_path?.join("cgroup.procs").as_os_str().as_bytes()).ok()?;
+        // fd 2 is the child's own stdio by the time pre_exec runs, so warn on a
+        // dup of spurd's stderr instead of into the job's output.
+        let log_fd = dup_cloexec(libc::STDERR_FILENO);
+        Some(Self { procs, log_fd })
+    }
+
+    /// Call from `pre_exec`, while the child is still root: an unprivileged process
+    /// cannot write another cgroup's `cgroup.procs`. Returns whether the join landed.
+    pub(crate) fn join(&self) -> bool {
+        join_cgroup_self(&self.procs, self.log_fd)
+    }
+
+    #[cfg(test)]
+    fn procs_path(&self) -> &std::ffi::CStr {
+        &self.procs
+    }
+}
+
+impl Drop for CgroupJoin {
+    fn drop(&mut self) {
+        if self.log_fd >= 0 {
+            unsafe { libc::close(self.log_fd) };
+        }
+    }
+}
+
 /// Whether `pid` is in the job's cgroup. The child joins itself pre-exec, so
 /// this verifies the join rather than performing it.
-fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
+pub(crate) fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
     let Ok(procs) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) else {
         return false;
     };
@@ -1171,11 +1232,18 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
     })
 }
 
-/// Owns a job's cgroup between creation and the point the running job takes it
-/// over. Every error return in between would otherwise strand the directory.
-struct CgroupGuard(Option<PathBuf>);
+/// Owns a job's cgroup until something else takes responsibility: a launch hands
+/// it to the caller, a teardown removes it. Error returns would strand it.
+#[must_use = "the cgroup is removed when this guard drops; bind it to choose when"]
+pub(crate) struct CgroupGuard(Option<PathBuf>);
 
 impl CgroupGuard {
+    /// Take over a cgroup already detached from its job. Removal is deferred to
+    /// the drop, so the holder picks a point where blocking is acceptable.
+    pub(crate) fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
     fn path(&self) -> Option<&Path> {
         self.0.as_deref()
     }
@@ -1194,6 +1262,53 @@ impl Drop for CgroupGuard {
     }
 }
 
+/// Bounded to 200ms: cleanup sits on the completion-reporting path, and the next
+/// `setup_cgroup` clears any directory this gives up on.
+const CGROUP_REMOVE_ATTEMPTS: u32 = 20;
+const CGROUP_REMOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Take a job's cgroup directory, clearing a leftover one first. `AlreadyExists` means the
+/// leftover could not be removed, which the caller refuses to adopt: it may carry another
+/// run's processes, limits and device filter.
+fn claim_cgroup_dir(cgroup_path: &Path) -> std::io::Result<()> {
+    if cgroup_path.exists() {
+        cleanup_cgroup(cgroup_path);
+    }
+    std::fs::create_dir(cgroup_path)
+}
+
+/// Whether a failed cgroup claim must fail the launch or may run without isolation.
+enum CgroupClaim {
+    Fatal(String),
+    Degrade,
+}
+
+/// A surviving or uncreatable cgroup is never adopted; the choice is only fail vs. run
+/// unconstrained. Fail closed for root (a survival means live processes it should reap) or
+/// `required`; else degrade, so a root-owned leftover a non-root agent cannot remove never wedges.
+fn classify_cgroup_claim_failure(
+    err: &std::io::Error,
+    is_root: bool,
+    required: bool,
+    cgroup_path: &Path,
+) -> CgroupClaim {
+    if is_root {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return CgroupClaim::Fatal(format!(
+                "job cgroup {} could not be cleared for reuse (live processes still in it)",
+                cgroup_path.display()
+            ));
+        }
+        return CgroupClaim::Fatal(format!("cgroup creation failed as root: {err}"));
+    }
+    if required {
+        return CgroupClaim::Fatal(format!(
+            "[cgroup] required but the job cgroup could not be created: {err}"
+        ));
+    }
+    CgroupClaim::Degrade
+}
+
 /// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
     // Kill any remaining processes
@@ -1205,9 +1320,17 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
         }
     }
 
-    // Remove cgroup directory
-    if let Err(e) = std::fs::remove_dir(cgroup_path) {
-        warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
+    // `kill` returning does not mean the process has left the cgroup, and rmdir
+    // fails EBUSY until it has. An abandoned dir strands its device program.
+    for attempt in 1..=CGROUP_REMOVE_ATTEMPTS {
+        match std::fs::remove_dir(cgroup_path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if attempt == CGROUP_REMOVE_ATTEMPTS => {
+                warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
+            }
+            Err(_) => std::thread::sleep(CGROUP_REMOVE_INTERVAL),
+        }
     }
 }
 
@@ -1703,7 +1826,7 @@ async fn launch_container_job(
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
     job_io: JobIo,
-    cgroup_path: CgroupGuard,
+    cgroup_path: &CgroupGuard,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
 
@@ -1763,9 +1886,10 @@ async fn launch_container_job(
             }
 
             // Join while still root, before pivot_root hides the host cgroupfs and
-            // before close_inherited_fds reaps the log fd.
+            // before close_inherited_fds reaps the log fd. `required` is verified
+            // parent-side after readiness, so a failure here is best-effort.
             if let Some(ref procs) = cgroup_procs {
-                join_cgroup_self(procs, cgroup_log_fd);
+                let _ = join_cgroup_self(procs, cgroup_log_fd);
             }
 
             crate::container::close_inherited_fds(ready_w);
@@ -1889,7 +2013,6 @@ async fn launch_container_job(
                 RunningJob::Forked {
                     pid: child_pid,
                     _pidfd: pidfd,
-                    cgroup_path: cgroup_path.into_inner(),
                     reaped: false,
                 },
                 pty_master,
@@ -1922,18 +2045,29 @@ fn build_namespace_wrapper(
     visible_device_paths: &[String],
     script_path: &Path,
 ) -> String {
-    let gpu_mounts = visible_device_paths
+    let dri_nodes: Vec<&str> = visible_device_paths
         .iter()
         .filter(|p| p.starts_with("/dev/dri/"))
-        .map(|path| {
-            let basename = path.rsplit('/').next().unwrap_or("");
-            format!(
-                "  if [ -e $SPUR_HOST_DRI/{b} ]; then\n    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n  fi\n",
-                b = basename,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+        .filter_map(|p| p.rsplit('/').next())
+        .filter(|b| !b.is_empty())
+        .collect();
+    let stash_dri = dri_nodes
+        .iter()
+        .map(|b| format!("  cp -a /dev/dri/{b} $SPUR_HOST_DRI/{b} 2>/dev/null || true\n"))
+        .collect::<String>();
+
+    // Gated on the mount: without the tmpfs the restore lands on the host's real
+    // /dev/dri, where `cp` unlinks the node before recreating it.
+    const MOUNT_DRI: &str = "mount -t tmpfs tmpfs /dev/dri 2>/dev/null";
+    let mount_and_restore_dri = if dri_nodes.is_empty() {
+        format!("  {MOUNT_DRI} || true\n")
+    } else {
+        let restore = dri_nodes
+            .iter()
+            .map(|b| format!("    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n"))
+            .collect::<String>();
+        format!("  if {MOUNT_DRI}; then\n{restore}  fi\n")
+    };
 
     let final_exec = if uid > 0 {
         format!(
@@ -1952,16 +2086,19 @@ fn build_namespace_wrapper(
             "# Namespace isolation wrapper — all mounts best-effort\n",
             "mount -t proc proc /proc 2>/dev/null || true\n",
             "mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\n",
-            "# GPU device restriction: save original /dev/dri, replace with\n",
-            "# tmpfs, then selectively copy only allocated devices back.\n",
+            "# GPU device restriction: stash the allocated /dev/dri nodes, replace\n",
+            "# the directory with a tmpfs, then copy only those back. Staging any\n",
+            "# other node would mknod a device the cgroup device filter denies.\n",
             "SPUR_HOST_DRI=$(mktemp -d /tmp/.spur_dri_XXXXXX 2>/dev/null || echo /tmp/.spur_dri)\n",
-            "if [ -d /dev/dri ] && cp -a /dev/dri/. $SPUR_HOST_DRI/ 2>/dev/null; then\n",
-            "  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n",
-            "{gpu_mounts}",
+            "if [ -d /dev/dri ]; then\n",
+            "  mkdir -p $SPUR_HOST_DRI 2>/dev/null || true\n",
+            "{stash_dri}",
+            "{mount_and_restore_dri}",
             "fi\n",
             "{final_exec}",
         ),
-        gpu_mounts = gpu_mounts,
+        stash_dri = stash_dri,
+        mount_and_restore_dri = mount_and_restore_dri,
         final_exec = final_exec,
     )
 }
@@ -2042,8 +2179,31 @@ mod cpuset_tests {
 }
 
 #[cfg(test)]
+mod cgroup_join_tests {
+    use super::CgroupJoin;
+    use std::path::Path;
+
+    #[test]
+    fn a_job_with_a_cgroup_is_wired_to_join_its_procs_file() {
+        let join = CgroupJoin::for_cgroup(Some(Path::new("/sys/fs/cgroup/spur/job_7")))
+            .expect("a job with a cgroup must be wired to join it");
+        assert_eq!(
+            join.procs_path().to_bytes(),
+            b"/sys/fs/cgroup/spur/job_7/cgroup.procs"
+        );
+    }
+
+    #[test]
+    fn a_job_without_a_cgroup_has_nothing_to_join() {
+        // Degraded, not fatal: a non-root agent creates no cgroup, and the
+        // child still has to run.
+        assert!(CgroupJoin::for_cgroup(None).is_none());
+    }
+}
+
+#[cfg(test)]
 mod cgroup_guard_tests {
-    use super::CgroupGuard;
+    use super::{cleanup_cgroup, CgroupGuard};
 
     #[test]
     fn dropping_the_guard_removes_the_cgroup() {
@@ -2074,6 +2234,35 @@ mod cgroup_guard_tests {
     #[test]
     fn a_disabled_cgroup_is_a_no_op() {
         drop(CgroupGuard(None));
+    }
+
+    #[test]
+    fn cleanup_removes_an_empty_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_3");
+        std::fs::create_dir(&cgroup).unwrap();
+
+        cleanup_cgroup(&cgroup);
+        assert!(!cgroup.exists());
+    }
+
+    #[test]
+    fn cleanup_gives_up_on_a_cgroup_that_never_empties() {
+        // A non-empty dir fails rmdir the way a busy cgroup does, so this exhausts
+        // the retry budget; reaching the assert at all is the property under test.
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_4");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), "not-a-pid\n").unwrap();
+
+        cleanup_cgroup(&cgroup);
+        assert!(cgroup.exists());
+    }
+
+    #[test]
+    fn cleanup_of_a_missing_cgroup_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        cleanup_cgroup(&dir.path().join("job_5"));
     }
 }
 
@@ -2508,6 +2697,71 @@ mod tests {
     }
 
     #[test]
+    fn claiming_a_cgroup_dir_creates_it_when_nothing_is_there() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job_1");
+        claim_cgroup_dir(&path).expect("a fresh id must get its directory");
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn claiming_a_cgroup_dir_clears_an_empty_leftover() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job_1");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("marker"), "stale").unwrap();
+        std::fs::remove_file(path.join("marker")).unwrap();
+
+        claim_cgroup_dir(&path).expect("an empty leftover must be cleared and remade");
+        assert!(path.is_dir());
+    }
+
+    // A directory outliving its cleanup is how a live cgroup presents: rmdir fails while
+    // processes remain, and adopting it would hand them this run's limits and filter.
+    #[test]
+    fn claiming_refuses_a_leftover_that_survives_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job_1");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupant"), "still here").unwrap();
+
+        let err = claim_cgroup_dir(&path).expect_err("a surviving cgroup must not be adopted");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    // A non-root agent inheriting a root-owned leftover cgroup it cannot remove gets EEXIST from
+    // the claim. Under required=false that must degrade to no isolation, not refuse the launch.
+    #[test]
+    fn a_nonroot_agent_degrades_when_a_leftover_cgroup_cannot_be_cleared() {
+        let eexist = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eexist, false, false, Path::new("/x/job_1")),
+            CgroupClaim::Degrade
+        ));
+        // A plain creation error degrades the same way for a non-root, non-required agent.
+        let eperm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eperm, false, false, Path::new("/x/job_1")),
+            CgroupClaim::Degrade
+        ));
+    }
+
+    // The safety directions the degrade must not weaken: a root agent that cannot clear a
+    // leftover has live processes to reckon with, and `required` means enforce or refuse.
+    #[test]
+    fn a_root_or_required_agent_still_fails_on_an_unclaimable_cgroup() {
+        let eexist = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eexist, true, false, Path::new("/x/job_1")),
+            CgroupClaim::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_cgroup_claim_failure(&eexist, false, true, Path::new("/x/job_1")),
+            CgroupClaim::Fatal(_)
+        ));
+    }
+
+    #[test]
     fn write_job_scratch_is_executable_and_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -2815,6 +3069,77 @@ mod tests {
         assert!(!wrapper.contains("nvidia"));
     }
 
+    /// A bulk `cp -a /dev/dri/.` recreates every host node with `mknod(2)`, which the
+    /// filter denies — and that failure must not skip the tmpfs that hides them.
+    #[test]
+    fn test_namespace_wrapper_stages_only_allocated_dri_nodes() {
+        let script = PathBuf::from("/work/.spur_job_9.sh");
+        let paths = vec!["/dev/dri/renderD128".into()];
+        let wrapper = build_namespace_wrapper(1000, 1000, &paths, &script);
+
+        assert!(
+            !wrapper.contains("/dev/dri/."),
+            "no bulk copy of the host directory:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("cp -a /dev/dri/renderD128 $SPUR_HOST_DRI/renderD128"),
+            "the job's own node is staged:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("cp -a $SPUR_HOST_DRI/renderD128 /dev/dri/renderD128"),
+            "and restored onto the tmpfs:\n{wrapper}"
+        );
+        let mount = wrapper
+            .find("mount -t tmpfs tmpfs /dev/dri")
+            .expect("missing /dev/dri tmpfs mount");
+        let restore = wrapper
+            .find("cp -a $SPUR_HOST_DRI/")
+            .expect("missing restore");
+        assert!(
+            mount < restore,
+            "the tmpfs must be mounted before nodes are restored onto it:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("if mount -t tmpfs tmpfs /dev/dri 2>/dev/null; then"),
+            "and the restore must be gated on that mount: against the host's real \
+             /dev/dri, `cp` unlinks the node before recreating it:\n{wrapper}"
+        );
+    }
+
+    /// A job allocated no render nodes must still get the empty tmpfs; skipping the
+    /// mount would leave every GPU on the node visible in `/dev/dri`.
+    #[test]
+    fn test_namespace_wrapper_mounts_empty_dri_tmpfs_without_gpus() {
+        let script = PathBuf::from("/work/.spur_job_10.sh");
+        let wrapper = build_namespace_wrapper(1000, 1000, &[], &script);
+
+        assert!(
+            wrapper.contains("mount -t tmpfs tmpfs /dev/dri"),
+            "zero-GPU job must still hide the host's /dev/dri:\n{wrapper}"
+        );
+        assert!(
+            !wrapper.contains("cp -a"),
+            "nothing is staged for a job with no allocated nodes:\n{wrapper}"
+        );
+    }
+
+    /// The security-critical direction: a job launched without an injection plan
+    /// was allocated nothing, so the filter must be built from an empty list.
+    #[test]
+    fn no_injection_plan_yields_no_device_paths() {
+        assert!(allocated_device_paths(None).is_empty());
+
+        let plan = spur_devices::inject::HostInjectionPlan {
+            device_paths: vec!["/dev/dri/renderD128".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            allocated_device_paths(Some(&plan)),
+            ["/dev/dri/renderD128"],
+            "a plan's paths reach the filter unchanged"
+        );
+    }
+
     #[tokio::test]
     async fn jobio_wire_pty() {
         let (master, slave) = crate::pty::openpty_with_winsize(Some(&crate::pty::WindowSize {
@@ -2978,18 +3303,24 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
 
-        join_cgroup_self(&c_path, -1);
+        assert!(
+            join_cgroup_self(&c_path, -1),
+            "a successful write must report joined"
+        );
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, std::process::id().to_string());
     }
 
     #[test]
-    fn join_cgroup_self_is_silent_when_the_path_is_missing() {
-        // Best-effort: a non-existent cgroup.procs must not panic, so a failed
-        // placement degrades to an unconstrained job instead of aborting launch.
+    fn join_cgroup_self_reports_failure_when_the_path_is_missing() {
+        // A non-existent cgroup.procs must not panic and must report the miss, so the
+        // caller can degrade (best-effort) or abort (`required`) as it chooses.
         let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
-        join_cgroup_self(&c_path, -1);
+        assert!(
+            !join_cgroup_self(&c_path, -1),
+            "a missing cgroup must report not joined"
+        );
     }
 
     #[test]
@@ -3001,7 +3332,10 @@ mod tests {
         let (read_fd, write_fd) = (fds[0], fds[1]);
         let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
 
-        join_cgroup_self(&c_path, write_fd);
+        assert!(
+            !join_cgroup_self(&c_path, write_fd),
+            "the failed join must be reported"
+        );
         unsafe { libc::close(write_fd) };
 
         let mut buf = [0u8; 128];

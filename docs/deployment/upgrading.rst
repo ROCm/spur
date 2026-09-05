@@ -322,6 +322,52 @@ restart — ``scontrol reconfigure`` will not apply it afterwards.
 Rolling back is safe with the section left in place: older binaries do not know
 ``[cgroup]`` and ignore it.
 
+Job device access (``constrain_devices``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing ``constrain_devices`` attaches a default-deny BPF device
+filter to every job cgroup, and it defaults to **on** — including for a
+``spur.conf`` with no ``[cgroup]`` section, or one written before the field
+existed.
+
+**Effect:** a batch payload can open only the device nodes its allocation granted,
+plus the base pseudo-devices and a built-in host-infrastructure set. A job that had
+been reaching a GPU it was not allocated — by re-exporting ``ROCR_VISIBLE_DEVICES``,
+or because it never read the variable — now fails that ``open`` with ``EPERM``.
+
+**A job can also be denied a host device node its allocation never covered**, and
+that is the risk to plan the rollout around. Some device nodes belong to the node
+rather than to any job, so no allocation hands them out and nothing puts them in the
+allow-list. The known cases are RDMA/InfiniBand verbs under ``/dev/infiniband/`` —
+needed by MPI, and by NCCL or RCCL over InfiniBand, which makes this reach
+**non-GPU** jobs — and the vendor control nodes a GPU runtime initializes through,
+such as ``/dev/nvidiactl`` and ``/dev/nvidia-uvm``, which a node configured through
+GRES rather than a CDI spec does not list as devices. Both are allowed by default,
+so the common cases keep working with no configuration; see
+:ref:`device-filter-implicit-allow` for the full implicit set.
+
+A site whose jobs open some other host device node will still see ``EPERM``. Name
+those paths rather than turning the filter off:
+
+.. code-block:: toml
+
+   [cgroup]
+   extra_device_paths = ["/dev/some-site-device"]
+
+Roll the agent out node by node and watch job output for ``EPERM`` on device paths.
+To defer the change entirely:
+
+.. code-block:: toml
+
+   [cgroup]
+   constrain_devices = false
+
+Installing the filter needs ``CAP_BPF`` and ``CAP_NET_ADMIN`` (or ``CAP_SYS_ADMIN``);
+a cgroup-device program is a net-admin program type, so ``CAP_BPF`` alone is not enough.
+An agent without them logs ``device filter not installed`` and runs the job with no
+device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
+turns that degradation into a refused launch.
+
 See Also
 --------
 

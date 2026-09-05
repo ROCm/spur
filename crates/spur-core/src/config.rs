@@ -1479,6 +1479,14 @@ pub struct CgroupConfig {
     /// `OOMKillStep` defaults off; on here, since partial kills fail murkily.
     #[serde(default = "default_true_fn")]
     pub oom_kill_job: bool,
+    /// Restrict the job to its allocated device nodes (`ConstrainDevices`) via a
+    /// cgroup-v2 BPF device filter. Default-deny: no allocation, pseudo-devices only.
+    #[serde(default = "default_true_fn")]
+    pub constrain_devices: bool,
+    /// Extra device paths every job may open, on top of its allocation and the
+    /// host-infrastructure list: the escape hatch for a site device the defaults miss.
+    #[serde(default)]
+    pub extra_device_paths: Vec<String>,
 }
 
 fn default_min_ram_mb() -> u64 {
@@ -1502,6 +1510,8 @@ impl Default for CgroupConfig {
             allowed_swap_percent: 0,
             min_ram_mb: default_min_ram_mb(),
             oom_kill_job: true,
+            constrain_devices: true,
+            extra_device_paths: Vec::new(),
         }
     }
 }
@@ -2379,6 +2389,47 @@ mod tests {
         let cfg = SlurmConfig::load_from_str("cluster_name = \"test\"").expect("parses");
         assert!(cfg.cgroup.enabled);
         assert_eq!(cfg.cgroup.allowed_swap_percent, 0);
+    }
+
+    #[test]
+    fn devices_are_constrained_unless_a_config_opts_out() {
+        // A `spur.conf` deployed before the field existed must still load, and land
+        // on isolation; the `Default` impl and the serde default must agree.
+        assert!(CgroupConfig::default().constrain_devices);
+
+        let upgraded =
+            SlurmConfig::load_from_str("cluster_name = \"t\"\n[cgroup]\nconstrain_swap = true\n")
+                .expect("parses");
+        assert!(
+            upgraded.cgroup.constrain_swap,
+            "the field the config does set still applies"
+        );
+        assert!(upgraded.cgroup.constrain_devices);
+
+        let opted_out = SlurmConfig::load_from_str(
+            "cluster_name = \"t\"\n[cgroup]\nconstrain_devices = false\n",
+        )
+        .expect("parses");
+        assert!(!opted_out.cgroup.constrain_devices);
+    }
+
+    #[test]
+    fn extra_device_paths_default_to_none_and_parse_as_a_list() {
+        assert!(CgroupConfig::default().extra_device_paths.is_empty());
+
+        let without =
+            SlurmConfig::load_from_str("cluster_name = \"t\"\n[cgroup]\nrequired = true\n")
+                .expect("parses");
+        assert!(
+            without.cgroup.extra_device_paths.is_empty(),
+            "a config written before the field existed must still load, granting nothing extra"
+        );
+
+        let with = SlurmConfig::load_from_str(
+            "cluster_name = \"t\"\n[cgroup]\nextra_device_paths = [\"/dev/site-accel0\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(with.cgroup.extra_device_paths, ["/dev/site-accel0"]);
     }
 
     #[test]
