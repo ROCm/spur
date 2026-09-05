@@ -763,20 +763,9 @@ async fn dispatch_step(
         .into_inner()
         .step_id;
 
-    if args.input.is_some() {
-        eprintln!("srun: warning: --input is not supported in step mode, ignoring");
-    }
-    for warning in step_mode_unsupported_warnings(args) {
-        eprintln!("{warning}");
-    }
+    warn_and_validate_step(args, ntasks)?;
 
     let environment = srun_dispatch_environment(args);
-    warn_unsupported_cpu_bind(&environment);
-    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, ntasks)
-        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, ntasks))
-    {
-        anyhow::bail!("{err}");
-    }
     let resp = client
         .run_step(RunStepRequest {
             job_id,
@@ -1344,16 +1333,14 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
     )
 }
 
-/// Flags a step run inside an allocation accepts on the command line but does
-/// not yet honor. The batch and standalone-srun paths apply these; the step
-/// path (`dispatch_step` → `RunStep`) silently drops them, so warn rather than
-/// let a `--container-image` request quietly become a plain host run.
-/// Convergence tracked in spur#777 (container). `--pty` is now honored in step
-/// mode (spur#780) via `run_interactive_pty`, so it is no longer listed here.
+/// Container options a job step accepts on the command line but does not yet
+/// honor. The batch and standalone-srun paths apply these; the step path
+/// (`dispatch_step` → `RunStep`) drops them, so warn rather than let the request
+/// quietly become a plain host run.
 fn step_mode_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
     let mut warnings = Vec::new();
     // Any container option implies the user wants a container; all of them are
-    // dropped in step mode, so warn if any is set (not just --container-image).
+    // dropped, so warn if any is set (not just --container-image).
     let container_requested = args.container_image.is_some()
         || !args.container_mounts.is_empty()
         || args.container_workdir.is_some()
@@ -1362,12 +1349,33 @@ fn step_mode_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
         || args.container_remap_root;
     if container_requested {
         warnings.push(
-            "srun: warning: container options are not yet honored in step mode; \
-             the command runs on the host, not inside a container (spur#777)"
+            "srun: warning: container options are not yet honored for a job step; \
+             the command runs on the host, not inside a container"
                 .to_string(),
         );
     }
     warnings
+}
+
+/// Warnings and validation shared by every job-step dispatch — the buffered
+/// `RunStep` path and the interactive `--pty` path. Emits the --input/container
+/// warnings and bails on an invalid `--cpu-bind` spec so a malformed mask/map
+/// fails loudly on either path rather than silently running unbound.
+fn warn_and_validate_step(args: &SrunArgs, ntasks: u32) -> Result<()> {
+    if args.input.is_some() {
+        eprintln!("srun: warning: --input is not supported for a job step, ignoring");
+    }
+    for warning in step_mode_unsupported_warnings(args) {
+        eprintln!("{warning}");
+    }
+    let environment = srun_dispatch_environment(args);
+    warn_unsupported_cpu_bind(&environment);
+    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, ntasks)
+        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, ntasks))
+    {
+        anyhow::bail!("{err}");
+    }
+    Ok(())
 }
 
 async fn run_as_step(
@@ -1382,27 +1390,27 @@ async fn run_as_step(
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    // Step-mode warnings (--input, dropped container options) are emitted in
-    // dispatch_step, which every non-pty step dispatch goes through. A `--pty`
-    // step returns before dispatch_step, so emit the dropped-container warning on
-    // that path here (--pty itself is honored, so it needs no warning).
     let io = resolve_io_paths(args);
     let user = crate::interactive::job_caller_user(&mut client, job_id, None).await?;
 
     // An interactive step (`srun --pty` inside an allocation) drives a PTY via
-    // InteractiveSession instead of the buffered RunStep path (spur#780), the
-    // same machinery `srun --jobid --overlap --pty` already uses. It runs its
-    // own step and owns the exit code, so return here rather than dispatching a
-    // second, non-interactive step.
+    // InteractiveSession instead of the buffered RunStep path, the same machinery
+    // `srun --jobid --overlap --pty` already uses. It runs its own step and owns
+    // the exit code. Share the same warnings + cpu-bind validation the buffered
+    // path uses (the interactive step is one PTY, so ntasks = 1), and finish
+    // through handle_terminal_state so the srun epilog still runs.
     if args.pty {
-        for warning in step_mode_unsupported_warnings(args) {
-            eprintln!("{warning}");
-        }
+        warn_and_validate_step(args, 1)?;
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
         let exit_code =
             run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
                 .await?;
-        std::process::exit(exit_code);
+        let state = if exit_code == 0 {
+            JobState::JobCompleted
+        } else {
+            JobState::JobFailed
+        };
+        handle_terminal_state(state, job_id, exit_code, work_dir, &io.stdout, hooks, true).await;
     }
 
     let step_params = StepDispatchParams {
@@ -1481,7 +1489,6 @@ mod tests {
         let warnings = step_mode_unsupported_warnings(&args);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("container options"));
-        assert!(warnings[0].contains("spur#777"));
     }
 
     #[test]
@@ -1494,8 +1501,8 @@ mod tests {
 
     #[test]
     fn step_mode_no_longer_warns_on_pty() {
-        // --pty is now honored in step mode (routes to run_interactive_pty,
-        // spur#780), so it must not produce an unsupported-flag warning.
+        // --pty is now honored for a job step (routes to run_interactive_pty),
+        // so it must not produce an unsupported-flag warning.
         let args = SrunArgs::try_parse_from(["srun", "--pty", "bash"]).expect("parse failed");
         assert!(step_mode_unsupported_warnings(&args).is_empty());
     }
