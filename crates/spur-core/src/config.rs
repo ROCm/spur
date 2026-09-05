@@ -1995,9 +1995,10 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
     match parts.len() {
         1 => parts[0].parse().ok(),
         2 => {
-            let h: u32 = parts[0].parse().ok()?;
-            let m: u32 = parts[1].parse().ok()?;
-            h.checked_mul(60)?.checked_add(m)
+            // minutes:seconds → round a sub-minute remainder up, matching parse_hms
+            let m: u32 = parts[0].parse().ok()?;
+            let sec: u32 = parts[1].parse().ok()?;
+            m.checked_add(if sec > 0 { 1 } else { 0 })
         }
         3 => parse_hms(s),
         _ => None,
@@ -2034,13 +2035,13 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
             mins.checked_mul(60)
         }
         2 => {
-            // HH:MM → hours and minutes (no seconds)
-            let h: u64 = parts[0].parse().ok()?;
-            let m: u64 = parts[1].parse().ok()?;
-            h.checked_mul(3600)?.checked_add(m.checked_mul(60)?)
+            // minutes:seconds (Slurm has no bare hours:minutes form without days)
+            let m: u64 = parts[0].parse().ok()?;
+            let sec: u64 = parts[1].parse().ok()?;
+            m.checked_mul(60)?.checked_add(sec)
         }
         3 => {
-            // HH:MM:SS
+            // hours:minutes:seconds
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
             let sec: u64 = parts[2].parse().ok()?;
@@ -2087,8 +2088,13 @@ fn parse_suffix_duration_seconds(s: &str) -> Option<u64> {
 }
 
 fn parse_hms_seconds(s: &str) -> Option<u64> {
+    // The part after `days-`: hours, hours:minutes, or hours:minutes:seconds.
     let parts: Vec<&str> = s.split(':').collect();
     match parts.len() {
+        1 => {
+            let h: u64 = parts[0].parse().ok()?;
+            h.checked_mul(3600)
+        }
         2 => {
             let h: u64 = parts[0].parse().ok()?;
             let m: u64 = parts[1].parse().ok()?;
@@ -2107,12 +2113,17 @@ fn parse_hms_seconds(s: &str) -> Option<u64> {
 }
 
 fn parse_hms(s: &str) -> Option<u32> {
+    // The part after `days-`: hours, hours:minutes, or hours:minutes:seconds.
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 3 && parts.len() != 2 {
+    if parts.len() > 3 || parts.is_empty() {
         return None;
     }
     let h: u32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
+    let m: u32 = if parts.len() >= 2 {
+        parts[1].parse().ok()?
+    } else {
+        0
+    };
     let s: u32 = if parts.len() == 3 {
         parts[2].parse().ok()?
     } else {
@@ -2603,7 +2614,8 @@ cni_mtu = 1400
     #[test]
     fn test_parse_time() {
         assert_eq!(parse_time_minutes("60"), Some(60));
-        assert_eq!(parse_time_minutes("1:30"), Some(90));
+        // minutes:seconds — 1m30s rounds up to 2 minutes
+        assert_eq!(parse_time_minutes("1:30"), Some(2));
         assert_eq!(parse_time_minutes("72:00:00"), Some(4320));
         assert_eq!(parse_time_minutes("1-00:00:00"), Some(1440));
         assert_eq!(parse_time_minutes("INFINITE"), None);
@@ -2614,9 +2626,9 @@ cni_mtu = 1400
         // "N" → N minutes in seconds
         assert_eq!(parse_time_seconds("1"), Some(60));
         assert_eq!(parse_time_seconds("60"), Some(3600));
-        // "H:MM" → exact seconds
-        assert_eq!(parse_time_seconds("1:30"), Some(5400)); // 1h30m
-                                                            // "H:MM:SS" → exact seconds (the key case)
+        // "MM:SS" → exact seconds
+        assert_eq!(parse_time_seconds("1:30"), Some(90)); // 1m30s
+                                                          // "H:MM:SS" → exact seconds (the key case)
         assert_eq!(parse_time_seconds("0:00:10"), Some(10));
         assert_eq!(parse_time_seconds("0:01:30"), Some(90));
         assert_eq!(parse_time_seconds("1:00:00"), Some(3600));
@@ -2626,6 +2638,34 @@ cni_mtu = 1400
         // limits
         assert_eq!(parse_time_seconds("INFINITE"), None);
         assert_eq!(parse_time_seconds("UNLIMITED"), None);
+    }
+
+    #[test]
+    fn parse_time_covers_all_six_slurm_forms() {
+        // The six documented `--time` forms, in seconds.
+        let cases = [
+            ("10", 10 * 60),                                      // minutes
+            ("4:00", 4 * 60),                                     // minutes:seconds
+            ("30:00", 30 * 60),                                   // minutes:seconds
+            ("1:30", 90),                                         // minutes:seconds
+            ("0:30", 30),                                         // minutes:seconds
+            ("1:00:00", 3600),                                    // hours:minutes:seconds
+            ("2-12", 2 * 86400 + 12 * 3600),                      // days-hours
+            ("2-12:30", 2 * 86400 + 12 * 3600 + 30 * 60),         // days-hours:minutes
+            ("2-12:30:45", 2 * 86400 + 12 * 3600 + 30 * 60 + 45), // days-hours:minutes:seconds
+            ("1-0", 86400),                                       // days-hours (bare hours = 0)
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_time_seconds(input), Some(want), "seconds for {input}");
+        }
+
+        // minutes view: sub-minute remainders round up.
+        assert_eq!(parse_time_minutes("10"), Some(10));
+        assert_eq!(parse_time_minutes("4:00"), Some(4));
+        assert_eq!(parse_time_minutes("1:30"), Some(2)); // 1m30s → 2m
+        assert_eq!(parse_time_minutes("0:30"), Some(1)); // 30s → 1m
+        assert_eq!(parse_time_minutes("2-12"), Some(2 * 1440 + 12 * 60));
+        assert_eq!(parse_time_minutes("2-12:30"), Some(2 * 1440 + 12 * 60 + 30));
     }
 
     #[test]
@@ -2976,8 +3016,8 @@ memory_mb = 1024000
         // Overflow on the `+ hms`, not the multiply: 2982616 days leaves only
         // 255 minutes of headroom and "05:00:00" is 300.
         assert_eq!(parse_time_minutes("2982616-05:00:00"), None);
-        // HH:MM arm.
-        assert_eq!(parse_time_minutes("71582789:00"), None);
+        // minutes:seconds arm — a minutes field past u32::MAX fails to parse.
+        assert_eq!(parse_time_minutes("4294967296:00"), None);
         // u64 seconds overflow.
         assert_eq!(parse_time_seconds("213503982334602-00:00:00"), None);
         // The largest non-overflowing value is still accepted unchanged.
