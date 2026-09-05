@@ -5,6 +5,7 @@ use crate::env_defaults::{apply_csv, apply_str, apply_string, env_first, was_cli
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use spur_core::resource::parse_memory_mb;
 use spur_proto::proto::{JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
 
@@ -634,23 +635,6 @@ fn parse_datetime_arg(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         s,
         &chrono::Local::now(),
     )?)
-}
-
-/// Parse memory string (e.g., "4G", "4096M", "4096") into MB.
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else if let Some(kb) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
-        let val: u64 = kb.parse().context("invalid memory value")?;
-        Ok(val / 1024)
-    } else {
-        // Default: MB
-        Ok(s.parse().context("invalid memory value")?)
-    }
 }
 
 /// Parse a GPU flag value ("4" or "mi300x:4") into a proto GpuRequest.

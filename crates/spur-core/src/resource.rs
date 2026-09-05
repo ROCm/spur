@@ -298,6 +298,30 @@ impl ResourceSet {
 /// The input is trimmed and empty strings are rejected, so callers that split a
 /// comma-list (CLI `--gres`, `SLURM_GRES`, REST, FFI) can pass raw segments
 /// without worrying about incidental whitespace or trailing commas.
+/// Parse a Slurm-style `--mem` size into MiB. Optional K/M/G/T suffix
+/// (case-insensitive), no suffix means MiB. Shared by sbatch/srun/salloc.
+pub fn parse_memory_mb(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("invalid memory value ''");
+    }
+    let (num, mult): (&str, f64) = match s.as_bytes()[s.len() - 1] {
+        b'K' | b'k' => (&s[..s.len() - 1], 1.0 / 1024.0),
+        b'M' | b'm' => (&s[..s.len() - 1], 1.0),
+        b'G' | b'g' => (&s[..s.len() - 1], 1024.0),
+        b'T' | b't' => (&s[..s.len() - 1], 1024.0 * 1024.0),
+        _ => (s, 1.0),
+    };
+    let val: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid memory value '{s}'"))?;
+    if !val.is_finite() || val < 0.0 {
+        anyhow::bail!("invalid memory value '{s}'");
+    }
+    Ok((val * mult) as u64)
+}
+
 pub fn parse_gres(gres: &str) -> Option<(String, Option<String>, u32)> {
     let gres = gres.trim();
     if gres.is_empty() {
@@ -807,5 +831,45 @@ mod accounting_tests {
         assert_eq!(inv.total_gpus(), 3);
         assert_eq!(inv.gpu_counts().get("mi300x"), Some(&2));
         assert_eq!(ResourceSet::default().total_gpus(), 0);
+    }
+}
+
+#[cfg(test)]
+mod parse_memory_tests {
+    use super::parse_memory_mb;
+
+    #[test]
+    fn default_unit_is_mib() {
+        assert_eq!(parse_memory_mb("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn all_suffixes_supported_case_insensitive() {
+        assert_eq!(parse_memory_mb("1024K").unwrap(), 1);
+        assert_eq!(parse_memory_mb("1024k").unwrap(), 1);
+        assert_eq!(parse_memory_mb("4096M").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("4096m").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("4G").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("4g").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("1T").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_mb("1t").unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn fractional_gigabytes() {
+        assert_eq!(parse_memory_mb("1.5G").unwrap(), 1536);
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(parse_memory_mb("  2G  ").unwrap(), 2048);
+    }
+
+    #[test]
+    fn rejects_garbage_and_empty() {
+        assert!(parse_memory_mb("").is_err());
+        assert!(parse_memory_mb("abc").is_err());
+        assert!(parse_memory_mb("G").is_err());
+        assert!(parse_memory_mb("-5G").is_err());
     }
 }

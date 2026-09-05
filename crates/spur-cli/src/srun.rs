@@ -7,6 +7,7 @@ use crate::env_defaults::{
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
+use spur_core::resource::parse_memory_mb;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
@@ -1385,18 +1386,6 @@ async fn run_as_step(
         true,
     )
     .await;
-}
-
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else {
-        Ok(s.parse().context("invalid memory value")?)
-    }
 }
 
 fn load_hooks_config() -> HooksConfig {
