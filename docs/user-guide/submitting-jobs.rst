@@ -339,6 +339,69 @@ those runtimes expect — ``LOCAL_RANK``, ``LOCAL_WORLD_SIZE``, ``NODE_RANK``, t
 ``OMPI_COMM_WORLD_*`` ranks, and ``SPUR_PEER_NODES`` — so ``torchrun``, MPI, and
 PMI/PMIx launchers run without extra wiring.
 
+.. _submit-sbcast:
+
+Staging Files onto Allocated Nodes — ``sbcast``
+------------------------------------------------
+
+``sbcast`` copies a file from the submit host to every node allocated to a
+running job. The usual reason is to put a binary, dataset, or config on fast
+node-local storage (``/tmp``, ``/dev/shm``) at job start, so the ranks read it
+from local disk instead of all hitting a shared filesystem at once.
+
+.. code-block:: bash
+
+   sbcast ./model.bin /tmp/model.bin
+
+Run inside a job script, that stages the file on each allocated node before the
+work starts:
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH --nodes=4
+   #SBATCH --gres=gpu:mi300x:8
+
+   sbcast --force ./model.bin /tmp/model.bin
+   srun ./train --model /tmp/model.bin
+
+Options:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 12 66
+
+   * - Option
+     - Short
+     - Description
+   * - ``--force``
+     - ``-f``
+     - Overwrite the destination if it already exists. Without it, an existing
+       file is an error.
+   * - ``--jobid``
+     - ``-j``
+     - Job to broadcast to. Defaults to ``$SPUR_JOB_ID``, then ``$SLURM_JOB_ID``,
+       so it can be omitted inside an allocation.
+
+A relative ``DEST`` resolves against the job's working directory; an absolute
+path is used as given. The destination file takes the mode of the source file.
+
+The job must be running and owned by the caller. If some nodes fail — a
+read-only path, a full disk — the broadcast continues to the rest and reports
+the per-node failures rather than stopping at the first one.
+
+Writes land as the job's user, so the destination must be a path that user can
+write. Staging into a root-owned directory fails with a permission error even
+when the node agent runs as root.
+
+.. note::
+
+   ``--compress``/``-C`` and ``--preserve``/``-p`` are accepted for drop-in
+   compatibility but do nothing: nothing is compressed on the wire, and the mode
+   always comes from the source file. ``--exclude`` and ``--send-libs`` are not
+   supported yet. The file is sent in a single message, so its size is bounded
+   by the controller's maximum request size.
+
 See Also
 --------
 
