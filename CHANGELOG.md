@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.11.0](https://github.com/ROCm/spur/compare/v0.10.0...v0.11.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurd:** stop injecting torch rendezvous env vars, match Slurm ([#793](https://github.com/ROCm/spur/issues/793))
+
+### Features
+
+* **cgroup:** add [cgroup] config and derive limits from the node allocation ([#762](https://github.com/ROCm/spur/issues/762)) ([bda405f](https://github.com/ROCm/spur/commit/bda405f9c39da5529f3a48fe5866aa52fb14cd88))
+* **spur-cli:** add scontrol show assoc_mgr for limits against live usage ([#746](https://github.com/ROCm/spur/issues/746)) ([4c3719d](https://github.com/ROCm/spur/commit/4c3719d79f1968b7d34efd5df5c3407abaef73fe))
+* **spurd:** file-back and live-stream srun step output ([#819](https://github.com/ROCm/spur/issues/819)) ([ee98dc3](https://github.com/ROCm/spur/commit/ee98dc3810f6532f12f1b4caabb9520dd6c87fb2))
+
+
+### Bug Fixes
+
+* **spur-cli:** honor --export=ALL,VAR=val combined form and inline assignments ([#795](https://github.com/ROCm/spur/issues/795)) ([7093e3f](https://github.com/ROCm/spur/commit/7093e3fbdb54bb28b3f236bdb64f058897344c36))
+* **spurctld:** hold jobs whose QOS or association limits cannot be read ([#744](https://github.com/ROCm/spur/issues/744)) ([b58a7d8](https://github.com/ROCm/spur/commit/b58a7d83b7e9457ea5da0e103f6f0f433a5fa797))
+* **spurd:** stop injecting torch rendezvous env vars, match Slurm ([#793](https://github.com/ROCm/spur/issues/793)) ([fba350d](https://github.com/ROCm/spur/commit/fba350d75b03c5032067886f98e73a8c8c43f382))
+* **tests:** pull e2e postgres image from mirror.gcr.io ([#796](https://github.com/ROCm/spur/issues/796)) ([3d950d7](https://github.com/ROCm/spur/commit/3d950d798a3646d18ad7a9fea8f7008df3ef080b))
+
 ## [0.10.0](https://github.com/ROCm/spur/compare/v0.9.1...v0.10.0) (2026-09-01)
 
 
