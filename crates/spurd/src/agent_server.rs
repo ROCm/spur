@@ -2408,10 +2408,16 @@ impl SlurmAgent for AgentService {
         }
 
         let read_back = |path: String| async move {
-            tokio::fs::read(&path)
-                .await
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default()
+            match tokio::fs::read(&path).await {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) => {
+                    // Don't fail the step over a read-back error, but log it so a
+                    // missing response body can be correlated with a filesystem
+                    // fault rather than looking like the step produced no output.
+                    warn!(path = %path, error = %e, "failed to read back step output");
+                    String::new()
+                }
+            }
         };
 
         // Containerized step (spur#777): run the command inside the requested
@@ -2619,42 +2625,64 @@ impl SlurmAgent for AgentService {
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 }
                 if file_path.is_empty() {
+                    // Could not resolve the step's spool file (the step failed to
+                    // start, or the step_id is wrong). Signal an error rather than
+                    // a clean EOF, so the client falls back to the buffered RunStep
+                    // output instead of treating an empty stream as success.
                     let _ = tx
-                        .send(Ok(StreamJobOutputChunk {
-                            data: Vec::new(),
-                            eof: true,
-                        }))
+                        .send(Err(Status::not_found(format!(
+                            "no output stream for job {job_id} step {step_id}"
+                        ))))
                         .await;
                     return;
                 }
-                let mut offset = 0u64;
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                let mut file = match tokio::fs::File::open(&file_path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("open step output file: {e}"))))
+                            .await;
+                        return;
+                    }
+                };
+                // Tail incrementally: seek to the last offset and read only the
+                // newly appended bytes each poll, instead of re-reading the whole
+                // file (which is O(n^2) for high-volume steps).
+                let mut offset: u64 = 0;
                 loop {
-                    if let Ok(data) = tokio::fs::read(&file_path).await {
-                        if data.len() as u64 > offset {
-                            let new_data = data[offset as usize..].to_vec();
-                            offset = data.len() as u64;
-                            if tx
-                                .send(Ok(StreamJobOutputChunk {
-                                    data: new_data,
-                                    eof: false,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break; // client disconnected
+                    if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                        let mut buf = Vec::new();
+                        if let Ok(n) = file.read_to_end(&mut buf).await {
+                            if n > 0 {
+                                offset += n as u64;
+                                if tx
+                                    .send(Ok(StreamJobOutputChunk {
+                                        data: buf,
+                                        eof: false,
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    break; // client disconnected
+                                }
                             }
                         }
                     }
                     let still_running = active_steps.lock().await.contains_key(&step_key);
                     if !still_running {
-                        if let Ok(data) = tokio::fs::read(&file_path).await {
-                            if data.len() as u64 > offset {
-                                let _ = tx
-                                    .send(Ok(StreamJobOutputChunk {
-                                        data: data[offset as usize..].to_vec(),
-                                        eof: false,
-                                    }))
-                                    .await;
+                        // Final read to drain anything written after the last poll.
+                        if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                            let mut buf = Vec::new();
+                            if let Ok(n) = file.read_to_end(&mut buf).await {
+                                if n > 0 {
+                                    let _ = tx
+                                        .send(Ok(StreamJobOutputChunk {
+                                            data: buf,
+                                            eof: false,
+                                        }))
+                                        .await;
+                                }
                             }
                         }
                         let _ = tx
