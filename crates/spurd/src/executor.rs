@@ -1275,7 +1275,11 @@ pub(crate) struct StepOutputFiles {
 /// roots [`open_step_output_files`] (via [`create_job_spool_dir`]) chooses
 /// between. A reader that did not open the file cannot see which root the writer
 /// picked, so it checks both. Kept in sync with `open_step_output_files`' names.
-pub(crate) fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: bool) -> Vec<PathBuf> {
+pub(crate) fn step_output_path_candidates(
+    job_id: JobId,
+    step_id: u32,
+    stderr: bool,
+) -> Vec<PathBuf> {
     let name = format!("step{step_id}.{}", if stderr { "err" } else { "out" });
     [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]
         .into_iter()
@@ -1285,7 +1289,11 @@ pub(crate) fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: b
 
 /// The step's spool file if it already exists on disk, so a reader can tail a
 /// step that finished before it observed the step's active_steps entry.
-pub(crate) fn existing_step_output_path(job_id: JobId, step_id: u32, stderr: bool) -> Option<String> {
+pub(crate) fn existing_step_output_path(
+    job_id: JobId,
+    step_id: u32,
+    stderr: bool,
+) -> Option<String> {
     step_output_path_candidates(job_id, step_id, stderr)
         .into_iter()
         .find(|p| p.exists())
