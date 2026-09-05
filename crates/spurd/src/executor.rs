@@ -1100,9 +1100,30 @@ fn permitted_cores(requested: &[u32], parent_effective: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Create-or-join the job's cgroup for a transient step or interactive session
+/// and return its `cgroup.procs` path for [`join_cgroup_self`] in a pre-exec hook.
+/// Idempotent: the batch launch or an earlier step in the same allocation may
+/// have created it already, in which case the process joins the existing one.
+pub(crate) fn setup_step_cgroup(
+    job_id: JobId,
+    cgroup: &CgroupConfig,
+    cpus: u32,
+    memory_mb: u64,
+) -> Option<std::ffi::CString> {
+    let path = setup_cgroup(job_id, cgroup, cpus, memory_mb, &[]).ok()??;
+    std::ffi::CString::new(path.join("cgroup.procs").as_os_str().as_bytes()).ok()
+}
+
+/// Remove a job's cgroup directory once its allocation ends (best-effort). The
+/// directory removes only when empty, so this is a no-op while processes remain.
+pub(crate) fn remove_job_cgroup(job_id: JobId) {
+    let path = PathBuf::from(CGROUP_ROOT).join(format!("job_{}", job_id));
+    let _ = std::fs::remove_dir(&path);
+}
+
 /// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
 /// pre-exec so it's async-signal-safe (raw syscalls only); best-effort, warns to `log_fd`.
-fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
+pub(crate) fn join_cgroup_self(procs_path: &std::ffi::CStr, log_fd: RawFd) {
     let pid = unsafe { libc::getpid() };
 
     let mut buf = [0u8; 24];

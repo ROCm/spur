@@ -2269,8 +2269,16 @@ impl SlurmAgent for AgentService {
 
         let memlock = self.limits.memlock;
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
+        // Confine the step to the allocation's cgroup (create-or-join). Without
+        // this a step runs in spurd's own cgroup with no per-job limits. Join
+        // while still root, before the privilege drop.
+        let cgroup_procs =
+            crate::executor::setup_step_cgroup(job_id, &self.cgroup, cpus, memory_mb);
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(ref procs) = cgroup_procs {
+                    crate::executor::join_cgroup_self(procs, -1);
+                }
                 crate::executor::apply_memlock(memlock);
                 if let Some(ref pd) = priv_drop {
                     pd.apply()
@@ -2644,8 +2652,17 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
+        // Confine the interactive session to the allocation's cgroup (create-or-
+        // join) so it obeys the same per-job limits as a batch job.
+        let cgroup_procs = {
+            let jobs = self.running.lock().await;
+            jobs.get(&init.job_id).and_then(|t| {
+                crate::executor::setup_step_cgroup(init.job_id, &self.cgroup, t.cpus, t.memory_mb)
+            })
+        };
+
         let (master_fd, child, child_pid) =
-            Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
+            Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref(), cgroup_procs)?;
 
         info!(
             job_id = init.job_id,
@@ -2886,6 +2903,9 @@ impl AgentService {
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
             }
+            // Reclaim the allocation cgroup a step/interactive session may have
+            // created (best-effort; only removes once it is empty).
+            crate::executor::remove_job_cgroup(job_id);
         }
     }
 
@@ -3363,6 +3383,7 @@ impl AgentService {
         argv: &[String],
         job_id: u32,
         winsize: Option<&crate::pty::WindowSize>,
+        cgroup_procs: Option<std::ffi::CString>,
     ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
         use std::os::fd::AsRawFd;
         use std::process::Stdio;
@@ -3432,6 +3453,11 @@ impl AgentService {
         unsafe {
             cmd.pre_exec(move || {
                 raw.wire()?;
+                // Confine the interactive session to the allocation's cgroup,
+                // while still root, before the privilege drop.
+                if let Some(ref procs) = cgroup_procs {
+                    crate::executor::join_cgroup_self(procs, -1);
+                }
                 if let Some(ref pd) = priv_drop_for_child {
                     pd.apply()
                         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
@@ -3715,7 +3741,7 @@ mod tests {
             work_dir: "/tmp".into(),
         };
         let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None)
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, None)
                 .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
         assert!(pid > 0);
         let status = child.wait().await.expect("child should be reapable");
