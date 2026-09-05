@@ -1038,8 +1038,9 @@ Manage tokens with ``spur token``, which talks to the controller on port 6817:
 token's ID, creation time, expiry, and status (``active`` or ``revoked``).
 
 ``--ttl`` accepts a duration suffixed with ``d`` (days), ``h`` (hours), ``m``
-(minutes), or ``s`` (seconds), or a bare integer number of seconds. Omitting
-``--ttl`` creates a token that never expires.
+(minutes), or ``s`` (seconds), or a bare integer number of seconds. The duration
+must be positive: ``--ttl 0`` (or ``0d``, ``0h``, ``0s``) is rejected rather than
+read as "no expiry". Omitting ``--ttl`` creates a token that never expires.
 
 See Also
 --------
