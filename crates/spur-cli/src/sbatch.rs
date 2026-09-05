@@ -5,6 +5,7 @@ use crate::env_defaults::{apply_csv, apply_str, apply_string, env_first, was_cli
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use spur_core::resource::parse_memory_mb;
 use spur_proto::proto::{JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
 
@@ -635,9 +636,6 @@ fn parse_datetime_arg(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         &chrono::Local::now(),
     )?)
 }
-
-/// Parse memory string (e.g., "4G", "4096M", "4096") into MB.
-use spur_core::resource::parse_memory_mb;
 
 /// Parse a GPU flag value ("4" or "mi300x:4") into a proto GpuRequest.
 pub(crate) fn parse_gpu_flag(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest>> {

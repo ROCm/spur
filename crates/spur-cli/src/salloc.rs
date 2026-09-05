@@ -4,6 +4,7 @@
 use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use spur_core::resource::parse_memory_mb;
 use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
@@ -394,8 +395,6 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
         &mut args.exclusive,
     );
 }
-
-use spur_core::resource::parse_memory_mb;
 
 #[cfg(test)]
 mod tests {

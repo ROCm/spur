@@ -7,6 +7,7 @@ use crate::env_defaults::{
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
+use spur_core::resource::parse_memory_mb;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
@@ -1347,8 +1348,6 @@ async fn run_as_step(
     )
     .await;
 }
-
-use spur_core::resource::parse_memory_mb;
 
 fn load_hooks_config() -> HooksConfig {
     crate::spur_config::load_spur_config().hooks
