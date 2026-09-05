@@ -421,6 +421,79 @@ pub fn count(pattern: &str) -> Result<usize, HostlistError> {
     Ok(expand(pattern)?.len())
 }
 
+/// Validate a hostlist pattern without materializing it.
+///
+/// Applies exactly the same grammar and error conditions as [`expand`] —
+/// unmatched or misordered brackets, reversed ranges, and the
+/// `MAX_HOSTLIST_SIZE` cap — but counts hosts instead of building the
+/// `Vec<String>`. The submit path validates attacker-influenced `--nodelist`
+/// and `--exclude` here, so counting avoids the throwaway multi-megabyte
+/// allocation a full `expand` would make only to drop it.
+pub fn validate(pattern: &str) -> Result<(), HostlistError> {
+    let mut count: u64 = 0;
+    for part in split_top_level(pattern) {
+        count_single(part.trim(), &mut count)?;
+    }
+    Ok(())
+}
+
+/// Counting twin of [`expand_single`]: accumulates the host count into `count`,
+/// enforcing the cap with the same pre-loop and incremental guards rather than
+/// pushing names. Kept structurally parallel to `expand_single` so the two
+/// cannot drift in what they accept.
+fn count_single(pattern: &str, count: &mut u64) -> Result<(), HostlistError> {
+    if let Some(bracket_start) = pattern.find('[') {
+        let bracket_end = pattern
+            .find(']')
+            .ok_or_else(|| HostlistError::InvalidPattern("unmatched [".into()))?;
+
+        // ']' before '[' would make the slice below reversed (start > end) and panic.
+        if bracket_end < bracket_start {
+            return Err(HostlistError::InvalidPattern(format!(
+                "']' before '[': {pattern}"
+            )));
+        }
+
+        let prefix = &pattern[..bracket_start];
+        let range_str = &pattern[bracket_start + 1..bracket_end];
+        let suffix = &pattern[bracket_end + 1..];
+
+        for range_part in range_str.split(',') {
+            if let Some((start, end, width)) = parse_range_bounds(range_part)? {
+                let range_count = (end - start).saturating_add(1);
+                if count.saturating_add(range_count) > MAX_HOSTLIST_SIZE as u64 {
+                    return Err(HostlistError::TooLarge {
+                        max: MAX_HOSTLIST_SIZE,
+                    });
+                }
+
+                for i in start..=end {
+                    // Backstop nested products that multiply past the cap.
+                    if *count >= MAX_HOSTLIST_SIZE as u64 {
+                        return Err(HostlistError::TooLarge {
+                            max: MAX_HOSTLIST_SIZE,
+                        });
+                    }
+                    if suffix.contains('[') {
+                        let name = format!("{}{:0>width$}{}", prefix, i, suffix, width = width);
+                        count_single(&name, count)?;
+                    } else {
+                        *count += 1;
+                    }
+                }
+            } else if suffix.contains('[') {
+                let name = format!("{}{}{}", prefix, range_part, suffix);
+                count_single(&name, count)?;
+            } else {
+                *count += 1;
+            }
+        }
+    } else {
+        *count += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,5 +897,57 @@ mod tests {
     #[test]
     fn count_rejects_oversized_range() {
         assert!(count("node[0-18446744073709551615]").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_the_same_patterns_expand_does() {
+        for pattern in [
+            "node[001-003,005,010-012]",
+            "rack[1-2]-node[1-2]",
+            "gpu[01-04],cpu[01-02]",
+            "node9,node010,node011",
+            "login01",
+            "node[0-999999]", // exactly the cap
+        ] {
+            assert!(
+                validate(pattern).is_ok(),
+                "validate rejected a pattern expand accepts: {pattern}"
+            );
+            assert!(expand(pattern).is_ok(), "expand sanity check: {pattern}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_the_same_patterns_expand_does() {
+        // Malformed brackets, reversed range, and every over-cap shape, each
+        // returning the same error class as expand without allocating the list.
+        assert!(matches!(
+            validate("node[1-2"),
+            Err(HostlistError::InvalidPattern(_))
+        ));
+        assert!(matches!(
+            validate("a]b[1-2]"),
+            Err(HostlistError::InvalidPattern(_))
+        ));
+        assert!(matches!(
+            validate("node[5-3]"),
+            Err(HostlistError::InvalidRange(_))
+        ));
+        assert!(matches!(
+            validate("node[0-18446744073709551615]"),
+            Err(HostlistError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            validate("node[0-1000000]"),
+            Err(HostlistError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            validate("rack[0-9999]-node[0-9999]"),
+            Err(HostlistError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            validate("rack[0-999999]-node[1,2]"),
+            Err(HostlistError::TooLarge { .. })
+        ));
     }
 }

@@ -3500,10 +3500,18 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
 
-    // Reject an unexpandable --nodelist/--exclude here, else it matches no node and hangs the job.
+    // Reject an unexpandable --nodelist/--exclude at the submit boundary. An
+    // invalid pattern otherwise falls back to a literal name that matches no
+    // node: a bad --nodelist then never schedules (the job hangs with no
+    // reason), and a bad --exclude silently excludes nothing, so a job the user
+    // meant to keep off specific nodes can land on exactly those nodes. Both are
+    // failures the submitter cannot see, so both are rejected here as Slurm does.
+    //
+    // `validate` only counts hosts; it does not build the (possibly ~1M-element)
+    // Vec that `expand` would, since the scheduler re-expands the pattern later.
     for (flag, pattern) in [("nodelist", &spec.nodelist), ("exclude", &spec.exclude)] {
         if !pattern.is_empty() {
-            spur_core::hostlist::expand(pattern).map_err(|e| {
+            spur_core::hostlist::validate(pattern).map_err(|e| {
                 Status::invalid_argument(format!("invalid --{flag} '{pattern}': {e}"))
             })?;
         }
