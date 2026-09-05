@@ -10,7 +10,7 @@ use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
-    JobSpec, JobState, RunStepRequest, StreamJobOutputChunk, StreamJobOutputRequest,
+    ContainerSpec, JobSpec, JobState, RunStepRequest, StreamJobOutputChunk, StreamJobOutputRequest,
     SubmitJobRequest,
 };
 use std::collections::HashMap;
@@ -736,6 +736,29 @@ struct StepDispatchParams<'a> {
     user: &'a str,
 }
 
+/// Build the step's container spec from the srun args, or None when no image was
+/// requested (the step runs on the host, the pre-#777 behavior). Mirrors the
+/// container options srun exposes; the CLI does not surface name/readonly/
+/// entrypoint, so those stay unset.
+fn container_spec_from_args(args: &SrunArgs) -> Option<ContainerSpec> {
+    let image = args.container_image.clone().filter(|s| !s.is_empty())?;
+    Some(ContainerSpec {
+        image,
+        mounts: args.container_mounts.clone(),
+        workdir: args.container_workdir.clone().unwrap_or_default(),
+        name: String::new(),
+        readonly: false,
+        mount_home: args.container_mount_home,
+        env: args
+            .container_env
+            .iter()
+            .filter_map(|s| s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect(),
+        entrypoint: String::new(),
+        remap_root: args.container_remap_root,
+    })
+}
+
 async fn dispatch_step(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -803,6 +826,7 @@ async fn dispatch_step(
             label: args.label,
             mpi: step_mpi.to_string(),
             user: params.user.to_string(),
+            container: container_spec_from_args(args),
         })
         .await
         .context("RunStep dispatch failed")?

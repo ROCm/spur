@@ -1,0 +1,121 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""E2E tests for `srun --container-image` on bare-metal job steps (spur#777).
+
+Inside an allocation, `srun --container-image=IMG cmd` must run cmd *inside* the
+image, not on the host. The test image is a minimal rootfs (no /var, /opt, ...),
+so the presence of a host-only directory cleanly distinguishes the host from the
+container filesystem.
+"""
+
+import threading
+import time
+
+import pytest
+
+from conftest import _deploy_cluster
+
+
+@pytest.fixture
+def container_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, tmp_path):
+    """A rootful single-node cluster with the minimal test image built and
+    shipped. Containerized steps enter mount/PID/user namespaces and pivot_root,
+    which need a root agent; an unprivileged agent cannot set them up."""
+    c = _deploy_cluster(
+        ssh_nodes,
+        remote_bin_dir,
+        agent_as_root=True,
+        config_overrides=cluster_config_overrides,
+    )
+    try:
+        c.container_preflight()
+        agent_user = c.spurd_agent_user(0)
+        assert agent_user == "root", f"containerized steps need a root agent, got {agent_user!r}"
+        c.container_image = c.build_container_image(tmp_path)
+        yield c
+    finally:
+        c.teardown()
+
+
+class TestSrunContainerStep:
+    def test_step_runs_inside_the_image(self, container_cluster):
+        cluster = container_cluster
+        img = cluster.container_image
+        # /var exists on the host but not in the minimal test image.
+        code, out = cluster.salloc_run(
+            f"srun --container-image={img} "
+            f'sh -c "if [ -d /var ]; then echo HOST-FS; else echo CONTAINER-FS; fi"\n'
+        )
+        assert code == 0, out
+        assert "CONTAINER-FS" in out, out
+        assert "HOST-FS" not in out, out
+
+    def test_step_exit_code_from_container(self, container_cluster):
+        cluster = container_cluster
+        img = cluster.container_image
+        code, out = cluster.salloc_run(
+            f'srun --container-image={img} sh -c "exit 13" || echo "ctn-exit=$?"\n'
+        )
+        assert code == 0, out
+        assert "ctn-exit=13" in out, out
+
+    def test_step_container_bind_mount(self, container_cluster):
+        cluster = container_cluster
+        img = cluster.container_image
+        # A host file bind-mounted into the container must be readable inside.
+        marker = cluster.write_file("mount-marker.txt", "MOUNT-MARKER-XYZ\n")
+        src_dir = marker.rsplit("/", 1)[0]
+        code, out = cluster.salloc_run(
+            f"srun --container-image={img} "
+            f"--container-mounts={src_dir}:/mnt:ro "
+            f"cat /mnt/mount-marker.txt\n"
+        )
+        assert code == 0, out
+        assert "MOUNT-MARKER-XYZ" in out, out
+
+    def test_scancel_kills_a_running_container_step(self, container_cluster):
+        cluster = container_cluster
+        img = cluster.container_image
+        job_name = "ctn-cancel"
+
+        def run():
+            cluster.salloc_run(
+                f"srun --container-image={img} sleep 120\n",
+                salloc_args=["-N", "1", "-J", job_name, "-t", "0:05"],
+            )
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        try:
+            deadline = time.time() + 40
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id is not None, "container step allocation never reached running"
+            # Let the container's `sleep` actually start before cancelling. Match
+            # the process by exact name (pgrep -x) so the `srun ... sleep 120`
+            # client command line does not count as the workload.
+            time.sleep(5)
+            assert cluster.nodes[0].exec_allow_fail("pgrep -x sleep || true").strip()
+
+            cluster.scancel(str(job_id))
+
+            # scancel must terminate the running step: salloc returns and the
+            # container's `sleep` is gone (after the SIGTERM → SIGKILL escalation).
+            t.join(timeout=40)
+            assert not t.is_alive(), "salloc did not return after scancel — step not cancelled"
+            deadline = time.time() + 20
+            leftover = "x"
+            while time.time() < deadline:
+                leftover = cluster.nodes[0].exec_allow_fail("pgrep -x sleep || true").strip()
+                if not leftover:
+                    break
+                time.sleep(1)
+            assert not leftover, f"cancelled step left a sleep process:\n{leftover}"
+        finally:
+            t.join(timeout=5)

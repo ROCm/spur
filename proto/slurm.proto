@@ -995,6 +995,21 @@ message ExecInJobResponse {
 // Controller-side request: run a step inside an allocation. The controller
 // fans out tasks across the allocation's nodes via each agent's RunCommand
 // RPC. Used by srun inside sbatch/salloc and standalone srun.
+// Container options for a job step run on a bare-metal node (spur#777). Absent =
+// run the step on the host (the pre-#777 behavior). The field set mirrors the
+// container options `srun` exposes and JobSpec carries for batch jobs.
+message ContainerSpec {
+  string image = 1;                 // OCI image ref or squashfs path; empty = no container
+  repeated string mounts = 2;       // "/src:/dst:ro" bind mounts
+  string workdir = 3;               // Workdir inside the container
+  string name = 4;                  // Named container (persists across jobs)
+  bool readonly = 5;                // Read-only rootfs
+  bool mount_home = 6;              // Bind-mount the user's home directory
+  map<string, string> env = 7;      // Extra env vars inside the container
+  string entrypoint = 8;            // Override entrypoint
+  bool remap_root = 9;              // Remap the user to root inside the container
+}
+
 message RunStepRequest {
   uint32 job_id = 1;
   repeated string command = 2;
@@ -1006,6 +1021,7 @@ message RunStepRequest {
   bool label = 8;      // Prefix output lines with [rank] (srun -l)
   string mpi = 9;      // Step MPI type; when empty, inherit job.spec.mpi
   string user = 10;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
+  ContainerSpec container = 11;  // Run the step inside this container; absent = on the host (spur#777)
 }
 
 message RunStepResponse {
@@ -1229,6 +1245,7 @@ message RunCommandRequest {
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
   // When true, PMIx was prepared via PreparePmix on the controller before RunCommand.
   bool pmix_prepared = 14;
+  ContainerSpec container = 15;  // Run the step inside this container; absent = on the host (spur#777)
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.

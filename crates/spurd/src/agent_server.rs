@@ -230,6 +230,14 @@ fn cancelled_step_response() -> RunCommandResponse {
 fn signal_step_process_group(pid: u32, signal: i32) {
     let sig =
         nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+    // Walk the process tree FIRST (leaf-first), then signal the group. A
+    // containerized step's workload runs as a grandchild inside a PID namespace,
+    // so it is in a different host process group that killpg misses; the tree
+    // walk reaches it the way batch container jobs are killed. Order matters:
+    // signalling the group first would kill the intermediate parent, emptying
+    // /proc/<pid>/children before the walk can find the grandchild. Harmless for a
+    // host step (the tree is just the step process).
+    crate::executor::kill_process_tree(pid as i32, sig);
     let leader = nix::unistd::Pid::from_raw(pid as i32);
     if let Err(e) = nix::sys::signal::killpg(leader, sig) {
         if let Err(kill_err) = nix::sys::signal::kill(leader, Some(sig)) {
@@ -847,6 +855,82 @@ async fn reap_killed_job(mut job: executor::RunningJob) {
 }
 
 /// Build a bash script that execs a command vector without shell interpretation.
+/// Set up a per-step container rootfs and run the step inside it, returning the
+/// exit code. Builds the `ContainerConfig` from the wire spec (spur#777),
+/// reusing the same primitives as the batch container path. The rootfs is named
+/// per step so concurrent `srun --overlap` steps in one allocation don't share a
+/// tree; it is removed when the step finishes.
+#[allow(clippy::too_many_arguments)]
+async fn run_containerized_step(
+    spec: &ContainerSpec,
+    job_id: u32,
+    step_id: u32,
+    command: &[String],
+    user: &str,
+    uid: u32,
+    gid: u32,
+    gpu_devices: &[u32],
+    device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+    env: HashMap<String, String>,
+    memlock: spur_core::config::MemlockLimit,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    pid_tx: tokio::sync::oneshot::Sender<i32>,
+) -> anyhow::Result<i32> {
+    let mounts: Vec<crate::container::BindMount> = spec
+        .mounts
+        .iter()
+        .filter_map(|m| crate::container::parse_mount(m).ok())
+        .collect();
+    let username = if user.is_empty() {
+        "spur".to_string()
+    } else {
+        user.to_string()
+    };
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{username}"));
+
+    let config = crate::container::ContainerConfig {
+        image: spec.image.clone(),
+        mounts,
+        workdir: (!spec.workdir.is_empty()).then(|| spec.workdir.clone()),
+        name: None, // per-step rootfs below; srun does not expose named containers
+        readonly: spec.readonly,
+        mount_home: spec.mount_home,
+        remap_root: spec.remap_root,
+        gpu_devices: gpu_devices.to_vec(),
+        environment: env.clone(),
+        container_env: spec.env.clone(),
+        entrypoint: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
+        uid,
+        gid,
+        username,
+        home_dir,
+        device_plan, // GPU device-node injection into the container (spur#777)
+    };
+
+    let image_path = crate::container::resolve_image(&spec.image, Some(user), Some(uid))
+        .map_err(|e| anyhow::anyhow!("resolve image {}: {e}", spec.image))?;
+
+    // Per-step rootfs so concurrent steps in one allocation don't collide.
+    let rootfs_name = format!("job{job_id}_step{step_id}");
+    let (rootfs, rootfs_mode) =
+        crate::container::setup_rootfs(&image_path, job_id, Some(&rootfs_name))?;
+
+    crate::executor::run_container_step(
+        job_id,
+        &config,
+        &rootfs,
+        rootfs_mode,
+        command,
+        &env,
+        memlock,
+        stdout,
+        stderr,
+        pid_tx,
+    )
+    .await
+}
+
 fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
     let joined = shlex::try_join(command.iter().map(String::as_str))
         .map_err(|e| Status::invalid_argument(format!("command is not shell-safe: {e}")))?;
@@ -1750,6 +1834,52 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id).await;
         }
 
+        // The signal paths above act on the tracked batch process only. An srun
+        // allocation's running steps live in active_steps (a transient
+        // run_command child, host or containerized), so cancel them too — set
+        // cancel_requested to catch a step that has not spawned yet, and signal
+        // the process group of one already running. Without this, `scancel` of an
+        // allocation leaves its running step alive.
+        let step_signal = if req.signal > 0 {
+            req.signal
+        } else {
+            nix::sys::signal::Signal::SIGTERM as i32
+        };
+        let step_pids: Vec<u32> = {
+            let mut steps = self.active_steps.lock().await;
+            steps
+                .iter_mut()
+                .filter(|(&(jid, _), _)| jid == job_id)
+                .filter_map(|(_, step)| {
+                    step.cancel_requested = true;
+                    step.pid
+                })
+                .collect()
+        };
+        info!(
+            job_id,
+            signal = step_signal,
+            step_pids = ?step_pids,
+            "cancel_job: signalling running steps"
+        );
+        for pid in &step_pids {
+            signal_step_process_group(*pid, step_signal);
+        }
+        // A containerized step's workload is PID 1 of its own PID namespace and
+        // ignores SIGTERM unless it installed a handler, so a graceful cancel
+        // leaves it running. Escalate to SIGKILL after a grace period (matching
+        // the job's SIGTERM → 5s → SIGKILL), which PID 1 cannot ignore from the
+        // parent namespace. Skipped when the caller already asked for SIGKILL.
+        let sigkill = nix::sys::signal::Signal::SIGKILL as i32;
+        if step_signal != sigkill && !step_pids.is_empty() {
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                for pid in step_pids {
+                    signal_step_process_group(pid, sigkill);
+                }
+            });
+        }
+
         // The signal paths only act on a running job; release a still-launching
         // reservation so a cancel-during-eviction doesn't strand it until the
         // TTL. Hold the running lock across the release (matching launch_job's
@@ -2035,7 +2165,7 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_user) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -2054,6 +2184,7 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
+                tracked.user.clone(),
             )
         };
 
@@ -2259,6 +2390,88 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
+        // Redirect the step's stdout/stderr to per-step spool files rather than
+        // piping the whole output into memory: the child inherits the write fds,
+        // stream_job_output tails the files live, and output stays bounded on this
+        // node. Paths are recorded in active_steps so the tail can find them. Both
+        // the host and container paths below use these files.
+        let step_files =
+            crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
+        let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
+        {
+            let mut steps = self.active_steps.lock().await;
+            if let Some(step) = steps.get_mut(&step_key) {
+                step.stdout_path = stdout_path.clone();
+                step.stderr_path = stderr_path.clone();
+            }
+        }
+
+        let read_back = |path: String| async move {
+            tokio::fs::read(&path)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+
+        // Containerized step (spur#777): run the command inside the requested
+        // image via the shared container primitives, output to the spool files.
+        if let Some(spec) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
+            // Inject the step's allocated GPUs into the container (device nodes +
+            // env), the same plan the batch container path uses.
+            let device_plan = if gpu_devices.is_empty() {
+                None
+            } else {
+                Some(
+                    self.device_registry
+                        .lock()
+                        .await
+                        .build_job_injection_plans("gpu", &gpu_devices, req.uid, req.gid)
+                        .map_err(|e| {
+                            Status::failed_precondition(format!("GPU injection plan failed: {e}"))
+                        })?
+                        .1,
+                )
+            };
+            // Record the container step's pid (its process-group leader) in
+            // active_steps as soon as it forks, so cancel_step can signal it.
+            let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+            let steps_for_pid = self.active_steps.clone();
+            let pid_recorder = tokio::spawn(async move {
+                if let Ok(pid) = pid_rx.await {
+                    let mut steps = steps_for_pid.lock().await;
+                    if let Some(step) = steps.get_mut(&step_key) {
+                        step.pid = Some(pid as u32);
+                    }
+                }
+            });
+            let exit_code = run_containerized_step(
+                spec,
+                job_id,
+                step_id,
+                &req.command,
+                &job_user,
+                req.uid,
+                req.gid,
+                &gpu_devices,
+                device_plan,
+                env,
+                self.limits.memlock,
+                step_files.stdout,
+                step_files.stderr,
+                pid_tx,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("containerized step failed: {e:#}")))?;
+            pid_recorder.abort();
+            return Ok(Response::new(RunCommandResponse {
+                exit_code,
+                stdout: read_back(stdout_path).await,
+                stderr: read_back(stderr_path).await,
+            }));
+        }
+
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&program_args)
             .current_dir(&work_dir)
@@ -2290,23 +2503,6 @@ impl SlurmAgent for AgentService {
         );
 
         use std::process::Stdio;
-
-        // Redirect the step's stdout/stderr to per-step spool files rather than
-        // piping the whole output into memory: the child inherits the write fds,
-        // stream_job_output tails the files live, and output stays bounded on this
-        // node. Paths are recorded in active_steps so the tail can find them.
-        let step_files =
-            crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
-                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
-        let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
-        let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
-        {
-            let mut steps = self.active_steps.lock().await;
-            if let Some(step) = steps.get_mut(&step_key) {
-                step.stdout_path = stdout_path.clone();
-                step.stderr_path = stderr_path.clone();
-            }
-        }
 
         let mut child = cmd
             .stdout(Stdio::from(step_files.stdout))
@@ -2355,14 +2551,8 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back. #781 replaces this with a client-side
-        // StreamJobOutput tail and drops the read-back, removing the memory bound.
-        let read_back = |path: String| async move {
-            tokio::fs::read(&path)
-                .await
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default()
-        };
+        // reading the spool files back (see `read_back` above). #781 replaces this
+        // with a client-side StreamJobOutput tail and drops the read-back.
         Ok(Response::new(RunCommandResponse {
             exit_code: spur_core::process::shell_exit_code(&status),
             stdout: read_back(stdout_path).await,
