@@ -10,7 +10,8 @@ use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
-    JobSpec, JobState, RunStepRequest, StreamJobOutputRequest, SubmitJobRequest,
+    JobSpec, JobState, RunStepRequest, StreamJobOutputChunk, StreamJobOutputRequest,
+    SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -774,6 +775,22 @@ async fn dispatch_step(
     {
         anyhow::bail!("{err}");
     }
+    // Live-stream the step's output when it lands on a single node and the user
+    // has not redirected to a file. The tail runs concurrently with the blocking
+    // RunStep and ends when the step leaves the agent's active_steps (#781).
+    let live_node = if io.stdout.is_empty() && io.stderr.is_empty() {
+        single_step_node(client, job_id).await
+    } else {
+        None
+    };
+    let mut stream_handle = live_node.map(|node| {
+        let mut ctrl = client.clone();
+        let user = params.user.to_string();
+        tokio::spawn(async move {
+            stream_step_output_live(&mut ctrl, &node, job_id, step_id, &user).await
+        })
+    });
+
     let resp = client
         .run_step(RunStepRequest {
             job_id,
@@ -795,7 +812,24 @@ async fn dispatch_step(
         eprintln!("srun: dispatched to node {}", resp.node);
     }
 
-    emit_step_output(io, job_id, work_dir, &resp.stdout, &resp.stderr).await;
+    // The step has left active_steps, so a live tail eofs promptly; bound the
+    // join so a tail that never resolved (step failed to start) can't hang, and
+    // fall back to the buffered output whenever streaming didn't cover it.
+    let streamed = if let Some(handle) = stream_handle.as_mut() {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut *handle).await {
+            Ok(joined) => joined.unwrap_or(false),
+            Err(_) => {
+                handle.abort();
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !streamed {
+        emit_step_output(io, job_id, work_dir, &resp.stdout, &resp.stderr).await;
+    }
 
     Ok(StepDispatchResult {
         exit_code: resp.exit_code,
@@ -1060,6 +1094,7 @@ async fn try_stream_output(
             job_id,
             stream: "stdout".into(),
             user: user.to_string(),
+            ..Default::default()
         })
         .await
     {
@@ -1081,6 +1116,101 @@ async fn try_stream_output(
             Ok(None) => return true,
             Err(_) => return false,
         }
+    }
+}
+
+/// Write a step output stream's chunks to this process's stdout/stderr as they
+/// arrive, returning true on a clean eof. The lock is held only across each
+/// synchronous write, never an await.
+async fn drain_step_stream(
+    mut stream: tonic::Streaming<StreamJobOutputChunk>,
+    to_stderr: bool,
+) -> bool {
+    loop {
+        match stream.message().await {
+            Ok(Some(chunk)) => {
+                if chunk.eof {
+                    return true;
+                }
+                if to_stderr {
+                    let mut h = std::io::stderr().lock();
+                    let _ = h.write_all(&chunk.data);
+                    let _ = h.flush();
+                } else {
+                    let mut h = std::io::stdout().lock();
+                    let _ = h.write_all(&chunk.data);
+                    let _ = h.flush();
+                }
+            }
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Tail a step's stdout and stderr live from the agent on `node`, writing chunks
+/// to this process's stdout/stderr as they arrive. Returns true only if it
+/// connected and both streams reached a clean eof, so the caller can suppress
+/// the buffered response; any failure returns false and the caller falls back to
+/// printing the buffered output. Runs concurrently with the blocking RunStep and
+/// ends when the step leaves the agent's active_steps.
+async fn stream_step_output_live(
+    controller: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    node: &str,
+    job_id: u32,
+    step_id: u32,
+    user: &str,
+) -> bool {
+    if controller
+        .get_node(GetNodeRequest {
+            name: node.to_string(),
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let agent_addr = format!("http://{node}:6818");
+    let req = |stream: &str| StreamJobOutputRequest {
+        job_id,
+        step_id,
+        stream: stream.to_string(),
+        user: user.to_string(),
+    };
+    let Ok(mut agent_out) = crate::interactive::connect_agent(&agent_addr).await else {
+        return false;
+    };
+    let Ok(mut agent_err) = crate::interactive::connect_agent(&agent_addr).await else {
+        return false;
+    };
+    let out = match agent_out.stream_job_output(req("stdout")).await {
+        Ok(r) => r.into_inner(),
+        Err(_) => return false,
+    };
+    let err = match agent_err.stream_job_output(req("stderr")).await {
+        Ok(r) => r.into_inner(),
+        Err(_) => return false,
+    };
+    let (out_ok, err_ok) =
+        tokio::join!(drain_step_stream(out, false), drain_step_stream(err, true));
+    out_ok && err_ok
+}
+
+/// The single node a step will run on, or None when live streaming should be
+/// skipped: a multi-node step (its output is aggregated in the response) or an
+/// allocation whose nodelist cannot be read.
+async fn single_step_node(
+    controller: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+) -> Option<String> {
+    let job = controller
+        .get_job(GetJobRequest { job_id })
+        .await
+        .ok()?
+        .into_inner();
+    match spur_core::hostlist::expand(&job.nodelist).ok()?.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 

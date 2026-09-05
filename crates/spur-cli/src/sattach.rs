@@ -104,6 +104,7 @@ async fn stream_output_only(
             job_id,
             stream: stream_name.to_string(),
             user: user.to_string(),
+            ..Default::default()
         })
         .await
         .context("failed to start output stream")?
