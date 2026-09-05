@@ -1344,21 +1344,15 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
 /// Flags a step run inside an allocation accepts on the command line but does
 /// not yet honor. The batch and standalone-srun paths apply these; the step
 /// path (`dispatch_step` → `RunStep`) silently drops them, so warn rather than
-/// let a `--container-image`/`--pty` request quietly become a plain host run.
-/// Convergence tracked in spur#777 (container) and spur#780 (pty).
+/// let a `--container-image` request quietly become a plain host run.
+/// Convergence tracked in spur#777 (container). `--pty` is now honored in step
+/// mode (spur#780) via `run_interactive_pty`, so it is no longer listed here.
 fn step_mode_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
     let mut warnings = Vec::new();
     if args.container_image.is_some() {
         warnings.push(
             "srun: warning: --container-image is not yet honored in step mode; \
              the command runs on the host, not inside the image (spur#777)"
-                .to_string(),
-        );
-    }
-    if args.pty {
-        warnings.push(
-            "srun: warning: --pty is not yet honored in step mode; \
-             the command runs non-interactively without a terminal (spur#780)"
                 .to_string(),
         );
     }
@@ -1386,6 +1380,18 @@ async fn run_as_step(
 
     let io = resolve_io_paths(args);
     let user = crate::interactive::job_caller_user(&mut client, job_id, None).await?;
+
+    // An interactive step (`srun --pty` inside an allocation) drives a PTY via
+    // InteractiveSession instead of the buffered RunStep path (spur#780), the
+    // same machinery `srun --jobid --overlap --pty` already uses. It runs its
+    // own step and owns the exit code, so return here rather than dispatching a
+    // second, non-interactive step.
+    if args.pty {
+        let node = first_node(args.nodelist.as_deref().unwrap_or_default());
+        let exit_code =
+            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user).await?;
+        std::process::exit(exit_code);
+    }
 
     let step_params = StepDispatchParams {
         args,
@@ -1467,17 +1473,15 @@ mod tests {
     }
 
     #[test]
-    fn step_mode_warns_on_pty() {
-        let args =
-            SrunArgs::try_parse_from(["srun", "--pty", "bash"]).expect("parse failed");
-        let warnings = step_mode_unsupported_warnings(&args);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("--pty"));
-        assert!(warnings[0].contains("spur#780"));
+    fn step_mode_no_longer_warns_on_pty() {
+        // --pty is now honored in step mode (routes to run_interactive_pty,
+        // spur#780), so it must not produce an unsupported-flag warning.
+        let args = SrunArgs::try_parse_from(["srun", "--pty", "bash"]).expect("parse failed");
+        assert!(step_mode_unsupported_warnings(&args).is_empty());
     }
 
     #[test]
-    fn step_mode_warns_on_both_flags_together() {
+    fn step_mode_warns_only_on_container_image_when_pty_also_set() {
         let args = SrunArgs::try_parse_from([
             "srun",
             "--container-image",
@@ -1486,7 +1490,9 @@ mod tests {
             "bash",
         ])
         .expect("parse failed");
-        assert_eq!(step_mode_unsupported_warnings(&args).len(), 2);
+        let warnings = step_mode_unsupported_warnings(&args);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--container-image"));
     }
 
     #[test]
