@@ -1212,7 +1212,7 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
 }
 
 /// Recursively signal a process and all its descendants (children first).
-fn kill_process_tree(pid: i32, sig: Signal) {
+pub(crate) fn kill_process_tree(pid: i32, sig: Signal) {
     let children = get_child_pids(pid);
     for child in &children {
         kill_process_tree(*child, sig);

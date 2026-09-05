@@ -230,6 +230,14 @@ fn cancelled_step_response() -> RunCommandResponse {
 fn signal_step_process_group(pid: u32, signal: i32) {
     let sig =
         nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+    // Walk the process tree FIRST (leaf-first), then signal the group. A
+    // containerized step's workload runs as a grandchild inside a PID namespace,
+    // so it is in a different host process group that killpg misses; the tree
+    // walk reaches it the way batch container jobs are killed. Order matters:
+    // signalling the group first would kill the intermediate parent, emptying
+    // /proc/<pid>/children before the walk can find the grandchild. Harmless for a
+    // host step (the tree is just the step process).
+    crate::executor::kill_process_tree(pid as i32, sig);
     let leader = nix::unistd::Pid::from_raw(pid as i32);
     if let Err(e) = nix::sys::signal::killpg(leader, sig) {
         if let Err(kill_err) = nix::sys::signal::kill(leader, Some(sig)) {
@@ -1824,6 +1832,52 @@ impl SlurmAgent for AgentService {
             self.send_explicit_signal(job_id, req.signal).await;
         } else {
             self.graceful_cancel(job_id).await;
+        }
+
+        // The signal paths above act on the tracked batch process only. An srun
+        // allocation's running steps live in active_steps (a transient
+        // run_command child, host or containerized), so cancel them too — set
+        // cancel_requested to catch a step that has not spawned yet, and signal
+        // the process group of one already running. Without this, `scancel` of an
+        // allocation leaves its running step alive.
+        let step_signal = if req.signal > 0 {
+            req.signal
+        } else {
+            nix::sys::signal::Signal::SIGTERM as i32
+        };
+        let step_pids: Vec<u32> = {
+            let mut steps = self.active_steps.lock().await;
+            steps
+                .iter_mut()
+                .filter(|(&(jid, _), _)| jid == job_id)
+                .filter_map(|(_, step)| {
+                    step.cancel_requested = true;
+                    step.pid
+                })
+                .collect()
+        };
+        info!(
+            job_id,
+            signal = step_signal,
+            step_pids = ?step_pids,
+            "cancel_job: signalling running steps"
+        );
+        for pid in &step_pids {
+            signal_step_process_group(*pid, step_signal);
+        }
+        // A containerized step's workload is PID 1 of its own PID namespace and
+        // ignores SIGTERM unless it installed a handler, so a graceful cancel
+        // leaves it running. Escalate to SIGKILL after a grace period (matching
+        // the job's SIGTERM → 5s → SIGKILL), which PID 1 cannot ignore from the
+        // parent namespace. Skipped when the caller already asked for SIGKILL.
+        let sigkill = nix::sys::signal::Signal::SIGKILL as i32;
+        if step_signal != sigkill && !step_pids.is_empty() {
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                for pid in step_pids {
+                    signal_step_process_group(pid, sigkill);
+                }
+            });
         }
 
         // The signal paths only act on a running job; release a still-launching

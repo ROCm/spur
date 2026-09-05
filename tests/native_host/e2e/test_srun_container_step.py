@@ -9,6 +9,9 @@ so the presence of a host-only directory cleanly distinguishes the host from the
 container filesystem.
 """
 
+import threading
+import time
+
 import pytest
 
 from conftest import _deploy_cluster
@@ -71,3 +74,48 @@ class TestSrunContainerStep:
         assert code == 0, out
         assert "MOUNT-MARKER-XYZ" in out, out
 
+    def test_scancel_kills_a_running_container_step(self, container_cluster):
+        cluster = container_cluster
+        img = cluster.container_image
+        job_name = "ctn-cancel"
+
+        def run():
+            cluster.salloc_run(
+                f"srun --container-image={img} sleep 120\n",
+                salloc_args=["-N", "1", "-J", job_name, "-t", "0:05"],
+            )
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        try:
+            deadline = time.time() + 40
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id is not None, "container step allocation never reached running"
+            # Let the container's `sleep` actually start before cancelling. Match
+            # the process by exact name (pgrep -x) so the `srun ... sleep 120`
+            # client command line does not count as the workload.
+            time.sleep(5)
+            assert cluster.nodes[0].exec_allow_fail("pgrep -x sleep || true").strip()
+
+            cluster.scancel(str(job_id))
+
+            # scancel must terminate the running step: salloc returns and the
+            # container's `sleep` is gone (after the SIGTERM → SIGKILL escalation).
+            t.join(timeout=40)
+            assert not t.is_alive(), "salloc did not return after scancel — step not cancelled"
+            deadline = time.time() + 20
+            leftover = "x"
+            while time.time() < deadline:
+                leftover = cluster.nodes[0].exec_allow_fail("pgrep -x sleep || true").strip()
+                if not leftover:
+                    break
+                time.sleep(1)
+            assert not leftover, f"cancelled step left a sleep process:\n{leftover}"
+        finally:
+            t.join(timeout=5)
