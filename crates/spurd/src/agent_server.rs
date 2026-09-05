@@ -2354,7 +2354,7 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back. #781 replaces this with a client-side
+        // reading the spool files back; a later change replaces this with a client-side
         // StreamJobOutput tail and drops the read-back, removing the memory bound.
         let read_back = |path: String| async move {
             match tokio::fs::read(&path).await {
@@ -2389,7 +2389,7 @@ impl SlurmAgent for AgentService {
         // Step output: tail the per-step spool file recorded by run_command and
         // finish when the step leaves active_steps (rather than the batch file,
         // which ends only when the whole allocation does). This is what lets an
-        // srun step stream live and terminate at step exit (#781).
+        // srun step stream live and terminate at step exit.
         if req.step_id != 0 {
             let active_steps = self.active_steps.clone();
             let want_stderr = req.stream == "stderr";
@@ -3814,6 +3814,15 @@ mod tests {
         assert_eq!(s, "#!/bin/bash\nset -- x\necho hi\n");
     }
 
+    // A unique job_id per test so each gets its own step spool dir
+    // (temp/spur/job<id>/step0.out) and parallel tests do not clobber one
+    // another's step output. Production step_ids are unique per job via
+    // create_job_step; only these fixed-id tests would otherwise collide.
+    fn next_test_job_id() -> u32 {
+        static NEXT_JOB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+        NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn run_command_test_setup() -> (AgentService, u32) {
         let svc = AgentService::new(
             test_reporter(),
@@ -3821,12 +3830,7 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        // A unique job_id per test so each gets its own step spool dir
-        // (temp/spur/job<id>/step0.out) and parallel tests do not clobber one
-        // another's step output. Production step_ids are unique per job via
-        // create_job_step; only these fixed-id tests would otherwise collide.
-        static NEXT_JOB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
-        let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let job_id = next_test_job_id();
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
         (svc, job_id)
     }
@@ -4124,7 +4128,7 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let job_id = 77;
+        let job_id = next_test_job_id();
         svc.insert_test_job(job_id, TrackedJob::dummy(std::process::id()))
             .await;
 
@@ -4583,7 +4587,7 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         // The step's stdout must live in a spool file the agent can tail, not
         // only in the RPC response — this file is what StreamJobOutput follows
-        // (#781). step_id defaults to 0 here, so the file is step0.out.
+        // step_id defaults to 0 here, so the file is step0.out.
         let contents = [
             std::path::PathBuf::from("/var/spool/spur"),
             std::env::temp_dir().join("spur"),
