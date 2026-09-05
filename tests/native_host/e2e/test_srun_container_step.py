@@ -56,3 +56,18 @@ class TestSrunContainerStep:
         )
         assert code == 0, out
         assert "ctn-exit=13" in out, out
+
+    def test_step_container_bind_mount(self, container_cluster):
+        cluster = container_cluster
+        img = cluster.container_image
+        # A host file bind-mounted into the container must be readable inside.
+        marker = cluster.write_file("mount-marker.txt", "MOUNT-MARKER-XYZ\n")
+        src_dir = marker.rsplit("/", 1)[0]
+        code, out = cluster.salloc_run(
+            f"srun --container-image={img} "
+            f"--container-mounts={src_dir}:/mnt:ro "
+            f"cat /mnt/mount-marker.txt\n"
+        )
+        assert code == 0, out
+        assert "MOUNT-MARKER-XYZ" in out, out
+
