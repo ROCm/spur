@@ -1991,6 +1991,14 @@ impl SlurmAgent for AgentService {
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
+        // A containerized step (spur#777) runs inside the requested image. The
+        // fields are plumbed through here; the container launch path lands in the
+        // next change. Until then, refuse rather than silently run on the host.
+        if req.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
+            return Err(Status::unimplemented(
+                "containerized job steps are not yet supported on this node (spur#777)",
+            ));
+        }
         // Steps carry their own uid straight from the wire — gate them exactly like a batch launch.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             req.uid,

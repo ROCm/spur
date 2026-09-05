@@ -2764,6 +2764,7 @@ impl SlurmController for ControllerService {
         let environment = req.environment.clone();
         let uid = req.uid;
         let gid = req.gid;
+        let container = req.container.clone();
         let step_id = req.step_id;
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
@@ -2937,6 +2938,7 @@ impl SlurmController for ControllerService {
             let work_dir = work_dir.clone();
             let environment = environment.clone();
             let step_mpi = mpi.clone();
+            let container = container.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -2962,6 +2964,7 @@ impl SlurmController for ControllerService {
                         pmix_plan,
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
+                        container: container.clone(),
                     })
                     .await
                     .map_err(|e| {
