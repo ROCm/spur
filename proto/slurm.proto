@@ -1006,6 +1006,17 @@ message RunStepRequest {
   bool label = 8;      // Prefix output lines with [rank] (srun -l)
   string mpi = 9;      // Step MPI type; when empty, inherit job.spec.mpi
   string user = 10;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
+  // Step-level container override (mirrors JobSpec fields 70-78).
+  // Empty/false = inherit from parent job's container config.
+  string container_image = 11;
+  repeated string container_mounts = 12;
+  string container_workdir = 13;
+  string container_name = 14;
+  bool container_readonly = 15;
+  bool container_mount_home = 16;
+  map<string, string> container_env = 17;
+  string container_entrypoint = 18;
+  bool container_remap_root = 19;
 }
 
 message RunStepResponse {
@@ -1229,6 +1240,18 @@ message RunCommandRequest {
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
   // When true, PMIx was prepared via PreparePmix on the controller before RunCommand.
   bool pmix_prepared = 14;
+  // Container fields for srun steps (mirrors JobSpec fields 70-78).
+  // Empty/false = no container; the step runs directly on the host or enters
+  // the parent job's existing namespaces when the job is containerized.
+  string container_image = 15;
+  repeated string container_mounts = 16;
+  string container_workdir = 17;
+  string container_name = 18;
+  bool container_readonly = 19;
+  bool container_mount_home = 20;
+  map<string, string> container_env = 21;
+  string container_entrypoint = 22;
+  bool container_remap_root = 23;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.

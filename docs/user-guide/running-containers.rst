@@ -59,13 +59,15 @@ runs inside the container.
    * - ``--container-name <name>``
      - Persist the container across jobs. Required for ``spur image export``.
    * - ``--container-readonly``
-     - Mount the container root read-only.
+     - Not yet implemented — rejected at submission. (A read-only container
+       root is not enforced yet; the flag is refused rather than silently
+       ignored.)
    * - ``--container-mount-home``
      - Mount your home directory into the container.
    * - ``--container-env KEY=VAL``
      - Set an environment variable inside the container. Repeatable.
    * - ``--container-entrypoint``
-     - Use the image's entrypoint (``sbatch``).
+     - Use the image's entrypoint.
    * - ``--container-remap-root``
      - Map the job user to root inside the container.
 
@@ -82,6 +84,36 @@ An interactive shell in a container with your home directory mounted:
 .. code-block:: bash
 
    srun --container-image ubuntu:22.04 --container-mount-home bash
+
+Containerized Job Steps
+-----------------------
+
+``srun`` steps run inside a container too, not just batch jobs. The container
+flags above apply to a step's ``srun`` and behave as follows:
+
+- **Step inside a containerized allocation.** When the batch job was submitted
+  with ``--container-image`` (``sbatch --container-image ...``), a nested
+  ``srun`` step enters that already-running container — it shares the job's
+  image, mounts, and GPU devices. This is the standard Slurm + Pyxis pattern
+  used by multi-node launchers.
+
+- **Step with its own image.** A standalone ``srun --container-image`` (or an
+  ``salloc`` allocation followed by ``srun --container-image``) creates a fresh
+  container for that step. Different steps in one allocation can use different
+  images and mounts.
+
+Concurrent steps on separate nodes each run their own container:
+
+.. code-block:: bash
+
+   salloc -N2 --gpus-per-node=8
+   srun --overlap -N1 -w node1 --container-image trainer.sqsh ray start --head ... &
+   srun --overlap -N1 -w node2 --container-image trainer.sqsh ray start --address ... &
+   wait
+
+GPU allocation, bind mounts, and cancellation apply per step: a cancelled step
+tears down its container and cleans up its rootfs without affecting the rest of
+the allocation.
 
 Exec Into a Running Container Job
 ---------------------------------

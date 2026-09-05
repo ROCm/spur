@@ -158,6 +158,14 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_workdir: Option<String>,
 
+    /// Named container (persists across steps in an allocation)
+    #[arg(long)]
+    pub container_name: Option<String>,
+
+    /// Read-only container rootfs (not yet implemented; rejected at submission)
+    #[arg(long)]
+    pub container_readonly: bool,
+
     /// Mount user home directory in container
     #[arg(long)]
     pub container_mount_home: bool,
@@ -165,6 +173,10 @@ pub struct SrunArgs {
     /// Set environment variable inside container (KEY=VAL)
     #[arg(long)]
     pub container_env: Vec<String>,
+
+    /// Override the container entrypoint
+    #[arg(long)]
+    pub container_entrypoint: Option<String>,
 
     /// Remap user to root inside container
     #[arg(long)]
@@ -214,6 +226,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     if args.jobid.is_some() && !args.overlap {
         anyhow::bail!("--jobid requires --overlap");
+    }
+
+    if args.container_readonly {
+        anyhow::bail!(
+            "--container-readonly is not yet implemented; the container root would be \
+             writable despite the flag. Omit it rather than rely on a read-only rootfs."
+        );
     }
 
     resolve_srun_env(&matches, &mut args)?;
@@ -607,6 +626,8 @@ fn build_srun_job_spec(
         container_image: args.container_image.clone().unwrap_or_default(),
         container_mounts: args.container_mounts.clone(),
         container_workdir: args.container_workdir.clone().unwrap_or_default(),
+        container_name: args.container_name.clone().unwrap_or_default(),
+        container_readonly: args.container_readonly,
         container_mount_home: args.container_mount_home,
         container_env: args
             .container_env
@@ -616,6 +637,7 @@ fn build_srun_job_spec(
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect(),
+        container_entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: args.container_remap_root,
         srun_job: true,
         pty: args.pty,
@@ -786,6 +808,22 @@ async fn dispatch_step(
             label: args.label,
             mpi: step_mpi.to_string(),
             user: params.user.to_string(),
+            container_image: args.container_image.clone().unwrap_or_default(),
+            container_mounts: args.container_mounts.clone(),
+            container_workdir: args.container_workdir.clone().unwrap_or_default(),
+            container_name: args.container_name.clone().unwrap_or_default(),
+            container_readonly: args.container_readonly,
+            container_mount_home: args.container_mount_home,
+            container_env: args
+                .container_env
+                .iter()
+                .filter_map(|s| {
+                    s.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect(),
+            container_entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
+            container_remap_root: args.container_remap_root,
         })
         .await
         .context("RunStep dispatch failed")?
@@ -2320,6 +2358,25 @@ mod tests {
         assert!(
             msg.contains("--overlap"),
             "expected --overlap error, got: {msg}"
+        );
+    }
+
+    /// --container-readonly is a no-op in the runtime today, so it is refused at
+    /// submission rather than silently ignored (the #777-class failure mode).
+    #[tokio::test]
+    async fn container_readonly_is_rejected() {
+        let result = main_with_args(vec![
+            "srun".into(),
+            "--container-image=img.sqsh".into(),
+            "--container-readonly".into(),
+            "hostname".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("--container-readonly") && msg.contains("not yet implemented"),
+            "expected a not-yet-implemented rejection, got: {msg}"
         );
     }
 

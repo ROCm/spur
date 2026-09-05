@@ -223,7 +223,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "container_name")]
     pub container_name: Option<String>,
 
-    /// Read-only container rootfs
+    /// Read-only container rootfs (not yet implemented; rejected at submission)
     #[arg(long, overrides_with = "container_readonly")]
     pub container_readonly: bool,
 
@@ -830,6 +830,12 @@ fn build_sbatch_job_spec(
     if is_wrap && !args.script_args.is_empty() {
         bail!("sbatch: script arguments may not be used with --wrap");
     }
+    if args.container_readonly {
+        bail!(
+            "--container-readonly is not yet implemented; the container root would be \
+             writable despite the flag. Omit it rather than rely on a read-only rootfs."
+        );
+    }
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let script = match choose_body_source(args.wrap.take(), args.script.clone(), stdin_is_terminal)?
     {
@@ -1122,6 +1128,21 @@ mod tests {
         assert_eq!(
             spec.submit_line,
             "sbatch -w node1 --exclusive --wrap hostname"
+        );
+    }
+
+    /// --container-readonly is a no-op in the runtime today, so it is refused at
+    /// submission rather than silently ignored (the #777-class failure mode).
+    #[test]
+    fn build_sbatch_job_spec_rejects_container_readonly() {
+        let argv = ["sbatch", "--container-readonly", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let err = build_sbatch_job_spec(args, None, &line).expect_err("readonly must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--container-readonly") && msg.contains("not yet implemented"),
+            "expected a not-yet-implemented rejection, got: {msg}"
         );
     }
 
