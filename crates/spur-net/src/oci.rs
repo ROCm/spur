@@ -16,7 +16,6 @@
 //! 6. Pack rootfs into squashfs via mksquashfs
 
 use std::ffi::OsStr;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -669,40 +668,12 @@ async fn resolve_manifest_list(
 }
 
 fn extract_layer(data: &[u8], media_type: Option<&str>, dest: &Path) -> anyhow::Result<()> {
-    extract_tar(crate::image_layer::decode(data, media_type)?, dest)
-}
-
-fn extract_tar(reader: impl Read, dest: &Path) -> anyhow::Result<()> {
-    let mut archive = tar::Archive::new(reader);
-    archive.set_overwrite(true);
-    // Unpack, ignoring permission errors (common in rootless)
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        // Skip whiteout files (.wh.*) — used for layer deletion
-        let path = entry.path()?.to_path_buf();
-        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-        if filename.starts_with(".wh.") {
-            // Whiteout: delete the corresponding file
-            let target = if filename == ".wh..wh..opq" {
-                // Opaque whiteout: directory should be empty
-                // (skip for now — complex to handle)
-                continue;
-            } else {
-                let real_name = filename.strip_prefix(".wh.").unwrap_or(filename);
-                dest.join(path.parent().unwrap_or(Path::new("")))
-                    .join(real_name)
-            };
-            let _ = std::fs::remove_file(&target);
-            let _ = std::fs::remove_dir_all(&target);
-            continue;
-        }
-
-        if let Err(e) = entry.unpack_in(dest) {
-            // Ignore permission errors on special files
-            debug!(path = %path.display(), error = %e, "skipping entry");
-        }
-    }
-    Ok(())
+    crate::image_layer::extract(
+        data,
+        media_type,
+        dest,
+        crate::image_layer::EntryUnpackPolicy::SkipFailedEntries,
+    )
 }
 
 /// Get the base URL for a registry.
