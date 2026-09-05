@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E test: GPU device injection into a containerized job step (spur#777).
+"""E2E test: GPU device injection into a containerized job step.
 
 A containerized `srun` step must receive the allocation's GPU device nodes
 (injected into the container) the same way a batch container job does.
@@ -9,7 +9,7 @@ A containerized `srun` step must receive the allocation's GPU device nodes
 The node's GPU is registered via a config `[[devices.gres]]` entry mapping the
 gres to the render node, so the test does not depend on the node having KFD
 compute topology (auto-detect) — it exercises the injection path, which is what
-spur#777 phase 3 added for steps. Needs a root agent (namespaces + device
+this change added for steps. Needs a root agent (namespaces + device
 injection).
 """
 

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for `srun --container-image` on bare-metal job steps (spur#777).
+"""E2E tests for `srun --container-image` on bare-metal job steps.
 
 Inside an allocation, `srun --container-image=IMG cmd` must run cmd *inside* the
 image, not on the host. The test image is a minimal rootfs (no /var, /opt, ...),

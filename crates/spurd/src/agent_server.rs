@@ -856,7 +856,7 @@ async fn reap_killed_job(mut job: executor::RunningJob) {
 
 /// Build a bash script that execs a command vector without shell interpretation.
 /// Set up a per-step container rootfs and run the step inside it, returning the
-/// exit code. Builds the `ContainerConfig` from the wire spec (spur#777),
+/// exit code. Builds the `ContainerConfig` from the wire spec,
 /// reusing the same primitives as the batch container path. The rootfs is named
 /// per step so concurrent `srun --overlap` steps in one allocation don't share a
 /// tree; it is removed when the step finishes.
@@ -905,7 +905,7 @@ async fn run_containerized_step(
         gid,
         username,
         home_dir,
-        device_plan, // GPU device-node injection into the container (spur#777)
+        device_plan, // GPU device-node injection into the container
     };
 
     let image_path = crate::container::resolve_image(&spec.image, Some(user), Some(uid))
@@ -2420,7 +2420,7 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        // Containerized step (spur#777): run the command inside the requested
+        // Containerized step: run the command inside the requested
         // image via the shared container primitives, output to the spool files.
         if let Some(spec) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
             // Inject the step's allocated GPUs into the container (device nodes +
@@ -2556,7 +2556,7 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back (see `read_back` above). #781 replaces this
+        // reading the spool files back (see `read_back` above); a later change replaces this
         // with a client-side StreamJobOutput tail and drops the read-back.
         Ok(Response::new(RunCommandResponse {
             exit_code: spur_core::process::shell_exit_code(&status),
@@ -2579,7 +2579,7 @@ impl SlurmAgent for AgentService {
         // Step output: tail the per-step spool file recorded by run_command and
         // finish when the step leaves active_steps (rather than the batch file,
         // which ends only when the whole allocation does). This is what lets an
-        // srun step stream live and terminate at step exit (#781).
+        // srun step stream live and terminate at step exit.
         if req.step_id != 0 {
             let active_steps = self.active_steps.clone();
             let want_stderr = req.stream == "stderr";
@@ -4773,7 +4773,7 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         // The step's stdout must live in a spool file the agent can tail, not
         // only in the RPC response — this file is what StreamJobOutput follows
-        // (#781). step_id defaults to 0 here, so the file is step0.out.
+        //. step_id defaults to 0 here, so the file is step0.out.
         let contents = [
             std::path::PathBuf::from("/var/spool/spur"),
             std::env::temp_dir().join("spur"),

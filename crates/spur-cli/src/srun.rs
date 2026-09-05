@@ -737,7 +737,7 @@ struct StepDispatchParams<'a> {
 }
 
 /// Build the step's container spec from the srun args, or None when no image was
-/// requested (the step runs on the host, the pre-#777 behavior). Mirrors the
+/// requested (the step runs on the host, the pre-container behavior). Mirrors the
 /// container options srun exposes; the CLI does not surface name/readonly/
 /// entrypoint, so those stay unset.
 fn container_spec_from_args(args: &SrunArgs) -> Option<ContainerSpec> {
@@ -803,7 +803,7 @@ async fn dispatch_step(
     }
     // Live-stream the step's output when it lands on a single node and the user
     // has not redirected to a file. The tail runs concurrently with the blocking
-    // RunStep and ends when the step leaves the agent's active_steps (#781).
+    // RunStep and ends when the step leaves the agent's active_steps.
     let live_node = if io.stdout.is_empty() && io.stderr.is_empty() {
         single_step_node(client, job_id).await
     } else {
