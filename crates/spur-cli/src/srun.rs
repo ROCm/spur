@@ -1389,7 +1389,8 @@ async fn run_as_step(
     if args.pty {
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
         let exit_code =
-            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user).await?;
+            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
+                .await?;
         std::process::exit(exit_code);
     }
 
@@ -1482,14 +1483,9 @@ mod tests {
 
     #[test]
     fn step_mode_warns_only_on_container_image_when_pty_also_set() {
-        let args = SrunArgs::try_parse_from([
-            "srun",
-            "--container-image",
-            "img.sqsh",
-            "--pty",
-            "bash",
-        ])
-        .expect("parse failed");
+        let args =
+            SrunArgs::try_parse_from(["srun", "--container-image", "img.sqsh", "--pty", "bash"])
+                .expect("parse failed");
         let warnings = step_mode_unsupported_warnings(&args);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--container-image"));
