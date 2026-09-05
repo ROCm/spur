@@ -862,10 +862,12 @@ async fn run_containerized_step(
     uid: u32,
     gid: u32,
     gpu_devices: &[u32],
+    device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
     env: HashMap<String, String>,
     memlock: spur_core::config::MemlockLimit,
     stdout: std::fs::File,
     stderr: std::fs::File,
+    pid_tx: tokio::sync::oneshot::Sender<i32>,
 ) -> anyhow::Result<i32> {
     let mounts: Vec<crate::container::BindMount> = spec
         .mounts
@@ -895,7 +897,7 @@ async fn run_containerized_step(
         gid,
         username,
         home_dir,
-        device_plan: None, // GPU device-node injection is spur#777 phase 3
+        device_plan, // GPU device-node injection into the container (spur#777)
     };
 
     let image_path = crate::container::resolve_image(&spec.image, Some(user), Some(uid))
@@ -916,6 +918,7 @@ async fn run_containerized_step(
         memlock,
         stdout,
         stderr,
+        pid_tx,
     )
     .await
 }
@@ -2361,6 +2364,34 @@ impl SlurmAgent for AgentService {
         // Containerized step (spur#777): run the command inside the requested
         // image via the shared container primitives, output to the spool files.
         if let Some(spec) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
+            // Inject the step's allocated GPUs into the container (device nodes +
+            // env), the same plan the batch container path uses.
+            let device_plan = if gpu_devices.is_empty() {
+                None
+            } else {
+                Some(
+                    self.device_registry
+                        .lock()
+                        .await
+                        .build_job_injection_plans("gpu", &gpu_devices, req.uid, req.gid)
+                        .map_err(|e| {
+                            Status::failed_precondition(format!("GPU injection plan failed: {e}"))
+                        })?
+                        .1,
+                )
+            };
+            // Record the container step's pid (its process-group leader) in
+            // active_steps as soon as it forks, so cancel_step can signal it.
+            let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+            let steps_for_pid = self.active_steps.clone();
+            let pid_recorder = tokio::spawn(async move {
+                if let Ok(pid) = pid_rx.await {
+                    let mut steps = steps_for_pid.lock().await;
+                    if let Some(step) = steps.get_mut(&step_key) {
+                        step.pid = Some(pid as u32);
+                    }
+                }
+            });
             let exit_code = run_containerized_step(
                 spec,
                 job_id,
@@ -2370,13 +2401,16 @@ impl SlurmAgent for AgentService {
                 req.uid,
                 req.gid,
                 &gpu_devices,
+                device_plan,
                 env,
                 self.limits.memlock,
                 step_files.stdout,
                 step_files.stderr,
+                pid_tx,
             )
             .await
             .map_err(|e| Status::internal(format!("containerized step failed: {e:#}")))?;
+            pid_recorder.abort();
             return Ok(Response::new(RunCommandResponse {
                 exit_code,
                 stdout: read_back(stdout_path).await,

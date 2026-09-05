@@ -1906,6 +1906,7 @@ pub async fn run_container_step(
     memlock: MemlockLimit,
     stdout: std::fs::File,
     stderr: std::fs::File,
+    pid_tx: tokio::sync::oneshot::Sender<i32>,
 ) -> anyhow::Result<i32> {
     use std::os::fd::AsRawFd;
 
@@ -1949,6 +1950,9 @@ pub async fn run_container_step(
             unsafe {
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                // Own process group so cancel_step's killpg reaches every process
+                // the container spawns, not just the step's entry process.
+                libc::setpgid(0, 0);
                 // Wire the step's spool files to stdout/stderr.
                 if libc::dup2(stdout_fd, libc::STDOUT_FILENO) < 0
                     || libc::dup2(stderr_fd, libc::STDERR_FILENO) < 0
@@ -2004,6 +2008,10 @@ pub async fn run_container_step(
             // The child holds the dup'd write fds now; release the parent copies.
             drop(stdout);
             drop(stderr);
+
+            // Publish the child pid (its own process group leader) so cancel_step
+            // can signal the step's whole process group.
+            let _ = pid_tx.send(child.as_raw());
 
             let mut buf = [0u8; 512];
             let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
