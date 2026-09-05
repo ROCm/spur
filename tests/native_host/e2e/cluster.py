@@ -209,6 +209,20 @@ class SpurCluster:
     waits for the cluster to become ready, and tears everything down.
     """
 
+    # Payload carried by build_imported_container_image(): a directory that
+    # exists only inside the image, so a bare command name resolves there
+    # only when the image's own PATH reaches the container.
+    IMAGE_ONLY_BIN_DIR = "/opt/img/bin"
+    IMAGE_PAYLOAD = "img-payload"
+    IMAGE_PAYLOAD_MARKER = "IMAGE_PAYLOAD_OK"
+
+    # Real public image pulled by pull_container_image(). Its config.Env holds
+    # PATH (first entry below), LANG and PYTHON_VERSION, none of which the job
+    # environment supplies. Pinned so those expectations stay true.
+    TEST_IMAGE = "docker.io/library/python:3.11-slim"
+    TEST_IMAGE_REGISTRY = "registry-1.docker.io"
+    TEST_IMAGE_PATH_HEAD = "/usr/local/bin"
+
     def __init__(self, nodes: list[SshNode], remote_dir: str, bin_dir: str):
         self.nodes = nodes
         self.node_names: list[str] = []
@@ -999,15 +1013,12 @@ class SpurCluster:
                     f"(apt install squashfs-tools)"
                 )
 
-    def build_container_image(self, tmp_path: Path) -> str:
+    def _build_test_rootfs(self, rootfs: Path, extra: str = "") -> None:
         """
-        Build a minimal squashfs container image locally, ship to all nodes.
-        Returns the remote path to the .sqsh file.
+        Populate *rootfs* locally with a minimal userland: host binaries plus
+        the libraries ldd reports for them. *extra* is shell appended to the
+        build script, run with $R pointing at the rootfs.
         """
-        remote_path = f"{self.remote_dir}/test-container.sqsh"
-        rootfs = tmp_path / "rootfs"
-        local_img = tmp_path / "test-container.sqsh"
-
         build_script = f"""set -e
 R='{rootfs}'
 mkdir -p "$R/bin" "$R/usr/bin" "$R/lib" "$R/lib64" \
@@ -1036,19 +1047,110 @@ done
 for f in /etc/passwd /etc/group /etc/nsswitch.conf; do
   [ -f "$f" ] && cp "$f" "$R/etc/"
 done
-mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
+{extra}
 """
         result = subprocess.run(
             ["sh", "-c", build_script],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"mksquashfs failed: {result.stderr}")
+            raise RuntimeError(f"rootfs build failed: {result.stderr}")
+
+    def build_container_image(self, tmp_path: Path) -> str:
+        """
+        Build a minimal squashfs container image locally, ship to all nodes.
+        Returns the remote path to the .sqsh file.
+        """
+        remote_path = f"{self.remote_dir}/test-container.sqsh"
+        rootfs = tmp_path / "rootfs"
+        local_img = tmp_path / "test-container.sqsh"
+        self._build_test_rootfs(
+            rootfs,
+            extra=f"""mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1""",
+        )
 
         for node in self.nodes:
             node.upload(str(local_img), remote_path)
 
         return remote_path
+
+    def build_imported_container_image(
+        self,
+        tmp_path: Path,
+        image_env: list[str],
+        tag: str = "spur-e2e-imgenv:test",
+    ) -> str:
+        """
+        Build an image through the real `spur image import` path, so the image
+        config recorded at import time is on the rootfs when a job launches.
+        *image_env* becomes the image's config.Env.
+
+        The rootfs carries a payload binary under IMAGE_ONLY_BIN_DIR, a
+        directory that exists nowhere on the host, so it is reachable only if
+        the image's own PATH survives into the container. It is a copy of a
+        real ELF rather than a shebang script, so the job's execve resolves a
+        binary the way `torchrun` from a venv image would.
+
+        Skips the test when docker or mksquashfs is unusable on node 0, where
+        both the docker build and the import run. Returns the remote .sqsh.
+        """
+        node = self.nodes[0]
+        # `docker info` (not `command -v docker`) so an unreachable daemon socket skips.
+        if node.exec_allow_fail("docker info >/dev/null 2>&1 && echo ok").strip() != "ok":
+            pytest.skip("docker not usable on node 0; cannot run `spur image import`")
+
+        rootfs = tmp_path / "import-rootfs"
+        local_tar = tmp_path / "import-rootfs.tar.gz"
+        payload = f"{self.IMAGE_ONLY_BIN_DIR}/{self.IMAGE_PAYLOAD}"
+        self._build_test_rootfs(rootfs, extra=f"""
+mkdir -p "$R{self.IMAGE_ONLY_BIN_DIR}"
+cp "$R/usr/bin/echo" "$R{payload}"
+tar -C "$R" -czf '{local_tar}' .
+""")
+
+        remote_tar = f"{self.remote_dir}/import-rootfs.tar.gz"
+        node.upload(str(local_tar), remote_tar)
+
+        # docker mints the config.Env; `spur image import` is what records it.
+        changes = " ".join(f"--change {shlex.quote('ENV ' + v)}" for v in image_env)
+        node.exec_allow_fail(f"docker rmi -f {shlex.quote(tag)}")
+        node.exec(f"docker import {changes} '{remote_tar}' {shlex.quote(tag)}")
+        return self.import_container_image(f"dockerd://{tag}", "dockerd")
+
+    def pull_container_image(self) -> str:
+        """
+        Import TEST_IMAGE straight from its registry, so the pull path rather
+        than `docker save` is what records the config. Skips when the registry
+        is unreachable. Returns the remote .sqsh path on node 0.
+        """
+        probe = self.nodes[0].exec_allow_fail(
+            f"getent hosts {self.TEST_IMAGE_REGISTRY} >/dev/null && echo ok"
+        )
+        if "ok" not in probe:
+            pytest.skip(f"{self.TEST_IMAGE_REGISTRY} unreachable from node 0")
+        return self.import_container_image(self.TEST_IMAGE, "registry")
+
+    def import_container_image(self, uri: str, slug: str) -> str:
+        """
+        Run the real `spur image import` on node 0. Each import gets its own
+        image directory, so the .sqsh it produced is the only one there and
+        this does not have to reproduce spur's image naming rules.
+
+        Unlike build_container_image, the result lands on node 0 alone, so a
+        job using it has to be pinned there with `-w`.
+        """
+        node = self.nodes[0]
+        if "ok" not in node.exec_allow_fail("command -v mksquashfs >/dev/null && echo ok"):
+            pytest.skip("mksquashfs not found on node 0 (apt install squashfs-tools)")
+        image_dir = f"{self.remote_dir}/images/{slug}"
+        node.exec(f"mkdir -p '{image_dir}'")
+        node.exec(
+            f"SPUR_IMAGE_DIR='{image_dir}' '{self.bin_dir}/spur' image import {shlex.quote(uri)}"
+        )
+        images = node.exec(f"ls '{image_dir}'/*.sqsh").split()
+        if len(images) != 1:
+            raise RuntimeError(f"expected one imported image under {image_dir}, got {images}")
+        return images[0]
 
     # --- Internal helpers ---
 

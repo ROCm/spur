@@ -37,6 +37,34 @@ def multi_container_cluster(multi_node_cluster, tmp_path):
     return multi_node_cluster
 
 
+@pytest.fixture
+def imported_image_cluster(cluster, tmp_path):
+    """
+    Single-node cluster whose image went through `spur image import`, so the
+    image config recorded at import time is present when a job launches.
+    """
+    cluster.container_preflight()
+    cluster.container_image = cluster.build_imported_container_image(
+        tmp_path,
+        image_env=[
+            f"PATH={cluster.IMAGE_ONLY_BIN_DIR}:/usr/bin",
+            "IMAGE_MARKER=from-image",
+        ],
+    )
+    return cluster
+
+
+@pytest.fixture
+def registry_image_cluster(cluster):
+    """
+    Single-node cluster running a real public image pulled from its registry,
+    so the config recorded by the pull path is what seeds the container.
+    """
+    cluster.container_preflight()
+    cluster.container_image = cluster.pull_container_image()
+    return cluster
+
+
 class TestContainerSingleNode:
     def test_container_launch_and_exit(self, container_cluster):
         cluster = container_cluster
@@ -200,6 +228,116 @@ class TestContainerSingleNode:
             f"bind mount test failed (1=content wrong, 2=ro not enforced), "
             f"state={state}\n{diag}"
         )
+
+    def test_container_starts_from_image_env(self, imported_image_cluster):
+        """A binary on the image's own PATH must be runnable, host PATH kept."""
+        cluster = imported_image_cluster
+        img = cluster.container_image
+        out_path = f"{cluster.remote_dir}/c10-image-env.out"
+        script = cluster.write_file(
+            "c10-image-env.sh",
+            "#!/bin/bash\n"
+            f"{cluster.IMAGE_PAYLOAD} {cluster.IMAGE_PAYLOAD_MARKER} || exit 1\n"
+            'echo "CONTAINER_PATH=$PATH"\n'
+            'echo "MARKER=$IMAGE_MARKER"\n',
+        )
+        # The import ran on node 0, so the .sqsh exists only there.
+        sb = cluster.sbatch([
+            "-J", "c10-image-env", "-N", "1", "-w", cluster.node_names[0],
+            "-o", out_path, f"--container-image={img}", script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        state = wait_job(cluster, job_id, timeout=120)
+        output = cluster.read_output_all_nodes(out_path)
+        diag = cluster.debug_job(job_id)
+        assert state in ("CD", "GONE"), (
+            f"job running the image's own binary must complete, got {state}\n"
+            f"{diag}\noutput:\n{output}"
+        )
+        assert cluster.IMAGE_PAYLOAD_MARKER in output, (
+            f"{cluster.IMAGE_PAYLOAD} is only on the image's PATH and must "
+            f"still resolve\noutput:\n{output}"
+        )
+        assert f"CONTAINER_PATH={cluster.IMAGE_ONLY_BIN_DIR}:" in output, (
+            f"image PATH entries must come first\noutput:\n{output}"
+        )
+        assert f"{cluster.bin_dir}" in output, (
+            f"job PATH entries must still be appended\noutput:\n{output}"
+        )
+        assert "MARKER=from-image" in output, (
+            f"non-PATH image variables must reach the container\noutput:\n{output}"
+        )
+
+    def test_container_without_image_config_keeps_job_env(self, container_cluster):
+        """An image with no recorded config must run on the job env, unchanged."""
+        cluster = container_cluster
+        img = cluster.container_image
+        out_path = f"{cluster.remote_dir}/c11-no-image-config.out"
+        script = cluster.write_file(
+            "c11-no-image-config.sh",
+            "#!/bin/bash\n"
+            "[ -e /etc/spur/image-config.json ] && exit 1\n"
+            'echo "CONTAINER_PATH=$PATH"\n'
+            "echo NO_IMAGE_CONFIG_OK\n",
+        )
+        sb = cluster.sbatch([
+            "-J", "c11-no-cfg", "-N", "1", "-o", out_path,
+            f"--container-image={img}", script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        state = wait_job(cluster, job_id, timeout=60)
+        output = cluster.read_output_all_nodes(out_path)
+        diag = cluster.debug_job(job_id)
+        assert state in ("CD", "GONE"), (
+            f"image without a recorded config must still run (1=config present), "
+            f"got {state}\n{diag}\noutput:\n{output}"
+        )
+        assert "NO_IMAGE_CONFIG_OK" in output, f"job did not run:\n{output}"
+        assert f"CONTAINER_PATH={cluster.bin_dir}:" in output, (
+            f"job PATH must pass through untouched\noutput:\n{output}"
+        )
+
+    def test_container_starts_from_pulled_image_env(self, registry_image_cluster):
+        """A real registry image must run on its own config.Env."""
+        cluster = registry_image_cluster
+        img = cluster.container_image
+        out_path = f"{cluster.remote_dir}/c12-pulled-image.out"
+        script = cluster.write_file(
+            "c12-pulled-image.sh",
+            "#!/bin/bash\n"
+            "python3 -c 'print(\"PULLED_IMAGE_OK\")' || exit 1\n"
+            'echo "CONTAINER_PATH=$PATH"\n'
+            'echo "PY=$PYTHON_VERSION"\n',
+        )
+        # The import ran on node 0, so the .sqsh exists only there.
+        sb = cluster.sbatch([
+            "-J", "c12-pulled", "-N", "1", "-w", cluster.node_names[0],
+            "-o", out_path, f"--container-image={img}", script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        state = wait_job(cluster, job_id, timeout=120)
+        output = cluster.read_output_all_nodes(out_path)
+        diag = cluster.debug_job(job_id)
+        assert state in ("CD", "GONE"), (
+            f"job in a pulled image must complete, got {state}\n{diag}\noutput:\n{output}"
+        )
+        assert "PULLED_IMAGE_OK" in output, f"the image's python did not run:\n{output}"
+        assert f"CONTAINER_PATH={cluster.TEST_IMAGE_PATH_HEAD}:" in output, (
+            f"the image's PATH must come first\noutput:\n{output}"
+        )
+        assert cluster.bin_dir in output, (
+            f"job PATH entries must still be appended\noutput:\n{output}"
+        )
+        # Set only in the image config, so it is empty without the fix. LANG is
+        # not usable here: the image sets it too, but the job environment has its
+        # own and job values win for everything except the search paths.
+        assert "PY=3.11" in output, f"PYTHON_VERSION must reach the job\noutput:\n{output}"
 
 
 class TestContainerMultiNode:

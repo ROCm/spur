@@ -246,6 +246,21 @@ fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
                 .with_context(|| format!("failed to extract layer {}", layer_file))?;
         }
 
+        // Record the image config so container jobs can start from its config.Env.
+        // Best effort: an archive without a readable config still imports.
+        if let Some(config_file) = manifest
+            .first()
+            .and_then(|entry| entry.get("Config"))
+            .and_then(|config| config.as_str())
+        {
+            let recorded = resolve_docker_save_file(&archive_root, config_file)
+                .and_then(|path| std::fs::read(path).with_context(|| format!("read {config_file}")))
+                .and_then(|config_json| spur_net::oci::record_image_config(dest, &config_json));
+            if let Err(e) = recorded {
+                eprintln!("warning: image environment not captured from {config_file}: {e:#}");
+            }
+        }
+
         Ok(())
     })();
 

@@ -1726,7 +1726,9 @@ async fn launch_container_job(
     // Snapshot everything the child needs (must not reference async state after fork)
     let config = &ctn.config;
     let rootfs = ctn.rootfs.clone();
-    let env_snapshot = env.clone();
+    // The image's own config.Env is the base environment, as with docker run;
+    // the job environment layers on top of it.
+    let env_snapshot = spur_net::oci::container_base_env(&rootfs, env.clone());
     let container_env = config.container_env.clone();
     let entrypoint = config.entrypoint.clone();
 
