@@ -103,7 +103,7 @@ fn classify_spool_error(dir: &Path, err: anyhow::Error) -> LaunchError {
     }
 }
 
-use crate::container::ContainerConfig;
+use crate::container::{ContainerConfig, RootfsMode};
 
 /// Cgroup root for slurmd-managed jobs.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
@@ -1870,6 +1870,168 @@ async fn launch_container_job(
                 },
                 pty_master,
             ))
+        }
+    }
+}
+
+/// Wrap a step's argv in a one-shot bash script that execs it, shell-escaped so
+/// metacharacters stay literal (matching `srun`'s no-shell argv semantics).
+fn build_container_step_script(command: &[String]) -> anyhow::Result<String> {
+    let joined = shlex::try_join(command.iter().map(String::as_str))
+        .context("command is not shell-safe")?;
+    Ok(format!("#!/bin/bash\nexec {joined}\n"))
+}
+
+/// Run a single job step inside a container to completion, returning its exit
+/// code.
+///
+/// Unlike [`launch_container_job`] — which yields a tracked, long-running
+/// `RunningJob` for a batch job — this forks, runs `container_init` (namespaces,
+/// mounts, `pivot_root`, priv drop) and the step command, and waits
+/// synchronously: a step's transient run-to-completion lifecycle. The child's
+/// stdout/stderr are the step's spool files (the child inherits the write fds via
+/// `dup2`), so the existing StreamJobOutput tail streams a containerized step's
+/// output the same way. The per-step `rootfs` is removed on return.
+///
+/// Reuses the same container primitives as the batch path rather than
+/// duplicating the fork/namespace logic.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_container_step(
+    job_id: JobId,
+    config: &ContainerConfig,
+    rootfs: &Path,
+    rootfs_mode: RootfsMode,
+    command: &[String],
+    env: &HashMap<String, String>,
+    memlock: MemlockLimit,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+) -> anyhow::Result<i32> {
+    use std::os::fd::AsRawFd;
+
+    // Step script inside the container's /tmp (visible after pivot_root). The
+    // rootfs is per-step, so this fixed name does not collide across steps.
+    let script = build_container_step_script(command)?;
+    let tmp_dir = rootfs.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let script_path = tmp_dir.join("spur_step.sh");
+    std::fs::write(&script_path, &script)
+        .with_context(|| format!("write step script {}", script_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // Sync pipe: child reports container_init status.
+    let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
+    nix::fcntl::fcntl(
+        &pipe_r,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .ok();
+    let ready_r = pipe_r.as_raw_fd();
+    let ready_w = pipe_w.as_raw_fd();
+
+    let stdout_fd = stdout.as_raw_fd();
+    let stderr_fd = stderr.as_raw_fd();
+    // The parent frame stays alive across the fork (it awaits the child below),
+    // so the child reads `config`/`rootfs` through the parent's memory (COW). The
+    // owned env copy is what the child mutates and execs with.
+    let rootfs_buf = rootfs.to_path_buf();
+    let env_snapshot = env.clone();
+    let container_env = config.container_env.clone();
+
+    match unsafe { nix::unistd::fork().context("fork for container step")? } {
+        nix::unistd::ForkResult::Child => {
+            // === CHILD === synchronous only; the tokio runtime is broken here.
+            drop(pipe_r);
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                // Wire the step's spool files to stdout/stderr.
+                if libc::dup2(stdout_fd, libc::STDOUT_FILENO) < 0
+                    || libc::dup2(stderr_fd, libc::STDERR_FILENO) < 0
+                {
+                    libc::_exit(1);
+                }
+            }
+            crate::container::close_inherited_fds(ready_w);
+            apply_memlock(memlock);
+
+            let hook_env = match crate::container::container_init(config, &rootfs_buf) {
+                Ok(env) => env,
+                Err(e) => {
+                    let msg = format!("E:{:#}", e);
+                    unsafe {
+                        libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
+                    }
+                    std::process::exit(1);
+                }
+            };
+            unsafe {
+                libc::write(ready_w, b"OK".as_ptr() as *const _, 2);
+            }
+            drop(pipe_w);
+
+            let mut final_env = env_snapshot;
+            for (k, v) in &container_env {
+                final_env.insert(k.clone(), v.clone());
+            }
+            for (k, v) in hook_env {
+                final_env.insert(k, v);
+            }
+            let c_env: Vec<CString> = final_env
+                .iter()
+                .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
+                .collect();
+            let c_env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
+
+            let shell = if Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            let c_shell = CString::new(shell).unwrap();
+            let exec_args = [c_shell.clone(), CString::new("/tmp/spur_step.sh").unwrap()];
+            let exec_refs: Vec<&std::ffi::CStr> = exec_args.iter().map(|s| s.as_c_str()).collect();
+            let _ = nix::unistd::execve(&c_shell, &exec_refs, &c_env_refs);
+            eprintln!("spur: execve failed: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            drop(pipe_w);
+            // The child holds the dup'd write fds now; release the parent copies.
+            drop(stdout);
+            drop(stderr);
+
+            let mut buf = [0u8; 512];
+            let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = n.max(0) as usize;
+            drop(pipe_r);
+            if n < 2 || &buf[..2] != b"OK" {
+                let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = nix::sys::wait::waitpid(child, None);
+                crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                let _ = std::fs::remove_dir_all(&rootfs_buf);
+                bail!("container step init failed for job {}: {}", job_id, msg);
+            }
+
+            // Wait for the step to finish in a blocking task so the async runtime
+            // is not stalled.
+            let exit = tokio::task::spawn_blocking(move || {
+                match nix::sys::wait::waitpid(child, None) {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                    _ => 1,
+                }
+            })
+            .await
+            .unwrap_or(1);
+
+            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+            let _ = std::fs::remove_dir_all(&rootfs_buf);
+            Ok(exit)
         }
     }
 }
