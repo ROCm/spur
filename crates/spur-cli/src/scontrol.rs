@@ -31,7 +31,7 @@ pub struct ScontrolArgs {
 pub enum ScontrolCommand {
     /// Show detailed information
     Show {
-        /// Entity type: job, node, partition, reservation, assoc_mgr, federation, config
+        /// Entity type: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -567,6 +567,15 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
 }
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
+    // Offline hostlist utilities resolve locally — no controller round-trip,
+    // matching Slurm (these work outside an allocation and while ctld is down).
+    match entity.to_lowercase().as_str() {
+        "hostnames" | "hostname" => return show_hostnames(name),
+        "hostlist" | "hostlistsorted" => return show_hostlist(name),
+        "hostnamestr" => return show_hostnamestr(name),
+        _ => {}
+    }
+
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
@@ -840,12 +849,72 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist",
                 other
             );
         }
     }
 
+    Ok(())
+}
+
+/// Resolve the hostlist argument for the offline `scontrol show hostnames`
+/// family. Falls back to `$SLURM_JOB_NODELIST` / `$SLURM_NODELIST` like Slurm
+/// so `scontrol show hostnames` works with no argument inside a job.
+fn resolve_hostlist(name: Option<&str>) -> Result<String> {
+    if let Some(value) = name {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    for var in ["SLURM_JOB_NODELIST", "SLURM_NODELIST"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    bail!(
+        "scontrol show hostnames: no hostlist given and neither \
+         SLURM_JOB_NODELIST nor SLURM_NODELIST is set"
+    )
+}
+
+/// Expand a hostlist and return it sorted + de-duplicated in Slurm's natural
+/// (numeric) order. The compress/expand round-trip reuses the controller's own
+/// hostlist codec so ordering matches `compress` exactly (node10 after node2).
+fn normalized_hosts(pattern: &str) -> Result<Vec<String>> {
+    let hosts = spur_core::hostlist::expand(pattern)
+        .map_err(|e| anyhow::anyhow!("invalid hostlist '{pattern}': {e}"))?;
+    let compact = spur_core::hostlist::compress(&hosts);
+    spur_core::hostlist::expand(&compact)
+        .map_err(|e| anyhow::anyhow!("invalid hostlist '{compact}': {e}"))
+}
+
+/// `scontrol show hostnames [HOSTLIST]` — expand to one hostname per line.
+fn show_hostnames(name: Option<&str>) -> Result<()> {
+    let pattern = resolve_hostlist(name)?;
+    for host in normalized_hosts(&pattern)? {
+        println!("{host}");
+    }
+    Ok(())
+}
+
+/// `scontrol show hostlist HOSTLIST` — collapse hostnames into a compact
+/// bracketed expression on a single line.
+fn show_hostlist(name: Option<&str>) -> Result<()> {
+    let pattern = resolve_hostlist(name)?;
+    let hosts = spur_core::hostlist::expand(&pattern)
+        .map_err(|e| anyhow::anyhow!("invalid hostlist '{pattern}': {e}"))?;
+    println!("{}", spur_core::hostlist::compress(&hosts));
+    Ok(())
+}
+
+/// `scontrol show hostnamestr HOSTLIST` — expand to one comma-separated line.
+fn show_hostnamestr(name: Option<&str>) -> Result<()> {
+    let pattern = resolve_hostlist(name)?;
+    println!("{}", normalized_hosts(&pattern)?.join(","));
     Ok(())
 }
 
@@ -2218,6 +2287,32 @@ mod tests {
         assert!(!out.contains("ClusterName=spur"), "{out}");
         assert!(out.contains("SlurmctldAddr=http://ctld:6817"), "{out}");
         assert!(out.contains("Version=9.9.9"), "{out}");
+    }
+
+    #[test]
+    fn show_hostnames_expands_sorted_unique() {
+        assert_eq!(
+            normalized_hosts("node[1-3]").unwrap(),
+            vec!["node1", "node2", "node3"]
+        );
+        // numeric (not lexical) sort and de-duplication, matching Slurm
+        assert_eq!(
+            normalized_hosts("node[2,10,1],node1").unwrap(),
+            vec!["node1", "node2", "node10"]
+        );
+        assert_eq!(
+            normalized_hosts("gpu[1-2],cpu[1-2]").unwrap(),
+            vec!["cpu1", "cpu2", "gpu1", "gpu2"]
+        );
+    }
+
+    #[test]
+    fn resolve_hostlist_prefers_explicit_arg_then_errors() {
+        assert_eq!(resolve_hostlist(Some("node[1-2]")).unwrap(), "node[1-2]");
+        std::env::remove_var("SLURM_JOB_NODELIST");
+        std::env::remove_var("SLURM_NODELIST");
+        assert!(resolve_hostlist(Some("   ")).is_err());
+        assert!(resolve_hostlist(None).is_err());
     }
 
     #[test]

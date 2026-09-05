@@ -606,6 +606,61 @@ scopes the view to the caller and lists only the QOS and accounts they take part
 in. Administrators see every scope, and may pass ``users=<name>`` to inspect one
 user.
 
+Expanding Node Lists — ``scontrol show hostnames``
+--------------------------------------------------
+
+Allocations report their nodes as a compact expression such as ``node[1-4]``.
+Distributed launchers need the individual hostnames behind it — most often to
+pick a rendezvous host. ``scontrol show hostnames`` expands one:
+
+.. code-block:: bash
+
+   scontrol show hostnames node[1-4]
+   # node1
+   # node2
+   # node3
+   # node4
+
+Three forms are available:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Subcommand
+     - Output
+   * - ``show hostnames``
+     - One hostname per line. ``hostname`` is accepted as an alias.
+   * - ``show hostlist``
+     - The hostnames collapsed back into a compact bracketed expression, on one
+       line. ``hostlistsorted`` is accepted as an alias.
+   * - ``show hostnamestr``
+     - The hostnames on a single comma-separated line.
+
+``hostlist`` is the inverse of ``hostnames``:
+
+.. code-block:: bash
+
+   scontrol show hostlist node1,node2,node3,node4
+   # node[1-4]
+
+Output is sorted in natural numeric order with duplicates removed, so ``node10``
+sorts after ``node9`` rather than after ``node1``.
+
+With no argument the list is read from ``$SLURM_JOB_NODELIST``, then
+``$SLURM_NODELIST``. Both are set inside a job, so a job script can omit it:
+
+.. code-block:: bash
+
+   MASTER_ADDR=$(scontrol show hostnames | head -n1)
+
+If no argument is given and neither variable is set, the command errors rather
+than printing nothing.
+
+Unlike the other ``scontrol show`` entities, these three are resolved by the CLI
+itself. They need no allocation and keep working while the controller is
+unreachable.
+
 Cluster Metrics — ``/metrics``
 ------------------------------
 
