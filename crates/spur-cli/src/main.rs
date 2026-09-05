@@ -21,6 +21,7 @@ mod sacctmgr;
 mod salloc;
 mod sattach;
 mod sbatch;
+mod sbcast;
 mod scancel;
 mod scontrol;
 mod scrontab;
@@ -126,6 +127,7 @@ fn main() -> anyhow::Result<()> {
     match bin_name {
         "salloc" => return runtime.block_on(salloc::main()),
         "sbatch" => return runtime.block_on(sbatch::main()),
+        "sbcast" => return runtime.block_on(sbcast::main()),
         "srun" => return runtime.block_on(srun::main()),
         "squeue" => return runtime.block_on(squeue::main()),
         "scancel" => return runtime.block_on(scancel::main()),
@@ -179,6 +181,7 @@ fn main() -> anyhow::Result<()> {
         "report" | "usage" => Some("sreport"),
         "trigger" | "triggers" => Some("strigger"),
         "attach" => Some("sattach"),
+        "sbcast" | "bcast" => Some("sbcast"),
         "crontab" | "cron" => Some("scrontab"),
         "health" | "monitor" => Some("smd"),
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
@@ -228,6 +231,7 @@ fn main() -> anyhow::Result<()> {
                 runtime.block_on(strigger::main_with_args(rewritten))
             }
             "sattach" | "attach" => runtime.block_on(sattach::main_with_args(rewritten)),
+            "sbcast" | "bcast" => runtime.block_on(sbcast::main_with_args(rewritten)),
             "scrontab" | "crontab" | "cron" => {
                 runtime.block_on(scrontab::main_with_args(rewritten))
             }
@@ -333,6 +337,7 @@ fn print_usage() {
     eprintln!("Slurm-compatible aliases (also work as symlinks):");
     eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
     eprintln!("  sprio sshare sstat sdiag sreport strigger sattach scrontab smd");
+    eprintln!("  sbcast");
 }
 
 #[cfg(test)]

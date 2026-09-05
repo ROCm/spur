@@ -2696,6 +2696,113 @@ impl SlurmController for ControllerService {
         Ok(resp)
     }
 
+    async fn sbcast(
+        &self,
+        request: Request<SbcastRequest>,
+    ) -> Result<Response<SbcastResponse>, Status> {
+        if self.check_leader(&request).is_err() {
+            let proxy = &self.leader_proxy;
+            let mut client = proxy.get_leader_client().await?;
+            let fwd = Self::forward_request(request);
+            return client.sbcast(fwd).await;
+        }
+
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        let job_id = req.job_id;
+
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+
+        spur_core::auth::check_job_owner(
+            &req.user,
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            "sbcast to",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        if job.state != spur_core::job::JobState::Running {
+            return Err(Status::failed_precondition(format!(
+                "job {job_id} is not running (state: {})",
+                job.state
+            )));
+        }
+        if job.allocated_nodes.is_empty() {
+            return Err(Status::internal(format!(
+                "job {job_id} has no allocated nodes"
+            )));
+        }
+
+        // Fan the file out to every node in the allocation. A per-node failure is
+        // collected rather than aborting, so a healthy node still gets the file.
+        let mut written: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for node_name in &job.allocated_nodes {
+            let node = match self.cluster.get_node(node_name) {
+                Some(n) => n,
+                None => {
+                    failures.push(format!("{node_name}: node not found"));
+                    continue;
+                }
+            };
+            let agent_addr = match node_comm_http_url(&node, node_name) {
+                Ok(a) => a,
+                Err(e) => {
+                    failures.push(format!("{node_name}: {e}"));
+                    continue;
+                }
+            };
+            let mut agent = match crate::agent_client::connect(agent_addr.clone()).await {
+                Ok(c) => c
+                    .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
+                Err(e) => {
+                    failures.push(format!("{node_name}: cannot reach agent: {e}"));
+                    continue;
+                }
+            };
+            let resp = agent
+                .receive_file(ReceiveFileRequest {
+                    job_id,
+                    dest: req.dest.clone(),
+                    data: req.data.clone(),
+                    mode: req.mode,
+                    force: req.force,
+                    uid: job.spec.uid,
+                    gid: job.spec.gid,
+                    work_dir: job.spec.work_dir.clone(),
+                })
+                .await;
+            match resp {
+                Ok(r) => {
+                    let inner = r.into_inner();
+                    if inner.success {
+                        written.push(node_name.clone());
+                    } else {
+                        failures.push(format!("{node_name}: {}", inner.message));
+                    }
+                }
+                Err(e) => failures.push(format!("{node_name}: {e}")),
+            }
+        }
+
+        let success = failures.is_empty();
+        let message = if success {
+            String::new()
+        } else {
+            failures.join("; ")
+        };
+        Ok(Response::new(SbcastResponse {
+            success,
+            message,
+            nodes: written,
+        }))
+    }
+
     /// Route a step from srun to the job's allocated nodes. Unlike ExecInJob,
     /// the job may not have a tracked process — salloc allocations only exist
     /// as scheduler bookkeeping.

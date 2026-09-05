@@ -445,6 +445,9 @@ service SlurmController {
   // and standalone srun. Fans out tasks via agent RunCommand RPCs.
   rpc RunStep(RunStepRequest) returns (RunStepResponse);
 
+  // Broadcast a file to node-local storage on every node of a running job (Slurm sbcast).
+  rpc Sbcast(SbcastRequest) returns (SbcastResponse);
+
   // -- Native cluster (k0s) lifecycle: SPUR owns the k0s cluster --
   rpc ClusterUp(ClusterUpRequest) returns (ClusterUpResponse);
   rpc ClusterDown(ClusterDownRequest) returns (ClusterDownResponse);
@@ -470,6 +473,9 @@ service SlurmAgent {
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+
+  // Write a file to this node's local filesystem for a job (sbcast fan-out target).
+  rpc ReceiveFile(ReceiveFileRequest) returns (ReceiveFileResponse);
   // Stop an in-flight srun step on this node without cancelling the allocation job.
   rpc CancelStep(CancelStepRequest) returns (google.protobuf.Empty);
   // Record an allocation on this node without launching a batch process.
@@ -1248,6 +1254,44 @@ message RegisterJobAllocationRequest {
 }
 
 message RegisterJobAllocationResponse {}
+
+// sbcast: client -> controller. The controller verifies ownership and fans the
+// file out to every node in the job's allocation. The whole file rides in one
+// message, bounded by MAX_GRPC_REQUEST_SIZE (ponytail: no block streaming yet;
+// upgrade path is a client-streaming RPC for files larger than the cap).
+message SbcastRequest {
+  uint32 job_id = 1;
+  string dest = 2;    // Destination path on each node; relative resolves against the job work_dir
+  bytes data = 3;     // File contents
+  uint32 mode = 4;    // Unix permission bits (e.g. 0o755)
+  bool force = 5;     // Overwrite an existing destination
+  string user = 6;    // Requesting user; controller/admin credential overrides
+}
+
+message SbcastResponse {
+  bool success = 1;
+  string message = 2;         // Error detail when success is false
+  repeated string nodes = 3;  // Nodes the file was written to
+}
+
+// controller -> agent: write one file to this node's local filesystem. uid/gid/
+// work_dir come from the controller's authoritative job record, so the agent
+// stays stateless about the job.
+message ReceiveFileRequest {
+  uint32 job_id = 1;
+  string dest = 2;
+  bytes data = 3;
+  uint32 mode = 4;
+  bool force = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  string work_dir = 8;  // For relative-dest resolution
+}
+
+message ReceiveFileResponse {
+  bool success = 1;
+  string message = 2;
+}
 
 message RunCommandResponse {
   int32 exit_code = 1;

@@ -83,6 +83,9 @@ Command Map
    * - ``spur attach``
      - ``sattach``
      - Attach to a running job's I/O
+   * - ``spur sbcast``
+     - ``sbcast``
+     - Broadcast a file to a job's allocated nodes
    * - ``spur crontab``
      - ``scrontab``
      - Manage recurring cron-style jobs

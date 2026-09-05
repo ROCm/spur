@@ -242,6 +242,7 @@ mock_controller_impl! {
         }
     }
     unimplemented {
+        sbcast(proto::SbcastRequest) -> proto::SbcastResponse;
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
         cancel_job(proto::CancelJobRequest) -> ();

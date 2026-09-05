@@ -12,6 +12,7 @@ mod mpi_plugin;
 pub(crate) mod privdrop;
 pub(crate) mod pty;
 mod reporter;
+mod sbcast;
 mod seccomp;
 
 use std::collections::HashMap;
