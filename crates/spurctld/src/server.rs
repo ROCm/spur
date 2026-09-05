@@ -3634,6 +3634,23 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
     let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
 
+    // Reject an unexpandable --nodelist/--exclude at the submit boundary. An
+    // invalid pattern otherwise falls back to a literal name that matches no
+    // node: a bad --nodelist then never schedules (the job hangs with no
+    // reason), and a bad --exclude silently excludes nothing, so a job the user
+    // meant to keep off specific nodes can land on exactly those nodes. Both are
+    // failures the submitter cannot see, so both are rejected here as Slurm does.
+    //
+    // `validate` only counts hosts; it does not build the (possibly ~1M-element)
+    // Vec that `expand` would, since the scheduler re-expands the pattern later.
+    for (flag, pattern) in [("nodelist", &spec.nodelist), ("exclude", &spec.exclude)] {
+        if !pattern.is_empty() {
+            spur_core::hostlist::validate(pattern).map_err(|e| {
+                Status::invalid_argument(format!("invalid --{flag} '{pattern}': {e}"))
+            })?;
+        }
+    }
+
     let job_spec = spur_core::job::JobSpec {
         name: spec.name,
         partition: if spec.partition.is_empty() {
@@ -7965,6 +7982,38 @@ mod tests {
         let core = proto_to_job_spec(spec).unwrap();
         assert_eq!(core.num_tasks, 1);
         assert_eq!(core.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn proto_to_job_spec_rejects_unexpandable_node_patterns() {
+        let over_cap = spur_proto::proto::JobSpec {
+            nodelist: "node[0-2000000]".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_to_job_spec(over_cap).unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "an over-cap nodelist is rejected at submission"
+        );
+
+        let malformed = spur_proto::proto::JobSpec {
+            exclude: "node]1-2[".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_to_job_spec(malformed).unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "a malformed exclude pattern is rejected too"
+        );
+
+        let valid = spur_proto::proto::JobSpec {
+            nodelist: "node[1-4],other5".into(),
+            ..Default::default()
+        };
+        assert!(
+            proto_to_job_spec(valid).is_ok(),
+            "a valid pattern still passes"
+        );
     }
 
     #[test]
