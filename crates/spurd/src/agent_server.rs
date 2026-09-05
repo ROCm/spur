@@ -2602,6 +2602,81 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn adopt_session(
+        &self,
+        request: Request<AdoptSessionRequest>,
+    ) -> Result<Response<AdoptSessionResponse>, Status> {
+        Self::require_controller(&request)?;
+        let uid = request.into_inner().uid;
+
+        // The allocation this uid holds on this node. Deterministic when several
+        // exist: the lowest job_id (an explicit override can come later).
+        let alloc = {
+            let jobs = self.running.lock().await;
+            jobs.iter()
+                .filter(|(_, t)| t.uid == uid)
+                .min_by_key(|(id, _)| **id)
+                .map(|(id, t)| {
+                    (
+                        *id,
+                        t.gid,
+                        t.gpu_devices.clone(),
+                        t.partition.clone(),
+                        t.nodelist.clone(),
+                        t.cpus,
+                        t.memory_mb,
+                    )
+                })
+        };
+
+        let Some((job_id, gid, gpu_devices, partition, nodelist, cpus, memory_mb)) = alloc else {
+            return Ok(Response::new(AdoptSessionResponse {
+                has_allocation: false,
+                ..Default::default()
+            }));
+        };
+
+        // GPU visibility + job env the adopted session should carry, matching
+        // what a step in the allocation sees.
+        let mut gpu_env = if gpu_devices.is_empty() {
+            HashMap::new()
+        } else {
+            self.device_registry
+                .lock()
+                .await
+                .build_job_injection_plans("gpu", &gpu_devices, uid, gid)
+                .map(|(host, _)| host.env)
+                .unwrap_or_default()
+        };
+        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
+
+        let mut senv = SpurEnv::new();
+        senv.extend(&gpu_env);
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
+
+        // Ensure the allocation cgroup exists (a bare salloc may have run no step
+        // yet) so the session has a target to join. Empty when enforcement is off.
+        let cgroup_path = crate::executor::setup_step_cgroup(job_id, &self.cgroup, cpus, memory_mb)
+            .map(|_| {
+                crate::executor::job_cgroup_dir(job_id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+
+        Ok(Response::new(AdoptSessionResponse {
+            has_allocation: true,
+            job_id,
+            cgroup_path,
+            environment: senv.into_map(),
+        }))
+    }
+
     async fn interactive_session(
         &self,
         request: Request<tonic::Streaming<InteractiveInput>>,
@@ -4140,6 +4215,40 @@ mod tests {
             .expect_err("a non-owner must not exec inside another user's job");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn adopt_session_resolves_the_uids_allocation() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 88;
+        svc.insert_test_job(job_id, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        // The owner's uid (TrackedJob::dummy uses uid 0) finds the allocation.
+        let resp = svc
+            .adopt_session(Request::new(AdoptSessionRequest { uid: 0 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.has_allocation);
+        assert_eq!(resp.job_id, job_id);
+        assert_eq!(
+            resp.environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("88")
+        );
+
+        // A uid with no allocation on this node gets nothing to adopt into.
+        let none = svc
+            .adopt_session(Request::new(AdoptSessionRequest { uid: 4242 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!none.has_allocation);
     }
 
     #[tokio::test]

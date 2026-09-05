@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod adopt;
 mod authclient;
 mod env_defaults;
 mod exec;
@@ -184,7 +185,7 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "node" | "k8s" | "image" | "exec" | "token" => Some(args[1].as_str()),
+        "net" | "node" | "k8s" | "image" | "exec" | "token" | "adopt" => Some(args[1].as_str()),
         _ => None,
     };
 
@@ -238,6 +239,7 @@ fn main() -> anyhow::Result<()> {
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             "token" => runtime.block_on(token::main_with_args(rewritten)),
+            "adopt" => runtime.block_on(adopt::main_with_args(rewritten)),
             _ => unreachable!(),
         };
         return result;
