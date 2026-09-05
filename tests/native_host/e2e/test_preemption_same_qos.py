@@ -76,8 +76,10 @@ def _start_pair(cluster, qos: str, node: str, prefix: str):
     """Run a victim under *qos*, then queue an aggressor in the same QOS behind
     it and boost the aggressor past the 2x preemption threshold.
 
-    Returns (victim_id, aggressor_id) with the victim RUNNING and the aggressor
-    PENDING, both asserted.
+    Returns (victim_id, aggressor_id, preempted_before) with the victim RUNNING
+    and the aggressor PENDING, both asserted. preempted_before is the `Jobs
+    preempted` counter sampled just before the boost, so callers can assert
+    whether the scheduler actually acted on the allow-list gate.
     """
     victim_script = cluster.write_file(f"{prefix}-victim.sh", _SLEEP_SCRIPT)
     victim_id = parse_job_id(
@@ -99,11 +101,13 @@ def _start_pair(cluster, qos: str, node: str, prefix: str):
     wait_job_state(cluster, aggressor_id, "PD", timeout=30)
     _assert_scontrol_state(cluster, aggressor_id, "PENDING", "aggressor before boost")
 
+    preempted_before = cluster.sdiag_jobs_preempted()
+
     # Both jobs share a QOS, so their base priorities are identical and no gap
     # exists until the aggressor is boosted. Boosting isolates the allow-list as
     # the only remaining variable between this test and its counterpart.
     cluster.scontrol("update", f"JobId={aggressor_id}", f"Priority={_AGGRESSOR_PRIORITY}")
-    return victim_id, aggressor_id
+    return victim_id, aggressor_id, preempted_before
 
 
 class TestSameQosBlockedWithoutSelfListing:
@@ -125,7 +129,9 @@ class TestSameQosBlockedWithoutSelfListing:
         victim_id = None
         aggressor_id = None
         try:
-            victim_id, aggressor_id = _start_pair(c, "solo-burst", node, "same-qos-block")
+            victim_id, aggressor_id, preempted_before = _start_pair(
+                c, "solo-burst", node, "same-qos-block"
+            )
 
             # The priority gap is satisfied; only the allow-list stands in the
             # way. Nothing must change over several scheduler cycles.
@@ -140,6 +146,9 @@ class TestSameQosBlockedWithoutSelfListing:
                 "the boosted aggressor must keep waiting while the allow-list blocks it"
             )
             _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor after guard")
+            assert c.sdiag_jobs_preempted() == preempted_before, (
+                "no preemption decision should have been made while the allow-list blocks it"
+            )
         finally:
             for jid in (victim_id, aggressor_id):
                 if jid is not None:
@@ -173,14 +182,21 @@ class TestSameQosAllowedWhenSelfListed:
         time.sleep(_CACHE_WARMUP_SECS)
 
         listed = c.sacctmgr(["show", "qos", "format=Name,Preempt", "-P"])
-        assert "solo-burst-open" in listed, (
-            f"self-referential preempt allow-list was not stored:\n{listed}"
+        preempt_field = next(
+            (line.split("|", 1)[1] for line in listed.splitlines()
+             if line.startswith("solo-burst-open|")),
+            None,
+        )
+        assert preempt_field is not None and "solo-burst-open" in preempt_field, (
+            f"self-referential preempt allow-list was not stored in the Preempt field:\n{listed}"
         )
 
         victim_id = None
         aggressor_id = None
         try:
-            victim_id, aggressor_id = _start_pair(c, "solo-burst-open", node, "same-qos-allow")
+            victim_id, aggressor_id, preempted_before = _start_pair(
+                c, "solo-burst-open", node, "same-qos-allow"
+            )
 
             terminal = wait_job(c, victim_id, timeout=_WAIT_PREEMPT)
             assert terminal in ("CA", "GONE"), (
@@ -192,6 +208,9 @@ class TestSameQosAllowedWhenSelfListed:
 
             wait_job_state(c, aggressor_id, "R", timeout=30)
             _assert_scontrol_state(c, aggressor_id, "RUNNING", "aggressor after preemption")
+            assert c.sdiag_jobs_preempted() > preempted_before, (
+                "a QOS listing itself must trigger a scheduler preemption decision"
+            )
         finally:
             for jid in (victim_id, aggressor_id):
                 if jid is not None:
@@ -245,6 +264,8 @@ class TestEmptyAllowListsDisablePreemptionClusterWide:
             assert aggressor_id is not None, "aggressor submit failed"
             wait_job_state(c, aggressor_id, "PD", timeout=30)
 
+            preempted_before = c.sdiag_jobs_preempted()
+
             # Boost on top of the QOS gap so the priority threshold is
             # unambiguously cleared and only the allow-list can be responsible.
             c.scontrol("update", f"JobId={aggressor_id}", f"Priority={_AGGRESSOR_PRIORITY}")
@@ -258,6 +279,9 @@ class TestEmptyAllowListsDisablePreemptionClusterWide:
             _assert_scontrol_state(c, victim_id, "RUNNING", "victim after guard")
             assert job_state(sq, aggressor_id) == "PD", (
                 "the boosted high-QOS job must wait when no allow-list permits it"
+            )
+            assert c.sdiag_jobs_preempted() == preempted_before, (
+                "no preemption decision should have been made with all allow-lists empty"
             )
         finally:
             for jid in (victim_id, aggressor_id):

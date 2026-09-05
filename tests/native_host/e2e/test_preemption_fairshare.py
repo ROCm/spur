@@ -71,16 +71,24 @@ def _assert_scontrol_state(cluster, job_id: int, expected: str, label: str = "")
     )
 
 
+def _sql_str(value: str) -> str:
+    """Escape a value for embedding as a single-quoted SQL string literal."""
+    return value.replace("'", "''")
+
+
 def _seed_usage(cluster, user: str, account: str, cpu_seconds: int) -> None:
     """Plant a decayed-usage row so fair-share has history to divide by.
 
-    period_start is NOW() so exponential decay is negligible, keeping the
-    resulting factor predictable rather than a function of test runtime.
+    period_start is truncated to today (not NOW()) so exponential decay stays
+    negligible while repeated calls for the same user/account still collide on
+    the table's (user_name, account, period_start) primary key and update in
+    place instead of inserting duplicate rows.
     """
     cluster.psql(
         "INSERT INTO usage "
         "(user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count) "
-        f"VALUES ('{user}', '{account}', NOW(), NOW(), {cpu_seconds}, 0, 1) "
+        f"VALUES ('{_sql_str(user)}', '{_sql_str(account)}', "
+        f"date_trunc('day', NOW()), NOW(), {cpu_seconds}, 0, 1) "
         "ON CONFLICT (user_name, account, period_start) "
         "DO UPDATE SET cpu_seconds = EXCLUDED.cpu_seconds"
     )
