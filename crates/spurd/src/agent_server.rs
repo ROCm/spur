@@ -2904,8 +2904,9 @@ impl AgentService {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
             }
             // Reclaim the allocation cgroup a step/interactive session may have
-            // created (best-effort; only removes once it is empty).
-            crate::executor::remove_job_cgroup(job_id);
+            // created: kill any residual members and remove it. This is the
+            // default node-side teardown, independent of any site epilog.
+            crate::executor::reclaim_job_cgroup(job_id);
         }
     }
 

@@ -1116,9 +1116,16 @@ pub(crate) fn setup_step_cgroup(
 
 /// Remove a job's cgroup directory once its allocation ends (best-effort). The
 /// directory removes only when empty, so this is a no-op while processes remain.
-pub(crate) fn remove_job_cgroup(job_id: JobId) {
+/// Reclaim a job's cgroup when its allocation ends: SIGKILL any process still in
+/// it, then remove the directory. This is the default node-side teardown for
+/// residual processes of a released allocation (an interactive/step child, or —
+/// once sessions are adopted — a debug SSH session), independent of any
+/// site-configured epilog. A no-op when the cgroup was never created.
+pub(crate) fn reclaim_job_cgroup(job_id: JobId) {
     let path = PathBuf::from(CGROUP_ROOT).join(format!("job_{}", job_id));
-    let _ = std::fs::remove_dir(&path);
+    if path.exists() {
+        cleanup_cgroup(&path);
+    }
 }
 
 /// Join the calling process to a cgroup (its pid → `cgroup.procs`). Runs post-fork
