@@ -1315,11 +1315,26 @@ pub(crate) fn open_step_output_files(
     let stdout_path = spool_dir.join(format!("step{step_id}.out"));
     let stderr_path = spool_dir.join(format!("step{step_id}.err"));
     let open = |path: &Path| -> Result<std::fs::File, LaunchError> {
-        open_output_file(&path.to_string_lossy(), false).map_err(|e| {
+        let file = open_output_file(&path.to_string_lossy(), false).map_err(|e| {
             LaunchError::NodeFault(
                 anyhow::Error::new(e).context(format!("open step output file {}", path.display())),
             )
-        })
+        })?;
+        // These files hold arbitrary user output, so keep them private (0600) —
+        // they can otherwise become world-readable under a typical umask. The
+        // child inherits the write fd, so it writes regardless of ownership; hand
+        // ownership to the job user when spurd is root so only they (and root)
+        // can read it, matching write_job_scratch.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            if should_run_as_user(uid) {
+                use nix::unistd::{Gid, Uid};
+                let _ = nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
+            }
+        }
+        Ok(file)
     };
     let stdout = open(&stdout_path)?;
     let stderr = open(&stderr_path)?;
