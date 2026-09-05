@@ -477,6 +477,9 @@ service SlurmAgent {
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // PTY-backed interactive session (srun --pty, sattach, srun --overlap --pty)
   rpc InteractiveSession(stream InteractiveInput) returns (stream InteractiveOutput);
+  // Whether a uid holds an allocation on this node, and how to adopt an SSH
+  // session into it (pam session adoption / admission). Answered locally.
+  rpc AdoptSession(AdoptSessionRequest) returns (AdoptSessionResponse);
 
   // -- Native cluster component control: the controller drives each node's
   //    spurd-owned k0s systemd unit through these. --
@@ -1248,6 +1251,18 @@ message RegisterJobAllocationRequest {
 }
 
 message RegisterJobAllocationResponse {}
+
+// Adopt an SSH session on this node into the allocation its user holds.
+message AdoptSessionRequest {
+  uint32 uid = 1;  // the local user whose session should be adopted
+}
+
+message AdoptSessionResponse {
+  bool has_allocation = 1;  // whether the uid holds an allocation on this node
+  uint32 job_id = 2;        // the chosen allocation (deterministic across calls)
+  string cgroup_path = 3;   // /sys/fs/cgroup/spur/job_<id> to join; empty if not confined
+  map<string, string> environment = 4;  // GPU visibility + SPUR_*/SLURM_* to export
+}
 
 message RunCommandResponse {
   int32 exit_code = 1;
