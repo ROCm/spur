@@ -766,6 +766,9 @@ async fn dispatch_step(
     if args.input.is_some() {
         eprintln!("srun: warning: --input is not supported in step mode, ignoring");
     }
+    for warning in step_mode_unsupported_warnings(args) {
+        eprintln!("{warning}");
+    }
 
     let environment = srun_dispatch_environment(args);
     warn_unsupported_cpu_bind(&environment);
@@ -1349,10 +1352,18 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
 /// mode (spur#780) via `run_interactive_pty`, so it is no longer listed here.
 fn step_mode_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
     let mut warnings = Vec::new();
-    if args.container_image.is_some() {
+    // Any container option implies the user wants a container; all of them are
+    // dropped in step mode, so warn if any is set (not just --container-image).
+    let container_requested = args.container_image.is_some()
+        || !args.container_mounts.is_empty()
+        || args.container_workdir.is_some()
+        || args.container_mount_home
+        || !args.container_env.is_empty()
+        || args.container_remap_root;
+    if container_requested {
         warnings.push(
-            "srun: warning: --container-image is not yet honored in step mode; \
-             the command runs on the host, not inside the image (spur#777)"
+            "srun: warning: container options are not yet honored in step mode; \
+             the command runs on the host, not inside a container (spur#777)"
                 .to_string(),
         );
     }
@@ -1371,13 +1382,10 @@ async fn run_as_step(
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    if args.input.is_some() {
-        eprintln!("srun: warning: --input is not supported in step mode, ignoring");
-    }
-    for warning in step_mode_unsupported_warnings(args) {
-        eprintln!("{warning}");
-    }
-
+    // Step-mode warnings (--input, dropped container options) are emitted in
+    // dispatch_step, which every non-pty step dispatch goes through. A `--pty`
+    // step returns before dispatch_step, so emit the dropped-container warning on
+    // that path here (--pty itself is honored, so it needs no warning).
     let io = resolve_io_paths(args);
     let user = crate::interactive::job_caller_user(&mut client, job_id, None).await?;
 
@@ -1387,6 +1395,9 @@ async fn run_as_step(
     // own step and owns the exit code, so return here rather than dispatching a
     // second, non-interactive step.
     if args.pty {
+        for warning in step_mode_unsupported_warnings(args) {
+            eprintln!("{warning}");
+        }
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
         let exit_code =
             run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
@@ -1469,8 +1480,16 @@ mod tests {
             .expect("parse failed");
         let warnings = step_mode_unsupported_warnings(&args);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("--container-image"));
+        assert!(warnings[0].contains("container options"));
         assert!(warnings[0].contains("spur#777"));
+    }
+
+    #[test]
+    fn step_mode_warns_on_container_flags_without_image() {
+        // Container modifiers are also dropped in step mode, so any of them warns.
+        let args = SrunArgs::try_parse_from(["srun", "--container-mounts", "/a:/b", "hostname"])
+            .expect("parse failed");
+        assert_eq!(step_mode_unsupported_warnings(&args).len(), 1);
     }
 
     #[test]
@@ -1482,13 +1501,13 @@ mod tests {
     }
 
     #[test]
-    fn step_mode_warns_only_on_container_image_when_pty_also_set() {
+    fn step_mode_warns_only_on_container_when_pty_also_set() {
         let args =
             SrunArgs::try_parse_from(["srun", "--container-image", "img.sqsh", "--pty", "bash"])
                 .expect("parse failed");
         let warnings = step_mode_unsupported_warnings(&args);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("--container-image"));
+        assert!(warnings[0].contains("container options"));
     }
 
     #[test]
