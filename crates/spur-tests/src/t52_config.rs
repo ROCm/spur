@@ -151,7 +151,7 @@ priority_tier = 1
 [[partitions]]
 name = "debug"
 nodes = "node[001-002]"
-max_time = "1:00"
+max_time = "1:00:00"
 "#,
         )
         .unwrap();
