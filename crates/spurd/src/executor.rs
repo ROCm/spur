@@ -1331,7 +1331,8 @@ pub(crate) fn open_step_output_files(
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
             if should_run_as_user(uid) {
                 use nix::unistd::{Gid, Uid};
-                let _ = nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
+                let _ =
+                    nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
             }
         }
         Ok(file)
