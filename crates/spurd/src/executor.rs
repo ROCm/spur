@@ -1275,7 +1275,11 @@ pub(crate) struct StepOutputFiles {
 /// roots [`open_step_output_files`] (via [`create_job_spool_dir`]) chooses
 /// between. A reader that did not open the file cannot see which root the writer
 /// picked, so it checks both. Kept in sync with `open_step_output_files`' names.
-pub(crate) fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: bool) -> Vec<PathBuf> {
+pub(crate) fn step_output_path_candidates(
+    job_id: JobId,
+    step_id: u32,
+    stderr: bool,
+) -> Vec<PathBuf> {
     let name = format!("step{step_id}.{}", if stderr { "err" } else { "out" });
     [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]
         .into_iter()
@@ -1285,7 +1289,11 @@ pub(crate) fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: b
 
 /// The step's spool file if it already exists on disk, so a reader can tail a
 /// step that finished before it observed the step's active_steps entry.
-pub(crate) fn existing_step_output_path(job_id: JobId, step_id: u32, stderr: bool) -> Option<String> {
+pub(crate) fn existing_step_output_path(
+    job_id: JobId,
+    step_id: u32,
+    stderr: bool,
+) -> Option<String> {
     step_output_path_candidates(job_id, step_id, stderr)
         .into_iter()
         .find(|p| p.exists())
@@ -1877,8 +1885,8 @@ async fn launch_container_job(
 /// Wrap a step's argv in a one-shot bash script that execs it, shell-escaped so
 /// metacharacters stay literal (matching `srun`'s no-shell argv semantics).
 fn build_container_step_script(command: &[String]) -> anyhow::Result<String> {
-    let joined = shlex::try_join(command.iter().map(String::as_str))
-        .context("command is not shell-safe")?;
+    let joined =
+        shlex::try_join(command.iter().map(String::as_str)).context("command is not shell-safe")?;
     Ok(format!("#!/bin/bash\nexec {joined}\n"))
 }
 
@@ -2027,15 +2035,14 @@ pub async fn run_container_step(
 
             // Wait for the step to finish in a blocking task so the async runtime
             // is not stalled.
-            let exit = tokio::task::spawn_blocking(move || {
-                match nix::sys::wait::waitpid(child, None) {
+            let exit =
+                tokio::task::spawn_blocking(move || match nix::sys::wait::waitpid(child, None) {
                     Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
                     Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
                     _ => 1,
-                }
-            })
-            .await
-            .unwrap_or(1);
+                })
+                .await
+                .unwrap_or(1);
 
             crate::container::cleanup_rootfs(job_id, &rootfs_mode);
             let _ = std::fs::remove_dir_all(&rootfs_buf);

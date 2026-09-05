@@ -2395,9 +2395,8 @@ impl SlurmAgent for AgentService {
         // stream_job_output tails the files live, and output stays bounded on this
         // node. Paths are recorded in active_steps so the tail can find them. Both
         // the host and container paths below use these files.
-        let step_files =
-            crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
-                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let step_files = crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
+            .map_err(|e| Status::internal(format!("step output files: {e}")))?;
         let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
         let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
         {
@@ -4329,7 +4328,10 @@ mod tests {
         // More output appears, then the step finishes.
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b"part2\n").unwrap();
         }
         svc.active_steps.lock().await.remove(&(job_id, step_id));

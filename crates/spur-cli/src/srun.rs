@@ -9,9 +9,9 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
-    ContainerSpec, JobSpec, JobState, RunStepRequest, StreamJobOutputChunk, StreamJobOutputRequest,
-    SubmitJobRequest,
+    CancelJobRequest, CompleteJobRequest, ContainerSpec, CreateJobStepRequest, GetJobRequest,
+    GetNodeRequest, JobSpec, JobState, RunStepRequest, StreamJobOutputChunk,
+    StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -752,7 +752,10 @@ fn container_spec_from_args(args: &SrunArgs) -> Option<ContainerSpec> {
         env: args
             .container_env
             .iter()
-            .filter_map(|s| s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|s| {
+                s.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect(),
         entrypoint: String::new(),
         remap_root: args.container_remap_root,
