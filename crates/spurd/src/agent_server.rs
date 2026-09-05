@@ -200,6 +200,10 @@ fn start_pmix_launch(
 struct ActiveStep {
     cancel_requested: bool,
     pid: Option<u32>,
+    /// Spool files the step's stdout/stderr are redirected to, so
+    /// `stream_job_output` can tail them live keyed on (job_id, step_id).
+    stdout_path: String,
+    stderr_path: String,
 }
 
 struct ActiveStepGuard {
@@ -2287,9 +2291,25 @@ impl SlurmAgent for AgentService {
 
         use std::process::Stdio;
 
+        // Redirect the step's stdout/stderr to per-step spool files rather than
+        // piping the whole output into memory: the child inherits the write fds,
+        // stream_job_output tails the files live, and output stays bounded on this
+        // node. Paths are recorded in active_steps so the tail can find them.
+        let step_files = crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
+            .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
+        let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
+        {
+            let mut steps = self.active_steps.lock().await;
+            if let Some(step) = steps.get_mut(&step_key) {
+                step.stdout_path = stdout_path.clone();
+                step.stderr_path = stderr_path.clone();
+            }
+        }
+
         let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(step_files.stdout))
+            .stderr(Stdio::from(step_files.stderr))
             .spawn()
             .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
         if let Some(pid) = child.id() {
@@ -2305,13 +2325,13 @@ impl SlurmAgent for AgentService {
             if cancel_now {
                 signal_step_process_group(pid, nix::sys::signal::Signal::SIGTERM as i32);
                 let _ = child.kill().await;
-                let _ = child.wait_with_output().await;
+                let _ = child.wait().await;
                 return Ok(Response::new(cancelled_step_response()));
             }
         }
 
-        let output = match child.wait_with_output().await {
-            Ok(output) => output,
+        let status = match child.wait().await {
+            Ok(status) => status,
             Err(e) => return Err(Status::internal(format!("command failed: {}", e))),
         };
 
@@ -2333,10 +2353,25 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        // Backward-compatible: the response still carries the step's output by
+        // reading the spool files back. #781 replaces this with a client-side
+        // StreamJobOutput tail and drops the read-back, removing the memory bound.
+        let read_back = |path: String| async move {
+            match tokio::fs::read(&path).await {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) => {
+                    // Don't fail the step over a read-back error, but log it so a
+                    // missing response body can be correlated with a filesystem
+                    // fault rather than looking like the step produced no output.
+                    warn!(path = %path, error = %e, "failed to read back step output");
+                    String::new()
+                }
+            }
+        };
         Ok(Response::new(RunCommandResponse {
-            exit_code: spur_core::process::shell_exit_code(&output.status),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: spur_core::process::shell_exit_code(&status),
+            stdout: read_back(stdout_path).await,
+            stderr: read_back(stderr_path).await,
         }))
     }
 
@@ -2350,6 +2385,129 @@ impl SlurmAgent for AgentService {
 
         self.check_job_access(job_id, identity.as_ref(), &req.user, "read output of")
             .await?;
+
+        // Step output: tail the per-step spool file recorded by run_command and
+        // finish when the step leaves active_steps (rather than the batch file,
+        // which ends only when the whole allocation does). This is what lets an
+        // srun step stream live and terminate at step exit (#781).
+        if req.step_id != 0 {
+            let active_steps = self.active_steps.clone();
+            let want_stderr = req.stream == "stderr";
+            let step_id = req.step_id;
+            let step_key = (job_id, step_id);
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            tokio::spawn(async move {
+                // run_command records the step's output path right before it
+                // spawns the child (once the spool file exists). Wait for that,
+                // falling back to the deterministic spool path if the file is
+                // already on disk (a step that finished before we observed its
+                // active_steps entry), and giving up only if the step comes and
+                // goes without ever producing a file.
+                const START_POLLS: u32 = 150; // 150 * 200ms = 30s startup grace
+                let mut file_path = String::new();
+                let mut seen = false;
+                for _ in 0..START_POLLS {
+                    {
+                        let steps = active_steps.lock().await;
+                        if let Some(step) = steps.get(&step_key) {
+                            seen = true;
+                            let path = if want_stderr {
+                                &step.stderr_path
+                            } else {
+                                &step.stdout_path
+                            };
+                            if !path.is_empty() {
+                                file_path = path.clone();
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(existing) =
+                        crate::executor::existing_step_output_path(job_id, step_id, want_stderr)
+                    {
+                        file_path = existing;
+                        break;
+                    }
+                    // Present then gone without a file: the step failed to spawn.
+                    if seen && !active_steps.lock().await.contains_key(&step_key) {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                }
+                if file_path.is_empty() {
+                    // Could not resolve the step's spool file (the step failed to
+                    // start, or the step_id is wrong). Signal an error rather than
+                    // a clean EOF, so the client falls back to the buffered RunStep
+                    // output instead of treating an empty stream as success.
+                    let _ = tx
+                        .send(Err(Status::not_found(format!(
+                            "no output stream for job {job_id} step {step_id}"
+                        ))))
+                        .await;
+                    return;
+                }
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                let mut file = match tokio::fs::File::open(&file_path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("open step output file: {e}"))))
+                            .await;
+                        return;
+                    }
+                };
+                // Tail incrementally: seek to the last offset and read only the
+                // newly appended bytes each poll, instead of re-reading the whole
+                // file (which is O(n^2) for high-volume steps).
+                let mut offset: u64 = 0;
+                loop {
+                    if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                        let mut buf = Vec::new();
+                        if let Ok(n) = file.read_to_end(&mut buf).await {
+                            if n > 0 {
+                                offset += n as u64;
+                                if tx
+                                    .send(Ok(StreamJobOutputChunk {
+                                        data: buf,
+                                        eof: false,
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    break; // client disconnected
+                                }
+                            }
+                        }
+                    }
+                    let still_running = active_steps.lock().await.contains_key(&step_key);
+                    if !still_running {
+                        // Final read to drain anything written after the last poll.
+                        if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                            let mut buf = Vec::new();
+                            if let Ok(n) = file.read_to_end(&mut buf).await {
+                                if n > 0 {
+                                    let _ = tx
+                                        .send(Ok(StreamJobOutputChunk {
+                                            data: buf,
+                                            eof: false,
+                                        }))
+                                        .await;
+                                }
+                            }
+                        }
+                        let _ = tx
+                            .send(Ok(StreamJobOutputChunk {
+                                data: Vec::new(),
+                                eof: true,
+                            }))
+                            .await;
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                }
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
 
         // No retry on a miss, same as run_command: a Running job has been
         // confirmed on every node (confirm_dispatch_on_nodes). Callers here
@@ -3380,6 +3538,7 @@ impl AgentService {
             ActiveStep {
                 cancel_requested: false,
                 pid,
+                ..Default::default()
             },
         );
     }
@@ -3662,7 +3821,12 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let job_id = 100;
+        // A unique job_id per test so each gets its own step spool dir
+        // (temp/spur/job<id>/step0.out) and parallel tests do not clobber one
+        // another's step output. Production step_ids are unique per job via
+        // create_job_step; only these fixed-id tests would otherwise collide.
+        static NEXT_JOB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+        let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
         (svc, job_id)
     }
@@ -3952,6 +4116,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_job_output_tails_step_spool_file() {
+        use tokio_stream::StreamExt as _;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 77;
+        svc.insert_test_job(job_id, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        // A step whose spool file already holds some output, recorded as an
+        // active step (as run_command would).
+        let step_id = 5;
+        let dir = std::env::temp_dir().join(format!("spur-stream-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("step5.out");
+        std::fs::write(&path, b"part1\n").unwrap();
+        svc.active_steps.lock().await.insert(
+            (job_id, step_id),
+            ActiveStep {
+                stdout_path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+
+        let mut stream = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                job_id,
+                step_id,
+                stream: "stdout".into(),
+                user: "testuser".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // The already-written bytes stream out before the step ends.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("a chunk should arrive")
+            .expect("stream still open")
+            .unwrap();
+        assert_eq!(first.data, b"part1\n");
+        assert!(!first.eof);
+
+        // More output appears, then the step finishes.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"part2\n").unwrap();
+        }
+        svc.active_steps.lock().await.remove(&(job_id, step_id));
+
+        let mut rest = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("a chunk should arrive")
+                .expect("stream still open")
+                .unwrap();
+            if chunk.eof {
+                break;
+            }
+            rest.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(rest, b"part2\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn stream_job_output_rejects_non_owner() {
         let svc = AgentService::new(
             test_reporter(),
@@ -3967,6 +4207,7 @@ mod tests {
                 job_id: 44,
                 stream: "stdout".into(),
                 user: "intruder".into(),
+                ..Default::default()
             }))
             .await
             .expect_err("a non-owner must not read another user's job output");
@@ -4326,6 +4567,33 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
         assert_eq!(observed_canonical, tmp_canonical);
+    }
+
+    #[tokio::test]
+    async fn run_command_writes_step_output_to_spool_file() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "spooled-marker".into()],
+            uid: 0,
+            gid: 0,
+            job_id,
+            ..Default::default()
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        // The step's stdout must live in a spool file the agent can tail, not
+        // only in the RPC response — this file is what StreamJobOutput follows
+        // (#781). step_id defaults to 0 here, so the file is step0.out.
+        let contents = [
+            std::path::PathBuf::from("/var/spool/spur"),
+            std::env::temp_dir().join("spur"),
+        ]
+        .iter()
+        .find_map(|base| {
+            std::fs::read_to_string(base.join(format!("job{job_id}")).join("step0.out")).ok()
+        })
+        .expect("step stdout spool file should exist on disk");
+        assert_eq!(contents.trim(), "spooled-marker");
     }
 
     #[tokio::test]

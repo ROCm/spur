@@ -1265,6 +1265,7 @@ message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
   string user = 3;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
+  uint32 step_id = 4; // 0 = the batch job's own output; >0 = tail that step's per-step spool file
 }
 
 message StreamJobOutputChunk {
