@@ -3198,6 +3198,11 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Look up one step without scanning (and cloning) every step in the cluster.
+    pub fn get_step(&self, job_id: JobId, step_id: u32) -> Option<JobStep> {
+        self.steps.read().get(&(job_id, step_id)).cloned()
+    }
+
     /// Get all steps for a job.
     pub fn get_steps(&self, job_id: JobId) -> Vec<JobStep> {
         self.steps
@@ -5711,6 +5716,10 @@ impl ClusterManager {
                     job.preempted_by = None;
                     job.preempt_mode = None;
                     job.preempt_qos = None;
+                    // Same reason, and it must be here rather than at requeue:
+                    // the finished run's record is written after that apply.
+                    job.derived_exit_code = 0;
+                    job.exit_signal = 0;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -5928,26 +5937,31 @@ impl ClusterManager {
                 step_id,
                 exit_code,
             } => {
-                // Record the step's own exit code/state.
-                {
-                    let mut steps = self.steps.write();
-                    if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
-                        step.state = if *exit_code == 0 {
-                            StepState::Completed
-                        } else {
-                            StepState::Failed
-                        };
-                        step.exit_code = Some(*exit_code);
-                        step.end_time = Some(timestamp);
+                // Keyed on job state, not step state: the eviction sweep
+                // (complete_evicted_steps) runs leader-only, so steps can diverge.
+                let job_over = jobs.get(job_id).is_some_and(|j| j.state.is_terminal());
+                if !job_over {
+                    // Record the step's own exit code/state.
+                    {
+                        let mut steps = self.steps.write();
+                        if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
+                            step.state = if *exit_code == 0 {
+                                StepState::Completed
+                            } else {
+                                StepState::Failed
+                            };
+                            step.exit_code = Some(*exit_code);
+                            step.end_time = Some(timestamp);
+                        }
                     }
-                }
-                // DerivedExitCode is the running max over srun steps (the batch
-                // step is excluded — it carries the job's own exit, not a step
-                // result). Maintained live so `scontrol show job` reflects it
-                // mid-run, matching Slurm.
-                if *step_id < STEP_RESERVED_MIN {
-                    if let Some(job) = jobs.get_mut(job_id) {
-                        job.derived_exit_code = job.derived_exit_code.max(*exit_code);
+                    // DerivedExitCode is the running max over srun steps (the batch
+                    // step is excluded — it carries the job's own exit, not a step
+                    // result). Maintained live so `scontrol show job` reflects it
+                    // mid-run, matching Slurm.
+                    if *step_id < STEP_RESERVED_MIN {
+                        if let Some(job) = jobs.get_mut(job_id) {
+                            job.derived_exit_code = job.derived_exit_code.max(*exit_code);
+                        }
                     }
                 }
             }
@@ -10434,6 +10448,147 @@ mod tests {
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(2));
         assert_eq!(job.derived_exit_code, 7);
+    }
+
+    /// A PTY client reports client-side, so its report can land after a sweep
+    /// has already closed the step out. The sweep's verdict must stand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_complete_is_ignored_once_the_job_is_terminal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("late-step")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: 1,
+                step_id: 0,
+                name: "pty".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: spur_core::resource::ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+            }),
+        });
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 3,
+        });
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+
+        let swept = cm
+            .get_step(1, 0)
+            .expect("step survives job completion until eviction");
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 9,
+        });
+
+        let after = cm.get_step(1, 0).expect("step still present");
+        assert_eq!(after.exit_code, swept.exit_code, "verdict must not reopen");
+        assert_eq!(after.state, swept.state);
+        assert_eq!(
+            cm.get_job(1).unwrap().derived_exit_code,
+            3,
+            "a late report must not raise DerivedExitCode after accounting saw it"
+        );
+    }
+
+    /// The requeue's own accounting row is written after that apply returns, so
+    /// the previous run's DerivedExitCode must survive it and clear at next start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derived_exit_code_survives_requeue_and_clears_at_next_start() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let start = || WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        };
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("requeued")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&start());
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 5,
+        });
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 9,
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!((job.derived_exit_code, job.exit_signal), (5, 9));
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: 1,
+            hold: false,
+            begin_time: None,
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(
+            (job.derived_exit_code, job.exit_signal),
+            (5, 9),
+            "accounting for the finished run is written after this apply"
+        );
+
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&start());
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(
+            (job.derived_exit_code, job.exit_signal),
+            (0, 0),
+            "the new run must not inherit the previous run's exit fields"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -9,9 +9,9 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, CompleteJobRequest, ContainerSpec, CreateJobStepRequest, GetJobRequest,
-    GetNodeRequest, JobSpec, JobState, RunStepRequest, StreamJobOutputChunk,
-    StreamJobOutputRequest, SubmitJobRequest,
+    CancelJobRequest, CompleteJobRequest, CompleteJobStepRequest, ContainerSpec,
+    CreateJobStepRequest, GetJobRequest, GetNodeRequest, JobSpec, JobState, RunStepRequest,
+    StreamJobOutputChunk, StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -241,6 +241,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // --jobid --overlap: exec into a running job (interactive PTY session)
     if let Some(job_id) = args.jobid {
+        let warnings = step_unsupported_warnings(&args)
+            .into_iter()
+            .chain(pty_step_unsupported_warnings(&args, &matches));
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
         let channel = crate::authclient::connect(&args.controller)
             .await
@@ -254,8 +260,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let known_owner = (!job.user.is_empty()).then_some(job.user.as_str());
         let user = crate::interactive::job_caller_user(&mut ctrl, job_id, known_owner).await?;
         let exit_code =
-            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
-                .await?;
+            run_interactive_pty(&mut ctrl, job_id, args.command.clone(), node, &user).await?;
         std::process::exit(exit_code);
     }
 
@@ -303,7 +308,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Step mode: if running inside an allocation, create a step instead of a new job
     if let Ok(parent_job_id) = std::env::var("SPUR_JOB_ID") {
         if let Ok(job_id) = parent_job_id.parse::<u32>() {
-            return run_as_step(&args, job_id, &hooks, &work_dir, &resolved_mpi).await;
+            return run_as_step(&args, &matches, job_id, &hooks, &work_dir, &resolved_mpi).await;
         }
     }
 
@@ -816,9 +821,12 @@ async fn dispatch_step(
         .into_inner()
         .step_id;
 
-    warn_and_validate_step(args, ntasks)?;
+    for warning in step_unsupported_warnings(args) {
+        eprintln!("{warning}");
+    }
 
     let environment = srun_dispatch_environment(args);
+    validate_step_cpu_bind(&environment, ntasks)?;
     // Live-stream the step's output when it lands on a single node and the user
     // has not redirected to a file. The tail runs concurrently with the blocking
     // RunStep and ends when the step leaves the agent's active_steps (#781).
@@ -982,7 +990,7 @@ async fn run_standalone_srun(
         ctrl_c_handle.abort();
         eprintln!("srun: opening interactive session on {}", running.nodelist);
         let result = run_interactive_pty(
-            &args.controller,
+            &mut client,
             job_id,
             args.command.clone(),
             String::new(),
@@ -996,6 +1004,8 @@ async fn run_standalone_srun(
                 user: owner.clone(),
             })
             .await;
+        // SrunProlog already ran for this invocation; pair it.
+        run_srun_epilog(hooks, work_dir).await;
         std::process::exit(result?);
     }
 
@@ -1313,6 +1323,16 @@ async fn poll_for_completion(
     }
 }
 
+async fn run_srun_epilog(hooks: &HooksConfig, work_dir: &str) {
+    let Some(ref srun_epilog) = hooks.srun_epilog else {
+        return;
+    };
+    let ctx = srun_hook_context("epilog_srun", work_dir);
+    if let Err(e) = spur_core::hooks::run_hook(srun_epilog, &ctx).await {
+        eprintln!("srun: warning: SrunEpilog failed: {}", e);
+    }
+}
+
 async fn handle_terminal_state(
     state: JobState,
     job_id: u32,
@@ -1322,12 +1342,7 @@ async fn handle_terminal_state(
     hooks: &HooksConfig,
     output_streamed: bool,
 ) -> ! {
-    if let Some(ref srun_epilog) = hooks.srun_epilog {
-        let ctx = srun_hook_context("epilog_srun", work_dir);
-        if let Err(e) = spur_core::hooks::run_hook(srun_epilog, &ctx).await {
-            eprintln!("srun: warning: SrunEpilog failed: {}", e);
-        }
-    }
+    run_srun_epilog(hooks, work_dir).await;
 
     let should_print = !output_streamed && stdout_path.is_empty();
 
@@ -1409,104 +1424,144 @@ fn warn_unsupported_cpu_bind(environment: &HashMap<String, String>) {
     }
 }
 
-/// Create an interactive PTY step on a running job and attach to it.
-///
-/// Retries transient failures (job not yet visible on agent after controller
-/// reports it as Running) up to a few seconds before giving up.
+/// A session that never ran still closes its step out, reporting 1 so the step
+/// does not linger Running for the life of the allocation.
+fn interactive_exit_code(outcome: &Result<i32>) -> i32 {
+    outcome.as_ref().copied().unwrap_or(1)
+}
+
+/// Report a PTY step's exit code. `RunStep` records its own steps controller-side;
+/// an interactive session streams client-to-agent, so nothing else closes this one.
+async fn complete_interactive_step(
+    ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    step_id: u32,
+    exit_code: i32,
+    user: &str,
+) {
+    // Bounded: this runs after the PTY has closed, so an unreachable leader would
+    // otherwise hang the user's shell with nothing on screen.
+    let report = ctrl.complete_job_step(CompleteJobStepRequest {
+        job_id,
+        step_id,
+        exit_code,
+        user: user.to_string(),
+        uid: nix::unistd::geteuid().as_raw(),
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(5), report).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("srun: warning: failed to record step {step_id} completion: {e}"),
+        Err(_) => eprintln!("srun: warning: timed out recording step {step_id} completion"),
+    }
+}
+
+/// Create an interactive PTY step on a running job and attach to it, reporting
+/// the step's exit code on every exit path once the step exists.
 async fn run_interactive_pty(
-    controller: &str,
+    ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     command: Vec<String>,
     node: String,
     user: &str,
 ) -> Result<i32> {
-    let channel = crate::authclient::connect(controller)
-        .await
-        .context("cannot connect to controller")?;
-    let mut ctrl = SlurmControllerClient::new(channel);
-
     let winsize = crate::interactive::get_terminal_size();
 
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut created_step: Option<u32> = None;
     let mut cached_step: Option<(u32, String)> = None;
 
-    for attempt in 0..5 {
-        if attempt > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
+    let outcome: Result<i32> = 'session: {
+        let mut last_err: Option<anyhow::Error> = None;
 
-        let (step_id, node_addr) = if let Some(ref cached) = cached_step {
-            cached.clone()
-        } else {
-            let step_resp = match ctrl
-                .create_job_step(CreateJobStepRequest {
-                    job_id,
-                    command: command.clone(),
-                    num_tasks: 1,
-                    cpus_per_task: 1,
-                    overlap: true,
-                    pty: true,
-                    winsize: Some(winsize),
-                    node: node.clone(),
-                    user: user.to_string(),
-                    uid: nix::unistd::geteuid().as_raw(),
-                })
-                .await
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+
+            let (step_id, node_addr) = if let Some(ref cached) = cached_step {
+                cached.clone()
+            } else {
+                let step_resp = match ctrl
+                    .create_job_step(CreateJobStepRequest {
+                        job_id,
+                        command: command.clone(),
+                        num_tasks: 1,
+                        cpus_per_task: 1,
+                        // A PTY step always shares the allocation it runs in.
+                        overlap: true,
+                        pty: true,
+                        winsize: Some(winsize),
+                        node: node.clone(),
+                        user: user.to_string(),
+                        uid: nix::unistd::geteuid().as_raw(),
+                    })
+                    .await
+                {
+                    Ok(resp) => resp.into_inner(),
+                    Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                        last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
+                        continue;
+                    }
+                    Err(status) => {
+                        break 'session Err(anyhow::anyhow!(
+                            "CreateJobStep failed: {}",
+                            status.message()
+                        ))
+                    }
+                };
+
+                created_step = Some(step_resp.step_id);
+                if step_resp.node_addr.is_empty() {
+                    break 'session Err(anyhow::anyhow!(
+                        "controller did not return a node address for job {}",
+                        job_id
+                    ));
+                }
+                let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
+                cached_step = Some(pair.clone());
+                pair
+            };
+
+            let mut agent = match crate::interactive::connect_agent(&node_addr).await {
+                Ok(agent) => agent,
+                Err(e) => break 'session Err(e),
+            };
+
+            match crate::interactive::open_interactive_session(
+                &mut agent,
+                job_id,
+                step_id,
+                command.clone(),
+                winsize,
+                true,
+                user,
+            )
+            .await
             {
-                Ok(resp) => resp.into_inner(),
+                Ok(handle) => {
+                    break 'session crate::interactive::drive_interactive_session(handle).await
+                }
                 Err(status) if is_retryable_status(&status) && attempt < 4 => {
-                    last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
+                    last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
                     continue;
                 }
                 Err(status) => {
-                    return Err(anyhow::anyhow!(
-                        "CreateJobStep failed: {}",
+                    break 'session Err(anyhow::anyhow!(
+                        "InteractiveSession RPC failed: {}",
                         status.message()
                     ))
                 }
-            };
-
-            if step_resp.node_addr.is_empty() {
-                anyhow::bail!(
-                    "controller did not return a node address for job {}",
-                    job_id
-                );
-            }
-            let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
-            cached_step = Some(pair.clone());
-            pair
-        };
-
-        let mut agent = crate::interactive::connect_agent(&node_addr).await?;
-
-        match crate::interactive::open_interactive_session(
-            &mut agent,
-            job_id,
-            step_id,
-            command.clone(),
-            winsize,
-            true,
-            user,
-        )
-        .await
-        {
-            Ok(handle) => {
-                return crate::interactive::drive_interactive_session(handle).await;
-            }
-            Err(status) if is_retryable_status(&status) && attempt < 4 => {
-                last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
-                continue;
-            }
-            Err(status) => {
-                return Err(anyhow::anyhow!(
-                    "InteractiveSession RPC failed: {}",
-                    status.message()
-                ));
             }
         }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("interactive session failed after retries")))
+    };
+
+    if let Some(step_id) = created_step {
+        let exit_code = interactive_exit_code(&outcome);
+        complete_interactive_step(ctrl, job_id, step_id, exit_code, user).await;
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("interactive session failed after retries")))
+    outcome
 }
 
 fn is_retryable_status(status: &tonic::Status) -> bool {
@@ -1516,45 +1571,120 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
     )
 }
 
-/// Container options a job step accepts on the command line but does not yet
-/// honor. The batch and standalone-srun paths apply these; the step path
-/// (`dispatch_step` → `RunStep`) drops them, so warn rather than let the request
-/// quietly become a plain host run.
-fn step_mode_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
-    let mut warnings = Vec::new();
-    // Any container option implies the user wants a container; all of them are
-    // dropped, so warn if any is set (not just --container-image).
-    let container_requested = args.container_image.is_some()
+/// True when any container flag is set. A buffered step forwards these in
+/// RunStepRequest; an interactive step has no field for them.
+fn container_requested(args: &SrunArgs) -> bool {
+    args.container_image.is_some()
         || !args.container_mounts.is_empty()
         || args.container_workdir.is_some()
         || args.container_mount_home
         || !args.container_env.is_empty()
-        || args.container_remap_root;
-    if container_requested {
+        || args.container_remap_root
+}
+
+/// Flags accepted on the command line that no job step can honor.
+fn step_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if args.input.is_some() {
+        warnings.push("srun: warning: --input is not supported for a job step, ignoring".into());
+    }
+    warnings
+}
+
+/// `-w` reaches a `--pty` step through CreateJobStep, but a buffered step inside
+/// an existing allocation runs on all of its nodes, so say so rather than drop it.
+fn buffered_step_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
+    if args.nodelist.is_some() {
+        return vec!["srun: warning: --nodelist is not applied to a job step; \
+             the step runs on the job's allocated nodes"
+            .into()];
+    }
+    Vec::new()
+}
+
+/// Flags a `--pty` step drops. Sizing reads `matches`, not `args`: salloc exports
+/// SPUR_NTASKS into every step, so `args` would warn about flags nobody typed.
+fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if container_requested(args) {
         warnings.push(
-            "srun: warning: container options are not yet honored for a job step; \
+            "srun: warning: container options are not honored for a --pty step; \
              the command runs on the host, not inside a container"
                 .to_string(),
+        );
+    }
+    if args.output.is_some() || args.error.is_some() {
+        warnings.push(
+            "srun: warning: --output/--error are not applied to a --pty step; \
+             output streams to the terminal"
+                .to_string(),
+        );
+    }
+
+    let sized = ["ntasks", "ntasks_per_node", "cpus_per_task", "nodes"]
+        .iter()
+        .any(|id| crate::env_defaults::was_cli_set(matches, id));
+    if sized {
+        warnings.push(
+            "srun: warning: --pty runs a single task on one node; \
+             --ntasks/--ntasks-per-node/--cpus-per-task/--nodes are ignored"
+                .into(),
+        );
+    }
+
+    let nodelist = args.nodelist.as_deref().unwrap_or_default().trim();
+    if nodelist.contains(',') {
+        warnings.push(
+            "srun: warning: --pty runs on one node; using the first entry of --nodelist".into(),
+        );
+    }
+    if args.chdir.is_some() {
+        warnings.push(
+            "srun: warning: --chdir does not move a --pty step; it starts in the job's \
+             working directory"
+                .into(),
+        );
+    }
+
+    // The agent spawns the PTY from the job's own environment and work dir, so
+    // everything srun would otherwise pass through SPUR_* env is dropped.
+    let env_scoped = args.cpu_bind.is_some()
+        || args.gpu_bind.is_some()
+        || args.label
+        || crate::env_defaults::was_cli_set(matches, "mpi");
+    if env_scoped {
+        warnings.push(
+            "srun: warning: a --pty step runs in the job's environment; \
+             --cpu-bind/--gpu-bind/--label/--mpi are ignored"
+                .into(),
         );
     }
     warnings
 }
 
-/// Warnings and validation shared by every job-step dispatch — the buffered
-/// `RunStep` path and the interactive `--pty` path. Emits the --input/container
-/// warnings and bails on an invalid `--cpu-bind` spec so a malformed mask/map
-/// fails loudly on either path rather than silently running unbound.
-fn warn_and_validate_step(args: &SrunArgs, ntasks: u32) -> Result<()> {
-    if args.input.is_some() {
-        eprintln!("srun: warning: --input is not supported for a job step, ignoring");
+/// How a step inside an allocation is dispatched. Split out from `run_as_step`
+/// so the routing decision is testable without a controller.
+#[derive(Debug, PartialEq, Eq)]
+enum StepDispatchKind {
+    Interactive { node: String },
+    Buffered,
+}
+
+fn step_dispatch_kind(args: &SrunArgs) -> StepDispatchKind {
+    if args.pty {
+        return StepDispatchKind::Interactive {
+            node: first_node(args.nodelist.as_deref().unwrap_or_default()),
+        };
     }
-    for warning in step_mode_unsupported_warnings(args) {
-        eprintln!("{warning}");
-    }
-    let environment = srun_dispatch_environment(args);
-    warn_unsupported_cpu_bind(&environment);
-    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, ntasks)
-        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, ntasks))
+    StepDispatchKind::Buffered
+}
+
+/// Warn on unsupported `--cpu-bind` modes and reject a spec that cannot cover
+/// `ntasks`. Buffered steps only — a `--pty` step forwards no env, so it warns.
+fn validate_step_cpu_bind(environment: &HashMap<String, String>, ntasks: u32) -> Result<()> {
+    warn_unsupported_cpu_bind(environment);
+    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(environment, ntasks)
+        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(environment, ntasks))
     {
         anyhow::bail!("{err}");
     }
@@ -1563,11 +1693,26 @@ fn warn_and_validate_step(args: &SrunArgs, ntasks: u32) -> Result<()> {
 
 async fn run_as_step(
     args: &SrunArgs,
+    matches: &ArgMatches,
     job_id: u32,
     hooks: &HooksConfig,
     work_dir: &str,
     step_mpi: &str,
 ) -> Result<()> {
+    // dispatch_step warns for the buffered path; the interactive path returns
+    // before it, so warn here — and before the controller round-trip.
+    let dispatch_kind = step_dispatch_kind(args);
+    let warnings = match dispatch_kind {
+        StepDispatchKind::Buffered => buffered_step_unsupported_warnings(args),
+        StepDispatchKind::Interactive { .. } => step_unsupported_warnings(args)
+            .into_iter()
+            .chain(pty_step_unsupported_warnings(args, matches))
+            .collect(),
+    };
+    for warning in warnings {
+        eprintln!("{warning}");
+    }
+
     let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
@@ -1576,24 +1721,15 @@ async fn run_as_step(
     let io = resolve_io_paths(args);
     let user = crate::interactive::job_caller_user(&mut client, job_id, None).await?;
 
-    // An interactive step (`srun --pty` inside an allocation) drives a PTY via
-    // InteractiveSession instead of the buffered RunStep path, the same machinery
-    // `srun --jobid --overlap --pty` already uses. It runs its own step and owns
-    // the exit code. Share the same warnings + cpu-bind validation the buffered
-    // path uses (the interactive step is one PTY, so ntasks = 1), and finish
-    // through handle_terminal_state so the srun epilog still runs.
-    if args.pty {
-        warn_and_validate_step(args, 1)?;
-        let node = first_node(args.nodelist.as_deref().unwrap_or_default());
-        let exit_code =
-            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
-                .await?;
-        let state = if exit_code == 0 {
-            JobState::JobCompleted
-        } else {
-            JobState::JobFailed
-        };
-        handle_terminal_state(state, job_id, exit_code, work_dir, &io.stdout, hooks, true).await;
+    // An interactive step drives a PTY over InteractiveSession rather than the
+    // buffered RunStep path, so it runs its own step and owns the exit code.
+    if let StepDispatchKind::Interactive { node } = dispatch_kind {
+        let result =
+            run_interactive_pty(&mut client, job_id, args.command.clone(), node, &user).await;
+        // Runs before `?` so a failed session still pairs the prolog. Not
+        // handle_terminal_state: only the step exited, so "job N failed" is wrong.
+        run_srun_epilog(hooks, work_dir).await;
+        std::process::exit(result?);
     }
 
     let step_params = StepDispatchParams {
@@ -1665,45 +1801,212 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 mod tests {
     use super::*;
 
+    /// A buffered step forwards containers now, so only a --pty step warns.
     #[test]
-    fn step_mode_warns_on_container_image() {
-        let args = SrunArgs::try_parse_from(["srun", "--container-image", "img.sqsh", "hostname"])
-            .expect("parse failed");
-        let warnings = step_mode_unsupported_warnings(&args);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("container options"));
+    fn pty_step_warns_on_container_image_but_buffered_does_not() {
+        let (args, matches) =
+            parse_srun(&["srun", "--pty", "--container-image", "img.sqsh", "bash"]);
+        let pty = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(pty.len(), 1);
+        assert!(pty[0].contains("container options are not honored for a --pty step"));
+        assert!(step_unsupported_warnings(&args).is_empty());
     }
 
     #[test]
-    fn step_mode_warns_on_container_flags_without_image() {
-        // Container modifiers are also dropped in step mode, so any of them warns.
-        let args = SrunArgs::try_parse_from(["srun", "--container-mounts", "/a:/b", "hostname"])
-            .expect("parse failed");
-        assert_eq!(step_mode_unsupported_warnings(&args).len(), 1);
+    fn pty_step_warns_on_container_flags_without_image() {
+        // Container modifiers are dropped too, so any of them warns on its own.
+        let (args, matches) = parse_srun(&["srun", "--pty", "--container-mounts", "/a:/b", "bash"]);
+        assert_eq!(pty_step_unsupported_warnings(&args, &matches).len(), 1);
     }
 
     #[test]
-    fn step_mode_no_longer_warns_on_pty() {
-        // --pty is now honored for a job step (routes to run_interactive_pty),
-        // so it must not produce an unsupported-flag warning.
-        let args = SrunArgs::try_parse_from(["srun", "--pty", "bash"]).expect("parse failed");
-        assert!(step_mode_unsupported_warnings(&args).is_empty());
-    }
-
-    #[test]
-    fn step_mode_warns_only_on_container_when_pty_also_set() {
+    fn step_warns_on_input() {
         let args =
-            SrunArgs::try_parse_from(["srun", "--container-image", "img.sqsh", "--pty", "bash"])
-                .expect("parse failed");
-        let warnings = step_mode_unsupported_warnings(&args);
+            SrunArgs::try_parse_from(["srun", "--input", "in.txt", "hostname"]).expect("parse");
+        let warnings = step_unsupported_warnings(&args);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("container options"));
+        assert!(warnings[0].contains("--input"));
     }
 
     #[test]
-    fn step_mode_silent_without_unsupported_flags() {
+    fn step_silent_without_unsupported_flags() {
         let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
-        assert!(step_mode_unsupported_warnings(&args).is_empty());
+        assert!(step_unsupported_warnings(&args).is_empty());
+    }
+
+    /// Parse the way `main_with_args` does, so tests see the same `ArgMatches`
+    /// the warning helpers consult for "did the user actually type this?".
+    fn parse_srun(argv: &[&str]) -> (SrunArgs, ArgMatches) {
+        let matches = SrunArgs::command()
+            .try_get_matches_from(argv)
+            .expect("parse failed");
+        let args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        (args, matches)
+    }
+
+    #[test]
+    fn pty_step_warns_on_output_redirect() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "-o", "out.txt", "bash"]);
+        let warnings = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--output/--error"));
+    }
+
+    #[test]
+    fn pty_step_warns_when_sizing_flags_are_typed() {
+        for argv in [
+            &["srun", "--pty", "-n", "4", "bash"][..],
+            &["srun", "--pty", "-N", "2", "bash"][..],
+            &["srun", "--pty", "-c", "8", "bash"][..],
+            &["srun", "--pty", "--ntasks-per-node", "2", "bash"][..],
+        ] {
+            let (args, matches) = parse_srun(argv);
+            let warnings = pty_step_unsupported_warnings(&args, &matches);
+            assert_eq!(warnings.len(), 1, "{argv:?}");
+            assert!(warnings[0].contains("single task on one node"), "{argv:?}");
+        }
+    }
+
+    /// salloc/sbatch export SPUR_NTASKS into every step, so warning off the
+    /// resolved value would fire on a bare `srun --pty` the user did type.
+    #[test]
+    #[serial(env_injection)]
+    fn pty_step_silent_when_sizing_came_from_the_allocation_env() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_NTASKS", "4");
+        std::env::set_var("SPUR_CPUS_PER_TASK", "8");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--pty", "bash"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert_eq!(args.ntasks, Some(4), "env must reach args");
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
+    }
+
+    #[test]
+    fn pty_step_warns_on_env_scoped_flags() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "--cpu-bind", "cores", "bash"]);
+        let warnings = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--cpu-bind/--gpu-bind/--label/--mpi"));
+    }
+
+    /// `--chdir` still sets the prolog/epilog working directory, so it gets its
+    /// own wording rather than a blanket "ignored".
+    #[test]
+    fn pty_step_warns_that_chdir_does_not_move_the_pty() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "--chdir", "/tmp", "bash"]);
+        let warnings = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--chdir does not move a --pty step"));
+        assert!(warnings[0].contains("starts in the job's working directory"));
+    }
+
+    #[test]
+    fn pty_step_warns_when_nodelist_names_several_nodes() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "-w", "n1,n2", "bash"]);
+        let warnings = pty_step_unsupported_warnings(&args, &matches);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("first entry of --nodelist"));
+    }
+
+    #[test]
+    fn buffered_step_warns_that_nodelist_is_dropped() {
+        let (args, _) = parse_srun(&["srun", "-w", "n1", "hostname"]);
+        let warnings = buffered_step_unsupported_warnings(&args);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--nodelist is not applied"));
+    }
+
+    /// A lost `\` continuation in a wrapped string literal leaves a run of
+    /// spaces in output that no behavioral assertion would catch.
+    #[test]
+    fn warning_text_is_not_mangled_by_line_wrapping() {
+        let (args, matches) = parse_srun(&[
+            "srun",
+            "--pty",
+            "-w",
+            "n1,n2",
+            "-o",
+            "o.txt",
+            "-n",
+            "2",
+            "--chdir",
+            "/tmp",
+            "--label",
+            "--container-image",
+            "i.sqsh",
+            "--input",
+            "in.txt",
+            "bash",
+        ]);
+        let all: Vec<String> = step_unsupported_warnings(&args)
+            .into_iter()
+            .chain(pty_step_unsupported_warnings(&args, &matches))
+            .chain(buffered_step_unsupported_warnings(&args))
+            .collect();
+        // Every dropped-flag warning, so a lost continuation in any of them is
+        // caught here.
+        assert_eq!(all.len(), 8, "expected every warning to fire: {all:?}");
+        for w in &all {
+            assert!(!w.contains("  "), "collapsed continuation in: {w:?}");
+            assert!(w.starts_with("srun: warning: "), "{w:?}");
+        }
+    }
+
+    #[test]
+    fn interactive_exit_code_prefers_the_session_result() {
+        assert_eq!(interactive_exit_code(&Ok(0)), 0);
+        assert_eq!(interactive_exit_code(&Ok(9)), 9);
+        assert_eq!(
+            interactive_exit_code(&Err(anyhow::anyhow!("session never opened"))),
+            1
+        );
+    }
+
+    #[test]
+    fn pty_step_silent_for_plain_interactive_shell() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "bash"]);
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
+    }
+
+    #[test]
+    fn step_dispatch_kind_routes_pty_to_interactive() {
+        let args = SrunArgs::try_parse_from(["srun", "--pty", "-w", "n1,n2", "bash"])
+            .expect("parse failed");
+        assert_eq!(
+            step_dispatch_kind(&args),
+            StepDispatchKind::Interactive {
+                node: "n1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn step_dispatch_kind_routes_plain_step_to_buffered() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
+        assert_eq!(step_dispatch_kind(&args), StepDispatchKind::Buffered);
+    }
+
+    #[test]
+    fn step_dispatch_kind_interactive_without_nodelist_leaves_node_empty() {
+        let args = SrunArgs::try_parse_from(["srun", "--pty", "bash"]).expect("parse failed");
+        assert_eq!(
+            step_dispatch_kind(&args),
+            StepDispatchKind::Interactive {
+                node: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn cpu_bind_validation_rejects_map_shorter_than_ntasks() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".to_string(), "map_cpu:0,1".to_string());
+        assert!(validate_step_cpu_bind(&env, 4).is_err());
     }
 
     #[test]
@@ -2498,6 +2801,53 @@ mod tests {
             user: "tester",
         };
         dispatch_step(client, 1, &params).await
+    }
+
+    /// A session that dies after CreateJobStep must still close the step out —
+    /// nothing else completes an interactive step before the job ends.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_step_reports_completion_when_session_fails() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".to_string()],
+            String::new(),
+            "tester",
+        )
+        .await
+        .expect_err("mock returns no node address, so the session cannot open");
+
+        assert!(err.to_string().contains("node address"), "{err}");
+        assert_eq!(
+            capture.complete_step_calls(),
+            vec![(crate::mock_controller::MOCK_STEP_ID, 1)],
+            "a failed session must still report the step complete"
+        );
+    }
+
+    /// A create that never succeeds must not report a completion for a step
+    /// that does not exist.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_step_reports_nothing_when_no_step_was_created() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_create_step_error(tonic::Code::PermissionDenied);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        run_interactive_pty(&mut client, 1, vec!["bash".into()], String::new(), "tester")
+            .await
+            .expect_err("CreateJobStep was rejected");
+
+        assert!(
+            capture.complete_step_calls().is_empty(),
+            "no step exists, so nothing may be reported complete"
+        );
     }
 
     /// With no `-n`, the step must ask the controller for one task per node.

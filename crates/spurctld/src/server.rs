@@ -2163,6 +2163,68 @@ impl SlurmController for ControllerService {
         Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
     }
 
+    async fn complete_job_step(
+        &self,
+        request: Request<CompleteJobStepRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let fwd = Self::forward_request(request);
+                    return client.complete_job_step(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward complete_job_step to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        let job_id = req.job_id;
+
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+
+        spur_core::auth::check_job_caller(
+            &req.user,
+            Some(req.uid),
+            self.caller_is_admin(__identity.as_ref()),
+            &job.spec.user,
+            job.spec.uid,
+            __identity.as_ref(),
+            "complete a step in",
+        )
+        .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        // Owning the job is not licence to address any step id: reserved ids
+        // belong to the batch, extern, and interactive steps.
+        if req.step_id >= spur_core::step::STEP_RESERVED_MIN {
+            return Err(Status::invalid_argument(format!(
+                "step {} is reserved and cannot be completed by a client",
+                req.step_id
+            )));
+        }
+        let step = self.cluster.get_step(job_id, req.step_id).ok_or_else(|| {
+            Status::not_found(format!("step {}.{} not found", job_id, req.step_id))
+        })?;
+        // Best-effort fast path; the WAL apply enforces this once the job ends.
+        if step.state.is_terminal() {
+            return Ok(Response::new(()));
+        }
+
+        self.cluster
+            .record_step_complete(job_id, req.step_id, req.exit_code)
+            .map_err(|e| Status::internal(format!("failed to record step completion: {e}")))?;
+
+        Ok(Response::new(()))
+    }
+
     async fn create_partition(
         &self,
         request: Request<CreatePartitionRequest>,
@@ -6269,6 +6331,161 @@ mod tests {
             svc.cluster.get_steps(job_id).len(),
             steps_before,
             "a denied attach must not leave a step behind"
+        );
+    }
+
+    /// Create a PTY-style step and return its id, so completion tests have a
+    /// real step to act on rather than a synthesized id.
+    async fn interactive_step_on(svc: &ControllerService, job_id: u32, owner: &str) -> u32 {
+        svc.create_job_step(Request::new(CreateJobStepRequest {
+            job_id,
+            command: vec!["bash".into()],
+            num_tasks: 1,
+            cpus_per_task: 1,
+            overlap: true,
+            pty: true,
+            winsize: None,
+            node: String::new(),
+            user: owner.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("owner may create a step")
+        .into_inner()
+        .step_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_step_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = interactive_step_on(&svc, job_id, "ubuntu").await;
+
+        let err = svc
+            .complete_job_step(Request::new(CompleteJobStepRequest {
+                job_id,
+                step_id,
+                exit_code: 42,
+                user: "rsikande".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-owner must not complete another user's step");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert!(
+            !step.state.is_terminal(),
+            "denied call must not close the step"
+        );
+        assert_eq!(step.exit_code, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_step_records_owner_exit_code() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = interactive_step_on(&svc, job_id, "ubuntu").await;
+
+        svc.complete_job_step(Request::new(CompleteJobStepRequest {
+            job_id,
+            step_id,
+            exit_code: 7,
+            user: "ubuntu".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the owner may complete their own step");
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert_eq!(step.exit_code, Some(7));
+        assert!(step.state.is_terminal());
+        let job = svc.cluster.get_job(job_id).expect("job present");
+        assert_eq!(
+            job.derived_exit_code, 7,
+            "step exit must reach DerivedExitCode"
+        );
+    }
+
+    /// Owning the job must not let a client address the batch step or invent an id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_step_rejects_reserved_and_unknown_step_ids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let reserved = svc
+            .complete_job_step(Request::new(CompleteJobStepRequest {
+                job_id,
+                step_id: spur_core::step::STEP_BATCH,
+                exit_code: 99,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("reserved step ids are not client-addressable");
+        assert_eq!(reserved.code(), Code::InvalidArgument);
+
+        let unknown = svc
+            .complete_job_step(Request::new(CompleteJobStepRequest {
+                job_id,
+                step_id: 4242,
+                exit_code: 99,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unknown step id must not be recorded");
+        assert_eq!(unknown.code(), Code::NotFound);
+
+        let job = svc.cluster.get_job(job_id).expect("job present");
+        assert_eq!(
+            job.derived_exit_code, 0,
+            "a rejected completion must not move DerivedExitCode"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_step_keeps_the_first_verdict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let step_id = interactive_step_on(&svc, job_id, "ubuntu").await;
+
+        for exit_code in [3, 0] {
+            svc.complete_job_step(Request::new(CompleteJobStepRequest {
+                job_id,
+                step_id,
+                exit_code,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("a repeat report is accepted as a no-op");
+        }
+
+        let step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == step_id)
+            .expect("step still present");
+        assert_eq!(
+            step.exit_code,
+            Some(3),
+            "a late report must not overwrite a recorded verdict"
         );
     }
 
