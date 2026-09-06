@@ -15,7 +15,7 @@ from typing import NamedTuple
 
 import pytest
 
-from cluster import parse_job_id, wait_job
+from cluster import parse_job_id, wait_job, wait_job_state
 
 MIB = 1024 * 1024
 
@@ -575,4 +575,66 @@ class TestCgroupContainerStep:
         # read spurd's own cgroup instead.
         assert "0::/spur/job_" in out, (
             f"a container step must join the job cgroup (exit {code})\noutput:\n{out}"
+        )
+
+
+def _hold_running_job(cluster, name: str) -> int:
+    """Submit a long sleep pinned to node 0 and return its id once RUNNING, so
+    exec/attach/step have a live job cgroup to enter."""
+    script = cluster.write_file(f"{name}.sh", "#!/bin/bash\nsleep 300\n")
+    job_id = parse_job_id(
+        cluster.sbatch(
+            ["-J", name, "-N", "1", "-w", cluster.node_names[0], "-t", "5",
+             "--cpus-per-task=1", "--mem=256", script]
+        )
+    )
+    assert job_id is not None, "sbatch failed to return a job id"
+    wait_job_state(cluster, job_id, "R", timeout=90)
+    return job_id
+
+
+class TestCgroupEntryPathMembership:
+    """A plain srun step, ``spur exec``, and a ``--pty`` attach each enter a
+    running job's cgroup via the same pre-exec join. The device-filter tests that
+    cover them use ``gpu_cluster`` and skip on a GPU-less node, so verify the
+    membership directly through ``/proc/self/cgroup`` instead.
+    """
+
+    def test_a_step_runs_inside_the_job_cgroup(self, cgroup_cluster):
+        cluster = cgroup_cluster
+        job_id = _hold_running_job(cluster, "cg-step-member")
+        try:
+            code, out = cluster.srun_in_allocation(job_id, ["cat", "/proc/self/cgroup"])
+        finally:
+            cluster.scancel(str(job_id))
+        assert f"0::/spur/job_{job_id}" in out, (
+            f"an srun step must join the job cgroup (exit {code})\noutput:\n{out}"
+        )
+
+    def test_exec_runs_inside_the_job_cgroup(self, cgroup_cluster):
+        cluster = cgroup_cluster
+        job_id = _hold_running_job(cluster, "cg-exec-member")
+        try:
+            out = cluster.cli_allow_fail(
+                ["spur", "exec", str(job_id), "cat", "/proc/self/cgroup"]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+        assert f"0::/spur/job_{job_id}" in out, (
+            f"spur exec must join the job cgroup\noutput:\n{out}"
+        )
+
+    def test_pty_attach_runs_inside_the_job_cgroup(self, cgroup_cluster):
+        cluster = cgroup_cluster
+        job_id = _hold_running_job(cluster, "cg-pty-member")
+        try:
+            # `--pty` streams over a PTY, so the cgroup line may carry a trailing
+            # CR; match it as a substring rather than a whole line.
+            code, out = cluster.srun_with_exit(
+                ["--jobid", str(job_id), "--overlap", "--pty", "cat", "/proc/self/cgroup"]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+        assert f"0::/spur/job_{job_id}" in out, (
+            f"a --pty attach must join the job cgroup (exit {code})\noutput:\n{out}"
         )
