@@ -398,7 +398,11 @@ async fn run_containerized_step(
     active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     step_key: (u32, u32),
     memlock: spur_core::config::MemlockLimit,
-) -> Result<Option<std::process::ExitStatus>, Status> {
+) -> Result<(Option<std::process::ExitStatus>, i32), Status> {
+    // Returns (exit_status, child_pid). The pid is 0 when the step was
+    // cancelled before the fork completed. The caller uses it to set the
+    // StepRootfsGuard::pid so the guard kills the child before removing the
+    // rootfs (preventing a live-process vs rm-rf race on future drop).
     use std::os::fd::AsRawFd;
 
     // Sync pipe: child signals readiness (or error) after container_init.
@@ -563,9 +567,10 @@ async fn run_containerized_step(
                     nix::sys::signal::Signal::SIGKILL,
                 );
                 let _ = nix::sys::wait::waitpid(child_pid, None);
-                return Ok(None);
+                return Ok((None, child_pid.as_raw()));
             }
 
+            let raw_pid = child_pid.as_raw();
             let wait_result =
                 tokio::task::spawn_blocking(move || nix::sys::wait::waitpid(child_pid, None)).await;
 
@@ -581,7 +586,7 @@ async fn run_containerized_step(
                     _ => std::process::ExitStatus::from_raw(1 << 8),
                 };
 
-            Ok(Some(exit_status))
+            Ok((Some(exit_status), raw_pid))
         }
     }
 }
@@ -1232,13 +1237,32 @@ impl Drop for StepScriptCleanup {
 /// the `run_command` future is dropped mid-flight (srun Ctrl-C, client
 /// disconnect, controller RPC timeout) between `setup_rootfs` and the normal
 /// cleanup — otherwise every such attempt leaks an extracted/mounted rootfs.
+/// Removes a step's container rootfs on drop, so a rootfs is torn down even when
+/// the `run_command` future is dropped mid-flight (srun Ctrl-C, client
+/// disconnect, controller RPC timeout) between `setup_rootfs` and the normal
+/// cleanup — otherwise every such attempt leaks an extracted/mounted rootfs.
+///
+/// `pid` is the container child's pid (set once known). On drop, any live child
+/// is killed before the rootfs is removed so `cleanup_rootfs` never races an
+/// `rm -rf`/umount against a process still pivoted into the directory.
 struct StepRootfsGuard {
     base: String,
     mode: crate::container::RootfsMode,
+    pid: Option<i32>,
 }
 
 impl Drop for StepRootfsGuard {
     fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            // Kill the container child (SIGKILL — it may be PID 1 in its
+            // namespace and ignore SIGTERM) and reap it so the process is
+            // fully gone before we unmount/remove the rootfs it lives in.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+        }
         crate::container::cleanup_rootfs(&self.base, &self.mode);
     }
 }
@@ -2717,10 +2741,15 @@ impl SlurmAgent for AgentService {
             let container_cfg = crate::container::ContainerConfig {
                 image: c.image.clone(),
                 mounts,
-                workdir: if c.workdir.is_empty() {
-                    None
-                } else {
+                // --container-workdir wins; fall back to --chdir (req.work_dir)
+                // so `srun --chdir=/foo --container-image=X` lands in /foo
+                // rather than /tmp (container_init's default).
+                workdir: if !c.workdir.is_empty() {
                     Some(c.workdir.clone())
+                } else if !work_dir.is_empty() {
+                    Some(work_dir.clone())
+                } else {
+                    None
                 },
                 name: if c.name.is_empty() {
                     None
@@ -2770,11 +2799,13 @@ impl SlurmAgent for AgentService {
                 container_cfg.name.as_deref(),
             )
             .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
-            // Tear the rootfs down on any exit from here on, including a
-            // dropped future — not just the normal return below.
-            let _rootfs_guard = StepRootfsGuard {
+            // Tear the rootfs down on any exit from here on. The pid is set
+            // after the fork (inside run_containerized_step) so the guard
+            // kills any live child before unmounting/removing the rootfs.
+            let mut rootfs_guard = StepRootfsGuard {
                 base: step_base.clone(),
                 mode: rootfs_mode.clone(),
+                pid: None,
             };
 
             // Write the step command as a script inside the rootfs so it's
@@ -2809,9 +2840,11 @@ impl SlurmAgent for AgentService {
             // Script path inside the container (after pivot_root, host paths are gone).
             let script_in_container = format!("/tmp/spur_step_{}_{}.sh", job_id, step_id);
 
-            // The rootfs is cleaned up by `_rootfs_guard` on scope exit
-            // (normal return or dropped future).
-            run_containerized_step(
+            // Run the container step. The guard kills the child before
+            // removing the rootfs — preventing a live-process vs rm-rf race
+            // when the future is dropped mid-flight. We set the pid as soon
+            // as we know it (immediately after the fork, before the wait).
+            let (maybe_status, child_pid) = run_containerized_step(
                 container_cfg,
                 rootfs,
                 script_in_container,
@@ -2821,7 +2854,11 @@ impl SlurmAgent for AgentService {
                 step_key,
                 memlock,
             )
-            .await?
+            .await?;
+            if child_pid != 0 {
+                rootfs_guard.pid = Some(child_pid);
+            }
+            maybe_status
         } else {
             // Case 3: no container — plain host process.
             let mut cmd = tokio::process::Command::new(&program);
