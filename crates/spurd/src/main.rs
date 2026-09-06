@@ -8,6 +8,7 @@ pub mod container;
 mod executor;
 pub(crate) mod job_entry;
 mod landlock;
+mod manifest;
 mod mpi_plugin;
 pub(crate) mod privdrop;
 pub(crate) mod pty;
@@ -331,6 +332,11 @@ async fn main() -> anyhow::Result<()> {
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.
     let running_jobs = agent_server::new_running_jobs();
+
+    // Re-adopt batch jobs that survived a spurd restart (spur#803): their
+    // processes are still alive in their cgroups, so re-track them before the
+    // reporter's first heartbeat rather than leaving them orphaned.
+    agent_server::readopt_surviving_jobs(&running_jobs).await;
 
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(

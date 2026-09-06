@@ -313,6 +313,20 @@ pub enum RunningJob {
     },
     /// Allocation registered without a batch process (standalone srun).
     AllocationOnly,
+    /// A batch job re-adopted after a spurd restart: the workload survived in
+    /// its cgroup but the OS process handle was lost, so it is tracked and
+    /// managed through the cgroup — done when the cgroup empties, killed by
+    /// signalling every member.
+    Adopted { cgroup_path: PathBuf },
+}
+
+/// Read the pids currently in a cgroup (`cgroup.procs`), empty if unreadable.
+fn cgroup_member_pids(cgroup_path: &Path) -> Vec<i32> {
+    std::fs::read_to_string(cgroup_path.join("cgroup.procs"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .collect()
 }
 
 /// Split a finished process's wait status into (exit_code, signal).
@@ -368,6 +382,10 @@ impl RunningJob {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
             RunningJob::AllocationOnly => None,
+            // A representative member for attach/status; the group is the cgroup.
+            RunningJob::Adopted { cgroup_path } => {
+                cgroup_member_pids(cgroup_path).first().map(|p| *p as u32)
+            }
         }
     }
 
@@ -408,6 +426,15 @@ impl RunningJob {
                 }
             }
             RunningJob::AllocationOnly => Ok(None),
+            // A re-adopted job is done when nothing is left in its cgroup. The
+            // real exit code was lost with the process handle across the restart.
+            RunningJob::Adopted { cgroup_path } => {
+                if cgroup_member_pids(cgroup_path).is_empty() {
+                    Ok(Some((0, 0)))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -436,6 +463,13 @@ impl RunningJob {
                 Ok(())
             }
             RunningJob::AllocationOnly => Ok(()),
+            // Signal every process in the cgroup — the group is all we have.
+            RunningJob::Adopted { cgroup_path } => {
+                for pid in cgroup_member_pids(cgroup_path) {
+                    let _ = signal::kill(Pid::from_raw(pid), sig);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -443,6 +477,17 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::AllocationOnly => None,
+            RunningJob::Adopted { cgroup_path } => Some(cgroup_path.clone()),
+        }
+    }
+
+    /// The job's cgroup without taking it (for persisting a re-adoption manifest).
+    pub fn cgroup(&self) -> Option<&Path> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Adopted { cgroup_path } => Some(cgroup_path),
             RunningJob::AllocationOnly => None,
         }
     }

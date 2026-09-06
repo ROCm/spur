@@ -151,6 +151,57 @@ pub(crate) fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Re-adopt batch jobs that survived a spurd restart. For each persisted
+/// manifest whose cgroup still holds live processes, insert a tracked `Adopted`
+/// job so the agent acknowledges it (attach/`--overlap`), can reap it, and
+/// reports it in heartbeats — instead of leaving it orphaned with the controller
+/// believing it RUNNING forever. Manifests for jobs that ended during the
+/// downtime are discarded; the running monitor loop then reports and cleans up a
+/// re-adopted job when its cgroup empties.
+pub(crate) async fn readopt_surviving_jobs(running: &RunningJobs) {
+    for m in crate::manifest::load_all() {
+        if !crate::manifest::cgroup_has_live_procs(&m.cgroup_path) {
+            info!(
+                job_id = m.job_id,
+                "job ended while spurd was down; discarding manifest"
+            );
+            crate::manifest::remove(m.job_id);
+            continue;
+        }
+        info!(
+            job_id = m.job_id,
+            cgroup = %m.cgroup_path,
+            "re-adopting job that survived a spurd restart"
+        );
+        running.lock().await.insert(
+            m.job_id,
+            TrackedJob {
+                job: executor::RunningJob::Adopted {
+                    cgroup_path: std::path::PathBuf::from(&m.cgroup_path),
+                },
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                has_pid_namespace: m.has_pid_namespace,
+                has_user_namespace: m.has_user_namespace,
+                has_mount_namespace: m.has_mount_namespace,
+                _pty_master: None,
+                work_dir: m.work_dir,
+                uid: m.uid,
+                gid: m.gid,
+                user: m.user,
+                partition: m.partition,
+                gpu_devices: m.gpu_devices,
+                cpus: m.cpus,
+                memory_mb: m.memory_mb,
+                nodelist: m.nodelist,
+                mpi: m.mpi,
+                run_attempt: m.run_attempt,
+            },
+        );
+    }
+}
+
 type PmixLaunchSetup = (
     PmixLaunchGuard,
     PmixLaunchPlan,
@@ -786,6 +837,9 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
+                    // The job has ended; drop its re-adoption manifest (spur#803)
+                    // so a later restart does not try to recover a dead job.
+                    crate::manifest::remove(c.job_id);
                     crate::container::cleanup_rootfs(
                         &crate::container::job_rootfs_base(c.job_id),
                         &c.rootfs_mode,
@@ -1942,6 +1996,33 @@ impl SlurmAgent for AgentService {
                 // surface where output actually landed (e.g. the /tmp fallback).
                 let stdout_path = result.stdout_path.clone();
                 let stderr_path = result.stderr_path.clone();
+                // Persist a manifest so a spurd restart can re-adopt this running
+                // job (spur#803). Re-adoption manages a survivor through its
+                // cgroup, so only cgroup-confined, non-interactive batch jobs are
+                // recorded — an interactive (pty) job has no detached workload to
+                // recover. Built here because launch_cfg is moved into TrackedJob.
+                let readopt_manifest = result
+                    .job
+                    .cgroup()
+                    .filter(|_| result.pty_master.is_none())
+                    .map(|cg| crate::manifest::JobManifest {
+                        job_id,
+                        uid: launch_cfg.uid,
+                        gid: launch_cfg.gid,
+                        user: launch_cfg.user.clone(),
+                        work_dir: launch_cfg.work_dir.clone(),
+                        partition: launch_cfg.partition.clone(),
+                        nodelist: launch_cfg.nodelist.clone(),
+                        gpu_devices: launch_cfg.gpu_devices.clone(),
+                        cpus: launch_cfg.cpus,
+                        memory_mb: launch_cfg.memory_mb,
+                        mpi: spec.mpi.clone(),
+                        run_attempt,
+                        cgroup_path: cg.to_string_lossy().into_owned(),
+                        has_pid_namespace: is_root || is_container,
+                        has_user_namespace: is_container && !is_root,
+                        has_mount_namespace: is_root || is_container,
+                    });
                 let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
@@ -1967,6 +2048,9 @@ impl SlurmAgent for AgentService {
                     },
                 );
                 drop(jobs);
+                if let Some(m) = readopt_manifest {
+                    crate::manifest::write(&m);
+                }
                 // Re-dispatch onto the same node reuses job_id and displaces an
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
@@ -3397,6 +3481,7 @@ impl SlurmAgent for AgentService {
 impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
         if self.running.lock().await.remove(&job_id).is_some() {
+            crate::manifest::remove(job_id);
             self.allocation.lock().await.release_job(job_id);
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
