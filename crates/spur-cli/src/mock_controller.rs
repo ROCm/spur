@@ -35,6 +35,8 @@ pub(crate) struct StepCapture {
     /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
     get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
     create_step_num_tasks: Arc<AtomicU32>,
+    create_step_error: Arc<Mutex<Option<tonic::Code>>>,
+    complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
     get_node_names: Arc<Mutex<Vec<String>>>,
@@ -62,6 +64,16 @@ impl StepCapture {
     /// Task count carried by the most recent `CreateJobStep`.
     pub(crate) fn create_step_num_tasks(&self) -> u32 {
         self.create_step_num_tasks.load(Ordering::SeqCst)
+    }
+
+    /// Make `create_job_step` fail, so tests can drive the pre-step failure path.
+    pub(crate) fn set_create_step_error(&self, code: tonic::Code) {
+        *self.create_step_error.lock().unwrap() = Some(code);
+    }
+
+    /// `(step_id, exit_code)` pairs from `CompleteJobStep`, in call order.
+    pub(crate) fn complete_step_calls(&self) -> Vec<(u32, i32)> {
+        self.complete_step_calls.lock().unwrap().clone()
     }
 
     /// Step id carried by the most recent `RunStep`.
@@ -137,10 +149,26 @@ mock_controller_impl! {
             self.capture
                 .create_step_num_tasks
                 .store(request.into_inner().num_tasks, Ordering::SeqCst);
+            if let Some(code) = *self.capture.create_step_error.lock().unwrap() {
+                return Err(tonic::Status::new(code, "mock create_job_step failure"));
+            }
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
                 node_addr: String::new(),
             }))
+        }
+
+        async fn complete_job_step(
+            &self,
+            request: tonic::Request<proto::CompleteJobStepRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let req = request.into_inner();
+            self.capture
+                .complete_step_calls
+                .lock()
+                .unwrap()
+                .push((req.step_id, req.exit_code));
+            Ok(tonic::Response::new(()))
         }
 
         async fn get_job(

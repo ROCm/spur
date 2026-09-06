@@ -552,6 +552,7 @@ mod tests {
         deregister_agent(pb::DeregisterAgentRequest) -> ();
         get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
         create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
+        complete_job_step(pb::CompleteJobStepRequest) -> ();
         create_partition(pb::CreatePartitionRequest) -> ();
         update_partition(pb::UpdatePartitionRequest) -> ();
         delete_partition(pb::DeletePartitionRequest) -> ();

@@ -64,7 +64,13 @@ Common options:
      - Wall-clock limit.
    * - ``--pty``
      -
-     - Allocate a pseudo-terminal (use with an interactive shell).
+     - Allocate a pseudo-terminal (use with an interactive shell). Inside an
+       existing allocation this runs as an interactive step: a single task on
+       one node, started in the *job's* environment and working directory
+       rather than your shell's. ``srun`` warns about the flags that implies it
+       must drop — ``--output``/``--error``/``--input``, the task-sizing flags,
+       ``--cpu-bind``/``--gpu-bind``/``--label``/``--mpi``, and container
+       options. ``--chdir`` moves the srun prolog/epilog but not the terminal.
    * - ``--label``
      - ``-l``
      - Prefix each output line with its task rank.

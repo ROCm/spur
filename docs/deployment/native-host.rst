@@ -456,8 +456,9 @@ cgroup, and are therefore **not** bounded by the job's limits:
      - Enters the job's *namespaces* via ``nsenter``; namespaces are not cgroups,
        so the process keeps ``spurd``'s cgroup.
    * - Interactive attach to a running job
-     - Same namespace-entry path as ``spur exec``. Note this is distinct from a
-       ``--pty`` job, which *is* contained because it launches as a batch payload.
+     - Same namespace-entry path as ``spur exec``. This covers every ``--pty``
+       shell: the job's batch payload is contained, but the attached shell is
+       spawned alongside it and is not.
    * - Standalone ``srun`` allocations
      - The allocation is recorded for accounting, but its steps run through the
        ``srun`` step path above.
