@@ -353,6 +353,36 @@ async fn main() -> anyhow::Result<()> {
         hb_reporter.heartbeat_loop().await;
     });
 
+    // Periodically re-discover node inventory. Inventory is otherwise frozen at
+    // startup, so a device count that changes out of band (e.g. a GPU
+    // partition-mode switch, or a GPU dropping off the bus) never reaches the
+    // controller and it keeps scheduling against hardware that no longer exists.
+    // On a change, replace the shared registry (so injection uses the new set)
+    // and re-register with the controller.
+    {
+        let reporter = reporter.clone();
+        let registry = registry.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                let rebuilt = init_device_registry(config.as_ref());
+                let fresh = reporter::discover_resources(&rebuilt);
+                if reporter.update_resources(fresh) {
+                    *registry.lock().await = rebuilt;
+                    match reporter.register().await {
+                        Ok(()) => {
+                            info!("node inventory changed; re-registered with the controller")
+                        }
+                        Err(e) => warn!(error = %e, "re-register after inventory change failed"),
+                    }
+                }
+            }
+        });
+    }
+
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
     let limits = match config.as_ref() {

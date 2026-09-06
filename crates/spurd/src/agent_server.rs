@@ -654,7 +654,7 @@ impl AgentService {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "unknown".into()),
-            &reporter.resources,
+            &reporter.resources.read().unwrap(),
         );
 
         // Load SPANK plugins from plugstack.conf if available
@@ -2124,9 +2124,9 @@ impl SlurmAgent for AgentService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<NodeResourcesResponse>, Status> {
-        let resources = &self.reporter.resources;
+        let resources = self.reporter.resources.read().unwrap();
         Ok(Response::new(NodeResourcesResponse {
-            total: Some(crate::reporter::resource_to_proto(resources)),
+            total: Some(crate::reporter::resource_to_proto(&resources)),
             used: Some(crate::reporter::allocations_to_proto(
                 &spur_core::resource::ResourceAllocations::default(),
             )),
