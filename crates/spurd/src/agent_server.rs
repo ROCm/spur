@@ -798,6 +798,8 @@ async fn run_containerized_step(
     active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     step_key: (u32, u32),
     memlock: spur_core::config::MemlockLimit,
+    cgroup: Option<&std::path::Path>,
+    cgroup_required: bool,
 ) -> Result<(Option<std::process::ExitStatus>, i32), Status> {
     // Returns (exit_status, child_pid). The pid is 0 when the step was
     // cancelled before the fork completed. The caller uses it to set the
@@ -844,6 +846,10 @@ async fn run_containerized_step(
         }
     }
 
+    // Built parent-side (nothing between fork and exec may allocate); the child
+    // joins itself below while still root, and `required` is verified parent-side.
+    let cgroup_join = executor::CgroupJoin::for_cgroup(cgroup);
+
     match unsafe { nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))? }
     {
         nix::unistd::ForkResult::Child => {
@@ -856,6 +862,12 @@ async fn run_containerized_step(
                 // Wire stdout/stderr to the per-step spool files.
                 libc::dup2(stdout_fd, libc::STDOUT_FILENO);
                 libc::dup2(stderr_fd, libc::STDERR_FILENO);
+            }
+
+            // Join while still root, before container_init's pivot_root hides the
+            // host cgroupfs and close_inherited_fds reaps the log fd.
+            if let Some(ref join) = cgroup_join {
+                let _ = join.join();
             }
 
             crate::container::close_inherited_fds(ready_w_fd);
@@ -946,6 +958,20 @@ async fn run_containerized_step(
                 return Err(Status::internal(format!(
                     "step container init failed: {msg}"
                 )));
+            }
+
+            // Verify the self-join above actually landed (it is best-effort in
+            // the child). Under `[cgroup] required` a step that missed its cgroup
+            // is refused and killed rather than run outside the limits and filter.
+            if escaped_job_cgroup(cgroup_required, cgroup, Some(child_pid.as_raw() as u32)) {
+                crate::executor::kill_process_tree(
+                    child_pid.as_raw(),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(child_pid, None);
+                return Err(Status::failed_precondition(
+                    "[cgroup] required but the step did not join its cgroup",
+                ));
             }
 
             // Register PID for cancellation.
@@ -3441,6 +3467,8 @@ impl SlurmAgent for AgentService {
                 &self.active_steps,
                 step_key,
                 memlock,
+                job_entry.cgroup_path.as_deref(),
+                self.cgroup.required,
             )
             .await?;
             if child_pid != 0 {
