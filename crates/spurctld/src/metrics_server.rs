@@ -199,6 +199,7 @@ mod tests {
             rlimits: Default::default(),
             cgroup: Default::default(),
             mpi: Default::default(),
+            health: Default::default(),
         }
     }
 

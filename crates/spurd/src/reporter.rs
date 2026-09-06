@@ -209,6 +209,34 @@ impl NodeReporter {
             }
         }
     }
+
+    /// Ask the controller to drain this node with a reason (Slurm `DrainNode`).
+    /// Best-effort: the caller (the periodic health-check loop) retries on its
+    /// next tick, so one failed attempt is only logged, not surfaced.
+    pub async fn drain_node(&self, reason: &str) {
+        match spur_client::connect_channel(&self.controller_addr).await {
+            Ok(channel) => {
+                let req = spur_proto::proto::DrainNodeRequest {
+                    name: self.hostname.clone(),
+                    reason: reason.to_string(),
+                };
+                match spur_proto::controller_client(channel).drain_node(req).await {
+                    Ok(resp) => warn!(
+                        node = %self.hostname,
+                        state = %resp.into_inner().actual_state,
+                        %reason,
+                        "drained node (health check failed)"
+                    ),
+                    Err(e) => warn!(node = %self.hostname, error = %e, "DrainNode RPC failed"),
+                }
+            }
+            Err(e) => warn!(
+                node = %self.hostname,
+                error = %e,
+                "failed to connect to controller to drain node"
+            ),
+        }
+    }
 }
 
 /// A `NOT_FOUND` heartbeat means the controller lost this node's registration

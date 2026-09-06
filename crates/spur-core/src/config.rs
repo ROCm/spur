@@ -119,6 +119,11 @@ pub struct SlurmConfig {
     /// MPI plugin settings for `--mpi=pmix` job steps.
     #[serde(default)]
     pub mpi: MpiConfig,
+
+    /// Node health-check program, run before a node re-enters the schedulable
+    /// pool and on an interval; a failure drains the node (spurd).
+    #[serde(default)]
+    pub health: HealthConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -1513,6 +1518,57 @@ impl Default for CgroupConfig {
             constrain_devices: true,
             extra_device_paths: Vec::new(),
         }
+    }
+}
+
+/// Node health-check configuration (Slurm `HealthCheckProgram` analog).
+///
+/// When `program` is set, spurd runs it before a released node re-enters the
+/// schedulable pool and on `interval_secs`; a non-zero exit or a timeout drains
+/// the node with the program's output as the reason, rather than handing the
+/// node to the next job. When `program` is `None` no checking happens at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    /// Fully-qualified path to the health-check program. `None` disables the
+    /// whole feature. No search path is set, matching the hook scripts.
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Run the check on this interval, in seconds. `0` disables the periodic
+    /// check (a re-entry check still runs when `check_before_reentry` is on).
+    #[serde(default = "default_health_interval")]
+    pub interval_secs: u64,
+    /// Kill the program and treat the check as failed after this many seconds.
+    #[serde(default = "default_health_timeout")]
+    pub timeout_secs: u64,
+    /// Run the check after each job completes, before the node is eligible for
+    /// the next one (the "return to pool" gate). On by default.
+    #[serde(default = "default_true_fn")]
+    pub check_before_reentry: bool,
+}
+
+fn default_health_interval() -> u64 {
+    300
+}
+
+fn default_health_timeout() -> u64 {
+    60
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            program: None,
+            interval_secs: default_health_interval(),
+            timeout_secs: default_health_timeout(),
+            check_before_reentry: true,
+        }
+    }
+}
+
+impl HealthConfig {
+    /// Whether any health checking is configured (a program is set).
+    pub fn is_enabled(&self) -> bool {
+        self.program.is_some()
     }
 }
 
@@ -2971,6 +3027,40 @@ job_submit_lua = "/etc/spur/job_submit.lua"
         // hooks section omitted — metrics should keep defaults
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.listen_addr, "[::]:6822");
+    }
+
+    #[test]
+    fn test_health_defaults() {
+        // With no [health] section the feature is off, but the interval/timeout
+        // carry sane defaults so enabling it later needs only a program path.
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(config.health.program.is_none());
+        assert!(!config.health.is_enabled());
+        assert_eq!(config.health.interval_secs, 300);
+        assert_eq!(config.health.timeout_secs, 60);
+        assert!(config.health.check_before_reentry);
+    }
+
+    #[test]
+    fn test_health_parses_program_and_overrides() {
+        let toml = r#"
+cluster_name = "x"
+
+[health]
+program = "/etc/spur/health.sh"
+interval_secs = 120
+timeout_secs = 15
+check_before_reentry = false
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(config.health.is_enabled());
+        assert_eq!(
+            config.health.program.as_deref(),
+            Some("/etc/spur/health.sh")
+        );
+        assert_eq!(config.health.interval_secs, 120);
+        assert_eq!(config.health.timeout_secs, 15);
+        assert!(!config.health.check_before_reentry);
     }
 
     #[test]

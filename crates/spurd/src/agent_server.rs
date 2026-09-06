@@ -1119,6 +1119,8 @@ pub struct AgentService {
     hooks: Arc<HooksConfig>,
     limits: spur_core::config::JobLimits,
     cgroup: CgroupConfig,
+    /// Node health check run before a completed node re-enters the pool.
+    health: spur_core::config::HealthConfig,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
@@ -1156,6 +1158,7 @@ impl AgentService {
                 enabled: false,
                 ..CgroupConfig::default()
             },
+            spur_core::config::HealthConfig::default(),
             MpiConfig::default(),
             new_running_jobs(),
             spur_core::config::AuthConfig::default().allow_root_jobs,
@@ -1175,6 +1178,7 @@ impl AgentService {
         cluster: &spur_core::config::ClusterConfig,
         limits: spur_core::config::JobLimits,
         cgroup: CgroupConfig,
+        health: spur_core::config::HealthConfig,
         mpi: MpiConfig,
         running: RunningJobs,
         allow_root_jobs: bool,
@@ -1239,6 +1243,7 @@ impl AgentService {
             hooks: Arc::new(hooks),
             limits,
             cgroup,
+            health,
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
@@ -1269,6 +1274,7 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let health = self.health.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -1339,8 +1345,11 @@ impl AgentService {
                     .map(|h| h.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "localhost".into());
 
-                let mut drain_jobs: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
+                // job_id -> drain reason, piggybacked on each job's completion
+                // report so the node goes idle-and-drained in one message (no
+                // window where a bad node looks schedulable).
+                let mut drain_jobs: std::collections::HashMap<u32, String> =
+                    std::collections::HashMap::new();
 
                 // Run epilog hook for completed jobs
                 if let Some(ref epilog_script) = hooks.epilog {
@@ -1363,7 +1372,25 @@ impl AgentService {
                                 error = %e,
                                 "epilog hook failed — requesting node drain"
                             );
-                            drain_jobs.insert(c.job_id);
+                            drain_jobs.insert(c.job_id, "epilog script failed".into());
+                        }
+                    }
+                }
+
+                // Health-check gate (spur#801): before a node that just finished
+                // a job re-enters the schedulable pool, verify it still works.
+                // A failure drains it in the same completion report, so the node
+                // never looks idle-and-healthy to the controller in between. The
+                // check runs once per completion batch, not once per job.
+                if health.check_before_reentry && !completed.is_empty() {
+                    if let Some(program) = health.program.clone() {
+                        if let crate::health::HealthOutcome::Unhealthy(reason) =
+                            crate::health::run_once(&program, health.timeout_secs).await
+                        {
+                            warn!(%reason, "node health check failed after job — draining node");
+                            for c in &completed {
+                                drain_jobs.entry(c.job_id).or_insert_with(|| reason.clone());
+                            }
                         }
                     }
                 }
@@ -1388,13 +1415,9 @@ impl AgentService {
                 }
 
                 for c in &completed {
-                    let drain = if drain_jobs.contains(&c.job_id) {
-                        Some(DrainRequest {
-                            reason: "epilog script failed".into(),
-                        })
-                    } else {
-                        None
-                    };
+                    let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
+                        reason: reason.clone(),
+                    });
                     report_completion(
                         &controller_addr,
                         c.job_id,
@@ -7799,6 +7822,7 @@ mod tests {
                 enabled: false,
                 ..CgroupConfig::default()
             },
+            spur_core::config::HealthConfig::default(),
             MpiConfig::default(),
             running,
             false, // allow_root_jobs
