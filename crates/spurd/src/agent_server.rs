@@ -149,7 +149,10 @@ async fn teardown_completed_job(
         return;
     }
 
-    crate::container::cleanup_rootfs(job_id, &completed.rootfs_mode);
+    crate::container::cleanup_rootfs(
+        &crate::container::job_rootfs_base(job_id),
+        &completed.rootfs_mode,
+    );
     crate::executor::cleanup_job_spool(job_id);
     if let Some(ref cgroup) = completed.cgroup {
         crate::executor::cleanup_cgroup(cgroup);
@@ -399,6 +402,23 @@ fn signal_step_tree(pid: u32, signal: i32) {
                     "failed to signal step (it may already have exited)"
                 );
             }
+        }
+    }
+}
+
+fn signal_step_process_group(pid: u32, signal: i32) {
+    let sig =
+        nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+    let leader = nix::unistd::Pid::from_raw(pid as i32);
+    if let Err(e) = nix::sys::signal::killpg(leader, sig) {
+        if let Err(kill_err) = nix::sys::signal::kill(leader, Some(sig)) {
+            warn!(
+                pid,
+                signal,
+                killpg = %e,
+                kill = %kill_err,
+                "step process group signal failed (step may already have exited)"
+            );
         }
     }
 }
@@ -718,6 +738,8 @@ async fn run_tokio_step_to_spool(
     step_files: crate::executor::StepOutputFiles,
     active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     step_key: (u32, u32),
+    cgroup: Option<&std::path::Path>,
+    cgroup_required: bool,
 ) -> Result<Option<std::process::ExitStatus>, Status> {
     use std::process::Stdio;
     let mut child = cmd
@@ -725,6 +747,16 @@ async fn run_tokio_step_to_spool(
         .stderr(Stdio::from(step_files.stderr))
         .spawn()
         .map_err(|e| Status::internal(format!("step command failed to spawn: {e}")))?;
+
+    // The pre-exec join reports whether it wrote `cgroup.procs`; this verifies the
+    // step actually landed there. Under `[cgroup] required` a step that did not is
+    // refused and its group killed rather than run outside the limits and filter.
+    if escaped_job_cgroup(cgroup_required, cgroup, child.id()) {
+        kill_step_process_group(&mut child).await;
+        return Err(Status::failed_precondition(
+            "[cgroup] required but the step did not join its cgroup",
+        ));
+    }
 
     if let Some(pid) = child.id() {
         let cancel_now = {
@@ -2934,7 +2966,7 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, cgroup_path) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -2955,6 +2987,7 @@ impl SlurmAgent for AgentService {
                 uid: tracked.uid,
                 gid: tracked.gid,
                 work_dir: tracked.work_dir.clone(),
+                cgroup_path: tracked.cgroup_path.clone(),
             };
             (
                 tracked.gpu_devices.clone(),
@@ -2963,7 +2996,7 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
-                tracked.cgroup_path.clone(),
+                entry,
             )
         };
 
@@ -3170,23 +3203,6 @@ impl SlurmAgent for AgentService {
         }
 
         let memlock = self.limits.memlock;
-        let cgroup_join = executor::CgroupJoin::for_cgroup(cgroup_path.as_deref());
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
-        unsafe {
-            cmd.pre_exec(move || {
-                crate::executor::apply_memlock(memlock);
-                // Before the drop below: an unprivileged process cannot write
-                // another cgroup's `cgroup.procs`.
-                if let Some(ref join) = cgroup_join {
-                    join.join();
-                }
-                if let Some(ref pd) = priv_drop {
-                    pd.apply()
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                }
-                Ok(())
-            });
-        }
 
         info!(
             command = ?req.command,
@@ -3199,39 +3215,18 @@ impl SlurmAgent for AgentService {
             "RunCommand: executing step"
         );
 
-        use std::process::Stdio;
-
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
-        // `spawn` only borrows, so the pre-exec closure and its dup'd log fd
-        // would otherwise stay alive for the whole step.
-        drop(cmd);
-        if escaped_job_cgroup(self.cgroup.required, cgroup_path.as_deref(), child.id()) {
-            // The user's work runs in descendants of the wrapper, and an escaped
-            // step is in no cgroup, so the group is the only handle reaching them.
-            kill_step_process_group(&mut child).await;
-            return Err(Status::failed_precondition(
-                "[cgroup] required but the step did not join its cgroup",
-            ));
-        }
-        if let Some(pid) = child.id() {
-            let cancel_now = {
-                let mut steps = self.active_steps.lock().await;
-                if let Some(step) = steps.get_mut(&step_key) {
-                    step.pid = Some(pid);
-                    step.cancel_requested
-                } else {
-                    false
-                }
-            };
-            if cancel_now {
-                signal_step_process_group(pid, nix::sys::signal::Signal::SIGTERM as i32);
-                let _ = child.kill().await;
-                let _ = child.wait_with_output().await;
-                return Ok(Response::new(cancelled_step_response()));
+        // Redirect the step's stdout/stderr to per-step spool files so
+        // stream_job_output can tail them live and output stays bounded on this
+        // node. Paths are recorded in active_steps so the tail can find them.
+        let step_files = crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
+            .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
+        let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
+        {
+            let mut steps = self.active_steps.lock().await;
+            if let Some(step) = steps.get_mut(&step_key) {
+                step.stdout_path = stdout_path.clone();
+                step.stderr_path = stderr_path.clone();
             }
         }
 
@@ -3288,25 +3283,23 @@ impl SlurmAgent for AgentService {
             for (k, v) in env {
                 cmd.env(k, v);
             }
-            if plan.apply_priv_in_child {
-                if let Some(pd) = priv_drop {
-                    unsafe {
-                        cmd.pre_exec(move || {
-                            crate::executor::apply_memlock(memlock);
-                            pd.apply()
-                                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-                        });
-                    }
-                }
-            } else {
-                unsafe {
-                    cmd.pre_exec(move || {
-                        crate::executor::apply_memlock(memlock);
-                        Ok(())
-                    });
-                }
+            unsafe {
+                cmd.pre_exec(move || {
+                    crate::executor::apply_memlock(memlock);
+                    Ok(())
+                });
             }
-            run_tokio_step_to_spool(cmd, step_files, &self.active_steps, step_key).await?
+            ChildContainment::for_plan(&plan, &job_entry, priv_drop, self.cgroup.required)
+                .register(&mut cmd);
+            run_tokio_step_to_spool(
+                cmd,
+                step_files,
+                &self.active_steps,
+                step_key,
+                job_entry.cgroup_path.as_deref(),
+                self.cgroup.required,
+            )
+            .await?
         } else if req.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
             // Case 2: standalone srun --container-image with no running parent
             // container — set up a fresh rootfs for this step.
@@ -3455,26 +3448,35 @@ impl SlurmAgent for AgentService {
             }
             maybe_status
         } else {
-            // Case 3: no container — plain host process.
-            let mut cmd = tokio::process::Command::new(&program);
-            cmd.args(&program_args)
-                .current_dir(&work_dir)
-                .process_group(0);
+            // Case 3: no container — plain host process. Route through the same
+            // launch plan as the other arms so the child joins the job cgroup.
+            let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
+            let full_command: Vec<String> = std::iter::once(program.clone())
+                .chain(program_args.iter().cloned())
+                .collect();
+            let plan = build_launch_plan(&job_entry, priv_drop.as_ref(), &full_command);
+            let mut cmd = tokio::process::Command::new(&plan.program);
+            cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
             for (k, v) in env {
                 cmd.env(k, v);
             }
-            let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
             unsafe {
                 cmd.pre_exec(move || {
                     crate::executor::apply_memlock(memlock);
-                    if let Some(ref pd) = priv_drop {
-                        pd.apply()
-                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                    }
                     Ok(())
                 });
             }
-            run_tokio_step_to_spool(cmd, step_files, &self.active_steps, step_key).await?
+            ChildContainment::for_plan(&plan, &job_entry, priv_drop, self.cgroup.required)
+                .register(&mut cmd);
+            run_tokio_step_to_spool(
+                cmd,
+                step_files,
+                &self.active_steps,
+                step_key,
+                job_entry.cgroup_path.as_deref(),
+                self.cgroup.required,
+            )
+            .await?
         };
 
         let status = match maybe_status {
