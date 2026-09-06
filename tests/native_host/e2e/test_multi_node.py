@@ -264,8 +264,11 @@ class TestBackfillReservation:
         cluster = multi_node_cluster
         n0, n1 = cluster.node_names[0], cluster.node_names[1]
 
+        # Must still hold n0 when the reservation is asserted below: if the filler
+        # exits on its own first, big dispatches early and clears the reservation,
+        # racing the check. Cancelled right after the assert so big can then run.
         filler_script = cluster.write_file(
-            "backfill-filler.sh", "#!/bin/bash\nsleep 8\n"
+            "backfill-filler.sh", "#!/bin/bash\nsleep 45\n"
         )
         filler_id = parse_job_id(
             cluster.sbatch(
@@ -321,7 +324,10 @@ class TestBackfillReservation:
             f"n1's State= should carry the PLANNED overlay flag:\n{n1_show}"
         )
 
+        # Free the reserved slot (small) and n0 (filler) so big can finally
+        # dispatch — it must not stay starved.
         cluster.scancel(str(small_id))
+        cluster.scancel(str(filler_id))
 
         wait_job(cluster, big_id, timeout=90)
         big_content = cluster.read_output_on_any_node(big_out)
