@@ -179,7 +179,8 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_entrypoint: Option<String>,
 
-    /// Remap user to root inside container
+    /// Remap the submitting user to root inside the container.
+    /// NOT YET IMPLEMENTED: rejected at submission rather than silently ignored.
     #[arg(long)]
     pub container_remap_root: bool,
 
@@ -233,6 +234,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         anyhow::bail!(
             "--container-readonly is not yet implemented; the container root would be \
              writable despite the flag. Omit it rather than rely on a read-only rootfs."
+        );
+    }
+
+    if args.container_remap_root {
+        anyhow::bail!(
+            "--container-remap-root is not yet implemented; the container would run as the \
+             submitting user despite the flag. Rootless UID/GID remapping (submitter -> root \
+             inside the container, unprivileged on the host) is planned but not yet available. \
+             Omit the flag rather than rely on it."
         );
     }
 
@@ -2965,6 +2975,25 @@ mod tests {
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("--container-readonly") && msg.contains("not yet implemented"),
+            "expected a not-yet-implemented rejection, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_remap_root_is_rejected() {
+        // The flag was parsed, propagated, and silently ignored; it must now
+        // fail at submission rather than run the container as the submitting user.
+        let result = main_with_args(vec![
+            "srun".into(),
+            "--container-image=img.sqsh".into(),
+            "--container-remap-root".into(),
+            "hostname".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("--container-remap-root") && msg.contains("not yet implemented"),
             "expected a not-yet-implemented rejection, got: {msg}"
         );
     }

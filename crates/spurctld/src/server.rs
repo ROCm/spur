@@ -783,6 +783,18 @@ impl SlurmController for ControllerService {
         let mut core_spec = proto_to_job_spec(spec)?;
         Self::bind_spec_to_identity(&mut core_spec, identity.as_ref())?;
 
+        // --container-remap-root is parsed and propagated but rootless UID/GID
+        // remapping is not implemented. Reject it at submission rather than
+        // accept it and silently run the container as the submitting user.
+        if core_spec.container_remap_root {
+            return Err(Status::invalid_argument(
+                "--container-remap-root is not yet implemented; rootless UID/GID remapping \
+                 (submitter -> root inside the container, unprivileged on the host) is planned \
+                 but not available. Resubmit without the flag — the container runs as the \
+                 submitting user.",
+            ));
+        }
+
         // Clamp a non-privileged caller's base priority to the configured ceiling before it reaches
         // the scheduler, so one submission cannot front-run the whole queue. Non-fatal: clamp + warn.
         let priority_warning = Self::clamp_priority(
@@ -5217,6 +5229,35 @@ mod tests {
             .expect_err("submit_job must not serve locally when there is no leader");
         assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(status.message(), "not the Raft leader");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_rejects_container_remap_root() {
+        // The flag was parsed and propagated but never honored; submission must
+        // fail rather than run the container as the submitting user.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let spec = spur_proto::proto::JobSpec {
+            name: "remap".into(),
+            user: "alice".into(),
+            work_dir: "/home/alice".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            container_image: "img.sqsh".into(),
+            container_remap_root: true,
+            ..Default::default()
+        };
+        let status = svc
+            .submit_job(Request::new(SubmitJobRequest { spec: Some(spec) }))
+            .await
+            .expect_err("container_remap_root must be rejected at submission");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("--container-remap-root"),
+            "rejection should name the flag, got: {}",
+            status.message()
+        );
     }
 
     #[test]
