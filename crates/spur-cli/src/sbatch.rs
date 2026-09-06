@@ -239,7 +239,8 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "container_entrypoint")]
     pub container_entrypoint: Option<String>,
 
-    /// Remap user to root inside container
+    /// Remap the submitting user to root inside the container.
+    /// NOT YET IMPLEMENTED: rejected at submission rather than silently ignored.
     #[arg(long, overrides_with = "container_remap_root")]
     pub container_remap_root: bool,
 
