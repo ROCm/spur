@@ -487,7 +487,11 @@ fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
     let default_devices = spur_core::config::DevicesConfig::default();
     let devices_config = config.map(|c| &c.devices).unwrap_or(&default_devices);
 
-    let cdi_cache = CdiCache::load(&devices_config.cdi_spec_dirs, devices_config.auto_detect);
+    let cdi_cache = CdiCache::load(
+        &devices_config.cdi_spec_dirs,
+        devices_config.auto_detect,
+        devices_config.overlay_host_rocm_libs,
+    );
 
     let gres_entries: Vec<spur_devices::GresEntry> = devices_config
         .gres

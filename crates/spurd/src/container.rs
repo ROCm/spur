@@ -610,6 +610,17 @@ fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::Conta
         }
     }
 
+    // Record the injected library mounts in the job's log (spur#779): overlaying
+    // host libraries over the image's is a substitution the job can otherwise
+    // only detect by reading /proc/self/mountinfo, so name it where it's visible.
+    if !plan.mounts.is_empty() {
+        let overlaid: Vec<&str> = plan.mounts.iter().map(|m| m.target.as_str()).collect();
+        info!(
+            mounts = ?overlaid,
+            "overlaying host library paths onto the container image (replacing the image's own)"
+        );
+    }
+
     // Mounts: bind-mount library paths etc.
     for m in &plan.mounts {
         let source = Path::new(&m.source);

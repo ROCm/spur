@@ -514,7 +514,9 @@ const CDI_SPEC_PATH: &str = "/etc/cdi/amd.json";
 /// k8s-device-plugin; acceptable for Phase-2 containerd injection — a native spur-device-plugin is
 /// a later milestone.
 async fn write_cdi_spec() -> anyhow::Result<()> {
-    let specs = spur_devices::cdi::discovery::discover_to_cdi();
+    // No host-ROCm library overlay for k0s/containerd pods (spur#779): match the
+    // native-container default of leaving the image's userspace in place.
+    let specs = spur_devices::cdi::discovery::discover_to_cdi(false);
     if specs.is_empty() {
         info!("no AMD GPUs discovered; not writing a CDI spec");
         return Ok(());

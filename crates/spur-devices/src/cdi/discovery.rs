@@ -21,7 +21,10 @@ const VRAM_HEAP_TYPE: u64 = 1;
 const IO_LINK_XGMI: u32 = 2;
 const GPU_SUPPLEMENTARY_GROUPS: [&str; 2] = ["video", "render"];
 
-pub fn discover_to_cdi() -> Vec<CdiSpec> {
+/// Build the auto-detected AMD CDI spec. `overlay_host_rocm_libs` decides
+/// whether the host's `/opt/rocm/lib{,64}` is bind-mounted over the image's
+/// (spur#779); device nodes and GPU groups are injected regardless.
+pub fn discover_to_cdi(overlay_host_rocm_libs: bool) -> Vec<CdiSpec> {
     let gpus = discover_amd_gpus();
     if gpus.is_empty() {
         return Vec::new();
@@ -29,7 +32,7 @@ pub fn discover_to_cdi() -> Vec<CdiSpec> {
 
     let devices: Vec<CdiDevice> = gpus.iter().map(|g| g.to_cdi_device()).collect();
 
-    let shared_edits = build_shared_edits();
+    let shared_edits = build_shared_edits(overlay_host_rocm_libs);
 
     let mut spec_annotations = HashMap::new();
     spec_annotations.insert(annotations::AUTO_DETECTED.into(), "true".into());
@@ -340,7 +343,7 @@ impl DiscoveredGpu {
     }
 }
 
-fn build_shared_edits() -> ContainerEdits {
+fn build_shared_edits(overlay_host_rocm_libs: bool) -> ContainerEdits {
     let mut edits = ContainerEdits::default();
 
     if Path::new("/dev/kfd").exists() {
@@ -358,19 +361,25 @@ fn build_shared_edits() -> ContainerEdits {
         });
     }
 
-    for lib_path in &["/opt/rocm/lib", "/opt/rocm/lib64"] {
-        if Path::new(lib_path).is_dir() {
-            edits.mounts.push(Mount {
-                host_path: lib_path.to_string(),
-                container_path: lib_path.to_string(),
-                r#type: None,
-                options: Some(vec![
-                    "ro".into(),
-                    "nosuid".into(),
-                    "nodev".into(),
-                    "bind".into(),
-                ]),
-            });
+    // The host-ROCm library overlay is opt-in (spur#779). Default off keeps the
+    // image's own userspace, matching `docker run --device=/dev/kfd ...`;
+    // overlaying the host's runtime/math/tuning libraries over the image's is a
+    // silent version split. Device nodes and GPU groups are injected either way.
+    if overlay_host_rocm_libs {
+        for lib_path in &["/opt/rocm/lib", "/opt/rocm/lib64"] {
+            if Path::new(lib_path).is_dir() {
+                edits.mounts.push(Mount {
+                    host_path: lib_path.to_string(),
+                    container_path: lib_path.to_string(),
+                    r#type: None,
+                    options: Some(vec![
+                        "ro".into(),
+                        "nosuid".into(),
+                        "nodev".into(),
+                        "bind".into(),
+                    ]),
+                });
+            }
         }
     }
 
@@ -803,8 +812,35 @@ mod tests {
 
     #[test]
     fn test_discover_does_not_panic() {
-        let specs = discover_to_cdi();
-        let _ = specs;
+        let _ = discover_to_cdi(false);
+        let _ = discover_to_cdi(true);
+    }
+
+    #[test]
+    fn test_shared_edits_library_overlay_is_gated() {
+        // The overlay flag governs only the /opt/rocm library bind mounts, and
+        // only when the host actually has those directories.
+        let host_has_rocm = std::path::Path::new("/opt/rocm/lib").is_dir()
+            || std::path::Path::new("/opt/rocm/lib64").is_dir();
+
+        let off = build_shared_edits(false);
+        assert!(
+            off.mounts.is_empty(),
+            "no library mounts must be injected when the overlay is off, got {:?}",
+            off.mounts
+        );
+
+        let on = build_shared_edits(true);
+        if host_has_rocm {
+            assert!(
+                on.mounts
+                    .iter()
+                    .any(|m| m.host_path.starts_with("/opt/rocm/lib")),
+                "overlay on + host ROCm present must inject the library mounts"
+            );
+        }
+        // Device-node injection is independent of the overlay flag.
+        assert_eq!(off.device_nodes.len(), on.device_nodes.len());
     }
 
     #[test]
@@ -859,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_build_shared_edits_kfd() {
-        let _ = build_shared_edits();
+        let _ = build_shared_edits(false);
     }
 
     #[test]
