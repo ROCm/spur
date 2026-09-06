@@ -541,3 +541,38 @@ class TestCgroupConfigValidation:
         assert "allowed_ram_percent" in out, (
             f"startup failure must name the offending field:\n{out}"
         )
+
+
+class TestCgroupContainerStep:
+    """A standalone ``srun --container-image`` step takes the fork + pivot_root
+    container path (``run_containerized_step``), distinct from a batch container,
+    a plain step, and an nsenter step. It must still join the job cgroup.
+    """
+
+    def test_container_step_runs_inside_the_job_cgroup(self, cgroup_cluster, tmp_path):
+        cluster = cgroup_cluster
+        cluster.container_preflight()
+        image = cluster.build_container_image(tmp_path)
+
+        # A *standalone* srun --container-image is what takes the fork + pivot_root
+        # container path; its own allocation is non-container. (The same flag on a
+        # step inside an allocation stays a plain host step.)
+        code, out = cluster.srun_with_exit(
+            ["-w", cluster.node_names[0], "--mem=256", f"--container-image={image}",
+             "sh", "-c",
+             "cat /proc/self/cgroup; "
+             "test -e /etc/os-release && echo IS_HOST || echo IS_CONTAINER"]
+        )
+
+        # /etc/os-release exists on the host but not in the minimal image, so this
+        # proves the step ran inside the pivoted rootfs (arm 2), not on the host —
+        # otherwise it would join the cgroup regardless and prove nothing.
+        assert "IS_CONTAINER" in out, (
+            f"the step must run inside the container rootfs (exit {code})\noutput:\n{out}"
+        )
+        # The container's /proc still reports the host cgroup path (no cgroup-ns
+        # remap), so a joined step reads /spur/job_<id>; an uncontained one would
+        # read spurd's own cgroup instead.
+        assert "0::/spur/job_" in out, (
+            f"a container step must join the job cgroup (exit {code})\noutput:\n{out}"
+        )
