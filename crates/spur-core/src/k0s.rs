@@ -59,16 +59,18 @@ mod local_path_tests {
     }
 }
 
-/// Generate a k0s controller config (YAML) for a mesh-native cluster: the API server is advertised
-/// on `api_address` (the control-plane's WireGuard mesh IP) and Calico runs in `bird` mode (native
-/// routing, no overlay) so pod traffic rides the mesh. `cni_mtu` sets Calico's MTU (typically below
-/// the underlay to leave room for WireGuard's ~50-byte overhead, avoiding fragmentation). Returns
-/// `None` for any `cni` other than `"calico"` (the k0s default, kube-router, needs no config file).
-/// `sans` are extra API-server certificate SANs (e.g. the control-plane's mesh + underlay IPs).
+/// Generate a k0s controller config (YAML) for a Calico cluster. `api_address` is where the API
+/// server is advertised — the control-plane's WireGuard mesh IP when `mesh_native`, else its real
+/// underlay address. `mesh_native` also picks Calico's mode: `bird` (native routing over the mesh,
+/// no overlay) when true, else `vxlan` (Calico's own overlay — no mesh required). `cni_mtu` sets
+/// Calico's MTU (typically below the underlay to leave room for encapsulation overhead, avoiding
+/// fragmentation). Returns `None` for any `cni` other than `"calico"` (the k0s default, kube-router,
+/// needs no config file). `sans` are extra API-server certificate SANs.
 ///
-/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over WireGuard cryptokey routing, so
-/// node-local load balancing (EnvoyProxy) is enabled to give konnectivity a cluster-wide balanced
-/// endpoint instead of pinning every agent to one controller.
+/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over the mesh's cryptokey routing (`bird`
+/// mode) or Calico's own overlay (`vxlan` mode), so node-local load balancing (EnvoyProxy) is enabled
+/// to give konnectivity a cluster-wide balanced endpoint instead of pinning every agent to one controller.
+#[allow(clippy::too_many_arguments)]
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,
@@ -77,6 +79,7 @@ pub fn k0s_controller_config_yaml(
     api_address: &str,
     sans: &[String],
     cp_count: usize,
+    mesh_native: bool,
 ) -> Option<String> {
     if cni != "calico" {
         return None;
@@ -100,7 +103,8 @@ pub fn k0s_controller_config_yaml(
     y.push_str(&format!("    podCIDR: {pod_cidr}\n"));
     y.push_str(&format!("    serviceCIDR: {service_cidr}\n"));
     y.push_str("    calico:\n");
-    y.push_str("      mode: bird\n");
+    let mode = if mesh_native { "bird" } else { "vxlan" };
+    y.push_str(&format!("      mode: {mode}\n"));
     y.push_str(&format!("      mtu: {cni_mtu}\n"));
     if cp_count > 1 {
         y.push_str("    nodeLocalLoadBalancing:\n");
@@ -189,6 +193,7 @@ mod k0s_config_tests {
             "192.0.2.1",
             &["192.0.2.1".to_string(), "203.0.113.9".to_string()],
             1,
+            true,
         )
         .unwrap();
         assert!(y.contains("address: 192.0.2.1"));
@@ -201,6 +206,25 @@ mod k0s_config_tests {
     }
 
     #[test]
+    fn calico_config_uses_vxlan_without_a_mesh() {
+        // Documentation-range addresses only (RFC 5737 TEST-NET); no real infrastructure IPs.
+        let y = k0s_controller_config_yaml(
+            "calico",
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            1450,
+            "203.0.113.9",
+            &["203.0.113.9".to_string()],
+            1,
+            false,
+        )
+        .unwrap();
+        assert!(y.contains("address: 203.0.113.9"));
+        assert!(y.contains("mode: vxlan"));
+        assert!(!y.contains("mode: bird"));
+    }
+
+    #[test]
     fn kuberouter_default_generates_no_config() {
         assert!(k0s_controller_config_yaml(
             "kuberouter",
@@ -210,6 +234,7 @@ mod k0s_config_tests {
             "192.0.2.1",
             &[],
             3,
+            true,
         )
         .is_none());
     }
@@ -225,6 +250,7 @@ mod k0s_config_tests {
             "192.0.2.1",
             &["192.0.2.1".to_string()],
             3,
+            true,
         )
         .unwrap();
         assert!(y.contains("nodeLocalLoadBalancing:"));
@@ -243,6 +269,7 @@ mod k0s_config_tests {
             "192.0.2.1",
             &["192.0.2.1".to_string()],
             1,
+            true,
         )
         .unwrap();
         assert!(!y.contains("nodeLocalLoadBalancing"));

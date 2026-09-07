@@ -308,3 +308,5 @@ pluggable
 torchrun
 backoff
 unapplied
+UDP
+VXLAN
