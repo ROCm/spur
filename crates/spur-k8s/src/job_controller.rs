@@ -1772,6 +1772,10 @@ mod tests {
         cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
         cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
         cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
+        raft_add_learner(pb::RaftAddLearnerRequest) -> ();
+        raft_promote_voter(pb::RaftPromoteVoterRequest) -> ();
+        raft_remove_voter(pb::RaftRemoveVoterRequest) -> ();
+        raft_membership(pb::RaftMembershipRequest) -> pb::RaftMembershipResponse;
     }
 
     /// A kube client whose every request fails. The deletion path tolerates

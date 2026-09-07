@@ -108,6 +108,11 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         // cannot tell that from a plain read, so record both.
         "ClusterKubeconfig" => targeted(Create, TxnEntity::Cluster, LeaderOnly),
 
+        // --- Raft controller membership. The target is the raft node id. ---
+        "RaftAddLearner" => targeted(Create, TxnEntity::Cluster, LeaderOnly),
+        "RaftPromoteVoter" => targeted(Update, TxnEntity::Cluster, LeaderOnly),
+        "RaftRemoveVoter" => targeted(Delete, TxnEntity::Cluster, LeaderOnly),
+
         // --- Accounting entities. Slurm's txn_table covers exactly these. ---
         // `sacctmgr modify` reaches the create RPCs as an upsert, so their
         // handlers replace the action below with the verb the write performed.
@@ -128,6 +133,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         | "ListReservations"
         | "ListTokens"
         | "ClusterStatus"
+        | "RaftMembership"
         | "Ping"
         | "GetJobMetrics"
         | "GetNodeMetrics"
