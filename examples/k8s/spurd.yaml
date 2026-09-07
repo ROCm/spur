@@ -26,7 +26,7 @@ spec:
           image: rocm/spur:0.16.0 # x-release-please-version
           command: [spurd]
           args:
-            - --controller=spurctld.spur.svc.cluster.local:6817
+            - --controller=spurctld-client.spur.svc.cluster.local:6817
             - --listen=[::]:6816
           ports:
             - containerPort: 6816
