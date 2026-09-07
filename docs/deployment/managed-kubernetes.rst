@@ -41,6 +41,78 @@ Prerequisites
   pre-stage the binary — see `Installing k0s`_).
 - For the mesh-native CNI only: a WireGuard mesh (``spur0``) already established
   across the nodes via ``spur net join`` / ``spur net mesh``.
+- The ports below, open between the cluster nodes. ``spur k8s silo prepare-node``
+  opens them. See `Open the k0s ports`_.
+- For ``silo install`` only: ``chrony`` installed on every worker node. The
+  platform stack runs an exporter that mounts ``/run/chrony`` from the host, and
+  Ubuntu's cloud image keeps time with ``systemd-timesyncd``, which creates no
+  such directory. The exporter then never becomes healthy, and ArgoCD blocks on
+  it instead of retrying the rest of the observability stack.
+
+Open the k0s ports
+~~~~~~~~~~~~~~~~~~~
+
+k0s needs these ports between the nodes. ``spur k8s silo prepare-node`` opens them
+with ``iptables``. This table says what each one carries, so you can open them
+yourself when another tool owns the host firewall.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 10 30 48
+
+   * - Port
+     - Proto
+     - Direction
+     - Purpose
+   * - ``6443``
+     - TCP
+     - worker → control plane
+     - kube-apiserver. A worker cannot join without it.
+   * - ``8132``
+     - TCP
+     - worker → control plane
+     - konnectivity agent.
+   * - ``10250``
+     - TCP
+     - control plane → worker
+     - kubelet: logs, ``exec``, and metrics.
+   * - ``9443``
+     - TCP
+     - control plane ↔ control plane
+     - k0s join API. HA only.
+   * - ``2380``
+     - TCP
+     - control plane ↔ control plane
+     - etcd peer. HA only.
+   * - ``6817``, ``6818``, ``6821``
+     - TCP
+     - node ↔ node
+     - ``spurctld``, ``spurd``, and the controller's Raft port.
+   * - ``80``, ``443``
+     - TCP
+     - client → cluster
+     - The platform-stack gateway. ``silo install`` only.
+   * - ``30000-32767``
+     - TCP, UDP
+     - client → cluster
+     - NodePort range.
+
+The CNI also needs pod and service traffic to pass between the nodes. Calico
+adds ``179``/TCP for BGP, and ``4789``/UDP when you configure VXLAN.
+``silo prepare-node`` opens neither, because the CNI is a per-cluster choice.
+
+.. warning::
+
+   A stock cloud image often ends its ``INPUT`` chain with a catch-all reject
+   and opens only ``22``. The worker then logs
+   ``Failed to connect to apiserver [...] no route to host`` and never joins,
+   while ``spur k8s status`` still reports ``phase: ready``. The phase describes
+   the node components SPUR starts, not Kubernetes membership. Run
+   ``kubectl get nodes`` to confirm that the workers joined.
+
+   A single-node cluster hits this too. A pod reaches the cluster's own service
+   IP through a DNAT to the node's ``6443``, and that packet crosses ``INPUT``.
+   Without the rule, every in-cluster API client fails with ``no route to host``.
 
 Configure the cluster
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -64,6 +136,155 @@ choice):
    storage_provisioner = "local-path"  # default StorageClass for PVCs; or "none"
    # local_path_dir = "/mnt/scratch/local-path"  # point local-path at a big disk (default /var/lib)
    k0s_version = "v1.36.2+k0s.0"     # pinned; or "latest"
+
+Prepare the node
+~~~~~~~~~~~~~~~~
+
+.. note::
+
+   **SPUR assumes the node is already configured.** Preparing a node is the
+   operator's job, and ``spur k8s silo install`` neither performs it nor
+   requires it. The install runs a read-only sanity check first, names what
+   looks wrong, and continues.
+
+   ``spur k8s silo prepare-node`` remains available as a convenience for a bare
+   node. It is not a step in the deployment workflow, and a node prepared by
+   another tool needs it no more than a node prepared by hand.
+
+``spur k8s silo prepare-node`` makes a bare node ready to run k0s. It runs locally as
+root and needs no controller, so it works before any cluster exists.
+
+It gives the k0s data directory its own disk, opens the ports the cluster
+needs, raises the kernel limits the platform stack exhausts, and makes sure the
+node keeps the time:
+
+.. code-block:: bash
+
+   sudo spur k8s silo prepare-node --data-disk /dev/sdb
+   sudo spur k8s silo prepare-node --data-disk /dev/sdb --dry-run   # report, change nothing
+
+The data disk
+'''''''''''''
+
+k0s keeps etcd, every container image, and every kubelet volume under
+``/var/lib/k0s``. The platform stack takes that well past 100 GB, which is more
+than a stock cloud image's root disk holds.
+
+.. warning::
+
+   Run this **before the node first runs k0s**. k0s records an absolute path for
+   every kubelet volume, so a data directory that moves onto another device later
+   breaks each of those mounts. The command refuses to run once ``/var/lib/k0s``
+   holds data on the root filesystem, because at that point the move is unsafe.
+
+The command formats the device ext4 only when it carries no filesystem, and it
+adds an ``/etc/fstab`` entry keyed by UUID with ``nofail``. A device that already
+carries another filesystem is refused unless you pass ``--force-format``, which
+erases it. A second run reports what is already in place and changes nothing.
+
+Omit ``--data-disk`` to leave the data directory on the root filesystem.
+
+The firewall
+''''''''''''
+
+The command then adds two ``ACCEPT`` rules at the head of the ``INPUT`` chain,
+one for TCP and one for UDP, covering the ports in `Open the k0s ports`_. It
+inserts at the head so the rules sit ahead of a catch-all reject.
+
+It adds and never removes. The node keeps the policy it arrived with, and the
+``FORWARD`` chain stays untouched, because the CNI writes its own rules there.
+A second run finds the rules already in place and changes nothing.
+
+The command speaks ``iptables`` and nothing else. It stops with an error when
+``iptables`` is absent or cannot read the ``INPUT`` chain. Open the ports
+yourself when ``ufw``, ``firewalld``, or another tool owns the ruleset: those
+tools rewrite the whole ruleset on reload, and they would drop a rule SPUR
+inserted behind their back.
+
+Finally the command installs and enables ``spur-k0s-firewall.service``, which
+puts the same two rules back after a reboot. iptables rules live in kernel
+memory, so a reboot empties the chain and something has to write them back.
+
+The unit carries the two rules and nothing else. It tests for each rule before
+it inserts it, exactly as the command does, so a boot adds nothing to a node
+that already carries them. It runs after ``netfilter-persistent.service``,
+because that unit flushes the chain before it restores.
+
+.. warning::
+
+   The command no longer writes ``/etc/iptables/rules.v4``. An earlier version
+   saved the whole live ruleset there with ``iptables-save``, which fails on a
+   node where the cluster already runs: the snapshot picks up the CNI's chains,
+   and those match against ipsets that the CNI creates at start-up.
+   ``iptables-restore`` resolves every line before it applies any, so one
+   missing ipset leaves the boot with **no** rules at all, SPUR's included.
+
+   A node prepared by that version still holds the bad file. Delete
+   ``/etc/iptables/rules.v4``, or remove the lines that name an ipset, then run
+   ``spur k8s silo prepare-node`` again to install the unit.
+
+Kernel limits
+'''''''''''''
+
+The command last raises two ``inotify`` limits, and writes them to
+``/etc/sysctl.d/90-spur-k0s.conf`` for the next boot:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 14 46
+
+   * - sysctl
+     - Floor
+     - Why
+   * - ``fs.inotify.max_user_instances``
+     - ``8192``
+     - Stock Ubuntu allows 128, which the platform stack exhausts.
+   * - ``fs.inotify.max_user_watches``
+     - ``524288``
+     - A recent kernel scales this from RAM and already sits far higher. The
+       floor protects a small-memory node, where the default is 8192.
+
+These are floors, not targets. A node that already sits higher keeps its value,
+and the drop-in records the value the command settled on, so the boot-time apply
+never lowers the node.
+
+An ``inotify`` limit counts **per UID on the host**. A container gets no
+namespace of its own, so kubelet, containerd, and every pod that runs as root
+draw from one pool. The platform stack is full of config watchers, and the
+cluster runs out.
+
+.. warning::
+
+   This failure arrives late and reads as something else. Once the pool is
+   empty, ``inotify_init1`` returns ``EMFILE``, which a Go workload reports as
+   ``failed to create fsnotify watcher: too many open files``. That looks like a
+   file-descriptor limit, so raising ``ulimit -n`` is the obvious fix and changes
+   nothing. Worse, a kubelet that cannot open a watcher stops tracking ConfigMap
+   and Secret updates, and no pod crashes to say so.
+
+Time sync
+'''''''''
+
+The command last makes sure ``chrony`` runs. The requirement is chrony itself,
+not a correct clock: the platform stack's ``otel-lgtm-stack`` chart ships a
+``nodeexporter-chrony-exporter`` DaemonSet that reads
+``unix:///run/chrony/chronyd.sock`` from a ``hostPath`` mount.
+
+The command tests for that socket. A node that serves it keeps whatever it has.
+A node that does not gets ``chrony`` from ``apt-get``, started at once. The
+clock then converges over a few minutes.
+
+.. warning::
+
+   ``systemd-timesyncd`` is not enough, although it keeps the clock correct.
+   Ubuntu's cloud image runs it by default and it creates no socket, so the
+   exporter never becomes healthy and ArgoCD reports ``otel-lgtm-stack`` as
+   degraded. Installing chrony disables ``systemd-timesyncd``, so the node ends
+   with one time source rather than two.
+
+A right clock matters on its own, because skew invalidates a TLS certificate, an
+OIDC token and an etcd lease. Any NTP client would do for that. The socket is
+what makes it chrony.
 
 Installing k0s
 ~~~~~~~~~~~~~~~
@@ -267,6 +488,203 @@ latter is inventory-only (it does not drain pods or stop k0s) and is for
 decommissioning a host from SPUR entirely. Use ``k8s remove-nodes`` first, then
 ``node remove`` if the host is also leaving SPUR.
 
+Install the platform stack
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``spur k8s up`` gives you Kubernetes and nothing on top of it. ``silo install``
+deploys the cluster-forge platform stack (ArgoCD, Gitea, OpenBao, and the AI/ML
+tooling) onto it.
+
+**It brings the cluster up itself.** A cluster that is not ready yet is not an
+error: the command requests the same bring-up that ``spur k8s up`` does, then
+waits for the cluster to reach ready before it installs anything. On a node that
+is registered and configured, this is the only command you run.
+
+**It assumes the node is configured, and prepares nothing.** How a node gets its
+disk, its firewall rules and its kernel limits is the operator's business, and
+the command neither performs that work nor requires any particular tool to have
+done it.
+
+It does run a read-only sanity check first. The check names what looks wrong and
+the install continues, because each of these fails late and as something else: an
+unraised ``inotify`` limit as a kubelet that quietly stops tracking ConfigMap
+updates, a full disk as an image pull that never finishes. The check covers:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 68
+
+   * - Check
+     - Reported when
+   * - Free space
+     - ``/var/lib/k0s`` holds less than 150 GB. One install of size ``medium``
+       used 141 GB.
+   * - Ports
+     - The ``INPUT`` chain does not accept the TCP or UDP ports k0s needs.
+   * - Kernel limits
+     - An ``inotify`` limit sits below the floor in `Kernel limits`_.
+   * - chrony
+     - Nothing serves ``/run/chrony/chronyd.sock``, which the platform
+       stack's chrony exporter reads.
+
+The check changes nothing and stops nothing. Which device holds the data
+directory is not checked: keeping it on the root filesystem is a supported
+choice, so only the free space on it matters.
+
+**It needs ``git`` on the node**, which is what clones cluster-forge. The
+command stops at once when ``git`` is absent, rather than minutes in, at the
+clone. Pass ``--release`` as a release archive URL to download the sources over
+HTTP instead, which needs no ``git``.
+
+The command needs two more things that ``spur k8s up`` does not set up. Prepare
+both before the first run:
+
+* **A cluster-admin kubeconfig for root.** The command runs ``kubectl`` as root
+  and reads no ``KUBECONFIG`` variable. Set ``[cluster]
+  allow_admin_kubeconfig = true`` in ``spur.conf``, or write
+  ``/root/.kube/config`` yourself.
+* **A TLS certificate for the domain.** ``--cert-option`` defaults to
+  ``existing``, which needs ``--tls-cert`` and ``--tls-key``. Pass
+  ``--cert-option generate`` to build a self-signed pair instead. The command
+  builds that pair itself and needs no certificate tool on the node. The pair
+  lasts 365 days and the key file is created ``0600``.
+
+.. code-block:: bash
+
+   # a pre-staged certificate (the default)
+   sudo spur k8s silo install --domain cf.example.com \
+       --tls-cert /etc/spur/cf.example.com.crt \
+       --tls-key /etc/spur/cf.example.com.key
+
+   # a self-signed certificate, for a test cluster
+   sudo spur k8s silo install --domain cf.example.com --cert-option generate
+
+   # choose a release and a size
+   sudo spur k8s silo install --domain cf.example.com --cert-option generate \
+       --release v2.2.2 --size large
+
+   # reinstall over an installed stack
+   sudo spur k8s silo install --domain cf.example.com --cert-option generate --force
+
+``--release`` takes a tag, a branch, or a release archive URL. An empty value
+takes the release SPUR pins, so two installs a month apart deploy the same
+platform stack.
+
+**This runs locally, so it is not usable from a workstation.** The command needs
+root, a cluster that can pull images, and network access to the cluster-forge
+repository. It needs no other tool on the node: it installs no Helm and no
+``kubectl``, and it runs no external deployer.
+
+The cluster must already be ``ready``; the command refuses to run otherwise. A
+second run is a no-op once the stack is installed, unless you pass ``--force``.
+
+How the bootstrap works
+'''''''''''''''''''''''
+
+cluster-forge delivers itself through ArgoCD, so the install is a bootstrap.
+``silo install`` puts ArgoCD, OpenBao and Gitea on the cluster by hand, and then
+creates the one ArgoCD Application that owns everything after that, the three
+bootstrapped components included.
+
+The order is forced, not chosen. ArgoCD comes first because everything after it
+is an ArgoCD Application. OpenBao comes next, because the Gitea init job reads
+the OpenBao root token, waits on the OpenBao service, and pulls its own user
+password from an OpenBao path. Gitea comes last of the three.
+
+Every stage renders a Helm chart, and **SPUR renders the charts in the cluster
+rather than on the node**. It starts a short-lived pod on ArgoCD's own image,
+sends each chart in over ``kubectl exec``, runs ``helm template`` there, and
+applies the result from the node. The pod gets no ServiceAccount token, and the
+command deletes it when the install ends.
+
+That pod carries the same Helm that ArgoCD reconciles these charts with
+afterwards. Rendering the bootstrap with any other Helm renders each component
+twice, by two versions that can disagree. The image comes from the ArgoCD
+chart's own ``appVersion``, so there is no second version to keep in step, and
+the cluster pulls that image anyway.
+
+The bootstrap ends by creating the ``cluster-forge`` Application, which points
+ArgoCD at the repositories Gitea now holds. ArgoCD then adopts ArgoCD, OpenBao
+and Gitea, and deploys the rest of the stack over the next several minutes.
+Nothing waits for that.
+
+Every stage probes for its own result first, so an install that fails part way
+resumes instead of repeating stages that take minutes.
+
+What ``silo install`` does around the bootstrap
+''''''''''''''''''''''''''''''''''''''''''''''''
+
+cluster-forge expects the cluster RKE2 builds, which prepares itself through
+files under ``/etc/rancher`` and ``/var/lib/rancher`` that k0s never reads.
+``silo install`` therefore does that preparation itself, through the Kubernetes
+API. Each step is idempotent, so a re-run changes nothing.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Step
+     - Reason
+   * - Stage ``/root/.kube/config``
+     - The command runs ``kubectl`` as root and reads no ``KUBECONFIG``
+       variable. An existing file is never overwritten.
+   * - Alias the cluster-forge StorageClasses
+     - cluster-forge asks for ``default``, ``mlstorage``, ``direct`` and
+       ``multinode``. Each missing name is created on the default provisioner.
+   * - Create the ``cluster-tls`` secret
+     - The gateway's ``https`` listener names it. Without it the listener
+       reports ``InvalidCertificateRef``.
+   * - Register the ``HelmChartConfig`` kind
+     - An RKE2-only CRD. ArgoCD caches the API resource list at startup, so the
+       kind is registered before the bootstrap runs.
+   * - Label one node ``cluster-bloom/first-node=true``
+     - cluster-forge pins the Envoy proxy pods to it, and names this label. RKE2
+       sets it through the node config, which k0s does not use.
+   * - Create a MetalLB address pool
+     - Runs after the bootstrap, because the CRD arrives with the platform
+       stack. The pool holds the address of the node that runs the gateway.
+       Only a Kubernetes node can answer for the address, and the k0s control
+       plane node carries no kubelet.
+   * - Recreate an empty unrecoverable database
+     - See the note below.
+
+.. note::
+
+   cluster-forge registers the Kyverno admission webhook with
+   ``failurePolicy: Fail`` before the Kyverno pod serves, and the k0s API server
+   reaches that webhook through konnectivity. A PVC created inside that window
+   is rejected. CloudNativePG records the instance serial before it creates the
+   PVC, so the database then refuses to start and asks for a restore from
+   backup. ``silo install`` watches for five minutes and recreates any such
+   database that has no volume, because a database with no volume holds no data
+   and ArgoCD self-heals it within about two minutes. A database that does have
+   a volume is reported, not touched.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - Size
+     - Behaviour
+   * - ``small``
+     - Builds no ``cluster-values`` repository, so it **cannot disable an
+       application** and leaves ``global.domain`` empty. Not the default.
+   * - ``medium``
+     - The default.
+   * - ``large``
+     - For a cluster with capacity to spare.
+
+Read the state back with ``spur k8s status``, which grows a ``silo:`` line once
+the stack has been installed:
+
+.. code-block:: text
+
+   phase: ready
+   control-plane: cp-1
+   silo: installed release=v1.2.3 size=medium domain=cf.example.com
+
+A cluster that never ran ``silo install`` prints no ``silo:`` line at all.
+
 Tear down
 ~~~~~~~~~
 
@@ -384,8 +802,12 @@ Command reference
      - Print a kubeconfig (redirect to a file). Bare = own scope; ``--user``/``--admin`` need admin.
    * - ``spur k8s down [--reset]``
      - Stop the cluster; ``--reset`` also wipes k0s state. Admin only.
+   * - ``spur k8s silo prepare-node [--data-disk <dev>] [--force-format] [--dry-run]``
+     - Make this node ready to run k0s (local; run as root, before the node first runs k0s). Mounts ``--data-disk`` at ``/var/lib/k0s``, opens the k0s ports with ``iptables``, raises the ``inotify`` limits, and installs ``chrony`` when nothing serves its socket.
    * - ``spur k8s install-k0s [--version <tag>|latest] [--path <p>] [--force]``
      - Install the k0s binary on this node (local; run as root).
+   * - ``spur k8s silo install --domain <d> [--release <r>] [--size small|medium|large] [--cert-option existing|generate] [--tls-cert <p>] [--tls-key <p>] [--force]``
+     - Deploy the cluster-forge platform stack (local; needs root). Brings the cluster up first when it is not ready, and reports what ``silo prepare-node`` has not done. ``--release`` takes a tag, a branch, or a release archive URL, and defaults to the pinned release. ``--cert-option existing`` is the default and needs ``--tls-cert`` and ``--tls-key``. Admin only.
 
 Configuration reference (``[cluster]``)
 ---------------------------------------

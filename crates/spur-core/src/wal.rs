@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
-use crate::k0s::{K0sPhase, K0sRole};
+use crate::k0s::{K0sPhase, K0sRole, SiloState};
 use crate::node::{NodeSource, NodeState};
 use crate::partition::Partition;
 use crate::reservation::Reservation;
@@ -341,6 +341,12 @@ pub enum WalOperation {
     /// emitted for a whole-inventory cluster (empty `member_nodes`).
     K0sMemberNodesRemove {
         nodes: Vec<String>,
+    },
+    /// Record what `spur k8s install-silo` reported. The deployer runs outside the controller, so
+    /// this is the only way the platform stack reaches `K0sClusterState`. Last write wins, which
+    /// makes replay idempotent.
+    K0sSetSilo {
+        silo: SiloState,
     },
 }
 

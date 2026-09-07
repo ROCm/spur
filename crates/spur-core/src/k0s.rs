@@ -18,6 +18,10 @@ pub const K0S_DEFAULT_BINARY: &str = "/usr/local/bin/k0s";
 /// The GitHub repo k0s releases come from.
 pub const K0S_REPO: &str = "k0sproject/k0s";
 
+/// k0s's data directory. Everything k0s keeps on a node lives here — etcd, containerd images, and
+/// every kubelet volume — so it is the path `spur k8s prepare-node` gives a dedicated disk.
+pub const K0S_DATA_DIR: &str = "/var/lib/k0s";
+
 /// k0s's manifest-deployer directory (under the default data-dir). Any manifest written to a
 /// `<stack>/` subdirectory here is applied + reconciled by the k0s controller automatically, so SPUR
 /// ships cluster addons (e.g. local-path storage) by writing files here — no in-cluster kube client.
@@ -311,11 +315,53 @@ pub enum K0sPhase {
     Degraded,
 }
 
+/// Lifecycle phase of the platform stack installed on top of k0s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiloPhase {
+    #[default]
+    NotInstalled,
+    Installing,
+    Installed,
+    Failed,
+}
+
+impl SiloPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not-installed",
+            Self::Installing => "installing",
+            Self::Installed => "installed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Platform stack state. The deployer runs outside the controller, so this records what it
+/// reported rather than anything the controller observed itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiloState {
+    #[serde(default)]
+    pub phase: SiloPhase,
+    #[serde(default)]
+    pub release: String,
+    #[serde(default)]
+    pub size: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 /// Cluster-wide k0s state held in the replicated raft state machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct K0sClusterState {
     #[serde(default)]
     pub phase: K0sPhase,
+    /// Platform stack install state. Default on every cluster that never ran install-silo,
+    /// including every state written before this field existed.
+    #[serde(default)]
+    pub silo: SiloState,
     /// Bootstrap control-plane: seeds etcd (started tokenless), primary endpoint for admin/token RPCs.
     #[serde(default)]
     pub control_plane_node: Option<String>,

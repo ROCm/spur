@@ -12,6 +12,7 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
+use spur_core::k0s::{SiloPhase, SiloState};
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
@@ -3372,12 +3373,65 @@ impl SlurmController for ControllerService {
         }
         let state = self.cluster.k0s_state();
         let control_plane_nodes = state.controllers();
+        // Omitted on a cluster that never ran install-silo, so an old client and an untouched
+        // cluster read the same: no silo line at all.
+        let silo = (state.silo != SiloState::default()).then(|| SiloStatus {
+            phase: state.silo.phase.as_str().to_string(),
+            release: state.silo.release.clone(),
+            size: state.silo.size.clone(),
+            domain: state.silo.domain.clone(),
+            message: state.silo.message.clone(),
+        });
         Ok(Response::new(ClusterStatusResponse {
             phase: crate::cluster_k8s::phase_str(state.phase),
             control_plane_node: state.control_plane_node.unwrap_or_default(),
             control_plane_nodes,
             member_nodes: state.member_nodes,
             nodes: crate::cluster_k8s::live_node_statuses(&self.cluster).await,
+            silo,
+        }))
+    }
+
+    async fn cluster_report_silo(
+        &self,
+        request: Request<ClusterReportSiloRequest>,
+    ) -> Result<Response<ClusterReportSiloResponse>, Status> {
+        if self.check_leader(&request).is_err() {
+            let mut client = self.leader_proxy.get_leader_client().await?;
+            let fwd = Self::forward_request(request);
+            return client.cluster_report_silo(fwd).await;
+        }
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "recording the platform stack state requires cluster admin",
+            ));
+        }
+        let phase = match req.phase.as_str() {
+            "not-installed" => SiloPhase::NotInstalled,
+            "installing" => SiloPhase::Installing,
+            "installed" => SiloPhase::Installed,
+            "failed" => SiloPhase::Failed,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown silo phase {other}"
+                )))
+            }
+        };
+        self.cluster
+            .set_k0s_silo(SiloState {
+                phase,
+                release: req.release,
+                size: req.size,
+                domain: req.domain,
+                message: req.message,
+            })
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ClusterReportSiloResponse {
+            accepted: true,
+            message: String::new(),
         }))
     }
 

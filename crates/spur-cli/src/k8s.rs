@@ -6,10 +6,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use spur_core::k0s::SiloPhase;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     ClusterAddNodesRequest, ClusterDownRequest, ClusterKubeconfigRequest,
-    ClusterRemoveNodesRequest, ClusterStatusRequest, ClusterUpRequest,
+    ClusterRemoveNodesRequest, ClusterReportSiloRequest, ClusterStatusRequest,
+    ClusterStatusResponse, ClusterUpRequest,
 };
 
 /// Manage the SPUR-provisioned k0s cluster.
@@ -99,6 +101,11 @@ pub enum K8sCommand {
         #[arg(long, conflicts_with = "user")]
         admin: bool,
     },
+    /// Prepare a node for the platform stack, and install it.
+    Silo {
+        #[command(subcommand)]
+        command: SiloCommand,
+    },
     /// Download + install the k0s binary on THIS node (local; no controller needed).
     /// Run as root for the default /usr/local/bin path.
     InstallK0s {
@@ -154,12 +161,85 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
         K8sCommand::Kubeconfig { user, admin } => cmd_kubeconfig(&controller, user, admin).await,
+        K8sCommand::Silo { command } => match command {
+            SiloCommand::PrepareNode {
+                data_disk,
+                force_format,
+                dry_run,
+            } => crate::prepare_node::cmd_prepare_node(data_disk, force_format, dry_run).await,
+            SiloCommand::Install {
+                release,
+                size,
+                domain,
+                cert_option,
+                tls_cert,
+                tls_key,
+                force,
+            } => {
+                let opts = SiloOptions {
+                    release,
+                    size,
+                    domain,
+                    cert_option,
+                    tls_cert,
+                    tls_key,
+                };
+                cmd_install_silo(&controller, &opts, force).await
+            }
+        },
         K8sCommand::InstallK0s {
             version,
             path,
             force,
         } => cmd_install_k0s(&version, &path, force).await,
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SiloCommand {
+    /// Prepare THIS node to run k0s and the platform stack (local; no controller needed). Run as
+    /// root, and run it before `spur k8s silo install`. Gives the k0s data directory a dedicated
+    /// disk, which cannot be done once the node has run k0s.
+    PrepareNode {
+        /// Block device to mount at /var/lib/k0s, e.g. /dev/sdb. It is formatted ext4 when it
+        /// carries no filesystem. Omit to leave the data directory on the root filesystem.
+        #[arg(long)]
+        data_disk: Option<String>,
+        /// Erase a filesystem already on --data-disk. Without this a non-ext4 device is refused.
+        #[arg(long)]
+        force_format: bool,
+        /// Report what would change without touching the node.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Install the platform stack (cluster-forge) onto the k0s cluster from THIS node, then record
+    /// the outcome on the controller. Brings the cluster up first when it is not running yet.
+    /// Not usable from a workstation.
+    Install {
+        /// cluster-forge release to deploy: a tag, a branch, or a release archive URL.
+        /// Empty = the pinned release.
+        #[arg(long)]
+        release: Option<String>,
+        /// Cluster size profile. `small` builds no cluster-values repository, so it cannot
+        /// disable an application.
+        #[arg(long, value_parser = ["small", "medium", "large"], default_value = "medium")]
+        size: String,
+        /// Ingress domain for the platform stack.
+        #[arg(long)]
+        domain: String,
+        /// Certificate source. `existing` needs --tls-cert and --tls-key.
+        #[arg(long, value_parser = ["existing", "generate"], default_value = "existing")]
+        cert_option: String,
+        /// Path to the TLS certificate, when --cert-option is `existing`.
+        #[arg(long)]
+        tls_cert: Option<String>,
+        /// Path to the TLS private key, when --cert-option is `existing`.
+        #[arg(long)]
+        tls_key: Option<String>,
+        /// Reinstall even when the controller already reports the stack installed.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn effective_user() -> String {
@@ -208,6 +288,189 @@ async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
         info.path.display(),
         short
     );
+    Ok(())
+}
+
+/// Report the outcome to the controller. A failed report is not fatal to an install that already
+/// succeeded, so this warns and returns rather than propagating: losing the status record is worse
+/// reported than it is silently swallowed, but it must not turn a good install into a bad exit.
+async fn report_silo(
+    controller: &str,
+    phase: SiloPhase,
+    release: &str,
+    size: &str,
+    domain: &str,
+    message: &str,
+) {
+    let req = ClusterReportSiloRequest {
+        phase: phase.as_str().to_string(),
+        release: release.to_string(),
+        size: size.to_string(),
+        domain: domain.to_string(),
+        message: message.to_string(),
+        caller: effective_user(),
+    };
+    let sent = async {
+        let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
+        client.cluster_report_silo(req).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = sent {
+        eprintln!("warning: could not record silo status on the controller: {e}");
+    }
+}
+
+pub(crate) struct SiloOptions {
+    release: Option<String>,
+    size: String,
+    domain: String,
+    cert_option: String,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+}
+
+async fn cluster_status(controller: &str) -> Result<ClusterStatusResponse> {
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
+    Ok(client
+        .cluster_status(ClusterStatusRequest {})
+        .await?
+        .into_inner())
+}
+
+/// How long to wait for the cluster to reach ready after asking for it.
+const CLUSTER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const CLUSTER_READY_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bring the cluster up and wait for it, the way `spur k8s up` does.
+///
+/// `cluster_up` is a request rather than an action: spurctld reconciles toward ready on its own
+/// schedule, so asking is not enough and this has to wait for the result.
+async fn ensure_cluster_ready(
+    controller: &str,
+    status: ClusterStatusResponse,
+) -> Result<ClusterStatusResponse> {
+    eprintln!(
+        "The k0s cluster is {}, so SPUR is bringing it up ...",
+        status.phase
+    );
+    {
+        let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
+        // `caller` is what spurctld authorises against, so a default request is refused as
+        // non-admin however the command was invoked.
+        let resp = client
+            .cluster_up(ClusterUpRequest {
+                caller: effective_user(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        if !resp.accepted {
+            anyhow::bail!(
+                "the k0s cluster did not accept the bring-up: {}",
+                resp.message
+            );
+        }
+    }
+    let deadline = std::time::Instant::now() + CLUSTER_READY_TIMEOUT;
+    loop {
+        let status = cluster_status(controller).await?;
+        if status.phase == "ready" {
+            eprintln!("The k0s cluster is ready");
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the k0s cluster is still {} after {}s — check `spur k8s status`",
+                status.phase,
+                CLUSTER_READY_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(CLUSTER_READY_POLL).await;
+    }
+}
+
+/// Where the gateway certificate comes from. `existing` names two files, so both have to be there
+/// before anything is created; `generate` builds a pair from the domain.
+fn cert_source(o: &SiloOptions) -> Result<crate::silo::certs::CertSource<'_>> {
+    if o.cert_option != "existing" {
+        return Ok(crate::silo::certs::CertSource::Generate { domain: &o.domain });
+    }
+    let (cert, key) = (
+        o.tls_cert.as_deref().unwrap_or_default(),
+        o.tls_key.as_deref().unwrap_or_default(),
+    );
+    if cert.is_empty() || key.is_empty() {
+        anyhow::bail!(
+            "--cert-option existing needs --tls-cert and --tls-key; pass --cert-option generate \
+             to let the deployer make a self-signed pair"
+        );
+    }
+    Ok(crate::silo::certs::CertSource::Existing { cert, key })
+}
+
+async fn cmd_install_silo(controller: &str, o: &SiloOptions, force: bool) -> Result<()> {
+    // Resolve before anything is reported: an omitted --release takes the pinned version, and the
+    // cluster has to record the version it actually runs rather than an empty string.
+    let resolved = crate::silo::release::resolve(o.release.as_deref().unwrap_or_default())?;
+    let (release, size, domain) = (
+        resolved.revision.as_str(),
+        o.size.as_str(),
+        o.domain.as_str(),
+    );
+    crate::silo::preflight::report_unmet_prerequisites().await;
+    crate::silo::preflight::require_install_binaries(&resolved)?;
+
+    let mut status = cluster_status(controller).await?;
+    if let Some(silo) = &status.silo {
+        if silo.phase == SiloPhase::Installed.as_str() && !force {
+            eprintln!(
+                "platform stack already installed (release {}, size {}) — use --force to reinstall",
+                silo.release, silo.size
+            );
+            return Ok(());
+        }
+    }
+    if status.phase != "ready" {
+        status = ensure_cluster_ready(controller, status).await?;
+    }
+
+    let cert_source = cert_source(o)?;
+
+    let dir = crate::silo::kubeconfig::private_dir()?;
+    crate::silo::kubeconfig::stage(controller, effective_user()).await?;
+    crate::silo::storage::ensure_storage_classes().await?;
+    crate::silo::certs::ensure_cluster_tls(cert_source, &dir).await?;
+    // Before the deployer, so the Envoy proxy pods schedule as soon as the platform stack creates
+    // them rather than sitting Pending until an operator notices.
+    let mut control_plane = status.control_plane_nodes.clone();
+    if control_plane.is_empty() && !status.control_plane_node.is_empty() {
+        control_plane.push(status.control_plane_node.clone());
+    }
+    let gateway_node = crate::silo::gateway_node::ensure_first_node_label(&control_plane).await?;
+    crate::silo::ensure_helm_chart_config_crd().await?;
+
+    report_silo(controller, SiloPhase::Installing, release, size, domain, "").await;
+    let options = crate::silo::Options {
+        release: &resolved,
+        size,
+        domain,
+    };
+    if let Err(e) = crate::silo::install(&options, &dir).await {
+        let msg = format!("{e:#}");
+        report_silo(controller, SiloPhase::Failed, release, size, domain, &msg).await;
+        return Err(e);
+    }
+
+    // After the platform stack, not before: the MetalLB CRD arrives with it.
+    if let Err(e) = crate::silo::metallb::ensure_load_balancer_pool(&gateway_node).await {
+        eprintln!("warning: {e}");
+    }
+    if let Err(e) = crate::silo::cnpg::repair_unrecoverable_databases().await {
+        eprintln!("warning: {e}");
+    }
+    report_silo(controller, SiloPhase::Installed, release, size, domain, "").await;
+    println!("platform stack installed (size {size}, domain {domain})");
     Ok(())
 }
 
@@ -337,6 +600,22 @@ async fn cmd_status(controller: &str) -> Result<()> {
             println!("members: all nodes");
         } else {
             println!("members: {}", resp.member_nodes.join(", "));
+        }
+    }
+    if let Some(silo) = &resp.silo {
+        print!("silo: {}", silo.phase);
+        if !silo.release.is_empty() {
+            print!(" release={}", silo.release);
+        }
+        if !silo.size.is_empty() {
+            print!(" size={}", silo.size);
+        }
+        if !silo.domain.is_empty() {
+            print!(" domain={}", silo.domain);
+        }
+        println!();
+        if !silo.message.is_empty() {
+            println!("  {}", silo.message);
         }
     }
     for n in resp.nodes {
@@ -524,6 +803,133 @@ mod tests {
     fn controller_defaults_and_env() {
         let args = K8sArgs::try_parse_from(["k8s", "status"]).unwrap();
         assert_eq!(args.controller, "http://localhost:6817");
+    }
+
+    #[test]
+    fn parses_silo_install_with_flags() {
+        let args = K8sArgs::try_parse_from([
+            "k8s",
+            "silo",
+            "install",
+            "--release",
+            "v1.2.3",
+            "--size",
+            "large",
+            "--domain",
+            "cf.example.com",
+            "--force",
+        ])
+        .unwrap();
+        match args.command {
+            K8sCommand::Silo {
+                command:
+                    SiloCommand::Install {
+                        release,
+                        size,
+                        domain,
+                        force,
+                        ..
+                    },
+            } => {
+                assert_eq!(release.as_deref(), Some("v1.2.3"));
+                assert_eq!(size, "large");
+                assert_eq!(domain, "cf.example.com");
+                assert!(force);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn silo_install_defaults_to_medium() {
+        // `small` builds no cluster-values repository and so cannot disable an application, which
+        // is why it is not the default.
+        let args =
+            K8sArgs::try_parse_from(["k8s", "silo", "install", "--domain", "cf.example.com"])
+                .unwrap();
+        match args.command {
+            K8sCommand::Silo {
+                command:
+                    SiloCommand::Install {
+                        size,
+                        release,
+                        force,
+                        ..
+                    },
+            } => {
+                assert_eq!(size, "medium");
+                assert_eq!(release, None);
+                assert!(!force);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn silo_install_requires_domain() {
+        assert!(K8sArgs::try_parse_from(["k8s", "silo", "install"]).is_err());
+    }
+
+    #[test]
+    fn parses_silo_prepare_node() {
+        let args = K8sArgs::try_parse_from([
+            "k8s",
+            "silo",
+            "prepare-node",
+            "--data-disk",
+            "/dev/sdb",
+            "--dry-run",
+        ])
+        .unwrap();
+        match args.command {
+            K8sCommand::Silo {
+                command:
+                    SiloCommand::PrepareNode {
+                        data_disk,
+                        force_format,
+                        dry_run,
+                    },
+            } => {
+                assert_eq!(data_disk.as_deref(), Some("/dev/sdb"));
+                assert!(!force_format);
+                assert!(dry_run);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn the_old_flat_names_are_gone() {
+        // Both moved under `silo`, so the flat forms must not silently keep working and leave two
+        // spellings of the same command in use.
+        assert!(K8sArgs::try_parse_from(["k8s", "install-silo", "--domain", "d"]).is_err());
+        assert!(K8sArgs::try_parse_from(["k8s", "prepare-node"]).is_err());
+    }
+
+    #[test]
+    fn install_silo_rejects_an_unknown_cert_option() {
+        assert!(K8sArgs::try_parse_from([
+            "k8s",
+            "install-silo",
+            "--domain",
+            "cf.example.com",
+            "--cert-option",
+            "letsencrypt",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn install_silo_rejects_an_unknown_size() {
+        assert!(K8sArgs::try_parse_from([
+            "k8s",
+            "install-silo",
+            "--domain",
+            "cf.example.com",
+            "--size",
+            "enormous",
+        ])
+        .is_err());
     }
 
     #[test]

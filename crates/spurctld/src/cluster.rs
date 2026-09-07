@@ -2924,6 +2924,13 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record the platform stack state that `spur k8s install-silo` reported. Last write wins:
+    /// the deployer owns the truth here, and the controller only stores what it was told.
+    pub fn set_k0s_silo(&self, silo: spur_core::k0s::SiloState) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sSetSilo { silo })?;
+        Ok(())
+    }
+
     /// snapshot of the current cluster-wide k0s state.
     pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
         self.k0s.read().clone()
@@ -6126,6 +6133,9 @@ impl ClusterManager {
                 let mut k0s = self.k0s.write();
                 k0s.member_nodes =
                     crate::cluster_k8s::subtract_member_nodes(&k0s.member_nodes, drop);
+            }
+            WalOperation::K0sSetSilo { silo } => {
+                self.k0s.write().silo = silo.clone();
             }
             WalOperation::K0sSetPhase {
                 phase,
@@ -18273,6 +18283,54 @@ mod tests {
             .unwrap();
         wait_for("w1 removed", || cm.k0s_state().member_nodes.len() == 2);
         assert_eq!(cm.k0s_state().member_nodes, vec!["cp", "w2"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_silo_state_applies_and_last_write_wins() {
+        use spur_core::k0s::{SiloPhase, SiloState};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert_eq!(cm.k0s_state().silo, SiloState::default());
+        assert_eq!(cm.k0s_state().silo.phase, SiloPhase::NotInstalled);
+
+        cm.set_k0s_silo(SiloState {
+            phase: SiloPhase::Installing,
+            release: "v1.2.3".into(),
+            size: "medium".into(),
+            domain: "cf.example.com".into(),
+            message: String::new(),
+        })
+        .unwrap();
+        wait_for("installing recorded", || {
+            cm.k0s_state().silo.phase == SiloPhase::Installing
+        });
+
+        // The deployer owns the truth, so a later report replaces the earlier one wholesale.
+        // That is what makes replaying the operation idempotent.
+        cm.set_k0s_silo(SiloState {
+            phase: SiloPhase::Failed,
+            release: "v1.2.3".into(),
+            size: "medium".into(),
+            domain: "cf.example.com".into(),
+            message: "bloom exited with 1".into(),
+        })
+        .unwrap();
+        wait_for("failure recorded", || {
+            cm.k0s_state().silo.phase == SiloPhase::Failed
+        });
+        assert_eq!(cm.k0s_state().silo.message, "bloom exited with 1");
+        assert_eq!(cm.k0s_state().silo.release, "v1.2.3");
+    }
+
+    #[test]
+    fn silo_state_defaults_when_absent_from_persisted_json() {
+        // A controller replaying a Raft entry written before the silo field existed must not
+        // crash. This is the back-compat guarantee that #[serde(default)] buys.
+        let old = r#"{"phase":"ready","control_plane_node":"cp","control_plane_nodes":["cp"],
+                      "member_nodes":["cp"],"reset_requested":false}"#;
+        let state: spur_core::k0s::K0sClusterState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.silo, spur_core::k0s::SiloState::default());
+        assert_eq!(state.silo.phase, spur_core::k0s::SiloPhase::NotInstalled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

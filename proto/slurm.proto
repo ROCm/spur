@@ -408,6 +408,9 @@ service SlurmController {
   rpc ClusterAddNodes(ClusterAddNodesRequest) returns (ClusterAddNodesResponse);
   // Gracefully remove workers from a running cluster (cordon+drain, then k0s reset the node).
   rpc ClusterRemoveNodes(ClusterRemoveNodesRequest) returns (ClusterRemoveNodesResponse);
+  // Record the outcome of a platform-stack install. `spur k8s install-silo` runs the deployer
+  // locally and reports here, so the controller is the single place status is read from.
+  rpc ClusterReportSilo(ClusterReportSiloRequest) returns (ClusterReportSiloResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -942,6 +945,31 @@ message ClusterStatusResponse {
   repeated string control_plane_nodes = 4;
   // Member nodes the cluster is scoped to. Empty = the whole inventory is enrolled.
   repeated string member_nodes = 5;
+  // Platform stack (cluster-forge) install state. Absent on a cluster that never ran install-silo.
+  optional SiloStatus silo = 6;
+}
+
+message SiloStatus {
+  // "not-installed" | "installing" | "installed" | "failed"
+  string phase = 1;
+  string release = 2;
+  string size = 3;
+  string domain = 4;
+  // Why the last attempt failed, or how it finished. Empty when never attempted.
+  string message = 5;
+}
+
+message ClusterReportSiloRequest {
+  string phase = 1;
+  string release = 2;
+  string size = 3;
+  string domain = 4;
+  string message = 5;
+  string caller = 6;   // For authorization (cluster admin required).
+}
+message ClusterReportSiloResponse {
+  bool accepted = 1;
+  string message = 2;
 }
 
 message ClusterNodeStatus {
