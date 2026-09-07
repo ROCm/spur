@@ -338,13 +338,16 @@ or because it never read the variable — now fails that ``open`` with ``EPERM``
 **A job can also be denied a host device node its allocation never covered**, and
 that is the risk to plan the rollout around. Some device nodes belong to the node
 rather than to any job, so no allocation hands them out and nothing puts them in the
-allow-list. The known cases are RDMA/InfiniBand verbs under ``/dev/infiniband/`` —
+allow-list. The main case is RDMA/InfiniBand verbs under ``/dev/infiniband/`` —
 needed by MPI, and by NCCL or RCCL over InfiniBand, which makes this reach
-**non-GPU** jobs — and the vendor control nodes a GPU runtime initializes through,
-such as ``/dev/nvidiactl`` and ``/dev/nvidia-uvm``, which a node configured through
-GRES rather than a CDI spec does not list as devices. Both are allowed by default,
-so the common cases keep working with no configuration; see
-:ref:`device-filter-implicit-allow` for the full implicit set.
+**non-GPU** jobs. These are allowed by default, so the common cases keep working with
+no configuration; see :ref:`device-filter-implicit-allow` for the full implicit set.
+
+The vendor control nodes a GPU runtime initializes through, such as ``/dev/nvidiactl``
+and ``/dev/nvidia-uvm``, reach a job through its allocation's CDI device edits. A node
+configured through GRES rather than a CDI spec does not list them as devices, so a GPU
+job there fails with ``EPERM`` on those nodes until they are named in
+``extra_device_paths``.
 
 A site whose jobs open some other host device node will still see ``EPERM``. Name
 those paths rather than turning the filter off:

@@ -444,7 +444,7 @@ Out of the box the job's cgroup gets:
 - ``pids.max`` as a fork-bomb guard.
 - A default-deny BPF device filter attached to the cgroup, so the job can open its
   allocated device nodes, the base pseudo-devices, and the shared host-infrastructure
-  nodes (RDMA verbs and vendor control nodes) listed under
+  nodes (RDMA verbs, MIG capability nodes) listed under
   :ref:`device-filter-implicit-allow` — and nothing else. Name any device the list
   misses in ``extra_device_paths``, or turn the filter off with
   ``constrain_devices``.

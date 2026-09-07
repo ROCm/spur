@@ -1355,15 +1355,14 @@ isolation boundary and worth knowing:
   out per job, so no allocation can ever grant them: ``/dev/fuse`` (used by
   Apptainer and Singularity, which run *inside* the batch job), everything under
   ``/dev/infiniband/`` (RDMA verbs, for MPI and for NCCL or RCCL over InfiniBand),
-  the vendor control nodes a GPU runtime initializes through (``/dev/nvidiactl``,
-  ``/dev/nvidia-uvm``, ``/dev/nvidia-uvm-tools``, ``/dev/nvidia-modeset``), and the
-  MIG capability nodes under ``/dev/nvidia-caps/``. Every one is resolved by path
-  when the filter is built, so a node without that hardware grants nothing extra.
+  and the MIG capability nodes under ``/dev/nvidia-caps/``. Every one is resolved by
+  path when the filter is built, so a node without that hardware grants nothing extra.
 
-Granting the vendor control nodes to a job with no GPUs is deliberate: they let a
-GPU runtime initialize, but enumerating an actual device still needs that device's
-own node, so the job still sees zero GPUs. This matches what container runtimes
-inject as shared edits.
+The vendor control nodes a GPU runtime initializes through — ``/dev/nvidiactl``,
+``/dev/nvidia-uvm`` and the like — are **not** in this set. They reach a job through
+its allocation's CDI device edits, the same path as the per-GPU compute nodes, so a
+job with no GPU never gets them. A node configured through GRES rather than a CDI
+spec does not enumerate them as devices, so name them in ``extra_device_paths`` there.
 
 **The per-GPU compute nodes are not in that set.** ``/dev/nvidia<N>``, ``/dev/kfd``
 and the ``/dev/dri`` render and card nodes reach a job only through its allocation —

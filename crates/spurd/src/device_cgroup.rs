@@ -64,11 +64,6 @@ pub fn base_device_rules() -> Vec<DeviceRule> {
 /// job's `device_paths`; denying them breaks jobs not reaching for a GPU at all.
 const HOST_INFRA_DEVICE_NODES: &[&str] = &[
     "/dev/fuse", // Apptainer/Singularity run inside the batch job
-    // CUDA initialization; enumerating a GPU still needs /dev/nvidia<N>.
-    "/dev/nvidiactl",
-    "/dev/nvidia-uvm",
-    "/dev/nvidia-uvm-tools",
-    "/dev/nvidia-modeset",
 ];
 
 /// Entry names are per-host (`uverbs0`, `nvidia-cap2`, ...), so these are enumerated.
@@ -83,8 +78,9 @@ const HOST_INFRA_DEVICE_DIRS: &[&str] = &[
 /// IB and NVIDIA majors are assigned dynamically, so these resolve by path like any
 /// allocated node; a node without that hardware has nothing to stat.
 ///
-/// Per-GPU compute nodes (`/dev/nvidia<N>`, `/dev/kfd`, `/dev/dri/*`) are
-/// deliberately absent — gating those on the allocation is the security property.
+/// GPU nodes are deliberately absent — per-GPU compute (`/dev/nvidia<N>`, `/dev/kfd`,
+/// `/dev/dri/*`) and vendor control (`nvidiactl`, `nvidia-uvm`) alike arrive through the
+/// allocation's CDI edits, so a job with no GPU gets none. Gating them there is the point.
 pub fn host_infra_device_paths() -> Vec<String> {
     let mut paths: Vec<String> = HOST_INFRA_DEVICE_NODES
         .iter()
@@ -661,16 +657,16 @@ mod tests {
     #[test]
     fn host_infra_list_covers_the_shared_nodes_no_allocation_grants() {
         let paths = host_infra_device_paths();
-        for expected in [
-            "/dev/fuse",
-            "/dev/nvidiactl",
-            "/dev/nvidia-uvm",
-            "/dev/nvidia-uvm-tools",
-            "/dev/nvidia-modeset",
-        ] {
+        assert!(
+            paths.iter().any(|p| p == "/dev/fuse"),
+            "/dev/fuse is host infrastructure, not an allocatable device"
+        );
+        // Vendor control nodes now arrive through the allocation's CDI edits; a job
+        // with no GPU must not receive them from the host-infrastructure set.
+        for denied in ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-modeset"] {
             assert!(
-                paths.iter().any(|p| p == expected),
-                "{expected} is host infrastructure, not an allocatable device"
+                !paths.iter().any(|p| p == denied),
+                "{denied} must come from the allocation, not host infrastructure"
             );
         }
         assert!(
@@ -760,7 +756,7 @@ mod tests {
         let paths = device_paths_for_job(&allocated, &extra);
         assert!(paths.iter().any(|p| p == "/dev/dri/renderD128"));
         assert!(paths.iter().any(|p| p == "/dev/site-accel0"));
-        assert!(paths.iter().any(|p| p == "/dev/nvidiactl"));
+        assert!(paths.iter().any(|p| p == "/dev/fuse"));
     }
 
     #[test]
