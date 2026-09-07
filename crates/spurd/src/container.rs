@@ -1009,6 +1009,102 @@ fn setup_user_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---- Rootless-root (--container-remap-root) ---------------------------------
+//
+// Runs an image as UID 0 inside a user namespace while the host-side identity is
+// the unprivileged submitter, AND keeps root-owned image paths (/root, caches,
+// site-packages) writable. The extracted rootfs is a private per-job tree, so
+// the caller chowns it to the submitter; the container then runs as UID 0 in a
+// user namespace mapping 0 -> submitter, so container-root owns every path and
+// writes succeed — while the process is never host root. The user namespace is
+// created last (after all mount setup) and its map is written by the (root)
+// parent, since an unprivileged post-unshare process cannot self-map an
+// arbitrary host id (validated on hardware; see the parent/child dance in
+// `container_init` + executor's `launch_container_job`).
+//
+// (An idmapped-mount variant would avoid the recursive chown for large images,
+// but needs overlay-mode rootfs + overlay-over-idmap handling — a perf follow-up.)
+
+/// Write `0 <id> 1` uid/gid maps for `pid` (setgroups denied first). The caller
+/// must be root (it maps an arbitrary host id) AND must only call this AFTER the
+/// target has finished `unshare(CLONE_NEWUSER)` — writing earlier fails EPERM.
+pub fn write_container_id_maps(pid: i32, uid: u32, gid: u32) -> anyhow::Result<()> {
+    std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))
+        .with_context(|| format!("write /proc/{pid}/uid_map"))?;
+    // setgroups must be denied before gid_map; ignore ENOENT on old kernels.
+    let _ = std::fs::write(format!("/proc/{pid}/setgroups"), "deny");
+    std::fs::write(format!("/proc/{pid}/gid_map"), format!("0 {gid} 1\n"))
+        .with_context(|| format!("write /proc/{pid}/gid_map"))?;
+    Ok(())
+}
+
+/// Recursively chown a private per-job extracted rootfs to the submitter, so a
+/// container-root process mapped to that uid owns every path and its writes
+/// succeed. Root-only; runs before the container forks.
+pub fn chown_rootfs_to_submitter(rootfs: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
+    // `-h` chowns symlinks themselves (never dereferences), matching how the
+    // files were owned in the image. The rootfs is a private per-job tree.
+    let status = std::process::Command::new("chown")
+        .arg("-Rh")
+        .arg(format!("{uid}:{gid}"))
+        .arg(rootfs)
+        .status()
+        .with_context(|| format!("run chown on {}", rootfs.display()))?;
+    if !status.success() {
+        bail!(
+            "chown -Rh {}:{} {} failed ({status})",
+            uid,
+            gid,
+            rootfs.display()
+        );
+    }
+    Ok(())
+}
+
+/// What `container_init` needs to run a `--container-remap-root` job. Built by
+/// the (root) parent before the fork; the fds are inherited across it.
+pub struct RemapSetup {
+    /// Child -> parent: after `unshare(CLONE_NEWUSER)`, the child writes its PID
+    /// as seen in the host pid namespace (4 bytes, native endian) so the parent
+    /// can address `/proc/<pid>/uid_map`.
+    pub map_req_fd: RawFd,
+    /// Parent -> child: one byte once the id maps are written (0 = failure).
+    pub map_go_fd: RawFd,
+}
+
+/// This process's PID in the OUTERMOST (host / spurd) pid namespace, which
+/// `/proc/self/status` reports first in `NSpid`. The remap child is PID 1 in its
+/// own nested pid namespace, so `getpid()` is useless to the parent.
+fn host_pid_from_status() -> anyhow::Result<i32> {
+    let status = std::fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("NSpid:") {
+            if let Some(first) = rest.split_whitespace().next() {
+                return first.parse::<i32>().context("parse NSpid host pid");
+            }
+        }
+    }
+    bail!("NSpid not present in /proc/self/status");
+}
+
+/// Final step of a remap-root container: create the user namespace and have the
+/// (root) parent write our `0 <submitter> 1` map. Called AFTER dropping to the
+/// submitter and AFTER all mount setup — an unprivileged post-unshare process
+/// may only self-map its own uid, so the arbitrary map must come from the parent.
+fn enter_remap_userns(r: &RemapSetup, host_pid: i32) -> anyhow::Result<()> {
+    use std::os::unix::io::BorrowedFd;
+    nix::sched::unshare(CloneFlags::CLONE_NEWUSER).context("unshare(CLONE_NEWUSER) for remap")?;
+    let req = unsafe { BorrowedFd::borrow_raw(r.map_req_fd) };
+    nix::unistd::write(req, &host_pid.to_ne_bytes()).context("send host pid to parent")?;
+    let go = unsafe { BorrowedFd::borrow_raw(r.map_go_fd) };
+    let mut b = [0u8; 1];
+    nix::unistd::read(go, &mut b).context("wait for parent id-map write")?;
+    if b[0] != 1 {
+        bail!("parent could not write container id maps for --container-remap-root");
+    }
+    Ok(())
+}
+
 /// Make all mounts private so pivot_root works and mount/unmount events
 /// don't propagate between the container and host.
 fn set_mount_propagation_private() -> anyhow::Result<()> {
@@ -1042,7 +1138,7 @@ fn fork_into_pid_namespace() -> anyhow::Result<()> {
 ///
 /// Prevents gRPC sockets, other jobs' output files, etc. from leaking
 /// into the container process.
-pub fn close_inherited_fds(preserve_fd: RawFd) {
+pub fn close_inherited_fds(preserve_fds: &[RawFd]) {
     let fd_dir = Path::new("/proc/self/fd");
     // Collect fds first — iterating /proc/self/fd holds a directory fd
     // that we must not close while the iterator is alive.
@@ -1051,7 +1147,7 @@ pub fn close_inherited_fds(preserve_fd: RawFd) {
         .flatten()
         .flatten()
         .filter_map(|entry| entry.file_name().to_string_lossy().parse::<RawFd>().ok())
-        .filter(|&fd| fd > 2 && fd != preserve_fd)
+        .filter(|&fd| fd > 2 && !preserve_fds.contains(&fd))
         .collect();
     for fd in fds {
         unsafe {
@@ -1064,6 +1160,7 @@ pub fn close_inherited_fds(preserve_fd: RawFd) {
 pub fn container_init(
     config: &ContainerConfig,
     rootfs: &Path,
+    remap: Option<&RemapSetup>,
 ) -> anyhow::Result<HashMap<String, String>> {
     let is_root = nix::unistd::geteuid().is_root();
 
@@ -1076,7 +1173,11 @@ pub fn container_init(
         }
     }
 
-    if is_root {
+    if is_root || remap.is_some() {
+        // Root path (including remap): create the mount + pid namespaces as root.
+        // For remap the USER namespace is created last (below), after every mount
+        // op, because a userns child cannot change the propagation of inherited
+        // mounts (both MS_PRIVATE and MS_SLAVE fail EPERM there).
         nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
             .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")?;
     } else {
@@ -1087,6 +1188,18 @@ pub fn container_init(
     set_mount_propagation_private()?;
     fork_into_pid_namespace()?;
 
+    // Remap: read our host-namespace PID NOW, while the host /proc is still
+    // visible. After mount_filesystems mounts the container's own /proc,
+    // /proc/self/status only reports the in-namespace PID (1), which the parent
+    // (in the host pid namespace) cannot address for the id-map write.
+    let remap_host_pid = match remap {
+        Some(_) => Some(host_pid_from_status().context("read remap host pid")?),
+        None => None,
+    };
+
+    // Remap: the rootfs was already chowned to the submitter by the parent, so
+    // all setup here runs as root on a submitter-owned tree (no EOVERFLOW), and
+    // the container-root the submitter maps to owns every path afterwards.
     mount_filesystems(rootfs)?;
 
     // Registry-based device injection
@@ -1107,8 +1220,19 @@ pub fn container_init(
     let workdir = config.workdir.as_deref().unwrap_or("/tmp");
     pivot_into_rootfs(rootfs, workdir)?;
 
-    if is_root {
-        drop_privileges(config.uid, config.gid, &supplementary_gids)?;
+    match remap {
+        Some(r) => {
+            // Drop to the submitter (carrying the GPU groups) FIRST, so the
+            // keep-groups user namespace preserves host device access, then
+            // enter the userns (mapped to container-root by the parent).
+            drop_privileges(config.uid, config.gid, &supplementary_gids)?;
+            enter_remap_userns(r, remap_host_pid.expect("host pid read for remap"))?;
+        }
+        None => {
+            if is_root {
+                drop_privileges(config.uid, config.gid, &supplementary_gids)?;
+            }
+        }
     }
 
     Ok(hook_env)
@@ -1852,7 +1976,7 @@ mod tests {
                 std::mem::forget(f2);
                 std::mem::forget(preserve);
 
-                close_inherited_fds(preserve_fd);
+                close_inherited_fds(&[preserve_fd]);
 
                 let preserved_ok = fd_is_open(preserve_fd);
                 let f1_closed = !fd_is_open(f1_fd);

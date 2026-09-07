@@ -458,20 +458,23 @@ async fn run_containerized_step(
                 libc::dup2(stderr_fd, libc::STDERR_FILENO);
             }
 
-            crate::container::close_inherited_fds(ready_w_fd);
+            crate::container::close_inherited_fds(&[ready_w_fd]);
 
             executor::apply_memlock(memlock);
 
-            let hook_env = match crate::container::container_init(&container_cfg, &rootfs_clone) {
-                Ok(env) => env,
-                Err(e) => {
-                    let msg = format!("E:{e:#}");
-                    unsafe {
-                        libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+            // Step containers do not support --container-remap-root yet (it is
+            // rejected at submission); pass None.
+            let hook_env =
+                match crate::container::container_init(&container_cfg, &rootfs_clone, None) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        let msg = format!("E:{e:#}");
+                        unsafe {
+                            libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+                        }
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
-                }
-            };
+                };
 
             unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
             drop(ready_w);

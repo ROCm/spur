@@ -1744,6 +1744,27 @@ async fn launch_container_job(
         -1
     };
 
+    // --container-remap-root (root spurd only): chown the private per-job rootfs
+    // to the submitter so the container-root it maps to owns every path, and set
+    // up the parent<->child map-handshake pipes BEFORE the fork so the fds are
+    // inherited. Rootless-root cannot be done by the child alone: an unprivileged
+    // post-unshare process may only self-map its own uid, so the (root) parent
+    // must write the container's `0 <submitter> 1` map after the child unshares.
+    let remap = config.remap_root && nix::unistd::geteuid().is_root();
+    let mut remap_pipes: Option<(OwnedFd, OwnedFd, OwnedFd, OwnedFd)> = None;
+    if remap {
+        crate::container::chown_rootfs_to_submitter(&rootfs, cfg.uid, cfg.gid)
+            .context("chown rootfs for --container-remap-root")?;
+        let (req_r, req_w) = nix::unistd::pipe().context("remap map-request pipe")?;
+        let (go_r, go_w) = nix::unistd::pipe().context("remap map-go pipe")?;
+        remap_pipes = Some((req_r, req_w, go_r, go_w));
+    }
+    // Raw fds the child needs (captured before fork): its request write end and
+    // its go read end.
+    let remap_child_fds: Option<(RawFd, RawFd)> = remap_pipes
+        .as_ref()
+        .map(|(_req_r, req_w, go_r, _go_w)| (req_w.as_raw_fd(), go_r.as_raw_fd()));
+
     match unsafe { nix::unistd::fork().context("fork for container job")? } {
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
@@ -1770,22 +1791,31 @@ async fn launch_container_job(
                 join_cgroup_self(procs, cgroup_log_fd);
             }
 
-            crate::container::close_inherited_fds(ready_w);
+            let remap_setup = remap_child_fds.map(|(req_w, go_r)| crate::container::RemapSetup {
+                map_req_fd: req_w,
+                map_go_fd: go_r,
+            });
+            let mut preserve = vec![ready_w];
+            if let Some(ref rs) = remap_setup {
+                preserve.extend([rs.map_req_fd, rs.map_go_fd]);
+            }
+            crate::container::close_inherited_fds(&preserve);
 
             // RLIMIT_MEMLOCK: raise while still root, before container_init drops privileges.
             apply_memlock(cfg.memlock);
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
-            let hook_env = match crate::container::container_init(config, &rootfs) {
-                Ok(env) => env,
-                Err(e) => {
-                    let msg = format!("E:{:#}", e);
-                    unsafe {
-                        libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
+            let hook_env =
+                match crate::container::container_init(config, &rootfs, remap_setup.as_ref()) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        let msg = format!("E:{:#}", e);
+                        unsafe {
+                            libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
+                        }
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
-                }
-            };
+                };
 
             // Signal parent: setup complete
             unsafe {
@@ -1853,6 +1883,29 @@ async fn launch_container_job(
             let pidfd = pidfd_open(child_pid).ok();
             if pidfd.is_none() {
                 debug!("pidfd_open unavailable, falling back to raw PID tracking");
+            }
+
+            // --container-remap-root handshake: the container (PID 1 in its pid
+            // namespace) unshares its user namespace and sends its HOST pid; we
+            // (root) write its `0 <submitter> 1` id maps and release it. This must
+            // complete before the child can finish container_init and report OK.
+            if let Some((req_r, req_w, go_r, go_w)) = remap_pipes {
+                // Close the child's ends so our read sees EOF if it dies early.
+                drop(req_w);
+                drop(go_r);
+                let mut pid_bytes = [0u8; 4];
+                let n =
+                    unsafe { libc::read(req_r.as_raw_fd(), pid_bytes.as_mut_ptr() as *mut _, 4) };
+                if n == 4 {
+                    let host_pid = i32::from_ne_bytes(pid_bytes);
+                    let ok = crate::container::write_container_id_maps(host_pid, cfg.uid, cfg.gid)
+                        .map_err(|e| warn!(job_id, error = %e, "failed to write container id maps"))
+                        .is_ok();
+                    let byte = [u8::from(ok)];
+                    let _ = unsafe { libc::write(go_w.as_raw_fd(), byte.as_ptr() as *const _, 1) };
+                }
+                drop(req_r);
+                drop(go_w);
             }
 
             let mut buf = [0u8; 512];

@@ -1056,17 +1056,27 @@ done
         if result.returncode != 0:
             raise RuntimeError(f"rootfs build failed: {result.stderr}")
 
-    def build_container_image(self, tmp_path: Path) -> str:
+    def build_container_image(
+        self, tmp_path: Path, rootfs_extra: str = "", all_root: bool = False
+    ) -> str:
         """
         Build a minimal squashfs container image locally, ship to all nodes.
         Returns the remote path to the .sqsh file.
+
+        *rootfs_extra* is shell appended to the rootfs build (with ``$R`` at the
+        rootfs root) before packing, so a test can plant marker files. When
+        *all_root* is set the image is packed with every file owned by root
+        (mksquashfs ``-all-root``), mimicking a real root-layout image — the
+        case ``--container-remap-root`` exists for.
         """
         remote_path = f"{self.remote_dir}/test-container.sqsh"
         rootfs = tmp_path / "rootfs"
         local_img = tmp_path / "test-container.sqsh"
+        opts = "-all-root" if all_root else ""
         self._build_test_rootfs(
             rootfs,
-            extra=f"""mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1""",
+            extra=f"""{rootfs_extra}
+mksquashfs "$R" '{local_img}' -noappend -quiet {opts} >/dev/null 2>&1""",
         )
 
         for node in self.nodes:

@@ -239,8 +239,9 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "container_entrypoint")]
     pub container_entrypoint: Option<String>,
 
-    /// Remap the submitting user to root inside the container.
-    /// NOT YET IMPLEMENTED: rejected at submission rather than silently ignored.
+    /// Run the container as root (uid 0) inside a user namespace while staying
+    /// the submitting user on the host (rootless-root via idmapped mounts).
+    /// Requires a root spurd; the job never becomes host root.
     #[arg(long, overrides_with = "container_remap_root")]
     pub container_remap_root: bool,
 
