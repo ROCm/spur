@@ -119,9 +119,13 @@ each entry's host part, so ``controller.node_id`` never needs to be set. Each
 pod's hostname must correspond to its own ``peers`` entry.
 
 Resolution precedence is: explicit ``controller.node_id`` -> position in
-``peers`` -> hostname ordinal. The resolved id must fall within
-``1..=len(peers)``; if a pod's hostname matches no entry (or matches more than
-one), the controller fails fast at startup rather than joining with a wrong ID.
+``peers`` -> hostname ordinal. An explicit id is any positive number. A derived
+id must match a peer entry, or be the next ordinal of the same StatefulSet as a
+peer (``spurctld-3`` with three peers is node 4, a replica that waits to be
+added to the cluster), or, when every peer is an IP address, fall within
+``1..=len(peers)``. Any other derived id, including a hostname that matches more
+than one entry, makes the controller fail fast at startup rather than join with
+a wrong ID.
 
 Adjust partition definitions to match your cluster hardware. Once the controller
 is running, ``scontrol reconfigure`` applies many sections live, while others

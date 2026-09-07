@@ -334,6 +334,9 @@ pub struct ControllerConfig {
     pub first_job_id: u32,
 
     /// Raft peers for HA consensus, "host:port" each. Empty = single-node mode.
+    /// This is the member list of the first bootstrap and, after that, only a
+    /// seed list for discovery; the replicated Raft membership is the true one,
+    /// so a node added at runtime does not have to appear here.
     /// Must be identically ordered on every controller: node ids derive from
     /// list position, so a reordered list can form an inconsistent voter set.
     /// Example: ["node1:6821", "node2:6821", "node3:6821"]
@@ -342,8 +345,11 @@ pub struct ControllerConfig {
 
     /// This node's Raft ID. Normally unset; single-node mode always uses 1.
     /// Otherwise resolved as: explicit value, else position in `peers` (by
-    /// hostname), else hostname ordinal (IP-only peers). Must be in
-    /// `1..=peers.len()` and, if set, equal its position (index + 1).
+    /// hostname), else hostname ordinal. An id larger than `peers.len()` is how
+    /// a node joins a running cluster as a new member: set it explicitly, or let
+    /// a StatefulSet replica past the seed list derive it from its ordinal, which
+    /// needs the same name before the ordinal as a peer entry. Any other derived
+    /// id that matches no peer entry is an error.
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).

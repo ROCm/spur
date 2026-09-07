@@ -99,7 +99,7 @@ async fn livez(State(state): State<Arc<MetricsState>>) -> Response {
     liveness(&state.raft)
 }
 
-fn liveness(raft: &RaftHandle) -> Response {
+pub(crate) fn liveness(raft: &RaftHandle) -> Response {
     if raft.is_core_running() {
         (StatusCode::OK, "ok\n").into_response()
     } else {
@@ -116,7 +116,7 @@ async fn readyz(State(state): State<Arc<MetricsState>>) -> Response {
     readiness(&state.raft)
 }
 
-fn readiness(raft: &RaftHandle) -> Response {
+pub(crate) fn readiness(raft: &RaftHandle) -> Response {
     if !raft.is_core_running() {
         return (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response();
     }
