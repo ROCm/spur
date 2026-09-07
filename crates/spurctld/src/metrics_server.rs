@@ -102,7 +102,7 @@ async fn livez(State(state): State<Arc<MetricsState>>) -> Response {
     liveness(&state.raft)
 }
 
-fn liveness(raft: &RaftHandle) -> Response {
+pub(crate) fn liveness(raft: &RaftHandle) -> Response {
     if raft.is_core_running() {
         (StatusCode::OK, "ok\n").into_response()
     } else {
@@ -122,7 +122,7 @@ async fn readyz(State(state): State<Arc<MetricsState>>) -> Response {
 /// Below the kubelet's default probe timeout of one second.
 const LEADER_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 
-async fn readiness(raft: &RaftHandle) -> Response {
+pub(crate) async fn readiness(raft: &RaftHandle) -> Response {
     if !raft.is_core_running() {
         return (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response();
     }
