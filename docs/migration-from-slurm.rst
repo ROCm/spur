@@ -61,8 +61,6 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Accepted for compatibility; the job-id filter is not yet applied server-side.
    * - ``sacct`` ``ReqMem``
      - The ``ReqMem`` format field has no value yet and renders empty.
-   * - ``squeue`` format
-     - The ``%b`` (GRES) and ``%L`` (time-left) format fields are not yet resolved.
    * - ``sstat``
      - Per-process ``Ave*`` and ``Max*`` metrics (for example ``AveRSS``, ``MaxVMSize``) show ``N/A``.
    * - ``sprio``

@@ -127,6 +127,10 @@ SUSPENDED, COMPLETING**.
      - END_TIME
    * - ``%Y``
      - SCHEDNODES
+     - ``%L``
+     - TIME_LEFT
+   * - ``%b``
+     - GRES
      -
      -
 
