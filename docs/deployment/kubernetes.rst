@@ -62,17 +62,16 @@ Deploy
 
 .. note::
 
-   Before applying, review the manifests and update namespaces, image names/tags, resource limits, and storage classes to match your environment. In agent mode, ensure the ``--controller`` argument in ``spurd.yaml`` includes the ``http://`` scheme (e.g. ``http://spurctld.spur.svc.cluster.local:6817``).
+   Before applying, review the manifests and update namespaces, image names/tags, resource limits, and storage classes to match your environment. In agent mode, ensure the ``--controller`` argument in ``spurd.yaml`` includes the ``http://`` scheme (e.g. ``http://spurctld-client.spur.svc.cluster.local:6817``).
 
-.. warning::
+.. note::
 
-   **Set the final replica count of** ``spurctld`` **before the first apply.** It cannot
-   be raised later. Each new StatefulSet ordinal gets an empty volume from
-   ``volumeClaimTemplates``, and a rolling update starts at the highest ordinal, so new
-   empty replicas would try to form a second Raft cluster before the replica that holds
-   the data is even restarted. spurctld detects this and refuses to start, which leaves
-   the new replicas in ``CrashLoopBackOff``. To change the count, take the cluster down
-   and build it again.
+   The ``spurctld`` replica count may be raised after the first apply, but not by
+   ``kubectl scale`` alone. A new StatefulSet ordinal starts with an empty volume,
+   finds that the running cluster does not list it, and waits without serving the
+   client API, so its readiness probe fails and the Service keeps traffic away from
+   it. An administrator then adds it to the Raft membership. See
+   :doc:`controller-ha`.
 
 Apply manifests in order (Pod mode):
 
@@ -125,7 +124,8 @@ peer (``spurctld-3`` with three peers is node 4, a replica that waits to be
 added to the cluster), or, when every peer is an IP address, fall within
 ``1..=len(peers)``. Any other derived id, including a hostname that matches more
 than one entry, makes the controller fail fast at startup rather than join with
-a wrong ID.
+a wrong ID. :doc:`controller-ha` tells how a replica past the seed list is added
+to the cluster.
 
 Adjust partition definitions to match your cluster hardware. Once the controller
 is running, ``scontrol reconfigure`` applies many sections live, while others

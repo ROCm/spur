@@ -35,7 +35,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: [spur-k8s-operator]
           args:
-            - --controller-addr=spurctld.spur.svc.cluster.local:6817
+            - --controller-addr=spurctld-client.spur.svc.cluster.local:6817
             - --listen=[::]:6818
             - --health-addr=[::]:8080
           env:

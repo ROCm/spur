@@ -32,6 +32,7 @@ DEFAULT_TIMEOUT = 60
 WAIT_INTERVAL = 2
 HA_TIMEOUT = 90
 CLUSTER_SCOPED_KINDS = frozenset({"ClusterRole", "ClusterRoleBinding"})
+ADMIN_POD = "spur-admin"
 
 
 def wait_until(
@@ -128,6 +129,36 @@ class FixtureConfig:
             image=image,
             config_toml="""
 cluster_name = "k8s-ci"
+
+[scheduler]
+interval_secs = 1
+plugin = "backfill"
+
+[[partitions]]
+name = "default"
+state = "UP"
+default = true
+nodes = "ALL"
+max_time = "1h"
+default_time = "10m"
+""".strip(),
+        )
+
+    @classmethod
+    def raft_seed(cls) -> FixtureConfig:
+        """One controller that names only itself, so that a later replica is a
+        node past the seed list and has to be added at runtime."""
+        image = os.environ.get("SPUR_CI_IMAGE", _DEFAULT_IMAGE)
+        return cls(
+            replicas=1,
+            image=image,
+            config_toml="""
+cluster_name = "k8s-ci-raft-seed"
+
+[controller]
+peers = [
+  "spurctld-0.spurctld.spur.svc.cluster.local:6821",
+]
 
 [scheduler]
 interval_secs = 1
@@ -432,6 +463,7 @@ class ClusterFixture:
 
     def teardown_workloads(self) -> None:
         self._force_delete_pods("app=spurctld")
+        self._force_delete_pods(f"app={ADMIN_POD}")
         self._force_delete_pods("app=spur-k8s-operator")
 
         for delete_fn in [
@@ -448,6 +480,9 @@ class ClusterFixture:
                 propagation_policy="Background",
             ),
             lambda: self.core_v1.delete_namespaced_service("spurctld", self.namespace),
+            lambda: self.core_v1.delete_namespaced_service(
+                "spurctld-client", self.namespace
+            ),
             lambda: self.core_v1.delete_namespaced_service(
                 "spur-k8s-operator", self.namespace
             ),
@@ -472,6 +507,7 @@ class ClusterFixture:
 
         self._wait_pods_gone("app=spurctld")
         self._wait_pods_gone("app=spur-k8s-operator")
+        self._wait_pods_gone(f"app={ADMIN_POD}")
         logger.info("workload teardown complete")
 
     def cleanup_test_workloads(self) -> None:
@@ -782,3 +818,103 @@ def assert_eventually(
         wait_until(check_fn, timeout, msg, interval=interval)
     except TimeoutError as exc:
         raise AssertionError(str(exc)) from exc
+
+
+def pod_state(namespace: str, pod_name: str) -> tuple[str, bool, int]:
+    """Phase, readiness and restart count of one pod; ("Missing", False, 0) if absent."""
+    _load_kube_config()
+    core = client.CoreV1Api()
+    try:
+        pod = core.read_namespaced_pod(pod_name, namespace)
+    except ApiException as exc:
+        if _is_not_found(exc):
+            return "Missing", False, 0
+        raise
+    ready = any(
+        c.type == "Ready" and c.status == "True"
+        for c in (pod.status.conditions or [])
+    )
+    restarts = sum(c.restart_count for c in (pod.status.container_statuses or []))
+    return pod.status.phase or "", ready, restarts
+
+
+def service_endpoint_pods(namespace: str, service: str) -> set[str]:
+    """Names of the pods a Service currently routes to."""
+    _load_kube_config()
+    core = client.CoreV1Api()
+    try:
+        endpoints = core.read_namespaced_endpoints(service, namespace)
+    except ApiException as exc:
+        if _is_not_found(exc):
+            return set()
+        raise
+    return {
+        addr.target_ref.name
+        for subset in (endpoints.subsets or [])
+        for addr in (subset.addresses or [])
+        if addr.target_ref is not None
+    }
+
+
+def scale_controllers(namespace: str, replicas: int) -> None:
+    _load_kube_config()
+    client.AppsV1Api().patch_namespaced_stateful_set_scale(
+        "spurctld", namespace, {"spec": {"replicas": replicas}}
+    )
+
+
+def delete_pvc(namespace: str, name: str) -> None:
+    _load_kube_config()
+    try:
+        client.CoreV1Api().delete_namespaced_persistent_volume_claim(name, namespace)
+    except ApiException as exc:
+        if not _is_not_found(exc):
+            raise
+
+
+def start_admin_pod(namespace: str, image: str) -> None:
+    """A long-lived pod that runs the CLI as root.
+
+    The controller image runs as an unprivileged user, and the raft membership
+    commands need an operator: root, or a member of sudo/wheel. The controller
+    resolves the caller by name on its own host, where root always exists.
+    """
+    _load_kube_config()
+    core = client.CoreV1Api()
+    body = client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name=ADMIN_POD, namespace=namespace, labels={"app": ADMIN_POD}
+        ),
+        spec=client.V1PodSpec(
+            restart_policy="Never",
+            security_context=client.V1PodSecurityContext(run_as_user=0),
+            containers=[
+                client.V1Container(
+                    name="cli",
+                    image=image,
+                    image_pull_policy="IfNotPresent",
+                    command=["sleep", "infinity"],
+                )
+            ],
+        ),
+    )
+    try:
+        core.create_namespaced_pod(namespace, body)
+    except ApiException as exc:
+        if not _is_already_exists(exc):
+            raise
+    wait_until(
+        lambda: pod_state(namespace, ADMIN_POD)[0] == "Running",
+        DEFAULT_TIMEOUT * 2,
+        f"admin pod {ADMIN_POD} not running",
+    )
+
+
+def spur_admin(namespace: str, controller_pod: str, args: list[str]) -> str:
+    """Run `spur admin ...` from the admin pod against one controller pod."""
+    controller = f"http://{controller_pod}.spurctld.{namespace}.svc.cluster.local:6817"
+    return exec_in_pod(
+        namespace,
+        ADMIN_POD,
+        ["spur", "admin", "--controller", controller, *args],
+    )

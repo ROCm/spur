@@ -34,11 +34,20 @@ def ha_cluster(k8s_suite):
     c.teardown_workloads()
 
 
+@pytest.fixture(scope="class")
+def seed_cluster(k8s_suite):
+    c = ClusterFixture.deploy(k8s_suite, FixtureConfig.raft_seed())
+    yield c
+    c.teardown_workloads()
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_between_tests(request):
     yield
     if "cluster" in request.fixturenames:
         request.getfixturevalue("cluster").cleanup_test_workloads()
+    elif "seed_cluster" in request.fixturenames:
+        request.getfixturevalue("seed_cluster").cleanup_test_workloads()
     elif "ha_cluster" in request.fixturenames:
         fixture = request.getfixturevalue("ha_cluster")
         fixture.cleanup_test_workloads()

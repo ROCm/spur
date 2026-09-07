@@ -463,6 +463,12 @@ service SlurmController {
   rpc ClusterAddNodes(ClusterAddNodesRequest) returns (ClusterAddNodesResponse);
   // Gracefully remove workers from a running cluster (cordon+drain, then k0s reset the node).
   rpc ClusterRemoveNodes(ClusterRemoveNodesRequest) returns (ClusterRemoveNodesResponse);
+
+  // -- Raft membership admin: grow or shrink the controller set at runtime --
+  rpc RaftAddLearner(RaftAddLearnerRequest) returns (google.protobuf.Empty);
+  rpc RaftPromoteVoter(RaftPromoteVoterRequest) returns (google.protobuf.Empty);
+  rpc RaftRemoveVoter(RaftRemoveVoterRequest) returns (google.protobuf.Empty);
+  rpc RaftMembership(RaftMembershipRequest) returns (RaftMembershipResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -1836,3 +1842,45 @@ message RevokeTokenRequest {
 }
 
 message RevokeTokenResponse {}
+
+// -- Raft membership admin --
+
+message RaftAddLearnerRequest {
+  uint64 node_id = 1;
+  // Raft address of the new controller, "host:port".
+  string address = 2;
+  string user = 3;
+}
+
+message RaftPromoteVoterRequest {
+  uint64 node_id = 1;
+  string user = 2;
+}
+
+// node_id may name a voter or a learner. The method keeps its name for wire
+// compatibility.
+message RaftRemoveVoterRequest {
+  uint64 node_id = 1;
+  string user = 2;
+}
+
+message RaftMembershipRequest {}
+
+message RaftMember {
+  uint64 node_id = 1;
+  string address = 2;
+  bool voter = 3;
+  // Highest log index the leader has replicated to this member; -1 when the
+  // answering node is not the leader, or the leader has no figure yet.
+  int64 matched_index = 4;
+}
+
+message RaftMembershipResponse {
+  repeated RaftMember members = 1;
+  // 0 when no leader is known.
+  uint64 leader = 2;
+  uint64 this_node = 3;
+  // Raft role of the answering node: Leader, Follower, Candidate or Learner.
+  string state = 4;
+  uint64 last_log_index = 5;
+}

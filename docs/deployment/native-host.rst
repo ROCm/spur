@@ -298,6 +298,8 @@ addresses, in the same order on every controller, to the ``peers`` list in the c
 Raft automatically elects a leader. Workers connect to any controller and are redirected
 to the current leader.
 
+To add or remove a controller after the first start, see :doc:`controller-ha`.
+
 Joining Worker Nodes
 --------------------
 

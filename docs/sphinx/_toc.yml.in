@@ -29,6 +29,7 @@ subtrees:
               - file: deployment/kubernetes
               - file: deployment/managed-kubernetes
               - file: deployment/partitioning
+              - file: deployment/controller-ha
               - file: deployment/upgrading
               - file: deployment/uninstalling
       - file: migration-from-slurm
