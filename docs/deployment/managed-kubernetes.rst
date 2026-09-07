@@ -179,6 +179,7 @@ Networking / CNI
 
 **kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
 on the node's primary interface and workers join over it. No mesh required.
+``pod_cidr``/``service_cidr`` are applied the same as under ``calico``.
 
 **calico** (``cni = "calico"``) — with the WireGuard mesh enabled
 (``network.wg_enabled = true``), ``spur k8s up`` generates a k0s config that
@@ -199,11 +200,13 @@ between nodes; open that port if a host firewall default-denies it.
 
 .. note::
 
-   Like ``nodeLocalLoadBalancing`` above, this is rendered once per control
-   plane and does not hot-reload: toggling ``network.wg_enabled`` after a
-   cluster's nodes are already ``active`` does not retroactively switch them
-   between ``bird`` and ``vxlan``. Reprovision (``spur k8s down --reset`` then
-   ``spur k8s up``) to pick up the change.
+   Like ``nodeLocalLoadBalancing`` above, the generated network config is
+   rendered once per control plane as it is brought up and does not
+   hot-reload. This applies to either CNI: an **existing** cluster picks up
+   neither a changed ``pod_cidr``/``service_cidr`` nor a
+   ``network.wg_enabled`` toggle (which would otherwise switch Calico between
+   ``bird`` and ``vxlan``) on upgrade alone. Reprovision with
+   ``spur k8s down --reset`` followed by ``spur k8s up`` to pick up the change.
 
 Storage
 ~~~~~~~
