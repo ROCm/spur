@@ -5,8 +5,10 @@ mod agent_server;
 mod auth_middleware;
 mod cluster;
 pub mod container;
+mod device_cgroup;
 mod executor;
 pub(crate) mod job_entry;
+pub(crate) mod job_lifecycle;
 mod landlock;
 mod mpi_plugin;
 pub(crate) mod privdrop;
@@ -27,6 +29,43 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
+
+/// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
+///
+/// Kernels before 5.11 charge BPF program memory against this limit instead of the
+/// memory cgroup, and the default admits only a handful. On 5.11+ it does not gate.
+fn raise_own_memlock_rlimit() {
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: each call below reads or writes only the local `rlimit` it is
+    // handed, which outlives the call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited) } == 0 {
+        return;
+    }
+    // Without CAP_SYS_RESOURCE the hard limit will not move, but the soft one can
+    // still be raised to meet it.
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut current) } == 0 {
+        let to_hard = libc::rlimit {
+            rlim_cur: current.rlim_max,
+            rlim_max: current.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &to_hard) } == 0 {
+            return;
+        }
+    }
+    // Visible at the default log level: this changes what jobs can do, and the
+    // operator docs promise the agent says so when it cannot raise the limit.
+    warn!(
+        error = %std::io::Error::last_os_error(),
+        "could not raise RLIMIT_MEMLOCK; BPF program loads may fail on kernels before 5.11"
+    );
+}
 
 fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
     use spur_core::config::MemlockLimit;
@@ -60,7 +99,7 @@ fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
 /// bounded at all, and the agent log is the only place that shows what it booted with.
 fn log_cgroup_status(cgroup: &spur_core::config::CgroupConfig) {
     if !cgroup.enabled {
-        warn!("[cgroup] enforcement disabled; jobs run with no cpu or memory bound");
+        warn!("[cgroup] enforcement disabled; jobs run with no cpu, memory or device bound");
         return;
     }
     info!(
@@ -73,6 +112,8 @@ fn log_cgroup_status(cgroup: &spur_core::config::CgroupConfig) {
         allowed_swap_percent = cgroup.allowed_swap_percent,
         min_ram_mb = cgroup.min_ram_mb,
         oom_kill_job = cgroup.oom_kill_job,
+        constrain_devices = cgroup.constrain_devices,
+        extra_device_paths = ?cgroup.extra_device_paths,
         "cgroup enforcement"
     );
     // An unprivileged agent cannot create the cgroup root, so `required` turns every
@@ -174,6 +215,10 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| args.log_level.parse().unwrap()),
         )
         .init();
+
+    // Raised before anything reads or inherits it, so a `memlock = "inherit"` job
+    // does not depend on whether a BPF load ran first. Needs the subscriber to log.
+    raise_own_memlock_rlimit();
 
     let hostname = args.hostname.unwrap_or_else(|| {
         hostname::get()
