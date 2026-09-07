@@ -106,13 +106,15 @@ class TestSrunPtyStepMultiNode:
         # controller falls back to the first allocated node.
         cluster = multi_node_cluster
         first, target = cluster.node_names[0], cluster.node_names[1]
+        assert first != target, "fixture must provide two distinct nodes"
+        # Pin the allocation to both nodes: a bare -N 2 is a node count, so the
+        # scheduler may exclude `target` and the step's -w below would then fail.
         # Tagged: salloc echoes the whole nodelist, so a bare name match would
         # hold even if the step ran on the wrong node.
         code, out = cluster.salloc_run(
             f'srun --pty -w {target} bash -c \'echo NODE=${{SPUR_TARGET_NODE:-$(hostname)}}\'\n',
-            salloc_args=["-N", "2", "-t", "0:05"],
+            salloc_args=["-N", "2", "-w", f"{first},{target}", "-t", "0:05"],
         )
         assert code == 0, out
-        assert first != target, "fixture must provide two distinct nodes"
         hosts = {ln.split("=", 1)[1].strip() for ln in out.splitlines() if ln.startswith("NODE=")}
         assert hosts == {target}, out
