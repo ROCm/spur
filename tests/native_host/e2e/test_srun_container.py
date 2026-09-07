@@ -642,7 +642,11 @@ class TestSrunContainerStepMultiNode:
             f"--container-image='{img}' cat '{MARKER_PATH}' > '{out2}' 2>&1 &\n"
             f"wait"
         )
-        code, out = cluster.salloc_run(body, salloc_args=["-N", "2", "-t", "0:03"])
+        # Pin both nodes: a bare -N 2 is a node count, so the scheduler may
+        # exclude node2 and the -w step below would then fail.
+        code, out = cluster.salloc_run(
+            body, salloc_args=["-N", "2", "-w", f"{node1},{node2}", "-t", "0:03"]
+        )
         assert code == 0, f"salloc overlap run failed (exit {code}):\n{out}"
         # Both srun clients run in the salloc shell (node 0), so both outputs
         # land on node 0.
