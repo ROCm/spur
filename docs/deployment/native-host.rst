@@ -363,6 +363,8 @@ to the current leader.
 Each controller writes its Raft snapshot atomically, so ``state_dir`` needs free space for
 about two copies of ``raft/snapshot.json`` (the current file plus the new temporary one).
 
+To add or remove a controller after the first start, see :doc:`controller-ha`.
+
 Joining Worker Nodes
 --------------------
 

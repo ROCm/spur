@@ -8,4 +8,5 @@ toolkit is the recommended path; the manual guide covers the same steps by hand.
 - **MPI** — :ref:`PMIx setup <mpi-pmix-install>` and :ref:`mpirun setup <mpirun-setup>` (agent prerequisites)
 - **Kubernetes** — :doc:`kubernetes` and :doc:`managed-kubernetes`
 - **Configure** — :doc:`partitioning`
+- **Scale the controllers** — :doc:`controller-ha`
 - **Operate** — :doc:`upgrading` and :doc:`uninstalling`

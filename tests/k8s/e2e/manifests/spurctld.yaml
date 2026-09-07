@@ -14,6 +14,24 @@ spec:
       port: 6821
       targetPort: 6821
   clusterIP: None  # headless for StatefulSet peer DNS
+  # A controller that waits to be added to the Raft membership is not ready, and
+  # DNS omits an unready pod by default. The leader must still resolve it.
+  publishNotReadyAddresses: true
+---
+# Readiness-gated client entry point, because the headless Service above now
+# answers for waiting Pods too.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurctld-client
+  namespace: spur
+spec:
+  selector:
+    app: spurctld
+  ports:
+    - name: grpc
+      port: 6817
+      targetPort: 6817
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -47,19 +65,23 @@ spec:
               name: grpc
             - containerPort: 6821
               name: raft
+            - containerPort: 6823
+              name: probes
           volumeMounts:
             - name: config
               mountPath: /etc/spur
             - name: spool
               mountPath: /var/spool/spur
           readinessProbe:
-            tcpSocket:
-              port: 6817
+            httpGet:
+              path: /readyz
+              port: 6823
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            tcpSocket:
-              port: 6817
+            httpGet:
+              path: /livez
+              port: 6823
             initialDelaySeconds: 15
             periodSeconds: 20
       volumes:
