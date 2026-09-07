@@ -752,6 +752,9 @@ pub struct RaftHandle {
     pub raft: SpurRaft,
     pub node_id: NodeId,
     pub peers: BTreeMap<NodeId, String>,
+    /// The validated openraft config, so that admin checks use the same
+    /// figures the node runs with.
+    pub config: Arc<Config>,
 }
 
 impl RaftHandle {
@@ -1163,7 +1166,7 @@ pub async fn start_raft_with_recovery_mode(
     });
 
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
-    let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
+    let raft = Raft::new(node_id, config.clone(), network, log_store, state_machine).await?;
 
     // Symmetric bootstrap only applies on first-ever startup; skip it once we
     // have prior state, else openraft logs an ERROR rejecting it every restart.
@@ -1216,6 +1219,7 @@ pub async fn start_raft_with_recovery_mode(
         raft,
         node_id,
         peers: peer_map,
+        config,
     })
 }
 
@@ -2193,6 +2197,44 @@ mod join_tests {
         (listener, addr)
     }
 
+    /// A controller that predates `ClusterProbe` answers `UNIMPLEMENTED`: tonic
+    /// gives that code for a service it does not serve, exactly as an old build
+    /// does for the whole `RaftInternal` service.
+    #[tokio::test]
+    async fn probe_support_tells_an_old_controller_from_a_current_one() {
+        let (old_listener, old_addr) = reserve().await;
+        tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(old_listener);
+            let _ = tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        assert_eq!(
+            probe_support(&old_addr.to_string()).await,
+            ProbeSupport::Unimplemented
+        );
+
+        let (listener, addr) = reserve().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = start_raft(1, &[addr.to_string()], dir.path(), noop_applier())
+            .await
+            .unwrap();
+        serve(listener, node.raft.clone());
+        assert_eq!(
+            probe_support(&addr.to_string()).await,
+            ProbeSupport::Supported
+        );
+
+        // Take a port and let it go, so nothing listens there.
+        let (closed_listener, closed_addr) = reserve().await;
+        drop(closed_listener);
+        assert_eq!(
+            probe_support(&closed_addr.to_string()).await,
+            ProbeSupport::Unreachable
+        );
+    }
+
     /// The whole join path: node 2 is in no configuration of node 1, so the
     /// leader can only reach it through the address in the membership entry.
     /// Node 2 never calls `initialize()`; its membership arrives in the
@@ -2242,5 +2284,41 @@ mod join_tests {
             .voter_ids([1, 2], "node 2 is a voter")
             .await
             .unwrap();
+    }
+}
+
+/// Whether a peer understands the `ClusterProbe` RPC, which a controller must
+/// before it can reach a node that only the replicated membership names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSupport {
+    Supported,
+    /// The peer runs a build that predates the RPC.
+    Unimplemented,
+    Unreachable,
+}
+
+/// Ask one peer whether it implements `ClusterProbe`.
+pub async fn probe_support(addr: &str) -> ProbeSupport {
+    let Ok(endpoint) = tonic::transport::Endpoint::from_shared(format!("http://{addr}")) else {
+        return ProbeSupport::Unreachable;
+    };
+    let endpoint = endpoint
+        .connect_timeout(PEER_PROBE_TIMEOUT)
+        .timeout(PEER_PROBE_TIMEOUT);
+    let Ok(Ok(channel)) = tokio::time::timeout(PEER_PROBE_TIMEOUT, endpoint.connect()).await else {
+        return ProbeSupport::Unreachable;
+    };
+    let mut client = raft_client(channel);
+    match tokio::time::timeout(
+        PEER_PROBE_TIMEOUT,
+        client.cluster_probe(spur_proto::raft_proto::ClusterProbeRequest {}),
+    )
+    .await
+    {
+        Ok(Ok(_)) => ProbeSupport::Supported,
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            ProbeSupport::Unimplemented
+        }
+        _ => ProbeSupport::Unreachable,
     }
 }
