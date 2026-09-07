@@ -1314,6 +1314,7 @@ message InitSession {
   repeated string argv = 6;  // Command to run (empty = default shell)
   map<string, string> env = 7;
   string user = 8;           // Requesting user; verified identity must own the job; the controller/admin credential overrides
+  ContainerSpec container = 9;  // Effective container the step runs in (empty image = host); resolved by the controller
 }
 
 message InteractiveInput {
@@ -1661,11 +1662,13 @@ message CreateJobStepRequest {
   string node = 8;            // Target node (-w); empty = first allocated node
   string user = 9;            // Requesting user; verified identity must own the job; the controller/admin credential overrides
   uint32 uid = 10;            // Caller Unix uid for Munge-like ownership when unauthenticated; 0 = absent
+  ContainerSpec container = 11;  // Step's own container request (empty image = none/inherit)
 }
 
 message CreateJobStepResponse {
   uint32 step_id = 1;
   string node_addr = 2;        // Address of the selected node (-w target, else first allocated); host:port for agent
+  ContainerSpec container = 3; // Effective container for the step (step's own, else inherited from the job); empty image = host
 }
 
 message CompleteJobStepRequest {

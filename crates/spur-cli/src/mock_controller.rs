@@ -155,6 +155,7 @@ mock_controller_impl! {
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
                 node_addr: String::new(),
+                container: None,
             }))
         }
 

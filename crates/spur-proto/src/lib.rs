@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod proto {
+    // Generated code: the InteractiveInput oneof carries InitSession inline, which
+    // is legitimately larger than its byte/int variants.
+    #![allow(clippy::large_enum_variant)]
     tonic::include_proto!("slurm");
 }
 

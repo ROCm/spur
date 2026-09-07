@@ -49,12 +49,16 @@ class TestSrunPtyStep:
         assert code == 0, out
         assert "DerivedExitCode=7:0" in out, out
 
-    def test_pty_step_warns_on_dropped_container_flags(self, cluster):
+    def test_pty_no_longer_warns_that_container_is_dropped(self, cluster):
+        # --pty now honors --container-image (see test_srun_container.py for the
+        # in-container assertions); the old "not honored" warning must be gone. A
+        # nonexistent image errors during setup rather than warning, so `|| true`
+        # keeps the pipefail shell going.
         code, out = cluster.salloc_run(
-            "srun --pty --container-image /nonexistent.sqsh echo hi\n"
+            "srun --pty --container-image /nonexistent.sqsh echo hi || true\n"
         )
         assert code == 0, out
-        assert "container options are not honored for a --pty step" in out, out
+        assert "container options are not honored for a --pty step" not in out, out
 
     def test_pty_step_sizing_warning_tracks_what_was_typed(self, cluster):
         # salloc exports SPUR_NTASKS into every step, so a bare `srun --pty`

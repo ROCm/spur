@@ -2160,7 +2160,16 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
+        // Resolve the effective container so the interactive-PTY client can forward it
+        // to the agent: the agent connects directly (bypassing the controller) and cannot
+        // see the parent job spec to inherit `salloc/sbatch --container-image`.
+        let container = resolve_step_container(req.container.clone(), &job.spec);
+
+        Ok(Response::new(CreateJobStepResponse {
+            step_id,
+            node_addr,
+            container,
+        }))
     }
 
     async fn complete_job_step(
@@ -2830,22 +2839,7 @@ impl SlurmController for ControllerService {
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
-        // Effective container for the step: the step's own ContainerSpec when it
-        // set one (srun --container-image), otherwise inherit the parent job's
-        // container config (sbatch --container-image). When the step overrides,
-        // its env is merged over the job's container env (step-wins) so setting
-        // one step variable doesn't silently drop the job's container env.
-        let step_container = match req.container.clone().filter(|c| !c.image.is_empty()) {
-            Some(mut step) => {
-                if let Some(parent) = container_spec_from_job_spec(&job.spec) {
-                    let mut env = parent.env;
-                    env.extend(step.env);
-                    step.env = env;
-                }
-                Some(step)
-            }
-            None => container_spec_from_job_spec(&job.spec),
-        };
+        let step_container = resolve_step_container(req.container.clone(), &job.spec);
         let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
         let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
         let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
@@ -3702,6 +3696,29 @@ fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<Contai
         entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         remap_root: spec.container_remap_root,
     })
+}
+
+/// Effective container for a step: the step's own `ContainerSpec` when it set one
+/// (`srun --container-image`), otherwise inherit the parent job's container config
+/// (`sbatch --container-image`). When the step overrides, its env is merged over the
+/// job's container env (step-wins) so setting one step variable doesn't silently drop
+/// the job's container env. Shared by the buffered (`run_step`) and interactive-PTY
+/// (`create_job_step`) dispatch paths.
+fn resolve_step_container(
+    step: Option<ContainerSpec>,
+    job_spec: &spur_core::job::JobSpec,
+) -> Option<ContainerSpec> {
+    match step.filter(|c| !c.image.is_empty()) {
+        Some(mut step) => {
+            if let Some(parent) = container_spec_from_job_spec(job_spec) {
+                let mut env = parent.env;
+                env.extend(step.env);
+                step.env = env;
+            }
+            Some(step)
+        }
+        None => container_spec_from_job_spec(job_spec),
+    }
 }
 
 fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
@@ -4963,6 +4980,63 @@ mod tests {
             cpus_per_task: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resolve_step_container_prefers_the_steps_own_image() {
+        let mut job = owned_job("u", "/w");
+        job.container_image = Some("parent.sqsh".into());
+        let step = ContainerSpec {
+            image: "step.sqsh".into(),
+            ..Default::default()
+        };
+        let eff = resolve_step_container(Some(step), &job).expect("effective container");
+        assert_eq!(eff.image, "step.sqsh");
+    }
+
+    #[test]
+    fn resolve_step_container_inherits_parent_when_step_omits_image() {
+        // A bare `srun --pty` inside a containerized salloc/sbatch: the step has
+        // no image of its own and must inherit the allocation's.
+        let mut job = owned_job("u", "/w");
+        job.container_image = Some("parent.sqsh".into());
+        assert_eq!(
+            resolve_step_container(Some(ContainerSpec::default()), &job)
+                .expect("inherit on empty image")
+                .image,
+            "parent.sqsh"
+        );
+        assert_eq!(
+            resolve_step_container(None, &job)
+                .expect("inherit on no container")
+                .image,
+            "parent.sqsh"
+        );
+    }
+
+    #[test]
+    fn resolve_step_container_merges_parent_env_under_step_env() {
+        let mut job = owned_job("u", "/w");
+        job.container_image = Some("parent.sqsh".into());
+        job.container_env = std::collections::HashMap::from([
+            ("A".to_string(), "parent".to_string()),
+            ("B".to_string(), "parent".to_string()),
+        ]);
+        let step = ContainerSpec {
+            image: "step.sqsh".into(),
+            env: std::collections::HashMap::from([("B".to_string(), "step".to_string())]),
+            ..Default::default()
+        };
+        let eff = resolve_step_container(Some(step), &job).expect("effective container");
+        assert_eq!(eff.env.get("A").map(String::as_str), Some("parent"));
+        assert_eq!(eff.env.get("B").map(String::as_str), Some("step"));
+    }
+
+    #[test]
+    fn resolve_step_container_is_none_without_any_image() {
+        let job = owned_job("u", "/w");
+        assert!(resolve_step_container(None, &job).is_none());
+        assert!(resolve_step_container(Some(ContainerSpec::default()), &job).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6584,6 +6658,7 @@ mod tests {
                 node: String::new(),
                 user: "local-wire-name".into(),
                 uid: owner_uid,
+                container: None,
             }))
             .await
             .expect("uid match must authorize step creation despite username mismatch");

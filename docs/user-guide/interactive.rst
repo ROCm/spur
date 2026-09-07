@@ -69,8 +69,10 @@ Common options:
        one node, started in the *job's* environment and working directory
        rather than your shell's. ``srun`` warns about the flags that implies it
        must drop — ``--output``/``--error``/``--input``, the task-sizing flags,
-       ``--cpu-bind``/``--gpu-bind``/``--label``/``--mpi``, and container
-       options. ``--chdir`` moves the srun prolog/epilog but not the terminal.
+       and ``--cpu-bind``/``--gpu-bind``/``--label``/``--mpi``. ``--chdir`` moves
+       the srun prolog/epilog but not the terminal. ``--container-image`` *is*
+       honored — the interactive shell runs inside the container (see
+       :doc:`running-containers`).
    * - ``--label``
      - ``-l``
      - Prefix each output line with its task rank.

@@ -184,6 +184,7 @@ pub struct InteractiveSessionHandle {
 /// Open the InteractiveSession RPC, returning the raw handle.
 ///
 /// Returns `Err(tonic::Status)` on RPC failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_interactive_session(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -192,6 +193,7 @@ pub async fn open_interactive_session(
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
     user: &str,
+    container: Option<spur_proto::proto::ContainerSpec>,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
@@ -203,6 +205,7 @@ pub async fn open_interactive_session(
             argv,
             env: HashMap::new(),
             user: user.to_string(),
+            container,
         })),
     };
 
@@ -322,9 +325,12 @@ pub async fn run_interactive_session(
     overlap: bool,
     user: &str,
 ) -> Result<i32> {
-    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, user)
-        .await
-        .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
+    let handle =
+        open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, user, None)
+            .await
+            .map_err(|status| {
+                anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message())
+            })?;
     drive_interactive_session(handle).await
 }
 
