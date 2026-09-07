@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod admin;
 mod auth_keys;
 mod authclient;
 mod clap_exit;
@@ -155,6 +156,7 @@ fn main() -> anyhow::Result<()> {
         "exec" => return runtime.block_on(exec::main()),
         "token" => return runtime.block_on(token::main()),
         "auth-keys" => return auth_keys::main(),
+        "admin" => return runtime.block_on(admin::main()),
         _ => {}
     }
 
@@ -191,7 +193,9 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "node" | "k8s" | "image" | "exec" | "token" | "auth-keys" => Some(args[1].as_str()),
+        "net" | "node" | "k8s" | "image" | "exec" | "token" | "auth-keys" | "admin" => {
+            Some(args[1].as_str())
+        }
         _ => None,
     };
 
@@ -246,6 +250,7 @@ fn main() -> anyhow::Result<()> {
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             "token" => runtime.block_on(token::main_with_args(rewritten)),
             "auth-keys" => auth_keys::main_with_args(rewritten),
+            "admin" => runtime.block_on(admin::main_with_args(rewritten)),
             _ => unreachable!(),
         };
         return result;
@@ -360,6 +365,10 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     writeln!(
         w,
         "  auth-keys   Generate JWKS files for native authentication"
+    )?;
+    writeln!(
+        w,
+        "  admin       Administer the controller set (raft membership)"
     )?;
     writeln!(
         w,
