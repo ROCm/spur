@@ -240,8 +240,9 @@ pub struct SbatchArgs {
     pub container_entrypoint: Option<String>,
 
     /// Run the container as root (uid 0) inside a user namespace while staying
-    /// the submitting user on the host (rootless-root via idmapped mounts).
-    /// Requires a root spurd; the job never becomes host root.
+    /// the submitting user on the host; the job never becomes host root. Takes
+    /// effect on a root daemon (a non-root daemon already runs the container as
+    /// root inside a user namespace).
     #[arg(long, overrides_with = "container_remap_root")]
     pub container_remap_root: bool,
 

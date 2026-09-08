@@ -239,10 +239,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     if args.container_remap_root {
         anyhow::bail!(
-            "--container-remap-root is not yet implemented; the container would run as the \
-             submitting user despite the flag. Rootless UID/GID remapping (submitter -> root \
-             inside the container, unprivileged on the host) is planned but not yet available. \
-             Omit the flag rather than rely on it."
+            "--container-remap-root is not yet supported for srun steps. Run it as a batch \
+             container job instead (sbatch --container-image ... --container-remap-root), \
+             where the container runs as root inside a user namespace, unprivileged on the host."
         );
     }
 
@@ -2993,8 +2992,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("--container-remap-root") && msg.contains("not yet implemented"),
-            "expected a not-yet-implemented rejection, got: {msg}"
+            msg.contains("--container-remap-root") && msg.contains("not yet supported"),
+            "expected a not-yet-supported-for-steps rejection, got: {msg}"
         );
     }
 

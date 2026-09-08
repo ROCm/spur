@@ -70,7 +70,12 @@ runs inside the container.
      - Shell command run inside the container immediately before the job script
        (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
-     - Map the job user to root inside the container.
+     - Run the container as root (uid 0) inside a user namespace while the
+       host-side identity stays the unprivileged submitter, so a root-layout
+       image can write ``/root`` and other root-owned paths. The job never
+       becomes host root. Batch (``sbatch``) container jobs only; not yet
+       supported for ``srun`` steps. Takes effect on a root daemon — a non-root
+       daemon already runs the container as root inside a user namespace.
 
 A GPU training job with a read-only data mount:
 
