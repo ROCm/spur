@@ -4635,13 +4635,10 @@ impl AgentService {
     /// Bidirectional PTY bridge: reads master fd, forwards inbound messages
     /// (stdin, resize, signal), and drains remaining output after child exit.
     ///
-    /// `interactive` decides what closing the client's input stream means. An
-    /// interactive client (stdin is a TTY) only closes it when the terminal goes
-    /// away, so that is a hangup: SIGHUP the step and stop. A non-interactive
-    /// client (script/pipe/redirect) closes it as soon as stdin hits EOF while it
-    /// keeps reading output, so that is just stdin-EOF: stop forwarding input but
-    /// keep draining until the command finishes. Without this, a `--pty` step run
-    /// non-interactively is SIGHUP'd before its output is flushed.
+    /// `interactive` sets what closing the client's input stream means: for an
+    /// interactive client (TTY) it is a hangup (SIGHUP the step and stop); for a
+    /// non-interactive one (script/pipe/redirect) it is stdin-EOF, so stop
+    /// forwarding input but keep draining until the command exits.
     async fn run_pty_bridge<S, F>(
         master: std::os::fd::OwnedFd,
         wait_exit: F,
