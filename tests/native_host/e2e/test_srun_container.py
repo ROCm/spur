@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from cluster import parse_job_id, wait_job, wait_job_state
+from cluster import DAEMON_ENV_CANARY, parse_job_id, wait_job, wait_job_state
 
 
 def _toolchain_mounts(cluster) -> list:
@@ -695,97 +695,74 @@ class TestSrunContainerStepSanity:
 class TestSrunPtyContainerStep:
     """`srun --pty` must run inside the requested container, not on the host.
 
-    These drive the interactive path — the agent allocates the PTY, so the steps
-    run through `salloc_run` (there is no client-side pseudo-tty). The step's
-    stdout is a tty; to read the in-image marker back it is redirected to a file,
-    matching `test_salloc_then_srun_container`.
+    Driven from the host client without a pseudo-tty (the e2e runs over SSH). The
+    client marks the session non-interactive, so the agent drains the step's
+    output rather than hanging it up on stdin-EOF, which is what makes the
+    captured marker reliable.
     """
 
     def test_pty_container_entry(self, step_container_cluster):
-        # Explicit --container-image on the --pty step (no image on the salloc):
-        # spurd builds a fresh container for the interactive step.
+        # Standalone `srun --pty --container-image`: spurd builds a fresh container
+        # for the interactive step; reading the in-image marker proves entry.
         cluster = step_container_cluster
-        img = cluster.step_container_image
-        out_path = f"{cluster.remote_dir}/pty-step.out"
-        body = (
-            f"'{cluster.bin_dir}/srun' --pty --container-image='{img}' "
-            f"cat '{MARKER_PATH}' > '{out_path}' 2>&1\n"
-        )
-        code, out = cluster.salloc_run(body, salloc_args=["-N", "1", "-t", "0:02"])
-        assert code == 0, f"salloc + srun --pty --container-image failed (exit {code}):\n{out}"
-        step_out = cluster.nodes[0].read_file(out_path)
-        assert MARKER_CONTENT in step_out, (
-            f"--pty step ran on host, not in container:\n{step_out}"
-        )
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty",
+            f"--container-image={cluster.step_container_image}",
+            "cat", MARKER_PATH,
+        ])
+        assert code == 0, f"srun --pty --container-image failed (exit {code}):\n{out}"
+        assert MARKER_CONTENT in out, f"--pty step ran on host, not in container:\n{out}"
 
     def test_pty_step_is_a_tty_inside_the_container(self, step_container_cluster):
-        # Combined check: the step both runs on a real tty (agent-allocated PTY)
-        # and inside the container (sees the in-image marker).
+        # The step runs on a real (agent-allocated) tty *and* inside the container.
         cluster = step_container_cluster
-        img = cluster.step_container_image
-        code, out = cluster.salloc_run(
-            f"'{cluster.bin_dir}/srun' --pty --container-image='{img}' "
-            f"bash -c 'test -t 1 && cat {MARKER_PATH} || echo NO-TTY'\n",
-            salloc_args=["-N", "1", "-t", "0:02"],
-        )
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty",
+            f"--container-image={cluster.step_container_image}",
+            "bash", "-c", f"test -t 1 && cat {MARKER_PATH} || echo NO-TTY",
+        ])
         assert code == 0, out
         assert MARKER_CONTENT in out, f"pty container step not in container:\n{out}"
         assert "NO-TTY" not in out, f"pty container step did not get a tty:\n{out}"
 
-    def test_pty_inherits_allocation_container(self, step_container_cluster):
-        # `salloc --container-image` + a bare `srun --pty`: the step has no image
-        # of its own and must inherit the allocation's (the allocation holder has
-        # no live namespaces, so this builds a fresh container from the inherited
-        # image rather than nsenter-ing).
-        cluster = step_container_cluster
-        img = cluster.step_container_image
-        out_path = f"{cluster.remote_dir}/pty-inherit.out"
-        body = f"'{cluster.bin_dir}/srun' --pty cat '{MARKER_PATH}' > '{out_path}' 2>&1\n"
-        code, out = cluster.salloc_run(
-            body, salloc_args=["-N", "1", "-t", "0:02", f"--container-image={img}"]
-        )
-        assert code == 0, f"salloc --container-image + srun --pty failed (exit {code}):\n{out}"
-        step_out = cluster.nodes[0].read_file(out_path)
-        assert MARKER_CONTENT in step_out, (
-            f"inherited-container --pty step not in container:\n{step_out}"
-        )
-
     def test_pty_nested_srun_enters_parent_container(self, step_container_cluster):
-        # `sbatch --container-image` + a nested `srun --pty`: the batch job has
-        # live namespaces, so the pty step enters them via nsenter rather than
-        # building a new rootfs. Verifies the assumption that this path already
-        # worked before the fix.
+        # `sbatch --container-image` keeps a container alive; `srun --jobid
+        # --overlap --pty` then attaches and enters the *running* container via
+        # nsenter (not a fresh rootfs). The nested srun carries no image, so the
+        # controller resolves the inherited one and the agent joins the parent's
+        # namespaces.
         cluster = step_container_cluster
         img = cluster.step_container_image
-        out_path = f"{cluster.remote_dir}/pty-nsenter.out"
-        script = cluster.write_file(
-            "pty-nsenter.sh",
-            f"#!/bin/bash\n{cluster.bin_dir}/srun --pty cat '{MARKER_PATH}'\n",
-        )
+        sleeper = cluster.write_file("pty-sleeper.sh", "#!/bin/bash\nsleep 120\n")
         sb = cluster.sbatch([
-            "-J", "pty-nsenter", "-N", "1", "-t", "0:03", "-o", out_path,
+            "-J", "pty-nsenter", "-N", "1", "-t", "0:05",
             f"--container-image={img}",
-            *_toolchain_mounts(cluster),
-            script,
+            sleeper,
         ])
         job_id = parse_job_id(sb)
         assert job_id is not None, f"sbatch did not return a job id: {sb}"
-        wait_job(cluster, job_id, timeout=120)
-        out = cluster.read_output_on_any_node(out_path)
-        diag = cluster.debug_job(job_id)
-        assert MARKER_CONTENT in out, (
-            f"nested --pty srun did not enter parent container:\n{diag}\noutput:\n{out}"
-        )
+        wait_job_state(cluster, job_id, "R", timeout=120)
+        try:
+            code, out = cluster.srun_with_exit([
+                "--jobid", str(job_id), "--overlap", "--pty",
+                "cat", MARKER_PATH,
+            ])
+            diag = cluster.debug_job(job_id)
+            assert code == 0, f"nested --pty attach failed (exit {code}):\n{diag}\n{out}"
+            assert MARKER_CONTENT in out, (
+                f"nested --pty srun did not enter parent container:\n{diag}\noutput:\n{out}"
+            )
+        finally:
+            cluster.scancel(job_id)
 
     def test_pty_without_image_runs_on_host(self, step_container_cluster):
         # A --pty step with no image runs on the host and cannot see the in-image
         # marker — proves the image is what gates the container path (not --pty).
         cluster = step_container_cluster
-        code, out = cluster.salloc_run(
-            f"'{cluster.bin_dir}/srun' --pty "
-            f"bash -c 'test -f {MARKER_PATH} && echo FOUND || echo NOTFOUND'\n",
-            salloc_args=["-N", "1", "-t", "0:02"],
-        )
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty",
+            "bash", "-c", f"test -f {MARKER_PATH} && echo FOUND || echo NOTFOUND",
+        ])
         assert code == 0, out
         assert "NOTFOUND" in out, f"marker found on host — assumption violated:\n{out}"
 
@@ -793,21 +770,59 @@ class TestSrunPtyContainerStep:
         # GPU device nodes, render group, and SPUR_JOB_GPUS must be injected into
         # the interactive container step, matching the buffered path.
         cluster = step_gpu_container_cluster
-        out_path = f"{cluster.remote_dir}/pty-gpu.out"
-        body = (
-            f"'{cluster.bin_dir}/srun' --pty "
-            f"--container-image='{cluster.step_container_image}' "
-            f"--container-mounts={cluster.step_probe}:/probe.sh:ro "
-            f"/probe.sh > '{out_path}' 2>&1\n"
-        )
-        code, out = cluster.salloc_run(
-            body, salloc_args=["-N", "1", "--gres=gpu:1", "-t", "0:03"]
-        )
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:03", "--pty", "--gres=gpu:1",
+            f"--container-image={cluster.step_container_image}",
+            f"--container-mounts={cluster.step_probe}:/probe.sh:ro",
+            "/probe.sh",
+        ])
         assert code == 0, f"gpu --pty step failed (exit {code}):\n{out}"
-        parsed = _parse_probe(cluster.nodes[0].read_file(out_path))
+        parsed = _parse_probe(out)
         assert parsed.get("VISIBLE_COUNT") == "1", f"expected 1 visible GPU:\n{out}"
         assert parsed.get("SPUR_COUNT") == "1", f"expected SPUR_JOB_GPUS=1:\n{out}"
         assert parsed.get("KFD") == "yes", f"/dev/kfd not injected in pty step:\n{out}"
         assert int(parsed.get("RENDER_COUNT", "0")) >= 1, (
             f"no /dev/dri/renderD* injected in pty step:\n{out}"
         )
+
+    def test_daemon_env_does_not_leak_into_container_sessions(self, step_container_cluster):
+        # spurd's own environment (which may hold node/daemon secrets) must not
+        # leak into a session that ENTERS a running container job. A canary lives
+        # only in spurd's env (cluster.py injects it at launch); the job clients
+        # run over separate SSH channels and never have it, so its presence inside
+        # a session means the daemon environment leaked. Covers all three nsenter
+        # entry paths: `spur exec`, `srun --overlap`, and `srun --overlap --pty`.
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        sleeper = cluster.write_file("leak-sleeper.sh", "#!/bin/bash\nsleep 120\n")
+        sb = cluster.sbatch([
+            "-J", "envleak", "-N", "1", "-t", "0:05",
+            f"--container-image={img}",
+            sleeper,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        wait_job_state(cluster, job_id, "R", timeout=120)
+        # A small deterministic marker keeps the assertion robust regardless of how
+        # much env output a --pty step flushes.
+        probe = "env | grep -q SPUR_DAEMON_ENV_CANARY && echo LEAKED || echo CLEAN"
+        try:
+            entries = {
+                "spur exec": lambda: cluster.cli_with_exit(
+                    ["exec", str(job_id), "bash", "-c", probe]
+                ),
+                "srun --overlap": lambda: cluster.srun_with_exit(
+                    ["--jobid", str(job_id), "--overlap", "bash", "-c", probe]
+                ),
+                "srun --overlap --pty": lambda: cluster.srun_with_exit(
+                    ["--jobid", str(job_id), "--overlap", "--pty", "bash", "-c", probe]
+                ),
+            }
+            for name, run in entries.items():
+                code, out = run()
+                assert code == 0, f"{name} env probe failed:\n{out}"
+                assert "CLEAN" in out and "LEAKED" not in out, (
+                    f"spurd env leaked into {name} (canary={DAEMON_ENV_CANARY}):\n{out}"
+                )
+        finally:
+            cluster.scancel(job_id)

@@ -9,6 +9,7 @@ use spur_proto::proto::{
     JobKeepaliveRequest,
 };
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -195,6 +196,12 @@ pub async fn open_interactive_session(
     user: &str,
     container: Option<spur_proto::proto::ContainerSpec>,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
+    // When our stdin is not a TTY (a script, redirected input, a pipe), the
+    // client closes its input stream as soon as stdin hits EOF. Tell the agent so
+    // it treats that as stdin-EOF (drain output, let the command finish) rather
+    // than a hangup (SIGHUP). Interactive clients keep the hangup-on-disconnect
+    // behavior.
+    let non_interactive = !std::io::stdin().is_terminal();
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
             job_id,
@@ -206,6 +213,7 @@ pub async fn open_interactive_session(
             env: HashMap::new(),
             user: user.to_string(),
             container,
+            non_interactive,
         })),
     };
 

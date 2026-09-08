@@ -2853,6 +2853,16 @@ impl SlurmAgent for AgentService {
             // host's mount namespace, where a job's work_dir need not exist.
             cmd.current_dir(&entry.work_dir);
         }
+        // Start from an empty environment so spurd's own environment (secrets
+        // included) never leaks into the exec'd command; then apply the job's own.
+        cmd.env_clear();
+        cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        for (k, v) in Self::session_environ(&entry) {
+            cmd.env(k, v);
+        }
         ChildContainment::for_plan(&plan, &entry, priv_drop, self.cgroup.required)
             .register(&mut cmd);
 
@@ -3397,6 +3407,9 @@ impl SlurmAgent for AgentService {
             // container's pivoted mount namespace does not preserve it — that
             // remains best-effort.
             cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
+            // Empty the environment first so spurd's own (secrets included) is not
+            // inherited; the step's resolved environment is applied on top.
+            cmd.env_clear();
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -3576,6 +3589,9 @@ impl SlurmAgent for AgentService {
             let plan = build_launch_plan(&job_entry, priv_drop.as_ref(), &full_command);
             let mut cmd = tokio::process::Command::new(&plan.program);
             cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
+            // Empty the environment first so spurd's own (secrets included) is not
+            // inherited; the step's resolved environment is applied on top.
+            cmd.env_clear();
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -3899,6 +3915,9 @@ impl SlurmAgent for AgentService {
         });
 
         let argv: Vec<String> = init.argv.clone();
+        // A non-interactive client (no TTY) closes its input stream on stdin-EOF
+        // while still reading output; an interactive one only closes it on hangup.
+        let interactive = !init.non_interactive;
 
         // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
         // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
@@ -3967,7 +3986,8 @@ impl SlurmAgent for AgentService {
                         .await
                         .unwrap_or(128)
                 };
-                Self::run_pty_bridge(master_fd, wait_exit, child_pid, inbound, tx).await;
+                Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
+                    .await;
             });
 
             return Ok(Response::new(ReceiverStream::new(rx)));
@@ -4010,7 +4030,7 @@ impl SlurmAgent for AgentService {
                 .unwrap_or(128)
         };
         tokio::spawn(Self::run_pty_bridge(
-            master_fd, wait_exit, child_pid, inbound, tx,
+            master_fd, wait_exit, child_pid, interactive, inbound, tx,
         ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -4609,10 +4629,19 @@ impl AgentService {
 
     /// Bidirectional PTY bridge: reads master fd, forwards inbound messages
     /// (stdin, resize, signal), and drains remaining output after child exit.
+    ///
+    /// `interactive` decides what closing the client's input stream means. An
+    /// interactive client (stdin is a TTY) only closes it when the terminal goes
+    /// away, so that is a hangup: SIGHUP the step and stop. A non-interactive
+    /// client (script/pipe/redirect) closes it as soon as stdin hits EOF while it
+    /// keeps reading output, so that is just stdin-EOF: stop forwarding input but
+    /// keep draining until the command finishes. Without this, a `--pty` step run
+    /// non-interactively is SIGHUP'd before its output is flushed.
     async fn run_pty_bridge<S, F>(
         master: std::os::fd::OwnedFd,
         wait_exit: F,
         child_pid: i32,
+        interactive: bool,
         mut inbound: S,
         tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
     ) where
@@ -4643,6 +4672,9 @@ impl AgentService {
 
         let mut read_buf = vec![0u8; 4096];
         let mut child_exited = false;
+        // Cleared when the client stops sending input; the branch is then parked so
+        // a non-interactive stdin-EOF doesn't spin the select.
+        let mut input_open = true;
         let mut exit_code: i32 = 128;
 
         loop {
@@ -4676,7 +4708,7 @@ impl AgentService {
                     }
                 }
 
-                item = inbound.next(), if !child_exited => {
+                item = inbound.next(), if input_open && !child_exited => {
                     match item {
                         Some(Ok(input)) => {
                             match input.msg {
@@ -4701,11 +4733,26 @@ impl AgentService {
                                 Some(interactive_input::Msg::Init(_)) | None => {}
                             }
                         }
-                        Some(Err(_)) | None => {
+                        Some(Err(_)) => {
+                            // Broken input stream: the client is gone. Hang up.
                             let _ = crate::pty::signal_foreground(
                                 master_raw, child_pid, libc::SIGHUP,
                             );
                             break;
+                        }
+                        None => {
+                            if interactive {
+                                // The terminal went away — hang the step up.
+                                let _ = crate::pty::signal_foreground(
+                                    master_raw, child_pid, libc::SIGHUP,
+                                );
+                                break;
+                            }
+                            // Non-interactive stdin-EOF: the client still wants the
+                            // output. Stop forwarding input and keep draining until
+                            // the command exits; a truly-gone client is caught by a
+                            // failing tx.send below.
+                            input_open = false;
                         }
                     }
                 }
@@ -5064,10 +5111,13 @@ impl AgentService {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        if entry.pid > 0 {
-            for (k, v) in Self::read_proc_environ(entry.pid as u32) {
-                cmd.env(k, v);
-            }
+        // Start from an empty environment so spurd's own environment (which may
+        // hold daemon secrets) never leaks into the session; then apply the job's
+        // own environment.
+        cmd.env_clear();
+        cmd.env("TERM", "xterm-256color");
+        for (k, v) in Self::session_environ(entry) {
+            cmd.env(k, v);
         }
         for (k, v) in entry.env_vars(job_id) {
             cmd.env(k, v);
@@ -5135,6 +5185,34 @@ impl AgentService {
                 Some((k.to_string(), v.to_string()))
             })
             .collect()
+    }
+
+    /// The environment a session that *enters* a running job should start from —
+    /// the job's own environment, never spurd's. For a container job the tracked
+    /// pid is the namespace shepherd (a fork of spurd whose `/proc/environ` is
+    /// spurd's environment, secrets and all), so read the container's workload
+    /// (the shepherd's child, PID 1 inside the container) instead. For a host job
+    /// the tracked pid is the workload itself. Callers must `env_clear()` first so
+    /// spurd's own environment is not inherited on top of this.
+    fn session_environ(entry: &crate::job_entry::JobEntry) -> Vec<(String, String)> {
+        if entry.pid <= 0 {
+            return Vec::new();
+        }
+        let target = if entry.has_namespaces() {
+            Self::container_workload_pid(entry.pid as u32).unwrap_or(entry.pid as u32)
+        } else {
+            entry.pid as u32
+        };
+        Self::read_proc_environ(target)
+    }
+
+    /// Resolve a container's workload pid (PID 1 in its namespace) from the
+    /// shepherd pid: the shepherd forks exactly one child to become the namespace
+    /// init, so its sole entry in `children` is that workload.
+    fn container_workload_pid(shepherd: u32) -> Option<u32> {
+        let content =
+            std::fs::read_to_string(format!("/proc/{shepherd}/task/{shepherd}/children")).ok()?;
+        content.split_whitespace().next().and_then(|s| s.parse().ok())
     }
 }
 
@@ -8506,7 +8584,7 @@ mod tests {
                 .unwrap_or(128)
         };
         tokio::spawn(AgentService::run_pty_bridge(
-            master, wait_exit, child_pid, inbound, out_tx,
+            master, wait_exit, child_pid, true, inbound, out_tx,
         ));
 
         in_tx
@@ -8551,5 +8629,80 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    // A non-interactive client (no TTY) closes its input stream on stdin-EOF while
+    // still reading output. The bridge must NOT hang the step up then — it must
+    // drain the command's output and report it. Regression guard for the fix that
+    // makes `srun --pty <cmd>` work in scripts/pipes/CI. The child sleeps briefly
+    // before printing so a hang-up-on-input-close regression would kill it first.
+    #[tokio::test]
+    async fn run_pty_bridge_non_interactive_drains_after_input_close() {
+        use spur_proto::proto::{interactive_output, InteractiveInput};
+
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("O_NONBLOCK");
+
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 0.2; printf DRAINED")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let mut child = cmd.spawn().expect("spawn sh");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        // Input stream closed immediately (dropped sender) = non-interactive stdin-EOF.
+        let (in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<InteractiveInput, tonic::Status>>(1);
+        drop(in_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<
+            Result<spur_proto::proto::InteractiveOutput, tonic::Status>,
+        >(64);
+
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(128)
+        };
+        // interactive = false: input-close is stdin-EOF, not a hangup.
+        tokio::spawn(AgentService::run_pty_bridge(
+            master, wait_exit, child_pid, false, inbound, out_tx,
+        ));
+
+        let mut collected = Vec::new();
+        let mut got_exit = false;
+        while let Some(Ok(msg)) = out_rx.recv().await {
+            match msg.msg {
+                Some(interactive_output::Msg::Data(d)) => collected.extend_from_slice(&d),
+                Some(interactive_output::Msg::ExitStatus(_)) => {
+                    got_exit = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(
+            text.contains("DRAINED"),
+            "non-interactive bridge dropped output after input close, got: {text:?}"
+        );
+        assert!(got_exit, "bridge did not report an exit status");
     }
 }

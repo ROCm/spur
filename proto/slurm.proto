@@ -1315,6 +1315,7 @@ message InitSession {
   map<string, string> env = 7;
   string user = 8;           // Requesting user; verified identity must own the job; the controller/admin credential overrides
   ContainerSpec container = 9;  // Effective container the step runs in (empty image = host); resolved by the controller
+  bool non_interactive = 10;    // Client stdin is not a TTY: closing the input stream is stdin-EOF, not a hangup, so the agent drains output and lets the command finish instead of SIGHUP-ing it
 }
 
 message InteractiveInput {
