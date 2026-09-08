@@ -5186,13 +5186,10 @@ impl AgentService {
             .collect()
     }
 
-    /// The environment a session that *enters* a running job should start from —
-    /// the job's own environment, never spurd's. For a container job the tracked
-    /// pid is the namespace shepherd (a fork of spurd whose `/proc/environ` is
-    /// spurd's environment, secrets and all), so read the container's workload
-    /// (the shepherd's child, PID 1 inside the container) instead. For a host job
-    /// the tracked pid is the workload itself. Callers must `env_clear()` first so
-    /// spurd's own environment is not inherited on top of this.
+    /// The environment a session that *enters* a running job starts from: the
+    /// job's own, never spurd's. For a container job the tracked pid is the
+    /// shepherd (a spurd fork carrying spurd's env), so read the container's
+    /// workload (PID 1) instead. Callers must `env_clear()` first.
     fn session_environ(entry: &crate::job_entry::JobEntry) -> Vec<(String, String)> {
         if entry.pid <= 0 {
             return Vec::new();
