@@ -1992,7 +1992,6 @@ fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
         return days.checked_mul(24 * 60)?.checked_add(hms);
     }
 
-    // hours:minutes:seconds or hours:minutes or just minutes
     let parts: Vec<&str> = s.split(':').collect();
     match parts.len() {
         1 => parts[0].parse().ok(),
@@ -2092,8 +2091,8 @@ fn parse_suffix_duration_seconds(s: &str) -> Option<u64> {
     Some(total)
 }
 
-/// Parse the part after `days-`: bare hours, `hours:minutes`, or
-/// `hours:minutes:seconds`. The bare-hours case backs Slurm's `days-hours`.
+/// Parse an hours-first duration to exact seconds: bare hours, `hours:minutes`,
+/// or `hours:minutes:seconds`. Also used by the minute-granularity parser.
 fn parse_hms_seconds(s: &str) -> Option<u64> {
     let parts: Vec<&str> = s.split(':').collect();
     match parts.len() {
@@ -2118,30 +2117,9 @@ fn parse_hms_seconds(s: &str) -> Option<u64> {
     }
 }
 
-/// Parse an hours-first duration to minutes: bare hours, `hours:minutes`, or
-/// `hours:minutes:seconds`. Serves both the bare `hours:minutes:seconds` form
-/// and the part after `days-`, where the bare-hours case backs Slurm's
-/// `days-hours`. Any leftover seconds round up.
+/// Parse an hours-first duration to minutes, rounding up leftover seconds.
 fn parse_hms(s: &str) -> Option<u32> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() > 3 {
-        return None;
-    }
-    let h: u32 = parts[0].parse().ok()?;
-    let m: u32 = if parts.len() >= 2 {
-        parts[1].parse().ok()?
-    } else {
-        0
-    };
-    let s: u32 = if parts.len() == 3 {
-        parts[2].parse().ok()?
-    } else {
-        0
-    };
-    // Round up seconds
-    h.checked_mul(60)?
-        .checked_add(m)?
-        .checked_add(if s > 0 { 1 } else { 0 })
+    u32::try_from(parse_hms_seconds(s)?.div_ceil(60)).ok()
 }
 
 /// Format minutes as D-HH:MM:SS or HH:MM:SS.
@@ -2655,6 +2633,56 @@ cni_mtu = 1400
         assert_eq!(parse_time_minutes("0:59"), Some(1));
         assert_eq!(parse_time_minutes("0:60"), Some(1));
         assert_eq!(parse_time_minutes("0:61"), Some(2));
+    }
+
+    #[test]
+    fn parse_time_minutes_carries_hms_seconds() {
+        for (hms, seconds, minutes) in [
+            ("0:0:0", 0, 0),
+            ("0:0:59", 59, 1),
+            ("0:0:60", 60, 1),
+            ("0:0:61", 61, 2),
+            ("0:0:90", 90, 2),
+            ("0:0:120", 120, 2),
+            ("1:2:121", 3_841, 65),
+            ("0:0:4294967296", 4_294_967_296, 71_582_789),
+        ] {
+            for (input, expected_seconds, expected_minutes) in [
+                (hms.to_string(), seconds, minutes),
+                (format!("2-{hms}"), seconds + 172_800, minutes + 2_880),
+            ] {
+                assert_eq!(
+                    parse_time_seconds(&input),
+                    Some(expected_seconds),
+                    "{input}"
+                );
+                assert_eq!(
+                    parse_time_minutes(&input),
+                    Some(expected_minutes),
+                    "{input}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_time_minutes_checks_hms_overflow() {
+        for prefix in ["", "0-"] {
+            for hms in [
+                "71582789:0:0",
+                "0:4294967295:1",
+                "0:0:257698037701",
+                "5124095576030431:0:0",
+                "0:307445734561825861:0",
+                "1:0:18446744073709551615",
+            ] {
+                let input = format!("{prefix}{hms}");
+                assert_eq!(parse_time_minutes(&input), None, "{input}");
+            }
+            let input = format!("{prefix}0:0:257698037640");
+            assert_eq!(parse_time_minutes(&input), Some(u32::MAX - 1), "{input}");
+        }
+        assert_eq!(parse_time_minutes("2982616-4:14:61"), None);
     }
 
     #[test]

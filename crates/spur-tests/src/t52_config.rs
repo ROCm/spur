@@ -31,12 +31,14 @@ mod tests {
     #[test]
     fn t52_3_parse_hms() {
         assert_eq!(parse_time_minutes("72:00:00"), Some(4320));
+        assert_eq!(parse_time_minutes("0:0:90"), Some(2));
     }
 
     #[test]
     fn t52_4_parse_days_hms() {
         assert_eq!(parse_time_minutes("1-00:00:00"), Some(1440));
         assert_eq!(parse_time_minutes("7-00:00:00"), Some(10080));
+        assert_eq!(parse_time_minutes("2-0:0:90"), Some(2882));
     }
 
     #[test]
