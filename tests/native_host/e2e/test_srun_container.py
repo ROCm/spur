@@ -838,7 +838,7 @@ class TestSrunPtyContainerStep:
         try:
             entries = {
                 "spur exec": lambda: cluster.cli_with_exit(
-                    ["exec", str(job_id), "bash", "-c", probe]
+                    ["spur", "exec", str(job_id), "bash", "-c", probe]
                 ),
                 "srun --overlap": lambda: cluster.srun_with_exit(
                     ["--jobid", str(job_id), "--overlap", "bash", "-c", probe]
