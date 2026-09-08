@@ -894,6 +894,64 @@ mod tests {
         )
     }
 
+    // A job deferred to a future start must book the GPUs it will occupy. Resolving the
+    // picks against `now` booked none of them, so another job could take the same window.
+    #[test]
+    fn future_gpu_reservation_holds_the_requested_devices() {
+        let mut sched = BackfillScheduler::new(100);
+
+        // One 8-GPU node with every GPU held by a running job.
+        let mut nodes = vec![make_gpu_node(8)];
+        let mut busy = ResourceAllocations::with_scalar(8, 1024);
+        busy.devices.insert(
+            "gpu".into(),
+            (0..8)
+                .map(spur_core::resource::AllocatedDevice::injectable)
+                .collect(),
+        );
+        nodes[0].alloc_resources = busy;
+
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "waiter".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                gres: vec!["gpu:8".into()],
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let now = Utc::now();
+        assert!(
+            sched.schedule(&[job], &cluster).is_empty(),
+            "every GPU is busy, so nothing starts now"
+        );
+
+        // The running allocation is held for 24h, so the deferred job books the hour after.
+        let booked = sched.timelines[0].accumulated_at(now + Duration::minutes(24 * 60 + 1));
+        assert_eq!(
+            booked.total_device_count("gpu"),
+            8,
+            "the deferred job must book all 8 GPUs it needs"
+        );
+    }
+
     #[test]
     fn unplaced_job_records_why_it_was_not_started() {
         let mut sched = BackfillScheduler::new(100);

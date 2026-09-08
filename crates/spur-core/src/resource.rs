@@ -59,7 +59,7 @@ impl AllocatedDevice {
 
 impl ResourceAllocations {
     pub fn is_empty(&self) -> bool {
-        self.cpus == 0 && self.memory_mb == 0 && self.devices.is_empty()
+        self.cpus == 0 && self.memory_mb == 0 && !self.has_devices()
     }
 
     pub fn has_devices(&self) -> bool {
@@ -378,11 +378,14 @@ pub fn build_node_allocation(
         let mut effective_alloc = current_alloc.clone();
         effective_alloc.add(&alloc);
         let picked = inventory.pick_devices(&effective_alloc, "gpu", dtype, count);
-        alloc
-            .devices
-            .entry("gpu".into())
-            .or_default()
-            .extend(picked);
+        // Guard like the generic loop: an unsatisfiable pick must not leave an empty device key.
+        if !picked.is_empty() {
+            alloc
+                .devices
+                .entry("gpu".into())
+                .or_default()
+                .extend(picked);
+        }
     }
 
     for (name, count) in &request.generic {
@@ -728,16 +731,17 @@ mod accounting_tests {
         assert_eq!(alloc.generic_count("absent"), 0);
     }
 
-    /// `is_empty` inspects the map while `has_devices` inspects inside it, so a
-    /// leftover empty vector reads as non-empty yet holds nothing.
+    /// `is_empty` used to inspect the map while `has_devices` inspected inside it, so a
+    /// leftover empty vector read as non-empty yet held nothing. Both now look inside.
     #[test]
-    fn is_empty_and_has_devices_disagree_on_empty_device_vec() {
+    fn is_empty_agrees_with_has_devices_on_empty_device_vec() {
         let mut alloc = ResourceAllocations::default();
         assert!(alloc.is_empty());
         assert!(!alloc.has_devices());
 
+        // A key with an empty list holds nothing, so both predicates must say so.
         alloc.devices.insert("gpu".into(), Vec::new());
-        assert!(!alloc.is_empty());
+        assert!(alloc.is_empty());
         assert!(!alloc.has_devices());
 
         alloc
@@ -745,6 +749,42 @@ mod accounting_tests {
             .insert("gpu".into(), vec![AllocatedDevice::injectable(3)]);
         assert!(alloc.has_devices());
         assert_eq!(alloc.total_device_count("gpu"), 1);
+    }
+
+    #[test]
+    fn build_node_allocation_adds_no_key_when_no_gpu_is_free() {
+        let one_gpu = || GpuResource {
+            device_id: 0,
+            gpu_type: "mi300x".into(),
+            memory_mb: 192_000,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+        };
+        let inventory = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: vec![one_gpu()],
+            ..Default::default()
+        };
+        // The node's only GPU is already handed out.
+        let mut current = ResourceAllocations::default();
+        current
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
+        let request = ResourceSet {
+            cpus: 1,
+            memory_mb: 512,
+            gpus: vec![one_gpu()],
+            ..Default::default()
+        };
+
+        let alloc = build_node_allocation(&inventory, &current, &request);
+
+        assert!(
+            !alloc.devices.contains_key("gpu"),
+            "an unsatisfiable request must not leave an empty device list behind"
+        );
+        assert!(!alloc.has_devices());
     }
 
     #[test]
