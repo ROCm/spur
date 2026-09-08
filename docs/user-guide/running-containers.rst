@@ -164,9 +164,10 @@ containerized ``salloc``/``sbatch`` allocation:
    # ...now inside the allocation shell:
    srun --pty --container-image trainer.sqsh bash   # interactive shell in the container
 
-   # or inherit the allocation's image:
-   salloc -N1 --container-image trainer.sqsh
-   srun --pty bash                                   # same container, interactive
+   # or attach an interactive shell to a running containerized job
+   # (enters its container via nsenter):
+   sbatch -N1 --container-image trainer.sqsh long_job.sh
+   srun --jobid=<id> --overlap --pty bash            # same container, interactive
 
 A ``--pty`` step nested inside a containerized ``sbatch``/``salloc`` job enters
 the parent's running container (like any other nested step) rather than building
