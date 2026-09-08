@@ -15,6 +15,8 @@ pub(crate) mod privdrop;
 pub(crate) mod pty;
 mod reporter;
 mod seccomp;
+mod ssh_admission;
+mod ssh_identity;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -185,6 +187,14 @@ struct Args {
     #[arg(long = "token", env = "SPUR_JOIN_TOKEN")]
     token: Option<String>,
 
+    /// Root-only Unix socket for native SSH admission (requires strict cgroups and auth)
+    #[arg(long, requires = "ssh_admission_token_file")]
+    ssh_admission_socket: Option<std::path::PathBuf>,
+
+    /// Root-owned mode 0600/0400 file containing an administrator read credential
+    #[arg(long, requires = "ssh_admission_socket")]
+    ssh_admission_token_file: Option<std::path::PathBuf>,
+
     /// Foreground mode
     #[arg(short = 'D', long)]
     foreground: bool,
@@ -260,6 +270,17 @@ async fn main() -> anyhow::Result<()> {
             );
             None
         }
+    };
+    let ssh_listener = match (&args.ssh_admission_socket, &args.ssh_admission_token_file) {
+        (Some(socket), Some(token)) => {
+            let cfg = config.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("SSH admission requires a valid explicit configuration")
+            })?;
+            ssh_admission::validate_startup(cfg, nix::unistd::geteuid().as_raw())?;
+            Some(ssh_admission::AdmissionListener::bind(socket, token)?)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("SSH admission socket and token file must be specified together"),
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
@@ -498,6 +519,17 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    let ssh_jobs = agent_service.ssh_jobs();
+    let ssh_future = async move {
+        match ssh_listener {
+            Some(listener) => {
+                listener
+                    .serve(ssh_jobs, hostname, args.controller.clone())
+                    .await
+            }
+            None => std::future::pending::<anyhow::Result<()>>().await,
+        }
+    };
     let server_future = tonic::transport::Server::builder()
         .layer(crate::auth_middleware::AgentAuthLayer::new(
             auth_mode, &jwt_key,
@@ -509,6 +541,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::select! {
         result = server_future => { result?; }
+        result = ssh_future => { result?; anyhow::bail!("SSH admission listener stopped"); }
         _ = sigterm.recv() => {
             info!("received SIGTERM, deregistering from controller");
             let dereg_reporter = reporter.clone();

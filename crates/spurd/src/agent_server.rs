@@ -88,12 +88,45 @@ pub(crate) struct TrackedJob {
     mpi: String,
     /// Run epoch; echoed on completion and guards the grace-period SIGKILL.
     run_attempt: u32,
+    ssh_eligible: bool,
+    ssh_generation: Arc<()>,
     /// The job's cgroup, owned here so every launch path into the job can reach
     /// it. `None` when cgroup enforcement is off or no cgroup was created.
     cgroup_path: Option<std::path::PathBuf>,
 }
 
 impl TrackedJob {
+    pub(crate) fn ssh_snapshot(
+        &self,
+        job_id: u32,
+        user: &str,
+        uid: u32,
+    ) -> Option<crate::ssh_admission::Snapshot> {
+        if !self.ssh_eligible || uid == 0 || self.uid != uid || self.user != user {
+            return None;
+        }
+        Some(crate::ssh_admission::Snapshot {
+            job_id,
+            user: self.user.clone(),
+            uid,
+            run_attempt: self.run_attempt,
+            generation: self.ssh_generation.clone(),
+            cgroup: self.cgroup_path.clone()?,
+            gpu_devices: self.gpu_devices.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ssh_fixture(cgroup: std::path::PathBuf, eligible: bool) -> Self {
+        Self {
+            uid: 1001,
+            user: "alice".into(),
+            ssh_eligible: eligible,
+            gpu_devices: vec![0, 2],
+            ..Self::allocation_only(Some(cgroup))
+        }
+    }
+
     /// Take the cgroup path, leaving `None`. Whichever teardown path reaches
     /// the job first takes it, so the removal it authorizes happens once.
     fn take_cgroup(&mut self) -> Option<std::path::PathBuf> {
@@ -2544,6 +2577,8 @@ impl SlurmAgent for AgentService {
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
+                        ssh_eligible: spec.exclusive && !is_container,
+                        ssh_generation: Arc::new(()),
                         cgroup_path: result.cgroup_path,
                     },
                 );
@@ -2924,6 +2959,8 @@ impl SlurmAgent for AgentService {
                 // srun allocation-only jobs use their own cancel lifecycle;
                 // epoch 0 leaves the stale-report guard disabled for them.
                 run_attempt: 0,
+                ssh_eligible: false,
+                ssh_generation: Arc::new(()),
                 cgroup_path,
             },
         );
@@ -4062,6 +4099,20 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    pub(crate) fn ssh_jobs(&self) -> crate::ssh_admission::LocalJobs {
+        crate::ssh_admission::LocalJobs {
+            running: self.running.clone(),
+            lifecycle: self.lifecycle.clone(),
+        }
+    }
+
+    async fn revoke_ssh(&self, job_id: u32) {
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        if let Some(tracked) = self.running.lock().await.get_mut(&job_id) {
+            tracked.ssh_eligible = false;
+        }
+    }
+
     async fn drop_tracked_job(&self, job_id: u32) {
         // The cgroup removal and the release below both key off the id, so a launch
         // reusing it must not interleave with them.
@@ -4203,6 +4254,7 @@ impl AgentService {
 
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+        self.revoke_ssh(job_id).await;
         let is_allocation_only = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
@@ -4226,10 +4278,14 @@ impl AgentService {
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
     async fn suspend_signal(&self, job_id: u32, resume: bool) {
-        let jobs = self.running.lock().await;
-        let Some(tracked) = jobs.get(&job_id) else {
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        let mut jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get_mut(&job_id) else {
             return;
         };
+        if !resume {
+            tracked.ssh_eligible = false;
+        }
         let sig = if resume {
             nix::sys::signal::Signal::SIGCONT
         } else {
@@ -4297,6 +4353,7 @@ impl AgentService {
     }
 
     async fn graceful_cancel(&self, job_id: u32) {
+        self.revoke_ssh(job_id).await;
         let is_allocation_only = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
@@ -4773,6 +4830,8 @@ impl TrackedJob {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            ssh_eligible: false,
+            ssh_generation: Arc::new(()),
             cgroup_path,
         }
     }
@@ -7504,6 +7563,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ssh_admission_revocation_and_suspend_keep_generation_ineligible() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for suspend in [false, true] {
+            svc.running
+                .lock()
+                .await
+                .insert(7, TrackedJob::ssh_fixture(dir.path().into(), true));
+            let before = svc.running.lock().await[&7].ssh_generation.clone();
+            if suspend {
+                svc.suspend_signal(7, false).await;
+                svc.suspend_signal(7, true).await;
+            } else {
+                svc.revoke_ssh(7).await;
+            }
+            let jobs = svc.running.lock().await;
+            let tracked = &jobs[&7];
+            assert!(Arc::ptr_eq(&before, &tracked.ssh_generation));
+            assert!(tracked.ssh_snapshot(7, "alice", 1001).is_none());
+        }
+        assert!(dir.path().read_dir().unwrap().next().is_none());
+    }
+
     /// Helper: poll until the job is removed from `running` (by the monitor).
     async fn wait_job_reaped(svc: &AgentService, job_id: u32, timeout_ms: u64) -> bool {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
@@ -7578,6 +7666,8 @@ mod tests {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            ssh_eligible: false,
+            ssh_generation: Arc::new(()),
             cgroup_path: None,
         };
         svc.insert_test_job(job_id, tracked).await;
@@ -7636,6 +7726,8 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
+                ssh_eligible: false,
+                ssh_generation: Arc::new(()),
                 cgroup_path: None,
             };
             (t, pid)

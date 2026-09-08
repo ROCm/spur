@@ -3804,6 +3804,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-pam"
+version = "0.10.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "spur-proto"
 version = "0.10.0"
 dependencies = [

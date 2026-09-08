@@ -133,6 +133,15 @@ Examples:
    salloc -N1 --gres=gpu:2 -t 2:00:00
    spur alloc --partition gpu --exclusive
 
+On nodes where an administrator has enabled experimental native SSH adoption,
+you can use ordinary ``ssh user@allocated-node`` while an exclusive native
+allocation is running. Keep the allocating shell open; SSH disconnects do not
+release the allocation, and reconnecting does not create a new quota or deadline.
+The normal login environment is preserved and the connection joins the existing
+allocation's cgroup. Container allocations and ambiguous allocation selection are
+not supported. See :doc:`/deployment/native-host` for prerequisites and validation
+limits; SSH support is disabled unless explicitly installed and configured.
+
 Attach to a Running Job — ``sattach``
 -------------------------------------
 

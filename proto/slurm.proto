@@ -295,6 +295,9 @@ message JobInfo {
   string sched_nodelist = 78;
 
   bool min_memory_is_per_cpu = 79;
+
+  // Presence distinguishes generation-aware controllers from older peers.
+  optional uint32 run_attempt = 80;
 }
 
 message NodeInfo {

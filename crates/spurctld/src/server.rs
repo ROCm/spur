@@ -31,6 +31,7 @@ use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
+const SSH_ADMISSION_HEADER: &str = "x-spur-ssh-admission";
 
 /// Resolve the comm address for an agent registration.
 ///
@@ -275,7 +276,59 @@ impl ControllerService {
         }
     }
 
-    /// Reads never require the leader (every node applies the committed log),
+    async fn get_job_for_ssh_admission(
+        &self,
+        request: Request<GetJobRequest>,
+    ) -> Result<Response<JobInfo>, Status> {
+        let identity = Self::verified_identity(&request)
+            .ok_or_else(|| {
+                Status::unauthenticated("SSH admission requires an authenticated identity")
+            })?
+            .clone();
+
+        if !self.raft.is_leader() {
+            if request.metadata().get(FORWARDED_HEADER).is_some() {
+                return Err(self.not_leader_status());
+            }
+            let mut client = self.leader_proxy.get_leader_client().await?;
+            let mut forwarded = Self::forward_request(request);
+            forwarded
+                .metadata_mut()
+                .insert(SSH_ADMISSION_HEADER, MetadataValue::from_static("1"));
+            let response = client.get_job(forwarded).await?;
+            // An older leader can answer GetJob without enforcing the admission read contract.
+            if response
+                .metadata()
+                .get(SSH_ADMISSION_HEADER)
+                .is_none_or(|value| value != "1")
+            {
+                return Err(Status::unavailable(
+                    "leader did not confirm SSH admission read",
+                ));
+            }
+            return Ok(response);
+        }
+
+        if !self.raft.ensure_leader().await {
+            return Err(self.not_leader_status());
+        }
+        let job_id = request.get_ref().job_id;
+        // Array-parent display records are synthesized, not actual allocations.
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let info = self
+            .scoped_job_info(&job, Some(&identity))
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        let mut response = Response::new(info);
+        response
+            .metadata_mut()
+            .insert(SSH_ADMISSION_HEADER, MetadataValue::from_static("1"));
+        Ok(response)
+    }
+
+    /// Ordinary reads never require the leader (every node applies the committed log),
     /// so forwarding is only an optional freshness hop. Skipping already-
     /// forwarded requests avoids forward loops between non-leaders.
     fn read_should_forward<T>(&self, request: &Request<T>) -> bool {
@@ -887,6 +940,14 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
+        if request
+            .metadata()
+            .get(SSH_ADMISSION_HEADER)
+            .is_some_and(|value| value == "1")
+        {
+            return self.get_job_for_ssh_admission(request).await;
+        }
+
         let forward = self.read_should_forward(&request);
         let meta = request.metadata().clone();
         // Capture identity before the forward so the serving node (leader or read-allowed follower)
@@ -4159,6 +4220,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         // plan lives on the cluster, not the job record.
         planned_start_time: None,
         sched_nodelist: String::new(),
+        run_attempt: Some(job.run_attempt),
     }
 }
 
@@ -4963,6 +5025,123 @@ mod tests {
             cpus_per_task: 1,
             ..Default::default()
         }
+    }
+
+    fn ssh_admission_req(
+        job_id: u32,
+        identity: Option<spur_core::auth::Identity>,
+    ) -> Request<GetJobRequest> {
+        let mut request = get_job_req(job_id, identity);
+        request
+            .metadata_mut()
+            .insert(SSH_ADMISSION_HEADER, MetadataValue::from_static("1"));
+        request
+    }
+
+    #[tokio::test]
+    async fn get_job_ssh_admission_rejects_missing_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let svc = no_leader_service(cluster, dir.path()).await;
+        let mut request = ssh_admission_req(1, None);
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer unverified"),
+        );
+        let err = svc.get_job(request).await.unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated);
+        svc.raft.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_job_ssh_admission_fails_without_leader_while_ordinary_read_succeeds() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        cluster.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(owned_job("bob", "/home/bob")),
+        });
+        let svc = no_leader_service(cluster, dir.path()).await;
+
+        for forwarded in [false, true] {
+            let mut request = ssh_admission_req(1, Some(viewer("bob", false)));
+            if forwarded {
+                request
+                    .metadata_mut()
+                    .insert(FORWARDED_HEADER, MetadataValue::from_static("true"));
+            }
+            let err = svc.get_job(request).await.unwrap_err();
+            assert_eq!(err.code(), Code::Unavailable);
+        }
+
+        for identity in [None, Some(viewer("bob", false))] {
+            let response = svc.get_job(get_job_req(1, identity)).await.unwrap();
+            assert!(response.metadata().get(SSH_ADMISSION_HEADER).is_none());
+            assert_eq!(response.get_ref().job_id, 1);
+            assert_eq!(response.get_ref().work_dir, "/home/bob");
+        }
+        svc.raft.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_ssh_admission_confirms_single_node_leader_and_preserves_disclosure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = svc
+            .cluster
+            .submit_job(owned_job("bob", "/home/bob"))
+            .unwrap()
+            .job_id;
+
+        for (identity, expected_work_dir) in [
+            (viewer("bob", false), "/home/bob"),
+            (viewer("carol", true), "/home/bob"),
+            (viewer("alice", false), ""),
+        ] {
+            let response = svc
+                .get_job(ssh_admission_req(job_id, Some(identity)))
+                .await
+                .unwrap();
+            assert_eq!(response.metadata().get(SSH_ADMISSION_HEADER).unwrap(), "1");
+            assert_eq!(response.get_ref().job_id, job_id);
+            assert_eq!(response.get_ref().work_dir, expected_work_dir);
+            assert_eq!(response.get_ref().run_attempt, Some(0));
+        }
+        let err = svc
+            .get_job(ssh_admission_req(u32::MAX, Some(viewer("bob", false))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        svc.raft.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_ssh_admission_rejects_cached_leadership_without_confirmation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = svc
+            .cluster
+            .submit_job(owned_job("bob", "/home/bob"))
+            .unwrap()
+            .job_id;
+        svc.raft.raft.shutdown().await.unwrap();
+        assert!(
+            svc.raft.is_leader(),
+            "shutdown retains the cached leader metric"
+        );
+
+        let err = svc
+            .get_job(ssh_admission_req(job_id, Some(viewer("bob", false))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert!(svc
+            .get_job(get_job_req(job_id, Some(viewer("bob", false))))
+            .await
+            .is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7670,6 +7849,16 @@ mod tests {
             ..Default::default()
         }));
         assert!(!with(JobSpec::default()));
+    }
+
+    #[test]
+    fn job_to_proto_carries_run_attempt_with_presence() {
+        let mut job = spur_core::job::Job::new(7, owned_job("bob", "/home/bob"));
+        assert_eq!(JobInfo::default().run_attempt, None);
+        for attempt in [0, 1, 7, u32::MAX] {
+            job.run_attempt = attempt;
+            assert_eq!(job_to_proto(&job).run_attempt, Some(attempt));
+        }
     }
 
     #[test]

@@ -114,6 +114,148 @@ The two daemons are configured with command-line flags. The most common are belo
    falls back to defaults for those sections, which is fine when none of them are
    in use.
 
+Native SSH allocation adoption (experimental)
+---------------------------------------------
+
+Spur can admit ordinary OpenSSH connections into an existing exclusive native
+allocation. The scheduler, allocation ID, and ``salloc`` lifetime remain unchanged:
+keep the allocating shell open, then use ``ssh user@allocated-node``. Closing an
+SSH connection does not release the allocation. No replacement shell, mandatory
+container, or per-command ``spur exec`` proxy is involved.
+
+This integration is opt-in and is not installed or enabled by the normal binary
+installer. It is intended for evaluation on disposable development nodes, not as
+a complete hostile-tenant isolation or guaranteed-preemption solution. Existing
+privileged job launch paths also require security review before untrusted users
+are admitted; authentication and this PAM module do not repair those paths.
+
+Build the Linux PAM module separately:
+
+.. code-block:: bash
+
+   cargo build --release -p spur-pam
+
+The artifact is ``target/release/libpam_spur.so``. Install it in a root-controlled
+PAM module directory appropriate to the distribution. Do not install it or edit
+PAM on a shared machine merely to test the build.
+
+Agent prerequisites
+~~~~~~~~~~~~~~~~~~~
+
+The node agent must run as root with authenticated RPCs (``auth.mode = "required"``),
+root jobs disabled, and mandatory cgroup CPU, memory, and device enforcement.
+The controller must support the strict SSH admission read. Ordinary job queries
+retain their existing behavior; an older controller cannot authorize adoption.
+Protect the controller transport with the deployment's trusted network or tunnel,
+and do not expose the unauthenticated REST API.
+
+Create a dedicated root-owned directory with mode ``0700`` and a root-owned
+regular token file with mode ``0600`` or ``0400``. The token must authorize reading
+the full job records for the users being admitted; never use an SSH-provided token
+or a developer's home-directory configuration. Add these flags to the agent's
+existing command:
+
+.. code-block:: text
+
+   --ssh-admission-socket /run/spur-ssh/admission.sock
+   --ssh-admission-token-file /etc/spur/ssh-admission.token
+
+The socket is mode ``0600`` and accepts only root peers. Existing socket paths
+are not silently removed; investigate stale paths before restarting. Neither flag
+changes the node's SSH or PAM configuration.
+
+PAM integration
+~~~~~~~~~~~~~~~
+
+On a disposable validation node, keep an independent administrative access path.
+For the developer SSH service, enable ``UsePAM yes`` and add the following to the
+appropriate account and session stacks, using the actual installed module path:
+
+.. code-block:: text
+
+   account requisite /path/to/libpam_spur.so socket=/run/spur-ssh/admission.sock
+   session requisite /path/to/libpam_spur.so socket=/run/spur-ssh/admission.sock
+
+Place the adoption session entry after any module that changes cgroup membership,
+including ``pam_systemd``. Audit the entire PAM stack for control-flow shortcuts
+and verify the final cgroup of the connection process and its descendants. The
+module accepts only service ``sshd`` and non-root users. Administrative bypasses,
+if needed, must be separately controlled by the operator, not a permissive module
+argument.
+
+Account management checks authorization without moving its caller. Session setup
+opens a fresh connection to the agent, which verifies kernel peer credentials and
+passes an opened allocation membership descriptor using ``SCM_RIGHTS``. PAM writes
+``0`` to adopt itself, closes the descriptor, and awaits the agent's membership
+confirmation. Allocation lifecycle locks cover this handshake. The agent never
+moves a numeric PID, avoiding adoption of an unrelated process after PID reuse.
+No caller-selected PID, cgroup path, or environment variable is trusted. Validate the exact OpenSSH build:
+portable OpenSSH calls PAM session setup before its post-authentication fork, so
+this adopts the per-connection process and its subsequently forked descendants,
+not the listening SSH daemon. A multiplexed connection stays with its original
+allocation; open a new connection when changing allocations.
+
+The login keeps its normal UID, groups, HOME, and shell. PAM adds ``SPUR_JOB_ID``,
+``SLURM_JOB_ID``, and GPU visibility variables. These variables assist applications;
+the cgroup is the resource-enforcement boundary. Zero-GPU allocations receive
+``-1`` visibility masks.
+
+Admission fails closed when the local allocation is missing, ambiguous, revoked,
+ineligible, or not cgroup-enforced; when the controller is unavailable; or when
+owner, placement, generation, running state, or time-limit checks fail. Container
+allocations and allocation-only standalone ``srun`` registrations are not supported.
+Suspension revokes further admission for that local generation; resume does not
+restore it. Existing batch jobs, ``spur exec``, and ``spur run`` retain their APIs.
+
+Limits and deployment gate
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This change does not replace the scheduler's accounting or teardown implementation.
+It does not implement GPU-hour budgets, external fencing, a checkpoint protocol,
+or a verified all-node cleanup barrier. Controller connectivity loss denies new
+admissions, but does not itself terminate previously admitted connections.
+
+Socket operations have a five-second budget, but the kernel cgroup-migration
+write can block independently of that budget. If migration returns after timeout,
+PAM refuses the session and does not export allocation metadata; migration itself
+may already have happened. Verify the installed OpenSSH build denies command and
+forwarding access on PAM session failure, and quarantine nodes with stalled
+migration rather than assuming an application-level timeout can undo it.
+
+Before deployment, verify cancellation, expiry, suspension, and preemption against
+real connection descendants, detached workloads, and the actual cgroup hierarchy.
+Existing batch-process signals do not necessarily reach SSH descendants immediately;
+cleanup still depends on the agent's allocation teardown. A successful cancel RPC
+is not evidence that all SSH work has stopped.
+
+Also validate remote commands, SFTP/scp, rsync, tmux, connection multiplexing, and
+IDE connections. Disable forwarding until its lifetime and access policy have been
+validated; a PAM session failure must not leave a usable forwarding-only connection.
+Unrestricted sudo, shared Docker sockets, cron, or user service managers can bypass
+session containment and require separate policy. Docker labels alone do not place
+daemon-created containers in the allocation cgroup. This integration does not grant
+host root or make unrestricted-root leases safe.
+
+CPU-only development checks
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   cargo test -p spur-pam --locked
+   cargo test -p spurd ssh_admission --locked
+   cargo test -p spurctld ssh_admission --locked
+   cargo build -p spur-pam --locked
+   python3 crates/spur-pam/tests/test_real_pam.py
+
+The Python integration uses the production shared library and Linux-PAM with a
+temporary service directory. Run it as a non-root user; it verifies real rejection
+paths, not a successful SSH login. ``SPUR_PAM_MODULE`` can select a different built
+module path.
+
+These tests use PAM ABI fixtures, Unix sockets, and temporary files rather than
+GPUs or the host's cgroups. They do not install a PAM module, modify ``/etc/pam.d``,
+start the node agent, or prove a production SSH deployment safe.
+
 Quick Start: Two-Node Cluster
 -----------------------------
 

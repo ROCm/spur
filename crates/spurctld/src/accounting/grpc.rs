@@ -382,6 +382,7 @@ impl SlurmAccounting for AccountingService {
                 time_min: None,
                 requeue: false,
                 restarts: 0,
+                run_attempt: None,
                 batch_flag: false,
                 exclusive: false,
                 planned_start_time: None,
