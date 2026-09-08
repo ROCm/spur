@@ -4,7 +4,7 @@
 """E2E test: srun steps and interactive sessions are confined to the job cgroup.
 
 Previously the step/interactive dispatch path spawned directly with no cgroup, so
-those jobs ran in spurd's own service cgroup with no per-job limits (issue #802).
+those jobs ran in spurd's own service cgroup with no per-job limits.
 """
 
 import pytest

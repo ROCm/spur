@@ -1109,8 +1109,12 @@ pub(crate) fn setup_step_cgroup(
     cgroup: &CgroupConfig,
     cpus: u32,
     memory_mb: u64,
+    cpu_ids: &[u32],
 ) -> Option<std::ffi::CString> {
-    let path = setup_cgroup(job_id, cgroup, cpus, memory_mb, &[]).ok()??;
+    // Pass the job's allocated cores so `constrain_cores` pins cpuset.cpus, the
+    // same as the batch path — otherwise a step that creates the cgroup (an
+    // srun-only allocation) would run core-unconfined.
+    let path = setup_cgroup(job_id, cgroup, cpus, memory_mb, cpu_ids).ok()??;
     std::ffi::CString::new(path.join("cgroup.procs").as_os_str().as_bytes()).ok()
 }
 

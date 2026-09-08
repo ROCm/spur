@@ -2271,13 +2271,17 @@ impl SlurmAgent for AgentService {
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         // Confine the step to the allocation's cgroup (create-or-join). Without
         // this a step runs in spurd's own cgroup with no per-job limits. Join
-        // while still root, before the privilege drop.
+        // while still root, before the privilege drop. Pin to the job's cores so
+        // `constrain_cores` applies to the step too.
+        let cpu_ids = self.allocation.lock().await.job_cpu_ids(job_id);
         let cgroup_procs =
-            crate::executor::setup_step_cgroup(job_id, &self.cgroup, cpus, memory_mb);
+            crate::executor::setup_step_cgroup(job_id, &self.cgroup, cpus, memory_mb, &cpu_ids);
         unsafe {
             cmd.pre_exec(move || {
                 if let Some(ref procs) = cgroup_procs {
-                    crate::executor::join_cgroup_self(procs, -1);
+                    // The step's stderr is already wired to its spool file here,
+                    // so report a join failure there rather than dropping it.
+                    crate::executor::join_cgroup_self(procs, libc::STDERR_FILENO);
                 }
                 crate::executor::apply_memlock(memlock);
                 if let Some(ref pd) = priv_drop {
@@ -2653,12 +2657,25 @@ impl SlurmAgent for AgentService {
         }
 
         // Confine the interactive session to the allocation's cgroup (create-or-
-        // join) so it obeys the same per-job limits as a batch job.
-        let cgroup_procs = {
+        // join) so it obeys the same per-job limits as a batch job. Read the
+        // job's sizing under the lock, then do the (synchronous) cgroup I/O
+        // outside it so the async runtime is not blocked.
+        let sizing = {
             let jobs = self.running.lock().await;
-            jobs.get(&init.job_id).and_then(|t| {
-                crate::executor::setup_step_cgroup(init.job_id, &self.cgroup, t.cpus, t.memory_mb)
-            })
+            jobs.get(&init.job_id).map(|t| (t.cpus, t.memory_mb))
+        };
+        let cgroup_procs = match sizing {
+            Some((cpus, memory_mb)) => {
+                let cpu_ids = self.allocation.lock().await.job_cpu_ids(init.job_id);
+                crate::executor::setup_step_cgroup(
+                    init.job_id,
+                    &self.cgroup,
+                    cpus,
+                    memory_mb,
+                    &cpu_ids,
+                )
+            }
+            None => None,
         };
 
         let (master_fd, child, child_pid) =

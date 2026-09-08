@@ -98,6 +98,16 @@ impl NodeAllocation {
             .collect()
     }
 
+    /// The cores allocated to `job_id` (empty if it holds no allocation here).
+    /// Steps/interactive sessions use this to pin their cgroup's `cpuset.cpus` to
+    /// the same cores the job was granted.
+    pub fn job_cpu_ids(&self, job_id: u32) -> Vec<u32> {
+        self.owners
+            .get(&job_id)
+            .map(|a| a.cpu_ids.clone())
+            .unwrap_or_default()
+    }
+
     /// Available GPU count (optionally filtered by type).
     pub fn free_gpus(&self, gpu_type: Option<&str>) -> u32 {
         self.gpu_allocated
