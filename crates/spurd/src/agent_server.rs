@@ -4030,7 +4030,12 @@ impl SlurmAgent for AgentService {
                 .unwrap_or(128)
         };
         tokio::spawn(Self::run_pty_bridge(
-            master_fd, wait_exit, child_pid, interactive, inbound, tx,
+            master_fd,
+            wait_exit,
+            child_pid,
+            interactive,
+            inbound,
+            tx,
         ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -5212,7 +5217,10 @@ impl AgentService {
     fn container_workload_pid(shepherd: u32) -> Option<u32> {
         let content =
             std::fs::read_to_string(format!("/proc/{shepherd}/task/{shepherd}/children")).ok()?;
-        content.split_whitespace().next().and_then(|s| s.parse().ok())
+        content
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
     }
 }
 
