@@ -259,8 +259,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             .into_inner();
         let known_owner = (!job.user.is_empty()).then_some(job.user.as_str());
         let user = crate::interactive::job_caller_user(&mut ctrl, job_id, known_owner).await?;
-        let exit_code =
-            run_interactive_pty(&mut ctrl, job_id, args.command.clone(), node, &user).await?;
+        let exit_code = run_interactive_pty(
+            &mut ctrl,
+            job_id,
+            args.command.clone(),
+            node,
+            &user,
+            container_spec_from_srun_args(&args),
+        )
+        .await?;
         std::process::exit(exit_code);
     }
 
@@ -815,6 +822,9 @@ async fn dispatch_step(
             node: String::new(),
             user: params.user.to_string(),
             uid: nix::unistd::geteuid().as_raw(),
+            // The buffered path carries the container on RunStep; this call only
+            // registers the step to obtain its id.
+            container: None,
         })
         .await
         .context("failed to create job step")?
@@ -995,6 +1005,7 @@ async fn run_standalone_srun(
             args.command.clone(),
             String::new(),
             &owner,
+            container_spec_from_srun_args(args),
         )
         .await;
         let _ = client
@@ -1463,11 +1474,16 @@ async fn run_interactive_pty(
     command: Vec<String>,
     node: String,
     user: &str,
+    container: Option<ContainerSpec>,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();
 
     let mut created_step: Option<u32> = None;
     let mut cached_step: Option<(u32, String)> = None;
+    // The controller resolves the step's own container against the parent job's
+    // (inheriting `salloc/sbatch --container-image`) and echoes the effective spec;
+    // persisted across retries since a cached step skips the CreateJobStep call.
+    let mut effective_container: Option<ContainerSpec> = None;
 
     let outcome: Result<i32> = 'session: {
         let mut last_err: Option<anyhow::Error> = None;
@@ -1493,6 +1509,7 @@ async fn run_interactive_pty(
                         node: node.clone(),
                         user: user.to_string(),
                         uid: nix::unistd::geteuid().as_raw(),
+                        container: container.clone(),
                     })
                     .await
                 {
@@ -1510,6 +1527,7 @@ async fn run_interactive_pty(
                 };
 
                 created_step = Some(step_resp.step_id);
+                effective_container = step_resp.container.clone();
                 if step_resp.node_addr.is_empty() {
                     break 'session Err(anyhow::anyhow!(
                         "controller did not return a node address for job {}",
@@ -1534,6 +1552,7 @@ async fn run_interactive_pty(
                 winsize,
                 true,
                 user,
+                effective_container.clone(),
             )
             .await
             {
@@ -1571,17 +1590,6 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
     )
 }
 
-/// True when any container flag is set. A buffered step forwards these in
-/// RunStepRequest; an interactive step has no field for them.
-fn container_requested(args: &SrunArgs) -> bool {
-    args.container_image.is_some()
-        || !args.container_mounts.is_empty()
-        || args.container_workdir.is_some()
-        || args.container_mount_home
-        || !args.container_env.is_empty()
-        || args.container_remap_root
-}
-
 /// Flags accepted on the command line that no job step can honor.
 fn step_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -1606,13 +1614,6 @@ fn buffered_step_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
 /// SPUR_NTASKS into every step, so `args` would warn about flags nobody typed.
 fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<String> {
     let mut warnings = Vec::new();
-    if container_requested(args) {
-        warnings.push(
-            "srun: warning: container options are not honored for a --pty step; \
-             the command runs on the host, not inside a container"
-                .to_string(),
-        );
-    }
     if args.output.is_some() || args.error.is_some() {
         warnings.push(
             "srun: warning: --output/--error are not applied to a --pty step; \
@@ -1724,8 +1725,15 @@ async fn run_as_step(
     // An interactive step drives a PTY over InteractiveSession rather than the
     // buffered RunStep path, so it runs its own step and owns the exit code.
     if let StepDispatchKind::Interactive { node } = dispatch_kind {
-        let result =
-            run_interactive_pty(&mut client, job_id, args.command.clone(), node, &user).await;
+        let result = run_interactive_pty(
+            &mut client,
+            job_id,
+            args.command.clone(),
+            node,
+            &user,
+            container_spec_from_srun_args(args),
+        )
+        .await;
         // Runs before `?` so a failed session still pairs the prolog. Not
         // handle_terminal_state: only the step exited, so "job N failed" is wrong.
         run_srun_epilog(hooks, work_dir).await;
@@ -1801,22 +1809,21 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 mod tests {
     use super::*;
 
-    /// A buffered step forwards containers now, so only a --pty step warns.
+    /// A --pty step now runs inside the requested container, so it no longer
+    /// warns that container options are dropped.
     #[test]
-    fn pty_step_warns_on_container_image_but_buffered_does_not() {
+    fn pty_step_does_not_warn_on_container_image() {
         let (args, matches) =
             parse_srun(&["srun", "--pty", "--container-image", "img.sqsh", "bash"]);
-        let pty = pty_step_unsupported_warnings(&args, &matches);
-        assert_eq!(pty.len(), 1);
-        assert!(pty[0].contains("container options are not honored for a --pty step"));
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
         assert!(step_unsupported_warnings(&args).is_empty());
     }
 
     #[test]
-    fn pty_step_warns_on_container_flags_without_image() {
-        // Container modifiers are dropped too, so any of them warns on its own.
+    fn pty_step_does_not_warn_on_container_flags() {
+        // Container modifiers ride the interactive path too, so they no longer warn.
         let (args, matches) = parse_srun(&["srun", "--pty", "--container-mounts", "/a:/b", "bash"]);
-        assert_eq!(pty_step_unsupported_warnings(&args, &matches).len(), 1);
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
     }
 
     #[test]
@@ -1926,22 +1933,8 @@ mod tests {
     #[test]
     fn warning_text_is_not_mangled_by_line_wrapping() {
         let (args, matches) = parse_srun(&[
-            "srun",
-            "--pty",
-            "-w",
-            "n1,n2",
-            "-o",
-            "o.txt",
-            "-n",
-            "2",
-            "--chdir",
-            "/tmp",
-            "--label",
-            "--container-image",
-            "i.sqsh",
-            "--input",
-            "in.txt",
-            "bash",
+            "srun", "--pty", "-w", "n1,n2", "-o", "o.txt", "-n", "2", "--chdir", "/tmp", "--label",
+            "--input", "in.txt", "bash",
         ]);
         let all: Vec<String> = step_unsupported_warnings(&args)
             .into_iter()
@@ -1950,7 +1943,7 @@ mod tests {
             .collect();
         // Every dropped-flag warning, so a lost continuation in any of them is
         // caught here.
-        assert_eq!(all.len(), 8, "expected every warning to fire: {all:?}");
+        assert_eq!(all.len(), 7, "expected every warning to fire: {all:?}");
         for w in &all {
             assert!(!w.contains("  "), "collapsed continuation in: {w:?}");
             assert!(w.starts_with("srun: warning: "), "{w:?}");
@@ -2818,6 +2811,7 @@ mod tests {
             vec!["bash".to_string()],
             String::new(),
             "tester",
+            None,
         )
         .await
         .expect_err("mock returns no node address, so the session cannot open");
@@ -2840,9 +2834,16 @@ mod tests {
         capture.set_create_step_error(tonic::Code::PermissionDenied);
         let mut client = crate::mock_controller::client(addr).await;
 
-        run_interactive_pty(&mut client, 1, vec!["bash".into()], String::new(), "tester")
-            .await
-            .expect_err("CreateJobStep was rejected");
+        run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect_err("CreateJobStep was rejected");
 
         assert!(
             capture.complete_step_calls().is_empty(),

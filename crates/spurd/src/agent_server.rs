@@ -782,6 +782,206 @@ async fn run_tokio_step_to_spool(
     }
 }
 
+/// What a containerized child execs after `container_init`. Both the buffered
+/// step (a script file inside the rootfs) and the interactive PTY step (an
+/// interactive shell or inline command) route through the same fork core.
+enum StepChildCommand {
+    /// Run `[entrypoint &&] <shell> <script_path>` — the buffered step path.
+    Script {
+        script_path: String,
+        entrypoint: Option<String>,
+    },
+    /// Exec an interactive shell in place. `None` cmdline = the image's default
+    /// shell; `Some(cmdline)` runs `<shell> -c "exec <cmdline>"` so the workload
+    /// replaces the shell (keeping the PTY session leader as the real process,
+    /// which job control and Ctrl-C depend on).
+    Shell {
+        cmdline: Option<String>,
+        entrypoint: Option<String>,
+    },
+}
+
+/// Reject NUL bytes in strings that reach `execve`: a NUL would silently degrade
+/// the child's exec (e.g. to `bash -c ""`, which exits 0), reporting a step that
+/// never ran as success. Checked before the fork so the error propagates cleanly.
+fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
+    let strings: [Option<&str>; 2] = match cmd {
+        StepChildCommand::Script {
+            script_path,
+            entrypoint,
+        } => [Some(script_path.as_str()), entrypoint.as_deref()],
+        StepChildCommand::Shell {
+            cmdline,
+            entrypoint,
+        } => [cmdline.as_deref(), entrypoint.as_deref()],
+    };
+    for s in strings.into_iter().flatten() {
+        if s.as_bytes().contains(&0) {
+            return Err(Status::invalid_argument(
+                "container entrypoint or step command contains a NUL byte",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runs in a freshly forked child after its stdio has been wired (spool fds or a
+/// PTY slave): joins the job cgroup while still root, runs `container_init`
+/// (namespace unshare, mounts, device injection, pivot_root, priv drop), signals
+/// readiness on `ready_w`, then execs `cmd`. Never returns. The whole namespace
+/// setup is shared by the buffered and PTY containerized-step paths.
+fn container_child_exec(
+    container_cfg: &crate::container::ContainerConfig,
+    rootfs: &std::path::Path,
+    ready_w: std::os::fd::OwnedFd,
+    memlock: spur_core::config::MemlockLimit,
+    cgroup_join: &Option<executor::CgroupJoin>,
+    env_base: HashMap<String, String>,
+    cmd: StepChildCommand,
+) -> ! {
+    use std::os::fd::AsRawFd;
+    let ready_w_fd = ready_w.as_raw_fd();
+
+    // Join while still root, before container_init's pivot_root hides the host
+    // cgroupfs and close_inherited_fds reaps the log fd.
+    if let Some(ref join) = cgroup_join {
+        let _ = join.join();
+    }
+
+    crate::container::close_inherited_fds(ready_w_fd);
+    executor::apply_memlock(memlock);
+
+    let hook_env = match crate::container::container_init(container_cfg, rootfs) {
+        Ok(env) => env,
+        Err(e) => {
+            let msg = format!("E:{e:#}");
+            unsafe {
+                libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+            }
+            std::process::exit(1);
+        }
+    };
+
+    unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
+    drop(ready_w);
+
+    let mut final_env = env_base;
+    for (k, v) in &container_cfg.container_env {
+        final_env.insert(k.clone(), v.clone());
+    }
+    for (k, v) in hook_env {
+        final_env.insert(k, v);
+    }
+
+    // Probe for a shell in the image (busybox/alpine has no /bin/bash), matching
+    // the batch path in executor.rs.
+    let shell = if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    let c_shell = std::ffi::CString::new(shell)
+        .unwrap_or_else(|_| std::ffi::CString::new("/bin/sh").unwrap());
+    let cstr = |s: &str| std::ffi::CString::new(s).unwrap_or_default();
+
+    // NUL bytes were rejected before the fork, so CString::new cannot fail here.
+    let argv: Vec<std::ffi::CString> = match cmd {
+        StepChildCommand::Script {
+            script_path,
+            entrypoint,
+        } => match entrypoint {
+            Some(ep) => vec![
+                c_shell.clone(),
+                cstr("-c"),
+                cstr(&format!("{ep} && {shell} {script_path}")),
+            ],
+            None => vec![c_shell.clone(), cstr(&script_path)],
+        },
+        StepChildCommand::Shell {
+            cmdline,
+            entrypoint,
+        } => match (cmdline, entrypoint) {
+            (None, None) => vec![c_shell.clone()],
+            (Some(cmd), None) => vec![c_shell.clone(), cstr("-c"), cstr(&format!("exec {cmd}"))],
+            (None, Some(ep)) => {
+                vec![
+                    c_shell.clone(),
+                    cstr("-c"),
+                    cstr(&format!("{ep} && exec {shell}")),
+                ]
+            }
+            (Some(cmd), Some(ep)) => {
+                vec![
+                    c_shell.clone(),
+                    cstr("-c"),
+                    cstr(&format!("{ep} && exec {cmd}")),
+                ]
+            }
+        },
+    };
+    let c_env: Vec<std::ffi::CString> = final_env
+        .iter()
+        .filter_map(|(k, v)| std::ffi::CString::new(format!("{k}={v}")).ok())
+        .collect();
+    let argv_refs: Vec<&std::ffi::CStr> = argv.iter().map(|s| s.as_c_str()).collect();
+    let env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
+    let _ = nix::unistd::execve(&argv[0], &argv_refs, &env_refs);
+    eprintln!(
+        "spur: execve {shell} failed: {}",
+        std::io::Error::last_os_error()
+    );
+    std::process::exit(127);
+}
+
+/// Parent-side readiness handshake for a containerized-step fork: read the "OK"
+/// (or "E:<msg>") the child writes after `container_init`, then verify the child
+/// landed in its cgroup under `[cgroup] required`. Kills and reaps the child on
+/// either failure. Shared by the buffered and PTY containerized-step paths.
+fn container_parent_ready(
+    child_pid: nix::unistd::Pid,
+    ready_r: std::os::fd::OwnedFd,
+    cgroup_required: bool,
+    cgroup: Option<&std::path::Path>,
+) -> Result<(), Status> {
+    use std::os::fd::AsRawFd;
+    let ready_r_fd = ready_r.as_raw_fd();
+    let mut buf = [0u8; 256];
+    let n = unsafe { libc::read(ready_r_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    drop(ready_r);
+    if n < 2 || &buf[..2] != b"OK" {
+        let msg = if n > 0 {
+            String::from_utf8_lossy(&buf[..n.max(0) as usize]).to_string()
+        } else {
+            "container init failed (no status)".to_string()
+        };
+        let _ = unsafe { libc::kill(child_pid.as_raw(), libc::SIGKILL) };
+        let _ = nix::sys::wait::waitpid(child_pid, None);
+        return Err(Status::internal(format!(
+            "step container init failed: {msg}"
+        )));
+    }
+
+    if escaped_job_cgroup(cgroup_required, cgroup, Some(child_pid.as_raw() as u32)) {
+        crate::executor::kill_process_tree(child_pid.as_raw(), nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(child_pid, None);
+        return Err(Status::failed_precondition(
+            "[cgroup] required but the step did not join its cgroup",
+        ));
+    }
+    Ok(())
+}
+
+/// Reap a directly-forked child and map its wait status to a shell-style exit
+/// code (128 + signal when killed). Used by the PTY bridge to await a container
+/// step that was forked raw (no `tokio::process::Child` to `wait()` on).
+fn waitpid_exit_code(pid: nix::unistd::Pid) -> i32 {
+    match nix::sys::wait::waitpid(pid, None) {
+        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
+        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+        _ => 128,
+    }
+}
+
 /// Launch a step command inside a fresh container rootfs, wiring the step's
 /// stdout/stderr to the per-step spool files (so `stream_job_output` can tail
 /// them live), matching the non-container step path. Used for standalone
@@ -816,35 +1016,20 @@ async fn run_containerized_step(
     )
     .ok();
 
-    let ready_r_fd = ready_r.as_raw_fd();
-    let ready_w_fd = ready_w.as_raw_fd();
     // Raw fds of the spool files the step's stdout/stderr are redirected to.
     let stdout_fd = step_files.stdout.as_raw_fd();
     let stderr_fd = step_files.stderr.as_raw_fd();
 
-    let rootfs_clone = rootfs.clone();
     // Start from the image's own config.Env (as `docker run` does and as the
     // batch container path does), with the job environment layered on top; read
     // from the rootfs before the fork. Keeps a containerized step consistent with
     // a containerized batch job (e.g. tools on the image's PATH resolve).
-    let env_clone = spur_net::oci::container_base_env(&rootfs, env);
-    let container_env = container_cfg.container_env.clone();
-    let entrypoint = container_cfg.entrypoint.clone();
-    let script_path_clone = script_path.clone();
-
-    // Reject NUL bytes before forking: a NUL would otherwise degrade the child's
-    // exec to `bash -c ""`, which exits 0 and reports a step that never ran as a
-    // success.
-    for s in [Some(script_path_clone.as_str()), entrypoint.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        if s.as_bytes().contains(&0) {
-            return Err(Status::invalid_argument(
-                "container entrypoint or step command contains a NUL byte",
-            ));
-        }
-    }
+    let env_base = spur_net::oci::container_base_env(&rootfs, env);
+    let child_cmd = StepChildCommand::Script {
+        script_path,
+        entrypoint: container_cfg.entrypoint.clone(),
+    };
+    reject_nul_bytes(&child_cmd)?;
 
     // Built parent-side (nothing between fork and exec may allocate); the child
     // joins itself below while still root, and `required` is verified parent-side.
@@ -855,7 +1040,6 @@ async fn run_containerized_step(
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS — synchronous only ===
             drop(ready_r);
-
             unsafe {
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -863,79 +1047,15 @@ async fn run_containerized_step(
                 libc::dup2(stdout_fd, libc::STDOUT_FILENO);
                 libc::dup2(stderr_fd, libc::STDERR_FILENO);
             }
-
-            // Join while still root, before container_init's pivot_root hides the
-            // host cgroupfs and close_inherited_fds reaps the log fd.
-            if let Some(ref join) = cgroup_join {
-                let _ = join.join();
-            }
-
-            crate::container::close_inherited_fds(ready_w_fd);
-
-            executor::apply_memlock(memlock);
-
-            let hook_env = match crate::container::container_init(&container_cfg, &rootfs_clone) {
-                Ok(env) => env,
-                Err(e) => {
-                    let msg = format!("E:{e:#}");
-                    unsafe {
-                        libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
-                    }
-                    std::process::exit(1);
-                }
-            };
-
-            unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
-            drop(ready_w);
-
-            let mut final_env = env_clone;
-            for (k, v) in &container_env {
-                final_env.insert(k.clone(), v.clone());
-            }
-            for (k, v) in hook_env {
-                final_env.insert(k, v);
-            }
-
-            // Probe for a shell in the image (busybox/alpine has no /bin/bash),
-            // matching the batch path in executor.rs.
-            let shell = if std::path::Path::new("/bin/bash").exists() {
-                "/bin/bash"
-            } else {
-                "/bin/sh"
-            };
-            let c_shell = std::ffi::CString::new(shell)
-                .unwrap_or_else(|_| std::ffi::CString::new("/bin/sh").unwrap());
-            // Honor --container-entrypoint, matching the batch path: run the
-            // entrypoint, then the step script, with the same shell. NUL bytes in
-            // these strings were rejected before fork, so CString::new cannot fail
-            // here in practice.
-            let argv: Vec<std::ffi::CString> = if let Some(ref ep) = entrypoint {
-                let cmd = format!("{ep} && {shell} {script_path_clone}");
-                vec![
-                    c_shell.clone(),
-                    std::ffi::CString::new("-c").unwrap_or_default(),
-                    std::ffi::CString::new(cmd).unwrap_or_default(),
-                ]
-            } else {
-                vec![
-                    c_shell.clone(),
-                    std::ffi::CString::new(script_path_clone.as_bytes()).unwrap_or_default(),
-                ]
-            };
-            let c_env: Vec<std::ffi::CString> = final_env
-                .iter()
-                .filter_map(|(k, v)| std::ffi::CString::new(format!("{k}={v}")).ok())
-                .collect();
-            let argv_refs: Vec<&std::ffi::CStr> = argv.iter().map(|s| s.as_c_str()).collect();
-            let env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
-            let _ = nix::unistd::execve(&c_shell, &argv_refs, &env_refs);
-            // stderr is the step's spool file here; surface the failure like the
-            // batch path rather than exiting silently.
-            eprintln!(
-                "spur: execve {shell} failed: {}",
-                std::io::Error::last_os_error()
+            container_child_exec(
+                &container_cfg,
+                &rootfs,
+                ready_w,
+                memlock,
+                &cgroup_join,
+                env_base,
+                child_cmd,
             );
-            std::process::exit(127);
         }
         nix::unistd::ForkResult::Parent { child: child_pid } => {
             // === PARENT ===
@@ -943,36 +1063,7 @@ async fn run_containerized_step(
             // The spool-file fds belong to the child now; close our copies.
             drop(step_files);
 
-            // Read the ready signal from the child.
-            let mut buf = [0u8; 256];
-            let n = unsafe { libc::read(ready_r_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            drop(ready_r);
-            if n < 2 || &buf[..2] != b"OK" {
-                let msg = if n > 0 {
-                    String::from_utf8_lossy(&buf[..n.max(0) as usize]).to_string()
-                } else {
-                    "container init failed (no status)".to_string()
-                };
-                let _ = unsafe { libc::kill(child_pid.as_raw(), libc::SIGKILL) };
-                let _ = nix::sys::wait::waitpid(child_pid, None);
-                return Err(Status::internal(format!(
-                    "step container init failed: {msg}"
-                )));
-            }
-
-            // Verify the self-join above actually landed (it is best-effort in
-            // the child). Under `[cgroup] required` a step that missed its cgroup
-            // is refused and killed rather than run outside the limits and filter.
-            if escaped_job_cgroup(cgroup_required, cgroup, Some(child_pid.as_raw() as u32)) {
-                crate::executor::kill_process_tree(
-                    child_pid.as_raw(),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                let _ = nix::sys::wait::waitpid(child_pid, None);
-                return Err(Status::failed_precondition(
-                    "[cgroup] required but the step did not join its cgroup",
-                ));
-            }
+            container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
 
             // Register PID for cancellation.
             let raw_pid = child_pid.as_raw() as u32;
@@ -2762,6 +2853,15 @@ impl SlurmAgent for AgentService {
             // host's mount namespace, where a job's work_dir need not exist.
             cmd.current_dir(&entry.work_dir);
         }
+        // env_clear so spurd's own environment (secrets included) never leaks in.
+        cmd.env_clear();
+        cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        for (k, v) in Self::session_environ(&entry) {
+            cmd.env(k, v);
+        }
         ChildContainment::for_plan(&plan, &entry, priv_drop, self.cgroup.required)
             .register(&mut cmd);
 
@@ -3306,6 +3406,9 @@ impl SlurmAgent for AgentService {
             // container's pivoted mount namespace does not preserve it — that
             // remains best-effort.
             cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
+            // Empty the environment first so spurd's own (secrets included) is not
+            // inherited; the step's resolved environment is applied on top.
+            cmd.env_clear();
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -3485,6 +3588,9 @@ impl SlurmAgent for AgentService {
             let plan = build_launch_plan(&job_entry, priv_drop.as_ref(), &full_command);
             let mut cmd = tokio::process::Command::new(&plan.program);
             cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
+            // Empty the environment first so spurd's own (secrets included) is not
+            // inherited; the step's resolved environment is applied on top.
+            cmd.env_clear();
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -3808,6 +3914,9 @@ impl SlurmAgent for AgentService {
         });
 
         let argv: Vec<String> = init.argv.clone();
+        // A non-interactive client (no TTY) closes its input stream on stdin-EOF
+        // while still reading output; an interactive one only closes it on hangup.
+        let interactive = !init.non_interactive;
 
         // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
         // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
@@ -3821,7 +3930,82 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        let (master_fd, child, child_pid) = Self::spawn_pty_in_job(
+        // Dispatch mirrors run_command's three cases. A parent job with live
+        // namespaces (containerized sbatch/salloc) is entered via nsenter; a step
+        // that requested its own image with no such parent builds a fresh
+        // container; otherwise the command runs on the host.
+        let step_image = init
+            .container
+            .as_ref()
+            .map(|c| c.image.as_str())
+            .unwrap_or("");
+        let parent_has_namespaces = entry.has_namespaces() && entry.pid > 0;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
+
+        if !parent_has_namespaces && !step_image.is_empty() {
+            // Case 2: fresh container for this interactive PTY step.
+            let container = init
+                .container
+                .as_ref()
+                .expect("image is non-empty in this arm");
+            let (master_fd, child_pid, rootfs_guard) = self
+                .spawn_containerized_pty_step(
+                    init.job_id,
+                    init.step_id,
+                    container,
+                    &argv,
+                    &entry,
+                    winsize.as_ref(),
+                )
+                .await?;
+
+            info!(
+                job_id = init.job_id,
+                child_pid,
+                image = %step_image,
+                "interactive container session started"
+            );
+
+            let active_steps = self.active_steps.clone();
+            let step_key = (init.job_id, init.step_id);
+            let wait_pid = nix::unistd::Pid::from_raw(child_pid);
+            tokio::spawn(async move {
+                // Hold the rootfs guard and the active-steps entry for the whole
+                // session: both drop when the bridge returns (child exit, client
+                // disconnect, or scancel), cleaning up the rootfs and the
+                // cancellation registration.
+                let _rootfs_guard = rootfs_guard;
+                let _step_guard = ActiveStepGuard {
+                    steps: active_steps,
+                    key: step_key,
+                };
+                let wait_exit = async move {
+                    tokio::task::spawn_blocking(move || waitpid_exit_code(wait_pid))
+                        .await
+                        .unwrap_or(128)
+                };
+                Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
+                    .await;
+            });
+
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+
+        if !step_image.is_empty() {
+            // Case 1: the parent job already provides a container; the step joins
+            // its namespaces via nsenter rather than building a new one. Leave a
+            // trace rather than silently dropping the requested image.
+            warn!(
+                job_id = init.job_id,
+                image = %step_image,
+                "step --container-image ignored: joining the parent job's running container"
+            );
+        }
+
+        // Case 1 (nsenter, parent has namespaces) and Case 3 (host): the existing
+        // path spawns via a tokio Child.
+        let (master_fd, mut child, child_pid) = Self::spawn_pty_in_job(
             &entry,
             &argv,
             init.job_id,
@@ -3836,10 +4020,21 @@ impl SlurmAgent for AgentService {
             "interactive session started"
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
-
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(128)
+        };
         tokio::spawn(Self::run_pty_bridge(
-            master_fd, child, child_pid, inbound, tx,
+            master_fd,
+            wait_exit,
+            child_pid,
+            interactive,
+            inbound,
+            tx,
         ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -4438,19 +4633,30 @@ impl AgentService {
 
     /// Bidirectional PTY bridge: reads master fd, forwards inbound messages
     /// (stdin, resize, signal), and drains remaining output after child exit.
-    async fn run_pty_bridge<S>(
+    ///
+    /// `interactive` sets what closing the client's input stream means: for an
+    /// interactive client (TTY) it is a hangup (SIGHUP the step and stop); for a
+    /// non-interactive one (script/pipe/redirect) it is stdin-EOF, so stop
+    /// forwarding input but keep draining until the command exits.
+    async fn run_pty_bridge<S, F>(
         master: std::os::fd::OwnedFd,
-        mut child: tokio::process::Child,
+        wait_exit: F,
         child_pid: i32,
+        interactive: bool,
         mut inbound: S,
         tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
     ) where
         S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
+        F: std::future::Future<Output = i32> + Send,
     {
         use crate::pty::WindowSize as PtyWinSize;
         use std::os::fd::AsRawFd;
         use tokio::io::unix::AsyncFd;
         use tokio_stream::StreamExt;
+
+        // Pinned so `wait_exit` can be polled in the select and, if the loop exits
+        // first (EOF/disconnect), awaited once more to reap.
+        tokio::pin!(wait_exit);
 
         let master_raw = master.as_raw_fd();
         let async_fd = match AsyncFd::new(master) {
@@ -4465,6 +4671,9 @@ impl AgentService {
 
         let mut read_buf = vec![0u8; 4096];
         let mut child_exited = false;
+        // Cleared when the client stops sending input; the branch is then parked so
+        // a non-interactive stdin-EOF doesn't spin the select.
+        let mut input_open = true;
         let mut exit_code: i32 = 128;
 
         loop {
@@ -4498,7 +4707,7 @@ impl AgentService {
                     }
                 }
 
-                item = inbound.next(), if !child_exited => {
+                item = inbound.next(), if input_open && !child_exited => {
                     match item {
                         Some(Ok(input)) => {
                             match input.msg {
@@ -4523,30 +4732,39 @@ impl AgentService {
                                 Some(interactive_input::Msg::Init(_)) | None => {}
                             }
                         }
-                        Some(Err(_)) | None => {
+                        Some(Err(_)) => {
+                            // Broken input stream: the client is gone. Hang up.
                             let _ = crate::pty::signal_foreground(
                                 master_raw, child_pid, libc::SIGHUP,
                             );
                             break;
                         }
+                        None => {
+                            if interactive {
+                                // The terminal went away — hang the step up.
+                                let _ = crate::pty::signal_foreground(
+                                    master_raw, child_pid, libc::SIGHUP,
+                                );
+                                break;
+                            }
+                            // Non-interactive stdin-EOF: the client still wants the
+                            // output. Stop forwarding input and keep draining until
+                            // the command exits; a truly-gone client is caught by a
+                            // failing tx.send below.
+                            input_open = false;
+                        }
                     }
                 }
 
-                status = child.wait(), if !child_exited => {
-                    exit_code = match status {
-                        Ok(s) => s.code().unwrap_or(128),
-                        Err(_) => 128,
-                    };
+                code = &mut wait_exit, if !child_exited => {
+                    exit_code = code;
                     child_exited = true;
                 }
             }
         }
 
         if !child_exited {
-            exit_code = match child.wait().await {
-                Ok(s) => s.code().unwrap_or(128),
-                Err(_) => 128,
-            };
+            exit_code = (&mut wait_exit).await;
         }
 
         let _ = tx
@@ -4611,6 +4829,237 @@ impl AgentService {
         Ok(())
     }
 
+    /// Launch an interactive PTY step in a fresh container rootfs, using the
+    /// controller-resolved effective image. Like `run_command`'s Case 2, but wires
+    /// the child's stdio to a PTY slave and returns the master fd for
+    /// [`Self::run_pty_bridge`]. The caller holds the returned rootfs guard for the
+    /// session so the rootfs is torn down when it ends.
+    async fn spawn_containerized_pty_step(
+        &self,
+        job_id: u32,
+        step_id: u32,
+        container: &ContainerSpec,
+        argv: &[String],
+        entry: &crate::job_entry::JobEntry,
+        winsize: Option<&crate::pty::WindowSize>,
+    ) -> Result<(std::os::fd::OwnedFd, i32, StepRootfsGuard), Status> {
+        use std::os::fd::AsRawFd;
+
+        let (gpu_devices, partition, nodelist) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&job_id).ok_or_else(|| {
+                Status::not_found(format!("job {job_id} not running on this node"))
+            })?;
+            let nodelist = if tracked.nodelist.is_empty() {
+                hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "localhost".into())
+            } else {
+                tracked.nodelist.clone()
+            };
+            (
+                tracked.gpu_devices.clone(),
+                tracked.partition.clone(),
+                nodelist,
+            )
+        };
+
+        // GPU device injection plan for the step's allocated GPUs (mirror Case 2).
+        let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
+            (HashMap::new(), None)
+        } else {
+            let (host_plan, container_plan) = self
+                .device_registry
+                .lock()
+                .await
+                .build_job_injection_plans("gpu", &gpu_devices, entry.uid, entry.gid)
+                .map_err(|e| {
+                    Status::failed_precondition(format!("GPU injection plan failed: {e}"))
+                })?;
+            (host_plan.env, Some(container_plan))
+        };
+        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
+
+        // User identity for the container shadow/home, resolved from the job's uid.
+        let user = (entry.uid > 0)
+            .then(|| {
+                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        let username = user
+            .as_ref()
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| "spur".to_string());
+        let home_dir = user
+            .as_ref()
+            .map(|u| u.dir.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("/home/{username}"));
+
+        // Session env: job identity + GPU visibility + user identity, layered later
+        // over the image's own config.Env.
+        let mut senv = SpurEnv::new();
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
+        let mut env = senv.into_map();
+        env.extend(gpu_env);
+        env.entry("TERM".to_string())
+            .or_insert_with(|| "xterm-256color".to_string());
+        env.insert("HOME".to_string(), home_dir.clone());
+        env.insert("USER".to_string(), username.clone());
+        env.insert("LOGNAME".to_string(), username.clone());
+
+        let mounts: Vec<crate::container::BindMount> = container
+            .mounts
+            .iter()
+            .filter_map(|m| crate::container::parse_mount(m).ok())
+            .collect();
+
+        let container_cfg = crate::container::ContainerConfig {
+            image: container.image.clone(),
+            mounts,
+            workdir: if !container.workdir.is_empty() {
+                Some(container.workdir.clone())
+            } else if !entry.work_dir.is_empty() {
+                Some(entry.work_dir.clone())
+            } else {
+                None
+            },
+            name: (!container.name.is_empty()).then(|| container.name.clone()),
+            readonly: container.readonly,
+            mount_home: container.mount_home,
+            remap_root: container.remap_root,
+            gpu_devices: gpu_devices.clone(),
+            environment: env.clone(),
+            container_env: {
+                let mut ce = container.env.clone();
+                maybe_deny_gpu_env(&mut ce, &gpu_devices);
+                ce
+            },
+            entrypoint: (!container.entrypoint.is_empty()).then(|| container.entrypoint.clone()),
+            uid: entry.uid,
+            gid: entry.gid,
+            username,
+            home_dir,
+            device_plan: container_device_plan,
+        };
+
+        let image_path = crate::container::resolve_image(&container.image, None, Some(entry.uid))
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let step_base = crate::container::step_rootfs_base(job_id, step_id);
+        let (rootfs, rootfs_mode) =
+            crate::container::setup_rootfs(&image_path, &step_base, container_cfg.name.as_deref())
+                .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
+        let mut rootfs_guard = StepRootfsGuard {
+            base: step_base,
+            mode: rootfs_mode,
+            pid: None,
+        };
+
+        // Interactive command: the image's default shell (empty argv) or the
+        // requested command, exec'd in place so it owns the PTY.
+        let cmdline = if argv.is_empty() {
+            None
+        } else {
+            Some(
+                shlex::try_join(argv.iter().map(String::as_str)).map_err(|e| {
+                    Status::invalid_argument(format!("command is not shell-safe: {e}"))
+                })?,
+            )
+        };
+        let child_cmd = StepChildCommand::Shell {
+            cmdline,
+            entrypoint: container_cfg.entrypoint.clone(),
+        };
+        reject_nul_bytes(&child_cmd)?;
+
+        let env_base = spur_net::oci::container_base_env(&rootfs, env);
+
+        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
+            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
+        let raw_io = crate::executor::JobIoRaw::Pty {
+            master: master.as_raw_fd(),
+            slave: slave.as_raw_fd(),
+        };
+
+        let (ready_r, ready_w) =
+            nix::unistd::pipe().map_err(|e| Status::internal(format!("pipe failed: {e}")))?;
+        nix::fcntl::fcntl(
+            &ready_r,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .ok();
+
+        let cgroup_join = executor::CgroupJoin::for_cgroup(entry.cgroup_path.as_deref());
+        let memlock = self.limits.memlock;
+
+        match unsafe {
+            nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))?
+        } {
+            nix::unistd::ForkResult::Child => {
+                // === CHILD PROCESS — synchronous only ===
+                drop(ready_r);
+                unsafe {
+                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                    // Wire the PTY slave as the controlling terminal (setsid +
+                    // TIOCSCTTY + dup2 slave->0/1/2 + close master) before
+                    // container_init pivots into the rootfs.
+                    if raw_io.wire().is_err() {
+                        std::process::exit(127);
+                    }
+                }
+                container_child_exec(
+                    &container_cfg,
+                    &rootfs,
+                    ready_w,
+                    memlock,
+                    &cgroup_join,
+                    env_base,
+                    child_cmd,
+                );
+            }
+            nix::unistd::ForkResult::Parent { child: child_pid } => {
+                // === PARENT ===
+                drop(ready_w);
+                drop(slave);
+
+                container_parent_ready(
+                    child_pid,
+                    ready_r,
+                    self.cgroup.required,
+                    entry.cgroup_path.as_deref(),
+                )?;
+
+                // Non-blocking so the bridge's AsyncFd reads/writes are correct.
+                nix::fcntl::fcntl(
+                    &master,
+                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+                )
+                .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
+
+                let raw_pid = child_pid.as_raw();
+                rootfs_guard.pid = Some(raw_pid);
+
+                // Register so scancel and the allocation-cancel path can signal it.
+                self.active_steps.lock().await.insert(
+                    (job_id, step_id),
+                    ActiveStep {
+                        epoch: next_step_epoch(),
+                        pid: Some(raw_pid as u32),
+                        ..Default::default()
+                    },
+                );
+
+                Ok((master, raw_pid, rootfs_guard))
+            }
+        }
+    }
+
     fn spawn_pty_in_job(
         entry: &crate::job_entry::JobEntry,
         argv: &[String],
@@ -4658,10 +5107,13 @@ impl AgentService {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        if entry.pid > 0 {
-            for (k, v) in Self::read_proc_environ(entry.pid as u32) {
-                cmd.env(k, v);
-            }
+        // Start from an empty environment so spurd's own environment (which may
+        // hold daemon secrets) never leaks into the session; then apply the job's
+        // own environment.
+        cmd.env_clear();
+        cmd.env("TERM", "xterm-256color");
+        for (k, v) in Self::session_environ(entry) {
+            cmd.env(k, v);
         }
         for (k, v) in entry.env_vars(job_id) {
             cmd.env(k, v);
@@ -4729,6 +5181,34 @@ impl AgentService {
                 Some((k.to_string(), v.to_string()))
             })
             .collect()
+    }
+
+    /// The environment a session that *enters* a running job starts from: the
+    /// job's own, never spurd's. For a container job the tracked pid is the
+    /// shepherd (a spurd fork carrying spurd's env), so read the container's
+    /// workload (PID 1) instead. Callers must `env_clear()` first.
+    fn session_environ(entry: &crate::job_entry::JobEntry) -> Vec<(String, String)> {
+        if entry.pid <= 0 {
+            return Vec::new();
+        }
+        let target = if entry.has_namespaces() {
+            Self::container_workload_pid(entry.pid as u32).unwrap_or(entry.pid as u32)
+        } else {
+            entry.pid as u32
+        };
+        Self::read_proc_environ(target)
+    }
+
+    /// Resolve a container's workload pid (PID 1 in its namespace) from the
+    /// shepherd pid: the shepherd forks exactly one child to become the namespace
+    /// init, so its sole entry in `children` is that workload.
+    fn container_workload_pid(shepherd: u32) -> Option<u32> {
+        let content =
+            std::fs::read_to_string(format!("/proc/{shepherd}/task/{shepherd}/children")).ok()?;
+        content
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
     }
 }
 
@@ -8031,6 +8511,32 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
+    // The PTY bridge reaps a raw-forked container step through `waitpid_exit_code`
+    // (there is no `tokio::process::Child` to `wait()` on), so exit-code mapping
+    // must match what the bridge reports to the client.
+    #[test]
+    fn waitpid_exit_code_reports_normal_exit() {
+        match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => unsafe { libc::_exit(7) },
+            nix::unistd::ForkResult::Parent { child } => {
+                assert_eq!(waitpid_exit_code(child), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn waitpid_exit_code_reports_signal_death_as_128_plus_signal() {
+        match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => loop {
+                unsafe { libc::pause() };
+            },
+            nix::unistd::ForkResult::Parent { child } => {
+                unsafe { libc::kill(child.as_raw(), libc::SIGKILL) };
+                assert_eq!(waitpid_exit_code(child), 128 + libc::SIGKILL);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn run_pty_bridge_echo_and_exit() {
         use spur_proto::proto::{interactive_input, interactive_output, InteractiveInput};
@@ -8054,7 +8560,7 @@ mod tests {
         unsafe {
             cmd.pre_exec(move || raw.wire());
         }
-        let child = cmd.spawn().expect("spawn cat");
+        let mut child = cmd.spawn().expect("spawn cat");
         let child_pid = child.id().expect("child pid") as i32;
         drop(slave);
 
@@ -8065,8 +8571,16 @@ mod tests {
         >(64);
 
         let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(128)
+        };
         tokio::spawn(AgentService::run_pty_bridge(
-            master, child, child_pid, inbound, out_tx,
+            master, wait_exit, child_pid, true, inbound, out_tx,
         ));
 
         in_tx
@@ -8111,5 +8625,80 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    // A non-interactive client (no TTY) closes its input stream on stdin-EOF while
+    // still reading output. The bridge must NOT hang the step up then — it must
+    // drain the command's output and report it. Regression guard for the fix that
+    // makes `srun --pty <cmd>` work in scripts/pipes/CI. The child sleeps briefly
+    // before printing so a hang-up-on-input-close regression would kill it first.
+    #[tokio::test]
+    async fn run_pty_bridge_non_interactive_drains_after_input_close() {
+        use spur_proto::proto::{interactive_output, InteractiveInput};
+
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("O_NONBLOCK");
+
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 0.2; printf DRAINED")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let mut child = cmd.spawn().expect("spawn sh");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        // Input stream closed immediately (dropped sender) = non-interactive stdin-EOF.
+        let (in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<InteractiveInput, tonic::Status>>(1);
+        drop(in_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<
+            Result<spur_proto::proto::InteractiveOutput, tonic::Status>,
+        >(64);
+
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(128)
+        };
+        // interactive = false: input-close is stdin-EOF, not a hangup.
+        tokio::spawn(AgentService::run_pty_bridge(
+            master, wait_exit, child_pid, false, inbound, out_tx,
+        ));
+
+        let mut collected = Vec::new();
+        let mut got_exit = false;
+        while let Some(Ok(msg)) = out_rx.recv().await {
+            match msg.msg {
+                Some(interactive_output::Msg::Data(d)) => collected.extend_from_slice(&d),
+                Some(interactive_output::Msg::ExitStatus(_)) => {
+                    got_exit = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(
+            text.contains("DRAINED"),
+            "non-interactive bridge dropped output after input close, got: {text:?}"
+        );
+        assert!(got_exit, "bridge did not report an exit status");
     }
 }

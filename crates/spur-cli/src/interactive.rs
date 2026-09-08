@@ -9,6 +9,7 @@ use spur_proto::proto::{
     JobKeepaliveRequest,
 };
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -184,6 +185,7 @@ pub struct InteractiveSessionHandle {
 /// Open the InteractiveSession RPC, returning the raw handle.
 ///
 /// Returns `Err(tonic::Status)` on RPC failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_interactive_session(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -192,7 +194,12 @@ pub async fn open_interactive_session(
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
     user: &str,
+    container: Option<spur_proto::proto::ContainerSpec>,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
+    // Non-TTY stdin (script, pipe, redirect) closes the input stream on EOF, not
+    // on hangup. Flag it so the agent drains output instead of SIGHUP-ing the
+    // step; interactive clients keep hangup-on-disconnect.
+    let non_interactive = !std::io::stdin().is_terminal();
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
             job_id,
@@ -203,6 +210,8 @@ pub async fn open_interactive_session(
             argv,
             env: HashMap::new(),
             user: user.to_string(),
+            container,
+            non_interactive,
         })),
     };
 
@@ -322,9 +331,12 @@ pub async fn run_interactive_session(
     overlap: bool,
     user: &str,
 ) -> Result<i32> {
-    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, user)
-        .await
-        .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
+    let handle =
+        open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, user, None)
+            .await
+            .map_err(|status| {
+                anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message())
+            })?;
     drive_interactive_session(handle).await
 }
 

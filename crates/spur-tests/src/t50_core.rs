@@ -1006,6 +1006,8 @@ address = "http://peer-a:6817"
                     argv: vec!["/bin/bash".into()],
                     env: HashMap::new(),
                     user: "alice".into(),
+                    container: None,
+                    non_interactive: false,
                 },
             )),
         };

@@ -30,6 +30,13 @@ ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
 
+# Injected into spurd's own environment (only) at launch so a test can prove the
+# daemon's environment does not leak into jobs or into sessions that enter a
+# running job (spur exec, srun --overlap, srun --overlap --pty). Job clients run
+# over separate SSH exec channels and never see this var, so its presence in a
+# session means it leaked from spurd.
+DAEMON_ENV_CANARY = "spurd-private-do-not-leak"
+
 # Extracts just the numeric host port for 5432/tcp. inspect returns structured
 # data, so this sidesteps parsing the multi-line, IPv4/IPv6-variant `docker port`
 # output. Dual-stack publishes both families on the same port, so index 0 suffices.
@@ -1303,10 +1310,13 @@ tar -C "$R" -czf '{local_tar}' .
         hostname = self.node_names[node_index]
         address = node.host
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
+        # `env VAR=val` runs under any sudo prefix, so the canary lands in spurd's
+        # own environment in both the rootless and rootful launch shapes.
+        daemon_env = f"env SPUR_DAEMON_ENV_CANARY={DAEMON_ENV_CANARY}"
         spurd_bin = (
-            f"{self._sudo_prefix()}'{self.bin_dir}/spurd'"
+            f"{self._sudo_prefix()}{daemon_env} '{self.bin_dir}/spurd'"
             if self.agent_as_root
-            else f"'{self.bin_dir}/spurd'"
+            else f"{daemon_env} '{self.bin_dir}/spurd'"
         )
         label_args = ""
         labels = self.agent_labels.get(node_index, {})

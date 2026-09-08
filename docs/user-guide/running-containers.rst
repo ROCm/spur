@@ -153,6 +153,26 @@ GPU allocation, bind mounts, and cancellation apply per step: a cancelled step
 tears down its container and cleans up its rootfs without affecting the rest of
 the allocation.
 
+Interactive steps (``srun --pty``) run inside the container too — you get a real
+terminal inside the container rather than on the host. The step uses its own
+``--container-image`` when given one, otherwise a nested ``srun --pty`` inherits
+the image from its containerized ``sbatch`` job:
+
+.. code-block:: bash
+
+   salloc -N1 --gpus-per-node=8
+   # ...now inside the allocation shell:
+   srun --pty --container-image trainer.sqsh bash   # interactive shell in the container
+
+   # or attach an interactive shell to a running containerized job
+   # (enters its container via nsenter):
+   sbatch -N1 --container-image trainer.sqsh long_job.sh
+   srun --jobid=<id> --overlap --pty bash            # same container, interactive
+
+A ``--pty`` step nested inside a containerized ``sbatch`` job enters
+the parent's running container (like any other nested step) rather than building
+a fresh one.
+
 Exec Into a Running Container Job
 ---------------------------------
 
