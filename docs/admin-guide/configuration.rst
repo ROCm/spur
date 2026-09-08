@@ -1204,28 +1204,28 @@ cgroups.
 
 .. note::
 
-   **Reload: Not implemented.** ``spurd`` reads this section once at startup, so
-   ``scontrol reconfigure`` does not apply changes here. Restart the agent.
-
    Upgrading a cluster whose ``spur.conf`` has no ``[cgroup]`` section changes
    what gets enforced — see :ref:`cgroup-upgrade-notes`.
 
 .. list-table::
    :header-rows: 1
-   :widths: 22 8 10 60
+   :widths: 20 8 10 14 48
 
    * - Field
      - Type
      - Default
+     - Reload
      - Description
    * - ``enabled``
      - bool
      - ``true``
+     - Agent restart
      - Master switch. When ``false``, no cgroup is created and no limit is
        applied.
    * - ``required``
      - bool
      - ``false``
+     - Agent restart
      - Refuse the work when a requested constraint cannot be applied, instead of
        warning and running it unconstrained. This gates a batch launch, the
        registration of an interactive allocation (``salloc``, standalone
@@ -1234,23 +1234,27 @@ cgroups.
    * - ``constrain_cores``
      - bool
      - ``true``
+     - Agent restart
      - Pin the job to its allocated cores via ``cpuset.cpus``. With
        ``cpu_quota`` off this is the only CPU bound, so a job whose allocation
        yields no cores runs CPU-unconstrained and ``spurd`` logs a warning.
    * - ``cpu_quota``
      - bool
      - ``false``
+     - Agent restart
      - Additionally cap CPU time with a CFS quota (``cpu.max``). Off because the
        cpuset already bounds whole-core allocations; enabling it adds a hard
        throttle on top.
    * - ``constrain_ram_space``
      - bool
      - ``true``
+     - Agent restart
      - Cap memory via ``memory.max`` and ``memory.high``. Costs some per-node job
        throughput — see the note below.
    * - ``allowed_ram_percent``
      - int
      - ``100``
+     - Agent restart
      - Hard ceiling (``memory.max``) as a percentage of the allocated memory.
        ``memory.high`` stays at 100% of the allocation, so the default makes the
        two equal and a value above 100 opens a soft-throttle band. Must be at
@@ -1259,6 +1263,7 @@ cgroups.
    * - ``constrain_swap``
      - bool
      - ``false``
+     - Agent restart
      - Bound swap via ``memory.swap.max``. Off by default, as in Slurm: while
        off, ``memory.max`` bounds resident memory only and a job that outgrows
        ``--mem`` swaps instead of being killed. Turning it on with
@@ -1266,22 +1271,26 @@ cgroups.
    * - ``allowed_swap_percent``
      - int
      - ``0``
+     - Agent restart
      - Swap allowance as a percentage of the allocated memory. ``0`` means no
        swap. Not capped at 100 — a swap-rich node may grant more swap than RAM,
        and Slurm places no upper bound on ``AllowedSwapSpace`` either.
    * - ``min_ram_mb``
      - int
      - ``30``
+     - Agent restart
      - Floor for the memory ceilings, in MiB. Guards against a tiny ``--mem``
        creating a cgroup so small the job dies during its own startup.
    * - ``oom_kill_job``
      - bool
      - ``true``
+     - Agent restart
      - On OOM, kill every process in the job (``memory.oom.group``) instead of
        letting the kernel pick one.
    * - ``constrain_devices``
      - bool
      - ``true``
+     - Agent restart
      - Restrict the job to the device nodes its allocation granted, using a
        cgroup-v2 BPF device filter. Default-deny: a job allocated no GPUs can open
        only the nodes listed under :ref:`device-filter-implicit-allow` below, and
@@ -1292,6 +1301,7 @@ cgroups.
    * - ``extra_device_paths``
      - [string]
      - ``[]``
+     - Agent restart
      - Additional device node paths **every** job on this node may open, on top of
        its allocation and the implicit set below. The escape hatch for a site
        device the defaults miss, short of turning the filter off. A path that is
