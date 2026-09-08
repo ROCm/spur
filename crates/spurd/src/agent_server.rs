@@ -731,6 +731,14 @@ impl AgentService {
         self.k0s.clone()
     }
 
+    /// Shared handle to this node's local allocation, so the inventory-refresh
+    /// task can update its capacity (via `update_capacity`) when devices appear
+    /// or vanish. Without it the agent's capacity stays frozen at startup and
+    /// rejects launches for devices the controller has already re-learned.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
+    }
+
     /// Spawn a background task to monitor running jobs and report completions.
     pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
