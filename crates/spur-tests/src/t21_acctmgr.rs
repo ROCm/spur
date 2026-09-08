@@ -92,7 +92,7 @@ mod tests {
     fn t21_8_qos_defaults() {
         let qos = Qos::default();
         assert_eq!(qos.priority, 0);
-        assert_eq!(qos.preempt_mode, QosPreemptMode::Off);
+        assert_eq!(qos.preempt_mode, None);
         assert_eq!(qos.usage_factor, 1.0);
     }
 

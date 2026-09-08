@@ -294,7 +294,8 @@ pub struct Qos {
     pub name: String,
     pub description: String,
     pub priority: i32,
-    pub preempt_mode: QosPreemptMode,
+    #[serde(default)]
+    pub preempt_mode: Option<QosPreemptMode>,
     pub limits: QosLimits,
     /// Usage factor — multiplier for fair-share usage accounting.
     /// 0.0 = don't charge, 1.0 = normal, 2.0 = double charge.
@@ -377,7 +378,7 @@ impl Default for Qos {
             name: String::new(),
             description: String::new(),
             priority: 0,
-            preempt_mode: QosPreemptMode::Off,
+            preempt_mode: None,
             limits: QosLimits::default(),
             usage_factor: 1.0,
             preempt: Vec::new(),
@@ -588,6 +589,14 @@ mod tests {
             "unknown".parse::<QosPreemptMode>().unwrap(),
             QosPreemptMode::Off
         );
+    }
+
+    #[test]
+    fn qos_without_preempt_mode_deserializes_as_unset() {
+        let mut value = serde_json::to_value(Qos::default()).unwrap();
+        value.as_object_mut().unwrap().remove("preempt_mode");
+        let decoded: Qos = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.preempt_mode, None);
     }
 
     #[test]

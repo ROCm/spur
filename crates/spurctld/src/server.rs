@@ -2329,7 +2329,7 @@ impl SlurmController for ControllerService {
             deny_qos: req.deny_qos,
             allow_qos: req.allow_qos,
             priority_tier: req.priority_tier,
-            preempt_mode,
+            preempt_mode: Some(preempt_mode),
             preempt_exempt_time: req.preempt_exempt_time,
             ..Default::default()
         };
@@ -4432,7 +4432,14 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_qos: part.allow_qos.join(","),
         deny_accounts: part.deny_accounts.join(","),
         deny_qos: part.deny_qos.join(","),
-        preempt_mode: format!("{:?}", part.preempt_mode),
+        preempt_mode: match part.preempt_mode {
+            Some(spur_core::partition::PreemptMode::Off) => "OFF",
+            Some(spur_core::partition::PreemptMode::Cancel) => "CANCEL",
+            Some(spur_core::partition::PreemptMode::Requeue) => "REQUEUE",
+            Some(spur_core::partition::PreemptMode::Suspend) => "SUSPEND",
+            None => "",
+        }
+        .into(),
         priority_tier: part.priority_tier,
         preempt_exempt_time: part.preempt_exempt_time,
     }

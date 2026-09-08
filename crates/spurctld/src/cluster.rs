@@ -4009,10 +4009,11 @@ impl ClusterManager {
             .filter(|p| current_names.contains(&p.name))
         {
             let preempt_str = match part.preempt_mode {
-                spur_core::partition::PreemptMode::Cancel => "cancel",
-                spur_core::partition::PreemptMode::Requeue => "requeue",
-                spur_core::partition::PreemptMode::Suspend => "suspend",
-                spur_core::partition::PreemptMode::Off => "off",
+                Some(spur_core::partition::PreemptMode::Cancel) => "cancel",
+                Some(spur_core::partition::PreemptMode::Requeue) => "requeue",
+                Some(spur_core::partition::PreemptMode::Suspend) => "suspend",
+                Some(spur_core::partition::PreemptMode::Off) => "off",
+                None => "",
             };
             self.propose(WalOperation::PartitionUpdate {
                 name: part.name.clone(),
@@ -5088,8 +5089,7 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Recompute a job's live effective priority. A running job's stored
-    /// `priority` is stale; this recalculates from age, fair-share, and tier.
+    #[cfg(test)]
     pub(crate) fn current_effective_priority(&self, job: &Job, partitions: &[Partition]) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
@@ -6293,10 +6293,11 @@ impl ClusterManager {
                         }
                         if let Some(pm) = preempt_mode {
                             part.preempt_mode = match pm.to_lowercase().as_str() {
-                                "cancel" => spur_core::partition::PreemptMode::Cancel,
-                                "requeue" => spur_core::partition::PreemptMode::Requeue,
-                                "suspend" => spur_core::partition::PreemptMode::Suspend,
-                                _ => spur_core::partition::PreemptMode::Off,
+                                "cancel" => Some(spur_core::partition::PreemptMode::Cancel),
+                                "requeue" => Some(spur_core::partition::PreemptMode::Requeue),
+                                "suspend" => Some(spur_core::partition::PreemptMode::Suspend),
+                                "" => None,
+                                _ => Some(spur_core::partition::PreemptMode::Off),
                             };
                         }
                         if let Some(def) = is_default {
@@ -15091,20 +15092,24 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].preempt_mode = "cancel".into();
+        config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
 
         cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
             name: "high".into(),
             priority: 5000,
+            preempt: vec!["low".into()],
             ..Default::default()
         });
 
-        // low job has no QOS (base=DEFAULT_PRIORITY=1000); high job's QOS
-        // priority (5000) becomes its base, making it >2x the low job's
-        // effective priority and crossing the preemption threshold.
         let mut low = basic_spec("low");
-        low.priority = Some(1000);
+        low.qos = Some("low".into());
         let low_id = submit_and_wait(&cm, low);
         let res = scalar_alloc(2, 4000);
         cm.start_job(
@@ -15137,6 +15142,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].preempt_mode = "cancel".into();
+        config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
 
@@ -15148,6 +15154,7 @@ mod tests {
         cm.qos_cache().insert(Qos {
             name: "primus".into(),
             priority: 10000,
+            preempt: vec!["burst".into()],
             ..Default::default()
         });
 
@@ -15168,19 +15175,9 @@ mod tests {
         primus.qos = Some("primus".into());
         submit_and_wait(&cm, primus);
 
-        // Confirm that primus effective > 2x burst effective (preemption threshold).
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-
-        let burst_job = cm.get_job(burst_id).unwrap();
-        let burst_effective = cm.current_effective_priority(&burst_job, &partitions);
-        let primus_effective = pending_refs[0].priority;
-        assert!(
-            primus_effective >= burst_effective * 2,
-            "primus effective ({primus_effective}) must be ≥2x burst ({burst_effective}) \
-             for preemption to fire"
-        );
 
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
             .await;
@@ -15194,14 +15191,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn explicit_priority_disables_qos_based_preemption() {
-        // When --priority is set explicitly on both jobs, QOS priority is not
-        // applied as the base seed. Both jobs land at the same effective
-        // priority and preemption does not fire — this is intentional: explicit
-        // --priority opts the job out of QOS-based scheduling.
+    async fn qos_rank_allows_preemption_despite_equal_effective_job_priority() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].preempt_mode = "cancel".into();
+        config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
 
@@ -15213,6 +15207,7 @@ mod tests {
         cm.qos_cache().insert(Qos {
             name: "primus".into(),
             priority: 10000,
+            preempt: vec!["burst".into()],
             ..Default::default()
         });
 
@@ -15241,13 +15236,7 @@ mod tests {
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
             .await;
 
-        // burst job must still be running — equal explicit priorities, no preemption.
-        let burst_job = cm.get_job(burst_id).unwrap();
-        assert_eq!(
-            burst_job.state,
-            JobState::Running,
-            "burst job must keep running when both jobs have identical explicit --priority"
-        );
+        settle(&cm, burst_id, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15446,17 +15435,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preempt_uses_candidate_qos_preempt_mode_over_partition() {
+    async fn suspend_preempt_mode_does_not_make_capacity_for_a_pending_job() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
-        // Partition says Cancel; the candidate's QoS overrides it to Suspend.
         config.partitions[0].preempt_mode = "cancel".into();
+        config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
 
         cm.qos_cache().insert(Qos {
             name: "suspend-me".into(),
-            preempt_mode: spur_core::accounting::QosPreemptMode::Suspend,
+            priority: 100,
+            preempt_mode: Some(spur_core::accounting::QosPreemptMode::Suspend),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 200,
+            preempt: vec!["suspend-me".into()],
             ..Default::default()
         });
 
@@ -15475,7 +15471,7 @@ mod tests {
         settle(&cm, low_id, JobState::Running);
 
         let mut high = basic_spec("high");
-        high.priority = Some(10_000);
+        high.qos = Some("high".into());
         let high_id = submit_and_wait(&cm, high);
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
@@ -15483,9 +15479,7 @@ mod tests {
         crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
             .await;
 
-        // Suspended, not Cancelled: proves the QoS override reached the real
-        // preemption action, not just the pure job_preempt_mode() decision.
-        settle(&cm, low_id, JobState::Suspended);
+        assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24074,6 +24068,7 @@ mod tests {
             max_time_minutes: Some(1440),
             allow_accounts: vec!["ml-team".into()],
             priority_tier: 2,
+            preempt_mode: Some(spur_core::partition::PreemptMode::Cancel),
             ..Default::default()
         }
     }
@@ -24125,6 +24120,34 @@ mod tests {
         assert_eq!(gpu.state, spur_core::partition::PartitionState::Drain);
         assert_eq!(gpu.max_time_minutes, Some(2880));
         assert!(gpu.allow_accounts.contains(&"infra".into()));
+
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            allow_qos: None,
+            priority_tier: None,
+            preempt_mode: Some(String::new()),
+            is_default: None,
+            preempt_exempt_time: None,
+        });
+        assert_eq!(
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .preempt_mode,
+            None
+        );
 
         cm.apply_operation(&WalOperation::PartitionDelete { name: "gpu".into() });
         assert!(

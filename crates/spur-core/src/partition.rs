@@ -35,7 +35,8 @@ pub struct Partition {
     pub deny_qos: Vec<String>,
 
     /// Scheduling
-    pub preempt_mode: PreemptMode,
+    #[serde(default)]
+    pub preempt_mode: Option<PreemptMode>,
     pub priority_tier: u32,
     /// Partition-level override for the minimum seconds a job must have been
     /// running before it is eligible for preemption. `None` defers to the
@@ -73,10 +74,11 @@ impl std::fmt::Display for PartitionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PreemptType {
-    /// No QOS-level restrictions — eligibility is determined solely by priority
-    /// gap, partition mode, and reservation tier (existing behaviour).
+    /// Preemption is not selected. This is the safe default.
     #[default]
     None,
+    /// Explicit hard disable, retained separately from an unset selection.
+    Off,
     /// A pending job may only preempt a running job when the pending job's QOS
     /// lists the running job's QOS in its `preempt` allow-list.
     QosPriority,
@@ -154,7 +156,7 @@ impl Default for Partition {
             allow_qos: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
-            preempt_mode: PreemptMode::Off,
+            preempt_mode: None,
             priority_tier: 1,
             preempt_exempt_time: None,
         }
@@ -170,6 +172,18 @@ mod tests {
         assert!(PreemptMode::Cancel.aggressiveness() > PreemptMode::Requeue.aggressiveness());
         assert!(PreemptMode::Requeue.aggressiveness() > PreemptMode::Suspend.aggressiveness());
         assert!(PreemptMode::Suspend.aggressiveness() > PreemptMode::Off.aggressiveness());
+    }
+
+    #[test]
+    fn partition_without_preempt_mode_deserializes_as_unset() {
+        let partition = Partition {
+            name: "gpu".into(),
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(partition).unwrap();
+        value.as_object_mut().unwrap().remove("preempt_mode");
+        let decoded: Partition = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.preempt_mode, None);
     }
 
     fn partition_with_tier(name: &str, priority_tier: u32) -> Partition {

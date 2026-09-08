@@ -195,17 +195,17 @@ mod tests {
 
         let part_off = Partition {
             name: "nopreempt".into(),
-            preempt_mode: PreemptMode::Off,
+            preempt_mode: Some(PreemptMode::Off),
             ..Default::default()
         };
-        assert_eq!(part_off.preempt_mode, PreemptMode::Off);
+        assert_eq!(part_off.preempt_mode, Some(PreemptMode::Off));
 
         let part_requeue = Partition {
             name: "requeue".into(),
-            preempt_mode: PreemptMode::Requeue,
+            preempt_mode: Some(PreemptMode::Requeue),
             ..Default::default()
         };
-        assert_eq!(part_requeue.preempt_mode, PreemptMode::Requeue);
+        assert_eq!(part_requeue.preempt_mode, Some(PreemptMode::Requeue));
     }
 
     #[test]

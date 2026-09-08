@@ -653,11 +653,9 @@ pub struct SchedulerConfig {
     /// operator-only. Raise it to grant users a band above the baseline.
     #[serde(default = "default_max_user_priority")]
     pub max_user_priority: u32,
-    /// Controls which jobs are eligible to preempt which. `None` (default)
-    /// enforces no cross-QOS restrictions — any job with sufficient priority gap
-    /// may preempt any other. `QosPriority` requires the pending job's QOS to
-    /// list the running job's QOS in its `preempt` allow-list. Mirrors Slurm's
-    /// `PreemptType`.
+    /// Controls whether the scheduler may preempt jobs. `None` (default) and
+    /// `Off` disable preemption. `QosPriority` requires the pending QOS to list
+    /// the running QOS in its `preempt` allow-list and have a higher QOS priority.
     #[serde(default)]
     pub preempt_type: PreemptType,
     /// Cluster-wide minimum number of seconds a job must have been running before
@@ -1947,12 +1945,14 @@ impl SlurmConfig {
                 deny_qos: pc.deny_qos.clone(),
                 allow_qos: pc.allow_qos.clone(),
                 priority_tier: pc.priority_tier,
-                preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
-                    "cancel" => PreemptMode::Cancel,
-                    "requeue" => PreemptMode::Requeue,
-                    "suspend" => PreemptMode::Suspend,
-                    _ => PreemptMode::Off,
-                },
+                preempt_mode: (!pc.preempt_mode.is_empty()).then(|| {
+                    match pc.preempt_mode.to_lowercase().as_str() {
+                        "cancel" => PreemptMode::Cancel,
+                        "requeue" => PreemptMode::Requeue,
+                        "suspend" => PreemptMode::Suspend,
+                        _ => PreemptMode::Off,
+                    }
+                }),
                 preempt_exempt_time: pc.preempt_exempt_time,
                 ..Default::default()
             })
@@ -3166,6 +3166,40 @@ deny_accounts = ["student"]
             vec!["research".to_string(), "faculty".to_string()]
         );
         assert_eq!(parts[0].deny_accounts, vec!["student".to_string()]);
+    }
+
+    #[test]
+    fn preemption_config_preserves_unset_and_explicit_off() {
+        let unset = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+"#,
+        )
+        .unwrap();
+        assert_eq!(unset.scheduler.preempt_type, PreemptType::None);
+        assert_eq!(unset.build_partitions()[0].preempt_mode, None);
+
+        let configured = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[scheduler]
+preempt_type = "off"
+
+[[partitions]]
+name = "gpu"
+preempt_mode = "off"
+"#,
+        )
+        .unwrap();
+        assert_eq!(configured.scheduler.preempt_type, PreemptType::Off);
+        assert_eq!(
+            configured.build_partitions()[0].preempt_mode,
+            Some(PreemptMode::Off)
+        );
     }
 
     #[test]

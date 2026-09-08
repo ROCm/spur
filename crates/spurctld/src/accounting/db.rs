@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS qos (
     name            TEXT PRIMARY KEY,
     description     TEXT NOT NULL DEFAULT '',
     priority        INTEGER NOT NULL DEFAULT 0,
-    preempt_mode    TEXT NOT NULL DEFAULT 'off',
+    preempt_mode    TEXT NOT NULL DEFAULT '',
     preempt         TEXT NOT NULL DEFAULT '',
     usage_factor    REAL NOT NULL DEFAULT 1.0,
     max_jobs_per_user INTEGER,
@@ -162,6 +162,7 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';

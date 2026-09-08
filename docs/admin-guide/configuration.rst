@@ -486,16 +486,11 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        cancelled.
    * - ``preempt_type``
      - string
-     - ``"none"``
+     - unset
      - Live
-     - Controls cross-QOS preemption eligibility. ``"none"`` (default) applies no
-       QOS-level restrictions — any job with a sufficient priority gap may preempt
-       any other. ``"qos_priority"`` enforces the per-QOS ``preempt`` allow-list:
-       a pending job may only preempt a running job when the pending job's QOS
-       explicitly lists the running job's QOS name in its ``preempt`` field. An
-       empty allow-list means the QOS may not preempt anything. Mirrors Slurm's
-       ``PreemptType=preempt/qos``. See :doc:`accounting` for the QOS
-       ``preempt`` field.
+     - Preemption is disabled when unset or ``"off"``. ``"qos_priority"`` enables
+       QOS-priority preemption, which requires both the pending QOS allow-list and
+       a higher stable QOS priority. See :doc:`accounting` for the decision table.
    * - ``preempt_exempt_time``
      - integer
      - ``0``
@@ -526,17 +521,13 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    available capacity — it does not reclaim capacity already given to a
    running job. Configure:
 
-   - A priority gap of more than 2× between the jobs that must run and the
-     jobs they need to be able to displace (via base ``--priority``, QOS
-     ``priority``, or a combination — see :doc:`accounting` for how the
-     effective priority gap is computed).
-   - ``preempt_type`` (and, if a running job should not simply be killed,
-     ``preemptmode=requeue`` or ``suspend`` on its QOS) so that gap actually
-     triggers preemption instead of only affecting scheduling order.
+   - ``preempt_type = "qos_priority"``.
+   - A pending QOS with a higher stable QOS priority and an allow-list entry
+     for the victim QOS.
+   - A victim action of ``cancel`` or ``requeue`` at its QOS or partition.
 
-   With both in place, a high-priority job that cannot find free capacity
-   will preempt a lower-priority running job holding the capacity it needs,
-   rather than waiting for it to finish on its own.
+   With those policy settings in place, a pending job that cannot find free
+   capacity can preempt an eligible lower-QOS job holding the capacity it needs.
 
 .. note::
 
@@ -747,7 +738,7 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
        tier among them.
    * - ``preempt_mode``
      - string
-     - ``"off"``
+     - unset
      - What the scheduler does to a running job when a higher-priority job needs
        its node.
 
@@ -759,13 +750,12 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
        finishes. Because the node stays occupied, any other job that also needs
        that node exclusively will have to wait until the paused job either
        finishes or is cancelled.
-       ``"off"`` (default) — running jobs in this partition are never kicked
-       out. The scheduler will wait for a free slot instead of preempting.
+       unset (default) — no partition action is configured.
+       ``"off"`` — running jobs in this partition are never kicked out.
 
-       A job's QOS can change what happens to *that specific job* when it is
-       kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
-       field is the on/off switch: preemption is only attempted at all when
-       this is set to something other than ``"off"``.
+       A victim QOS action overrides a partition action. An explicit ``"off"``
+       at either scope protects the victim; when both are unset, there is no
+       action. See :doc:`accounting` for the complete decision table.
    * - ``preempt_exempt_time``
      - integer or null
      - ``null`` (inherit global)

@@ -238,7 +238,8 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
         name: r.name,
         description: r.description,
         priority: r.priority,
-        preempt_mode: r.preempt_mode.parse::<QosPreemptMode>().unwrap_or_default(),
+        preempt_mode: (!r.preempt_mode.is_empty())
+            .then(|| r.preempt_mode.parse::<QosPreemptMode>().unwrap_or_default()),
         preempt: r
             .preempt
             .split(',')
@@ -390,7 +391,7 @@ mod tests {
         assert_eq!(qos.limits.max_submit_jobs_per_account, Some(40));
         assert_eq!(qos.limits.grp_submit_jobs, Some(30));
         assert_eq!(qos.priority, 100);
-        assert_eq!(qos.preempt_mode, QosPreemptMode::Cancel);
+        assert_eq!(qos.preempt_mode, Some(QosPreemptMode::Cancel));
         assert_eq!(qos.usage_factor, 2.0);
         assert_eq!(qos.limits.max_jobs_per_user, Some(10));
         assert_eq!(qos.limits.max_wall_minutes, Some(60));
