@@ -681,8 +681,8 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
 
 Time values for ``max_time`` and ``default_time`` accept ``minutes``,
 ``minutes:seconds``, ``hours:minutes:seconds``, ``days-hours``,
-``days-hours:minutes``, and ``days-hours:minutes:seconds``, as well as suffixed
-durations and ``INFINITE`` / ``UNLIMITED``. Partition limits round up to whole
+``days-hours:minutes``, and ``days-hours:minutes:seconds``, as well as values
+with suffixes and ``INFINITE`` / ``UNLIMITED``. Partition limits round up to whole
 minutes. Seconds fields carry into whole minutes before rounding: ``0:0:90`` is
 two minutes, and ``2-0:0:90`` is two days and two minutes.
 
@@ -690,7 +690,7 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
 
    Two-field colon values now mean minutes:seconds, not hours:minutes. When
    upgrading from the previous interpretation, replace values intended as
-   hours:minutes with explicit ``HH:MM:SS`` in partition configs and job
+   hours:minutes with explicit ``HH:MM:SS`` in partition configuration and job
    ``--time`` arguments. For example, use ``30:00:00`` for thirty hours;
    ``30:00`` now means thirty minutes. Bare ``days-hours`` values such as
    ``2-12`` now produce a finite duration of two days and twelve hours.
