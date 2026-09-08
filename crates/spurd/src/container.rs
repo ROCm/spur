@@ -610,14 +610,21 @@ fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::Conta
         }
     }
 
-    // Record the injected library mounts in the job's log (spur#779): overlaying
-    // host libraries over the image's is a substitution the job can otherwise
-    // only detect by reading /proc/self/mountinfo, so name it where it's visible.
-    if !plan.mounts.is_empty() {
-        let overlaid: Vec<&str> = plan.mounts.iter().map(|m| m.target.as_str()).collect();
+    // Record the host-ROCm library overlay in the job's log: overlaying host
+    // libraries over the image's is a substitution the job can otherwise only
+    // detect by reading /proc/self/mountinfo, so name it where it's visible. Only
+    // the /opt/rocm library paths are called out — plan.mounts also carries
+    // device-node and site-authored CDI mounts, which are not a userspace swap.
+    let rocm_overlaid: Vec<&str> = plan
+        .mounts
+        .iter()
+        .map(|m| m.target.as_str())
+        .filter(|t| t.starts_with("/opt/rocm/"))
+        .collect();
+    if !rocm_overlaid.is_empty() {
         info!(
-            mounts = ?overlaid,
-            "overlaying host library paths onto the container image (replacing the image's own)"
+            mounts = ?rocm_overlaid,
+            "overlaying host ROCm libraries onto the container image (replacing the image's own)"
         );
     }
 

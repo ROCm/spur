@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E for the host-ROCm container library overlay policy (spur#779).
+"""E2E for the host-ROCm container library overlay policy.
 
 On a GPU host, spur's auto-detected AMD CDI spec can bind-mount the host's
 /opt/rocm/lib over the same path inside every GPU container, replacing the
@@ -40,9 +40,11 @@ echo OVERLAY_PROBE_OK
 
 
 def _node_has_gpu_and_rocm(cluster) -> bool:
+    # Each condition must actually gate: a piped `ls | head` always exits 0, so
+    # test the device node and a render node directly.
     probe = cluster.nodes[0].exec_allow_fail(
-        "ls /dev/kfd /dev/dri/renderD* 2>/dev/null | head -1 && test -d /opt/rocm/lib "
-        "&& echo READY"
+        "test -e /dev/kfd && ls /dev/dri/renderD* >/dev/null 2>&1 "
+        "&& test -d /opt/rocm/lib && echo READY"
     )
     return "READY" in probe
 
@@ -61,8 +63,10 @@ def _run_probe(cluster, overlay_on: bool, tmp_path) -> tuple[dict, str]:
     img = cluster.build_container_image(tmp_path, rootfs_extra=ROOTFS_EXTRA)
     probe = cluster.write_file("overlay-probe.sh", PROBE)
     out = f"{cluster.remote_dir}/overlay-{overlay_on}.out"
+    # Pin to node 0: write_file placed the probe on node 0 only, and node 0 is
+    # the one _node_has_gpu_and_rocm verified.
     sb = cluster.sbatch(
-        ["-J", "rocm-overlay", "-N", "1", "--gres=gpu:1",
+        ["-J", "rocm-overlay", "-N", "1", "-w", cluster.node_names[0], "--gres=gpu:1",
          f"--container-image={img}", "-o", out, probe]
     )
     job_id = parse_job_id(sb)

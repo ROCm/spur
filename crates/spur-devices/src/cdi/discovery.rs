@@ -22,8 +22,8 @@ const IO_LINK_XGMI: u32 = 2;
 const GPU_SUPPLEMENTARY_GROUPS: [&str; 2] = ["video", "render"];
 
 /// Build the auto-detected AMD CDI spec. `overlay_host_rocm_libs` decides
-/// whether the host's `/opt/rocm/lib{,64}` is bind-mounted over the image's
-/// (spur#779); device nodes and GPU groups are injected regardless.
+/// whether the host's `/opt/rocm/lib{,64}` is bind-mounted over the image's;
+/// device nodes and GPU groups are injected regardless.
 pub fn discover_to_cdi(overlay_host_rocm_libs: bool) -> Vec<CdiSpec> {
     let gpus = discover_amd_gpus();
     if gpus.is_empty() {
@@ -361,30 +361,39 @@ fn build_shared_edits(overlay_host_rocm_libs: bool) -> ContainerEdits {
         });
     }
 
-    // The host-ROCm library overlay is opt-in (spur#779). Default off keeps the
-    // image's own userspace, matching `docker run --device=/dev/kfd ...`;
-    // overlaying the host's runtime/math/tuning libraries over the image's is a
-    // silent version split. Device nodes and GPU groups are injected either way.
-    if overlay_host_rocm_libs {
-        for lib_path in &["/opt/rocm/lib", "/opt/rocm/lib64"] {
-            if Path::new(lib_path).is_dir() {
-                edits.mounts.push(Mount {
-                    host_path: lib_path.to_string(),
-                    container_path: lib_path.to_string(),
-                    r#type: None,
-                    options: Some(vec![
-                        "ro".into(),
-                        "nosuid".into(),
-                        "nodev".into(),
-                        "bind".into(),
-                    ]),
-                });
-            }
-        }
-    }
-
+    edits.mounts = rocm_lib_overlay_mounts(overlay_host_rocm_libs, ROCM_LIB_DIRS);
     edits.additional_gids = gpu_supplementary_gids_from_group_file("/etc/group");
     edits
+}
+
+/// Host ROCm library directories overlaid into a GPU container, when enabled.
+const ROCM_LIB_DIRS: &[&str] = &["/opt/rocm/lib", "/opt/rocm/lib64"];
+
+/// Read-only bind mounts overlaying the host's ROCm libraries onto a container,
+/// or empty when the overlay is off. Opt-in: the default keeps the image's own
+/// userspace (matching `docker run --device=/dev/kfd ...`); overlaying the
+/// host's runtime/math/tuning libraries is a silent version split. Only
+/// directories that exist on the host are mounted. Split out from
+/// `build_shared_edits` so the gate is testable without a real `/opt/rocm`.
+fn rocm_lib_overlay_mounts(overlay_host_rocm_libs: bool, candidates: &[&str]) -> Vec<Mount> {
+    if !overlay_host_rocm_libs {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .filter(|p| Path::new(p).is_dir())
+        .map(|lib_path| Mount {
+            host_path: lib_path.to_string(),
+            container_path: lib_path.to_string(),
+            r#type: None,
+            options: Some(vec![
+                "ro".into(),
+                "nosuid".into(),
+                "nodev".into(),
+                "bind".into(),
+            ]),
+        })
+        .collect()
 }
 
 fn lookup_group_gid_in(group_file: &str, name: &str) -> Option<u32> {
@@ -817,30 +826,28 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_edits_library_overlay_is_gated() {
-        // The overlay flag governs only the /opt/rocm library bind mounts, and
-        // only when the host actually has those directories.
-        let host_has_rocm = std::path::Path::new("/opt/rocm/lib").is_dir()
-            || std::path::Path::new("/opt/rocm/lib64").is_dir();
+    fn test_rocm_lib_overlay_is_gated() {
+        // Inject a candidate directory that DOES exist (a tempdir) so the test is
+        // falsifiable regardless of whether the host has /opt/rocm: removing the
+        // gate would make the "off" case produce a mount and fail here.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let candidates = [path];
 
-        let off = build_shared_edits(false);
+        let off = rocm_lib_overlay_mounts(false, &candidates);
         assert!(
-            off.mounts.is_empty(),
-            "no library mounts must be injected when the overlay is off, got {:?}",
-            off.mounts
+            off.is_empty(),
+            "overlay off must inject no library mounts, got {off:?}"
         );
 
-        let on = build_shared_edits(true);
-        if host_has_rocm {
-            assert!(
-                on.mounts
-                    .iter()
-                    .any(|m| m.host_path.starts_with("/opt/rocm/lib")),
-                "overlay on + host ROCm present must inject the library mounts"
-            );
-        }
-        // Device-node injection is independent of the overlay flag.
-        assert_eq!(off.device_nodes.len(), on.device_nodes.len());
+        let on = rocm_lib_overlay_mounts(true, &candidates);
+        assert_eq!(on.len(), 1, "overlay on must mount the existing candidate");
+        assert_eq!(on[0].host_path, path);
+        assert_eq!(on[0].container_path, path);
+
+        // A candidate that does not exist is never mounted, even when opted in.
+        let missing = rocm_lib_overlay_mounts(true, &["/no/such/rocm/lib"]);
+        assert!(missing.is_empty());
     }
 
     #[test]

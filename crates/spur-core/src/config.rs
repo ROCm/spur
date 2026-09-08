@@ -1247,9 +1247,12 @@ pub struct DevicesConfig {
     /// userspace with the host's. Off by default: `docker run` on the same
     /// hardware leaves the image's libraries in place, and overlaying a
     /// different runtime/math-library/tuning stack than the image pins is a
-    /// silent version split (see spur#779). Device nodes (`/dev/kfd`,
+    /// silent version split. Device nodes (`/dev/kfd`,
     /// `/dev/dri/*`) and the GPU supplementary groups are injected regardless;
-    /// this flag governs only the library overlay.
+    /// this flag governs only the library overlay. It applies only to the
+    /// auto-detected AMD spec, so it is inert on a node that has any on-disk CDI
+    /// spec (auto-detection is skipped there), and it does not affect k0s/pod
+    /// containers, whose CDI spec never carries the overlay.
     #[serde(default)]
     pub overlay_host_rocm_libs: bool,
 }
@@ -2844,8 +2847,8 @@ job_submit_lua = "/etc/spur/job_submit.lua"
 
     #[test]
     fn test_devices_host_rocm_overlay_defaults_off() {
-        // The host-ROCm library overlay must be off by default (spur#779): a job
-        // gets the image's userspace unless the operator opts in.
+        // The host-ROCm library overlay must be off by default: a job gets the
+        // image's userspace unless the operator opts in.
         let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
         assert!(!config.devices.overlay_host_rocm_libs);
         assert!(
