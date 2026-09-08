@@ -458,20 +458,23 @@ async fn run_containerized_step(
                 libc::dup2(stderr_fd, libc::STDERR_FILENO);
             }
 
-            crate::container::close_inherited_fds(ready_w_fd);
+            crate::container::close_inherited_fds(&[ready_w_fd]);
 
             executor::apply_memlock(memlock);
 
-            let hook_env = match crate::container::container_init(&container_cfg, &rootfs_clone) {
-                Ok(env) => env,
-                Err(e) => {
-                    let msg = format!("E:{e:#}");
-                    unsafe {
-                        libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+            // Step containers do not support --container-remap-root yet (it is
+            // rejected at submission); pass None.
+            let hook_env =
+                match crate::container::container_init(&container_cfg, &rootfs_clone, None) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        let msg = format!("E:{e:#}");
+                        unsafe {
+                            libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+                        }
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
-                }
-            };
+                };
 
             unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
             drop(ready_w);
@@ -2329,6 +2332,16 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
+        }
+        // --container-remap-root is not yet supported for job steps (only batch
+        // containers implement it). Reject rather than silently run as the
+        // submitting user: the srun CLI already rejects it, but a direct gRPC
+        // client would otherwise bypass that guard.
+        if req.container.as_ref().is_some_and(|c| c.remap_root) {
+            return Err(Status::invalid_argument(
+                "--container-remap-root is not yet supported for job steps; run it as a \
+                 batch container job (sbatch --container-image ... --container-remap-root)",
+            ));
         }
         // Steps carry their own uid straight from the wire — gate them exactly like a batch launch.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
@@ -5211,6 +5224,38 @@ mod tests {
         assert!(
             err.message().contains("not found"),
             "expected an image-resolution failure, got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_container_remap_root_on_steps() {
+        // --container-remap-root is batch-only; a step that sets it (even a
+        // direct gRPC client bypassing the srun CLI guard) must be refused, not
+        // silently run as the submitting user.
+        let (svc, job_id) = run_command_test_setup().await;
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "hi".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            container: Some(spur_proto::proto::ContainerSpec {
+                image: "/some/image.sqsh".into(),
+                remap_root: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let err = svc
+            .run_command(req)
+            .await
+            .expect_err("a step with --container-remap-root must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("--container-remap-root"),
+            "rejection should name the flag, got: {}",
             err.message()
         );
     }
