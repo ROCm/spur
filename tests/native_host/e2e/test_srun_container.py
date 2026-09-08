@@ -725,12 +725,12 @@ class TestSrunPtyContainerStep:
         assert MARKER_CONTENT in out, f"pty container step not in container:\n{out}"
         assert "NO-TTY" not in out, f"pty container step did not get a tty:\n{out}"
 
-    def test_pty_nested_srun_enters_parent_container(self, step_container_cluster):
-        # `sbatch --container-image` keeps a container alive; `srun --jobid
-        # --overlap --pty` then attaches and enters the *running* container via
-        # nsenter (not a fresh rootfs). The nested srun carries no image, so the
-        # controller resolves the inherited one and the agent joins the parent's
-        # namespaces.
+    def test_pty_nested_srun_overlap_attach_enters_parent_container(self, step_container_cluster):
+        # Nested via EXTERNAL attach: `sbatch --container-image` keeps a container
+        # alive; a host-side `srun --jobid --overlap --pty` attaches and enters the
+        # *running* container via nsenter (not a fresh rootfs). The nested srun
+        # carries no image, so the controller resolves the inherited one and the
+        # agent joins the parent's namespaces.
         cluster = step_container_cluster
         img = cluster.step_container_image
         sleeper = cluster.write_file("pty-sleeper.sh", "#!/bin/bash\nsleep 120\n")
@@ -754,6 +754,35 @@ class TestSrunPtyContainerStep:
             )
         finally:
             cluster.scancel(job_id)
+
+    def test_pty_nested_srun_from_batch_script_enters_parent_container(self, step_container_cluster):
+        # Nested via a BATCH SCRIPT: a containerized `sbatch` runs a nested
+        # `srun --pty` itself (how a multi-node launcher nests interactive steps).
+        # It enters the batch job's running container via nsenter. Toolchain mounts
+        # make the host `srun` runnable inside the pivoted container; the batch
+        # stdin is non-interactive, so this relies on the pty output being drained
+        # rather than hung up on stdin-EOF.
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        out_path = f"{cluster.remote_dir}/pty-nested-inside.out"
+        script = cluster.write_file(
+            "pty-nested-inside.sh",
+            f"#!/bin/bash\n{cluster.bin_dir}/srun --pty cat '{MARKER_PATH}'\n",
+        )
+        sb = cluster.sbatch([
+            "-J", "pty-nested-in", "-N", "1", "-t", "0:03", "-o", out_path,
+            f"--container-image={img}",
+            *_toolchain_mounts(cluster),
+            script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch did not return a job id: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.read_output_on_any_node(out_path)
+        diag = cluster.debug_job(job_id)
+        assert MARKER_CONTENT in out, (
+            f"nested --pty srun (from batch script) did not enter parent container:\n{diag}\n{out}"
+        )
 
     def test_pty_without_image_runs_on_host(self, step_container_cluster):
         # A --pty step with no image runs on the host and cannot see the in-image
