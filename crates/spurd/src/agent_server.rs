@@ -4655,10 +4655,8 @@ impl AgentService {
         use tokio::io::unix::AsyncFd;
         use tokio_stream::StreamExt;
 
-        // The workload's exit is delivered by `wait_exit`: a `tokio::process::Child`
-        // wait for the host/nsenter path, or a blocking `waitpid` for a raw-forked
-        // container step. Pinned so it can be polled in the select and, if the loop
-        // exits first (EOF/disconnect), awaited once more to reap.
+        // Pinned so `wait_exit` can be polled in the select and, if the loop exits
+        // first (EOF/disconnect), awaited once more to reap.
         tokio::pin!(wait_exit);
 
         let master_raw = master.as_raw_fd();
