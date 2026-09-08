@@ -196,11 +196,9 @@ pub async fn open_interactive_session(
     user: &str,
     container: Option<spur_proto::proto::ContainerSpec>,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
-    // When our stdin is not a TTY (a script, redirected input, a pipe), the
-    // client closes its input stream as soon as stdin hits EOF. Tell the agent so
-    // it treats that as stdin-EOF (drain output, let the command finish) rather
-    // than a hangup (SIGHUP). Interactive clients keep the hangup-on-disconnect
-    // behavior.
+    // Non-TTY stdin (script, pipe, redirect) closes the input stream on EOF, not
+    // on hangup. Flag it so the agent drains output instead of SIGHUP-ing the
+    // step; interactive clients keep hangup-on-disconnect.
     let non_interactive = !std::io::stdin().is_terminal();
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
