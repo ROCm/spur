@@ -4829,14 +4829,11 @@ impl AgentService {
         Ok(())
     }
 
-    /// Launch an interactive PTY step inside a fresh container rootfs. The
-    /// effective image is resolved controller-side (the step's own
-    /// `--container-image`, else inherited from a containerized `salloc`/`sbatch`
-    /// allocation). Mirrors `run_command`'s Case 2, but wires the child's stdio to
-    /// a PTY slave (so the workload owns a real terminal) and returns the master
-    /// fd for [`Self::run_pty_bridge`] instead of collecting spooled output.
-    /// Returns `(pty_master, child_pid, rootfs_guard)`; the caller holds the guard
-    /// for the session's lifetime so the rootfs is torn down when it ends.
+    /// Launch an interactive PTY step in a fresh container rootfs, using the
+    /// controller-resolved effective image. Like `run_command`'s Case 2, but wires
+    /// the child's stdio to a PTY slave and returns the master fd for
+    /// [`Self::run_pty_bridge`]. The caller holds the returned rootfs guard for the
+    /// session so the rootfs is torn down when it ends.
     async fn spawn_containerized_pty_step(
         &self,
         job_id: u32,
