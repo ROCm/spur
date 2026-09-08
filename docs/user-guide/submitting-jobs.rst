@@ -138,10 +138,12 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - CPUs per task. Default ``1``.
    * - ``--mem``
      -
-     - Memory per node. ``512G`` and ``4096M`` use suffixes; a bare ``4096`` means MB.
+     - Memory per node. Takes a ``K``, ``M``, ``G``, or ``T`` suffix
+       (case-insensitive), e.g. ``512G`` or ``4096M``; a bare ``4096`` means MB.
+       ``sbatch``, ``srun``, and ``salloc`` accept the same set.
    * - ``--mem-per-cpu``
      -
-     - Memory per allocated CPU instead of per node.
+     - Memory per allocated CPU instead of per node. Same suffixes as ``--mem``.
    * - ``--gres``
      -
      - Generic resources, e.g. ``gpu:4`` or ``gpu:mi300x:8``. See

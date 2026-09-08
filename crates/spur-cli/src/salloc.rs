@@ -4,6 +4,7 @@
 use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use spur_core::resource::parse_memory_mb;
 use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
@@ -415,18 +416,6 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
         &["SPUR_EXCLUSIVE", "SALLOC_EXCLUSIVE"],
         &mut args.exclusive,
     );
-}
-
-fn parse_memory_mb(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-        let val: f64 = gb.parse().context("invalid memory value")?;
-        Ok((val * 1024.0) as u64)
-    } else if let Some(mb) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        Ok(mb.parse().context("invalid memory value")?)
-    } else {
-        Ok(s.parse().context("invalid memory value")?)
-    }
 }
 
 #[cfg(test)]
