@@ -24,7 +24,7 @@ import tomli_w
 logger = logging.getLogger(__name__)
 
 BINARIES = ["spurctld", "spurd", "spur"]
-CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
+CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol", "sbcast"]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))

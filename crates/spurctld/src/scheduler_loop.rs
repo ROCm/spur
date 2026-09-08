@@ -3162,6 +3162,14 @@ mod tests {
                 Ok(tonic::Response::new(Default::default()))
             }
 
+            async fn receive_file(
+                &self,
+                _request: tonic::Request<spur_proto::proto::ReceiveFileRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::ReceiveFileResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
             async fn run_command(
                 &self,
                 _request: tonic::Request<spur_proto::proto::RunCommandRequest>,
