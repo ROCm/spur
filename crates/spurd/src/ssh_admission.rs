@@ -61,7 +61,7 @@ impl LocalJobs {
         unique_snapshot(&*self.running.lock().await, user, uid)
     }
 
-    async fn finish(
+    pub(crate) async fn finish(
         &self,
         snapshot: &Snapshot,
         controller: &JobInfo,

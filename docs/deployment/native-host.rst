@@ -204,7 +204,8 @@ Admission fails closed when the local allocation is missing, ambiguous, revoked,
 ineligible, or not cgroup-enforced; when the controller is unavailable; or when
 owner, placement, generation, running state, or time-limit checks fail. Container
 allocations and allocation-only standalone ``srun`` registrations are not supported.
-Suspension revokes further admission for that local generation; resume does not
+Suspension and explicit job signals revoke further admission for that local
+generation, including nonterminating signals such as ``SIGUSR1``; resume does not
 restore it. Existing batch jobs, ``spur exec``, and ``spur run`` retain their APIs.
 
 Limits and deployment gate

@@ -4107,7 +4107,7 @@ impl AgentService {
     }
 
     async fn revoke_ssh(&self, job_id: u32) {
-        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        // Launch holds the lifecycle lock while cancellation must remain able to release its reservation.
         if let Some(tracked) = self.running.lock().await.get_mut(&job_id) {
             tracked.ssh_eligible = false;
         }
@@ -4278,7 +4278,6 @@ impl AgentService {
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
     async fn suspend_signal(&self, job_id: u32, resume: bool) {
-        let _lifecycle = self.lifecycle.acquire(job_id).await;
         let mut jobs = self.running.lock().await;
         let Some(tracked) = jobs.get_mut(&job_id) else {
             return;
@@ -7564,6 +7563,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ssh_admission_revocation_during_handoff_preserves_generation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        svc.running
+            .lock()
+            .await
+            .insert(7, TrackedJob::ssh_fixture(dir.path().into(), true));
+        let jobs = svc.ssh_jobs();
+        let snapshot = svc.running.lock().await[&7]
+            .ssh_snapshot(7, "alice", 1001)
+            .unwrap();
+        let controller = JobInfo {
+            job_id: 7,
+            user: "alice".into(),
+            uid: 1001,
+            state: spur_proto::proto::JobState::JobRunning as i32,
+            exclusive: true,
+            nodelist: "test-node".into(),
+            run_attempt: Some(snapshot.run_attempt),
+            start_time: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let admission = jobs.finish(&snapshot, &controller, "test-node", &mut server, true);
+        let revoke = async {
+            assert_eq!(client.read_u8().await.unwrap(), b'F');
+            let mut revocation = std::pin::pin!(svc.revoke_ssh(7));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(revocation.as_mut(), &mut context).is_ready());
+            let running = svc.running.lock().await;
+            assert!(Arc::ptr_eq(
+                &snapshot.generation,
+                &running[&7].ssh_generation
+            ));
+            drop(running);
+            client.write_all(b"JOINED\n").await.unwrap();
+        };
+        let (result, ()) = tokio::join!(admission, revoke);
+        assert!(
+            result.is_err(),
+            "revoked allocation must not complete admission"
+        );
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            response.is_empty(),
+            "revoked allocation must not receive OK"
+        );
+        drop(jobs.lifecycle.acquire(7).await);
+    }
+
+    #[tokio::test]
+    async fn ssh_admission_cancel_releases_launch_reservation_without_lifecycle_wait() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        for signal in [0, libc::SIGTERM] {
+            let _launch = svc.lifecycle.acquire(7).await;
+            svc.allocation
+                .lock()
+                .await
+                .allocate_for_job(7, 1, 0, &[])
+                .unwrap();
+            let mut request = Request::new(AgentCancelJobRequest { job_id: 7, signal });
+            request.extensions_mut().insert(controller_identity());
+            let mut cancel = std::pin::pin!(svc.cancel_job(request));
+            let mut context = Context::from_waker(Waker::noop());
+            match cancel.as_mut().poll(&mut context) {
+                Poll::Ready(result) => result.unwrap(),
+                Poll::Pending => panic!("cancellation must not wait behind the launch it cancels"),
+            };
+            assert!(!svc.allocation.lock().await.commit_job(7));
+        }
+    }
+
+    #[tokio::test]
     async fn ssh_admission_revocation_and_suspend_keep_generation_ineligible() {
         let svc = AgentService::new(
             test_reporter(),
@@ -7578,12 +7675,21 @@ mod tests {
                 .await
                 .insert(7, TrackedJob::ssh_fixture(dir.path().into(), true));
             let before = svc.running.lock().await[&7].ssh_generation.clone();
-            if suspend {
-                svc.suspend_signal(7, false).await;
-                svc.suspend_signal(7, true).await;
-            } else {
-                svc.revoke_ssh(7).await;
-            }
+            let _adoption = svc.lifecycle.acquire(7).await;
+            let operation = async {
+                if suspend {
+                    svc.suspend_signal(7, false).await;
+                    svc.suspend_signal(7, true).await;
+                } else {
+                    svc.revoke_ssh(7).await;
+                }
+            };
+            let mut operation = std::pin::pin!(operation);
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(operation.as_mut(), &mut context).is_ready(),
+                "revocation must not wait for an in-flight adoption"
+            );
             let jobs = svc.running.lock().await;
             let tracked = &jobs[&7];
             assert!(Arc::ptr_eq(&before, &tracked.ssh_generation));
