@@ -11,8 +11,6 @@ namespace and writes to /root succeed — while never becoming host root.
 
 import time
 
-import pytest
-
 from cluster import job_state, parse_job_id
 
 # Pure bash (minimal image). Report the in-container uid and whether a write to
