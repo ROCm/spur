@@ -169,7 +169,7 @@ the image from its containerized ``sbatch`` job:
    sbatch -N1 --container-image trainer.sqsh long_job.sh
    srun --jobid=<id> --overlap --pty bash            # same container, interactive
 
-A ``--pty`` step nested inside a containerized ``sbatch``/``salloc`` job enters
+A ``--pty`` step nested inside a containerized ``sbatch`` job enters
 the parent's running container (like any other nested step) rather than building
 a fresh one.
 
