@@ -2853,8 +2853,7 @@ impl SlurmAgent for AgentService {
             // host's mount namespace, where a job's work_dir need not exist.
             cmd.current_dir(&entry.work_dir);
         }
-        // Start from an empty environment so spurd's own environment (secrets
-        // included) never leaks into the exec'd command; then apply the job's own.
+        // env_clear so spurd's own environment (secrets included) never leaks in.
         cmd.env_clear();
         cmd.env(
             "PATH",
