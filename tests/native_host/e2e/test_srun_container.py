@@ -688,7 +688,7 @@ class TestSrunContainerStepSanity:
 
 
 # ---------------------------------------------------------------------------
-# Interactive PTY steps: `srun --pty --container-image` (issue #780 x #777)
+# Interactive PTY steps: `srun --pty --container-image`
 # ---------------------------------------------------------------------------
 
 
