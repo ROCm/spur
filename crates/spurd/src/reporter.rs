@@ -221,7 +221,10 @@ impl NodeReporter {
                     reason: reason.to_string(),
                 };
                 match spur_proto::controller_client(channel).drain_node(req).await {
-                    Ok(resp) => warn!(
+                    // The caller already warned about the failing check; a
+                    // successful drain each interval on a persistently unhealthy
+                    // node would just spam warnings, so log the outcome at info.
+                    Ok(resp) => info!(
                         node = %self.hostname,
                         state = %resp.into_inner().actual_state,
                         %reason,

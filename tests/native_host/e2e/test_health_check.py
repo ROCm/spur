@@ -13,7 +13,7 @@ handing it to the next job.
 
 import time
 
-from cluster import job_state, parse_job_id, wait_job
+from cluster import parse_job_id, wait_job
 
 
 PASSING_HEALTH = "#!/bin/bash\nexit 0\n"
