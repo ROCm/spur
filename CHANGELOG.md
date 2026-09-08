@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.11.0](https://github.com/ROCm/spur/compare/v0.10.0...v0.11.0) (2026-09-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurd:** stop injecting torch rendezvous env vars, match Slurm ([#793](https://github.com/ROCm/spur/issues/793))
+
+### Features
+
+* **cgroup:** add [cgroup] config and derive limits from the node allocation ([#762](https://github.com/ROCm/spur/issues/762)) ([bda405f](https://github.com/ROCm/spur/commit/bda405f9c39da5529f3a48fe5866aa52fb14cd88))
+* **spur-cli:** add scontrol show assoc_mgr for limits against live usage ([#746](https://github.com/ROCm/spur/issues/746)) ([4c3719d](https://github.com/ROCm/spur/commit/4c3719d79f1968b7d34efd5df5c3407abaef73fe))
+* **spur-cli:** honor --pty for srun steps in an allocation ([#820](https://github.com/ROCm/spur/issues/820)) ([de79428](https://github.com/ROCm/spur/commit/de794288e0e023aa4071502eb62ee437b99a37c0))
+* **spurd:** file-back and live-stream srun step output ([#819](https://github.com/ROCm/spur/issues/819)) ([ee98dc3](https://github.com/ROCm/spur/commit/ee98dc3810f6532f12f1b4caabb9520dd6c87fb2))
+* **spurd:** honor --container-image for srun --pty steps ([#845](https://github.com/ROCm/spur/issues/845)) ([2dfe3bb](https://github.com/ROCm/spur/commit/2dfe3bb0e1e7f14ed29cabf7bb9fb1956367eaa2))
+* **spurd:** implement containerized srun job steps on bare-metal nodes ([#833](https://github.com/ROCm/spur/issues/833)) ([e71fc8b](https://github.com/ROCm/spur/commit/e71fc8b99c6d14e2b115121cb2eab2460893f5fe))
+
+
+### Bug Fixes
+
+* **spur-cli:** honor --export=ALL,VAR=val combined form and inline assignments ([#795](https://github.com/ROCm/spur/issues/795)) ([7093e3f](https://github.com/ROCm/spur/commit/7093e3fbdb54bb28b3f236bdb64f058897344c36))
+* **spur-cli:** render squeue %L (TIME_LEFT) instead of ? ([#815](https://github.com/ROCm/spur/issues/815)) ([2369a96](https://github.com/ROCm/spur/commit/2369a96d872d749b7ff521ccaf5f9fd49e7322ef))
+* **spurctld:** hold jobs whose QOS or association limits cannot be read ([#744](https://github.com/ROCm/spur/issues/744)) ([b58a7d8](https://github.com/ROCm/spur/commit/b58a7d83b7e9457ea5da0e103f6f0f433a5fa797))
+* **spurctld:** make cni=calico work without the WireGuard mesh ([#812](https://github.com/ROCm/spur/issues/812)) ([c6d6894](https://github.com/ROCm/spur/commit/c6d6894495f3a01da1e5cbee8d7cc5e21ce6eba1))
+* **spurd:** kernel-enforced GPU device isolation across every launch path ([#814](https://github.com/ROCm/spur/issues/814)) ([4bae73a](https://github.com/ROCm/spur/commit/4bae73aff0e55027e3274dd3a94045346f365323))
+* **spurd:** kill container child before rootfs cleanup, honor --chdir in steps ([#838](https://github.com/ROCm/spur/issues/838)) ([f9655a6](https://github.com/ROCm/spur/commit/f9655a654b21c8482fb448f2fe4f6f9746a0f81c))
+* **spurd:** start container jobs from the image's config.Env ([#676](https://github.com/ROCm/spur/issues/676)) ([3c873a5](https://github.com/ROCm/spur/commit/3c873a5120862b36d34a5bb16908da518094026e))
+* **spurd:** stop injecting torch rendezvous env vars, match Slurm ([#793](https://github.com/ROCm/spur/issues/793)) ([fba350d](https://github.com/ROCm/spur/commit/fba350d75b03c5032067886f98e73a8c8c43f382))
+* **tests:** pull e2e postgres image from mirror.gcr.io ([#796](https://github.com/ROCm/spur/issues/796)) ([3d950d7](https://github.com/ROCm/spur/commit/3d950d798a3646d18ad7a9fea8f7008df3ef080b))
+
 ## [0.10.0](https://github.com/ROCm/spur/compare/v0.9.1...v0.10.0) (2026-09-01)
 
 
