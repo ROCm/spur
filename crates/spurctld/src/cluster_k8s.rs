@@ -831,15 +831,12 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
 }
 
 /// The address Calico/kubelet should use for `node`: its mesh IP when the mesh is configured
-/// (`net.wg_enabled`), else its real underlay address — a `k0s_mesh_ip` handed out with the mesh
+/// (`mesh_native`), else its real underlay address — a `k0s_mesh_ip` handed out with the mesh
 /// disabled is a pool-allocated address never bound to any interface, so it must not be used.
 /// `kubelet --node-ip` requires a literal IP (unlike `Node.address`, which may be an FQDN), so the
 /// underlay branch only returns a value that parses as one.
-fn calico_node_address<'a>(
-    net: &ClusterNetworking,
-    node: &'a spur_core::node::Node,
-) -> Option<&'a str> {
-    if net.wg_enabled {
+fn calico_node_address(mesh_native: bool, node: &spur_core::node::Node) -> Option<&str> {
+    if mesh_native {
         node.k0s_mesh_ip.as_deref()
     } else {
         node.address
@@ -848,15 +845,16 @@ fn calico_node_address<'a>(
     }
 }
 
-/// The k0s controller config for `node` (api on its Calico address + `bird`/`vxlan` mode per
-/// [`calico_node_address`]), or None for the default kube-router mode (`cni != "calico"`) / a node
-/// without a usable address yet. `cp_count > 1` also enables node-local load balancing.
+/// The k0s controller config for `node`, or None for an unknown CNI / a node without a usable
+/// address yet. `cp_count > 1` also enables node-local load balancing. Only Calico rides the mesh
+/// ([`calico_node_address`]); kube-router always advertises the API on the underlay address.
 fn controller_k0s_config(
     net: &ClusterNetworking,
     node: &spur_core::node::Node,
     cp_count: usize,
 ) -> Option<String> {
-    let api = calico_node_address(net, node)?;
+    let mesh_native = net.wg_enabled && net.cni == "calico";
+    let api = calico_node_address(mesh_native, node)?;
     // SANs: the advertised address + the underlay address (so `kubectl` over either works).
     let mut sans = vec![api.to_string()];
     if let Some(addr) = &node.address {
@@ -872,7 +870,7 @@ fn controller_k0s_config(
         api,
         &sans,
         cp_count,
-        net.wg_enabled,
+        mesh_native,
     )
 }
 
@@ -956,7 +954,7 @@ async fn converge_provisioning(
         };
         // For Calico, pin the node's kubelet node-ip to whichever address it's actually running on.
         let node_ip = if net.cni == "calico" {
-            calico_node_address(net, node).map(String::from)
+            calico_node_address(net.wg_enabled, node).map(String::from)
         } else {
             None
         };
@@ -1925,7 +1923,7 @@ mod tests {
         let mut n = spur_core::node::Node::new("cp".into(), Default::default());
         n.k0s_mesh_ip = Some("10.44.0.1".into());
         n.address = Some("203.0.113.9".into());
-        assert_eq!(calico_node_address(&net, &n), Some("10.44.0.1"));
+        assert_eq!(calico_node_address(net.wg_enabled, &n), Some("10.44.0.1"));
     }
 
     #[test]
@@ -1936,7 +1934,7 @@ mod tests {
         // never bound to a real interface here, so it must not be used.
         n.k0s_mesh_ip = Some("10.44.0.1".into());
         n.address = Some("203.0.113.9".into());
-        assert_eq!(calico_node_address(&net, &n), Some("203.0.113.9"));
+        assert_eq!(calico_node_address(net.wg_enabled, &n), Some("203.0.113.9"));
     }
 
     #[test]
@@ -1946,7 +1944,7 @@ mod tests {
         // Node.address may be an FQDN (docs/deployment/native-host.rst), but kubelet --node-ip
         // requires a literal IP -- must defer rather than pass a hostname through.
         n.address = Some("cp.example.internal".into());
-        assert_eq!(calico_node_address(&net, &n), None);
+        assert_eq!(calico_node_address(net.wg_enabled, &n), None);
     }
 
     #[test]

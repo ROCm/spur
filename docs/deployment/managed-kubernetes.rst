@@ -178,7 +178,15 @@ Networking / CNI
 ~~~~~~~~~~~~~~~~~
 
 **kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
-on the node's primary interface and workers join over it. No mesh required.
+on the node's primary interface and workers join over it. No mesh required. SPUR runs
+kube-router with ``overlay-type=full``, so every pod packet travels in the IPIP tunnel
+with the node address on the outside. kube-router's own default (``subnet``) sends pod
+packets unencapsulated between nodes of the same subnet, and a cloud NIC (OCI VNIC, AWS
+ENI, ...) drops a packet whose source is a pod address unless source/destination checking
+is disabled on the interface. Full overlay works on any underlay, at the cost of the IPIP
+header between same-subnet nodes.
+
+``pod_cidr`` and ``service_cidr`` from ``[cluster]`` apply to both CNIs.
 
 **calico** (``cni = "calico"``) — with the WireGuard mesh enabled
 (``network.wg_enabled = true``), ``spur k8s up`` generates a k0s config that
