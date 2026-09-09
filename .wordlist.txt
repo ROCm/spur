@@ -87,6 +87,7 @@ scontrol
 scrontab
 sdiag
 seccomp
+selectable
 setgid
 setuid
 shmem

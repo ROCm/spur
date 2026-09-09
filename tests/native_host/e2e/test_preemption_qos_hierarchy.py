@@ -19,8 +19,11 @@ Covers four scenarios:
    was set via scontrol update-partition, confirming the fix for the
    reconfigure-wipe bug.
 
-Tests 1 and 2 require Postgres (accounting_cluster fixture, skips when Docker
-is unavailable). Tests 3 and 4 only need the base cluster fixture.
+Preemption only runs under preempt_type=qos_priority, so tests 1-3 set it and
+build a QOS pair; whatever they are isolating (the allow-list, the exempt window)
+is then the only gate left unsatisfied. Tests 1-3 require Postgres
+(accounting_cluster fixture, skips when Docker is unavailable). Test 4 touches no
+jobs and only needs the base cluster fixture.
 """
 
 import time
@@ -35,9 +38,9 @@ _AUTH_ALLOW_ROOT = {"auth": {"plugin": "none", "allow_root_jobs": True}}
 
 
 class TestQosPreemptHierarchyBlocked:
-    """With preempt_type=qos_priority, a high-priority job whose QOS has an
-    empty preempt allow-list must NOT preempt a running job, even with a
-    priority gap well above 2×."""
+    """With preempt_type=qos_priority, a high-rank job whose QOS has an empty
+    preempt allow-list must NOT preempt a running job, even with a 1000x QOS
+    priority advantage."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -213,13 +216,22 @@ class TestPreemptExemptTime:
             ],
             "scheduler": {
                 "preempt_exempt_time": self.EXEMPT_SECS,
+                "preempt_type": "qos_priority",
             },
             **_AUTH_ALLOW_ROOT,
         }
 
-    def test_exempt_window_protects_then_expires(self, cluster):
-        c = cluster
+    def test_exempt_window_protects_then_expires(self, accounting_cluster):
+        c = accounting_cluster
         node0 = c.node_names[0]
+
+        # Everything except the exempt window permits preemption here: the
+        # hunter QOS allow-lists the victim QOS and outranks it 100x.
+        c.sacctmgr(["add", "qos", "name=exempt-low", "priority=100",
+                    "preemptmode=cancel"])
+        c.sacctmgr(["add", "qos", "name=exempt-high", "priority=10000",
+                    "preempt=exempt-low"])
+        time.sleep(15)  # wait past QoS cache refresh floor
 
         low_id = None
         try:
@@ -228,24 +240,23 @@ class TestPreemptExemptTime:
             )
             low_out = c.sbatch(
                 ["-J", "exempt-low", "-N", "1", f"--nodelist={node0}",
-                 "--exclusive", low_script]
+                 "--exclusive", "-q", "exempt-low", low_script]
             )
             low_id = parse_job_id(low_out)
             assert low_id is not None, f"submit failed:\n{low_out}"
             wait_job_state(c, low_id, "R", timeout=60)
 
-            # Submit the high-priority job immediately after low starts.
+            # Submit the high-QOS job immediately after low starts, so the whole
+            # exempt window is measured from a point where a preemptor is queued.
             high_script = c.write_file(
                 "exempt-high.sh", "#!/bin/bash\nsleep 2\n"
             )
             high_out = c.sbatch(
                 ["-J", "exempt-high", "-N", "1", f"--nodelist={node0}",
-                 "--exclusive", high_script]
+                 "--exclusive", "-q", "exempt-high", high_script]
             )
             high_id = parse_job_id(high_out)
             assert high_id is not None, f"submit failed:\n{high_out}"
-            # Force high's priority above the 2× threshold.
-            c.scontrol("update", f"JobId={high_id}", "Priority=1000000")
 
             # Within the exempt window: low must still be running.
             time.sleep(self.SAFE_WAIT_SECS)
@@ -260,11 +271,12 @@ class TestPreemptExemptTime:
             wait_job_state(c, low_id, "CA", timeout=30)
             high_state = wait_job(c, high_id, timeout=30)
             assert high_state == "CD", (
-                f"high-priority job did not complete after exempt window: {high_state}"
+                f"high-QOS job did not complete after exempt window: {high_state}"
             )
         finally:
             if low_id is not None:
                 c.cli_allow_fail(["scancel", str(low_id)])
+            c.cli_allow_fail(["scancel", "--name=exempt-high"])
 
 
 class TestReconfigurePreservesExemptTime:
