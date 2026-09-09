@@ -1,0 +1,139 @@
+{{- if .Values.controller.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurctld
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "controller") | nindent 4 }}
+spec:
+  selector:
+    {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "controller") | nindent 4 }}
+  clusterIP: None  # headless so StatefulSet pods get stable per-pod DNS for Raft
+  ports:
+    - name: grpc
+      port: {{ .Values.controller.service.grpcPort }}
+      targetPort: grpc
+    - name: raft
+      port: {{ .Values.controller.service.raftPort }}
+      targetPort: raft
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spurctld
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "controller") | nindent 4 }}
+spec:
+  serviceName: spurctld
+  replicas: {{ .Values.controller.replicaCount }}
+  podManagementPolicy: {{ .Values.controller.podManagementPolicy }}
+  selector:
+    matchLabels:
+      {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "controller") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spur.componentLabels" (dict "ctx" . "component" "controller") | nindent 8 }}
+        {{- with .Values.controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll pods when the config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.controller.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "spur.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spurctld
+          image: {{ include "spur.image" (dict "ctx" . "component" .Values.controller) }}
+          imagePullPolicy: {{ include "spur.imagePullPolicy" (dict "ctx" . "component" .Values.controller) }}
+          command: [spurctld]
+          args:
+            - --listen=[::]:{{ .Values.controller.service.grpcPort }}
+            - --config=/etc/spur/spur.conf
+          ports:
+            - containerPort: {{ .Values.controller.service.grpcPort }}
+              name: grpc
+            - containerPort: {{ .Values.controller.service.raftPort }}
+              name: raft
+          volumeMounts:
+            - name: config
+              mountPath: /etc/spur
+            - name: spool
+              mountPath: /var/spool/spur
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: {{ .Values.controller.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controller.probes.readiness.periodSeconds }}
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: {{ .Values.controller.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controller.probes.liveness.periodSeconds }}
+          {{- with .Values.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "spur.fullname" . }}-config
+        {{- if not .Values.controller.persistence.enabled }}
+        - name: spool
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.controller.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: spool
+      spec:
+        accessModes:
+          {{- toYaml .Values.controller.persistence.accessModes | nindent 10 }}
+        {{- if .Values.controller.persistence.storageClass }}
+        {{- if eq "-" .Values.controller.persistence.storageClass }}
+        storageClassName: ""
+        {{- else }}
+        storageClassName: {{ .Values.controller.persistence.storageClass | quote }}
+        {{- end }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.controller.persistence.size | quote }}
+  {{- end }}
+{{- if .Values.controller.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: spurctld
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "controller") | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.controller.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "controller") | nindent 6 }}
+{{- end }}
+{{- end }}

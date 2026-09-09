@@ -1,0 +1,237 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: spurjobs.spur.amd.com
+spec:
+  group: spur.amd.com
+  names:
+    categories: []
+    kind: SpurJob
+    plural: spurjobs
+    shortNames: []
+    singular: spurjob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .status.spurJobId
+      name: Job ID
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SpurJobSpec via `CustomResource`
+        properties:
+          spec:
+            description: "SpurJob CRD spec \u2014 Kubernetes-native way to submit\
+              \ GPU jobs to Spur.\n\napiVersion: spur.amd.com/v1alpha1\nkind: SpurJob"
+            properties:
+              account:
+                description: Spur account.
+                nullable: true
+                type: string
+              args:
+                default: []
+                description: Arguments to the command.
+                items:
+                  type: string
+                type: array
+              arraySpec:
+                description: Job array spec (e.g., "0-99%10").
+                nullable: true
+                type: string
+              command:
+                default: []
+                description: Command to run in the container.
+                items:
+                  type: string
+                type: array
+              cpusPerTask:
+                default: 1
+                description: CPUs per task.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              dependencies:
+                default: []
+                description: Job dependencies (e.g., ["afterok:123", "afterany:456"]).
+                items:
+                  type: string
+                type: array
+              env:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: Environment variables.
+                type: object
+              extraResources:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: 'Extra device plugin resources (e.g., {"rdma/devices":
+                  "1"}).'
+                type: object
+              gpus:
+                default:
+                  count: 0
+                  gpuType: null
+                description: GPU requirements.
+                properties:
+                  count:
+                    default: 0
+                    description: Number of GPUs needed.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  gpuType:
+                    description: GPU type filter (e.g., "mi300x", "h100").
+                    nullable: true
+                    type: string
+                type: object
+              hostIpc:
+                default: false
+                description: Enable host IPC namespace sharing (for NCCL shared memory).
+                type: boolean
+              hostNetwork:
+                default: false
+                description: Enable host networking (for RDMA/NCCL).
+                type: boolean
+              image:
+                description: Container image to run.
+                type: string
+              memoryPerNode:
+                description: Memory per node (K8s quantity string, e.g. "256Gi").
+                nullable: true
+                type: string
+              name:
+                description: Job name.
+                type: string
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: K8s node selector labels.
+                type: object
+              numNodes:
+                default: 1
+                description: Number of nodes to allocate.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              partition:
+                description: Spur partition to submit to.
+                nullable: true
+                type: string
+              priorityClass:
+                description: K8s PriorityClass name.
+                nullable: true
+                type: string
+              privileged:
+                default: false
+                description: Run container in privileged mode.
+                type: boolean
+              secretEnv:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: "Environment variables from K8s Secrets.\nMap of env\
+                  \ var name \u2192 \"secret-name/key\" reference.\nThe operator injects\
+                  \ these as secretKeyRef env vars into the pod,\nkeeping secrets\
+                  \ out of the SpurJob spec.\n\nExample: `{\"HF_TOKEN\": \"hf-creds/token\"\
+                  , \"API_KEY\": \"my-secret/api-key\"}`"
+                type: object
+              serviceAccount:
+                description: K8s ServiceAccount name.
+                nullable: true
+                type: string
+              shmSize:
+                description: Shared memory size (e.g., "64Gi"). Mounted as emptyDir
+                  at /dev/shm.
+                nullable: true
+                type: string
+              tasksPerNode:
+                default: 1
+                description: Tasks per node (e.g., one per GPU).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              timeLimit:
+                description: Time limit (e.g., "4h", "30m", "1h30m").
+                nullable: true
+                type: string
+              tolerations:
+                default: []
+                description: K8s tolerations.
+                items:
+                  properties:
+                    effect:
+                      nullable: true
+                      type: string
+                    key:
+                      nullable: true
+                      type: string
+                    operator:
+                      default: Equal
+                      type: string
+                    tolerationSeconds:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    value:
+                      nullable: true
+                      type: string
+                  type: object
+                type: array
+              volumes:
+                default: []
+                description: 'Volume mounts: "/src:/dst:ro" for hostPath or "pvc:claim-name:/dst"
+                  for PVCs.'
+                items:
+                  type: string
+                type: array
+            required:
+            - image
+            - name
+            type: object
+          status:
+            description: Status subresource for SpurJob.
+            nullable: true
+            properties:
+              assignedNodes:
+                default: []
+                description: Nodes assigned by the scheduler.
+                items:
+                  type: string
+                type: array
+              message:
+                description: Human-readable message.
+                nullable: true
+                type: string
+              pods:
+                default: []
+                description: Pod names created for this job.
+                items:
+                  type: string
+                type: array
+              spurJobId:
+                description: Spur-assigned job ID.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              state:
+                default: ''
+                description: Current state (Pending, Running, Completed, Failed, Cancelled).
+                type: string
+            type: object
+        required:
+        - spec
+        title: SpurJob
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+

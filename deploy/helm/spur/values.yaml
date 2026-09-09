@@ -1,0 +1,223 @@
+# Default values for Spur.
+#
+# This file is the contract between the chart and its users. Override any value
+# with `--set` or `-f values-overrides.yaml`. Re-running `helm upgrade` after
+# changing values is safe; Helm will diff and reconcile.
+
+# -- Cluster name written into spur.conf
+clusterName: spur-k8s
+
+# Container image shared by all daemons (spurctld / spurd / spurrestd / spurdbd /
+# operator are produced by the same multi-call binary build).
+image:
+  repository: ghcr.io/rocm/spur
+  tag: ""                 # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Common labels applied to every object the chart creates.
+commonLabels: {}
+commonAnnotations: {}
+
+# Namespace handling. By default the chart assumes the release namespace
+# already exists (Helm 3 won't create it without --create-namespace). Setting
+# this to true makes the chart render an explicit Namespace object.
+createNamespace: false
+
+# ServiceAccount used by all workloads (operator needs cluster RBAC).
+serviceAccount:
+  create: true
+  name: ""                # default: "<release>-spur"
+  annotations: {}
+
+# RBAC for the operator (ClusterRole / ClusterRoleBinding). Disable in
+# environments where cluster-scoped RBAC is provisioned out-of-band.
+rbac:
+  create: true
+
+# SpurJob CRD lifecycle. The CRD itself lives under crds/ so Helm installs it
+# on first install. Set install=false if you manage CRDs externally (e.g. ArgoCD
+# pre-sync hook). Helm never removes CRDs on uninstall — that's intentional to
+# avoid wiping user CRs.
+crds:
+  install: true
+
+# -----------------------------------------------------------------------------
+# Controller (spurctld) — Raft consensus, scheduler, job dispatch.
+# -----------------------------------------------------------------------------
+controller:
+  enabled: true
+  replicaCount: 3         # set to 1 for single-node dev clusters
+  image:
+    repository: ""        # falls back to .Values.image.repository
+    tag: ""
+    pullPolicy: ""
+  podManagementPolicy: Parallel
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podLabels: {}
+  podAnnotations: {}
+  persistence:
+    enabled: true
+    storageClass: ""      # "" → cluster default; "-" → disable dynamic provisioning
+    size: 1Gi
+    accessModes: [ReadWriteOnce]
+  service:
+    grpcPort: 6817
+    raftPort: 6821
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  probes:
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    liveness:
+      initialDelaySeconds: 15
+      periodSeconds: 20
+
+# -----------------------------------------------------------------------------
+# Node agent (spurd) — DaemonSet on every compute node.
+# -----------------------------------------------------------------------------
+agent:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  # The DaemonSet only schedules on nodes carrying this label; flip to an empty
+  # map to deploy fleet-wide.
+  nodeSelector:
+    spur.amd.com/compute: "true"
+  tolerations:
+    - key: spur.amd.com/gpu-node
+      operator: Exists
+      effect: NoSchedule
+  affinity: {}
+  hostNetwork: false
+  hostPID: true
+  privileged: true
+  resources: {}
+  podLabels: {}
+  podAnnotations: {}
+  service:
+    grpcPort: 6816
+  # ROCm GPU device exposure. Disable for CPU-only test clusters.
+  gpu:
+    rocm: true            # mounts /dev/kfd and /dev/dri
+  spool:
+    hostPath: /var/spool/spur
+  extraEnv:
+    - name: GPU_ENABLE_PAL
+      value: "0"
+    - name: HSA_ENABLE_SDMA
+      value: "1"
+  probes:
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+
+# -----------------------------------------------------------------------------
+# REST API daemon (spurrestd) — Slurm-compatible HTTP API.
+# -----------------------------------------------------------------------------
+restd:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podLabels: {}
+  podAnnotations: {}
+  service:
+    type: ClusterIP
+    port: 6820
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []             # example: [{ host: spur.example.com, paths: [{ path: /, pathType: Prefix }] }]
+    tls: []
+
+# -----------------------------------------------------------------------------
+# Accounting daemon (spurdbd) — gRPC in front of PostgreSQL.
+# -----------------------------------------------------------------------------
+accounting:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  service:
+    port: 6819
+  # External Postgres takes priority over the embedded dev sidecar.
+  # When externalDatabase.url is set, the sidecar is NOT deployed.
+  externalDatabase:
+    url: ""               # e.g. postgresql://user:pass@db.svc:5432/spur
+    existingSecret: ""    # secret containing key "url" with the connection string
+  embeddedPostgres:
+    enabled: true         # dev-mode sidecar; NOT for production
+    image: postgres:16
+    user: spur
+    password: spur
+    database: spur
+    storage:
+      enabled: false      # true → PVC; false → emptyDir (data lost on restart)
+      storageClass: ""
+      size: 8Gi
+
+# -----------------------------------------------------------------------------
+# Kubernetes operator — reconciles SpurJob CRs into pods.
+# -----------------------------------------------------------------------------
+operator:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podLabels: {}
+  podAnnotations: {}
+  service:
+    grpcPort: 6818
+    healthPort: 8080
+  probes:
+    readiness:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    liveness:
+      initialDelaySeconds: 15
+      periodSeconds: 20
+
+# -----------------------------------------------------------------------------
+# spur.conf contents. Keep these in sync with the controller deployment.
+# -----------------------------------------------------------------------------
+config:
+  scheduler:
+    intervalSecs: 2
+    maxJobsPerCycle: 100
+    plugin: backfill
+  partitions:
+    - name: default
+      state: UP
+      default: true
+      nodes: ALL
+      maxTime: "7d"
+      defaultTime: "1h"
+  # Free-form extra TOML appended verbatim to spur.conf. Use this for any field
+  # not modeled above without forking the chart.
+  extraToml: ""

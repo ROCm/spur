@@ -1,0 +1,89 @@
+Spur {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+{{- if .Values.controller.enabled }}
+  - spurctld          StatefulSet, replicas={{ .Values.controller.replicaCount }}{{ if gt (.Values.controller.replicaCount | int) 1 }} (Raft HA){{ end }}
+{{- end }}
+{{- if .Values.agent.enabled }}
+  - spurd             DaemonSet (selector: {{ .Values.agent.nodeSelector | toJson }})
+{{- end }}
+{{- if .Values.restd.enabled }}
+  - spurrestd         Deployment, replicas={{ .Values.restd.replicaCount }}, service :{{ .Values.restd.service.port }}
+{{- end }}
+{{- if .Values.accounting.enabled }}
+  - spurdbd           Deployment ({{ if or (ne .Values.accounting.externalDatabase.url "") (ne .Values.accounting.externalDatabase.existingSecret "") }}external DB{{ else }}embedded postgres dev sidecar{{ end }})
+{{- end }}
+{{- if .Values.operator.enabled }}
+  - spur-k8s-operator Deployment (reconciles SpurJob CRs)
+{{- end }}
+
+Quick checks:
+
+  kubectl -n {{ .Release.Namespace }} get pods
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/spurctld
+
+Submit a job via the operator (requires the CRD, installed by this chart):
+
+  cat <<EOF | kubectl apply -f -
+  apiVersion: spur.amd.com/v1alpha1
+  kind: SpurJob
+  metadata:
+    name: hello
+    namespace: {{ .Release.Namespace }}
+  spec:
+    name: hello
+    image: docker.io/library/busybox:latest
+    command: ["sh", "-c"]
+    args: ["echo hello from spur"]
+  EOF
+
+{{- if .Values.restd.enabled }}
+
+Reach the REST API from inside the cluster:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/spurrestd {{ .Values.restd.service.port }}:{{ .Values.restd.service.port }}
+  curl http://localhost:{{ .Values.restd.service.port }}/api/v1/ping
+{{- end }}
+
+{{- if and .Values.accounting.enabled .Values.accounting.embeddedPostgres.enabled (eq .Values.accounting.externalDatabase.url "") (eq .Values.accounting.externalDatabase.existingSecret "") }}
+
+WARNING: spurdbd is running with the dev-mode embedded postgres sidecar.
+         Data is {{ if .Values.accounting.embeddedPostgres.storage.enabled }}persisted on a PVC{{ else }}stored in emptyDir and will be LOST on restart{{ end }}.
+         For production, set accounting.externalDatabase.url (or .existingSecret).
+
+  To fix, pick one of these and re-run `helm upgrade`:
+
+  1) Keep the sidecar but add a PVC (data survives pod restarts):
+
+       helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+         --set accounting.embeddedPostgres.storage.enabled=true \
+         --set accounting.embeddedPostgres.storage.size=8Gi
+         # optionally: --set accounting.embeddedPostgres.storage.storageClass=<class>
+
+  2) Point at an external Postgres (recommended for production):
+
+       kubectl -n {{ .Release.Namespace }} create secret generic spur-db-creds \
+         --from-literal=url='postgresql://user:pass@db.host:5432/spur'
+
+       helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+         --set accounting.externalDatabase.existingSecret=spur-db-creds \
+         --set accounting.embeddedPostgres.enabled=false
+
+  3) Disable accounting entirely (no job history / usage records):
+
+       helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+         --set accounting.enabled=false
+{{- end }}
+
+{{- if not .Values.controller.persistence.enabled }}
+
+WARNING: controller.persistence.enabled=false — Raft log lives in emptyDir.
+         Quorum cluster state will be lost if all pods restart simultaneously.
+
+  To fix, re-run `helm upgrade` with a PVC for the controller:
+
+       helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values \
+         --set controller.persistence.enabled=true \
+         --set controller.persistence.size=1Gi
+         # optionally: --set controller.persistence.storageClass=<class>
+{{- end }}
