@@ -62,6 +62,14 @@ pub struct ClusterNetworking {
     pub provisioning_timeout: Duration,
 }
 
+impl ClusterNetworking {
+    /// Whether pods route natively over the WireGuard mesh. Only Calico (`bird` mode) can; kube-router
+    /// always tunnels over the underlay, so a mesh IP must never be advertised to it.
+    fn mesh_native(&self) -> bool {
+        self.wg_enabled && self.cni == "calico"
+    }
+}
+
 /// Leader-gated k0s reconcile loop. Spawned from `main.rs` when `[cluster].enabled`; it still
 /// re-checks leadership every tick because leadership can flip at any time.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: ClusterNetworking) {
@@ -847,13 +855,14 @@ fn calico_node_address(mesh_native: bool, node: &spur_core::node::Node) -> Optio
 
 /// `node`'s k0s controller config: CIDRs for either CNI, plus calico's API on its
 /// [`calico_node_address`] (and the `bird`/`vxlan` mode to match) once that address is known.
-/// Only Calico rides the mesh; kube-router tunnels over the underlay and never sees the mesh IP.
+/// Only Calico rides the mesh ([`ClusterNetworking::mesh_native`]); kube-router tunnels over the
+/// underlay and never sees the mesh IP.
 fn controller_k0s_config(
     net: &ClusterNetworking,
     node: &spur_core::node::Node,
     cp_count: usize,
 ) -> String {
-    let mesh_native = net.wg_enabled && net.cni == "calico";
+    let mesh_native = net.mesh_native();
     let (api, sans) = if net.cni == "calico" {
         let api = calico_node_address(mesh_native, node);
         let mut sans = Vec::new();
@@ -926,8 +935,8 @@ async fn converge_provisioning(
             clear_node_error(cluster, node);
             continue;
         }
-        // Generate the k0s config (CIDRs for either CNI; api on the Calico address + bird/vxlan
-        // when cni=calico). The bootstrap seeds etcd — no join token.
+        // The bootstrap seeds etcd — no join token. Its k0s config pins the CIDRs and CNI mode for
+        // the whole cluster.
         let k0s_config = Some(controller_k0s_config(net, node, cp_count));
         spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
     }
@@ -960,9 +969,10 @@ async fn converge_provisioning(
         } else {
             "worker"
         };
-        // For Calico, pin the node's kubelet node-ip to whichever address it's actually running on.
+        // For Calico, pin the node's kubelet node-ip to whichever address it's actually running on;
+        // kube-router picks the underlay address itself.
         let node_ip = if net.cni == "calico" {
-            calico_node_address(net.wg_enabled, node).map(String::from)
+            calico_node_address(net.mesh_native(), node).map(String::from)
         } else {
             None
         };
@@ -1975,7 +1985,10 @@ mod tests {
         let mut n = spur_core::node::Node::new("cp".into(), Default::default());
         n.k0s_mesh_ip = Some("10.44.0.1".into());
         n.address = Some("203.0.113.9".into());
-        assert_eq!(calico_node_address(net.wg_enabled, &n), Some("10.44.0.1"));
+        assert_eq!(
+            calico_node_address(net.mesh_native(), &n),
+            Some("10.44.0.1")
+        );
     }
 
     #[test]
@@ -1986,7 +1999,10 @@ mod tests {
         // never bound to a real interface here, so it must not be used.
         n.k0s_mesh_ip = Some("10.44.0.1".into());
         n.address = Some("203.0.113.9".into());
-        assert_eq!(calico_node_address(net.wg_enabled, &n), Some("203.0.113.9"));
+        assert_eq!(
+            calico_node_address(net.mesh_native(), &n),
+            Some("203.0.113.9")
+        );
     }
 
     #[test]
@@ -1996,7 +2012,7 @@ mod tests {
         // Node.address may be an FQDN (docs/deployment/native-host.rst), but kubelet --node-ip
         // requires a literal IP -- must defer rather than pass a hostname through.
         n.address = Some("cp.example.internal".into());
-        assert_eq!(calico_node_address(net.wg_enabled, &n), None);
+        assert_eq!(calico_node_address(net.mesh_native(), &n), None);
     }
 
     #[test]
@@ -2011,6 +2027,21 @@ mod tests {
         assert!(
             !y.contains("10.44.0.1"),
             "the unbound mesh IP must not leak into the config"
+        );
+    }
+
+    #[test]
+    fn controller_k0s_config_keeps_kuberouter_on_the_underlay_when_meshed() {
+        let net = test_net(true, "kuberouter");
+        let mut n = spur_core::node::Node::new("cp".into(), Default::default());
+        n.k0s_mesh_ip = Some("10.44.0.1".into());
+        n.address = Some("203.0.113.9".into());
+        let y = controller_k0s_config(&net, &n, 1);
+        assert!(y.contains("overlay-type: full"));
+        assert!(!y.contains("api:"));
+        assert!(
+            !y.contains("10.44.0.1"),
+            "kube-router tunnels over the underlay, so the mesh IP must not be advertised"
         );
     }
 
