@@ -55,8 +55,8 @@ noted as "accepted for compatibility" parse without error but have no effect yet
      - Difference
    * - Partitions
      - Defined in ``spur.conf``; there is no runtime ``scontrol create/update/delete partition``. Edit the config and reload the controller to change a partition.
-   * - ``squeue``/``sinfo`` ``--noconvert``
-     - Accepted for compatibility; Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. Slurm also defines the flag on ``sacct``, ``sstat``, ``sshare`` and ``sreport``, where it is not accepted yet.
+   * - ``--noconvert``
+     - Accepted for compatibility on ``squeue``, ``sinfo``, ``sacct``, ``sstat``, ``sshare``, and ``sreport``. Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. ``sstat`` still prints ``MemAlloc`` with an ``M`` suffix whether or not the flag is passed.
    * - ``sacct --jobs``
      - Accepted for compatibility; the job-id filter is not yet applied server-side.
    * - ``sacct`` ``ReqMem``

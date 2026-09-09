@@ -31,6 +31,10 @@ pub struct SshareArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
+    /// Accepted for Slurm compatibility; has no effect
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
@@ -234,6 +238,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = SshareArgs::try_parse_from(["sshare", "--noconvert"]).unwrap();
+        assert!(args.noconvert);
+    }
 
     #[test]
     fn short_h_means_noheader() {

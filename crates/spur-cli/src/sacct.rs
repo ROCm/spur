@@ -54,6 +54,10 @@ pub struct SacctArgs {
     #[arg(short = 'n', long)]
     pub noheader: bool,
 
+    /// Accepted for Slurm compatibility; has no effect
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Max records
     #[arg(long, default_value = "100")]
     pub limit: u32,
@@ -301,6 +305,13 @@ mod tests {
             derived_exit_code,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = SacctArgs::try_parse_from(["sacct", "--noconvert"]).unwrap();
+        assert!(args.noconvert);
     }
 
     #[test]
