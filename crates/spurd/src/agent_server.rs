@@ -2709,11 +2709,19 @@ impl SlurmAgent for AgentService {
                         "this node is not in the pushed mesh membership".to_string(),
                     ));
                 };
-                // Peers a human persisted via `spur net add-peer` are never this reconcile's to
-                // prune, even if they're absent from the pushed k0s membership.
-                let protected = spur_net::wireguard::WgConfig::read_from(&config_path)
-                    .map(|c| c.peers.into_iter().map(|p| p.public_key).collect())
-                    .unwrap_or_default();
+                // Peers in this node's persisted config are never this reconcile's to prune, even
+                // when absent from the pushed k0s membership.
+                let protected: std::collections::HashSet<String> =
+                    match spur_net::wireguard::WgConfig::read_from(&config_path) {
+                        Ok(c) => c.peers.into_iter().map(|p| p.public_key).collect(),
+                        // An unreadable config protects nothing, so say so — silently pruning
+                        // peers because the file moved or is unreadable is the bad outcome here.
+                        Err(e) if config_path.exists() => {
+                            tracing::warn!(path = %config_path.display(), error = %e, "cannot read persisted WireGuard config; its peers are not protected from the mesh prune");
+                            Default::default()
+                        }
+                        Err(_) => Default::default(),
+                    };
                 // Reconcile: prune peers no longer in the membership, then add/update the desired peers.
                 let current = spur_net::wireguard::list_peers(&iface).unwrap_or_default();
                 let (added, pruned) = spur_net::mesh::reconcile_mesh(

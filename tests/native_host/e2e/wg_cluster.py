@@ -145,6 +145,20 @@ class WgMesh:
         )
         return [line.strip() for line in out.splitlines() if line.strip()]
 
+    def conf_text(self, index: int) -> str:
+        """The node's persisted `/etc/wireguard/<iface>.conf`, verbatim."""
+        return self.nodes[index].exec_allow_fail(
+            f"{self._sudo}cat '/etc/wireguard/{self.iface}.conf'"
+        )
+
+    def add_interface_directive(self, index: int, directive: str) -> None:
+        """Insert a directive into the conf's `[Interface]` block, standing in for
+        one an operator hand-maintains outside Spur's model."""
+        self.nodes[index].exec(
+            f"{self._sudo}sed -i '/^\\[Interface\\]/a {directive}' "
+            f"'/etc/wireguard/{self.iface}.conf'"
+        )
+
     # --- wg introspection ---
 
     def wg_pubkey(self, index: int) -> str:

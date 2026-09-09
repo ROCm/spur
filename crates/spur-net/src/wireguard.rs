@@ -21,7 +21,7 @@ pub struct WgKeypair {
 }
 
 /// A WireGuard peer entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WgPeer {
     pub public_key: String,
     pub allowed_ips: String,
@@ -29,15 +29,23 @@ pub struct WgPeer {
     /// when peers connect inbound.
     pub endpoint: Option<String>,
     pub persistent_keepalive: Option<u16>,
+    /// `[Peer]` directives this type does not model (`PresharedKey`, …), carried verbatim so a
+    /// read-modify-write of an operator's file does not silently drop them.
+    #[serde(default)]
+    pub extra: Vec<String>,
 }
 
 /// Full WireGuard interface config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WgConfig {
     pub private_key: String,
     pub address: String,
     pub listen_port: Option<u16>,
     pub peers: Vec<WgPeer>,
+    /// `[Interface]` directives this type does not model (`PostUp`, `MTU`, `Table`, …), carried
+    /// verbatim for the same reason as [`WgPeer::extra`].
+    #[serde(default)]
+    pub extra: Vec<String>,
 }
 
 /// Generate a new WireGuard keypair by calling `wg genkey` and `wg pubkey`.
@@ -69,7 +77,7 @@ pub fn generate_keypair() -> anyhow::Result<WgKeypair> {
     child
         .stdin
         .as_mut()
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("`wg pubkey` stdin was not piped"))?
         .write_all(private_key.as_bytes())?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
@@ -97,6 +105,7 @@ struct PeerBuilder {
     allowed_ips: Option<String>,
     endpoint: Option<String>,
     persistent_keepalive: Option<u16>,
+    extra: Vec<String>,
 }
 
 impl PeerBuilder {
@@ -106,19 +115,20 @@ impl PeerBuilder {
             allowed_ips: self.allowed_ips?,
             endpoint: self.endpoint,
             persistent_keepalive: self.persistent_keepalive,
+            extra: self.extra,
         })
     }
 }
 
 impl WgConfig {
-    /// Parse a wg-quick compatible config file previously written by [`Self::to_ini`]. Tolerates
-    /// blank lines and `#`/`;` comments so a manually-annotated file still parses — but [`Self::to_ini`]
-    /// always regenerates a normalized file, so those annotations do not survive a subsequent write.
+    /// Parse a wg-quick compatible config file. Directives this type does not model are kept in
+    /// `extra` and re-emitted by [`Self::to_ini`]; comments and blank lines are not preserved.
     pub fn parse(content: &str) -> anyhow::Result<Self> {
         let mut private_key = None;
         let mut address = None;
         let mut listen_port = None;
         let mut peers = Vec::new();
+        let mut extra = Vec::new();
         let mut current_peer: Option<PeerBuilder> = None;
         let mut in_interface = false;
 
@@ -147,7 +157,7 @@ impl WgConfig {
                     "privatekey" => private_key = Some(value),
                     "address" => address = Some(value),
                     "listenport" => listen_port = value.parse().ok(),
-                    _ => {}
+                    _ => extra.push(line.to_string()),
                 }
             } else if let Some(peer) = current_peer.as_mut() {
                 match key.to_ascii_lowercase().as_str() {
@@ -155,7 +165,7 @@ impl WgConfig {
                     "allowedips" => peer.allowed_ips = Some(value),
                     "endpoint" => peer.endpoint = Some(value),
                     "persistentkeepalive" => peer.persistent_keepalive = value.parse().ok(),
-                    _ => {}
+                    _ => peer.extra.push(line.to_string()),
                 }
             }
         }
@@ -168,6 +178,7 @@ impl WgConfig {
                 .ok_or_else(|| anyhow::anyhow!("config missing [Interface] Address"))?,
             listen_port,
             peers,
+            extra,
         })
     }
 
@@ -179,13 +190,24 @@ impl WgConfig {
     }
 
     /// Insert or update a peer by public key, so the persisted config matches a live `wg set`.
-    pub fn upsert_peer(&mut self, peer: WgPeer) {
+    /// Attributes the caller leaves unset are kept from the existing entry, because `wg set peer`
+    /// omits them too and leaves the kernel's values alone — persisting a `None` as "no endpoint"
+    /// would drop, on the next reload, an endpoint the live interface still has.
+    pub fn upsert_peer(&mut self, mut peer: WgPeer) {
         match self
             .peers
             .iter_mut()
             .find(|p| p.public_key == peer.public_key)
         {
-            Some(existing) => *existing = peer,
+            Some(existing) => {
+                peer.endpoint = peer.endpoint.take().or_else(|| existing.endpoint.take());
+                peer.persistent_keepalive =
+                    peer.persistent_keepalive.or(existing.persistent_keepalive);
+                if peer.extra.is_empty() {
+                    peer.extra = std::mem::take(&mut existing.extra);
+                }
+                *existing = peer;
+            }
             None => self.peers.push(peer),
         }
     }
@@ -206,6 +228,10 @@ impl WgConfig {
         if let Some(port) = self.listen_port {
             out.push_str(&format!("ListenPort = {}\n", port));
         }
+        for line in &self.extra {
+            out.push_str(line);
+            out.push('\n');
+        }
 
         for peer in &self.peers {
             out.push_str("\n[Peer]\n");
@@ -216,6 +242,10 @@ impl WgConfig {
             }
             if let Some(ka) = peer.persistent_keepalive {
                 out.push_str(&format!("PersistentKeepalive = {}\n", ka));
+            }
+            for line in &peer.extra {
+                out.push_str(line);
+                out.push('\n');
             }
         }
 
@@ -228,33 +258,16 @@ impl WgConfig {
     /// (unique per process), fsyncs it, `rename`s over the target, then fsyncs the directory too
     /// (a rename is itself just a directory-entry update, which can be lost on its own).
     pub fn write_to(&self, path: &Path) -> anyhow::Result<()> {
-        use std::io::Write;
-        let content = self.to_ini();
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("wg");
         let tmp_path = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
 
-        let mut tmp_file = std::fs::File::create(&tmp_path).with_context(|| {
-            format!(
-                "failed to create temp WireGuard config at {}",
-                tmp_path.display()
-            )
-        })?;
-        tmp_file.write_all(content.as_bytes()).with_context(|| {
-            format!("failed to write WireGuard config to {}", tmp_path.display())
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // The temp name embeds the pid, so a leaked one is never reclaimed by a later write —
+        // and until the rename lands it holds the private key. Remove it on every failure.
+        if let Err(e) = self.install_via_tmp(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
         }
-        tmp_file
-            .sync_all()
-            .with_context(|| format!("failed to fsync {}", tmp_path.display()))?;
-        drop(tmp_file);
-
-        std::fs::rename(&tmp_path, path)
-            .with_context(|| format!("failed to install WireGuard config at {}", path.display()))?;
 
         // Best-effort: not every filesystem supports fsync on a directory fd.
         match std::fs::File::open(dir) {
@@ -270,6 +283,46 @@ impl WgConfig {
 
         Ok(())
     }
+
+    /// Fill `tmp_path` and `rename` it over `path`. Split out of [`Self::write_to`] so every
+    /// failure between creating and installing the temp file funnels through one cleanup path.
+    fn install_via_tmp(&self, tmp_path: &Path, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // Owner-only from the moment the file exists — the private key must never touch disk at
+        // the umask default, not even between the write and a later chmod.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut tmp_file = opts.open(tmp_path).with_context(|| {
+            format!(
+                "failed to create temp WireGuard config at {}",
+                tmp_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        tmp_file
+            .write_all(self.to_ini().as_bytes())
+            .with_context(|| {
+                format!("failed to write WireGuard config to {}", tmp_path.display())
+            })?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("failed to fsync {}", tmp_path.display()))?;
+        drop(tmp_file);
+
+        std::fs::rename(tmp_path, path)
+            .with_context(|| format!("failed to install WireGuard config at {}", path.display()))
+    }
 }
 
 /// Serialize concurrent CLI invocations mutating the same config file: an advisory exclusive lock
@@ -284,7 +337,17 @@ pub(crate) fn with_config_lock<T>(
     // A never-initialized --config-dir has no directory at all yet; create it so `remove_peer_durable`
     // can still take the lock and reach its own "nothing to persist" check instead of failing here.
     if let Some(dir) = lock_path.parent() {
-        std::fs::create_dir_all(dir)
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        // Matches wg-quick's own convention for /etc/wireguard: the configs inside name peers and
+        // endpoints, so the directory should not be world-listable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(dir)
             .with_context(|| format!("failed to create config directory {}", dir.display()))?;
     }
     let lock_file = std::fs::OpenOptions::new()
@@ -409,13 +472,20 @@ pub fn remove_peer_durable(
     public_key: &str,
 ) -> anyhow::Result<()> {
     with_config_lock(config_path, || {
-        if config_path.exists() {
-            let mut config = WgConfig::read_from(config_path)?;
-            config.remove_peer_by_key(public_key);
-            config.write_to(config_path)?;
-        }
+        persist_peer_removal(config_path, public_key)?;
         remove_peer(interface, public_key)
     })
+}
+
+/// The persist half of [`remove_peer_durable`], split out so it is testable without the `wg`
+/// binary the live half shells out to. Caller holds the config lock.
+fn persist_peer_removal(config_path: &Path, public_key: &str) -> anyhow::Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let mut config = WgConfig::read_from(config_path)?;
+    config.remove_peer_by_key(public_key);
+    config.write_to(config_path)
 }
 
 /// Add (or replace) a kernel route for `cidr` via the WireGuard interface.
@@ -531,7 +601,9 @@ mod tests {
                 allowed_ips: "10.44.0.2/32".into(),
                 endpoint: Some("203.0.113.10:51820".into()),
                 persistent_keepalive: Some(25),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let ini = config.to_ini();
         assert!(ini.contains("[Interface]"));
@@ -554,14 +626,17 @@ mod tests {
                     allowed_ips: "10.44.0.2/32".into(),
                     endpoint: Some("203.0.113.10:51820".into()),
                     persistent_keepalive: Some(25),
+                    ..Default::default()
                 },
                 WgPeer {
                     public_key: "peerB=".into(),
                     allowed_ips: "10.44.0.3/32".into(),
                     endpoint: None,
                     persistent_keepalive: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let parsed = WgConfig::parse(&config.to_ini()).unwrap();
         assert_eq!(parsed.private_key, config.private_key);
@@ -617,12 +692,14 @@ mod tests {
             address: "10.44.0.1/16".into(),
             listen_port: None,
             peers: vec![],
+            ..Default::default()
         };
         config.upsert_peer(WgPeer {
             public_key: "peerA=".into(),
             allowed_ips: "10.44.0.2/32".into(),
             endpoint: None,
             persistent_keepalive: None,
+            ..Default::default()
         });
         assert_eq!(config.peers.len(), 1);
 
@@ -631,6 +708,7 @@ mod tests {
             allowed_ips: "10.44.0.2/32,10.42.1.0/24".into(),
             endpoint: Some("203.0.113.1:51820".into()),
             persistent_keepalive: Some(25),
+            ..Default::default()
         });
         assert_eq!(
             config.peers.len(),
@@ -651,52 +729,161 @@ mod tests {
                 allowed_ips: "10.44.0.2/32".into(),
                 endpoint: None,
                 persistent_keepalive: None,
+                ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(config.remove_peer_by_key("peerA="));
         assert!(config.peers.is_empty());
         assert!(!config.remove_peer_by_key("peerA="), "already gone");
     }
 
-    /// `remove_peer_durable` on a config file that was never created (matching `remove_peer`'s
-    /// documented idempotency: "removing an absent peer succeeds") must treat that as nothing to
-    /// persist and still attempt the live removal, not error out of the read before ever trying.
+    /// Matching `remove_peer`'s documented idempotency ("removing an absent peer succeeds"), a
+    /// config file that was never created is nothing to persist, not a read error.
     #[test]
-    fn remove_peer_durable_treats_missing_config_as_nothing_to_persist() {
+    fn persist_peer_removal_treats_missing_config_as_nothing_to_persist() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("spur0.conf"); // never written
-        let err = format!(
-            "{:#}",
-            remove_peer_durable("spur0", &config_path, "peerA=").unwrap_err()
-        );
-        // The `wg` binary is unavailable in this test environment, so the live half fails — but the
-        // failure must come from THAT step, proving the missing-file persist step was skipped rather
-        // than erroring on `read_from`.
-        assert!(
-            err.contains("wg set peer remove") || err.contains("failed to run"),
-            "expected only the live wg step to fail, got: {err}"
-        );
+        persist_peer_removal(&config_path, "peerA=").unwrap();
+        assert!(!config_path.exists(), "must not fabricate a config file");
     }
 
-    /// Same idempotency guarantee, but for a `--config-dir` that was never created at all (not just
-    /// a missing `.conf` file inside an existing dir) — the realistic shape of "never ran `spur net
-    /// init` here".
+    /// The realistic shape of "never ran `spur net init` here": the lock must still be takeable on
+    /// a `--config-dir` that does not exist, so a removal reaches its nothing-to-persist check.
     #[test]
-    fn remove_peer_durable_treats_missing_config_dir_as_nothing_to_persist() {
+    fn config_lock_creates_a_missing_config_dir_owner_only() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("never-created-subdir").join("spur0.conf");
-        let err = format!(
-            "{:#}",
-            remove_peer_durable("spur0", &config_path, "peerA=").unwrap_err()
-        );
-        // The persist half must fully succeed (no lock/read/directory error); the only failure
-        // allowed here is `remove_peer`'s live `wg` call, which errors because the `wg` binary
-        // isn't available in this test environment — not because persistence choked on a missing dir.
+        let missing = dir.path().join("never-created-subdir");
+        let config_path = missing.join("spur0.conf");
+
+        with_config_lock(&config_path, || {
+            persist_peer_removal(&config_path, "peerA=")
+        })
+        .unwrap();
+
+        assert!(missing.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&missing).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    /// `add-peer` read-modify-writes a file the operator also hand-maintains: dropping a
+    /// `PresharedKey` silently downgrades crypto, dropping `PostUp` breaks routing on reboot.
+    #[test]
+    fn unmodeled_directives_survive_a_read_modify_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur0.conf");
+        std::fs::write(
+            &path,
+            "[Interface]\n\
+             PrivateKey = key=\n\
+             Address = 10.44.0.1/16\n\
+             MTU = 1380\n\
+             PostUp = ip route add 10.42.0.0/16 dev %i\n\
+             \n\
+             [Peer]\n\
+             PublicKey = peerA=\n\
+             AllowedIPs = 10.44.0.2/32\n\
+             PresharedKey = psk=\n",
+        )
+        .unwrap();
+
+        let mut config = WgConfig::read_from(&path).unwrap();
+        config.upsert_peer(WgPeer {
+            public_key: "peerB=".into(),
+            allowed_ips: "10.44.0.3/32".into(),
+            ..Default::default()
+        });
+        config.write_to(&path).unwrap();
+
+        let ini = std::fs::read_to_string(&path).unwrap();
         assert!(
-            err.contains("wg set peer remove") || err.contains("failed to run"),
-            "expected only the live wg step to fail, got: {err}"
+            ini.contains("MTU = 1380"),
+            "interface directive lost: {ini}"
         );
-        assert!(dir.path().join("never-created-subdir").is_dir());
+        assert!(
+            ini.contains("PostUp = ip route add 10.42.0.0/16 dev %i"),
+            "interface directive lost: {ini}"
+        );
+        assert!(ini.contains("PresharedKey = psk="), "peer key lost: {ini}");
+    }
+
+    /// `spur net add-peer` with no `--endpoint` omits the endpoint from `wg set`, leaving the live
+    /// one intact — so the persisted entry must keep it too, or the next reload cannot handshake.
+    #[test]
+    fn upsert_peer_keeps_attributes_the_caller_left_unset() {
+        let mut config = WgConfig::parse(
+            "[Interface]\nPrivateKey = key=\nAddress = 10.44.0.1/16\n\n\
+             [Peer]\nPublicKey = peerA=\nAllowedIPs = 10.44.0.2/32\n\
+             Endpoint = 203.0.113.9:51820\nPersistentKeepalive = 25\n",
+        )
+        .unwrap();
+
+        config.upsert_peer(WgPeer {
+            public_key: "peerA=".into(),
+            allowed_ips: "10.44.0.2/32".into(),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            config.peers[0].endpoint.as_deref(),
+            Some("203.0.113.9:51820")
+        );
+        assert_eq!(config.peers[0].persistent_keepalive, Some(25));
+    }
+
+    /// Re-adding an existing peer (`spur net add-peer` on a key already present) must not clear its
+    /// preshared key, matching `wg set peer`, which leaves an established one alone.
+    #[test]
+    fn upsert_peer_keeps_unmodeled_directives_of_the_peer_it_replaces() {
+        let mut config = WgConfig::parse(
+            "[Interface]\nPrivateKey = key=\nAddress = 10.44.0.1/16\n\n\
+             [Peer]\nPublicKey = peerA=\nAllowedIPs = 10.44.0.2/32\nPresharedKey = psk=\n",
+        )
+        .unwrap();
+
+        config.upsert_peer(WgPeer {
+            public_key: "peerA=".into(),
+            allowed_ips: "10.44.0.2/32,10.42.1.0/24".into(),
+            ..Default::default()
+        });
+
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].allowed_ips, "10.44.0.2/32,10.42.1.0/24");
+        assert_eq!(config.peers[0].extra, vec!["PresharedKey = psk="]);
+    }
+
+    /// The temp file is named after the pid, so one leaked by a failed write is never reclaimed by
+    /// a later successful one — and it holds the private key. A failing install must clean up.
+    #[test]
+    fn write_to_removes_its_temp_file_when_the_install_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur0.conf");
+        // A non-empty directory at the target makes the rename fail deterministically, without
+        // needing root or a read-only mount.
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupant"), b"x").unwrap();
+
+        let config = WgConfig {
+            private_key: "key=".into(),
+            address: "10.44.0.1/16".into(),
+            ..Default::default()
+        };
+        assert!(config.write_to(&path).is_err());
+
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file leaked on failure: {leftover:?}"
+        );
     }
 
     /// `add_peer_durable`/`remove_peer_durable`/`apply_mesh_durable` all run their live `wg` call
@@ -764,7 +951,9 @@ mod tests {
                 allowed_ips: "10.44.0.2/32".into(),
                 endpoint: Some("203.0.113.1:51820".into()),
                 persistent_keepalive: Some(25),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         config.write_to(&path).unwrap();
         let read_back = WgConfig::read_from(&path).unwrap();
@@ -781,6 +970,7 @@ mod tests {
             address: "10.44.0.1/16".into(),
             listen_port: None,
             peers: vec![],
+            ..Default::default()
         };
         base.write_to(&path).unwrap();
         let mut updated = base;
@@ -789,6 +979,7 @@ mod tests {
             allowed_ips: "10.44.0.2/32".into(),
             endpoint: None,
             persistent_keepalive: None,
+            ..Default::default()
         });
         updated.write_to(&path).unwrap();
 
@@ -824,6 +1015,7 @@ mod tests {
             address: "10.44.0.1/16".into(),
             listen_port: Some(51820),
             peers: vec![],
+            ..Default::default()
         }
         .write_to(&path)
         .unwrap();
@@ -834,6 +1026,7 @@ mod tests {
             allowed_ips: "10.44.0.2/32".into(),
             endpoint: Some("203.0.113.9:51820".into()),
             persistent_keepalive: Some(25),
+            ..Default::default()
         });
         config.write_to(&path).unwrap();
 
@@ -851,6 +1044,7 @@ mod tests {
             address: "10.44.0.2/16".into(),
             listen_port: None,
             peers: vec![],
+            ..Default::default()
         };
         let ini = config.to_ini();
         assert!(!ini.contains("ListenPort"));

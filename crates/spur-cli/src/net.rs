@@ -232,6 +232,7 @@ fn cmd_init(cidr: &str, interface: &str, port: u16, config_dir: &Path) -> Result
         address: format!("{}/{}", controller_ip, pool.prefix_len()),
         listen_port: Some(port),
         peers: vec![],
+        ..Default::default()
     };
 
     // Write config
@@ -286,7 +287,9 @@ fn cmd_join(
             allowed_ips: format!("{}/{}", address_network(address, prefix_len)?, prefix_len),
             endpoint: Some(endpoint.to_string()),
             persistent_keepalive: Some(25),
+            ..Default::default()
         }],
+        ..Default::default()
     };
 
     // Write config
@@ -366,6 +369,7 @@ fn cmd_add_peer(
         allowed_ips: allowed_ips.clone(),
         endpoint: endpoint.map(|s| s.to_string()),
         persistent_keepalive: Some(25),
+        ..Default::default()
     };
 
     let config_path = config_dir.join(format!("{}.conf", interface));
