@@ -783,15 +783,14 @@ impl SlurmController for ControllerService {
         let mut core_spec = proto_to_job_spec(spec)?;
         Self::bind_spec_to_identity(&mut core_spec, identity.as_ref())?;
 
-        // --container-remap-root is parsed and propagated but rootless UID/GID
-        // remapping is not implemented. Reject it at submission rather than
-        // accept it and silently run the container as the submitting user.
+        // --container-remap-root asks for rootless UID/GID remapping that is not
+        // implemented; reject it rather than accept the flag and not honor it.
         if core_spec.container_remap_root {
             return Err(Status::invalid_argument(
                 "--container-remap-root is not yet implemented; rootless UID/GID remapping \
-                 (submitter -> root inside the container, unprivileged on the host) is planned \
-                 but not available. Resubmit without the flag — the container runs as the \
-                 submitting user.",
+                 (submitter -> root inside the container, unprivileged on the host, with the \
+                 rootfs owned to match) is planned but not yet available. Resubmit without the \
+                 flag.",
             ));
         }
 
@@ -2815,6 +2814,18 @@ impl SlurmController for ControllerService {
             "run a step in",
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        // Mirror the submit-path guard: a step carries its own ContainerSpec
+        // (srun --container-remap-root), so reject the unimplemented flag here
+        // too, or a direct gRPC client could set it and bypass the submit check.
+        if req.container.as_ref().is_some_and(|c| c.remap_root) {
+            return Err(Status::invalid_argument(
+                "--container-remap-root is not yet implemented; rootless UID/GID remapping \
+                 (submitter -> root inside the container, unprivileged on the host, with the \
+                 rootfs owned to match) is planned but not yet available. Rerun the step \
+                 without the flag.",
+            ));
+        }
 
         if job.allocated_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(
@@ -5308,7 +5319,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_job_rejects_container_remap_root() {
         // The flag was parsed and propagated but never honored; submission must
-        // fail rather than run the container as the submitting user.
+        // fail rather than accept the flag and not honor it.
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let spec = spur_proto::proto::JobSpec {
@@ -5328,8 +5339,9 @@ mod tests {
             .expect_err("container_remap_root must be rejected at submission");
         assert_eq!(status.code(), Code::InvalidArgument);
         assert!(
-            status.message().contains("--container-remap-root"),
-            "rejection should name the flag, got: {}",
+            status.message().contains("--container-remap-root")
+                && status.message().contains("not yet implemented"),
+            "rejection should name the flag and say it is not implemented, got: {}",
             status.message()
         );
     }
@@ -6627,6 +6639,39 @@ mod tests {
             .expect("the owner must be allowed to attach");
 
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_rejects_container_remap_root() {
+        // A step carries its own ContainerSpec (srun --container-remap-root), so
+        // the unimplemented flag must be rejected on the step RPC too — not only
+        // at submit — or a direct gRPC client bypasses the guard.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let status = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                step_id: 0,
+                command: vec!["hostname".into()],
+                user: "ubuntu".into(),
+                container: Some(spur_proto::proto::ContainerSpec {
+                    image: "img.sqsh".into(),
+                    remap_root: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a step must not be able to set --container-remap-root");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("--container-remap-root")
+                && status.message().contains("not yet implemented"),
+            "got: {}",
+            status.message()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

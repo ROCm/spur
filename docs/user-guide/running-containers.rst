@@ -70,7 +70,9 @@ runs inside the container.
      - Shell command run inside the container immediately before the job script
        (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
-     - Map the job user to root inside the container.
+     - Not yet implemented — rejected at submission. (Mapping the submitting
+       user to root inside the container, unprivileged on the host, is planned;
+       the flag is refused rather than silently ignored.)
 
 A GPU training job with a read-only data mount:
 

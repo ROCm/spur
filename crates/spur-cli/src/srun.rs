@@ -179,8 +179,7 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_entrypoint: Option<String>,
 
-    /// Remap the submitting user to root inside the container.
-    /// NOT YET IMPLEMENTED: rejected at submission rather than silently ignored.
+    /// Remap the submitting user to root inside the container (not yet implemented; rejected at submission)
     #[arg(long)]
     pub container_remap_root: bool,
 
@@ -239,10 +238,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     if args.container_remap_root {
         anyhow::bail!(
-            "--container-remap-root is not yet implemented; the container would run as the \
-             submitting user despite the flag. Rootless UID/GID remapping (submitter -> root \
-             inside the container, unprivileged on the host) is planned but not yet available. \
-             Omit the flag rather than rely on it."
+            "--container-remap-root is not yet implemented and is rejected rather than silently \
+             ignored. Rootless UID/GID remapping (submitter -> root inside the container, \
+             unprivileged on the host, with the rootfs owned to match) is planned but not yet \
+             available. Omit the flag."
         );
     }
 
@@ -2983,9 +2982,12 @@ mod tests {
     #[tokio::test]
     async fn container_remap_root_is_rejected() {
         // The flag was parsed, propagated, and silently ignored; it must now
-        // fail at submission rather than run the container as the submitting user.
+        // fail early rather than accept the flag and not honor it. The
+        // unroutable controller makes the test fail fast (not hang dialing the
+        // real controller) if this reject is ever removed.
         let result = main_with_args(vec![
             "srun".into(),
+            "--controller=http://127.0.0.1:1".into(),
             "--container-image=img.sqsh".into(),
             "--container-remap-root".into(),
             "hostname".into(),
