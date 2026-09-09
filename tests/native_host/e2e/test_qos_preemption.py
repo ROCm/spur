@@ -8,8 +8,11 @@ Every state transition is verified through both squeue (the primary user-facing
 queue view) and scontrol show job (the detailed record view) so that a divergence
 between the two surfaces is caught as a test failure rather than silently masked.
 
-Requires Postgres on node 0 (the accounting_cluster fixture, which skips
-when Docker is unavailable).
+Requires:
+  - preempt_type=qos_priority (scheduler config); preemption is off otherwise,
+    and eligibility is then decided by the QOS allow-list plus QOS rank
+  - Postgres on node 0 (the accounting_cluster fixture, which skips when Docker
+    is unavailable)
 
 NOTE: REST API cross-verification is not yet covered here — the e2e infrastructure
 does not have a REST client helper. That is tracked as a separate gap.
@@ -26,6 +29,12 @@ from cluster import job_state, parse_job_id, wait_job, wait_job_state
 # as uid 0 unless this is explicitly enabled.
 _AUTH_ROOT = {"auth": {"allow_root_jobs": True}}
 
+# QOS cache refreshes on the accounting interval; a freshly added QOS needs a
+# cycle before the scheduler acts on it.
+_CACHE_WARMUP_SECS = 15
+
+_GUARD_SECS = 12
+
 
 def _assert_scontrol_state(cluster, job_id: int, expected: str, label: str = "") -> None:
     """Assert JobState=<expected> appears in scontrol show job output."""
@@ -38,9 +47,9 @@ def _assert_scontrol_state(cluster, job_id: int, expected: str, label: str = "")
 
 class TestQosPriorityPreemption:
     """A low-QOS running job must be preempted by a high-QOS pending job
-    contending for the same exclusive node, driven purely by the QOS
-    priority delta and the low QOS's preempt_mode override, once the
-    partition has opted into preemption at all."""
+    contending for the same exclusive node, driven by the high QOS's
+    allow-list entry for the low QOS plus its higher QOS rank, and evicted
+    according to the low QOS's preempt_mode override."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -60,6 +69,9 @@ class TestQosPriorityPreemption:
                     "preempt_mode": "cancel",
                 }
             ],
+            "scheduler": {
+                "preempt_type": "qos_priority",
+            },
             **_AUTH_ROOT,
         }
 
@@ -68,9 +80,9 @@ class TestQosPriorityPreemption:
         node0 = c.node_names[0]
 
         c.sacctmgr(["add", "qos", "name=low", "priority=-1000", "preemptmode=requeue"])
-        c.sacctmgr(["add", "qos", "name=high", "priority=100000"])
+        c.sacctmgr(["add", "qos", "name=high", "priority=100000", "preempt=low"])
         # Wait past the QoS cache refresh floor (10s) before submitting.
-        time.sleep(15)
+        time.sleep(_CACHE_WARMUP_SECS)
 
         low_id = None
         high_id = None
@@ -129,8 +141,6 @@ class TestQosPreemptModeOverride:
     disagree: a victim whose QOS says cancel must be cancelled even when the partition
     would otherwise requeue it."""
 
-    _CACHE_WARMUP_SECS = 15
-
     @pytest.fixture
     def cluster_config_overrides(self):
         return {
@@ -145,6 +155,9 @@ class TestQosPreemptModeOverride:
                     "preempt_mode": "requeue",
                 }
             ],
+            "scheduler": {
+                "preempt_type": "qos_priority",
+            },
             **_AUTH_ROOT,
         }
 
@@ -155,8 +168,8 @@ class TestQosPreemptModeOverride:
         node = c.node_names[0]
 
         c.sacctmgr(["add", "qos", "name=fragile", "priority=-1000", "preemptmode=cancel"])
-        c.sacctmgr(["add", "qos", "name=strong",  "priority=100000"])
-        time.sleep(self._CACHE_WARMUP_SECS)
+        c.sacctmgr(["add", "qos", "name=strong",  "priority=100000", "preempt=fragile"])
+        time.sleep(_CACHE_WARMUP_SECS)
 
         victim_id = None
         aggressor_id = None
@@ -215,8 +228,6 @@ class TestQosPreemptModeOff:
     takes effect. To prevent a QOS's jobs from being preempted, the QOS must
     simply not appear in any preemptor QOS's allow-list."""
 
-    _CACHE_WARMUP_SECS = 15
-
     @pytest.fixture
     def cluster_config_overrides(self):
         return {
@@ -231,6 +242,9 @@ class TestQosPreemptModeOff:
                     "preempt_mode": "cancel",
                 }
             ],
+            "scheduler": {
+                "preempt_type": "qos_priority",
+            },
             **_AUTH_ROOT,
         }
 
@@ -241,8 +255,8 @@ class TestQosPreemptModeOff:
         node = c.node_names[0]
 
         c.sacctmgr(["add", "qos", "name=defer-off", "priority=-500", "preemptmode=off"])
-        c.sacctmgr(["add", "qos", "name=hunter",    "priority=100000"])
-        time.sleep(self._CACHE_WARMUP_SECS)
+        c.sacctmgr(["add", "qos", "name=hunter", "priority=100000", "preempt=defer-off"])
+        time.sleep(_CACHE_WARMUP_SECS)
 
         victim_id = None
         aggressor_id = None
@@ -279,9 +293,99 @@ class TestQosPreemptModeOff:
             final = wait_job(c, aggressor_id, timeout=30)
             assert final == "CD", f"aggressor must complete; got {final!r}"
         finally:
-            if victim_id is not None:
-                c.cli_allow_fail(["scancel", str(victim_id)])
-            if aggressor_id is not None:
-                c.cli_allow_fail(["scancel", str(aggressor_id)])
-            if aggressor_id is not None:
-                c.cli_allow_fail(["scancel", str(aggressor_id)])
+            for jid in (victim_id, aggressor_id):
+                if jid is not None:
+                    c.cli_allow_fail(["scancel", str(jid)])
+
+
+class TestPreemptTypeUnsetDisablesPreemption:
+    """Preemption is off unless `scheduler.preempt_type = qos_priority`.
+
+    This is the global gate, and it is the one thing left unset here: the
+    partition allows cancellation, the hunter QOS allow-lists the victim QOS
+    and outranks it 100x, and the pending job is boosted far past the victim's
+    raw priority. That is exactly the configuration that evicts in
+    TestQosPreemptModeOverride, so nothing may happen here for any reason other
+    than the absent preempt_type.
+    """
+
+    # Deliberately not part of the eligibility rule any more; boosting it here
+    # fails the test loudly if raw job priority ever regains the ability to
+    # drive preemption on its own.
+    _AGGRESSOR_PRIORITY = 1_000_000
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {
+            "partitions": [
+                {
+                    "name": "default",
+                    "state": "UP",
+                    "default": True,
+                    "nodes": "ALL",
+                    "max_time": "24:00:00",
+                    "default_time": "10:00",
+                    "preempt_mode": "cancel",
+                }
+            ],
+            # No "scheduler" section at all: preempt_type falls back to its
+            # default, which disables preemption entirely.
+            **_AUTH_ROOT,
+        }
+
+    def test_absent_preempt_type_blocks_an_otherwise_valid_preemption(
+        self, accounting_cluster
+    ):
+        c = accounting_cluster
+        node = c.node_names[0]
+
+        c.sacctmgr(["add", "qos", "name=gate-victim", "priority=100",
+                    "preemptmode=cancel"])
+        c.sacctmgr(["add", "qos", "name=gate-hunter", "priority=10000",
+                    "preempt=gate-victim"])
+        time.sleep(_CACHE_WARMUP_SECS)
+
+        victim_id = None
+        aggressor_id = None
+        try:
+            victim_script = c.write_file("gate-victim.sh", "#!/bin/bash\nsleep 600\n")
+            victim_id = parse_job_id(
+                c.sbatch(["-N1", "--exclusive", f"--nodelist={node}",
+                          "-q", "gate-victim", victim_script])
+            )
+            assert victim_id is not None, "victim submit failed"
+            wait_job_state(c, victim_id, "R", timeout=30)
+            _assert_scontrol_state(c, victim_id, "RUNNING", "victim initial")
+
+            aggressor_script = c.write_file("gate-hunter.sh", "#!/bin/bash\nsleep 600\n")
+            aggressor_id = parse_job_id(
+                c.sbatch(["-N1", "--exclusive", f"--nodelist={node}",
+                          "-q", "gate-hunter", aggressor_script])
+            )
+            assert aggressor_id is not None, "aggressor submit failed"
+            wait_job_state(c, aggressor_id, "PD", timeout=30)
+            _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor before guard")
+
+            preempted_before = c.sdiag_jobs_preempted()
+            c.scontrol("update", f"JobId={aggressor_id}",
+                       f"Priority={self._AGGRESSOR_PRIORITY}")
+
+            time.sleep(_GUARD_SECS)
+            sq = c.squeue_all()
+            assert job_state(sq, victim_id) == "R", (
+                "preemption must stay off while scheduler.preempt_type is unset, "
+                "even with a valid allow-list and a 100x QOS rank gap"
+            )
+            _assert_scontrol_state(c, victim_id, "RUNNING", "victim after guard")
+            assert job_state(sq, aggressor_id) == "PD", (
+                "the allow-listed, higher-ranked aggressor must wait while the "
+                "global preemption gate is off"
+            )
+            _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor after guard")
+            assert c.sdiag_jobs_preempted() == preempted_before, (
+                "no preemption decision may be recorded with preempt_type unset"
+            )
+        finally:
+            for jid in (victim_id, aggressor_id):
+                if jid is not None:
+                    c.cli_allow_fail(["scancel", str(jid)])

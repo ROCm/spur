@@ -34,8 +34,10 @@ pub struct Partition {
     pub deny_accounts: Vec<String>,
     pub deny_qos: Vec<String>,
 
-    /// Scheduling
-    pub preempt_mode: PreemptMode,
+    /// Scheduling. `None` means nothing was configured at this scope; it
+    /// resolves the same as `Off`.
+    #[serde(default)]
+    pub preempt_mode: Option<PreemptMode>,
     pub priority_tier: u32,
     /// Partition-level override for the minimum seconds a job must have been
     /// running before it is eligible for preemption. `None` defers to the
@@ -69,16 +71,16 @@ impl std::fmt::Display for PartitionState {
     }
 }
 
-/// Controls cross-QOS preemption eligibility. Mirrors Slurm's `PreemptType`.
+/// Selects the preemption engine. Mirrors Slurm's `PreemptType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PreemptType {
-    /// No QOS-level restrictions — eligibility is determined solely by priority
-    /// gap, partition mode, and reservation tier (existing behaviour).
+    /// Preemption is disabled. `off` is accepted as a synonym.
     #[default]
+    #[serde(alias = "off")]
     None,
-    /// A pending job may only preempt a running job when the pending job's QOS
-    /// lists the running job's QOS in its `preempt` allow-list.
+    /// A pending job may preempt a running job only when the pending job's QOS
+    /// lists the running job's QOS in its `preempt` allow-list and outranks it.
     QosPriority,
 }
 
@@ -104,6 +106,33 @@ impl PreemptMode {
             Self::Requeue => 2,
             Self::Cancel => 3,
         }
+    }
+}
+
+/// Parse a configured partition preempt mode. An empty value means "not
+/// configured", which resolves the same as `off`. Unrecognized values are an
+/// error so a typo cannot silently disable preemption.
+pub fn parse_preempt_mode(value: &str) -> Result<Option<PreemptMode>, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "none" => Ok(None),
+        "off" => Ok(Some(PreemptMode::Off)),
+        "cancel" => Ok(Some(PreemptMode::Cancel)),
+        "requeue" => Ok(Some(PreemptMode::Requeue)),
+        "suspend" => Ok(Some(PreemptMode::Suspend)),
+        other => Err(format!(
+            "unknown preempt_mode '{other}'; expected none, off, cancel, requeue, or suspend"
+        )),
+    }
+}
+
+/// Wire form of a configured preempt mode; empty when unset.
+pub fn preempt_mode_str(mode: Option<PreemptMode>) -> &'static str {
+    match mode {
+        None => "",
+        Some(PreemptMode::Off) => "OFF",
+        Some(PreemptMode::Cancel) => "CANCEL",
+        Some(PreemptMode::Requeue) => "REQUEUE",
+        Some(PreemptMode::Suspend) => "SUSPEND",
     }
 }
 
@@ -154,7 +183,7 @@ impl Default for Partition {
             allow_qos: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
-            preempt_mode: PreemptMode::Off,
+            preempt_mode: None,
             priority_tier: 1,
             preempt_exempt_time: None,
         }
@@ -164,6 +193,30 @@ impl Default for Partition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preempt_mode_parses_unset_off_and_actions() {
+        assert_eq!(parse_preempt_mode(""), Ok(None));
+        assert_eq!(parse_preempt_mode("  "), Ok(None));
+        assert_eq!(parse_preempt_mode("none"), Ok(None));
+        assert_eq!(parse_preempt_mode("off"), Ok(Some(PreemptMode::Off)));
+        assert_eq!(parse_preempt_mode("OFF"), Ok(Some(PreemptMode::Off)));
+        assert_eq!(parse_preempt_mode("Cancel"), Ok(Some(PreemptMode::Cancel)));
+        assert!(parse_preempt_mode("cancle").is_err());
+    }
+
+    #[test]
+    fn preempt_mode_str_round_trips() {
+        for mode in [
+            None,
+            Some(PreemptMode::Off),
+            Some(PreemptMode::Cancel),
+            Some(PreemptMode::Requeue),
+            Some(PreemptMode::Suspend),
+        ] {
+            assert_eq!(parse_preempt_mode(preempt_mode_str(mode)), Ok(mode));
+        }
+    }
 
     #[test]
     fn preempt_mode_aggressiveness_orders_cancel_over_requeue_over_suspend_over_off() {

@@ -2,29 +2,36 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Black-box end-to-end tests for fair-share's influence on preemption eligibility.
+Black-box end-to-end tests proving fair-share has no say in preemption eligibility.
 
-Preemption fires on a gap in *effective* priority, and effective priority is a
-product:
+Fair-share used to feed the effective job priority that gated preemption:
 
     effective = base x min(fair_share, 10.0) x age_factor x max(partition_tier, 1)
-    base      = explicit --priority, else 1000 + qos.priority
 
-Because the terms multiply, fair-share does not merely break ties between jobs
-of equal QOS — it can overturn the QOS ordering outright. Fair-share spans
-roughly 33x in practice (capped at 10.0 above, sinking toward the account's
-target share below) while a QOS priority of 10000 against 100 spans only 10x
-(base 11000 against 1100). The wider range wins.
+Because the terms multiplied, fair-share (spanning roughly 33x in practice) could
+overturn the QOS ordering outright (a QOS priority of 10000 against 100 spans only
+10x on base). In production that let burst-QOS jobs at priority 100 repeatedly
+cancel team-QOS jobs at priority 10000 whose owners had drifted over their target
+share.
 
-These tests pin that behaviour down so a change to the priority model is a
-deliberate decision rather than an accident.
+Eligibility is now decided by the QOS allow-list plus QOS rank alone. Fair-share
+still orders pending jobs, but it can neither create nor block a preemption. These
+tests assert both halves of that:
+
+  FairShareCannotPreemptWithoutAllowList
+      An extreme fair-share disparity favouring the aggressor evicts nothing while
+      no allow-list permits it.
+
+  QosRankDecidesRegardlessOfFairShare
+      With an allow-list in place, QOS rank alone settles the outcome — a poor
+      fair-share does not stop the higher-ranked QOS from preempting, and a
+      stellar fair-share does not let the lower-ranked QOS preempt.
+
+Every fixture here sets preempt_type=qos_priority; without it preemption is off
+entirely and the negative tests would pass without exercising anything.
 
 Requires:
   - Postgres on node 0 (accounting_cluster fixture, skips when Docker is absent)
-
-Note the fixtures deliberately leave scheduler.preempt_type unset, so it
-defaults to `none` and the per-QOS `preempt` allow-list is not consulted. That
-is the configuration under test: eligibility rests entirely on the priority gap.
 """
 
 import time
@@ -41,14 +48,15 @@ _GUARD_SECS = 12
 
 # fairshare_refresh_secs is 10 in the harness config and FairshareCache clamps
 # its interval to a 10s floor, so a planted usage row needs two cycles plus
-# slack before the scheduler is guaranteed to see it.
+# slack before the scheduler is guaranteed to see it. The same wait covers the
+# QOS cache, which refreshes on the same interval.
 _FAIRSHARE_REFRESH_SECS = 30
 
 # Required when the test runner SSHes in as root: spurd refuses to execute jobs
 # as uid 0 unless this is explicitly enabled.
 _AUTH_ROOT = {"auth": {"plugin": "none", "allow_root_jobs": True}}
 
-_CANCEL_PARTITION = {
+_BASE_CONFIG = {
     "partitions": [
         {
             "name": "default",
@@ -60,7 +68,17 @@ _CANCEL_PARTITION = {
             "preempt_mode": "cancel",
         }
     ],
+    "scheduler": {
+        "preempt_type": "qos_priority",
+    },
+    **_AUTH_ROOT,
 }
+
+# Planted usage large enough that the account's actual share saturates, and
+# small enough (the counterpart) to hit the fair-share epsilon. Together they
+# drive the two accounts to opposite ends of the fair-share range.
+_HEAVY_USAGE = 999_000_000
+_LIGHT_USAGE = 1
 
 
 def _assert_scontrol_state(cluster, job_id: int, expected: str, label: str = "") -> None:
@@ -94,56 +112,50 @@ def _seed_usage(cluster, user: str, account: str, cpu_seconds: int) -> None:
     )
 
 
-class TestFairShareOverturnsQosPriority:
-    """A QOS priority of 100 must not be able to evict a QOS priority of 10000 —
-    yet it does, because fair-share is multiplied into the same number that gates
-    preemption.
+def _setup_skewed_accounts(cluster, user: str, heavy: str, light: str) -> None:
+    """Two accounts driven to opposite ends of the fair-share range.
 
-    Reproduces a production pattern where burst-QOS jobs (priority 100)
-    repeatedly cancelled team-QOS jobs (priority 10000) whose owners had drifted
-    over their fair-share target.
+    `heavy` gets the smaller weight and nearly all the recorded usage, so its
+    fair-share factor sinks; `light` gets the larger weight and effectively no
+    usage, so its factor pins to the 10.0 cap. That is the ~33x disparity that
+    used to be enough to overturn a 100x QOS priority ordering.
+    """
+    cluster.sacctmgr(["add", "account", f"name={heavy}", "fairshare=1"])
+    cluster.sacctmgr(["add", "account", f"name={light}", "fairshare=10"])
+    cluster.sacctmgr(["add", "user", f"name={user}", f"account={heavy}"])
+    cluster.sacctmgr(["add", "user", f"name={user}", f"account={light}"])
+    _seed_usage(cluster, user, heavy, _HEAVY_USAGE)
+    _seed_usage(cluster, user, light, _LIGHT_USAGE)
 
-    Arithmetic, with both accounts on the default partition (tier 1) and both
-    jobs freshly submitted (age_factor ~1.0):
 
-      target_share(heavy) = 1 / 11  = 0.0909      (fairshare weight 1 of 11)
-      target_share(light) = 10 / 11 = 0.909       (fairshare weight 10 of 11)
+class TestFairShareCannotPreemptWithoutAllowList:
+    """No fair-share disparity, however extreme, may evict a job that no QOS
+    allow-list permits preempting.
 
-      heavy holds ~all recorded usage  -> actual ~1.0  -> fs ~0.0909
-      light holds ~none                -> actual clamped to the 0.001 epsilon
-                                       -> fs 909, capped to 100, then to 10.0
-
-      victim  (team,  base 11000) effective ~ 11000 x 0.0909 =  1000
-      pending (burst, base  1100) effective ~  1100 x 10.0   = 11000
-
-      preemption fires when victim < pending / 2, i.e. 1000 < 5500. True, with
-      a 5.5x margin so the assertion does not sit on the threshold.
+    This is the direct regression test for the production defect: a burst QOS at
+    priority 100 cancelling team-QOS jobs at priority 10000 because the team's
+    owners had drifted over their fair-share target. The setup below reproduces
+    that disparity exactly — the aggressor holds the maximum fair-share factor and
+    the victim the minimum — and asserts that nothing happens, because the
+    aggressor's QOS names nothing in its preempt allow-list.
     """
 
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {**_CANCEL_PARTITION, **_AUTH_ROOT}
+        return _BASE_CONFIG
 
-    def test_low_qos_priority_preempts_high_qos_priority_via_fairshare(
-        self, accounting_cluster
-    ):
+    def test_extreme_fairshare_disparity_evicts_nothing(self, accounting_cluster):
         c = accounting_cluster
         node = c.node_names[0]
         user = c.nodes[0].user
 
-        # Unequal fair-share weights give the two accounts very different
-        # targets; planted usage then drives their actual shares apart.
-        c.sacctmgr(["add", "account", "name=fs-heavy", "fairshare=1"])
-        c.sacctmgr(["add", "account", "name=fs-light", "fairshare=10"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=fs-heavy"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=fs-light"])
+        _setup_skewed_accounts(c, user, "fs-heavy", "fs-light")
 
-        # The victim outranks the aggressor by 100x on QOS priority alone.
+        # The victim also outranks the aggressor by 100x on QOS priority, so
+        # fair-share is the only thing that could possibly favour the aggressor.
+        # Neither QOS lists the other.
         c.sacctmgr(["add", "qos", "name=fs-team", "priority=10000", "preemptmode=cancel"])
         c.sacctmgr(["add", "qos", "name=fs-burst", "priority=100", "preemptmode=cancel"])
-
-        _seed_usage(c, user, "fs-heavy", 999_000_000)
-        _seed_usage(c, user, "fs-light", 1)
         time.sleep(_FAIRSHARE_REFRESH_SECS)
 
         victim_id = None
@@ -163,10 +175,10 @@ class TestFairShareOverturnsQosPriority:
             # Sample the counter before the aggressor exists: the scheduler runs
             # on a sub-second cycle and can preempt while the submit call is
             # still returning, so a baseline taken any later may already include
-            # the preemption this test is trying to observe.
+            # the preemption this test is trying to catch.
             preempted_before = c.sdiag_jobs_preempted()
 
-            aggressor_script = c.write_file("fs-aggressor.sh", _QUICK_SCRIPT)
+            aggressor_script = c.write_file("fs-aggressor.sh", _SLEEP_SCRIPT)
             aggressor_id = parse_job_id(
                 c.sbatch([
                     "-N1", "--exclusive", f"--nodelist={node}",
@@ -174,12 +186,88 @@ class TestFairShareOverturnsQosPriority:
                 ])
             )
             assert aggressor_id is not None, "aggressor submit failed"
+            wait_job_state(c, aggressor_id, "PD", timeout=30)
+
+            time.sleep(_GUARD_SECS)
+            sq = c.squeue_all()
+            assert job_state(sq, victim_id) == "R", (
+                "a fair-share advantage must not evict anything on its own; in "
+                "production this exact disparity let a QOS priority of 100 cancel "
+                "jobs at QOS priority 10000"
+            )
+            _assert_scontrol_state(c, victim_id, "RUNNING", "victim after guard")
+            assert job_state(sq, aggressor_id) == "PD", (
+                "the fair-share-favoured job must wait rather than displace the "
+                "higher-ranked QOS"
+            )
+            _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor after guard")
+            assert c.sdiag_jobs_preempted() == preempted_before, (
+                "no preemption decision may be recorded when no allow-list permits one"
+            )
+        finally:
+            for jid in (victim_id, aggressor_id):
+                if jid is not None:
+                    c.cli_allow_fail(["scancel", str(jid)])
+
+
+class TestQosRankDecidesRegardlessOfFairShare:
+    """With an allow-list in place, QOS rank settles the outcome and fair-share
+    cannot override it in either direction.
+
+    The two tests are mirror images: the same accounts and the same ~33x
+    fair-share disparity, with only the direction of the QOS rank swapped. If
+    fair-share still leaked into the eligibility decision, exactly one of them
+    would fail.
+    """
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _BASE_CONFIG
+
+    def test_higher_qos_rank_preempts_despite_worse_fairshare(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        user = c.nodes[0].user
+
+        _setup_skewed_accounts(c, user, "fs-a-heavy", "fs-a-light")
+
+        # The aggressor outranks the victim on QOS but runs from the account with
+        # the exhausted fair-share; the victim sits on the pristine one.
+        c.sacctmgr(["add", "qos", "name=fs-a-victim", "priority=100",
+                    "preemptmode=cancel"])
+        c.sacctmgr(["add", "qos", "name=fs-a-hunter", "priority=10000",
+                    "preempt=fs-a-victim"])
+        time.sleep(_FAIRSHARE_REFRESH_SECS)
+
+        victim_id = None
+        aggressor_id = None
+        try:
+            victim_script = c.write_file("fs-a-victim.sh", _SLEEP_SCRIPT)
+            victim_id = parse_job_id(
+                c.sbatch([
+                    "-N1", "--exclusive", f"--nodelist={node}",
+                    "-A", "fs-a-light", "-q", "fs-a-victim", victim_script,
+                ])
+            )
+            assert victim_id is not None, "victim submit failed"
+            wait_job_state(c, victim_id, "R", timeout=30)
+            _assert_scontrol_state(c, victim_id, "RUNNING", "victim initial")
+
+            preempted_before = c.sdiag_jobs_preempted()
+
+            aggressor_script = c.write_file("fs-a-hunter.sh", _QUICK_SCRIPT)
+            aggressor_id = parse_job_id(
+                c.sbatch([
+                    "-N1", "--exclusive", f"--nodelist={node}",
+                    "-A", "fs-a-heavy", "-q", "fs-a-hunter", aggressor_script,
+                ])
+            )
+            assert aggressor_id is not None, "aggressor submit failed"
 
             terminal = wait_job(c, victim_id, timeout=_WAIT_PREEMPT)
             assert terminal in ("CA", "GONE"), (
-                "a QOS priority of 100 evicted a QOS priority of 10000 in production; "
-                "this test asserts that behaviour still reproduces, so that a change to "
-                f"the priority model is caught here. got {terminal!r}"
+                "an allow-listed, higher-ranked QOS must preempt even when its "
+                f"owner has exhausted their fair-share; got {terminal!r}"
             )
             if terminal != "GONE":
                 _assert_scontrol_state(c, victim_id, "CANCELLED", "victim after preemption")
@@ -201,64 +289,46 @@ class TestFairShareOverturnsQosPriority:
                 if jid is not None:
                     c.cli_allow_fail(["scancel", str(jid)])
 
-
-class TestEqualFairShareLeavesQosPriorityIntact:
-    """The control for the test above: with fair-share neutral on both sides, the
-    QOS priority ordering holds and the low-priority job cannot evict anyone.
-
-    Without this, the inversion test could pass for the wrong reason — a bug that
-    let *any* pending job preempt would satisfy it just as well.
-    """
-
-    @pytest.fixture
-    def cluster_config_overrides(self):
-        return {**_CANCEL_PARTITION, **_AUTH_ROOT}
-
-    def test_low_qos_cannot_preempt_high_qos_without_fairshare_divergence(
+    def test_lower_qos_rank_cannot_preempt_despite_better_fairshare(
         self, accounting_cluster
     ):
         c = accounting_cluster
         node = c.node_names[0]
         user = c.nodes[0].user
 
-        # Identical weights and identical planted usage: both accounts land on
-        # the same fair-share factor, so only QOS priority separates the jobs.
-        c.sacctmgr(["add", "account", "name=fs-even-a", "fairshare=1"])
-        c.sacctmgr(["add", "account", "name=fs-even-b", "fairshare=1"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=fs-even-a"])
-        c.sacctmgr(["add", "user", f"name={user}", "account=fs-even-b"])
+        _setup_skewed_accounts(c, user, "fs-b-heavy", "fs-b-light")
 
-        c.sacctmgr(["add", "qos", "name=fs-even-team", "priority=10000", "preemptmode=cancel"])
-        c.sacctmgr(["add", "qos", "name=fs-even-burst", "priority=100", "preemptmode=cancel"])
-
-        _seed_usage(c, user, "fs-even-a", 1_000_000)
-        _seed_usage(c, user, "fs-even-b", 1_000_000)
+        # Mirror of the test above: the aggressor now holds the pristine
+        # fair-share but is outranked on QOS. The allow-list still names the
+        # victim, so the strict rank comparison is the only thing left to block
+        # eviction — and fair-share must not be able to substitute for it.
+        c.sacctmgr(["add", "qos", "name=fs-b-victim", "priority=10000",
+                    "preemptmode=cancel"])
+        c.sacctmgr(["add", "qos", "name=fs-b-hunter", "priority=100",
+                    "preempt=fs-b-victim"])
         time.sleep(_FAIRSHARE_REFRESH_SECS)
 
         victim_id = None
         aggressor_id = None
         try:
-            victim_script = c.write_file("fs-even-victim.sh", _SLEEP_SCRIPT)
+            victim_script = c.write_file("fs-b-victim.sh", _SLEEP_SCRIPT)
             victim_id = parse_job_id(
                 c.sbatch([
                     "-N1", "--exclusive", f"--nodelist={node}",
-                    "-A", "fs-even-a", "-q", "fs-even-team", victim_script,
+                    "-A", "fs-b-heavy", "-q", "fs-b-victim", victim_script,
                 ])
             )
             assert victim_id is not None, "victim submit failed"
             wait_job_state(c, victim_id, "R", timeout=30)
             _assert_scontrol_state(c, victim_id, "RUNNING", "victim initial")
 
-            # Baseline before the aggressor exists, matching the inversion test:
-            # a later sample could absorb the very preemption being guarded
-            # against and turn this assertion into a no-op.
             preempted_before = c.sdiag_jobs_preempted()
 
-            aggressor_script = c.write_file("fs-even-aggressor.sh", _SLEEP_SCRIPT)
+            aggressor_script = c.write_file("fs-b-hunter.sh", _SLEEP_SCRIPT)
             aggressor_id = parse_job_id(
                 c.sbatch([
                     "-N1", "--exclusive", f"--nodelist={node}",
-                    "-A", "fs-even-b", "-q", "fs-even-burst", aggressor_script,
+                    "-A", "fs-b-light", "-q", "fs-b-hunter", aggressor_script,
                 ])
             )
             assert aggressor_id is not None, "aggressor submit failed"
@@ -267,16 +337,17 @@ class TestEqualFairShareLeavesQosPriorityIntact:
             time.sleep(_GUARD_SECS)
             sq = c.squeue_all()
             assert job_state(sq, victim_id) == "R", (
-                "a QOS priority of 100 must not evict a QOS priority of 10000 when "
-                "fair-share is neutral on both sides"
+                "a lower-ranked QOS must not evict a higher-ranked one even with "
+                "an allow-list entry and a maximal fair-share advantage"
             )
             _assert_scontrol_state(c, victim_id, "RUNNING", "victim after guard")
             assert job_state(sq, aggressor_id) == "PD", (
-                "the low-QOS job must wait rather than displace the high-QOS job"
+                "the lower-ranked aggressor must wait its turn"
             )
             _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor after guard")
             assert c.sdiag_jobs_preempted() == preempted_before, (
-                "no preemption may be recorded while fair-share is neutral"
+                "no preemption decision may be recorded when the aggressor's QOS "
+                "does not outrank the victim's"
             )
         finally:
             for jid in (victim_id, aggressor_id):
