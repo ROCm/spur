@@ -18,19 +18,27 @@ mod tests {
     }
 
     #[test]
-    fn t52_2_parse_hours_minutes() {
-        assert_eq!(parse_time_minutes("1:30"), Some(90));
+    fn t52_2_parse_minutes_seconds() {
+        // Slurm's two-field form is minutes:seconds; 1m30s rounds up to 2 min.
+        assert_eq!(parse_time_minutes("1:30"), Some(2));
+    }
+
+    #[test]
+    fn t52_2b_parse_days_hours() {
+        assert_eq!(parse_time_minutes("2-12"), Some(3600));
     }
 
     #[test]
     fn t52_3_parse_hms() {
         assert_eq!(parse_time_minutes("72:00:00"), Some(4320));
+        assert_eq!(parse_time_minutes("0:0:90"), Some(2));
     }
 
     #[test]
     fn t52_4_parse_days_hms() {
         assert_eq!(parse_time_minutes("1-00:00:00"), Some(1440));
         assert_eq!(parse_time_minutes("7-00:00:00"), Some(10080));
+        assert_eq!(parse_time_minutes("2-0:0:90"), Some(2882));
     }
 
     #[test]
@@ -151,7 +159,7 @@ priority_tier = 1
 [[partitions]]
 name = "debug"
 nodes = "node[001-002]"
-max_time = "1:00"
+max_time = "1:00:00"
 "#,
         )
         .unwrap();

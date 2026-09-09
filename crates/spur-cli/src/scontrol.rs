@@ -1770,9 +1770,8 @@ async fn reconfigure(controller: &str) -> Result<()> {
 }
 
 /// Parse a reservation duration into minutes via the shared `--time` grammar
-/// (whole minutes, `HH:MM:SS`, `D-HH:MM:SS`, `90m`); rejects INFINITE. Quirk of
-/// that grammar: a bare `MM:SS` is read as `HH:MM` and bare `days-hours` is
-/// rejected, so prefer the unambiguous colon forms.
+/// (whole minutes, `MM:SS`, `HH:MM:SS`, `days-hours`, `D-HH:MM`, `D-HH:MM:SS`,
+/// `90m`); rejects INFINITE.
 fn parse_reservation_duration(s: &str) -> Result<u32> {
     spur_core::config::parse_time_minutes(s).ok_or_else(|| {
         anyhow::anyhow!(
