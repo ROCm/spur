@@ -22,6 +22,10 @@ pub struct SstatArgs {
     #[arg(long)]
     pub noheader: bool,
 
+    /// Accepted for Slurm compatibility; has no effect
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Parsable output (delimiter-separated)
     #[arg(short = 'p', long)]
     pub parsable: bool,
@@ -249,6 +253,14 @@ fn state_name(state: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = SstatArgs::try_parse_from(["sstat", "--noconvert", "--jobs", "1"]).unwrap();
+        assert!(args.noconvert);
+        assert_eq!(args.job_id, "1");
+    }
 
     #[test]
     fn parse_field_list_accepts_aliases_case_and_padding() {

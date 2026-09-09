@@ -27,6 +27,10 @@ pub struct SreportArgs {
     #[arg(long, global = true)]
     pub noheader: bool,
 
+    /// Accepted for Slurm compatibility; has no effect
+    #[arg(long, global = true)]
+    pub noconvert: bool,
+
     /// Parsable output
     #[arg(short = 'p', long, global = true)]
     pub parsable: bool,
@@ -430,4 +434,31 @@ async fn report_job_sizes_by_user(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let before = SreportArgs::try_parse_from([
+            "sreport",
+            "--noconvert",
+            "cluster",
+            "AccountUtilizationByUser",
+        ])
+        .unwrap();
+        assert!(before.noconvert);
+
+        let after = SreportArgs::try_parse_from([
+            "sreport",
+            "cluster",
+            "AccountUtilizationByUser",
+            "--noconvert",
+        ])
+        .unwrap();
+        assert!(after.noconvert);
+    }
 }
