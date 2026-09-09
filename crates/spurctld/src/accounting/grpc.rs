@@ -706,10 +706,21 @@ impl SlurmAccounting for AccountingService {
             .as_deref()
             .map(canonicalize_qos_flags)
             .transpose()?;
+        // Canonicalize so a typo is rejected here rather than silently reading
+        // back as "no override" once the cache reloads.
+        let preempt_mode = req
+            .preempt_mode
+            .as_deref()
+            .map(|mode| {
+                spur_core::accounting::parse_qos_preempt_mode(mode)
+                    .map(spur_core::accounting::qos_preempt_mode_str)
+                    .map_err(Status::invalid_argument)
+            })
+            .transpose()?;
         let update = db::QosUpdate {
             description: req.description.as_deref(),
             priority: req.priority,
-            preempt_mode: req.preempt_mode.as_deref(),
+            preempt_mode,
             preempt: preempt_normalized.as_deref(),
             usage_factor: req.usage_factor,
             max_jobs_per_user: nullable_limit(req.max_jobs_per_user, "max_jobs_per_user")?,

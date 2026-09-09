@@ -1697,7 +1697,7 @@ message CreatePartitionRequest {
   repeated string allow_accounts = 10;
   repeated string allow_groups = 11;
   uint32 priority_tier = 12;
-  string preempt_mode = 13;       // "OFF" | "CANCEL" | "REQUEUE" | "SUSPEND"
+  string preempt_mode = 13;       // "" (unset) | "OFF" | "CANCEL" | "REQUEUE" | "SUSPEND"
   repeated string deny_accounts = 14;
   repeated string deny_qos = 15;
   repeated string allow_qos = 16;

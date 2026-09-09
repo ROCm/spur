@@ -518,10 +518,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("name= required"))?;
             let desc = p.get("description").cloned().unwrap_or_default();
             let priority: i32 = p.get("priority").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let preempt = p
-                .get("preemptmode")
-                .cloned()
-                .unwrap_or_else(|| "off".into());
+            let preempt = p.get("preemptmode").cloned().unwrap_or_default();
             let usage_factor: f64 = p
                 .get("usagefactor")
                 .and_then(|v| v.parse().ok())
@@ -960,7 +957,7 @@ async fn show(
             if qos_list.is_empty() && !has_name_filter {
                 let default_qos = QosInfo {
                     name: "normal".into(),
-                    preempt_mode: "off".into(),
+                    preempt_mode: String::new(),
                     usage_factor: 1.0,
                     ..Default::default()
                 };

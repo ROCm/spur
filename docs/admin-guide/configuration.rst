@@ -488,14 +488,15 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - string
      - ``"none"``
      - Live
-     - Controls cross-QOS preemption eligibility. ``"none"`` (default) applies no
-       QOS-level restrictions — any job with a sufficient priority gap may preempt
-       any other. ``"qos_priority"`` enforces the per-QOS ``preempt`` allow-list:
-       a pending job may only preempt a running job when the pending job's QOS
-       explicitly lists the running job's QOS name in its ``preempt`` field. An
-       empty allow-list means the QOS may not preempt anything. Mirrors Slurm's
-       ``PreemptType=preempt/qos``. See :doc:`accounting` for the QOS
-       ``preempt`` field.
+     - Selects the preemption engine. ``"none"`` (the default; ``"off"`` is
+       accepted as a synonym) disables preemption entirely.
+       ``"qos_priority"`` is the only value that enables it: a pending job may
+       then preempt a running job when the pending job's QOS lists the running
+       job's QOS name in its ``preempt`` allow-list **and** has a strictly
+       higher QOS ``priority``. An empty allow-list means the QOS may not
+       preempt anything. Mirrors Slurm's ``PreemptType=preempt/qos``. See
+       :doc:`accounting` for the QOS ``preempt`` field and the full decision
+       table.
    * - ``preempt_exempt_time``
      - integer
      - ``0``
@@ -526,17 +527,17 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    available capacity — it does not reclaim capacity already given to a
    running job. Configure:
 
-   - A priority gap of more than 2× between the jobs that must run and the
-     jobs they need to be able to displace (via base ``--priority``, QOS
-     ``priority``, or a combination — see :doc:`accounting` for how the
-     effective priority gap is computed).
-   - ``preempt_type`` (and, if a running job should not simply be killed,
-     ``preemptmode=requeue`` or ``suspend`` on its QOS) so that gap actually
-     triggers preemption instead of only affecting scheduling order.
+   - ``preempt_type = "qos_priority"``. Preemption is disabled by default.
+   - A QOS for the pending job that lists the running job's QOS in its
+     ``preempt`` allow-list and has a strictly higher QOS ``priority``
+     (see :doc:`accounting`).
+   - A non-``off`` action for the running job, from either its QOS
+     ``preemptmode`` or the ``preempt_mode`` of a partition it runs in. Use
+     ``cancel`` or ``requeue`` if the capacity must actually be freed —
+     ``suspend`` pauses the victim but leaves its nodes allocated.
 
-   With both in place, a high-priority job that cannot find free capacity
-   will preempt a lower-priority running job holding the capacity it needs,
-   rather than waiting for it to finish on its own.
+   With those policy settings in place, a pending job that cannot find free
+   capacity can preempt an eligible lower-QOS job holding the capacity it needs.
 
 .. note::
 
@@ -747,9 +748,9 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
        tier among them.
    * - ``preempt_mode``
      - string
-     - ``"off"``
-     - What the scheduler does to a running job when a higher-priority job needs
-       its node.
+     - unset
+     - What the scheduler does to a running job in this partition when an
+       eligible pending job needs its node.
 
        ``"cancel"`` — the running job is stopped and removed from the queue.
        ``"requeue"`` — the running job is stopped and put back in the queue;
@@ -759,13 +760,22 @@ jobs is skipped rather than deleted (see :ref:`reload-scope`).
        finishes. Because the node stays occupied, any other job that also needs
        that node exclusively will have to wait until the paused job either
        finishes or is cancelled.
-       ``"off"`` (default) — running jobs in this partition are never kicked
-       out. The scheduler will wait for a free slot instead of preempting.
+       unset (default) — nothing configured, so this partition supplies no
+       action. ``"off"`` — an explicit no-action, which resolves identically to
+       unset; the two differ only in that ``scontrol show partition`` reports
+       ``PreemptMode=NONE`` versus ``PreemptMode=OFF``, so you can tell whether
+       anyone configured the field. Neither is a protection: a job's QOS
+       ``preemptmode`` overrides the partition, so a QOS action still applies.
 
-       A job's QOS can change what happens to *that specific job* when it is
-       kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
-       field is the on/off switch: preemption is only attempted at all when
-       this is set to something other than ``"off"``.
+       Set the field back to unset with ``PreemptMode=NONE`` (or an empty
+       value) via ``scontrol update``.
+
+       A running job's QOS ``preemptmode`` overrides this field whenever it is
+       not ``off`` (see ``preemptmode`` in :doc:`accounting`). When a job spans
+       several partitions, the most aggressive ``preempt_mode`` among them wins
+       (``cancel`` > ``requeue`` > ``suspend`` > ``off``). Whether preemption is
+       attempted at all is governed by ``scheduler.preempt_type``, not by this
+       field. See :doc:`accounting` for the complete decision table.
    * - ``preempt_exempt_time``
      - integer or null
      - ``null`` (inherit global)
