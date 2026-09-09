@@ -7,7 +7,6 @@ mod cluster;
 pub mod container;
 mod device_cgroup;
 mod executor;
-mod health;
 pub(crate) mod job_entry;
 pub(crate) mod job_lifecycle;
 mod landlock;
@@ -127,19 +126,6 @@ fn log_cgroup_status(cgroup: &spur_core::config::CgroupConfig) {
             "[cgroup] swap denied outright (allowed_swap_percent = 0); a job that outgrows \
              its allocation is OOM-killed rather than paging out"
         );
-    }
-}
-
-fn log_health_status(health: &spur_core::config::HealthConfig) {
-    match &health.program {
-        None => info!("[health] no health-check program configured; nodes are never verified"),
-        Some(program) => info!(
-            program = %program,
-            interval_secs = health.interval_secs,
-            timeout_secs = health.timeout_secs,
-            check_before_reentry = health.check_before_reentry,
-            "node health checks enabled"
-        ),
     }
 }
 
@@ -431,11 +417,6 @@ async fn main() -> anyhow::Result<()> {
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
     let mpi_config = config.as_ref().map(|c| c.mpi.clone()).unwrap_or_default();
-    let health_config = config
-        .as_ref()
-        .map(|c| c.health.clone())
-        .unwrap_or_default();
-    log_health_status(&health_config);
     // Default-deny root execution: the job uid arrives on the wire and no RPC authenticates its
     // caller, so a uid-0 request must be refused unless the operator opted in.
     let allow_root_jobs = config
@@ -464,21 +445,10 @@ async fn main() -> anyhow::Result<()> {
         &cluster_config,
         limits,
         cgroup_config,
-        health_config.clone(),
         mpi_config,
         running_jobs,
         allow_root_jobs,
     );
-
-    // Periodic node health check (spur#801): a node degrading while idle is
-    // drained without waiting for the next job. The per-completion re-entry gate
-    // lives in the monitor loop. Only spawned when a program is configured.
-    if health_config.is_enabled() {
-        let health_reporter = reporter.clone();
-        tokio::spawn(async move {
-            health::periodic_loop(health_config, health_reporter).await;
-        });
-    }
 
     // the RPC-driven k0s component owner is idle until the controller sends
     // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —

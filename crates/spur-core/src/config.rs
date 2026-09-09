@@ -1521,29 +1521,71 @@ impl Default for CgroupConfig {
     }
 }
 
-/// Node health-check configuration (Slurm `HealthCheckProgram` analog).
+/// Node health-check configuration.
 ///
-/// When `program` is set, spurd runs it before a released node re-enters the
-/// schedulable pool and on `interval_secs`; a non-zero exit or a timeout drains
-/// the node with the program's output as the reason, rather than handing the
-/// node to the next job. When `program` is `None` no checking happens at all.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The controller submits each configured check as a real scheduled job that
+/// requests its nodes exclusively, so it runs only when a node is idle (the
+/// scheduler enforces the "probe only when idle" property — no special-case
+/// code). A non-zero exit drains the node with the check's output as the
+/// reason; a pass auto-resumes a node the health system had drained. Health-
+/// check jobs are visible in `squeue`/RPC/audit and run inside a cgroup like any
+/// other job. Empty `checks` = no health checking.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HealthConfig {
-    /// Fully-qualified path to the health-check program. `None` disables the
-    /// whole feature. No search path is set, matching the hook scripts.
+    /// The configured checks (`[[health.checks]]`).
     #[serde(default)]
-    pub program: Option<String>,
-    /// Run the check on this interval, in seconds. `0` disables the periodic
-    /// check (a re-entry check still runs when `check_before_reentry` is on).
+    pub checks: Vec<HealthCheck>,
+}
+
+/// One health check, run as a scheduled job on every eligible node on an
+/// interval. `nodes = 2` (with topology) expresses a pairwise fabric check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheck {
+    /// Fully-qualified path to the check program; run as the job's command.
+    pub program: String,
+    /// Nodes the check job requests exclusively (1 = per-node).
+    #[serde(default = "default_health_nodes")]
+    pub nodes: u32,
+    /// Re-run the check on each eligible node roughly this often.
     #[serde(default = "default_health_interval")]
     pub interval_secs: u64,
-    /// Kill the program and treat the check as failed after this many seconds.
+    /// Kill the check job and treat it as failed after this long.
     #[serde(default = "default_health_timeout")]
     pub timeout_secs: u64,
-    /// Run the check after each job completes, before the node is eligible for
-    /// the next one (the "return to pool" gate). On by default.
-    #[serde(default = "default_true_fn")]
-    pub check_before_reentry: bool,
+    /// If the check job cannot start within this long because the node stays
+    /// busy, soft-drain the node so it empties and the check can run. `0` waits
+    /// indefinitely for the node to go idle (never forces a drain).
+    #[serde(default = "default_health_max_wait")]
+    pub max_wait_secs: u64,
+    /// Unix user name the check runs as (for display and accounting). Defaults
+    /// to an unprivileged user. A privileged probe needs `user`/`uid`/`gid` set
+    /// to root (`0`) *and* `allow_root_jobs` enabled on the agents.
+    #[serde(default = "default_health_user")]
+    pub user: String,
+    /// Unix uid the check runs as. Defaults to `nobody` (65534). The agent must
+    /// be able to run jobs as this uid (a non-root spurd can only run as its own
+    /// uid, so set this to that uid on such a node).
+    #[serde(default = "default_health_uid")]
+    pub uid: u32,
+    /// Unix gid the check runs as. Defaults to `nogroup` (65534).
+    #[serde(default = "default_health_gid")]
+    pub gid: u32,
+}
+
+fn default_health_nodes() -> u32 {
+    1
+}
+
+fn default_health_user() -> String {
+    "nobody".to_string()
+}
+
+fn default_health_uid() -> u32 {
+    65534
+}
+
+fn default_health_gid() -> u32 {
+    65534
 }
 
 fn default_health_interval() -> u64 {
@@ -1554,21 +1596,14 @@ fn default_health_timeout() -> u64 {
     60
 }
 
-impl Default for HealthConfig {
-    fn default() -> Self {
-        Self {
-            program: None,
-            interval_secs: default_health_interval(),
-            timeout_secs: default_health_timeout(),
-            check_before_reentry: true,
-        }
-    }
+fn default_health_max_wait() -> u64 {
+    600
 }
 
 impl HealthConfig {
-    /// Whether any health checking is configured (a program is set).
+    /// Whether any health checking is configured.
     pub fn is_enabled(&self) -> bool {
-        self.program.is_some()
+        !self.checks.is_empty()
     }
 }
 
@@ -3031,36 +3066,56 @@ job_submit_lua = "/etc/spur/job_submit.lua"
 
     #[test]
     fn test_health_defaults() {
-        // With no [health] section the feature is off, but the interval/timeout
-        // carry sane defaults so enabling it later needs only a program path.
+        // With no [health] section there are no checks, so the feature is off.
         let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
-        assert!(config.health.program.is_none());
+        assert!(config.health.checks.is_empty());
         assert!(!config.health.is_enabled());
-        assert_eq!(config.health.interval_secs, 300);
-        assert_eq!(config.health.timeout_secs, 60);
-        assert!(config.health.check_before_reentry);
     }
 
     #[test]
-    fn test_health_parses_program_and_overrides() {
+    fn test_health_parses_checks_and_per_check_defaults() {
         let toml = r#"
 cluster_name = "x"
 
-[health]
-program = "/etc/spur/health.sh"
+[[health.checks]]
+program = "/etc/spur/gpu-health.sh"
+
+[[health.checks]]
+program = "/etc/spur/fabric-check.sh"
+nodes = 2
 interval_secs = 120
 timeout_secs = 15
-check_before_reentry = false
+max_wait_secs = 900
+user = "root"
+uid = 0
+gid = 0
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert!(config.health.is_enabled());
-        assert_eq!(
-            config.health.program.as_deref(),
-            Some("/etc/spur/health.sh")
-        );
-        assert_eq!(config.health.interval_secs, 120);
-        assert_eq!(config.health.timeout_secs, 15);
-        assert!(!config.health.check_before_reentry);
+        assert_eq!(config.health.checks.len(), 2);
+
+        // First check takes the per-field defaults, including an unprivileged
+        // identity (nobody:nogroup).
+        let gpu = &config.health.checks[0];
+        assert_eq!(gpu.program, "/etc/spur/gpu-health.sh");
+        assert_eq!(gpu.nodes, 1);
+        assert_eq!(gpu.interval_secs, 300);
+        assert_eq!(gpu.timeout_secs, 60);
+        assert_eq!(gpu.max_wait_secs, 600);
+        assert_eq!(gpu.user, "nobody");
+        assert_eq!(gpu.uid, 65534);
+        assert_eq!(gpu.gid, 65534);
+
+        // Second overrides them (a pairwise, privileged fabric check).
+        let fabric = &config.health.checks[1];
+        assert_eq!(fabric.program, "/etc/spur/fabric-check.sh");
+        assert_eq!(fabric.nodes, 2);
+        assert_eq!(fabric.interval_secs, 120);
+        assert_eq!(fabric.timeout_secs, 15);
+        assert_eq!(fabric.max_wait_secs, 900);
+        assert_eq!(fabric.user, "root");
+        assert_eq!(fabric.uid, 0);
+        assert_eq!(fabric.gid, 0);
     }
 
     #[test]

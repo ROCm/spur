@@ -19,7 +19,7 @@ use spur_core::accounting::{
     AccountLimits, PerUserCaps, Qos, ScopeLimitUsage, TresRecord, TresType, UserLimitUsage,
 };
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::{EnforcePartLimits, SlurmConfig};
+use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
@@ -447,7 +447,30 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// When each (check index, node name) last completed a check, so the pass
+    /// knows when the next one is due. Leader-local and transient (like
+    /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
+    /// round of checks on the new leader. In-flight and drain state are read
+    /// from the durable job store / node reasons instead, so they survive
+    /// failover.
+    health_last_check: parking_lot::Mutex<HashMap<(usize, String), std::time::Instant>>,
 }
+
+/// Reserved job-name prefix marking a controller-submitted health-check job, so
+/// its finalization can be recognized and users can't spoof one. The full name
+/// is `{PREFIX}{check_index}.{node}`.
+pub(crate) const HEALTH_JOB_PREFIX: &str = "_spur-health.";
+
+/// Node `state_reason` prefix for a node the health system soft-drained *to make
+/// room* for a starved check. Such a node auto-resumes once it empties so the
+/// pending check can land — a property read from this durable reason, not the
+/// leader-local slot, so it holds across a failover.
+const HEALTH_FORCE_DRAIN_PREFIX: &str = "health-check(pending): ";
+
+/// Node `state_reason` prefix for a node a check actually *failed* on. This
+/// drain is sticky: the node stays out of service for an operator to inspect,
+/// exactly like Slurm's failed `HealthCheckProgram`. It never auto-resumes.
+const HEALTH_FAIL_DRAIN_PREFIX: &str = "health-check(failed): ";
 
 struct PendingJobClassification {
     jobs: Vec<Job>,
@@ -541,6 +564,7 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
+            health_last_check: parking_lot::Mutex::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -598,6 +622,15 @@ impl ClusterManager {
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
+        // The health-check subsystem owns this name prefix; reject it on the
+        // user path so a submitted job can never masquerade as a health check
+        // and drive a node drain/resume on completion.
+        if spec.name.starts_with(HEALTH_JOB_PREFIX) {
+            return Err(SubmitError::invalid(format!(
+                "job name may not start with the reserved prefix '{HEALTH_JOB_PREFIX}'"
+            )));
+        }
+
         // One config/partitions snapshot for the whole submit path, so defaulting
         // and enforcement can't observe a concurrent reconfigure() mid-submit.
         let config = self.config();
@@ -1865,12 +1898,207 @@ impl ClusterManager {
         }
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
+        self.react_to_health_job_finalized(finalized.job_id, finalized.state, finalized.exit_code);
     }
 
     fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
         for f in &resp.jobs_finalized {
             self.run_job_finalized_side_effects(*f);
         }
+    }
+
+    /// One health-check scheduling pass, run each scheduler tick on the leader.
+    ///
+    /// For each configured check and eligible node it submits the check as an
+    /// exclusive whole-node job when it is due. Exclusivity means the scheduler
+    /// only starts it once the node is idle, so "probe only when idle" falls out
+    /// of normal scheduling. If a check stays queued past `max_wait_secs` because
+    /// the node keeps running user jobs, the node is soft-drained so it empties,
+    /// then resumed so the pending check can land.
+    pub fn run_node_health_pass(&self) {
+        let config = self.config();
+        if config.health.checks.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let now_utc = Utc::now();
+        let nodes = self.get_nodes();
+        for (idx, check) in config.health.checks.iter().enumerate() {
+            // Multi-node (fabric) checks need topology-aware node pairing, which
+            // is a follow-up; run only per-node checks for now.
+            if check.nodes != 1 {
+                warn!(
+                    check = %check.program,
+                    nodes = check.nodes,
+                    "skipping multi-node health check (per-node only for now)"
+                );
+                continue;
+            }
+            let interval = std::time::Duration::from_secs(check.interval_secs.max(1));
+            for node in &nodes {
+                let force_draining = matches!(node.state, NodeState::Drain | NodeState::Draining)
+                    && node
+                        .state_reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with(HEALTH_FORCE_DRAIN_PREFIX));
+
+                // A node we drained to make room for a starved check: resume it
+                // the moment it empties so the pending check dispatches. Driven
+                // off the durable drain reason, so it holds across a failover.
+                if force_draining {
+                    if !self.node_has_running_jobs(&node.name) {
+                        if let Err(e) = self.update_node_state(&node.name, NodeState::Idle, None) {
+                            warn!(node = %node.name, error = %e, "failed to resume node for health check");
+                        } else {
+                            self.scheduler_notify.notify_one();
+                        }
+                    }
+                    continue;
+                }
+
+                // Down / failed / operator- or fail-drained: hands off.
+                if self.node_off_limits_for_health(node) {
+                    continue;
+                }
+
+                // An in-flight check already covers this node. If it is stuck
+                // pending because the node stays busy, force-drain past max_wait.
+                if let Some(existing) = self.pending_health_job(idx, &node.name) {
+                    let waited = (now_utc - existing.submit_time).num_seconds();
+                    if check.max_wait_secs > 0
+                        && existing.state == JobState::Pending
+                        && waited >= check.max_wait_secs as i64
+                        && self.node_has_running_jobs(&node.name)
+                    {
+                        let reason = format!(
+                            "{HEALTH_FORCE_DRAIN_PREFIX}running overdue check {}",
+                            check.program
+                        );
+                        if let Err(e) = self.drain_node(&node.name, Some(reason)) {
+                            warn!(node = %node.name, error = %e, "failed to drain node for health check");
+                        }
+                    }
+                    continue;
+                }
+
+                // No check in flight: submit one if it is due.
+                let due = self
+                    .health_last_check
+                    .lock()
+                    .get(&(idx, node.name.clone()))
+                    .is_none_or(|t| now.duration_since(*t) >= interval);
+                if due {
+                    if let Err(e) = self.submit_health_job(idx, check, node) {
+                        warn!(node = %node.name, check = %check.program, error = %e, "failed to submit health-check job");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first non-terminal health-check job for `(idx, node)`, if one is in
+    /// flight. Read from the durable job store so it holds across a failover.
+    fn pending_health_job(&self, idx: usize, node: &str) -> Option<Job> {
+        let name = format!("{HEALTH_JOB_PREFIX}{idx}.{node}");
+        self.jobs
+            .read()
+            .values()
+            .find(|j| j.spec.name == name && !j.state.is_terminal())
+            .cloned()
+    }
+
+    /// Whether the health system must leave `node` untouched: only a node that
+    /// is up and schedulable (idle/allocated/mixed) is probed. A down node, or
+    /// one already drained (by an operator or a failed check), is off-limits —
+    /// a failed check's drain is sticky until an operator resumes the node.
+    fn node_off_limits_for_health(&self, node: &Node) -> bool {
+        !matches!(
+            node.state,
+            NodeState::Idle | NodeState::Allocated | NodeState::Mixed
+        )
+    }
+
+    /// Submit one check as an exclusive whole-node job pinned to `node`. It runs
+    /// as the check's configured (unprivileged by default) identity, inside the
+    /// node's own partition so the pin resolves, and is bounded by `timeout_secs`
+    /// so a hung check is killed.
+    fn submit_health_job(
+        &self,
+        idx: usize,
+        check: &HealthCheck,
+        node: &Node,
+    ) -> anyhow::Result<JobId> {
+        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let spec = JobSpec {
+            name: format!("{HEALTH_JOB_PREFIX}{idx}.{}", node.name),
+            user: check.user.clone(),
+            uid: check.uid,
+            gid: check.gid,
+            partition: node.partitions.first().cloned(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            exclusive: true,
+            nodelist: Some(node.name.clone()),
+            argv: vec![check.program.clone()],
+            time_limit: Some(chrono::Duration::seconds(check.timeout_secs.max(1) as i64)),
+            ..Default::default()
+        };
+        // Trusted internal submit: bypass the user-facing validation pipeline
+        // (auth, account/QOS, submit limits) that does not apply to a system job.
+        self.propose(WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(spec),
+        })?;
+        self.scheduler_notify.notify_one();
+        info!(job_id, node = %node.name, check = %check.program, "submitted health-check job");
+        Ok(job_id)
+    }
+
+    /// React to a finished health-check job: a non-zero exit (or timeout/failure)
+    /// drains the node with a sticky, operator-recoverable reason; a pass leaves
+    /// the node schedulable. A no-op for any non-health job.
+    fn react_to_health_job_finalized(&self, job_id: JobId, state: JobState, exit_code: i32) {
+        let Some(job) = self.get_job(job_id) else {
+            return;
+        };
+        let Some(rest) = job.spec.name.strip_prefix(HEALTH_JOB_PREFIX) else {
+            return;
+        };
+
+        // Record completion so the next check on this node is due one interval
+        // from now (best-effort; the store is authoritative for in-flight state).
+        if let Some((idx_str, node_from_name)) = rest.split_once('.') {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                self.health_last_check
+                    .lock()
+                    .insert((idx, node_from_name.to_string()), std::time::Instant::now());
+            }
+        }
+
+        let Some(node) = job.allocated_nodes.first().cloned() else {
+            // Never ran (e.g. cancelled while pending): nothing to drain.
+            return;
+        };
+        let program = job.spec.argv.first().cloned().unwrap_or_default();
+        let failed = matches!(
+            state,
+            JobState::Failed
+                | JobState::Timeout
+                | JobState::NodeFail
+                | JobState::Deadline
+                | JobState::OutOfMemory
+        );
+
+        if failed {
+            let reason =
+                format!("{HEALTH_FAIL_DRAIN_PREFIX}{program} failed ({state:?}, exit {exit_code})");
+            if let Err(e) = self.drain_node(&node, Some(reason)) {
+                warn!(node = %node, error = %e, "failed to drain node after failing health check");
+            }
+        }
+        // Passed/Cancelled/Preempted: leave the node as-is. A force-drained node
+        // was already resumed by the pass before the check could run.
     }
 
     fn run_epilog_slurmctld(&self, job_id: JobId) {
@@ -8556,6 +8784,149 @@ mod tests {
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
+        });
+    }
+
+    fn health_check(program: &str, interval_secs: u64) -> HealthCheck {
+        HealthCheck {
+            program: program.into(),
+            nodes: 1,
+            interval_secs,
+            timeout_secs: 60,
+            max_wait_secs: 600,
+            user: "nobody".into(),
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
+    fn config_with_checks(checks: Vec<HealthCheck>) -> SlurmConfig {
+        let mut cfg = test_config();
+        cfg.health = spur_core::config::HealthConfig { checks };
+        cfg
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_pass_submits_exclusive_pinned_root_job_when_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/opt/nhc.sh", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.run_node_health_pass();
+        wait_for("health job submitted", || {
+            !cm.get_jobs(&JobFilter::default()).is_empty()
+        });
+
+        let jobs = cm.get_jobs(&JobFilter::default());
+        assert_eq!(jobs.len(), 1, "exactly one health job");
+        let spec = &jobs[0].spec;
+        assert!(
+            spec.name.starts_with(HEALTH_JOB_PREFIX),
+            "reserved name marker, got {}",
+            spec.name
+        );
+        assert!(spec.exclusive, "check must take the whole node");
+        assert_eq!(spec.nodelist.as_deref(), Some("n1"), "pinned to the node");
+        assert_eq!(spec.uid, 65534, "runs as the unprivileged default identity");
+        assert_eq!(spec.argv, vec!["/opt/nhc.sh".to_string()]);
+        assert_eq!(
+            spec.partition.as_deref(),
+            Some("default"),
+            "submitted into the node's own partition so the pin resolves"
+        );
+
+        // A second pass while the first is in flight must not double-submit.
+        cm.run_node_health_pass();
+        assert_eq!(
+            cm.get_jobs(&JobFilter::default()).len(),
+            1,
+            "no duplicate check while one is in flight"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_pass_no_checks_submits_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.run_node_health_pass();
+        assert!(
+            cm.get_jobs(&JobFilter::default()).is_empty(),
+            "no [[health.checks]] means no probing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_rejects_reserved_health_name() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let spec = basic_spec("_spur-health.0.n1");
+        let err = cm.submit_job(spec).unwrap_err();
+        // The reject names the reserved prefix so the user understands why.
+        let SubmitError::InvalidArgument(msg) = &err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains(HEALTH_JOB_PREFIX), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_leaves_drained_node_alone() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/bin/true", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+
+        // A drained node (operator maintenance, or a prior failed check) is
+        // off-limits: no probe, so a failed node stays down for an operator.
+        cm.update_node_state("n1", NodeState::Drain, Some("maintenance".into()))
+            .unwrap();
+        wait_for("n1 drained", || {
+            cm.get_node("n1")
+                .is_some_and(|n| matches!(n.state, NodeState::Drain | NodeState::Draining))
+        });
+        assert!(cm.node_off_limits_for_health(&cm.get_node("n1").unwrap()));
+        cm.run_node_health_pass();
+        assert!(
+            cm.get_jobs(&JobFilter::default()).is_empty(),
+            "must not probe a drained node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_force_drain_resumes_when_node_empties() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/bin/true", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+
+        // A node soft-drained to make room for a starved check (with no jobs
+        // still running) must be resumed by the pass so the check can land.
+        cm.update_node_state(
+            "n1",
+            NodeState::Drain,
+            Some("health-check(pending): running overdue check /bin/true".into()),
+        )
+        .unwrap();
+        wait_for("n1 force-drained", || {
+            cm.get_node("n1")
+                .is_some_and(|n| matches!(n.state, NodeState::Drain | NodeState::Draining))
+        });
+
+        cm.run_node_health_pass();
+        wait_for("n1 resumed to idle", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
         });
     }
 
