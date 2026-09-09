@@ -74,3 +74,23 @@ class TestPeerPersistence:
         )
         # And connectivity actually still works, not just the peer table.
         raw_wg_mesh.assert_all_to_all(indices)
+
+    def test_add_peer_keeps_directives_spur_does_not_manage(self, raw_wg_mesh):
+        """`add-peer` rewrites a file operators also hand-maintain: silently
+        dropping an `MTU` or a `PostUp` changes the interface on its next reload."""
+        indices = list(range(len(raw_wg_mesh.nodes)))
+        raw_wg_mesh.add_interface_directive(0, "MTU = 1380")
+
+        # Re-adding a peer that is already there triggers the read-modify-write
+        # while leaving the mesh membership unchanged.
+        peer = 1 if len(indices) > 1 else 0
+        raw_wg_mesh.net_add_peer(
+            0, raw_wg_mesh.pubkeys[peer], f"{raw_wg_mesh.mesh_ip_for(peer)}/32"
+        )
+
+        conf = raw_wg_mesh.conf_text(0)
+        assert "MTU = 1380" in conf, f"unmanaged directive dropped by add-peer:\n{conf}"
+
+        # And the result is still a conf wg-quick accepts, with the mesh intact.
+        raw_wg_mesh.reload_interface(0)
+        raw_wg_mesh.assert_all_to_all(indices)

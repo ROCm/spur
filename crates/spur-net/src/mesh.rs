@@ -95,6 +95,7 @@ pub fn mesh_peers_for(self_mesh_ip: &str, members: &[MeshNode]) -> Vec<WgPeer> {
             // the underlay tunnel `spur net join` established. Only override when one is supplied.
             endpoint: Some(n.endpoint.clone()).filter(|e| !e.trim().is_empty()),
             persistent_keepalive: Some(25),
+            ..Default::default()
         })
         .collect()
 }
@@ -178,9 +179,9 @@ pub fn apply_mesh_durable(
 
 /// Of the interface's `current` peer public keys, those NOT in the desired member set (self
 /// excluded) and NOT in `protected` — i.e. peers for nodes that have left the mesh and should be
-/// removed. `protected` is a peer's exemption from this reconcile entirely: a key present in the
-/// node's own persisted config (added via `spur net add-peer`, outside this membership) is never
-/// this reconcile's to remove, no matter the membership it was pushed. Pure + tested.
+/// removed. `protected` is a peer's exemption from this reconcile entirely: any key present in the
+/// node's own persisted config is never this reconcile's to remove, no matter the membership it was
+/// pushed — including keys a prior `spur net mesh` wrote there. Pure + tested.
 pub fn peers_to_prune<'a>(
     current: &'a [String],
     self_mesh_ip: &str,
@@ -342,18 +343,18 @@ mod tests {
     }
 
     /// A peer absent from `members` is normally pruned (previous test) — but not if it's in
-    /// `protected`: a human explicitly added it via `spur net add-peer` for something outside this
-    /// membership (e.g. a non-k0s node), and this reconcile pass was never responsible for it.
+    /// `protected`: it is in the node's persisted config, for something outside this membership
+    /// (e.g. a non-k0s node), so this reconcile pass was never responsible for it.
     #[test]
     fn peers_to_prune_exempts_protected_peers() {
         let members = vec![node("10.44.0.1", None), node("10.44.0.2", None)];
         let current = vec![
             "pk-10.44.0.1".to_string(),
-            "pk-manually-added".to_string(), // not in members, but protected -> must survive
+            "pk-persisted".to_string(), // not in members, but protected -> must survive
             "pk-truly-departed".to_string(), // not in members, not protected -> pruned
         ];
         let protected: std::collections::HashSet<String> =
-            ["pk-manually-added".to_string()].into_iter().collect();
+            ["pk-persisted".to_string()].into_iter().collect();
         let prune = peers_to_prune(&current, "10.44.0.2", &members, &protected);
         assert_eq!(prune, vec!["pk-truly-departed"]);
     }
@@ -374,7 +375,9 @@ mod tests {
                 allowed_ips: "10.44.0.9/32".into(),
                 endpoint: None,
                 persistent_keepalive: None,
+                ..Default::default()
             }],
+            ..Default::default()
         }
         .write_to(&config_path)
         .unwrap();
