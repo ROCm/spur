@@ -243,6 +243,9 @@ Flags:
    * - ``--node-oriented``
      - ``-N``
      - One line per node instead of per partition.
+   * - ``--list-reasons``
+     - ``-R``
+     - List unavailable nodes (down/drain/draining/error) grouped by reason.
    * - ``--format``
      - ``-o``
      - Custom column format.
@@ -261,6 +264,27 @@ PARTITION STATE CPUS MEMORY GRES``.
 
    sinfo -N -o "%N %.6D %.11T %c %m %G"
    sinfo -p gpu -l
+
+``-R`` / ``--list-reasons`` lists only nodes that are unavailable (``down``,
+``drain``, ``drng``, ``err``), grouped by the admin reason set when the node was
+drained or downed, one row per reason with a compressed nodelist:
+
+.. code-block:: text
+
+   REASON               USER      TIMESTAMP           NODELIST
+   Memory errors        alice     2026-08-27T08:03:07 node[05,08]
+   Not responding       root      2026-08-27T09:15:44 node[01-03]
+
+All four columns are populated from live state. ``USER`` (``%u``, or ``%U`` for
+``user(uid)``) is the user who set the reason, resolved from the recorded UID;
+automatic reasons (for example a heartbeat timeout) are attributed to ``root``.
+``TIMESTAMP`` (``%H``) is when the reason was set. A UID that cannot be resolved
+to a name, or a node whose reason predates provenance tracking, renders as
+``Unknown``. ``-R -l`` adds a ``STATE`` column (``%t``).
+
+``scontrol show node`` appends the same provenance to the reason line as
+``Reason=<text> [<user>@<timestamp>]`` when a set-time is recorded, and the REST
+node object carries ``reason_uid`` and ``reason_time`` fields.
 
 Node states are shown as short abbreviations: ``idle`` (free), ``alloc`` (fully
 allocated), ``mix`` (partly allocated), ``down``, ``drain`` (offline, not

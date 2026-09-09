@@ -2795,6 +2795,7 @@ impl ClusterManager {
         name: &str,
         state: NodeState,
         reason: Option<String>,
+        reason_uid: Option<u32>,
     ) -> anyhow::Result<()> {
         let (old_state, effective_state) = {
             let nodes = self.nodes.read();
@@ -2821,12 +2822,16 @@ impl ClusterManager {
         // Resuming to Idle clears the lock.
         let admin_locked = effective_state.is_admin_hold();
 
+        let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
+
         self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: effective_state,
             reason,
             admin_locked,
+            reason_uid,
+            reason_time,
         })?;
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
@@ -3031,17 +3036,25 @@ impl ClusterManager {
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
                     // An admin hold's reason takes precedence over the liveness
-                    // reason it would otherwise be marked with.
-                    let reason = admin_locked
-                        .then(|| self.get_node(&name).and_then(|n| n.state_reason))
+                    // reason it would otherwise be marked with; keep that hold's
+                    // original attribution too. Otherwise this is a system
+                    // (heartbeat) action attributed to uid 0 at this instant.
+                    let held = admin_locked
+                        .then(|| self.get_node(&name))
                         .flatten()
-                        .or_else(|| Some("Not responding".into()));
+                        .filter(|n| n.state_reason.is_some());
+                    let (reason, reason_uid, reason_time) = match held {
+                        Some(n) => (n.state_reason, n.reason_uid, n.reason_time),
+                        None => (Some("Not responding".into()), Some(0), Some(Utc::now())),
+                    };
                     match self.propose(WalOperation::NodeStateChange {
                         name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
                         reason,
                         admin_locked,
+                        reason_uid,
+                        reason_time,
                     }) {
                         Ok(resp) => {
                             // A node that stopped heartbeating won't refresh its k0s unit gauge, so
@@ -3061,9 +3074,13 @@ impl ClusterManager {
                     let node = self.get_node(&name);
                     let admin_locked = node.as_ref().is_some_and(|n| n.admin_locked);
                     let recovered_state = recovered_node_state(node.as_ref());
-                    // An admin hold applied since the action was computed keeps its reason;
-                    // otherwise recovery clears the liveness reason it is replacing.
-                    let reason = node.and_then(|n| n.state_reason).filter(|_| admin_locked);
+                    // An admin hold applied since the action was computed keeps its reason
+                    // and attribution; otherwise recovery clears the liveness reason it is
+                    // replacing.
+                    let (reason, reason_uid, reason_time) = match node {
+                        Some(n) if admin_locked => (n.state_reason, n.reason_uid, n.reason_time),
+                        _ => (None, None, None),
+                    };
                     info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
                         name,
@@ -3071,6 +3088,8 @@ impl ClusterManager {
                         new_state: recovered_state,
                         reason,
                         admin_locked,
+                        reason_uid,
+                        reason_time,
                     }) {
                         warn!(error = %e, "failed to propose node recovery");
                     }
@@ -3086,6 +3105,7 @@ impl ClusterManager {
         &self,
         name: &str,
         reason: Option<String>,
+        reason_uid: Option<u32>,
     ) -> anyhow::Result<(NodeState, u32)> {
         let (old_state, running_count) = {
             // Lock order is jobs before nodes, matching apply_operation. Taking
@@ -3115,12 +3135,15 @@ impl ClusterManager {
         } else {
             NodeState::Drain
         };
+        let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
         self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: target_state,
             reason,
             admin_locked: true,
+            reason_uid,
+            reason_time,
         })?;
         info!(node = %name, state = %target_state, "node drain requested");
         Ok((target_state, running_count))
@@ -6106,11 +6129,15 @@ impl ClusterManager {
                 new_state,
                 reason,
                 admin_locked,
+                reason_uid,
+                reason_time,
                 ..
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.state = *new_state;
                     node.state_reason = reason.clone();
+                    node.reason_uid = *reason_uid;
+                    node.reason_time = *reason_time;
                     node.admin_locked = *admin_locked;
                 }
                 if *new_state == NodeState::Down {
@@ -7612,6 +7639,20 @@ pub(crate) enum HealthAction {
         name: String,
         old_state: NodeState,
     },
+}
+
+/// Attribution captured when an admin sets a node's state. A set-time is
+/// recorded only when a reason is present; clearing a reason (e.g. resume to
+/// Idle) leaves both unset. Captured at the call site, not in apply, so Raft
+/// replay stays deterministic.
+fn reason_attribution(
+    reason: &Option<String>,
+    reason_uid: Option<u32>,
+) -> (Option<u32>, Option<DateTime<Utc>>) {
+    match reason {
+        Some(_) => (reason_uid, Some(Utc::now())),
+        None => (None, None),
+    }
 }
 
 pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
@@ -9883,6 +9924,8 @@ mod tests {
             new_state: NodeState::Drain,
             reason: Some("maintenance".into()),
             admin_locked: true,
+            reason_uid: None,
+            reason_time: None,
         });
 
         let node = cm.get_node("n1").unwrap();
@@ -12465,7 +12508,7 @@ mod tests {
         let job_id = run_job_on(&cm, "spool-fault", "worker1");
 
         let (state, _) = cm
-            .drain_node("worker1", Some("launch failed: ENOSPC".into()))
+            .drain_node("worker1", Some("launch failed: ENOSPC".into()), None)
             .unwrap();
         assert_eq!(state, NodeState::Draining, "the job still holds the node");
 
@@ -20474,7 +20517,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
 
-        cm.update_node_state("n1", NodeState::Drain, Some("maint".into()))
+        cm.update_node_state("n1", NodeState::Drain, Some("maint".into()), Some(1000))
             .unwrap();
         wait_for("node drain applied", || {
             cm.get_node("n1")
@@ -20483,6 +20526,85 @@ mod tests {
         let node = cm.get_node("n1").unwrap();
         assert_eq!(node.state, NodeState::Drain);
         assert_eq!(node.state_reason, Some("maint".into()));
+        assert_eq!(node.reason_uid, Some(1000));
+        assert!(
+            node.reason_time.is_some(),
+            "set-time recorded with the reason"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_node_state_resume_clears_reason_attribution() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.update_node_state("n1", NodeState::Drain, Some("maint".into()), Some(1000))
+            .unwrap();
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.reason_uid == Some(1000))
+        });
+
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+        wait_for("resume applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state_reason, None);
+        assert_eq!(node.reason_uid, None, "resume clears the setter uid");
+        assert_eq!(node.reason_time, None, "resume clears the set-time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_down_attributes_reason_to_system_uid() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "stale", 4, 8000);
+        if let Some(node) = cm.nodes.write().get_mut("stale") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("health down applied", || {
+            cm.get_node("stale")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("stale").unwrap();
+        assert_eq!(node.state_reason.as_deref(), Some("Not responding"));
+        assert_eq!(node.reason_uid, Some(0), "system reason is uid 0");
+        assert!(node.reason_time.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_down_preserves_admin_hold_attribution() {
+        // A drained node (admin hold) that then stops heartbeating keeps the
+        // operator's reason and its original uid/time, not the system uid.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()), Some(1000))
+            .unwrap();
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.reason_uid == Some(1000))
+        });
+
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Drain,
+            admin_locked: true,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state_reason.as_deref(), Some("hw swap"));
+        assert_eq!(node.reason_uid, Some(1000), "admin-hold uid preserved");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20631,7 +20753,7 @@ mod tests {
                 .is_some_and(|n| n.state == NodeState::Down)
         });
 
-        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()))
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()), None)
             .unwrap();
         wait_for("drain applied", || {
             cm.get_node("n1")
@@ -20698,7 +20820,7 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
-        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()))
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()), None)
             .unwrap();
         wait_for("draining applied", || {
             cm.get_node("n1")
@@ -20785,7 +20907,7 @@ mod tests {
         settle(&cm, id, JobState::Running);
 
         // Admin drains while job is running — becomes Draining (admin_locked)
-        cm.update_node_state("locked", NodeState::Drain, Some("hw swap".into()))
+        cm.update_node_state("locked", NodeState::Drain, Some("hw swap".into()), None)
             .unwrap();
         wait_for("draining applied", || {
             cm.get_node("locked")
@@ -23597,6 +23719,8 @@ mod tests {
             new_state: NodeState::Down,
             reason: Some("heartbeat timeout".into()),
             admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].job_id, id);
@@ -23624,6 +23748,8 @@ mod tests {
             new_state: NodeState::Down,
             reason: None,
             admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
         });
         assert!(resp.jobs_finalized.is_empty());
         assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
@@ -23672,7 +23798,8 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("drain-job"));
         start_job_on(&cm, id, "n1");
 
-        cm.drain_node("n1", Some("maintenance".into())).unwrap();
+        cm.drain_node("n1", Some("maintenance".into()), None)
+            .unwrap();
         wait_for("n1 draining", || {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Draining)
@@ -23690,7 +23817,7 @@ mod tests {
 
         register_node(&cm, "n1", 4, 8000);
 
-        cm.drain_node("n1", None).unwrap();
+        cm.drain_node("n1", None, None).unwrap();
         wait_for("n1 drain", || {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Drain)
@@ -23771,7 +23898,7 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("drain-job"));
         start_job_on(&cm, id, "n1");
 
-        cm.drain_node("n1", None).unwrap();
+        cm.drain_node("n1", None, None).unwrap();
         wait_for("n1 draining", || {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Draining)

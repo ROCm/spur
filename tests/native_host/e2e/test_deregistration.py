@@ -95,6 +95,9 @@ class TestDrainAndRemove:
         out = cluster.sinfo()
         assert "drain" in out.lower()
 
+        reasons = cluster.cli(["sinfo", "-R"])
+        assert "maintenance" in reasons and node0 in reasons, reasons
+
         script = cluster.write_file(
             "drain_test.sh", "#!/bin/bash\nsleep 1\necho done\n"
         )

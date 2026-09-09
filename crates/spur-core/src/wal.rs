@@ -232,6 +232,10 @@ pub enum WalOperation {
         reason: Option<String>,
         #[serde(default)]
         admin_locked: bool,
+        #[serde(default)]
+        reason_uid: Option<u32>,
+        #[serde(default)]
+        reason_time: Option<chrono::DateTime<chrono::Utc>>,
     },
     NodeLabelsUpdate {
         name: String,

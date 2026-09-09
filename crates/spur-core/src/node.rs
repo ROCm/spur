@@ -82,6 +82,17 @@ impl NodeState {
         )
     }
 
+    /// The unavailable states `sinfo -R` reports: Down, Drain, Draining, Error.
+    /// Unlike [`is_admin_hold`](Self::is_admin_hold), this is purely about state,
+    /// not who set it or whether a reason exists, and excludes `Suspended`
+    /// (power management, not a fault).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Down | Self::Drain | Self::Draining | Self::Error
+        )
+    }
+
     pub fn display(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -299,6 +310,14 @@ pub struct Node {
     pub hostname: String,
     pub state: NodeState,
     pub state_reason: Option<String>,
+    /// UID that set the current `state_reason` (Slurm's `reason_uid`). `None`
+    /// when no reason is set or the setter was unauthenticated.
+    #[serde(default)]
+    pub reason_uid: Option<u32>,
+    /// When the current `state_reason` was set (Slurm's `reason_time`).
+    /// Captured at emit time so Raft replay is deterministic.
+    #[serde(default)]
+    pub reason_time: Option<DateTime<Utc>>,
     /// When true, the current state was set by an operator (admin API, drain,
     /// etc.) and auto-recovery is suppressed. Only an explicit admin action
     /// can clear it. Automatically-set states (heartbeat timeout) leave this
@@ -373,6 +392,8 @@ impl Node {
             hostname: String::new(),
             state: NodeState::Unknown,
             state_reason: None,
+            reason_uid: None,
+            reason_time: None,
             admin_locked: false,
             partitions: Vec::new(),
             source: NodeSource::default(),
@@ -475,6 +496,20 @@ mod tests {
         value.as_object_mut().unwrap().remove("k0s_last_error");
         let back: Node = serde_json::from_value(value).expect("deserialize node");
         assert_eq!(back.k0s_last_error, None);
+    }
+
+    #[test]
+    fn a_node_snapshot_without_reason_attribution_still_deserializes() {
+        // Pre-upgrade snapshots predate reason_uid/reason_time; replay must load
+        // them as absent rather than failing the restore.
+        let node = Node::new("n1".into(), ResourceSet::default());
+        let mut value = serde_json::to_value(&node).expect("serialize node");
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("reason_uid");
+        obj.remove("reason_time");
+        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        assert_eq!(back.reason_uid, None);
+        assert_eq!(back.reason_time, None);
     }
 
     #[test]
@@ -639,6 +674,29 @@ mod tests {
         }
         for &s in &non_holds {
             assert!(!s.is_admin_hold(), "{s:?} should not be admin hold");
+        }
+    }
+
+    #[test]
+    fn unavailable_states() {
+        let unavailable = [
+            NodeState::Down,
+            NodeState::Drain,
+            NodeState::Draining,
+            NodeState::Error,
+        ];
+        let available = [
+            NodeState::Idle,
+            NodeState::Allocated,
+            NodeState::Mixed,
+            NodeState::Suspended,
+            NodeState::Unknown,
+        ];
+        for &s in &unavailable {
+            assert!(s.is_unavailable(), "{s:?} should be unavailable");
+        }
+        for &s in &available {
+            assert!(!s.is_unavailable(), "{s:?} should not be unavailable");
         }
     }
 

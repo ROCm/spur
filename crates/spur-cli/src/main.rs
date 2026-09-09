@@ -16,6 +16,7 @@ mod net;
 mod node;
 mod nodelist;
 mod privilege;
+mod reason;
 mod sacct;
 mod sacctmgr;
 mod salloc;

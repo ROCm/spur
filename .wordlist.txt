@@ -185,6 +185,7 @@ MaxWall
 msg
 NNodes
 NODELIST
+nodelist
 OpenMetrics
 overridable
 PMIx
