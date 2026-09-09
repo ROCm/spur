@@ -855,22 +855,27 @@ fn controller_k0s_config(
     node: &spur_core::node::Node,
     cp_count: usize,
 ) -> String {
-    let api = calico_node_address(net, node);
-    // SANs: the advertised address + the underlay address (so `kubectl` over either works).
-    let mut sans = Vec::new();
-    if let Some(api) = api {
-        sans.push(api.to_string());
-        if let Some(addr) = &node.address {
-            if addr != api {
-                sans.push(addr.clone());
+    let (api, sans) = if net.cni == "calico" {
+        let api = calico_node_address(net, node);
+        let mut sans = Vec::new();
+        if let Some(api) = api {
+            sans.push(api.to_string());
+            if let Some(addr) = &node.address {
+                if addr != api {
+                    sans.push(addr.clone());
+                }
             }
         }
-    }
+        (api, sans)
+    } else {
+        (None, Vec::new())
+    };
+    let cni_mtu = (net.cni == "calico").then_some(net.cni_mtu);
     spur_core::k0s::k0s_controller_config_yaml(
         &net.cni,
         &net.pod_cidr,
         &net.service_cidr,
-        net.cni_mtu,
+        cni_mtu,
         api,
         &sans,
         cp_count,

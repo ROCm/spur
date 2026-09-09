@@ -63,13 +63,13 @@ mod local_path_tests {
 /// `api`/`sans`/Calico/load-balancing blocks are calico-only, and `sans` further needs `api_address`.
 /// `mesh_native` picks Calico's mode — `bird` (native routing over the WireGuard mesh, `api_address`
 /// being the control-plane's mesh IP) when true, else `vxlan` (Calico's own overlay, no mesh needed,
-/// `api_address` being its real underlay address).
+/// `api_address` being its real underlay address). `cni_mtu` is Calico-only.
 #[allow(clippy::too_many_arguments)]
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,
     service_cidr: &str,
-    cni_mtu: u16,
+    cni_mtu: Option<u16>,
     api_address: Option<&str>,
     sans: &[String],
     cp_count: usize,
@@ -100,7 +100,9 @@ pub fn k0s_controller_config_yaml(
         y.push_str("    calico:\n");
         let mode = if mesh_native { "bird" } else { "vxlan" };
         y.push_str(&format!("      mode: {mode}\n"));
-        y.push_str(&format!("      mtu: {cni_mtu}\n"));
+        if let Some(cni_mtu) = cni_mtu {
+            y.push_str(&format!("      mtu: {cni_mtu}\n"));
+        }
         if cp_count > 1 {
             y.push_str("    nodeLocalLoadBalancing:\n");
             y.push_str("      enabled: true\n");
@@ -185,7 +187,7 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
+            Some(1450),
             Some("192.0.2.1"),
             &["192.0.2.1".to_string(), "203.0.113.9".to_string()],
             1,
@@ -207,7 +209,7 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
+            Some(1450),
             Some("203.0.113.9"),
             &["203.0.113.9".to_string()],
             1,
@@ -228,7 +230,7 @@ mod k0s_config_tests {
             "kuberouter",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
+            None,
             Some("192.0.2.1"),
             &[],
             3,
@@ -249,7 +251,7 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
+            Some(1450),
             None,
             &[],
             1,
@@ -270,7 +272,7 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
+            Some(1450),
             Some("192.0.2.1"),
             &["192.0.2.1".to_string()],
             3,
@@ -288,7 +290,7 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
+            Some(1450),
             Some("192.0.2.1"),
             &["192.0.2.1".to_string()],
             1,

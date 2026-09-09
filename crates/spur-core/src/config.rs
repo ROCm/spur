@@ -980,8 +980,9 @@ pub struct ClusterConfig {
     #[serde(default = "default_k0s_binary")]
     pub k0s_binary: String,
     /// CNI mode: "kuberouter" (k0s default) or "calico" (`bird` native routing over the mesh when
-    /// `network.wg_enabled`, else its own `vxlan` overlay; kubelet `--node-ip` is pinned to whichever
-    /// address it advertises). Both carry `pod_cidr`/`service_cidr` into the generated k0s config.
+    /// `network.wg_enabled`, else its own `vxlan` overlay; kubelet `--node-ip` is pinned to its
+    /// advertised address for Calico only). Both carry `pod_cidr`/`service_cidr` into the generated
+    /// k0s config.
     #[serde(default = "default_cni")]
     pub cni: String,
     /// Storage provisioner SPUR ships so PVC workloads work out of the box (k0s bundles none).

@@ -198,6 +198,29 @@ advertises the API on each node's real underlay address and runs in ``vxlan``
 mode — Calico's own overlay, requiring no mesh. Standard VXLAN (UDP 4789)
 between nodes; open that port if a host firewall default-denies it.
 
+.. list-table:: CNI-specific managed-k0s behavior
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * - Setting or behavior
+     - ``kuberouter``
+     - ``calico``
+   * - ``pod_cidr`` / ``service_cidr``
+     - Passed to k0s
+     - Passed to k0s
+   * - ``cni_mtu``
+     - Ignored
+     - Emitted in the Calico configuration
+   * - API address and SANs
+     - k0s default interface selection
+     - Configured after an advertised address is available
+   * - Kubelet ``--node-ip``
+     - k0s default interface selection
+     - Pinned to the advertised address
+   * - ``network.wg_enabled``
+     - No CNI configuration effect
+     - Selects ``bird`` (enabled) or ``vxlan`` (disabled)
+
 .. note::
 
    Like ``nodeLocalLoadBalancing`` above, the generated network config is
@@ -436,7 +459,7 @@ Configuration reference (``[cluster]``)
      - ``kuberouter`` or ``calico`` (``bird`` over the mesh if enabled, else ``vxlan``).
    * - ``cni_mtu``
      - ``1450``
-     - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom).
+     - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom); ignored by ``kuberouter``.
    * - ``storage_provisioner``
      - ``local-path``
      - Storage Spur ships as the default StorageClass (``local-path`` or ``none``).
