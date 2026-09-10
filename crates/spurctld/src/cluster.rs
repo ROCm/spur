@@ -1961,7 +1961,9 @@ impl ClusterManager {
                 // off the durable drain reason, so it holds across a failover.
                 if force_draining {
                     if !self.node_has_running_jobs(&node.name) {
-                        if let Err(e) = self.update_node_state(&node.name, NodeState::Idle, None, None) {
+                        if let Err(e) =
+                            self.update_node_state(&node.name, NodeState::Idle, None, None)
+                        {
                             warn!(node = %node.name, error = %e, "failed to resume node for health check");
                         } else {
                             self.scheduler_notify.notify_one();
@@ -2006,10 +2008,7 @@ impl ClusterManager {
                     // Only count against the cap when this node is not already
                     // in health activity — a second check for the same node
                     // doesn't add a new node to the active set.
-                    if cap != 0
-                        && !active_nodes.contains(&node.name)
-                        && active_nodes.len() >= cap
-                    {
+                    if cap != 0 && !active_nodes.contains(&node.name) && active_nodes.len() >= cap {
                         continue;
                     }
                     match self.submit_health_job(idx, check, node) {
