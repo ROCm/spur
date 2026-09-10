@@ -472,6 +472,14 @@ const HEALTH_FORCE_DRAIN_PREFIX: &str = "health-check(pending): ";
 /// exactly like Slurm's failed `HealthCheckProgram`. It never auto-resumes.
 const HEALTH_FAIL_DRAIN_PREFIX: &str = "health-check(failed): ";
 
+/// The node a health-check job targets, parsed from its reserved name
+/// (`{HEALTH_JOB_PREFIX}{idx}.{node}`). `None` for any non-health name.
+fn health_job_target_node(name: &str) -> Option<&str> {
+    name.strip_prefix(HEALTH_JOB_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_, node)| node)
+}
+
 struct PendingJobClassification {
     jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
@@ -1923,15 +1931,19 @@ impl ClusterManager {
         let now = std::time::Instant::now();
         let now_utc = Utc::now();
         let nodes = self.get_nodes();
+
+        // Bound how many nodes are in health activity at once so a restart,
+        // failover, or first enable can't set off a fleet-wide check — and,
+        // downstream, force-drain — wave. `active` is the baseline of in-flight
+        // checks; each new submit below counts against the cap, which in turn
+        // bounds the force-drains, since only an in-flight check can force one.
+        let cap = config.health.concurrency_cap(nodes.len());
+        let mut active = self.count_health_active_nodes();
+
         for (idx, check) in config.health.checks.iter().enumerate() {
-            // Multi-node (fabric) checks need topology-aware node pairing, which
-            // is a follow-up; run only per-node checks for now.
+            // Multi-node checks are rejected at config load (topology-aware
+            // pairing is a follow-up); skip defensively without per-tick noise.
             if check.nodes != 1 {
-                warn!(
-                    check = %check.program,
-                    nodes = check.nodes,
-                    "skipping multi-node health check (per-node only for now)"
-                );
                 continue;
             }
             let interval = std::time::Duration::from_secs(check.interval_secs.max(1));
@@ -1981,15 +1993,22 @@ impl ClusterManager {
                     continue;
                 }
 
-                // No check in flight: submit one if it is due.
+                // No check in flight: submit one if it is due and the health
+                // activity budget allows another node.
                 let due = self
                     .health_last_check
                     .lock()
                     .get(&(idx, node.name.clone()))
                     .is_none_or(|t| now.duration_since(*t) >= interval);
                 if due {
-                    if let Err(e) = self.submit_health_job(idx, check, node) {
-                        warn!(node = %node.name, check = %check.program, error = %e, "failed to submit health-check job");
+                    if cap != 0 && active >= cap {
+                        continue;
+                    }
+                    match self.submit_health_job(idx, check, node) {
+                        Ok(_) => active += 1,
+                        Err(e) => {
+                            warn!(node = %node.name, check = %check.program, error = %e, "failed to submit health-check job")
+                        }
                     }
                 }
             }
@@ -2005,6 +2024,20 @@ impl ClusterManager {
             .values()
             .find(|j| j.spec.name == name && !j.state.is_terminal())
             .cloned()
+    }
+
+    /// How many distinct nodes currently have a non-terminal health-check job
+    /// (pending or running). Read from the durable job store so the cap holds
+    /// across a failover. A force-drained node still has its pending check, so
+    /// bounding this bounds the force-drains too.
+    fn count_health_active_nodes(&self) -> usize {
+        self.jobs
+            .read()
+            .values()
+            .filter(|j| !j.state.is_terminal())
+            .filter_map(|j| health_job_target_node(&j.spec.name))
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     /// Whether the health system must leave `node` untouched: only a node that
@@ -2081,6 +2114,23 @@ impl ClusterManager {
             return;
         };
         let program = job.spec.argv.first().cloned().unwrap_or_default();
+
+        // Exit 126/127 from the bash wrapper means the program could not be run
+        // (not found / not executable) — a deployment or config error, not a
+        // hardware fault. Draining the node for it would drain the whole fleet
+        // over one un-distributed script, so log it loudly and leave the node in
+        // service instead of taking a sticky hardware drain.
+        if state == JobState::Failed && matches!(exit_code, 126 | 127) {
+            warn!(
+                node = %node,
+                program = %program,
+                exit_code,
+                "health check could not run (missing or non-executable program?); \
+                 not draining the node — fix the program path/distribution"
+            );
+            return;
+        }
+
         let failed = matches!(
             state,
             JobState::Failed
@@ -8802,12 +8852,15 @@ mod tests {
 
     fn config_with_checks(checks: Vec<HealthCheck>) -> SlurmConfig {
         let mut cfg = test_config();
-        cfg.health = spur_core::config::HealthConfig { checks };
+        cfg.health = spur_core::config::HealthConfig {
+            checks,
+            ..Default::default()
+        };
         cfg
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn health_pass_submits_exclusive_pinned_root_job_when_due() {
+    async fn health_pass_submits_exclusive_pinned_job_when_due() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster_with_config(
             &dir,
@@ -8928,6 +8981,118 @@ mod tests {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
+    }
+
+    /// Submit a health check via the pass and drive it to Running on `node`,
+    /// returning its job id — the setup a completion-reaction test needs.
+    async fn health_job_running_on(cm: &ClusterManager, node: &str) -> JobId {
+        cm.run_node_health_pass();
+        wait_for("health job submitted", || {
+            !cm.get_jobs(&JobFilter::default()).is_empty()
+        });
+        let job_id = cm.get_jobs(&JobFilter::default())[0].job_id;
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec![node.to_string()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        wait_for("health job running", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| j.state == JobState::Running)
+        });
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_failed_job_sticky_drains_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/opt/nhc.sh", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = health_job_running_on(&cm, "n1").await;
+
+        // A real non-zero exit drains the node with the sticky failed reason.
+        cm.react_to_health_job_finalized(job_id, JobState::Failed, 1);
+        wait_for("n1 drained by failed check", || {
+            cm.get_node("n1").is_some_and(|n| {
+                matches!(n.state, NodeState::Drain | NodeState::Draining)
+                    && n.state_reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("health-check(failed): "))
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_passed_job_leaves_node_schedulable() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/opt/nhc.sh", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = health_job_running_on(&cm, "n1").await;
+
+        // A pass leaves the node in service — never drained.
+        cm.react_to_health_job_finalized(job_id, JobState::Completed, 0);
+        assert!(
+            cm.get_node("n1")
+                .is_some_and(|n| !matches!(n.state, NodeState::Drain | NodeState::Draining)),
+            "a passing check must not drain the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_launch_failure_does_not_drain() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(
+            &dir,
+            config_with_checks(vec![health_check("/opt/nhc.sh", 300)]),
+        )
+        .await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = health_job_running_on(&cm, "n1").await;
+
+        // Exit 127 means the program could not be run (a config/deploy error),
+        // not a hardware fault — so the node must NOT be drained, or one bad
+        // program path would drain the whole fleet.
+        cm.react_to_health_job_finalized(job_id, JobState::Failed, 127);
+        assert!(
+            cm.get_node("n1")
+                .is_some_and(|n| !matches!(n.state, NodeState::Drain | NodeState::Draining)),
+            "a launch failure (exit 127) must not drain the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_concurrency_cap_bounds_submits() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config_with_checks(vec![health_check("/opt/nhc.sh", 300)]);
+        // Cap health activity at a single node even though four are due at once.
+        cfg.health.max_unavailable = "1".into();
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        for n in ["n1", "n2", "n3", "n4"] {
+            register_node(&cm, n, 8, 16000);
+        }
+
+        cm.run_node_health_pass();
+        wait_for("first health job submitted", || {
+            !cm.get_jobs(&JobFilter::default()).is_empty()
+        });
+        // Even a second pass can't exceed the cap while the first is in flight.
+        cm.run_node_health_pass();
+        assert_eq!(
+            cm.get_jobs(&JobFilter::default()).len(),
+            1,
+            "max_unavailable=1 must cap health activity at one node"
+        );
     }
 
     // A `Barrier` forces both callers to start at the same instant, so this races for real on

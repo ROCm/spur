@@ -1530,11 +1530,27 @@ impl Default for CgroupConfig {
 /// reason; a pass auto-resumes a node the health system had drained. Health-
 /// check jobs are visible in `squeue`/RPC/audit and run inside a cgroup like any
 /// other job. Empty `checks` = no health checking.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthConfig {
     /// The configured checks (`[[health.checks]]`).
     #[serde(default)]
     pub checks: Vec<HealthCheck>,
+    /// Cap on how many nodes may be in health-check activity (a pending or
+    /// running `_spur-health.*` job) at once, so a restart, failover, or first
+    /// enable can't set off a fleet-wide check — and, downstream, a fleet-wide
+    /// force-drain — wave. An absolute count (`"5"`) or a percentage of eligible
+    /// nodes (`"10%"`, rounded up, at least 1); `"0"` or `"0%"` disables the cap.
+    #[serde(default = "default_health_max_unavailable")]
+    pub max_unavailable: String,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            checks: Vec::new(),
+            max_unavailable: default_health_max_unavailable(),
+        }
+    }
 }
 
 /// One health check, run as a scheduled job on every eligible node on an
@@ -1600,10 +1616,38 @@ fn default_health_max_wait() -> u64 {
     600
 }
 
+fn default_health_max_unavailable() -> String {
+    "10%".to_string()
+}
+
+/// Parse a `max_unavailable` value ("5" or "10%") against the eligible-node
+/// count into an absolute cap, or `None` if it is malformed. `0`/`0%` = no cap
+/// (returns `Some(0)`). A positive percentage rounds up and is at least 1, so a
+/// check can always make progress on a small fleet.
+fn parse_health_cap(value: &str, eligible_nodes: usize) -> Option<usize> {
+    let value = value.trim();
+    if let Some(pct) = value.strip_suffix('%') {
+        let pct: usize = pct.trim().parse().ok()?;
+        if pct == 0 {
+            return Some(0);
+        }
+        Some((eligible_nodes * pct).div_ceil(100).max(1))
+    } else {
+        value.parse().ok()
+    }
+}
+
 impl HealthConfig {
     /// Whether any health checking is configured.
     pub fn is_enabled(&self) -> bool {
         !self.checks.is_empty()
+    }
+
+    /// Resolve `max_unavailable` to an absolute node cap given the eligible-node
+    /// count. `0` = unlimited. Falls back to unlimited on a malformed value,
+    /// which `validate()` rejects at config load, so this is never reached.
+    pub fn concurrency_cap(&self, eligible_nodes: usize) -> usize {
+        parse_health_cap(&self.max_unavailable, eligible_nodes).unwrap_or(0)
     }
 }
 
@@ -2007,6 +2051,39 @@ impl SlurmConfig {
                     });
                 }
             }
+        }
+
+        // The health-check program is a path resolved on the node, so the
+        // controller can't stat it — but an absolute path is required, so a
+        // relative typo is caught here rather than draining every node when the
+        // check fails to launch. Multi-node checks need topology-aware pairing
+        // that does not exist yet, so reject them at load rather than skip and
+        // log-spam every scheduler tick.
+        for (i, check) in self.health.checks.iter().enumerate() {
+            if !Path::new(&check.program).is_absolute() {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("health.checks[{i}].program"),
+                    value: format!("{:?} (must be an absolute path)", check.program),
+                });
+            }
+            if check.nodes != 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("health.checks[{i}].nodes"),
+                    value: format!(
+                        "{} (only single-node checks are supported for now)",
+                        check.nodes
+                    ),
+                });
+            }
+        }
+        if parse_health_cap(&self.health.max_unavailable, 1).is_none() {
+            return Err(ConfigError::InvalidValue {
+                field: "health.max_unavailable".into(),
+                value: format!(
+                    "{:?} (expected a count like \"5\" or a percentage like \"10%\")",
+                    self.health.max_unavailable
+                ),
+            });
         }
         Ok(())
     }
@@ -3081,8 +3158,7 @@ cluster_name = "x"
 program = "/etc/spur/gpu-health.sh"
 
 [[health.checks]]
-program = "/etc/spur/fabric-check.sh"
-nodes = 2
+program = "/etc/spur/privileged-check.sh"
 interval_secs = 120
 timeout_secs = 15
 max_wait_secs = 900
@@ -3093,6 +3169,8 @@ gid = 0
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert!(config.health.is_enabled());
         assert_eq!(config.health.checks.len(), 2);
+        // Default cap protects against a fleet-wide wave without configuration.
+        assert_eq!(config.health.max_unavailable, "10%");
 
         // First check takes the per-field defaults, including an unprivileged
         // identity (nobody:nogroup).
@@ -3106,16 +3184,56 @@ gid = 0
         assert_eq!(gpu.uid, 65534);
         assert_eq!(gpu.gid, 65534);
 
-        // Second overrides them (a pairwise, privileged fabric check).
-        let fabric = &config.health.checks[1];
-        assert_eq!(fabric.program, "/etc/spur/fabric-check.sh");
-        assert_eq!(fabric.nodes, 2);
-        assert_eq!(fabric.interval_secs, 120);
-        assert_eq!(fabric.timeout_secs, 15);
-        assert_eq!(fabric.max_wait_secs, 900);
-        assert_eq!(fabric.user, "root");
-        assert_eq!(fabric.uid, 0);
-        assert_eq!(fabric.gid, 0);
+        // Second overrides them (a privileged check).
+        let priv_check = &config.health.checks[1];
+        assert_eq!(priv_check.program, "/etc/spur/privileged-check.sh");
+        assert_eq!(priv_check.interval_secs, 120);
+        assert_eq!(priv_check.timeout_secs, 15);
+        assert_eq!(priv_check.max_wait_secs, 900);
+        assert_eq!(priv_check.user, "root");
+        assert_eq!(priv_check.uid, 0);
+        assert_eq!(priv_check.gid, 0);
+    }
+
+    #[test]
+    fn test_health_rejects_relative_program() {
+        // A relative path would resolve to nothing on the node and drain it, so
+        // it is caught at config load instead.
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"x\"\n[[health.checks]]\nprogram = \"gpu-health.sh\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field.contains("program"))
+        );
+    }
+
+    #[test]
+    fn test_health_rejects_multi_node_until_topology() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"x\"\n[[health.checks]]\nprogram = \"/x.sh\"\nnodes = 2\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field.contains("nodes")));
+    }
+
+    #[test]
+    fn test_health_max_unavailable_parses_and_validates() {
+        // Absolute and percentage forms both parse; a bad value is rejected.
+        assert_eq!(parse_health_cap("5", 40), Some(5));
+        assert_eq!(parse_health_cap("10%", 40), Some(4));
+        assert_eq!(parse_health_cap("10%", 3), Some(1)); // rounds up, at least 1
+        assert_eq!(parse_health_cap("0", 40), Some(0)); // unlimited
+        assert_eq!(parse_health_cap("0%", 40), Some(0));
+        assert_eq!(parse_health_cap("bogus", 40), None);
+
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"x\"\n[health]\nmax_unavailable = \"lots\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "health.max_unavailable")
+        );
     }
 
     #[test]

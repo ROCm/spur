@@ -17,6 +17,8 @@ from cluster import parse_job_id, wait_job
 
 PASSING_HEALTH = "#!/bin/bash\nexit 0\n"
 FAILING_HEALTH = "#!/bin/bash\necho 'gpu fell off the bus' >&2\nexit 1\n"
+# Hangs well past timeout_secs so the time-limit must kill it.
+HANGING_HEALTH = "#!/bin/bash\nsleep 300\n"
 
 
 def _health_overrides(cluster, body: str, **check_kw) -> dict:
@@ -73,6 +75,14 @@ class TestHealthCheck:
         assert "health" in show.lower(), (
             f"drain reason should name the health check:\n{show}"
         )
+
+    def test_hanging_check_is_killed_by_timeout_and_drains(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        # The check hangs; the job's time limit (timeout_secs) must kill it and
+        # the timeout counts as a failure that drains the node.
+        cluster.start(_health_overrides(cluster, HANGING_HEALTH, timeout_secs=5))
+        target = cluster.node_names[0]
+        _wait_node_drained(cluster, target, timeout=45)
 
     def test_passing_check_leaves_node_schedulable(self, unstarted_cluster):
         cluster = unstarted_cluster
