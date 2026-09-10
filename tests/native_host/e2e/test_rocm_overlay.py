@@ -53,11 +53,20 @@ def _run_probe(cluster, overlay_on: bool, tmp_path) -> tuple[dict, str]:
     if not _node_has_gpu_and_rocm(cluster):
         pytest.skip("node 0 lacks a GPU (KFD) and/or /opt/rocm/lib")
     cluster.container_preflight()
+    # Overlay binds need a root agent; without passwordless sudo start() would
+    # otherwise raise instead of skipping cleanly.
+    cluster.root_agent_preflight()
 
+    # devices_config() pins auto_detect=True, which the whole feature is gated on.
     cluster.start(
-        config_overrides={"devices": {"overlay_host_rocm_libs": overlay_on}},
+        config_overrides=cluster.devices_config(overlay_host_rocm_libs=overlay_on),
         agent_as_root=True,
     )
+    # If the agent isn't actually root the injected binds fail with only a warn,
+    # so the overlay-off assertions would pass even with the gate reverted. Skip
+    # rather than assert a hollow pass.
+    if cluster.spurd_agent_user(0) != "root":
+        pytest.skip("overlay binds require a root agent; spurd is not running as root")
     cluster.gpu_preflight(1)
 
     img = cluster.build_container_image(tmp_path, rootfs_extra=ROOTFS_EXTRA)

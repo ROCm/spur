@@ -1242,17 +1242,10 @@ pub struct DevicesConfig {
     #[serde(default)]
     pub gres: Vec<DevicesGresEntry>,
 
-    /// Bind-mount the host's `/opt/rocm/lib{,64}` over the same paths inside
-    /// every auto-detected AMD GPU container, replacing the image's ROCm
-    /// userspace with the host's. Off by default: `docker run` on the same
-    /// hardware leaves the image's libraries in place, and overlaying a
-    /// different runtime/math-library/tuning stack than the image pins is a
-    /// silent version split. Device nodes (`/dev/kfd`,
-    /// `/dev/dri/*`) and the GPU supplementary groups are injected regardless;
-    /// this flag governs only the library overlay. It applies only to the
-    /// auto-detected AMD spec, so it is inert on a node that has any on-disk CDI
-    /// spec (auto-detection is skipped there), and it does not affect k0s/pod
-    /// containers, whose CDI spec never carries the overlay.
+    /// Bind-mount the host's `/opt/rocm/lib{,64}` over the image's inside
+    /// auto-detected AMD GPU containers; off by default. Inert when on-disk CDI
+    /// specs exist, and never applied to managed-k0s pods. Device nodes and GPU
+    /// groups are injected regardless.
     #[serde(default)]
     pub overlay_host_rocm_libs: bool,
 }

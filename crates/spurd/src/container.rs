@@ -610,25 +610,13 @@ fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::Conta
         }
     }
 
-    // Record the host-ROCm library overlay in the job's log: overlaying host
-    // libraries over the image's is a substitution the job can otherwise only
-    // detect by reading /proc/self/mountinfo, so name it where it's visible. Only
-    // the /opt/rocm library paths are called out — plan.mounts also carries
-    // device-node and site-authored CDI mounts, which are not a userspace swap.
-    let rocm_overlaid: Vec<&str> = plan
-        .mounts
-        .iter()
-        .map(|m| m.target.as_str())
-        .filter(|t| t.starts_with("/opt/rocm/"))
-        .collect();
-    if !rocm_overlaid.is_empty() {
-        info!(
-            mounts = ?rocm_overlaid,
-            "overlaying host ROCm libraries onto the container image (replacing the image's own)"
-        );
-    }
-
-    // Mounts: bind-mount library paths etc.
+    // Bind-mount injected paths, recording which host-ROCm library overlays
+    // actually bound so the job's log names them afterwards — overlaying host
+    // libraries over the image's is a userspace substitution the job can
+    // otherwise only see via /proc/self/mountinfo. Only /opt/rocm paths are
+    // called out; plan.mounts also carries site-authored CDI mounts, which are
+    // not a userspace swap.
+    let mut rocm_overlaid: Vec<&str> = Vec::new();
     for m in &plan.mounts {
         let source = Path::new(&m.source);
         if !source.exists() {
@@ -641,7 +629,17 @@ fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::Conta
                 error = %e,
                 "failed to bind mount injected mount"
             );
+            continue;
         }
+        if m.target.starts_with("/opt/rocm/") {
+            rocm_overlaid.push(m.target.as_str());
+        }
+    }
+    if !rocm_overlaid.is_empty() {
+        info!(
+            mounts = ?rocm_overlaid,
+            "overlaid host ROCm libraries onto the container (replacing the image's own)"
+        );
     }
 }
 

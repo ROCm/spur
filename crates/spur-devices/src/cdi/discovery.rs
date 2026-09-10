@@ -361,7 +361,11 @@ fn build_shared_edits(overlay_host_rocm_libs: bool) -> ContainerEdits {
         });
     }
 
-    edits.mounts = rocm_lib_overlay_mounts(overlay_host_rocm_libs, ROCM_LIB_DIRS);
+    // `extend`, not assign, so a mount added above is never silently dropped.
+    edits.mounts.extend(rocm_lib_overlay_mounts(
+        overlay_host_rocm_libs,
+        ROCM_LIB_DIRS,
+    ));
     edits.additional_gids = gpu_supplementary_gids_from_group_file("/etc/group");
     edits
 }
@@ -371,10 +375,8 @@ const ROCM_LIB_DIRS: &[&str] = &["/opt/rocm/lib", "/opt/rocm/lib64"];
 
 /// Read-only bind mounts overlaying the host's ROCm libraries onto a container,
 /// or empty when the overlay is off. Opt-in: the default keeps the image's own
-/// userspace (matching `docker run --device=/dev/kfd ...`); overlaying the
-/// host's runtime/math/tuning libraries is a silent version split. Only
-/// directories that exist on the host are mounted. Split out from
-/// `build_shared_edits` so the gate is testable without a real `/opt/rocm`.
+/// userspace (`docker run --device=/dev/kfd ...`), since overlaying a different
+/// runtime/math/tuning stack is a silent version split. Only existing dirs mount.
 fn rocm_lib_overlay_mounts(overlay_host_rocm_libs: bool, candidates: &[&str]) -> Vec<Mount> {
     if !overlay_host_rocm_libs {
         return Vec::new();
@@ -901,8 +903,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_shared_edits_kfd() {
-        let _ = build_shared_edits(false);
+    fn test_build_shared_edits_gates_only_the_library_overlay() {
+        // The gate wires through build_shared_edits: off adds no library mounts,
+        // while device nodes and GPU groups are injected either way (both read
+        // the same host state, so the comparison is stable everywhere and only
+        // fails if someone later moves that injection inside the gate).
+        let off = build_shared_edits(false);
+        let on = build_shared_edits(true);
+        assert!(
+            off.mounts.is_empty(),
+            "overlay off must add no library mounts"
+        );
+        assert_eq!(off.device_nodes.len(), on.device_nodes.len());
+        assert_eq!(off.additional_gids, on.additional_gids);
     }
 
     #[test]
