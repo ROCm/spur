@@ -27,7 +27,7 @@ from wg_cluster import WG_IFACE, wait_until
 # InternalIPs) so a kubectl error string is never mistaken for an address.
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
-BUSYBOX_IMAGE = "docker.io/library/busybox:1.36"
+BUSYBOX_IMAGE = "mirror.gcr.io/library/busybox:1.36"
 
 
 # --- kubectl helpers (run `k0s kubectl` on the control-plane node) -----------
