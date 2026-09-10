@@ -1132,6 +1132,14 @@ starts.
      - ``[]``
      - Extra directories to scan for CDI specs, beyond ``/etc/cdi`` and
        ``/var/run/cdi``.
+   * - ``overlay_host_rocm_libs``
+     - bool
+     - ``false``
+     - Bind-mount the host's ``/opt/rocm/lib{,64}`` over the image's inside
+       auto-detected AMD GPU containers, replacing the image's ROCm userspace.
+       Off by default. Applies only to the auto-detected spec — inert on a node
+       that has any on-disk CDI spec, and never applied to managed-k0s pods.
+       Device nodes and GPU groups are injected regardless.
    * - ``gres``
      - [table]
      - ``[]``

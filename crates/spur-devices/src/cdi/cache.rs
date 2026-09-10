@@ -60,7 +60,7 @@ impl CdiCache {
         }
     }
 
-    pub fn load(cdi_spec_dirs: &[String], auto_detect: bool) -> Self {
+    pub fn load(cdi_spec_dirs: &[String], auto_detect: bool, overlay_host_rocm_libs: bool) -> Self {
         let mut cdi_dirs: Vec<PathBuf> = DEFAULT_SPEC_DIRS.iter().map(PathBuf::from).collect();
         for extra in cdi_spec_dirs {
             cdi_dirs.push(PathBuf::from(extra));
@@ -73,7 +73,9 @@ impl CdiCache {
         }
 
         if cache.is_empty() && auto_detect {
-            cache.add_specs(&crate::cdi::discovery::discover_to_cdi());
+            cache.add_specs(&crate::cdi::discovery::discover_to_cdi(
+                overlay_host_rocm_libs,
+            ));
         } else if auto_detect {
             warn!("on-disk CDI specs found; auto_detect ignored");
         }
@@ -444,14 +446,14 @@ mod tests {
             .write_json(&dir.path().join("amd.json"))
             .unwrap();
 
-        let cache = CdiCache::load(&[dir.path().to_string_lossy().into_owned()], true);
+        let cache = CdiCache::load(&[dir.path().to_string_lossy().into_owned()], true, false);
         assert_eq!(cache.len(), 1);
         assert!(cache.get_device("amd.com/gpu=0").is_some());
     }
 
     #[test]
     fn test_load_empty_without_auto_detect() {
-        let cache = CdiCache::load(&[], false);
+        let cache = CdiCache::load(&[], false, false);
         assert!(cache.is_empty());
     }
 

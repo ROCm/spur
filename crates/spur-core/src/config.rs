@@ -1241,6 +1241,13 @@ pub struct DevicesConfig {
     /// File-based or countable GRES pools alongside CDI-discovered devices.
     #[serde(default)]
     pub gres: Vec<DevicesGresEntry>,
+
+    /// Bind-mount the host's `/opt/rocm/lib{,64}` over the image's inside
+    /// auto-detected AMD GPU containers; off by default. Inert when on-disk CDI
+    /// specs exist, and never applied to managed-k0s pods. Device nodes and GPU
+    /// groups are injected regardless.
+    #[serde(default)]
+    pub overlay_host_rocm_libs: bool,
 }
 
 impl Default for DevicesConfig {
@@ -1249,6 +1256,7 @@ impl Default for DevicesConfig {
             auto_detect: true,
             cdi_spec_dirs: Vec::new(),
             gres: Vec::new(),
+            overlay_host_rocm_libs: false,
         }
     }
 }
@@ -2971,6 +2979,24 @@ job_submit_lua = "/etc/spur/job_submit.lua"
         // hooks section omitted — metrics should keep defaults
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.listen_addr, "[::]:6822");
+    }
+
+    #[test]
+    fn test_devices_host_rocm_overlay_defaults_off() {
+        // The host-ROCm library overlay must be off by default: a job gets the
+        // image's userspace unless the operator opts in.
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(!config.devices.overlay_host_rocm_libs);
+        assert!(
+            config.devices.auto_detect,
+            "auto_detect stays on by default"
+        );
+
+        let opted_in = SlurmConfig::load_from_str(
+            "cluster_name = \"x\"\n[devices]\noverlay_host_rocm_libs = true\n",
+        )
+        .unwrap();
+        assert!(opted_in.devices.overlay_host_rocm_libs);
     }
 
     #[test]

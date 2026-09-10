@@ -1063,17 +1063,22 @@ done
         if result.returncode != 0:
             raise RuntimeError(f"rootfs build failed: {result.stderr}")
 
-    def build_container_image(self, tmp_path: Path) -> str:
+    def build_container_image(self, tmp_path: Path, rootfs_extra: str = "") -> str:
         """
         Build a minimal squashfs container image locally, ship to all nodes.
         Returns the remote path to the .sqsh file.
+
+        *rootfs_extra* is shell appended to the rootfs build (with ``$R`` at the
+        rootfs root) before the image is packed, so a test can plant marker
+        files in the image, e.g. its own ``/opt/rocm/lib``.
         """
         remote_path = f"{self.remote_dir}/test-container.sqsh"
         rootfs = tmp_path / "rootfs"
         local_img = tmp_path / "test-container.sqsh"
         self._build_test_rootfs(
             rootfs,
-            extra=f"""mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1""",
+            extra=f"""{rootfs_extra}
+mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1""",
         )
 
         for node in self.nodes:

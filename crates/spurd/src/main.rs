@@ -532,7 +532,26 @@ fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
     let default_devices = spur_core::config::DevicesConfig::default();
     let devices_config = config.map(|c| &c.devices).unwrap_or(&default_devices);
 
-    let cdi_cache = CdiCache::load(&devices_config.cdi_spec_dirs, devices_config.auto_detect);
+    let cdi_cache = CdiCache::load(
+        &devices_config.cdi_spec_dirs,
+        devices_config.auto_detect,
+        devices_config.overlay_host_rocm_libs,
+    );
+
+    // Make a post-upgrade dlopen failure self-diagnosing: if the host has ROCm
+    // libraries but the overlay is off, a GPU image that shipped none of its own
+    // and relied on the host's will now fail. Name the config key so the cause is
+    // in the log, not just a cryptic loader error inside the container.
+    if !devices_config.overlay_host_rocm_libs
+        && (std::path::Path::new("/opt/rocm/lib").is_dir()
+            || std::path::Path::new("/opt/rocm/lib64").is_dir())
+    {
+        info!(
+            "[devices] host /opt/rocm/lib{{,64}} present but not overlaid into GPU containers \
+             (overlay_host_rocm_libs = false); an image without its own ROCm userspace will not \
+             find it — set overlay_host_rocm_libs = true to restore the old behavior"
+        );
+    }
 
     let gres_entries: Vec<spur_devices::GresEntry> = devices_config
         .gres
