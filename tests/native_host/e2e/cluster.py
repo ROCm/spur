@@ -226,8 +226,8 @@ class SpurCluster:
     # Real public image pulled by pull_container_image(). Its config.Env holds
     # PATH (first entry below), LANG and PYTHON_VERSION, none of which the job
     # environment supplies. Pinned so those expectations stay true.
-    TEST_IMAGE = "docker.io/library/python:3.11-slim"
-    TEST_IMAGE_REGISTRY = "registry-1.docker.io"
+    TEST_IMAGE = "mirror.gcr.io/library/python:3.11-slim"
+    TEST_IMAGE_REGISTRY = "mirror.gcr.io"
     TEST_IMAGE_PATH_HEAD = "/usr/local/bin"
 
     def __init__(self, nodes: list[SshNode], remote_dir: str, bin_dir: str):

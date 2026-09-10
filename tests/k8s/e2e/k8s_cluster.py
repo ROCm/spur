@@ -546,7 +546,7 @@ class ClusterFixture:
 def base_spec(name: str, command: list[str], num_nodes: int = 1) -> dict:
     return {
         "name": name,
-        "image": "busybox:latest",
+        "image": "mirror.gcr.io/library/busybox:latest",
         "gpus": {},
         "numNodes": num_nodes,
         "tasksPerNode": 1,
