@@ -249,10 +249,13 @@ class TestHealthCheck:
                 "user": user, "uid": uid, "gid": gid,
             }
 
+        # Disable the concurrency cap so it doesn't serialize the two checks
+        # on the same node — this test is about name-collision independence, not
+        # cap behaviour (which is covered by health_concurrency_cap_bounds_submits).
         cluster.start({"health": {"checks": [
             _check(f"{rd}/health/ok.sh"),
             _check(f"{rd}/health/bad.sh"),
-        ]}})
+        ], "max_unavailable": "0"}})
         target = cluster.node_names[0]
 
         # The failing second check drains the node — so it ran, independently of

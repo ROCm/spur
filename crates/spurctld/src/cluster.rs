@@ -1932,13 +1932,15 @@ impl ClusterManager {
         let now_utc = Utc::now();
         let nodes = self.get_nodes();
 
-        // Bound how many nodes are in health activity at once so a restart,
-        // failover, or first enable can't set off a fleet-wide check — and,
-        // downstream, force-drain — wave. `active` is the baseline of in-flight
-        // checks; each new submit below counts against the cap, which in turn
-        // bounds the force-drains, since only an in-flight check can force one.
+        // Bound how many *distinct nodes* are in health activity at once so a
+        // restart, failover, or first enable can't set off a fleet-wide check —
+        // and, downstream, force-drain — wave. We track a set of node names
+        // rather than a plain counter so that multiple checks targeting the same
+        // node (e.g. a fast GPU probe + a slow fabric probe) are not counted
+        // twice: the node is already exclusively occupied by the first check, so
+        // a second check for it doesn't widen the blast radius.
         let cap = config.health.concurrency_cap(nodes.len());
-        let mut active = self.count_health_active_nodes();
+        let mut active_nodes: HashSet<String> = self.health_active_node_names();
 
         for (idx, check) in config.health.checks.iter().enumerate() {
             // Multi-node checks are rejected at config load (topology-aware
@@ -1959,7 +1961,7 @@ impl ClusterManager {
                 // off the durable drain reason, so it holds across a failover.
                 if force_draining {
                     if !self.node_has_running_jobs(&node.name) {
-                        if let Err(e) = self.update_node_state(&node.name, NodeState::Idle, None) {
+                        if let Err(e) = self.update_node_state(&node.name, NodeState::Idle, None, None) {
                             warn!(node = %node.name, error = %e, "failed to resume node for health check");
                         } else {
                             self.scheduler_notify.notify_one();
@@ -1986,7 +1988,7 @@ impl ClusterManager {
                             "{HEALTH_FORCE_DRAIN_PREFIX}running overdue check {}",
                             check.program
                         );
-                        if let Err(e) = self.drain_node(&node.name, Some(reason)) {
+                        if let Err(e) = self.drain_node(&node.name, Some(reason), None) {
                             warn!(node = %node.name, error = %e, "failed to drain node for health check");
                         }
                     }
@@ -2001,11 +2003,19 @@ impl ClusterManager {
                     .get(&(idx, node.name.clone()))
                     .is_none_or(|t| now.duration_since(*t) >= interval);
                 if due {
-                    if cap != 0 && active >= cap {
+                    // Only count against the cap when this node is not already
+                    // in health activity — a second check for the same node
+                    // doesn't add a new node to the active set.
+                    if cap != 0
+                        && !active_nodes.contains(&node.name)
+                        && active_nodes.len() >= cap
+                    {
                         continue;
                     }
                     match self.submit_health_job(idx, check, node) {
-                        Ok(_) => active += 1,
+                        Ok(_) => {
+                            active_nodes.insert(node.name.clone());
+                        }
                         Err(e) => {
                             warn!(node = %node.name, check = %check.program, error = %e, "failed to submit health-check job")
                         }
@@ -2030,14 +2040,17 @@ impl ClusterManager {
     /// (pending or running). Read from the durable job store so the cap holds
     /// across a failover. A force-drained node still has its pending check, so
     /// bounding this bounds the force-drains too.
-    fn count_health_active_nodes(&self) -> usize {
+    /// Names of nodes that currently have a non-terminal health-check job
+    /// (pending or running). Read from the durable job store so the cap holds
+    /// across a failover. A force-drained node still has its pending check, so
+    /// bounding this set bounds the force-drains too.
+    fn health_active_node_names(&self) -> HashSet<String> {
         self.jobs
             .read()
             .values()
             .filter(|j| !j.state.is_terminal())
-            .filter_map(|j| health_job_target_node(&j.spec.name))
-            .collect::<HashSet<_>>()
-            .len()
+            .filter_map(|j| health_job_target_node(&j.spec.name).map(str::to_owned))
+            .collect()
     }
 
     /// Whether the health system must leave `node` untouched: only a node that
@@ -2143,7 +2156,7 @@ impl ClusterManager {
         if failed {
             let reason =
                 format!("{HEALTH_FAIL_DRAIN_PREFIX}{program} failed ({state:?}, exit {exit_code})");
-            if let Err(e) = self.drain_node(&node, Some(reason)) {
+            if let Err(e) = self.drain_node(&node, Some(reason), None) {
                 warn!(node = %node, error = %e, "failed to drain node after failing health check");
             }
         }
@@ -8939,7 +8952,7 @@ mod tests {
 
         // A drained node (operator maintenance, or a prior failed check) is
         // off-limits: no probe, so a failed node stays down for an operator.
-        cm.update_node_state("n1", NodeState::Drain, Some("maintenance".into()))
+        cm.update_node_state("n1", NodeState::Drain, Some("maintenance".into()), None)
             .unwrap();
         wait_for("n1 drained", || {
             cm.get_node("n1")
@@ -8969,6 +8982,7 @@ mod tests {
             "n1",
             NodeState::Drain,
             Some("health-check(pending): running overdue check /bin/true".into()),
+            None,
         )
         .unwrap();
         wait_for("n1 force-drained", || {
