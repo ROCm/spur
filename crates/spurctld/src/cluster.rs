@@ -4665,6 +4665,8 @@ impl ClusterManager {
                 actor: "system".to_string(),
                 actor_uid: None,
                 verified: false,
+                // No request, so no peer; `source` already says it was internal.
+                peer_addr: String::new(),
                 source: TxnSource::System,
                 action: TxnAction::Delete,
                 entity_type: TxnEntity::Reservation,

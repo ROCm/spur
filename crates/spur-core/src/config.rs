@@ -963,6 +963,10 @@ pub struct LoggingConfig {
     pub level: String,
     pub format: String,
     pub file: Option<String>,
+    /// Every inbound controller RPC, reads included, on the `audit_rpc` target.
+    /// Slurm's `DebugFlags=AuditRPCs`; off by default as the highest-volume log.
+    #[serde(default)]
+    pub audit_rpcs: bool,
 }
 
 impl Default for LoggingConfig {
@@ -971,6 +975,7 @@ impl Default for LoggingConfig {
             level: "info".into(),
             format: "text".into(),
             file: None,
+            audit_rpcs: false,
         }
     }
 }
