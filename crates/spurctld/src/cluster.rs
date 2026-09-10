@@ -3177,21 +3177,40 @@ impl ClusterManager {
         name: &str,
         reason: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        // An admin hold's reason and lock outrank the shutdown reason, so an
-        // operator's drain is not silently cleared when the agent restarts.
-        let (old_state, admin_locked, admin_reason) = {
+        // An admin hold's reason, lock and attribution outrank the shutdown
+        // reason, so an operator's drain is not silently cleared when the
+        // agent restarts. Otherwise this is a system action: uid 0, now.
+        let (old_state, admin_locked, reason, reason_uid, reason_time) = {
             let nodes = self.nodes.read();
             let node = nodes
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
-            (node.state, node.admin_locked, node.state_reason.clone())
+            if node.admin_locked && node.state_reason.is_some() {
+                (
+                    node.state,
+                    node.admin_locked,
+                    node.state_reason.clone(),
+                    node.reason_uid,
+                    node.reason_time,
+                )
+            } else {
+                (
+                    node.state,
+                    node.admin_locked,
+                    reason,
+                    Some(0),
+                    Some(Utc::now()),
+                )
+            }
         };
         let resp = self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: NodeState::Down,
-            reason: if admin_locked { admin_reason } else { reason },
+            reason,
             admin_locked,
+            reason_uid,
+            reason_time,
         })?;
         self.k8s_metrics
             .set_node_up(&self.config().cluster_name, name, false);
@@ -23915,6 +23934,16 @@ mod tests {
         let node = cm.get_node("n1").expect("node must survive a shutdown");
         assert_eq!(node.wg_pubkey.as_deref(), Some("pubkey1"));
         assert!(!node.admin_locked, "must stay recoverable on heartbeat");
+        assert_eq!(node.state_reason.as_deref(), Some("agent shutdown"));
+        assert_eq!(
+            node.reason_uid,
+            Some(0),
+            "system action is attributed to root"
+        );
+        assert!(
+            node.reason_time.is_some(),
+            "system action carries a timestamp"
+        );
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
     }
 
