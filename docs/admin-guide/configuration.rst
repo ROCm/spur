@@ -920,32 +920,43 @@ WireGuard mesh networking and the agent port.
 ``[logging]``
 -------------
 
-**Reload: Not implemented** for every field below. The section is parsed but no
-daemon reads it.
-
 .. list-table::
    :header-rows: 1
-   :widths: 20 14 20 46
+   :widths: 18 12 12 18 40
 
    * - Field
      - Type
+     - Reload
      - Default
      - Description
    * - ``level``
      - string
+     - Not implemented
      - ``"info"``
      - Intended log level. Use the ``--log-level`` flag or the ``RUST_LOG``
        environment variable instead.
    * - ``format``
      - string
+     - Not implemented
      - ``"text"``
      - Intended log format. Output format is not configurable.
    * - ``file``
      - string
+     - Not implemented
      - none
      - Intended log file path. Logging to a file is not implemented; daemons log
        to stderr, so redirect via the service manager (for example systemd's
        journal) instead.
+   * - ``audit_rpcs``
+     - bool
+     - Restart
+     - ``false``
+     - Log every inbound controller RPC, reads included, on the ``audit_rpc``
+       tracing target with the method, authenticated user, peer address, and
+       outcome. Slurm's ``DebugFlags=AuditRPCs``. Off by default because it is
+       the highest-volume log Spur emits. The controller reads this at startup,
+       so changing it needs a restart rather than ``scontrol reconfigure``. See
+       :doc:`accounting`.
 
 ``[rlimits]``
 -------------

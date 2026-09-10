@@ -1004,15 +1004,19 @@ def _parse_txn_rows(out: str, where: str) -> list[dict]:
     return rows
 
 
-def _wait_txn_rows(c, res_name: str, predicate, timeout: int = 60) -> list[dict]:
+def _wait_txn_rows(
+    c, res_name: str, predicate, timeout: int = 60, entity: str = "reservation"
+) -> list[dict]:
     """Poll the audit log until some row for `res_name` satisfies `predicate`
-    (audit writes are async), then return all parsed rows for the reservation."""
+    (audit writes are async), then return all parsed rows for the entity."""
     fmt = "format=ID,Action,Actor,Where,Outcome,Verified"
-    where = f"reservation:{res_name}"
+    where = f"{entity}:{res_name}"
     deadline = time.time() + timeout
     last: list[dict] = []
     while time.time() < deadline:
-        rows = _parse_txn_rows(c.sacctmgr(["show", "txn", f"Name={res_name}", fmt]), where)
+        rows = _parse_txn_rows(
+            c.sacctmgr(["show", "txn", f"Entity={entity}", f"Name={res_name}", fmt]), where
+        )
         if any(predicate(r) for r in rows):
             return rows
         last = rows
@@ -1128,3 +1132,70 @@ class TestReservationAudit:
             assert denied[0]["actor"] == submit_user, denied
         finally:
             c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+
+class TestNodeAudit:
+    """Node state changes are audited, which is the question the audit log was
+    built to answer: who drained this node, and when."""
+
+    def test_drain_and_resume_recorded_in_txn_log(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        # No spaces: the fixed-column audit parser anchors on field positions.
+        reason = f"e2e-drain-{int(time.time())}"
+
+        try:
+            c.cli_as_user(
+                "root",
+                ["scontrol", "update", f"NodeName={node}", "State=DRAIN", f"Reason={reason}"],
+            )
+
+            rows = _wait_txn_rows(
+                c,
+                node,
+                lambda r: r["action"] == "update" and r["outcome"] == "success",
+                entity="node",
+            )
+            drained = [r for r in rows if r["action"] == "update" and r["outcome"] == "success"]
+            assert drained, rows
+            assert drained[0]["actor"] == "root", drained
+
+            # The reason and requested state are captured as asked for, so the
+            # log answers "what was set", not just "something was set".
+            info = c.sacctmgr(
+                ["show", "txn", "Entity=node", f"Name={node}", "format=Action,Info"]
+            )
+            assert reason in info, info
+
+            # PR #860's node-record attribution and the audit log must agree.
+            assert reason in c.sinfo(), "sinfo -R should show the drain reason"
+        finally:
+            # Leaving a node drained would starve every later test.
+            c.cli_as_user(
+                "root", ["scontrol", "update", f"NodeName={node}", "State=RESUME"]
+            )
+
+    def test_unprivileged_drain_is_denied_and_recorded(self, accounting_cluster):
+        """`spur node drain` requires cluster admin, and the refusal is audited.
+
+        Regression guard: `DrainNode` previously had no authorization check at
+        all, so any caller that could reach the controller could drain a node.
+        """
+        c = accounting_cluster
+        node = c.node_names[0]
+
+        probe = c.cli_as_user("nobody", ["sinfo"])
+        if "sudo" in probe.lower() and (
+            "password" in probe.lower() or "not allowed" in probe.lower()
+        ):
+            pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
+
+        out = c.cli_as_user(
+            "nobody", ["node", "drain", node, "--reason=e2e-unprivileged"]
+        ).lower()
+        assert "admin" in out or "permission" in out, f"drain should be refused: {out}"
+
+        nodes = c.sinfo_nodes()
+        assert "drain" not in nodes.get(node, "").lower(), (
+            f"an unprivileged drain must not take effect: {nodes}"
+        )

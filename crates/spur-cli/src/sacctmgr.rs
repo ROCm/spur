@@ -1031,7 +1031,7 @@ fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
 // Slurm's default `sacctmgr show transaction` columns: Time, Action, Actor,
 // Where, Info. Where renders entity_type:entity_name; Info renders details JSON.
 const TXN_DEFAULT_FORMAT: &str = "%-20t %-8a %-14A %-24w %-40i";
-const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-24w %-10o %-8u %-40i";
+const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-22p %-24w %-10o %-8u %-40i";
 
 fn txn_header(spec: char) -> &'static str {
     match spec {
@@ -1045,6 +1045,7 @@ fn txn_header(spec: char) -> &'static str {
         's' => "Source",
         'd' => "ID",
         'u' => "ActorUID",
+        'p' => "Peer",
         _ => "?",
     }
 }
@@ -1061,6 +1062,7 @@ fn txn_field_spec(name: &str) -> Option<char> {
         "source" => Some('s'),
         "id" => Some('d'),
         "actoruid" | "uid" => Some('u'),
+        "peer" | "peeraddr" => Some('p'),
         _ => None,
     }
 }
@@ -1074,13 +1076,12 @@ fn txn_format_fields(
         TXN_ALL_FORMAT,
         &txn_field_spec,
         &txn_header,
-        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID",
+        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID, Peer",
     )
 }
 
-/// Build a `GetTransactions` request from Slurm-style `key=value` filters
-/// (`Actor=`, `Action=`, `Entity=`, `Name=`, `Outcome=`, `Start=`, `End=`,
-/// `limit=`). `action`/`outcome` are lowercased to match the stored values.
+/// Build a `GetTransactions` request from Slurm-style `key=value` filters.
+/// `action`/`outcome` are lowercased to match the stored values.
 fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransactionsRequest {
     GetTransactionsRequest {
         actor: p.get("actor").cloned().unwrap_or_default(),
@@ -1101,6 +1102,11 @@ fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransa
         outcome: p
             .get("outcome")
             .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        peer_addr: p
+            .get("peer")
+            .or_else(|| p.get("peeraddr"))
+            .cloned()
             .unwrap_or_default(),
         start_after: p
             .get("start")
@@ -1125,6 +1131,7 @@ fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
         'v' => if t.verified { "yes" } else { "no" }.to_string(),
         's' => t.source.clone(),
         'd' => t.id.to_string(),
+        'p' => t.peer_addr.clone(),
         // uid is recorded only for a verified identity; render blank otherwise so
         // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
         'u' => {
@@ -2157,12 +2164,14 @@ mod tests {
             entity_name: "daily".into(),
             outcome: "success".into(),
             details: "{}".into(),
+            peer_addr: "10.11.99.42:51234".into(),
         };
         assert_eq!(resolve_txn_field(&t, 'w'), "reservation:daily");
         assert_eq!(resolve_txn_field(&t, 'v'), "yes");
         assert_eq!(resolve_txn_field(&t, 'A'), "bob");
         assert_eq!(resolve_txn_field(&t, 'd'), "7");
         assert_eq!(resolve_txn_field(&t, 'u'), "1000");
+        assert_eq!(resolve_txn_field(&t, 'p'), "10.11.99.42:51234");
     }
 
     #[test]
@@ -2615,6 +2624,7 @@ mod tests {
             entity_name: "gpu".into(),
             outcome: "success".into(),
             details: "{}".into(),
+            peer_addr: "10.11.99.42:51234".into(),
         }
     }
 

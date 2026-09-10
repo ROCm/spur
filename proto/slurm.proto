@@ -1392,6 +1392,7 @@ message GetTransactionsRequest {
   google.protobuf.Timestamp start_after = 6;
   google.protobuf.Timestamp start_before = 7;
   uint32 limit = 8;
+  string peer_addr = 9;         // prefix match, so a bare IP matches any port
 }
 
 message TransactionRecord {
@@ -1402,10 +1403,11 @@ message TransactionRecord {
   bool verified = 5;            // true only when a JWT identity was verified
   string source = 6;            // "api" | "system"
   string action = 7;            // "create" | "update" | "delete"
-  string entity_type = 8;       // "reservation"
+  string entity_type = 8;       // "node" | "job" | "reservation" | ...
   string entity_name = 9;
   string outcome = 10;          // "success" | "denied" | "error"
   string details = 11;          // JSON: requested parameters (+ error on failure)
+  string peer_addr = 12;        // caller's address, empty when unavailable
 }
 
 message GetTransactionsResponse {
