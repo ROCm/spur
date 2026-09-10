@@ -32,6 +32,12 @@ use crate::sched_stats::SchedStatsCollector;
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
 
+/// Shared by the controller entry points that can carry the flag, so the wording
+/// cannot drift between them.
+const REMAP_ROOT_UNIMPLEMENTED: &str =
+    "--container-remap-root is not yet implemented and has no effect on the container's user \
+     mapping, which is determined by how spurd is deployed.";
+
 /// Resolve the comm address for an agent registration.
 ///
 /// Tries the advertised address first, then the gRPC peer IP (dynamic registration
@@ -786,12 +792,9 @@ impl SlurmController for ControllerService {
         // --container-remap-root asks for rootless UID/GID remapping that is not
         // implemented; reject it rather than accept the flag and not honor it.
         if core_spec.container_remap_root {
-            return Err(Status::invalid_argument(
-                "--container-remap-root is not yet implemented; rootless UID/GID remapping \
-                 (submitter -> root inside the container, unprivileged on the host, with the \
-                 rootfs owned to match) is planned but not yet available. Resubmit without the \
-                 flag.",
-            ));
+            return Err(Status::invalid_argument(format!(
+                "{REMAP_ROOT_UNIMPLEMENTED} Resubmit without the flag."
+            )));
         }
 
         // Clamp a non-privileged caller's base priority to the configured ceiling before it reaches
@@ -2128,6 +2131,14 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
+        // The PTY client forwards the resolved container straight to the agent, so
+        // this path needs the same guard as run_step.
+        if req.container.as_ref().is_some_and(|c| c.remap_root) {
+            return Err(Status::invalid_argument(format!(
+                "{REMAP_ROOT_UNIMPLEMENTED} Rerun the step without the flag."
+            )));
+        }
+
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
                 "job {} is not running (state: {:?})",
@@ -2815,16 +2826,12 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        // Mirror the submit-path guard: a step carries its own ContainerSpec
-        // (srun --container-remap-root), so reject the unimplemented flag here
-        // too, or a direct gRPC client could set it and bypass the submit check.
+        // A step carries its own ContainerSpec, so a direct gRPC client would
+        // otherwise bypass the submit-path guard.
         if req.container.as_ref().is_some_and(|c| c.remap_root) {
-            return Err(Status::invalid_argument(
-                "--container-remap-root is not yet implemented; rootless UID/GID remapping \
-                 (submitter -> root inside the container, unprivileged on the host, with the \
-                 rootfs owned to match) is planned but not yet available. Rerun the step \
-                 without the flag.",
-            ));
+            return Err(Status::invalid_argument(format!(
+                "{REMAP_ROOT_UNIMPLEMENTED} Rerun the step without the flag."
+            )));
         }
 
         if job.allocated_nodes.is_empty() {
@@ -3717,7 +3724,9 @@ fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<Contai
         mount_home: spec.container_mount_home,
         env: spec.container_env.clone(),
         entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
-        remap_root: spec.container_remap_root,
+        // Rejected at submission, so only a pre-upgrade job can still carry it; do
+        // not let a step inherit it.
+        remap_root: false,
     })
 }
 
@@ -5060,6 +5069,31 @@ mod tests {
         let job = owned_job("u", "/w");
         assert!(resolve_step_container(None, &job).is_none());
         assert!(resolve_step_container(Some(ContainerSpec::default()), &job).is_none());
+    }
+
+    #[test]
+    fn resolve_step_container_does_not_inherit_remap_root() {
+        let mut job = owned_job("u", "/w");
+        job.container_image = Some("parent.sqsh".into());
+        job.container_remap_root = true;
+
+        // The inherit path is the one that used to carry the flag through.
+        assert!(
+            !resolve_step_container(None, &job)
+                .expect("inherited")
+                .remap_root
+        );
+        // The override path returns the step's own spec; this pins the merge to
+        // env only, so a later change cannot fold the parent's flag back in.
+        let step = ContainerSpec {
+            image: "step.sqsh".into(),
+            ..Default::default()
+        };
+        assert!(
+            !resolve_step_container(Some(step), &job)
+                .expect("override")
+                .remap_root
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6643,9 +6677,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_step_rejects_container_remap_root() {
-        // A step carries its own ContainerSpec (srun --container-remap-root), so
-        // the unimplemented flag must be rejected on the step RPC too — not only
-        // at submit — or a direct gRPC client bypasses the guard.
+        // A step's own ContainerSpec is a second path to the flag, so the step
+        // RPC must reject it too, not only submit.
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let job_id = running_job_owned_by(&svc, "ubuntu").await;
@@ -6665,6 +6698,37 @@ mod tests {
             }))
             .await
             .expect_err("a step must not be able to set --container-remap-root");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("--container-remap-root")
+                && status.message().contains("not yet implemented"),
+            "got: {}",
+            status.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_rejects_container_remap_root() {
+        // The interactive-PTY path returns the resolved container to the client,
+        // which sends it to the agent without passing back through the controller.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let status = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["bash".into()],
+                user: "ubuntu".into(),
+                container: Some(spur_proto::proto::ContainerSpec {
+                    image: "img.sqsh".into(),
+                    remap_root: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the PTY step path must not accept --container-remap-root");
         assert_eq!(status.code(), Code::InvalidArgument);
         assert!(
             status.message().contains("--container-remap-root")

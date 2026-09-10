@@ -238,10 +238,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     if args.container_remap_root {
         anyhow::bail!(
-            "--container-remap-root is not yet implemented and is rejected rather than silently \
-             ignored. Rootless UID/GID remapping (submitter -> root inside the container, \
-             unprivileged on the host, with the rootfs owned to match) is planned but not yet \
-             available. Omit the flag."
+            "--container-remap-root is not yet implemented and has no effect on the container's \
+             user mapping, which is determined by how spurd is deployed. Omit the flag."
         );
     }
 
@@ -2981,10 +2979,8 @@ mod tests {
 
     #[tokio::test]
     async fn container_remap_root_is_rejected() {
-        // The flag was parsed, propagated, and silently ignored; it must now
-        // fail early rather than accept the flag and not honor it. The
-        // unroutable controller makes the test fail fast (not hang dialing the
-        // real controller) if this reject is ever removed.
+        // Unroutable controller: if the guard ever regresses, this errors on
+        // connect rather than submitting a live job on a dev box.
         let result = main_with_args(vec![
             "srun".into(),
             "--controller=http://127.0.0.1:1".into(),

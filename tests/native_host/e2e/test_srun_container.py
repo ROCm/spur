@@ -675,6 +675,37 @@ class TestSrunContainerStepSanity:
             f"expected a clear rejection message, got:\n{out}"
         )
 
+    def test_container_remap_root_rejected(self, step_container_cluster):
+        """--container-remap-root is refused at submission (not a silent no-op)."""
+        cluster = step_container_cluster
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02",
+            f"--container-image={cluster.step_container_image}",
+            "--container-remap-root",
+            "true",
+        ])
+        assert code != 0, f"--container-remap-root should be rejected, got exit 0:\n{out}"
+        assert "container-remap-root" in out and "not yet implemented" in out, (
+            f"expected a clear rejection message, got:\n{out}"
+        )
+
+    def test_container_remap_root_rejected_via_sbatch(self, step_container_cluster):
+        """sbatch has no client-side bail, so this is the only path that proves
+        the controller itself rejects the flag rather than accepting it."""
+        cluster = step_container_cluster
+        script = cluster.write_file(
+            "remap-root-rej.sh", "#!/bin/bash\necho REJ\n", all_nodes=True
+        )
+        out = cluster.cli_allow_fail([
+            "sbatch", "-J", "remap-rej", "-N", "1",
+            f"--container-image={cluster.step_container_image}",
+            "--container-remap-root", script,
+        ])
+        assert parse_job_id(out) is None, f"expected rejection, got:\n{out}"
+        assert "container-remap-root" in out and "not yet implemented" in out, (
+            f"expected a clear rejection message, got:\n{out}"
+        )
+
     def test_step_without_image_runs_on_host(self, step_container_cluster):
         """A step with no container image runs on the host and cannot see the
         in-image marker — proves the flag is what gates the container path."""

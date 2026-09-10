@@ -179,7 +179,7 @@ message JobSpec {
   bool container_mount_home = 75;  // Bind-mount user home directory
   map<string, string> container_env = 76; // Extra env vars for container
   string container_entrypoint = 77; // Override entrypoint
-  bool container_remap_root = 78;  // Remap user to root inside container
+  bool container_remap_root = 78;  // Remap user to root inside container; not yet implemented, rejected at submission
 
   // Standalone srun: reserve an allocation without launching a batch script;
   // the user command runs as a job step after nodes are registered.
@@ -1025,7 +1025,7 @@ message ContainerSpec {
   bool mount_home = 6;              // Bind-mount the user's home directory
   map<string, string> env = 7;      // Extra env vars inside the container
   string entrypoint = 8;            // Override the container entrypoint
-  bool remap_root = 9;              // Remap the user to root inside the container
+  bool remap_root = 9;              // Remap the user to root inside the container; not yet implemented, rejected at submission
 }
 
 message RunStepResponse {
