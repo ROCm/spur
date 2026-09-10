@@ -53,6 +53,15 @@ pub fn resolve_unix_credentials(user: &str) -> Result<(u32, u32), AuthError> {
     }
 }
 
+/// Reverse-resolve a UID to its username via NSS. `None` when the UID has no
+/// passwd entry, mirroring how Slurm's `uid_to_string` falls back for display.
+pub fn username_for_uid(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+}
+
 /// Authenticated identity extracted from a token or peer credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -346,6 +355,13 @@ mod tests {
         assert_eq!(id.user, "alice");
         assert_eq!(id.uid, 1000);
         assert!(!id.is_admin);
+    }
+
+    #[test]
+    fn username_for_uid_is_none_for_unknown_uid() {
+        // A uid with no passwd entry resolves to None, mirroring how Slurm's
+        // display falls back when reason_uid can't be named.
+        assert_eq!(username_for_uid(u32::MAX), None);
     }
 
     #[test]

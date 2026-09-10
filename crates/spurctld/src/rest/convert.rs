@@ -48,6 +48,8 @@ pub fn node_to_json(
         "name": node.name,
         "state": node.state.display(),
         "reason": node.state_reason,
+        "reason_uid": node.reason_uid,
+        "reason_time": node.reason_time.map(|t| t.to_rfc3339()),
         "partitions": node.partitions,
         "cpus": node.total_resources.cpus,
         "alloc_cpus": node.alloc_resources.cpus,

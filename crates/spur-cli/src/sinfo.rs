@@ -41,6 +41,10 @@ pub struct SinfoArgs {
     #[arg(short = 'N', long)]
     pub node_oriented: bool,
 
+    /// List reasons nodes are down, drained, draining, or in error state
+    #[arg(short = 'R', long = "list-reasons")]
+    pub list_reasons: bool,
+
     /// Don't print header
     #[arg(short = 'h', long)]
     pub noheader: bool,
@@ -71,6 +75,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let fmt = if let Some(ref f) = args.format {
         f.clone()
+    } else if args.list_reasons {
+        if args.long {
+            format_engine::SINFO_LIST_REASONS_LONG_FORMAT.to_string()
+        } else {
+            format_engine::SINFO_LIST_REASONS_FORMAT.to_string()
+        }
     } else if args.long {
         "%#P %5a %.10l %.4D %.6t %.8c %.8m %N".to_string()
     } else if args.node_oriented {
@@ -111,7 +121,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if !args.noheader {
         println!("{}", format_engine::format_header(&fields));
     }
-    for line in render_sinfo_output(&fields, &partitions, &nodes, args.node_oriented) {
+
+    let lines = if args.list_reasons {
+        render_list_reasons(&fields, &nodes)
+    } else {
+        render_sinfo_output(&fields, &partitions, &nodes, args.node_oriented)
+    };
+    for line in lines {
         println!("{}", line);
     }
 
@@ -160,11 +176,14 @@ fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::NodeState>> {
     Ok(states)
 }
 
-fn group_nodes_by_display_state<'a>(nodes: &[&'a NodeInfo]) -> Vec<(String, Vec<&'a NodeInfo>)> {
+/// Group nodes by an arbitrary string key, returning groups sorted by key.
+fn group_nodes_by<'a>(
+    nodes: &[&'a NodeInfo],
+    key_fn: impl Fn(&NodeInfo) -> String,
+) -> Vec<(String, Vec<&'a NodeInfo>)> {
     let mut groups: BTreeMap<String, Vec<&'a NodeInfo>> = BTreeMap::new();
     for node in nodes {
-        let key = effective_state_str(node);
-        groups.entry(key).or_default().push(node);
+        groups.entry(key_fn(node)).or_default().push(node);
     }
     groups.into_iter().collect()
 }
@@ -198,7 +217,7 @@ fn render_sinfo_output(
                 .iter()
                 .filter(|n| n.partitions.contains(&part.name))
                 .collect();
-            let state_groups = group_nodes_by_display_state(&part_nodes);
+            let state_groups = group_nodes_by(&part_nodes, effective_state_str);
 
             if state_groups.is_empty() {
                 let row = format_engine::format_row(fields, &|spec| {
@@ -217,6 +236,39 @@ fn render_sinfo_output(
     }
 
     lines
+}
+
+/// Render the `-R` / `--list-reasons` view: nodes in an unavailable state,
+/// grouped by their admin reason, one row per reason with a compressed nodelist.
+fn render_list_reasons(fields: &[format_engine::FormatToken], nodes: &[NodeInfo]) -> Vec<String> {
+    let unavailable: Vec<&NodeInfo> = nodes
+        .iter()
+        .filter(|n| {
+            spur_core::node::NodeState::from_proto_i32(n.state)
+                .map(|s| s.is_unavailable())
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Slurm splits list-reason rows when reason, setter uid, or set-time differ.
+    // Effective state joins the key too: admin-hold precedence keeps a node's
+    // reason/uid/time when it later goes Down, so a still-drained peer with
+    // identical attribution must not share a row (which would misreport the
+    // `-R -l` STATE column). State is last so reason stays the primary sort key.
+    group_nodes_by(&unavailable, |n| {
+        let ts = n.reason_time.as_ref().map(|t| t.seconds).unwrap_or(0);
+        format!(
+            "{}\u{1}{:?}\u{1}{ts}\u{1}{}",
+            n.state_reason,
+            n.reason_uid,
+            effective_state_str(n)
+        )
+    })
+    .iter()
+    .map(|(_, group_nodes)| {
+        format_engine::format_row(fields, &|spec| resolve_list_reason_field(group_nodes, spec))
+    })
+    .collect()
 }
 
 fn resolve_node_field(
@@ -280,11 +332,48 @@ fn resolve_node_field(
     }
 }
 
+/// Fields resolvable from a group of nodes alone (no partition context):
+/// the group's shared display state and its nodelist rendering. Returns `None`
+/// for specs that need more than the node group.
+fn resolve_node_group_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) -> Option<String> {
+    match spec {
+        't' | 'T' => Some(if nodes.is_empty() {
+            "n/a".into()
+        } else {
+            effective_state_str(nodes[0])
+        }),
+        'N' => {
+            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            Some(spur_core::hostlist::compress(&names))
+        }
+        'n' => {
+            // Expanded form of the same sorted hostlist as `%N`, so `%n` and
+            // `%N` stay consistent (Slurm derives both from one sorted list).
+            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            let compressed = spur_core::hostlist::compress(&names);
+            Some(
+                spur_core::hostlist::expand(&compressed)
+                    .unwrap_or_else(|_| {
+                        let mut fallback = names;
+                        fallback.sort();
+                        fallback.dedup();
+                        fallback
+                    })
+                    .join(","),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn resolve_partition_field(
     part: &spur_proto::proto::PartitionInfo,
     nodes: &[&spur_proto::proto::NodeInfo],
     spec: char,
 ) -> String {
+    if let Some(v) = resolve_node_group_field(nodes, spec) {
+        return v;
+    }
     match spec {
         'P' | 'R' => {
             if part.is_default {
@@ -302,32 +391,31 @@ fn resolve_partition_field(
             }
         }
         'D' => nodes.len().to_string(),
-        't' | 'T' => {
-            if nodes.is_empty() {
-                "n/a".into()
-            } else {
-                effective_state_str(nodes[0])
-            }
-        }
-        'N' => {
-            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
-            spur_core::hostlist::compress(&names)
-        }
-        'n' => {
-            // Expanded form of the same sorted hostlist as `%N`, so `%n` and
-            // `%N` stay consistent (Slurm derives both from one sorted list).
-            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
-            let compressed = spur_core::hostlist::compress(&names);
-            spur_core::hostlist::expand(&compressed)
-                .unwrap_or_else(|_| {
-                    let mut fallback = names;
-                    fallback.sort();
-                    fallback.dedup();
-                    fallback
-                })
-                .join(",")
-        }
         'c' => part.total_cpus.to_string(),
+        _ => "?".into(),
+    }
+}
+
+/// Resolver for the `-R` / `--list-reasons` view. Delegates nodelist and state
+/// specs to [`resolve_node_group_field`] and resolves the reason (`%E`), setter
+/// user (`%u`/`%U`), and set-time (`%H`) from the group's first node.
+fn resolve_list_reason_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) -> String {
+    if let Some(v) = resolve_node_group_field(nodes, spec) {
+        return v;
+    }
+    let first = nodes.first();
+    match spec {
+        'E' => first.map(|n| n.state_reason.clone()).unwrap_or_default(),
+        // %u: user name of who set the reason.
+        'u' => crate::reason::reason_user(first.and_then(|n| n.reason_uid), false),
+        // %U: user name and uid, e.g. `root(0)`; `Unknown(<uid>)` when the uid
+        // has no passwd entry, `Unknown` when no uid was recorded.
+        'U' => crate::reason::reason_user(first.and_then(|n| n.reason_uid), true),
+        // %H: timestamp of the reason.
+        'H' => match first.and_then(|n| n.reason_time.as_ref()) {
+            Some(ts) => crate::timefmt::format_timestamp(Some(ts)),
+            None => "Unknown".into(),
+        },
         _ => "?".into(),
     }
 }
@@ -631,7 +719,7 @@ mod tests {
             make_node("n4", NodeState::NodeDrain, "p"),
         ];
         let refs: Vec<&NodeInfo> = nodes.iter().collect();
-        let groups = group_nodes_by_display_state(&refs);
+        let groups = group_nodes_by(&refs, effective_state_str);
 
         assert_eq!(groups.len(), 3);
         // BTreeMap ordering: alphabetical — "down", "drain", "idle"
@@ -651,7 +739,7 @@ mod tests {
             make_node("n3", NodeState::NodeIdle, "p"),
         ];
         let refs: Vec<&NodeInfo> = nodes.iter().collect();
-        let groups = group_nodes_by_display_state(&refs);
+        let groups = group_nodes_by(&refs, effective_state_str);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, "idle");
@@ -660,7 +748,7 @@ mod tests {
 
     #[test]
     fn test_group_nodes_by_display_state_empty() {
-        let groups = group_nodes_by_display_state(&[]);
+        let groups = group_nodes_by(&[], effective_state_str);
         assert!(groups.is_empty());
     }
 
@@ -881,7 +969,7 @@ mod tests {
             make_reserved_node("n3", NodeState::NodeIdle, "p", "maint"),
         ];
         let refs: Vec<&NodeInfo> = nodes.iter().collect();
-        let groups = group_nodes_by_display_state(&refs);
+        let groups = group_nodes_by(&refs, effective_state_str);
 
         assert_eq!(groups.len(), 2, "expected idle + resv groups: {groups:?}");
         assert_eq!(groups[0].0, "idle");
@@ -897,7 +985,7 @@ mod tests {
             make_reserved_node("n2", NodeState::NodeAllocated, "p", "maint"),
         ];
         let refs: Vec<&NodeInfo> = nodes.iter().collect();
-        let groups = group_nodes_by_display_state(&refs);
+        let groups = group_nodes_by(&refs, effective_state_str);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, "alloc");
@@ -1022,5 +1110,201 @@ mod tests {
         let lines = render_sinfo_output(&fields, &partitions, &nodes, true);
         assert_eq!(lines.len(), 1, "orphan node still gets one row");
         assert!(lines[0].contains("orphan"));
+    }
+
+    // --- list-reasons (-R) tests ---
+
+    fn make_reason_node(name: &str, state: NodeState, reason: &str) -> NodeInfo {
+        let mut n = make_node(name, state, "p");
+        n.state_reason = reason.into();
+        n
+    }
+
+    fn make_reason_node_attr(
+        name: &str,
+        state: NodeState,
+        reason: &str,
+        uid: Option<u32>,
+        time_secs: Option<i64>,
+    ) -> NodeInfo {
+        let mut n = make_reason_node(name, state, reason);
+        n.reason_uid = uid;
+        n.reason_time = time_secs.map(|seconds| prost_types::Timestamp { seconds, nanos: 0 });
+        n
+    }
+
+    fn list_reasons_fields() -> Vec<format_engine::FormatToken> {
+        format_engine::parse_format(
+            format_engine::SINFO_LIST_REASONS_FORMAT,
+            &format_engine::sinfo_header,
+        )
+    }
+
+    #[test]
+    fn list_reasons_flag_parses() {
+        assert!(parse_sinfo_args(&["sinfo", "-R"]).list_reasons);
+        assert!(parse_sinfo_args(&["sinfo", "--list-reasons"]).list_reasons);
+    }
+
+    #[test]
+    fn list_reasons_excludes_available_nodes() {
+        let nodes = vec![
+            make_reason_node("n1", NodeState::NodeIdle, ""),
+            make_reason_node("n2", NodeState::NodeAllocated, ""),
+            make_reason_node("n3", NodeState::NodeDown, "hw fault"),
+        ];
+        let lines = render_list_reasons(&list_reasons_fields(), &nodes);
+        assert_eq!(lines.len(), 1, "only the down node is listed: {lines:?}");
+        assert!(lines[0].contains("hw fault"));
+        assert!(lines[0].contains("n3"));
+        assert!(!lines[0].contains("n1"));
+    }
+
+    #[test]
+    fn list_reasons_groups_shared_reason_into_one_row() {
+        let nodes = vec![
+            make_reason_node("n1", NodeState::NodeDown, "Memory errors"),
+            make_reason_node("n5", NodeState::NodeDown, "Memory errors"),
+        ];
+        let lines = render_list_reasons(&list_reasons_fields(), &nodes);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Memory errors"));
+        assert!(
+            lines[0].contains("n[1,5]"),
+            "shared reason compresses the nodelist: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn list_reasons_distinct_reasons_are_separate_rows_sorted_by_reason() {
+        let nodes = vec![
+            make_reason_node("n1", NodeState::NodeDrain, "maintenance"),
+            make_reason_node("n2", NodeState::NodeDown, "Memory errors"),
+        ];
+        let lines = render_list_reasons(&list_reasons_fields(), &nodes);
+        assert_eq!(lines.len(), 2);
+        // BTreeMap ordering is by byte value: 'M' (77) sorts before 'm' (109).
+        assert!(lines[0].contains("Memory errors"), "{lines:?}");
+        assert!(lines[1].contains("maintenance"), "{lines:?}");
+    }
+
+    #[test]
+    fn list_reasons_header_and_unknown_when_uid_time_unset() {
+        let fields = list_reasons_fields();
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("REASON"), "{header}");
+        assert!(header.contains("USER"), "{header}");
+        assert!(header.contains("TIMESTAMP"), "{header}");
+        assert!(header.contains("NODELIST"), "{header}");
+
+        // No reason_uid / reason_time recorded (e.g. a pre-upgrade node): USER
+        // and TIMESTAMP fall back to "Unknown".
+        let nodes = vec![make_reason_node("n1", NodeState::NodeDown, "hw fault")];
+        let lines = render_list_reasons(&fields, &nodes);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("hw fault"));
+        assert_eq!(
+            lines[0].matches("Unknown").count(),
+            2,
+            "USER and TIMESTAMP both Unknown: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn list_reasons_renders_uid_and_time_when_set() {
+        // %U carries the uid in parens and %H the Slurm-form timestamp. The
+        // username half of %U depends on NSS, so assert only the uid/time parts.
+        let fields = format_engine::parse_format("%E|%U|%H", &format_engine::sinfo_header);
+        let nodes = vec![make_reason_node_attr(
+            "n1",
+            NodeState::NodeDown,
+            "hw fault",
+            Some(0),
+            Some(1_756_281_787),
+        )];
+        let lines = render_list_reasons(&fields, &nodes);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("(0)"), "%U shows uid: {}", lines[0]);
+        assert!(
+            lines[0].contains("2025-08-27T08:03:07"),
+            "%H shows the set-time: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn list_reasons_splits_rows_on_differing_uid() {
+        // Same reason text but different setters: Slurm emits separate rows.
+        let nodes = vec![
+            make_reason_node_attr("n1", NodeState::NodeDown, "hw fault", Some(1), Some(100)),
+            make_reason_node_attr("n2", NodeState::NodeDown, "hw fault", Some(2), Some(100)),
+        ];
+        let lines = render_list_reasons(&list_reasons_fields(), &nodes);
+        assert_eq!(lines.len(), 2, "differing uid splits the group: {lines:?}");
+    }
+
+    #[test]
+    fn list_reasons_splits_rows_on_differing_state_same_attribution() {
+        // Admin-hold precedence keeps a node's reason/uid/time when it later
+        // goes Down. A still-drained peer with identical attribution must land
+        // in its own row, or `-R -l` would misreport one node's STATE.
+        let fields = format_engine::parse_format(
+            format_engine::SINFO_LIST_REASONS_LONG_FORMAT,
+            &format_engine::sinfo_header,
+        );
+        let nodes = vec![
+            make_reason_node_attr("n1", NodeState::NodeDrain, "hw swap", Some(1000), Some(100)),
+            make_reason_node_attr("n2", NodeState::NodeDown, "hw swap", Some(1000), Some(100)),
+        ];
+        let lines = render_list_reasons(&fields, &nodes);
+        assert_eq!(
+            lines.len(),
+            2,
+            "differing state splits the group: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("drain") && l.contains("n1")),
+            "drained node keeps its state: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("down") && l.contains("n2")),
+            "downed node keeps its state: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn list_reasons_long_adds_state_column() {
+        let fields = format_engine::parse_format(
+            format_engine::SINFO_LIST_REASONS_LONG_FORMAT,
+            &format_engine::sinfo_header,
+        );
+        let nodes = vec![make_reason_node("n1", NodeState::NodeDrain, "maintenance")];
+        let lines = render_list_reasons(&fields, &nodes);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("maintenance"));
+        assert!(
+            lines[0].contains("drain"),
+            "long -R includes the STATE column: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn list_reasons_no_unavailable_nodes_yields_no_rows() {
+        // Mirrors `sinfo -R -t idle`: the state filter leaves only available
+        // nodes, so list-reasons produces nothing.
+        let nodes = vec![
+            make_reason_node("n1", NodeState::NodeIdle, ""),
+            make_reason_node("n2", NodeState::NodeMixed, ""),
+        ];
+        let lines = render_list_reasons(&list_reasons_fields(), &nodes);
+        assert!(
+            lines.is_empty(),
+            "no unavailable nodes -> no rows: {lines:?}"
+        );
     }
 }

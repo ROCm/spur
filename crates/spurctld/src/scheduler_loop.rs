@@ -1839,7 +1839,7 @@ async fn confirm_dispatch_on_nodes(
     // with the hold that stops the job walking the cluster.
     for (node_name, reason) in &prolog_failed {
         warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
-        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone())) {
+        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone()), Some(0)) {
             error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
         }
     }
@@ -2215,6 +2215,7 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 &node.name,
                 spur_core::node::NodeState::Suspended,
                 Some("Power saving".into()),
+                Some(0),
             );
             if let Some(ref cmd) = cluster.config().power.suspend_command {
                 spawn_power_command(&cmd.replace("{node}", &node.name), &node.name, "suspend");
@@ -2229,8 +2230,12 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     continue;
                 }
                 info!(node = %node.name, "resuming suspended node for pending jobs");
-                let _ =
-                    cluster.update_node_state(&node.name, spur_core::node::NodeState::Idle, None);
+                let _ = cluster.update_node_state(
+                    &node.name,
+                    spur_core::node::NodeState::Idle,
+                    None,
+                    None,
+                );
                 if let Some(ref cmd) = cluster.config().power.resume_command {
                     spawn_power_command(&cmd.replace("{node}", &node.name), &node.name, "resume");
                 }

@@ -371,6 +371,12 @@ pub const SQUEUE_DEFAULT_FORMAT: &str = "%.18i %.9P %.8j %.8u %.2t %10M %6D %R";
 /// Default sinfo format string.
 pub const SINFO_DEFAULT_FORMAT: &str = "%#P %5a %.10l %.6D %.6t %N";
 
+/// sinfo `-R` / `--list-reasons` format string (matches Slurm).
+pub const SINFO_LIST_REASONS_FORMAT: &str = "%20E %9u %19H %N";
+
+/// sinfo `-R -l` / `--long --list-reasons` format string (matches Slurm).
+pub const SINFO_LIST_REASONS_LONG_FORMAT: &str = "%20E %12U %19H %6t %N";
+
 /// Header names for squeue format specifiers.
 pub fn squeue_header(spec: char) -> &'static str {
     match spec {
@@ -425,6 +431,9 @@ pub fn sinfo_header(spec: char) -> &'static str {
         'n' => "HOSTNAMES",
         'O' => "CPU_LOAD",
         'e' => "FREE_MEM",
+        'E' => "REASON",
+        'H' => "TIMESTAMP",
+        'u' | 'U' => "USER",
         _ => "?",
     }
 }

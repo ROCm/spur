@@ -326,6 +326,12 @@ message NodeInfo {
   // reservation for a specific pending job (0 = no planned reservation).
   uint32 planned_job_id = 54;
   google.protobuf.Timestamp planned_start = 55;
+
+  // Who set state_reason (Slurm reason_uid) and when (reason_time). `reason_uid`
+  // is absent when no reason is set or the setter was unauthenticated; uid 0
+  // marks a system/automatic reason.
+  optional uint32 reason_uid = 56;
+  google.protobuf.Timestamp reason_time = 57;
 }
 
 message PartitionInfo {

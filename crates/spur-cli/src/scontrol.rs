@@ -603,11 +603,20 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 let total = node.total_resources.as_ref();
                 let alloc = node.alloc_resources.as_ref();
                 println!("NodeName={}", node.name);
-                println!(
-                    "   State={} Reason={}",
-                    node_state_display(&node),
-                    node.state_reason
-                );
+                // Append `[user@time]` to the reason when a set-time is recorded,
+                // matching Slurm's `scontrol show node` format.
+                let reason = match (node.reason_time.as_ref(), node.state_reason.is_empty()) {
+                    (Some(t), false) => {
+                        let user = crate::reason::reason_user(node.reason_uid, false);
+                        format!(
+                            "{} [{user}@{}]",
+                            node.state_reason,
+                            crate::timefmt::format_timestamp(Some(t))
+                        )
+                    }
+                    _ => node.state_reason.clone(),
+                };
+                println!("   State={} Reason={}", node_state_display(&node), reason);
                 if !node.partitions.is_empty() {
                     println!("   Partitions={}", node.partitions.join(","));
                 }

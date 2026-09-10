@@ -1364,12 +1364,13 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "update node")?;
 
+        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
         let req = request.into_inner();
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
                 .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
             self.cluster
-                .update_node_state(&req.name, node_state, req.reason)
+                .update_node_state(&req.name, node_state, req.reason, reason_uid)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
         if !req.labels.is_empty() || !req.remove_labels.is_empty() {
@@ -1397,6 +1398,7 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
         let req = request.into_inner();
         let reason = if req.reason.is_empty() {
             None
@@ -1408,7 +1410,7 @@ impl SlurmController for ControllerService {
         }
         let (actual_state, running_jobs) = self
             .cluster
-            .drain_node(&req.name, reason)
+            .drain_node(&req.name, reason, reason_uid)
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(spur_proto::proto::DrainNodeResponse {
             actual_state: actual_state.to_string(),
@@ -1800,6 +1802,9 @@ impl SlurmController for ControllerService {
                 &req.reporting_node,
                 spur_core::node::NodeState::Drain,
                 Some(req.drain_reason),
+                // Unauthenticated RPC with client-supplied node/reason; render
+                // Unknown rather than attributing to root (uid 0).
+                None,
             ) {
                 warn!(
                     node = %req.reporting_node,
@@ -4404,6 +4409,8 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         features: node.features.clone(),
         planned_job_id: 0,
         planned_start: None,
+        reason_uid: node.reason_uid,
+        reason_time: node.reason_time.map(datetime_to_proto),
     }
 }
 
