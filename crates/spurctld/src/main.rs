@@ -401,5 +401,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         rlimits: Default::default(),
         cgroup: Default::default(),
         mpi: Default::default(),
+        health: Default::default(),
     }
 }

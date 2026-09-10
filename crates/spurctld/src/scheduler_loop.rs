@@ -142,6 +142,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.enforce_reservation_end_times();
         cluster.evict_expired_terminal_jobs();
 
+        // Submit due node health checks as exclusive whole-node jobs and enforce
+        // the starvation drain/resume. Runs leader-only, alongside the other
+        // per-tick maintenance.
+        cluster.run_node_health_pass();
+
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
@@ -3453,6 +3458,7 @@ mod tests {
                 rlimits: Default::default(),
                 cgroup: Default::default(),
                 mpi: Default::default(),
+                health: Default::default(),
             }
         }
 

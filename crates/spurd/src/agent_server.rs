@@ -1339,8 +1339,11 @@ impl AgentService {
                     .map(|h| h.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "localhost".into());
 
-                let mut drain_jobs: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
+                // job_id -> drain reason, piggybacked on each job's completion
+                // report so the node goes idle-and-drained in one message (no
+                // window where a bad node looks schedulable).
+                let mut drain_jobs: std::collections::HashMap<u32, String> =
+                    std::collections::HashMap::new();
 
                 // Run epilog hook for completed jobs
                 if let Some(ref epilog_script) = hooks.epilog {
@@ -1363,7 +1366,7 @@ impl AgentService {
                                 error = %e,
                                 "epilog hook failed — requesting node drain"
                             );
-                            drain_jobs.insert(c.job_id);
+                            drain_jobs.insert(c.job_id, "epilog script failed".into());
                         }
                     }
                 }
@@ -1388,13 +1391,9 @@ impl AgentService {
                 }
 
                 for c in &completed {
-                    let drain = if drain_jobs.contains(&c.job_id) {
-                        Some(DrainRequest {
-                            reason: "epilog script failed".into(),
-                        })
-                    } else {
-                        None
-                    };
+                    let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
+                        reason: reason.clone(),
+                    });
                     report_completion(
                         &controller_addr,
                         c.job_id,
