@@ -91,7 +91,11 @@ impl VirtualAgent {
                 let mut items = list.items.into_iter();
                 match (items.next(), items.next()) {
                     (None, _) => Err(Status::not_found(format!(
-                        "spur.amd.com/job-id={job_id} label not yet visible"
+                        "no SpurJob carries the label spur.amd.com/job-id={job_id}. In Pod mode \
+                         the operator makes Pods only for a SpurJob custom resource, so a job \
+                         submitted with the CLI (sbatch, spur submit) has nothing to launch. \
+                         Submit it with `kubectl apply` of a SpurJob instead. If this job DID \
+                         come from a SpurJob, the label is not visible yet and this is retried."
                     ))),
                     (Some(job), None) => Ok(job),
                     (Some(_), Some(_)) => Err(Status::failed_precondition(format!(
@@ -167,6 +171,13 @@ impl SlurmAgent for VirtualAgent {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+
+        // Two nodes with one sanitized name would share a Pod name and a peer DNS
+        // name; the second Pod create returns 409 and the job hangs on a missing
+        // peer. Refuse the whole launch instead of creating a partial job.
+        if let Some(collision) = sanitized_collision(&split_nodelist(&spec.nodelist)) {
+            return Err(Status::invalid_argument(collision.to_string()));
+        }
 
         // Pod name includes target_node to avoid conflicts for multi-node jobs
         let pod_name = if target_node.is_empty() {
@@ -249,8 +260,14 @@ impl SlurmAgent for VirtualAgent {
 
         senv.set("SPUR_TASK_OFFSET", req.task_offset);
         senv.set("SPUR_NODE_RANK", node_rank);
-        if !peer_nodes.is_empty() {
-            senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
+        // The controller sends agent addresses in `peer_nodes`. In Pod mode every
+        // node answers on the one operator address, so that list is the same
+        // address repeated and no workload can reach a peer with it. The Pods of a
+        // multi-node job are reachable under the headless Service instead, because
+        // each Pod takes its target node as its hostname.
+        let peer_dns = headless_peer_dns(&spec.nodelist, job_id, &ns);
+        if !peer_dns.is_empty() {
+            senv.set("SPUR_PEER_NODES", peer_dns.join(","));
         }
         if !target_node.is_empty() {
             senv.set("SPUR_TARGET_NODE", &target_node);
@@ -439,7 +456,7 @@ impl SlurmAgent for VirtualAgent {
         let (hostname, subdomain) = if num_peers > 1 && !target_node.is_empty() {
             (
                 Some(sanitize_k8s_name(&target_node)),
-                Some(format!("spur-job-{}", job_id)),
+                Some(job_service_name(job_id)),
             )
         } else {
             (None, None)
@@ -565,7 +582,7 @@ impl SlurmAgent for VirtualAgent {
 
         // Also clean up the headless service if it exists
         let services: Api<Service> = Api::namespaced(self.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_service_name(job_id);
         match services.delete(&svc_name, &DeleteParams::default()).await {
             Ok(_) => debug!(job_id, "deleted headless Service"),
             Err(kube::Error::Api(e)) if e.code == 404 => {}
@@ -847,7 +864,7 @@ impl VirtualAgent {
         namespace: &str,
     ) -> Result<(), kube::Error> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_service_name(job_id);
 
         let selector = BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
 
@@ -953,6 +970,85 @@ fn sanitize_k8s_name(s: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+/// The headless Service of a job. The Pod `subdomain` and the peer DNS names
+/// only resolve while they use this exact name.
+fn job_service_name(job_id: u32) -> String {
+    format!("spur-job-{job_id}")
+}
+
+/// The node names of a comma-separated nodelist, trimmed, empty segments dropped.
+/// `launch_job` and `headless_peer_dns` must read the list the same way.
+fn split_nodelist(nodelist: &str) -> Vec<&str> {
+    nodelist
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Two node names that `sanitize_k8s_name` maps to one Kubernetes name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeNameCollision {
+    first: String,
+    second: String,
+    sanitized: String,
+}
+
+impl std::fmt::Display for NodeNameCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node names {:?} and {:?} both sanitize to {:?}",
+            self.first, self.second, self.sanitized
+        )
+    }
+}
+
+/// The first pair of nodes whose sanitized names are equal. Such a pair would
+/// share a Pod name and a peer DNS name, so the launch must be refused.
+fn sanitized_collision(nodes: &[&str]) -> Option<NodeNameCollision> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for node in nodes {
+        let sanitized = sanitize_k8s_name(node);
+        let Some(first) = seen.insert(sanitized.clone(), node) else {
+            continue;
+        };
+        return Some(NodeNameCollision {
+            first: first.to_string(),
+            second: node.to_string(),
+            sanitized,
+        });
+    }
+    None
+}
+
+/// The DNS names under which the Pods of a multi-node job reach each other.
+///
+/// `launch_job` gives each Pod `hostname = sanitize_k8s_name(target_node)` and
+/// `subdomain = job_service_name(id)`, and `ensure_headless_service` publishes
+/// that Service, so every peer answers at
+/// `<hostname>.<service>.<namespace>.svc.cluster.local`. The order follows
+/// the nodelist, so index N is the peer whose SPUR_NODE_RANK is N.
+///
+/// A single node job gets no headless Service and therefore no name to return.
+fn headless_peer_dns(nodelist: &str, job_id: u32, namespace: &str) -> Vec<String> {
+    let nodes = split_nodelist(nodelist);
+    if nodes.len() < 2 {
+        return Vec::new();
+    }
+    nodes
+        .iter()
+        .map(|n| {
+            format!(
+                "{}.{}.{}.svc.cluster.local",
+                sanitize_k8s_name(n),
+                job_service_name(job_id),
+                namespace
+            )
+        })
+        .collect()
 }
 
 /// Determine the K8s device plugin resource key based on GPU type.
@@ -1281,5 +1377,88 @@ mod tests {
         assert_eq!(gpu_request_to_gres(8, Some("mi300x")), "gpu:mi300x:8");
         assert_eq!(gpu_request_to_gres(4, Some("mi250x")), "gpu:mi250x:4");
         assert_eq!(gpu_request_to_gres(1, Some("gfx942")), "gpu:gfx942:1");
+    }
+}
+
+#[cfg(test)]
+mod peer_dns_tests {
+    use super::{headless_peer_dns, sanitized_collision, split_nodelist, NodeNameCollision};
+
+    #[test]
+    fn dotted_and_dashed_names_collide_after_sanitizing() {
+        let collision = sanitized_collision(&["node.a", "node-b", "node-a"]);
+        assert_eq!(
+            collision,
+            Some(NodeNameCollision {
+                first: "node.a".to_string(),
+                second: "node-a".to_string(),
+                sanitized: "node-a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn distinct_names_do_not_collide() {
+        assert_eq!(sanitized_collision(&["node-a", "node-b", "node-c"]), None);
+    }
+
+    #[test]
+    fn a_single_name_cannot_collide() {
+        assert_eq!(sanitized_collision(&["node.a"]), None);
+        assert_eq!(sanitized_collision(&[]), None);
+    }
+
+    #[test]
+    fn collision_message_names_both_nodes_and_the_shared_name() {
+        let collision = sanitized_collision(&["node.a", "node-a"]).expect("collision");
+        assert_eq!(
+            collision.to_string(),
+            r#"node names "node.a" and "node-a" both sanitize to "node-a""#
+        );
+    }
+
+    #[test]
+    fn collision_check_reads_the_nodelist_like_peer_dns() {
+        let nodes = split_nodelist(" node.a , node-a, ");
+        assert_eq!(nodes, vec!["node.a", "node-a"]);
+        assert!(sanitized_collision(&nodes).is_some());
+        assert!(sanitized_collision(&split_nodelist(" node-a , ")).is_none());
+    }
+
+    #[test]
+    fn multi_node_job_gets_one_resolvable_name_per_node_in_nodelist_order() {
+        let out = headless_peer_dns("node-a,node-b,node-c", 7, "spur");
+        assert_eq!(
+            out,
+            vec![
+                "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-c.spur-job-7.spur.svc.cluster.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_node_job_gets_nothing_because_it_has_no_headless_service() {
+        assert!(headless_peer_dns("node-a", 7, "spur").is_empty());
+        assert!(headless_peer_dns("", 7, "spur").is_empty());
+    }
+
+    #[test]
+    fn node_names_are_sanitized_the_same_way_as_the_pod_hostname() {
+        let out = headless_peer_dns("Node_A.example,node-b", 3, "ns");
+        assert_eq!(out[0], "node-a-example.spur-job-3.ns.svc.cluster.local");
+    }
+
+    #[test]
+    fn segments_are_trimmed_and_empty_ones_dropped() {
+        let out = headless_peer_dns(" node-a , node-b, ", 7, "spur");
+        assert_eq!(
+            out,
+            vec![
+                "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
+            ]
+        );
     }
 }
