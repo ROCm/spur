@@ -3,6 +3,7 @@
 
 mod agent;
 mod auth_middleware;
+mod controller;
 mod crd;
 mod health;
 mod heartbeat;
@@ -258,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run an async task with exponential backoff retry on failure (issue #52).
+/// Run an async task with exponential backoff retry on failure.
 ///
 /// If the task exits with an error, it is restarted after a delay that doubles
 /// each time (1s → 2s → 4s → ... → 60s max). On success the backoff resets.

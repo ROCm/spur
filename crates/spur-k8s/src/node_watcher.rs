@@ -6,17 +6,20 @@ use std::hash::{Hash, Hasher};
 use std::pin::pin;
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures_util::TryStreamExt;
 use k8s_openapi::api::core::v1::Node as K8sNode;
 use kube::api::Api;
 use kube::runtime::watcher::{self, Event};
 use kube::Client;
 use tonic::transport::Channel;
+use tonic::Status;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{NodeState, RegisterAgentRequest, ResourceSet, UpdateNodeRequest};
 
+use crate::controller::{connect, is_transport_error};
 use crate::heartbeat::HeartbeatManager;
 
 /// Tracks the taint state of a K8s node and whether spurctld has been notified.
@@ -105,7 +108,7 @@ pub async fn run(
 
     info!(selector = %label_selector, "starting K8s node watcher");
 
-    let mut ctrl_client = connect_controller(&controller_addr).await?;
+    let mut ctrl_client = connect(&controller_addr).await?;
     let mut fingerprints: HashMap<String, u64> = HashMap::new();
     let mut taint_states: HashMap<String, NodeTaintState> = HashMap::new();
 
@@ -122,8 +125,6 @@ pub async fn run(
                 let fp = fingerprint(&resources);
 
                 if fingerprints.get(&name) != Some(&fp) {
-                    fingerprints.insert(name.clone(), fp);
-
                     info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
@@ -138,14 +139,19 @@ pub async fn run(
                     };
 
                     match ctrl_client.register_agent(req.clone()).await {
-                        Ok(_) => {
-                            debug!(node = %name, "K8s node registered with spurctld");
-                            hb.track(name.clone(), req).await;
+                        Ok(_) => {}
+                        Err(status) if registration_failure_restarts_watcher(&status) => {
+                            return Err(status).context(format!("register K8s node {name}"));
                         }
-                        Err(e) => {
-                            error!(node = %name, error = %e, "failed to register K8s node")
+                        Err(status) => {
+                            // The fingerprint stays unset, so the node's next event retries.
+                            error!(node = %name, error = %status, "spurctld refused the K8s node registration");
+                            continue;
                         }
                     }
+                    debug!(node = %name, "K8s node registered with spurctld");
+                    hb.track(name.clone(), req).await;
+                    fingerprints.insert(name.clone(), fp);
                 }
 
                 let entry = taint_states.entry(name.clone()).or_insert(NodeTaintState {
@@ -191,6 +197,14 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// A transport error means the controller may be gone; ending the watcher lets
+/// its retry loop open a fresh channel and list every node again. Any other
+/// refusal, such as a missing admission token, would repeat on every restart
+/// and stop taint and drain sync for all nodes, so it is logged instead.
+fn registration_failure_restarts_watcher(status: &Status) -> bool {
+    is_transport_error(status)
 }
 
 /// Check if a K8s node has the not-ready taint.
@@ -286,19 +300,6 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
         gpus,
         generic: Default::default(),
     }
-}
-
-async fn connect_controller(addr: &str) -> anyhow::Result<SlurmControllerClient<Channel>> {
-    let url = if addr.starts_with("http") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    };
-    let client = SlurmControllerClient::connect(url)
-        .await?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
-    Ok(client)
 }
 
 #[cfg(test)]
@@ -760,5 +761,28 @@ mod tests {
     fn fingerprint_no_gpus() {
         let r = make_resources(4, 8000, 0);
         assert_eq!(fingerprint(&r), fingerprint(&r));
+    }
+
+    #[test]
+    fn a_transport_error_during_registration_restarts_the_watcher() {
+        assert!(registration_failure_restarts_watcher(&Status::unavailable(
+            "tcp connect error"
+        )));
+        assert!(registration_failure_restarts_watcher(&Status::cancelled(
+            "Timeout expired"
+        )));
+    }
+
+    #[test]
+    fn a_refused_registration_keeps_the_watcher_running() {
+        assert!(!registration_failure_restarts_watcher(
+            &Status::unauthenticated("admission token required")
+        ));
+        assert!(!registration_failure_restarts_watcher(
+            &Status::invalid_argument("bad resources")
+        ));
+        assert!(!registration_failure_restarts_watcher(
+            &Status::permission_denied("no")
+        ));
     }
 }

@@ -16,11 +16,10 @@ use kube::runtime::finalizer::{self, finalizer, Event as FinalizerEvent};
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::Client;
 use tokio::sync::Mutex;
-use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
+use crate::controller::ControllerClient;
 use crate::crd::{to_core_job_spec, SpurJob, SpurJobStatus};
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, GetJobRequest, ReportJobStatusRequest, SubmitJobRequest,
 };
@@ -51,7 +50,7 @@ pub enum ReconcileError {
 /// Shared state for the reconciler.
 pub struct JobControllerCtx {
     pub client: Client,
-    pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
+    pub ctrl_client: Mutex<ControllerClient>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
     /// Consecutive reconcile failures per SpurJob (keyed by [`failure_key`]),
@@ -211,8 +210,11 @@ async fn submit_to_controller(
 
     let mut ctrl = ctx.ctrl_client.lock().await;
     let job_id = match ctrl
-        .submit_job(SubmitJobRequest {
-            spec: Some(proto_spec),
+        .call(|mut c| async move {
+            c.submit_job(SubmitJobRequest {
+                spec: Some(proto_spec),
+            })
+            .await
         })
         .await
     {
@@ -296,7 +298,10 @@ async fn handle_job(
 
     let mut ctrl = ctx.ctrl_client.lock().await;
 
-    match ctrl.get_job(GetJobRequest { job_id }).await {
+    match ctrl
+        .call(|mut c| async move { c.get_job(GetJobRequest { job_id }).await })
+        .await
+    {
         Ok(resp) => {
             let info = resp.into_inner();
             let spur_state = proto_job_state_to_string(info.state);
@@ -347,13 +352,19 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     if let Some(job_id) = status.spur_job_id {
         if !is_terminal(&status.state) {
             let mut ctrl = ctx.ctrl_client.lock().await;
-            let _ = ctrl
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: String::new(),
+            if let Err(e) = ctrl
+                .call(|mut c| async move {
+                    c.cancel_job(CancelJobRequest {
+                        job_id,
+                        signal: 0,
+                        user: String::new(),
+                    })
+                    .await
                 })
-                .await;
+                .await
+            {
+                warn!(spurjob = %name, job_id, error = %e, "failed to cancel Spur job on deletion");
+            }
         }
 
         // Delete all Pods by label
@@ -392,19 +403,9 @@ pub async fn run(
     controller_addr: String,
     operator_namespace: String,
 ) -> anyhow::Result<()> {
-    let url = if controller_addr.starts_with("http") {
-        controller_addr
-    } else {
-        format!("http://{}", controller_addr)
-    };
-    let ctrl_client = SlurmControllerClient::connect(url)
-        .await?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
-
     let ctx = Arc::new(JobControllerCtx {
         client: client.clone(),
-        ctrl_client: Mutex::new(ctrl_client),
+        ctrl_client: Mutex::new(ControllerClient::new(&controller_addr)),
         pod_tracker: Mutex::new(HashMap::new()),
         failures: StdMutex::new(HashMap::new()),
     });
@@ -629,7 +630,10 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     // controller-side staleness check for this report.
                     run_attempt: 0,
                 };
-                if let Err(e) = ctrl.report_job_status(req).await {
+                if let Err(e) = ctrl
+                    .call(|mut c| async move { c.report_job_status(req).await })
+                    .await
+                {
                     error!(job_id, error = %e, "failed to report job status");
                 } else if report_state.is_terminal() {
                     ctx.pod_tracker.lock().await.remove(&job_id);
