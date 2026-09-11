@@ -13,11 +13,13 @@ use kube::api::Api;
 use kube::runtime::watcher::{self, Event};
 use kube::Client;
 use tonic::transport::Channel;
+use tonic::Status;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{NodeState, RegisterAgentRequest, ResourceSet, UpdateNodeRequest};
 
+use crate::controller::{connect, is_transport_error};
 use crate::heartbeat::HeartbeatManager;
 
 /// Tracks the taint state of a K8s node and whether spurctld has been notified.
@@ -106,7 +108,7 @@ pub async fn run(
 
     info!(selector = %label_selector, "starting K8s node watcher");
 
-    let mut ctrl_client = crate::controller::connect(&controller_addr).await?;
+    let mut ctrl_client = connect(&controller_addr).await?;
     let mut fingerprints: HashMap<String, u64> = HashMap::new();
     let mut taint_states: HashMap<String, NodeTaintState> = HashMap::new();
 
@@ -136,13 +138,17 @@ pub async fn run(
                         join_token: String::new(),
                     };
 
-                    // A refused registration ends the watcher. Its retry loop
-                    // restarts it and lists every node again, which is the only
-                    // way to try again before the node's next event.
-                    ctrl_client
-                        .register_agent(req.clone())
-                        .await
-                        .with_context(|| format!("register K8s node {name}"))?;
+                    match ctrl_client.register_agent(req.clone()).await {
+                        Ok(_) => {}
+                        Err(status) if registration_failure_restarts_watcher(&status) => {
+                            return Err(status).context(format!("register K8s node {name}"));
+                        }
+                        Err(status) => {
+                            // The fingerprint stays unset, so the node's next event retries.
+                            error!(node = %name, error = %status, "spurctld refused the K8s node registration");
+                            continue;
+                        }
+                    }
                     debug!(node = %name, "K8s node registered with spurctld");
                     hb.track(name.clone(), req).await;
                     fingerprints.insert(name.clone(), fp);
@@ -191,6 +197,14 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// A transport error means the controller may be gone; ending the watcher lets
+/// its retry loop open a fresh channel and list every node again. Any other
+/// refusal, such as a missing admission token, would repeat on every restart
+/// and stop taint and drain sync for all nodes, so it is logged instead.
+fn registration_failure_restarts_watcher(status: &Status) -> bool {
+    is_transport_error(status)
 }
 
 /// Check if a K8s node has the not-ready taint.
@@ -747,5 +761,28 @@ mod tests {
     fn fingerprint_no_gpus() {
         let r = make_resources(4, 8000, 0);
         assert_eq!(fingerprint(&r), fingerprint(&r));
+    }
+
+    #[test]
+    fn a_transport_error_during_registration_restarts_the_watcher() {
+        assert!(registration_failure_restarts_watcher(&Status::unavailable(
+            "tcp connect error"
+        )));
+        assert!(registration_failure_restarts_watcher(&Status::cancelled(
+            "Timeout expired"
+        )));
+    }
+
+    #[test]
+    fn a_refused_registration_keeps_the_watcher_running() {
+        assert!(!registration_failure_restarts_watcher(
+            &Status::unauthenticated("admission token required")
+        ));
+        assert!(!registration_failure_restarts_watcher(
+            &Status::invalid_argument("bad resources")
+        ));
+        assert!(!registration_failure_restarts_watcher(
+            &Status::permission_denied("no")
+        ));
     }
 }
