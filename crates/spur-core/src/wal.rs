@@ -948,6 +948,43 @@ mod deregistration_wal_tests {
         }
     }
 
+    // Frozen pre-optional-preempt_mode PartitionCreate entry; `preempt_mode` was a
+    // bare `PreemptMode` whose default serialized as "Off". Never regenerate.
+    #[test]
+    fn partition_create_pre_optional_preempt_mode_still_deserializes() {
+        const PARTITION_CREATE_PRE_OPTIONAL: &str = r#"{"PartitionCreate":{"partition":{"name":"gpu","state":"Up","is_default":true,"nodes":"ALL","selector":{},"max_time_minutes":1440,"default_time_minutes":10,"max_nodes":null,"min_nodes":1,"allow_root":true,"exclusive_user":false,"allow_accounts":[],"allow_groups":[],"allow_qos":[],"deny_accounts":[],"deny_qos":[],"preempt_mode":"Off","priority_tier":1,"preempt_exempt_time":null}}}"#;
+
+        let op: WalOperation = serde_json::from_str(PARTITION_CREATE_PRE_OPTIONAL)
+            .expect("legacy PartitionCreate must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::PartitionCreate { partition } => {
+                assert_eq!(partition.name, "gpu");
+                // Legacy "Off" decodes to an explicit Off, which resolves the
+                // same as unset — an upgraded cluster keeps its behaviour.
+                assert_eq!(
+                    partition.preempt_mode,
+                    Some(crate::partition::PreemptMode::Off)
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // A legacy entry that carried a real action must keep it.
+    #[test]
+    fn partition_create_pre_optional_preserves_configured_action() {
+        const LEGACY_CANCEL: &str = r#"{"PartitionCreate":{"partition":{"name":"gpu","state":"Up","is_default":false,"nodes":"ALL","selector":{},"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":1,"allow_root":true,"exclusive_user":false,"allow_accounts":[],"allow_groups":[],"allow_qos":[],"deny_accounts":[],"deny_qos":[],"preempt_mode":"Cancel","priority_tier":1,"preempt_exempt_time":null}}}"#;
+
+        let op: WalOperation = serde_json::from_str(LEGACY_CANCEL).expect("must deserialize");
+        match op {
+            WalOperation::PartitionCreate { partition } => assert_eq!(
+                partition.preempt_mode,
+                Some(crate::partition::PreemptMode::Cancel)
+            ),
+            _ => panic!("wrong variant"),
+        }
+    }
+
     // Frozen pre-multi-CP K0sSetPhase entry (no control_plane_nodes field); must still deserialize
     // or spurctld crashes on upgrade replay. Never regenerate.
     #[test]

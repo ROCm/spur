@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
-use crate::partition::{Partition, PartitionState, PreemptMode, PreemptType};
+use crate::partition::{Partition, PartitionState, PreemptType};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -658,10 +658,8 @@ pub struct SchedulerConfig {
     /// operator-only. Raise it to grant users a band above the baseline.
     #[serde(default = "default_max_user_priority")]
     pub max_user_priority: u32,
-    /// Controls which jobs are eligible to preempt which. `None` (default)
-    /// enforces no cross-QOS restrictions — any job with sufficient priority gap
-    /// may preempt any other. `QosPriority` requires the pending job's QOS to
-    /// list the running job's QOS in its `preempt` allow-list. Mirrors Slurm's
+    /// Selects the preemption engine. `none` (default, also spelled `off`)
+    /// disables preemption entirely; `qos_priority` enables it. Mirrors Slurm's
     /// `PreemptType`.
     #[serde(default)]
     pub preempt_type: PreemptType,
@@ -1797,6 +1795,14 @@ impl SlurmConfig {
                 ),
             });
         }
+        for pc in &self.partitions {
+            crate::partition::parse_preempt_mode(&pc.preempt_mode).map_err(|value| {
+                ConfigError::InvalidValue {
+                    field: format!("partitions.{}.preempt_mode", pc.name),
+                    value,
+                }
+            })?;
+        }
         // Keepalive detection is interval + timeout, so an hour-long interval silently disables
         // the liveness this exists to provide.
         for (field, value) in [
@@ -2115,12 +2121,8 @@ impl SlurmConfig {
                 deny_qos: pc.deny_qos.clone(),
                 allow_qos: pc.allow_qos.clone(),
                 priority_tier: pc.priority_tier,
-                preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
-                    "cancel" => PreemptMode::Cancel,
-                    "requeue" => PreemptMode::Requeue,
-                    "suspend" => PreemptMode::Suspend,
-                    _ => PreemptMode::Off,
-                },
+                preempt_mode: crate::partition::parse_preempt_mode(&pc.preempt_mode)
+                    .unwrap_or(None),
                 preempt_exempt_time: pc.preempt_exempt_time,
                 ..Default::default()
             })
@@ -3524,6 +3526,56 @@ deny_accounts = ["student"]
             vec!["research".to_string(), "faculty".to_string()]
         );
         assert_eq!(parts[0].deny_accounts, vec!["student".to_string()]);
+    }
+
+    #[test]
+    fn partition_preempt_mode_defaults_to_unset() {
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.build_partitions()[0].preempt_mode, None);
+
+        let explicit = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\npreempt_mode = \"off\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.build_partitions()[0].preempt_mode,
+            Some(crate::partition::PreemptMode::Off)
+        );
+    }
+
+    #[test]
+    fn partition_preempt_mode_typo_is_rejected_at_load() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\npreempt_mode = \"cancle\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("preempt_mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn preempt_type_defaults_to_disabled_and_accepts_off_synonym() {
+        let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(unset.scheduler.preempt_type, PreemptType::None);
+
+        for value in ["none", "off"] {
+            let cfg = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n\n[scheduler]\npreempt_type = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.scheduler.preempt_type, PreemptType::None, "{value}");
+        }
+
+        let enabled = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[scheduler]\npreempt_type = \"qos_priority\"\n",
+        )
+        .unwrap();
+        assert_eq!(enabled.scheduler.preempt_type, PreemptType::QosPriority);
     }
 
     #[test]

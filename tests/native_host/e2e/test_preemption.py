@@ -8,7 +8,14 @@ Covers the fix where a job repeatedly preempted (PreemptMode=Requeue) must
 never be held with JobHoldMaxRequeue: preemption requeues are tracked
 separately from failure requeues (dispatch failure/Timeout/NodeFail) and are
 never checked against `max_batch_requeue`.
+
+Requires:
+  - preempt_type=qos_priority (scheduler config); preemption is off otherwise
+  - a QOS pair where the aggressor allow-lists the victim and outranks it
+  - Postgres on node 0 (accounting_cluster fixture, skips when Docker is absent)
 """
+
+import time
 
 import pytest
 
@@ -19,6 +26,10 @@ from cluster import parse_job_id, wait_job, wait_job_state
 # release, scheduler pickup, and spurd relaunch, which is sensitive to CI host
 # load — not a latency assertion.
 RESCHEDULE_TIMEOUT = 60
+
+# QOS cache refreshes on the accounting interval; a freshly added QOS needs a
+# cycle before the scheduler acts on it.
+_CACHE_WARMUP_SECS = 15
 
 
 class TestChronicPreemption:
@@ -42,10 +53,25 @@ class TestChronicPreemption:
                     "preempt_mode": "requeue",
                 }
             ],
+            "scheduler": {
+                "preempt_type": "qos_priority",
+            },
+            # Required when the test runner SSHes in as root: spurd refuses to
+            # execute jobs as uid 0 unless this is explicitly enabled.
+            "auth": {"plugin": "none", "allow_root_jobs": True},
         }
 
-    def test_chronic_preemption_never_holds_job(self, cluster):
+    def test_chronic_preemption_never_holds_job(self, accounting_cluster):
+        cluster = accounting_cluster
         node0 = cluster.node_names[0]
+
+        # Neither QOS sets preemptmode, so both defer to the partition's
+        # `requeue` — the mode whose requeue accounting is under test.
+        cluster.sacctmgr(["add", "qos", "name=chronic-low", "priority=100"])
+        cluster.sacctmgr(["add", "qos", "name=chronic-high", "priority=10000",
+                          "preempt=chronic-low"])
+        time.sleep(_CACHE_WARMUP_SECS)
+
         low_id = None
         try:
             low_script = cluster.write_file(
@@ -53,7 +79,7 @@ class TestChronicPreemption:
             )
             sb = cluster.sbatch(
                 ["-J", "chronic-low", "-N", "1", f"--nodelist={node0}",
-                 "--exclusive", low_script]
+                 "--exclusive", "-q", "chronic-low", low_script]
             )
             low_id = parse_job_id(sb)
             assert low_id is not None, f"submit failed:\n{sb}"
@@ -71,13 +97,10 @@ class TestChronicPreemption:
                 )
                 hb = cluster.sbatch(
                     ["-J", f"chronic-high-{i}", "-N", "1", f"--nodelist={node0}",
-                     "--exclusive", hi_script]
+                     "--exclusive", "-q", "chronic-high", hi_script]
                 )
                 hi_id = parse_job_id(hb)
                 assert hi_id is not None, f"submit failed:\n{hb}"
-                # A high enough priority guarantees preemption eligibility
-                # (candidate.priority must be < pending.priority / 2).
-                cluster.scontrol("update", f"JobId={hi_id}", "Priority=1000000")
 
                 wait_job_state(cluster, low_id, "PD", timeout=15)
                 show = cluster.scontrol("show", "job", str(low_id))

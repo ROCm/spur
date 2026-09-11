@@ -2303,18 +2303,8 @@ impl SlurmController for ControllerService {
             }
         };
 
-        let preempt_mode = match req.preempt_mode.to_uppercase().as_str() {
-            "" | "OFF" => spur_core::partition::PreemptMode::Off,
-            "CANCEL" => spur_core::partition::PreemptMode::Cancel,
-            "REQUEUE" => spur_core::partition::PreemptMode::Requeue,
-            "SUSPEND" => spur_core::partition::PreemptMode::Suspend,
-            other => {
-                return Err(Status::invalid_argument(format!(
-                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
-                    other
-                )))
-            }
-        };
+        let preempt_mode = spur_core::partition::parse_preempt_mode(&req.preempt_mode)
+            .map_err(Status::invalid_argument)?;
 
         let partition = spur_core::partition::Partition {
             name: req.name,
@@ -2381,12 +2371,10 @@ impl SlurmController for ControllerService {
 
         let preempt_mode = req
             .preempt_mode
-            .map(|pm| match pm.to_uppercase().as_str() {
-                v @ ("OFF" | "CANCEL" | "REQUEUE" | "SUSPEND") => Ok(v.to_string()),
-                other => Err(Status::invalid_argument(format!(
-                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
-                    other
-                ))),
+            .map(|pm| {
+                spur_core::partition::parse_preempt_mode(&pm)
+                    .map(|mode| spur_core::partition::preempt_mode_str(mode).to_string())
+                    .map_err(Status::invalid_argument)
             })
             .transpose()?;
 
@@ -4439,7 +4427,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_qos: part.allow_qos.join(","),
         deny_accounts: part.deny_accounts.join(","),
         deny_qos: part.deny_qos.join(","),
-        preempt_mode: format!("{:?}", part.preempt_mode),
+        preempt_mode: spur_core::partition::preempt_mode_str(part.preempt_mode).to_string(),
         priority_tier: part.priority_tier,
         preempt_exempt_time: part.preempt_exempt_time,
     }

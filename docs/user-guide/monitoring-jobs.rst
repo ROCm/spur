@@ -361,9 +361,11 @@ per-field width with ``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
-``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS name that
-authorized the preemption under ``preempt_type = qos_priority``; ``N/A`` for
-plain priority-based preemption. All three appear in the long format (``-l``).
+``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS of that
+preempting job — the QOS whose ``preempt`` allow-list authorized the
+preemption. It is set for any job preempted by this release; jobs preempted by
+an earlier release, which recorded no authorizing QOS, show ``N/A`` even though
+they were preempted. All three appear in the long format (``-l``).
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.
@@ -528,8 +530,10 @@ fields:
 * ``PreemptedBy=<job_id>`` — the ID of the higher-priority job that triggered
   the preemption. Only shown when the job has been preempted.
 * ``PreemptMode=Requeue|Cancel|Suspend`` — how the preemption was carried out.
-* ``PreemptQOS=<name>`` — the QOS that authorized the preemption under
-  ``preempt_type = qos_priority``; ``N/A`` for plain priority-based preemption.
+* ``PreemptQOS=<name>`` — the QOS of the preempting job, whose ``preempt``
+  allow-list authorized the preemption. Set for any job preempted by this
+  release; jobs preempted by an earlier release show ``N/A`` even though they
+  were preempted.
 
 **Quick reference — one command for any preempted job:**
 

@@ -723,7 +723,11 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 );
                 print!(
                     "   PreemptMode={} PriorityTier={}",
-                    part.preempt_mode.to_uppercase(),
+                    if part.preempt_mode.is_empty() {
+                        "NONE"
+                    } else {
+                        &part.preempt_mode
+                    },
                     part.priority_tier
                 );
                 if let Some(t) = part.preempt_exempt_time {
@@ -1198,7 +1202,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
     let mut deny_accounts = String::new();
     let mut deny_qos = String::new();
     let mut priority_tier: u32 = 1;
-    let mut preempt_mode = "OFF".to_string();
+    let mut preempt_mode = String::new();
     let mut preempt_exempt_time: Option<u32> = None;
 
     for param in params {
