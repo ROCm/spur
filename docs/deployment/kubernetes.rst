@@ -120,6 +120,26 @@ Apply with ``kubectl``:
 
 The operator watches SpurJob resources, submits them to the controller, and updates status fields as the job progresses.
 
+Operator connection to the controller
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The operator opens each channel to ``spurctld`` with these bounds:
+
+- A connect timeout of 10 s. A Service with no ready endpoint drops the connection attempt, and
+  the kernel retries it for more than two minutes. The operator stops earlier and connects again
+  when the controller is ready.
+- HTTP/2 keepalive pings every 10 s. A ping with no answer in 5 s closes the channel.
+- A bound of 30 s on each request.
+
+The job controller keeps one channel open. After a transport error it drops the channel and opens a
+new one on the next call. A refusal from the controller, for example ``NOT_FOUND``, is an answer and
+keeps the channel.
+
+The node watcher registers each Kubernetes node with the controller. A transport error during a
+registration restarts the node watcher, which lists every node again. A refusal that is not a
+transport error, for example a missing admission token, is written to the log. The node watcher
+tries the registration again at the next event of that node.
+
 Authenticating the operator agent surface
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
