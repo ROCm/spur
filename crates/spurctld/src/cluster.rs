@@ -484,6 +484,9 @@ struct PendingJobClassification {
     jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
     bb_stage_candidates: Vec<JobId>,
+    /// Over-quota jobs that idle-fill may place on nodes Phase 1 leaves empty,
+    /// highest priority first. Empty unless `scheduler.idle_fill_enabled`.
+    idle_fill_candidates: Vec<Job>,
 }
 
 struct PendingJobCandidate {
@@ -3708,7 +3711,15 @@ impl ClusterManager {
             .map(|candidate| (candidate.job.job_id, self.resolve_qos(&candidate.job)))
             .collect();
 
+        // Jobs the QOS gate rejects on the group node cap alone. They stay
+        // rejected here and keep reporting that reason: idle-fill decides
+        // separately, against the nodes Phase 1 leaves empty. Only the QOS gate
+        // feeds this, so a job the account gate already rejected never appears —
+        // the account gate runs first and returns before this one.
+        let mut idle_fill_candidates = Vec::new();
+
         {
+            let idle_fill = self.config().scheduler.idle_fill_enabled;
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
@@ -3735,9 +3746,23 @@ impl ClusterManager {
                     &nodes,
                     &reserved,
                     consumed_wall,
+                    idle_fill,
                 ) {
                     Ok(charge) => charge,
-                    Err(reason) => return GateOutcome::Block(reason),
+                    Err(block) => {
+                        if block.idle_fill_eligible {
+                            let mut candidate = job.clone();
+                            // The account gate credits nodes it already occupies,
+                            // which have running jobs and so are never idle. Left
+                            // in place the credit reads as a nodelist and, once it
+                            // covers `num_nodes`, restricts placement to exactly
+                            // those non-idle nodes — see
+                            // `NodePlacement::nodelist_is_additive`.
+                            candidate.preferred_nodes.clear();
+                            idle_fill_candidates.push(candidate);
+                        }
+                        return GateOutcome::Block(block.reason);
+                    }
                 };
                 reserved.reserve(job, qos_charge, account_charge);
                 GateOutcome::Keep
@@ -3822,6 +3847,7 @@ impl ClusterManager {
                 .collect(),
             reason_updates,
             bb_stage_candidates,
+            idle_fill_candidates,
         }
     }
 
@@ -7168,12 +7194,22 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// `Err(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
+/// Why the QOS gate rejected a job.
+struct QosBlock {
+    reason: PendingReason,
+    /// The group node cap is the only limit in the way, so idle-fill may loan
+    /// this job idle nodes. Always `false` when idle-fill is switched off, so
+    /// the extra limit evaluation is not paid for on the default path.
+    idle_fill_eligible: bool,
+}
+
+/// `Err(..)` if the job would exceed a QOS group/per-user cap. `reserved`
 /// folds in headroom claimed earlier this pass so it can't over-subscribe. On
 /// success, extends `job.preferred_nodes` with any nodes credited toward the
 /// grp-node cap so placement actually lands on one of them, and returns the
 /// node count actually charged against `grp_tres` so the caller can record it
 /// (rather than the job's raw `num_nodes`) in `reserved`.
+#[allow(clippy::too_many_arguments)]
 fn qos_block_with(
     job: &mut Job,
     qos: &Qos,
@@ -7181,7 +7217,8 @@ fn qos_block_with(
     nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
-) -> Result<u64, spur_core::job::PendingReason> {
+    idle_fill: bool,
+) -> Result<u64, QosBlock> {
     let Some(qos_name) = job.spec.qos.as_ref() else {
         return Ok(0);
     };
@@ -7242,7 +7279,20 @@ fn qos_block_with(
             job.preferred_nodes.extend(reusable_nodes);
             Ok(grp_node_charge)
         }
-        QosCheckResult::Blocked(reason) => Err(reason),
+        QosCheckResult::Blocked(reason) => Err(QosBlock {
+            reason,
+            idle_fill_eligible: idle_fill
+                && spur_core::qos::grp_node_is_sole_blocker(
+                    job,
+                    qos,
+                    running_count,
+                    submitted_count,
+                    &user_running_tres,
+                    &qos_running_tres,
+                    consumed_wall_minutes,
+                    grp_node_charge,
+                ),
+        }),
     }
 }
 
