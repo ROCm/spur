@@ -46,6 +46,13 @@ impl AuditSlot {
     }
 }
 
+/// Read back what a handler deposited, for tests that drive a handler directly
+/// rather than through the layer.
+#[cfg(test)]
+pub(crate) fn take_for_test(slot: &Arc<AuditSlot>) -> Option<Annotation> {
+    slot.take()
+}
+
 /// Take the handle so a handler can annotate after `into_inner()` has consumed
 /// the request. `None` when the layer is absent, as in handler unit tests.
 pub(crate) fn slot<T>(request: &tonic::Request<T>) -> Option<Arc<AuditSlot>> {

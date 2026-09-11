@@ -1206,8 +1206,8 @@ accounting database's ``txn`` (transaction) log, capturing **who** ran the
 command, **from where**, **when**, and the **outcome**. Recording is
 best-effort: a database outage never blocks the operation itself.
 
-Coverage is a property of the RPC pipeline, not of individual commands. A Tower
-middleware in front of every controller and accounting RPC writes the row, so an
+Coverage is a property of the RPC pipeline, not of individual commands. A single
+layer in front of every controller and accounting RPC writes the row, so an
 action cannot be mutating and unrecorded; a newly added RPC fails the test suite
 until it is explicitly classified as mutating, read-only, or internal.
 
@@ -1238,8 +1238,8 @@ Each record captures:
   ``no`` for permissive/disabled anonymous callers (asserted, trust-on-wire) and
   for internal ``system`` actions such as the expired-reservation purge.
 - **Peer** — the address the request arrived from. Often the only attribution
-  left for an unauthenticated caller under ``permissive``, and what makes host
-  auth logs joinable to a Spur action.
+  left for an unauthenticated caller under ``permissive``, and what lets a host's
+  login records be matched against a Spur action.
 - **Action** — ``create``, ``update``, or ``delete``.
 - **Where** — the target, rendered ``entity_type:entity_name`` (e.g.
   ``node:node07``).
@@ -1272,9 +1272,10 @@ Who drained a node
 ~~~~~~~~~~~~~~~~~~
 
 Node state changes are recorded twice, for different questions. The ``txn`` log
-holds the **history** — every drain, resume, and failed attempt, queryable by
-actor across entities. The node record itself holds the **current** reason's
-attribution, shown by ``sinfo -R`` and ``scontrol show node`` without needing
+holds the **history** — every drain, resume, and failed attempt, which can be
+searched by actor across entities. The node record itself holds the
+**current** reason's attribution, shown by ``sinfo -R`` and
+``scontrol show node`` without needing
 the accounting database at all:
 
 .. code-block:: bash
@@ -1324,7 +1325,7 @@ ephemeral port that host connected from, while ``10.0.0.4`` does not also match
 Logging every RPC
 ~~~~~~~~~~~~~~~~~
 
-The ``txn`` log covers mutations. To log **every** inbound controller RPC,
+The ``txn`` log covers mutations. To log every **authenticated** controller RPC,
 reads included, set ``logging.audit_rpcs``:
 
 .. code-block:: toml
@@ -1338,6 +1339,22 @@ Slurm's ``DebugFlags=AuditRPCs`` and is off by default for the same reason: on a
 busy cluster it is the highest-volume log Spur produces, since it includes
 ``squeue``/``sinfo`` polling and node heartbeats. The dedicated target lets it be
 routed to its own file rather than mixed into the controller log.
+
+.. note::
+
+   A request whose credential is missing, malformed, expired, or forged is
+   refused during authentication, before either audit tier runs, so it appears
+   in neither this stream nor the ``txn`` log. Those refusals are instead logged
+   **unconditionally** at warning level on the controller's main log, with the
+   path, peer address, and reason — they are not gated behind ``audit_rpcs``,
+   because a rejected credential is worth recording on every cluster.
+
+   Slurm behaves the same way: its ``AUDIT_RPCS`` line prints the *authenticated*
+   user and so runs only after the credential verifies, while a failure is
+   reported separately as an error (``Protocol authentication error``). Refused
+   credentials also get no ``txn`` row deliberately — there is no verified actor
+   to attribute one to, and letting unauthenticated traffic insert rows would
+   give an unauthenticated caller a way to grow the database.
 
 Retention
 ~~~~~~~~~
