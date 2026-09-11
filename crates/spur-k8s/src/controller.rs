@@ -45,6 +45,15 @@ pub async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<Channel
         .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE))
 }
 
+/// The readiness probe only asks whether the controller accepts a connection,
+/// and kubelet bounds the probe itself, so it needs none of the channel bounds.
+pub async fn probe(addr: &str) -> anyhow::Result<()> {
+    Endpoint::from_shared(controller_url(addr))?
+        .connect()
+        .await?;
+    Ok(())
+}
+
 /// A channel whose peer is gone answers nothing until the kernel gives up on
 /// it, and the request bound alone does not close it, so the next call would
 /// wait on the same dead connection. Drop it after a transport error instead.
