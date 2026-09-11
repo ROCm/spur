@@ -28,9 +28,13 @@ _DEFAULT_IMAGE = "ghcr.io/rocm/spur:ci"
 SPUR_JOB_GROUP = "spur.amd.com"
 SPUR_JOB_VERSION = "v1alpha1"
 SPUR_JOB_PLURAL = "spurjobs"
+CRD_NAME = f"{SPUR_JOB_PLURAL}.{SPUR_JOB_GROUP}"
 DEFAULT_TIMEOUT = 60
 WAIT_INTERVAL = 2
 HA_TIMEOUT = 90
+# The operator registers the nodes only after it reaches a ready controller;
+# measured at about three minutes after the controller Pods are ready.
+NODE_REGISTER_TIMEOUT = 300
 CLUSTER_SCOPED_KINDS = frozenset({"ClusterRole", "ClusterRoleBinding"})
 
 
@@ -93,6 +97,10 @@ def _is_not_found(exc: ApiException) -> bool:
 
 
 def _is_already_exists(exc: ApiException) -> bool:
+    return exc.status == 409
+
+
+def _is_conflict(exc: ApiException) -> bool:
     return exc.status == 409
 
 
@@ -201,7 +209,7 @@ class SuiteContext:
                 raise
 
         try:
-            self.ext_v1.delete_custom_resource_definition("spurjobs.spur.amd.com")
+            self.ext_v1.delete_custom_resource_definition(CRD_NAME)
         except ApiException as exc:
             if not _is_not_found(exc):
                 raise
@@ -231,10 +239,37 @@ class SuiteContext:
         except ApiException as exc:
             if not _is_already_exists(exc):
                 raise
-            self.ext_v1.replace_custom_resource_definition(
-                "spurjobs.spur.amd.com", crd_body
-            )
+            self._replace_crd(crd_body)
         logger.info("SpurJob CRD applied")
+
+    def _replace_crd(self, crd_body: dict) -> None:
+        # A replace needs the live resourceVersion, which can move between the
+        # read and the write, so try once more on a conflict.
+        for attempt in range(2):
+            live = self.ext_v1.read_custom_resource_definition(CRD_NAME)
+            if live.metadata.deletion_timestamp is not None:
+                # The previous session's teardown is still removing the CRD. A
+                # replace would land on an object that vanishes mid-run.
+                self._wait_crd_gone()
+                self.ext_v1.create_custom_resource_definition(crd_body)
+                return
+            crd_body["metadata"]["resourceVersion"] = live.metadata.resource_version
+            try:
+                self.ext_v1.replace_custom_resource_definition(CRD_NAME, crd_body)
+                return
+            except ApiException as exc:
+                if not _is_conflict(exc) or attempt == 1:
+                    raise
+
+    def _wait_crd_gone(self) -> None:
+        def gone() -> bool:
+            try:
+                self.ext_v1.read_custom_resource_definition(CRD_NAME)
+                return False
+            except ApiException as exc:
+                return _is_not_found(exc)
+
+        wait_until(gone, DEFAULT_TIMEOUT * 2, "CRD still terminating")
 
 
 class ClusterFixture:
@@ -418,6 +453,14 @@ class ClusterFixture:
         )
         logger.info("controller pod(s) ready: %s", self._ready_controller_count())
 
+        wait_until(
+            lambda: self._registered_node_count() >= 1,
+            NODE_REGISTER_TIMEOUT,
+            "no node registered with the controller",
+            interval=5,
+        )
+        logger.info("node(s) registered: %s", self._registered_node_count())
+
     def _operator_available(self) -> bool:
         try:
             dep = self.apps_v1.read_namespaced_deployment(
@@ -429,6 +472,14 @@ class ClusterFixture:
 
     def _ready_controller_count(self) -> int:
         return count_ready_pods(self.namespace, "app=spurctld")
+
+    def _registered_node_count(self) -> int:
+        """Nodes the controller lists; a follower answers this from local state."""
+        try:
+            out = exec_in_pod(self.namespace, "spurctld-0", ["spur", "nodes", "-N", "-h"])
+        except ApiException:
+            return 0
+        return sum(1 for line in out.splitlines() if line.strip())
 
     def teardown_workloads(self) -> None:
         self._force_delete_pods("app=spurctld")
