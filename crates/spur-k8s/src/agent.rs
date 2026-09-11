@@ -1359,4 +1359,16 @@ mod peer_dns_tests {
         let out = headless_peer_dns("Node_A.example,node-b", 3, "ns");
         assert_eq!(out[0], "node-a-example.spur-job-3.ns.svc.cluster.local");
     }
+
+    #[test]
+    fn segments_are_trimmed_and_empty_ones_dropped() {
+        let out = headless_peer_dns(" node-a , node-b, ", 7, "spur");
+        assert_eq!(
+            out,
+            vec![
+                "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
+            ]
+        );
+    }
 }
