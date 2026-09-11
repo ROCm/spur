@@ -172,6 +172,13 @@ impl SlurmAgent for VirtualAgent {
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
+        // Two nodes with one sanitized name would share a Pod name and a peer DNS
+        // name; the second Pod create returns 409 and the job hangs on a missing
+        // peer. Refuse the whole launch instead of creating a partial job.
+        if let Some(collision) = sanitized_collision(&split_nodelist(&spec.nodelist)) {
+            return Err(Status::invalid_argument(collision.to_string()));
+        }
+
         // Pod name includes target_node to avoid conflicts for multi-node jobs
         let pod_name = if target_node.is_empty() {
             format!("spur-job-{}", job_id)
@@ -971,6 +978,52 @@ fn job_service_name(job_id: u32) -> String {
     format!("spur-job-{job_id}")
 }
 
+/// The node names of a comma-separated nodelist, trimmed, empty segments dropped.
+/// `launch_job` and `headless_peer_dns` must read the list the same way.
+fn split_nodelist(nodelist: &str) -> Vec<&str> {
+    nodelist
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Two node names that `sanitize_k8s_name` maps to one Kubernetes name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeNameCollision {
+    first: String,
+    second: String,
+    sanitized: String,
+}
+
+impl std::fmt::Display for NodeNameCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node names {:?} and {:?} both sanitize to {:?}",
+            self.first, self.second, self.sanitized
+        )
+    }
+}
+
+/// The first pair of nodes whose sanitized names are equal. Such a pair would
+/// share a Pod name and a peer DNS name, so the launch must be refused.
+fn sanitized_collision(nodes: &[&str]) -> Option<NodeNameCollision> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for node in nodes {
+        let sanitized = sanitize_k8s_name(node);
+        let Some(first) = seen.insert(sanitized.clone(), node) else {
+            continue;
+        };
+        return Some(NodeNameCollision {
+            first: first.to_string(),
+            second: node.to_string(),
+            sanitized,
+        });
+    }
+    None
+}
+
 /// The DNS names under which the Pods of a multi-node job reach each other.
 ///
 /// `launch_job` gives each Pod `hostname = sanitize_k8s_name(target_node)` and
@@ -981,11 +1034,7 @@ fn job_service_name(job_id: u32) -> String {
 ///
 /// A single node job gets no headless Service and therefore no name to return.
 fn headless_peer_dns(nodelist: &str, job_id: u32, namespace: &str) -> Vec<String> {
-    let nodes: Vec<&str> = nodelist
-        .split(',')
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .collect();
+    let nodes = split_nodelist(nodelist);
     if nodes.len() < 2 {
         return Vec::new();
     }
@@ -1333,7 +1382,48 @@ mod tests {
 
 #[cfg(test)]
 mod peer_dns_tests {
-    use super::headless_peer_dns;
+    use super::{headless_peer_dns, sanitized_collision, split_nodelist, NodeNameCollision};
+
+    #[test]
+    fn dotted_and_dashed_names_collide_after_sanitizing() {
+        let collision = sanitized_collision(&["node.a", "node-b", "node-a"]);
+        assert_eq!(
+            collision,
+            Some(NodeNameCollision {
+                first: "node.a".to_string(),
+                second: "node-a".to_string(),
+                sanitized: "node-a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn distinct_names_do_not_collide() {
+        assert_eq!(sanitized_collision(&["node-a", "node-b", "node-c"]), None);
+    }
+
+    #[test]
+    fn a_single_name_cannot_collide() {
+        assert_eq!(sanitized_collision(&["node.a"]), None);
+        assert_eq!(sanitized_collision(&[]), None);
+    }
+
+    #[test]
+    fn collision_message_names_both_nodes_and_the_shared_name() {
+        let collision = sanitized_collision(&["node.a", "node-a"]).expect("collision");
+        assert_eq!(
+            collision.to_string(),
+            r#"node names "node.a" and "node-a" both sanitize to "node-a""#
+        );
+    }
+
+    #[test]
+    fn collision_check_reads_the_nodelist_like_peer_dns() {
+        let nodes = split_nodelist(" node.a , node-a, ");
+        assert_eq!(nodes, vec!["node.a", "node-a"]);
+        assert!(sanitized_collision(&nodes).is_some());
+        assert!(sanitized_collision(&split_nodelist(" node-a , ")).is_none());
+    }
 
     #[test]
     fn multi_node_job_gets_one_resolvable_name_per_node_in_nodelist_order() {
