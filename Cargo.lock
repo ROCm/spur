@@ -3657,6 +3657,7 @@ dependencies = [
  "shlex",
  "spur-client",
  "spur-core",
+ "spur-logging",
  "spur-net",
  "spur-proto",
  "spur-update",
@@ -3666,7 +3667,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tracing-subscriber",
  "whoami",
  "zstd",
 ]
@@ -3756,12 +3756,22 @@ dependencies = [
  "serde",
  "serde_json",
  "spur-core",
+ "spur-logging",
  "spur-proto",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tonic",
  "tower",
+ "tracing",
+]
+
+[[package]]
+name = "spur-logging"
+version = "0.11.0"
+dependencies = [
+ "chrono",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3895,6 +3905,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spur-core",
+ "spur-logging",
  "spur-metrics",
  "spur-net",
  "spur-proto",
@@ -3908,7 +3919,6 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3930,6 +3940,7 @@ dependencies = [
  "spur-client",
  "spur-core",
  "spur-devices",
+ "spur-logging",
  "spur-net",
  "spur-proto",
  "spur-sched",
@@ -3941,7 +3952,6 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
