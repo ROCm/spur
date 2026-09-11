@@ -50,9 +50,16 @@ pub async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<Channel
 /// wait on the same dead connection. Drop it after a transport error instead.
 pub fn is_transport_error(status: &Status) -> bool {
     use tonic::Code;
+    // tonic maps hyper transport errors other than a failed connect to Unknown,
+    // and an h2 GOAWAY or protocol error from a dying peer to Internal. A
+    // needless reconnect on an application Internal is harmless.
     matches!(
         status.code(),
-        Code::Unavailable | Code::Unknown | Code::Cancelled | Code::DeadlineExceeded
+        Code::Unavailable
+            | Code::Unknown
+            | Code::Cancelled
+            | Code::DeadlineExceeded
+            | Code::Internal
     )
 }
 
@@ -156,14 +163,60 @@ mod tests {
         assert!(ctrl.client.is_none(), "the dead channel must not be reused");
     }
 
+    /// The client starts without a channel and the first call opens it. After
+    /// a transport error the next call opens a new one.
+    #[tokio::test]
+    async fn the_next_call_after_a_transport_error_reconnects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut ctrl = ControllerClient::new(&addr);
+        assert!(
+            ctrl.client.is_none(),
+            "nothing connects before the first call"
+        );
+
+        let gone: Result<(), Status> = ctrl
+            .call(|_| async { Err(Status::cancelled("Timeout expired")) })
+            .await;
+        assert!(gone.is_err());
+        assert!(ctrl.client.is_none(), "the channel is dropped");
+
+        let answered: Result<(), Status> = ctrl.call(|_| async { Ok(()) }).await;
+        assert!(answered.is_ok());
+        assert!(ctrl.client.is_some(), "the call reconnected");
+    }
+
+    /// Nothing listens on port 1, so the kernel refuses the connect at once.
+    #[tokio::test]
+    async fn a_refused_connect_is_unavailable_and_leaves_no_channel() {
+        let mut ctrl = ControllerClient::new("127.0.0.1:1");
+
+        let err = ctrl
+            .call(|mut c| async move { c.ping(()).await })
+            .await
+            .expect_err("nothing listens on port 1");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        assert!(ctrl.client.is_none());
+    }
+
     #[test]
     fn transport_errors_are_the_codes_a_dead_peer_produces() {
         assert!(is_transport_error(&Status::unavailable(
             "tcp connect error"
         )));
+        assert!(is_transport_error(&Status::unknown("transport error")));
         assert!(is_transport_error(&Status::cancelled("Timeout expired")));
+        assert!(is_transport_error(&Status::deadline_exceeded("deadline")));
+        assert!(is_transport_error(&Status::internal("h2 protocol error")));
+
+        assert!(!is_transport_error(&Status::ok("")));
         assert!(!is_transport_error(&Status::not_found("no such job")));
+        assert!(!is_transport_error(&Status::invalid_argument("bad")));
         assert!(!is_transport_error(&Status::permission_denied("no")));
+        assert!(!is_transport_error(&Status::failed_precondition(
+            "not the leader"
+        )));
     }
 
     #[test]
