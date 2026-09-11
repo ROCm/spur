@@ -14,6 +14,8 @@ use axum::Router;
 use kube::Client;
 use tracing::{debug, info};
 
+use crate::controller::connect;
+
 struct HealthState {
     k8s_client: Client,
     controller_addr: String,
@@ -53,9 +55,7 @@ async fn readyz(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
     let k8s_ok = state.k8s_client.apiserver_version().await.is_ok();
 
     // Check spurctld reachability
-    let ctrl_ok = crate::controller::connect(&state.controller_addr)
-        .await
-        .is_ok();
+    let ctrl_ok = connect(&state.controller_addr).await.is_ok();
 
     if k8s_ok && ctrl_ok {
         debug!("readyz: ok");
