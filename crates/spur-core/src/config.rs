@@ -671,6 +671,16 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Let a job that is over its QOS group node cap run on nodes that are
+    /// otherwise idle, on the understanding that a job with a quota claim can
+    /// reclaim them by preemption. A group node cap protects a share of a
+    /// contested cluster; while nodes sit empty there is no contest, so enforcing
+    /// it strands capacity. `false` (default) keeps the strict behaviour.
+    ///
+    /// Cluster-wide only: an over-quota job is by definition escaping a per-QOS
+    /// limit, so a per-QOS opt-in would let a QOS grant itself the exemption.
+    #[serde(default)]
+    pub idle_fill_enabled: bool,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -712,6 +722,7 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            idle_fill_enabled: false,
         }
     }
 }

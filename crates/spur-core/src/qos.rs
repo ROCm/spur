@@ -250,6 +250,58 @@ pub fn check_qos_limits_with_grp_node_charge(
     }
 }
 
+/// Whether the QOS group *node* cap is the only limit holding this job back, so
+/// idle-fill may loan it idle nodes.
+///
+/// The blocked reason alone cannot answer this. `qos_resource_breach` reports
+/// only the first breach it finds and checks `grp_tres` in the order cpu, node,
+/// mem, gpu — so a job over both its node and GPU caps reports the node one, and
+/// treating that reason as eligibility would loan nodes to a job whose real
+/// constraint is a contended resource. Instead this re-runs the full check with
+/// the node dimension lifted: idle nodes are spare, every other cap is not.
+///
+/// Lifting means setting the dimension to `0`, which `tres_cap_breach` skips —
+/// a TRES dimension of 0 is ignored rather than blocking.
+#[allow(clippy::too_many_arguments)]
+pub fn grp_node_is_sole_blocker(
+    job: &Job,
+    qos: &Qos,
+    user_running_count: u32,
+    user_submitted_count: u32,
+    user_running_tres: &TresRecord,
+    qos_running_tres: &TresRecord,
+    consumed_wall_minutes: Option<u64>,
+    grp_node_charge: u64,
+) -> bool {
+    let check = |qos: &Qos| {
+        check_qos_limits_with_grp_node_charge(
+            job,
+            qos,
+            user_running_count,
+            user_submitted_count,
+            user_running_tres,
+            qos_running_tres,
+            consumed_wall_minutes,
+            grp_node_charge,
+        )
+    };
+
+    if check(qos) == QosCheckResult::Allowed {
+        return false;
+    }
+
+    let mut lifted = qos.clone();
+    let Some(grp) = lifted.limits.grp_tres.as_mut() else {
+        return false;
+    };
+    if grp.get(TresType::Node) == 0 {
+        return false;
+    }
+    grp.set(TresType::Node, 0);
+
+    check(&lifted) == QosCheckResult::Allowed
+}
+
 /// QOS submit-count limits (`MaxSubmitJobsPerUser`, `MaxSubmitJobsPerAccount`,
 /// `GrpSubmitJobs`). These always deny at submission (Slurm's
 /// `acct_policy_validate`), independent of `DenyOnLimit`, because admitting the
@@ -892,6 +944,118 @@ mod tests {
             result,
             QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit)
         );
+    }
+
+    /// A QOS whose group cap is `grp`, over which `running` is already charged.
+    fn grp_qos(grp: TresRecord) -> Qos {
+        Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn sole_blocker(
+        job: &Job,
+        qos: &Qos,
+        qos_running: &TresRecord,
+        user_running_count: u32,
+    ) -> bool {
+        grp_node_is_sole_blocker(
+            job,
+            qos,
+            user_running_count,
+            0,
+            &TresRecord::new(),
+            qos_running,
+            None,
+            job.spec.num_nodes as u64,
+        )
+    }
+
+    #[test]
+    fn grp_node_is_sole_blocker_when_only_the_node_cap_is_breached() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        let qos = grp_qos(grp);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2); // 2 + 3 > 4
+
+        assert!(sole_blocker(&job, &qos, &qos_running, 0));
+    }
+
+    #[test]
+    fn grp_node_not_sole_blocker_when_the_job_already_fits() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 10);
+        let qos = grp_qos(grp);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+
+        assert!(!sole_blocker(&job, &qos, &TresRecord::new(), 0));
+    }
+
+    /// The reason code alone is not enough to decide eligibility: `grp_tres` is
+    /// checked cpu -> node -> mem -> gpu and only the first breach is reported,
+    /// so this job reports the node limit while a memory breach also stands.
+    /// Loaning it idle nodes would let it escape a cap on a contended resource.
+    #[test]
+    fn grp_node_not_sole_blocker_when_the_memory_cap_is_also_breached() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        grp.set(TresType::Memory, 2000);
+        let qos = grp_qos(grp);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        job.spec.memory_per_node_mb = Some(1000); // 3 * 1000 > 2000
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2); // 2 + 3 > 4
+
+        assert_eq!(
+            check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running, None),
+            QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit),
+            "precondition: the node breach is the one reported"
+        );
+        assert!(!sole_blocker(&job, &qos, &qos_running, 0));
+    }
+
+    #[test]
+    fn grp_node_not_sole_blocker_when_a_non_tres_limit_also_blocks() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        let mut qos = grp_qos(grp);
+        qos.limits.max_jobs_per_user = Some(1);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2);
+
+        assert!(!sole_blocker(&job, &qos, &qos_running, 1));
+    }
+
+    #[test]
+    fn grp_node_not_sole_blocker_without_a_group_cap() {
+        let qos = make_qos(None, None);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+
+        assert!(!sole_blocker(&job, &qos, &TresRecord::new(), 0));
+    }
+
+    #[test]
+    fn grp_node_not_sole_blocker_when_the_node_dimension_is_unset() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 2); // job asks for 4 cpus
+        let qos = grp_qos(grp);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+
+        assert!(!sole_blocker(&job, &qos, &TresRecord::new(), 0));
     }
 
     #[test]
