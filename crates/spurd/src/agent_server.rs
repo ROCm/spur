@@ -4179,6 +4179,7 @@ impl SlurmAgent for AgentService {
         // Use the interface spurd resolved at startup (via the reporter), not a fresh env read
         // that would ignore spur.conf and could diverge from the rest of spurd.
         let iface = self.reporter.wg_iface.clone();
+        let config_path = self.reporter.wg_config_dir.join(format!("{iface}.conf"));
         // proto -> spur-net mesh types.
         let members: Vec<spur_net::mesh::MeshNode> = request
             .into_inner()
@@ -4215,6 +4216,19 @@ impl SlurmAgent for AgentService {
                         "this node is not in the pushed mesh membership".to_string(),
                     ));
                 };
+                // Peers in this node's persisted config are never this reconcile's to prune, even
+                // when absent from the pushed k0s membership.
+                let protected: std::collections::HashSet<String> =
+                    match spur_net::wireguard::WgConfig::read_from(&config_path) {
+                        Ok(c) => c.peers.into_iter().map(|p| p.public_key).collect(),
+                        // An unreadable config protects nothing, so say so — silently pruning
+                        // peers because the file moved or is unreadable is the bad outcome here.
+                        Err(e) if config_path.exists() => {
+                            tracing::warn!(path = %config_path.display(), error = %e, "cannot read persisted WireGuard config; its peers are not protected from the mesh prune");
+                            Default::default()
+                        }
+                        Err(_) => Default::default(),
+                    };
                 // Reconcile: prune peers no longer in the membership, then add/update the desired peers.
                 let current = spur_net::wireguard::list_peers(&iface).unwrap_or_default();
                 let (added, pruned) = spur_net::mesh::reconcile_mesh(
@@ -4222,6 +4236,7 @@ impl SlurmAgent for AgentService {
                     &self_mesh_ip,
                     &members,
                     &current,
+                    &protected,
                     false,
                 )?;
                 Ok((
@@ -5715,6 +5730,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
         ))
     }
@@ -7021,6 +7037,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
         ))
     }
@@ -7784,6 +7801,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
         ));
         let svc = AgentService::with_cluster_config(
