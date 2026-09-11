@@ -168,6 +168,36 @@ impl std::fmt::Display for SrunCompleteError {
 
 impl std::error::Error for SrunCompleteError {}
 
+/// Errors from cancelling a job.
+#[derive(Debug)]
+pub enum CancelError {
+    NotFound(JobId),
+    AlreadyTerminal { job_id: JobId, state: JobState },
+    NotOwner(spur_core::auth::AuthError),
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for CancelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "job {id} not found"),
+            Self::AlreadyTerminal { job_id, state } => {
+                write!(f, "job {job_id} is already {state:?}")
+            }
+            Self::NotOwner(e) => write!(f, "{e}"),
+            Self::Internal(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CancelError {}
+
+impl From<anyhow::Error> for CancelError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Internal(err)
+    }
+}
+
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1295,23 +1325,28 @@ impl ClusterManager {
     /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller and
     /// a literal `"root"` is the admin override, so both are treated as internal here; the raw
     /// [`spur_core::auth::check_job_owner`] no longer infers that itself.
-    fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
+    fn check_job_owner(
+        user: &str,
+        owner: &str,
+        action: &str,
+    ) -> Result<(), spur_core::auth::AuthError> {
         let is_internal = user.is_empty() || user == "root";
-        spur_core::auth::check_job_owner(user, is_internal, owner, action).map_err(Into::into)
+        spur_core::auth::check_job_owner(user, is_internal, owner, action)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or
     /// empty (trusted internal/daemon calls).
-    pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
+    pub fn cancel_job(&self, job_id: JobId, user: &str) -> Result<(), CancelError> {
         {
             let jobs = self.jobs.read();
-            let job = jobs
-                .get(&job_id)
-                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            let job = jobs.get(&job_id).ok_or(CancelError::NotFound(job_id))?;
             if job.state.is_terminal() {
-                anyhow::bail!("job {} is already {:?}", job_id, job.state);
+                return Err(CancelError::AlreadyTerminal {
+                    job_id,
+                    state: job.state,
+                });
             }
-            Self::check_job_owner(user, &job.spec.user, "cancel")?;
+            Self::check_job_owner(user, &job.spec.user, "cancel").map_err(CancelError::NotOwner)?;
         }
 
         // Use JobComplete (not JobStateChange) so that resource deallocation
@@ -19378,6 +19413,42 @@ mod tests {
         assert!(
             result.is_err(),
             "cancelling an already-cancelled job must fail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_errors_are_typed_and_keep_their_text() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let err = cm.cancel_job(999, "testuser").unwrap_err();
+        assert!(matches!(err, CancelError::NotFound(999)), "{err:?}");
+        assert_eq!(err.to_string(), "job 999 not found");
+
+        let job_id = submit_and_wait(&cm, basic_spec("typed-cancel"));
+        let err = cm.cancel_job(job_id, "other_user").unwrap_err();
+        assert!(matches!(err, CancelError::NotOwner(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "user other_user cannot cancel job owned by testuser"
+        );
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+        let err = cm.cancel_job(job_id, "testuser").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CancelError::AlreadyTerminal {
+                    job_id: id,
+                    state: JobState::Cancelled
+                } if id == job_id
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("job {job_id} is already Cancelled")
         );
     }
 

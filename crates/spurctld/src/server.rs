@@ -22,7 +22,7 @@ use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
 use crate::accounting::{txn, TxnAction, TxnEntity, TxnRecord, TxnSource};
-use crate::cluster::{ClusterManager, JobFilter, PartitionError, ReservationError};
+use crate::cluster::{CancelError, ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
@@ -945,7 +945,7 @@ impl SlurmController for ControllerService {
 
         self.cluster
             .cancel_job(job_id, &req.user)
-            .map_err(cluster_err_to_status)?;
+            .map_err(cancel_err_to_status)?;
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
@@ -4799,18 +4799,22 @@ fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (
     (max_nodes, clear)
 }
 
-fn cluster_err_to_status(err: anyhow::Error) -> Status {
-    if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
-        return Status::permission_denied(err.to_string());
-    }
-    Status::internal(err.to_string())
-}
-
 fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
     if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
         return Status::permission_denied(err.to_string());
     }
     Status::failed_precondition(err.to_string())
+}
+
+fn cancel_err_to_status(err: CancelError) -> Status {
+    let message = err.to_string();
+    let code = match err {
+        CancelError::NotFound(_) => Code::NotFound,
+        CancelError::AlreadyTerminal { .. } => Code::FailedPrecondition,
+        CancelError::NotOwner(_) => Code::PermissionDenied,
+        CancelError::Internal(_) => Code::Internal,
+    };
+    Status::new(code, message)
 }
 
 fn node_complete_to_status(err: NodeCompleteError) -> Status {
@@ -6098,6 +6102,69 @@ mod tests {
             .into_inner();
         assert_eq!(resp.requeued, 1);
         assert!(resp.skipped.is_empty());
+    }
+
+    // Exercises the cancel RPC boundary. The operator relies on NotFound and
+    // FailedPrecondition to tell "nothing left to cancel" from a real failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_rpc_maps_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let spec = spur_core::job::JobSpec {
+            name: "cancel".into(),
+            user: "alice".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let cancel = |job_id: u32, user: &str| {
+            Request::new(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: user.into(),
+            })
+        };
+
+        let err = svc
+            .cancel_job(cancel(999_999, "alice"))
+            .await
+            .expect_err("unknown job must error");
+        assert_eq!(err.code(), Code::NotFound);
+        assert_eq!(err.message(), "job 999999 not found");
+
+        let err = svc
+            .cancel_job(cancel(job_id, "mallory"))
+            .await
+            .expect_err("non-owner must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        svc.cancel_job(cancel(job_id, "alice"))
+            .await
+            .expect("owner cancel must succeed");
+        for _ in 0..200 {
+            if job_state(&svc.cluster, job_id) == Some(JobState::Cancelled) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let err = svc
+            .cancel_job(cancel(job_id, "alice"))
+            .await
+            .expect_err("a terminal job must not be cancelled twice");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(err.message(), format!("job {job_id} is already Cancelled"));
     }
 
     // An authenticated non-admin cannot requeue another user's job by setting user="root" on
@@ -8599,6 +8666,39 @@ mod tests {
             assert_eq!(status.code(), want_code);
             let agent_retryable = spur_proto::controller_rpc_retryable(&status);
             assert_eq!(retry, agent_retryable, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_err_to_status_maps_each_variant() {
+        let cases = [
+            (CancelError::NotFound(7), Code::NotFound),
+            (
+                CancelError::AlreadyTerminal {
+                    job_id: 7,
+                    state: JobState::Cancelled,
+                },
+                Code::FailedPrecondition,
+            ),
+            (
+                CancelError::NotOwner(spur_core::auth::AuthError::NotJobOwner {
+                    user: "mallory".into(),
+                    owner: "alice".into(),
+                    action: "cancel".into(),
+                }),
+                Code::PermissionDenied,
+            ),
+            (
+                CancelError::Internal(anyhow::anyhow!("raft propose failed")),
+                Code::Internal,
+            ),
+        ];
+
+        for (err, want_code) in cases {
+            let message = err.to_string();
+            let status = cancel_err_to_status(err);
+            assert_eq!(status.code(), want_code, "{message}");
+            assert_eq!(status.message(), message);
         }
     }
 
