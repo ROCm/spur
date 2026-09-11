@@ -47,6 +47,13 @@ The binaries land in ``target/release/``. For a fuller build walkthrough see
    (agent gRPC), and **6821** (Raft, controller-to-controller). Open these between the
    relevant hosts.
 
+   ``spurctld`` also listens on **6823** for ``/livez`` and ``/readyz``, on every
+   interface, so that an orchestrator or a load balancer can reach it. The two routes
+   need no credential and answer with a status code and one word: whether the Raft
+   core runs, and whether a leader is known. Do not open 6823 more widely than the
+   checker needs, and set ``probes.enabled = false`` to switch it off. See
+   :doc:`/admin-guide/configuration`.
+
 Daemon Flags
 ------------
 
@@ -290,6 +297,8 @@ addresses, in the same order on every controller, to the ``peers`` list in the c
 
 Raft automatically elects a leader. Workers connect to any controller and are redirected
 to the current leader.
+
+To add or remove a controller after the first start, see :doc:`controller-ha`.
 
 Joining Worker Nodes
 --------------------

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod admin;
 mod authclient;
 mod env_defaults;
 mod exec;
@@ -150,6 +151,7 @@ fn main() -> anyhow::Result<()> {
         "image" => return runtime.block_on(image::main()),
         "exec" => return runtime.block_on(exec::main()),
         "token" => return runtime.block_on(token::main()),
+        "admin" => return runtime.block_on(admin::main()),
         _ => {}
     }
 
@@ -186,7 +188,7 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "node" | "k8s" | "image" | "exec" | "token" => Some(args[1].as_str()),
+        "net" | "node" | "k8s" | "image" | "exec" | "token" | "admin" => Some(args[1].as_str()),
         _ => None,
     };
 
@@ -240,6 +242,7 @@ fn main() -> anyhow::Result<()> {
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             "token" => runtime.block_on(token::main_with_args(rewritten)),
+            "admin" => runtime.block_on(admin::main_with_args(rewritten)),
             _ => unreachable!(),
         };
         return result;
@@ -329,6 +332,7 @@ fn print_usage() {
     eprintln!("  attach      Attach to a running job's I/O");
     eprintln!("  crontab     Manage recurring cron-style jobs");
     eprintln!("  health      Node health monitoring");
+    eprintln!("  admin       Administer the controller set (raft membership)");
     eprintln!("  version     Show version (--check to check for updates)");
     eprintln!("  self-update Download and install the latest version (--nightly)");
     eprintln!();
