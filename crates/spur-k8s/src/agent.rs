@@ -1291,3 +1291,139 @@ mod tests {
         assert_eq!(gpu_request_to_gres(1, Some("gfx942")), "gpu:gfx942:1");
     }
 }
+
+#[cfg(test)]
+mod resolve_job_tests {
+    use super::*;
+    use crate::test_support::{list_response, FakeApiServer};
+    use http::StatusCode;
+
+    const JOB_ID: u32 = 7;
+    const LIST_PATH: &str = "/apis/spur.amd.com/v1alpha1/spurjobs";
+
+    fn spur_job(name: &str, namespace: Option<&str>, assigned_nodes: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "spur.amd.com/v1alpha1",
+            "kind": "SpurJob",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": { "spur.amd.com/job-id": JOB_ID.to_string() },
+            },
+            "spec": { "name": name, "image": "busybox" },
+            "status": { "assignedNodes": assigned_nodes },
+        })
+    }
+
+    fn server_listing(jobs: &[serde_json::Value]) -> FakeApiServer {
+        FakeApiServer::answering(StatusCode::OK, &list_response(jobs))
+    }
+
+    fn assert_lists_by_job_label(server: &FakeApiServer) {
+        let requests = server.requests();
+        assert!(!requests.is_empty(), "the agent must ask the API server");
+        for req in &requests {
+            assert_eq!(req.method, http::Method::GET);
+            assert_eq!(req.path, LIST_PATH);
+            assert!(
+                req.decoded_query()
+                    .contains(&format!("labelSelector=spur.amd.com/job-id={JOB_ID}")),
+                "the list must select on the job label, got query {:?}",
+                req.query
+            );
+        }
+    }
+
+    /// Paused time lets the retry loop burn the whole lookup budget at once, so
+    /// the test observes the real budget without waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn no_spurjob_within_the_budget_is_a_not_found_rejection() {
+        let server = server_listing(&[]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .resolve_job(JOB_ID)
+            .await
+            .err()
+            .expect("no SpurJob must fail");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let expected_message = format!(
+            "no SpurJob carries the label spur.amd.com/job-id={JOB_ID} after {}s",
+            NS_LOOKUP_BUDGET.as_secs()
+        );
+        assert!(
+            err.message().starts_with(&expected_message),
+            "the message must say what was missing and for how long, got {:?}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("kubectl apply"),
+            "the message must tell the operator how to submit a job the operator can launch"
+        );
+        assert!(
+            server.requests().len() > 1,
+            "an empty list is retried while the label may still be propagating"
+        );
+        assert_lists_by_job_label(&server);
+    }
+
+    #[tokio::test]
+    async fn the_one_matching_spurjob_gives_its_namespace_and_allocation() {
+        let server = server_listing(&[spur_job("train", Some("team-a"), &["n1", "n2"])]);
+        let agent = VirtualAgent::new(server.client());
+
+        let resolved = agent.resolve_job(JOB_ID).await.expect("one match resolves");
+
+        assert_eq!(resolved.namespace, "team-a");
+        assert_eq!(resolved.assigned_nodes, vec!["n1", "n2"]);
+        assert_eq!(server.requests().len(), 1, "a match needs no retry");
+        assert_lists_by_job_label(&server);
+    }
+
+    #[tokio::test]
+    async fn two_matching_spurjobs_are_refused_without_a_retry() {
+        let server = server_listing(&[
+            spur_job("train", Some("team-a"), &[]),
+            spur_job("train-copy", Some("team-b"), &[]),
+        ]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .resolve_job(JOB_ID)
+            .await
+            .err()
+            .expect("ambiguity must fail");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("refusing to guess"),
+            "got {:?}",
+            err.message()
+        );
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "a real conflict is not a propagation race, so it must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_match_without_a_namespace_is_not_found() {
+        let server = server_listing(&[spur_job("train", None, &[])]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .resolve_job(JOB_ID)
+            .await
+            .err()
+            .expect("no namespace must fail");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(
+            err.message().contains("has no namespace"),
+            "got {:?}",
+            err.message()
+        );
+    }
+}
