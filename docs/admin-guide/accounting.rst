@@ -1114,8 +1114,9 @@ associations, and other dimensions in the same value are still enforced —
 ``maxtresperjob=cpu=0,gres/gpu=4`` caps GPUs and ignores CPUs.
 
 A resource therefore cannot be denied by capping it at ``0``. To keep jobs off a
-resource, leave it out of what they request; to stop a scope from running
-anything, use ``maxsubmitjobs=0``.
+resource, leave it out of what they request; to stop a scope from having any job
+accepted, use ``maxsubmitjobs=0`` — it rejects every submission outright, so
+nothing is queued.
 
 .. _grptres-node-packing:
 
