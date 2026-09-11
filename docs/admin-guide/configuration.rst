@@ -880,9 +880,10 @@ WireGuard mesh networking and the agent port.
    * - ``wg_enabled``
      - bool
      - ``false``
-     - Not implemented
-     - Intended to enable WireGuard mesh networking. No code reads it; the mesh
-       is driven by ``[cluster] enabled`` instead.
+     - Restart
+     - Enable WireGuard mesh networking. For a managed k0s cluster using Calico,
+       selects ``bird`` native routing when enabled or ``vxlan`` when disabled;
+       it does not change kuberouter's CNI configuration.
    * - ``wg_cidr``
      - string
      - ``"10.44.0.0/16"``
@@ -1774,23 +1775,25 @@ own startup. Only ``allow_admin_kubeconfig`` is reloadable.
      - string
      - ``"10.42.0.0/16"``
      - Restart
-     - Pod network CIDR. Prefix must be ``<= /24`` (per-node /24 carving).
+     - Pod network CIDR passed to k0s for either CNI. Prefix must be ``<= /24``
+       (per-node /24 carving).
    * - ``service_cidr``
      - string
      - ``"10.43.0.0/16"``
      - Restart
-     - Service network CIDR.
+     - Service network CIDR passed to k0s for either CNI.
    * - ``cni``
      - string
      - ``"kuberouter"``
      - Restart
-     - CNI mode: ``"kuberouter"`` (k0s default) or ``"calico"`` (bird native routing
-       over the mesh).
+     - CNI mode: ``"kuberouter"`` (k0s default interface selection) or ``"calico"``
+       (``bird`` native routing over the mesh when WireGuard is enabled, otherwise
+       ``vxlan``; pins kubelet ``--node-ip`` to the advertised address).
    * - ``cni_mtu``
      - integer
      - ``1450``
      - Restart
-     - CNI MTU, leaving headroom for WireGuard overhead.
+     - Calico MTU, leaving headroom for WireGuard overhead. Ignored by ``kuberouter``.
    * - ``control_plane_node``
      - string
      - none

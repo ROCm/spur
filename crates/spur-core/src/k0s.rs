@@ -59,59 +59,57 @@ mod local_path_tests {
     }
 }
 
-/// Generate a k0s controller config (YAML) for a Calico cluster. `api_address` is where the API
-/// server is advertised — the control-plane's WireGuard mesh IP when `mesh_native`, else its real
-/// underlay address. `mesh_native` also picks Calico's mode: `bird` (native routing over the mesh,
-/// no overlay) when true, else `vxlan` (Calico's own overlay — no mesh required). `cni_mtu` sets
-/// Calico's MTU (typically below the underlay to leave room for encapsulation overhead, avoiding
-/// fragmentation). Returns `None` for any `cni` other than `"calico"` (the k0s default, kube-router,
-/// needs no config file). `sans` are extra API-server certificate SANs.
-///
-/// For a multi-CP cluster (`cp_count > 1`) no VIP can float over the mesh's cryptokey routing (`bird`
-/// mode) or Calico's own overlay (`vxlan` mode), so node-local load balancing (EnvoyProxy) is enabled
-/// to give konnectivity a cluster-wide balanced endpoint instead of pinning every agent to one controller.
+/// Generates the k0s controller config: `pod_cidr`/`service_cidr` apply to either `cni`; the
+/// `api`/`sans`/Calico/load-balancing blocks are calico-only, and `sans` further needs `api_address`.
+/// `mesh_native` picks Calico's mode — `bird` (native routing over the WireGuard mesh, `api_address`
+/// being the control-plane's mesh IP) when true, else `vxlan` (Calico's own overlay, no mesh needed,
+/// `api_address` being its real underlay address). `cni_mtu` is Calico-only.
 #[allow(clippy::too_many_arguments)]
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,
     service_cidr: &str,
-    cni_mtu: u16,
-    api_address: &str,
+    cni_mtu: Option<u16>,
+    api_address: Option<&str>,
     sans: &[String],
     cp_count: usize,
     mesh_native: bool,
-) -> Option<String> {
-    if cni != "calico" {
-        return None;
-    }
+) -> String {
+    let calico = cni == "calico";
     let mut y = String::new();
     y.push_str("apiVersion: k0s.k0sproject.io/v1beta1\n");
     y.push_str("kind: ClusterConfig\n");
     y.push_str("metadata:\n");
     y.push_str("  name: k0s\n");
     y.push_str("spec:\n");
-    y.push_str("  api:\n");
-    y.push_str(&format!("    address: {api_address}\n"));
-    if !sans.is_empty() {
-        y.push_str("    sans:\n");
-        for san in sans {
-            y.push_str(&format!("      - {san}\n"));
+    if let Some(api_address) = api_address.filter(|_| calico) {
+        y.push_str("  api:\n");
+        y.push_str(&format!("    address: {api_address}\n"));
+        if !sans.is_empty() {
+            y.push_str("    sans:\n");
+            for san in sans {
+                y.push_str(&format!("      - {san}\n"));
+            }
         }
     }
     y.push_str("  network:\n");
-    y.push_str("    provider: calico\n");
+    y.push_str(&format!("    provider: {cni}\n"));
     y.push_str(&format!("    podCIDR: {pod_cidr}\n"));
     y.push_str(&format!("    serviceCIDR: {service_cidr}\n"));
-    y.push_str("    calico:\n");
-    let mode = if mesh_native { "bird" } else { "vxlan" };
-    y.push_str(&format!("      mode: {mode}\n"));
-    y.push_str(&format!("      mtu: {cni_mtu}\n"));
-    if cp_count > 1 {
-        y.push_str("    nodeLocalLoadBalancing:\n");
-        y.push_str("      enabled: true\n");
-        y.push_str("      type: EnvoyProxy\n");
+    if calico {
+        y.push_str("    calico:\n");
+        let mode = if mesh_native { "bird" } else { "vxlan" };
+        y.push_str(&format!("      mode: {mode}\n"));
+        if let Some(cni_mtu) = cni_mtu {
+            y.push_str(&format!("      mtu: {cni_mtu}\n"));
+        }
+        if cp_count > 1 {
+            y.push_str("    nodeLocalLoadBalancing:\n");
+            y.push_str("      enabled: true\n");
+            y.push_str("      type: EnvoyProxy\n");
+        }
     }
-    Some(y)
+    y
 }
 
 #[cfg(test)]
@@ -189,13 +187,12 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
-            "192.0.2.1",
+            Some(1450),
+            Some("192.0.2.1"),
             &["192.0.2.1".to_string(), "203.0.113.9".to_string()],
             1,
             true,
-        )
-        .unwrap();
+        );
         assert!(y.contains("address: 192.0.2.1"));
         assert!(y.contains("      - 203.0.113.9"));
         assert!(y.contains("provider: calico"));
@@ -212,31 +209,60 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
-            "203.0.113.9",
+            Some(1450),
+            Some("203.0.113.9"),
             &["203.0.113.9".to_string()],
             1,
             false,
-        )
-        .unwrap();
+        );
         assert!(y.contains("address: 203.0.113.9"));
         assert!(y.contains("mode: vxlan"));
         assert!(!y.contains("mode: bird"));
+        // The CIDRs ride along whichever Calico mode is picked.
+        assert!(y.contains("podCIDR: 192.0.2.0/24"));
+        assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
     }
 
+    /// kuberouter must carry the configured CIDRs, not k0s's own built-in default.
     #[test]
-    fn kuberouter_default_generates_no_config() {
-        assert!(k0s_controller_config_yaml(
+    fn kuberouter_carries_configured_pod_and_service_cidr() {
+        let y = k0s_controller_config_yaml(
             "kuberouter",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
-            "192.0.2.1",
+            None,
+            Some("192.0.2.1"),
             &[],
             3,
             true,
-        )
-        .is_none());
+        );
+        assert!(y.contains("provider: kuberouter"));
+        assert!(y.contains("podCIDR: 192.0.2.0/24"));
+        assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
+        assert!(!y.contains("api:"));
+        assert!(!y.contains("calico:"));
+    }
+
+    /// A calico controller whose advertised address isn't resolvable yet still gets the CIDRs and
+    /// the calico block; only the `api` block waits.
+    #[test]
+    fn calico_without_an_api_address_still_carries_cidr_but_omits_api_block() {
+        let y = k0s_controller_config_yaml(
+            "calico",
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            Some(1450),
+            None,
+            &[],
+            1,
+            true,
+        );
+        assert!(y.contains("podCIDR: 192.0.2.0/24"));
+        assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
+        assert!(!y.contains("api:"));
+        assert!(y.contains("calico:"));
+        assert!(y.contains("mode: bird"));
+        assert!(y.contains("mtu: 1450"));
     }
 
     #[test]
@@ -246,13 +272,12 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
-            "192.0.2.1",
+            Some(1450),
+            Some("192.0.2.1"),
             &["192.0.2.1".to_string()],
             3,
             true,
-        )
-        .unwrap();
+        );
         assert!(y.contains("nodeLocalLoadBalancing:"));
         assert!(y.contains("enabled: true"));
         assert!(y.contains("type: EnvoyProxy"));
@@ -265,13 +290,12 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
-            1450,
-            "192.0.2.1",
+            Some(1450),
+            Some("192.0.2.1"),
             &["192.0.2.1".to_string()],
             1,
             true,
-        )
-        .unwrap();
+        );
         assert!(!y.contains("nodeLocalLoadBalancing"));
     }
 }
