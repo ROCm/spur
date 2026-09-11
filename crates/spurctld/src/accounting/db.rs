@@ -174,7 +174,8 @@ DECLARE
 BEGIN
     FOR target IN
         SELECT *
-        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'))
+        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'),
+                     ('txn', 'actor_uid'))
              AS t(tbl, col)
     LOOP
         IF EXISTS (
