@@ -20,9 +20,10 @@ use spur_core::auth::Identity;
 use super::registry::{self, AuditScope, Mutating, RpcClass};
 use super::AuditSlot;
 use crate::accounting::{txn, TxnOutcome, TxnRecord, TxnSource};
+use crate::auth_middleware::Verified;
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
-use crate::rpc_middleware::grpc_operation_name;
+use crate::rpc_middleware::{grpc_operation_name, peer_addr};
 
 /// Not `audit`, which already carries job-submit hook decisions; interleaving
 /// the two would leave neither stream filterable.
@@ -109,6 +110,9 @@ where
         let method = grpc_operation_name(req.uri().path());
         let class = registry::classify(&method);
         let identity = req.extensions().get::<Identity>().cloned();
+        // The marker, not the identity's presence: a future path deriving an
+        // identity without checking a credential must not record as verified.
+        let verified = req.extensions().get::<Verified>().is_some();
         let peer = peer_addr(req.extensions());
 
         // Only mutating RPCs get a slot, so a read cannot annotate its way into
@@ -172,6 +176,7 @@ where
                     let record = build_record(
                         m,
                         identity.as_ref(),
+                        verified,
                         peer,
                         annotation,
                         outcome,
@@ -209,18 +214,12 @@ fn outcome_of(headers: &HeaderMap) -> (TxnOutcome, Option<String>) {
     }
 }
 
-fn peer_addr(extensions: &http::Extensions) -> Option<String> {
-    extensions
-        .get::<tonic::transport::server::TcpConnectInfo>()
-        .and_then(|info| info.remote_addr())
-        .map(|addr| addr.to_string())
-}
-
 /// Assemble the row from the layer's half (who, where from, how it ended) and
 /// the handler's half (which object, which parameters).
 fn build_record(
     m: Mutating,
     identity: Option<&Identity>,
+    verified: bool,
     peer: Option<String>,
     annotation: Option<super::Annotation>,
     outcome: TxnOutcome,
@@ -230,8 +229,8 @@ fn build_record(
         Some(a) => (a.target, a.details, a.asserted_actor),
         None => (String::new(), serde_json::json!({}), None),
     };
-    // A verified credential always wins; the wire is consulted only when there
-    // is no identity to trust, which is `permissive` with no token.
+    // An identity always wins over the wire, verified or not; the asserted name
+    // is consulted only when there is no identity at all.
     let actor = match identity {
         Some(id) => id.user.clone(),
         None => asserted.unwrap_or_default(),
@@ -239,8 +238,12 @@ fn build_record(
     TxnRecord {
         ts: Utc::now(),
         actor,
-        actor_uid: identity.map(|id| i64::from(id.uid)),
-        verified: identity.is_some(),
+        // Gated on verification, not presence, so a recorded uid is always one
+        // a credential proved rather than one a host asserted.
+        actor_uid: verified
+            .then(|| identity.map(|id| i64::from(id.uid)))
+            .flatten(),
+        verified,
         peer_addr: peer.unwrap_or_default(),
         source: TxnSource::Api,
         action: m.action,
@@ -286,6 +289,7 @@ mod tests {
         let rec = build_record(
             node_update(),
             Some(&identity("alice", 1000)),
+            true,
             Some("10.11.99.42:51234".into()),
             Some(annotation("n1", None)),
             TxnOutcome::Success,
@@ -307,6 +311,7 @@ mod tests {
         let rec = build_record(
             node_update(),
             Some(&identity("alice", 1000)),
+            true,
             None,
             Some(annotation("n1", Some("root"))),
             TxnOutcome::Success,
@@ -326,6 +331,7 @@ mod tests {
         let rec = build_record(
             node_update(),
             None,
+            false,
             None,
             Some(annotation("daily", Some("bob"))),
             TxnOutcome::Denied,
@@ -341,11 +347,37 @@ mod tests {
         assert!(rec.details.contains("cannot modify"));
     }
 
+    /// Guards a mechanism that does not exist yet: `auth.plugin = "none"` would
+    /// derive an identity from the local UNIX user, which is not proof.
+    #[test]
+    fn an_unverified_identity_names_the_actor_but_claims_no_proof() {
+        let rec = build_record(
+            node_update(),
+            Some(&identity("root", 0)),
+            false,
+            None,
+            Some(annotation("n1", None)),
+            TxnOutcome::Success,
+            None,
+        );
+
+        assert_eq!(
+            rec.actor, "root",
+            "the derived name is still worth recording"
+        );
+        assert!(!rec.verified, "no credential was verified");
+        assert_eq!(
+            rec.actor_uid, None,
+            "an unproven uid 0 must not be stored as though a credential proved it"
+        );
+    }
+
     #[test]
     fn a_uid_above_i32_max_is_not_wrapped_negative() {
         let rec = build_record(
             node_update(),
             Some(&identity("svc", 4_000_000_000)),
+            true,
             None,
             Some(annotation("n1", None)),
             TxnOutcome::Success,
@@ -361,6 +393,7 @@ mod tests {
         let rec = build_record(
             node_update(),
             None,
+            false,
             None,
             None,
             TxnOutcome::Error,
@@ -485,8 +518,10 @@ mod tests {
             .uri(format!("/slurm.SlurmController/{method}"))
             .body(())
             .expect("request");
+        // Mirrors `AuthLayer`, which inserts both together on a verified token.
         if let Some(id) = identity {
             req.extensions_mut().insert(id);
+            req.extensions_mut().insert(Verified);
         }
 
         let layer = AuditLayer::new(context.clone() as Arc<dyn AuditContext>, false);
@@ -532,6 +567,11 @@ mod tests {
         assert_eq!(rows[0].actor, "alice");
         assert_eq!(rows[0].outcome, TxnOutcome::Success);
         assert_eq!(rows[0].entity_type, TxnEntity::Node);
+        assert!(
+            rows[0].verified,
+            "the Verified marker must reach the record"
+        );
+        assert_eq!(rows[0].actor_uid, Some(1000));
     }
 
     #[tokio::test]

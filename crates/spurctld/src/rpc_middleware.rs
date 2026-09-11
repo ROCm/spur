@@ -101,6 +101,14 @@ pub(crate) fn grpc_operation_name(path: &str) -> String {
         .to_string()
 }
 
+/// Caller address for a request, `None` when the transport did not record one.
+pub(crate) fn peer_addr(extensions: &http::Extensions) -> Option<String> {
+    extensions
+        .get::<tonic::transport::server::TcpConnectInfo>()
+        .and_then(|info| info.remote_addr())
+        .map(|addr| addr.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

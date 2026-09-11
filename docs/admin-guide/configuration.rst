@@ -951,10 +951,12 @@ WireGuard mesh networking and the agent port.
      - bool
      - Restart
      - ``false``
-     - Log every inbound controller RPC, reads included, on the ``audit_rpc``
-       tracing target with the method, authenticated user, peer address, and
-       outcome. Slurm's ``DebugFlags=AuditRPCs``. Off by default because it is
-       the highest-volume log Spur emits. The controller reads this at startup,
+     - Log every authenticated controller RPC, reads included, on the
+       ``audit_rpc`` tracing target with the method, authenticated user, peer
+       address, and outcome. Slurm's ``DebugFlags=AuditRPCs``. Off by default
+       because it is the highest-volume log Spur emits. Requests refused during
+       authentication are logged unconditionally on the main log instead, so
+       they do not depend on this setting. The controller reads this at startup,
        so changing it needs a restart rather than ``scontrol reconfigure``. See
        :doc:`accounting`.
 

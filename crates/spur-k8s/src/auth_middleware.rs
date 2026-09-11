@@ -16,6 +16,14 @@ use tracing::warn;
 use spur_core::auth::BearerOutcome;
 use spur_core::config::AuthMode;
 
+/// Caller address for a request, `None` when the transport did not record one.
+fn peer_addr(extensions: &http::Extensions) -> Option<String> {
+    extensions
+        .get::<tonic::transport::server::TcpConnectInfo>()
+        .and_then(|info| info.remote_addr())
+        .map(|addr| addr.to_string())
+}
+
 #[derive(Clone)]
 pub struct AgentAuthLayer {
     inner: Arc<AgentAuthConfig>,
@@ -100,6 +108,14 @@ where
                 }
             }
             BearerOutcome::Reject(msg) => {
+                // A forged credential aimed at pod creation is worth recording on
+                // every cluster, so this is not gated behind any debug setting.
+                warn!(
+                    path = %req.uri().path(),
+                    peer = peer_addr(req.extensions()).as_deref().unwrap_or("-"),
+                    reason = %msg,
+                    "rejected an operator RPC with an invalid credential"
+                );
                 let resp = tonic::Status::unauthenticated(msg).into_http();
                 return Box::pin(async move { Ok(resp) });
             }

@@ -1309,24 +1309,31 @@ impl SlurmController for ControllerService {
             }
         }
 
+        // Annotate before the gate and before validating, so a refused or
+        // malformed request is still attributed to the node it targeted.
+        let audit = crate::audit::slot(&request);
+        let parsed = request
+            .get_ref()
+            .state
+            .map(spur_core::node::NodeState::from_proto_i32);
+        {
+            let r = request.get_ref();
+            crate::audit::annotate(
+                &audit,
+                &r.name,
+                txn::node_update_details(
+                    requested_node_state(r.state, parsed.flatten()).as_deref(),
+                    r.reason.as_deref(),
+                    &r.labels,
+                    &r.remove_labels,
+                ),
+            );
+        }
+
         self.require_admin(&request, "update node")?;
 
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
-        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
-        let parsed = req.state.map(spur_core::node::NodeState::from_proto_i32);
-        // Annotate before validating so a rejected request is still attributed
-        // to the node it targeted.
-        crate::audit::annotate(
-            &audit,
-            &req.name,
-            txn::node_update_details(
-                requested_node_state(req.state, parsed.flatten()).as_deref(),
-                req.reason.as_deref(),
-                &req.labels,
-                &req.remove_labels,
-            ),
-        );
         let node_state = match parsed {
             Some(None) => return Err(Status::invalid_argument("invalid node state")),
             other => other.flatten(),
@@ -1362,14 +1369,21 @@ impl SlurmController for ControllerService {
             }
         }
 
+        // Annotate before the gate so a refused attempt still names the node it
+        // targeted, which is the whole question the audit log answers.
+        let audit = crate::audit::slot(&request);
+        crate::audit::annotate(
+            &audit,
+            &request.get_ref().name,
+            txn::node_drain_details(&request.get_ref().reason),
+        );
+
         // Draining a node takes it out of service cluster-wide, so it needs the
         // same bar as `update_node`, which reaches the identical state change.
         self.require_admin(&request, "drain node")?;
 
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
-        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
-        crate::audit::annotate(&audit, &req.name, txn::node_drain_details(&req.reason));
         let reason = if req.reason.is_empty() {
             None
         } else {
@@ -1406,17 +1420,18 @@ impl SlurmController for ControllerService {
             }
         }
 
+        let audit = crate::audit::slot(&request);
+        crate::audit::annotate(
+            &audit,
+            &request.get_ref().name,
+            txn::node_remove_details(&request.get_ref().reason, request.get_ref().force),
+        );
+
         // Removing a node evicts its running jobs, so it needs the same bar as
         // the other operator-driven node RPCs.
         self.require_admin(&request, "remove node")?;
 
-        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
-        crate::audit::annotate(
-            &audit,
-            &req.name,
-            txn::node_remove_details(&req.reason, req.force),
-        );
         let reason = if req.reason.is_empty() {
             None
         } else {
@@ -9300,6 +9315,58 @@ mod tests {
             svc.deregister_node(remove).await.unwrap_err().code(),
             Code::NotFound
         );
+    }
+
+    /// A refused mutation must still name what it targeted — "who tried to drain
+    /// node07 and was denied" is exactly what the audit log is for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_node_action_is_annotated_before_the_gate() {
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        for (name, run) in [("DrainNode", 0), ("DeregisterNode", 1), ("UpdateNode", 2)] {
+            let slot = Arc::new(crate::audit::AuditSlot::default());
+            let err = match run {
+                0 => {
+                    let mut r = Request::new(spur_proto::proto::DrainNodeRequest {
+                        name: "node07".into(),
+                        reason: "dc cycle".into(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.drain_node(r).await.unwrap_err()
+                }
+                1 => {
+                    let mut r = Request::new(spur_proto::proto::DeregisterNodeRequest {
+                        name: "node07".into(),
+                        force: true,
+                        reason: String::new(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.deregister_node(r).await.unwrap_err()
+                }
+                _ => {
+                    let mut r = Request::new(UpdateNodeRequest {
+                        name: "node07".into(),
+                        state: None,
+                        reason: None,
+                        labels: Default::default(),
+                        remove_labels: Vec::new(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.update_node(r).await.unwrap_err()
+                }
+            };
+
+            assert_eq!(err.code(), Code::PermissionDenied, "{name}");
+            let annotation = crate::audit::take_for_test(&slot)
+                .unwrap_or_else(|| panic!("{name} must annotate before refusing"));
+            assert_eq!(annotation.target, "node07", "{name}");
+        }
     }
 
     // --- authoritative_user ---
