@@ -18,6 +18,7 @@ use kube::Client;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::controller::ControllerClient;
 use crate::crd::{to_core_job_spec, SpurJob, SpurJobStatus};
 use spur_proto::proto::{
     CancelJobRequest, GetJobRequest, ReportJobStatusRequest, SubmitJobRequest,
@@ -49,7 +50,7 @@ pub enum ReconcileError {
 /// Shared state for the reconciler.
 pub struct JobControllerCtx {
     pub client: Client,
-    pub ctrl_client: Mutex<crate::controller::ControllerClient>,
+    pub ctrl_client: Mutex<ControllerClient>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
     /// Consecutive reconcile failures per SpurJob (keyed by [`failure_key`]),
@@ -399,14 +400,9 @@ pub async fn run(
     controller_addr: String,
     operator_namespace: String,
 ) -> anyhow::Result<()> {
-    let ctrl_client = crate::controller::ControllerClient::connected(
-        &controller_addr,
-        crate::controller::connect(&controller_addr).await?,
-    );
-
     let ctx = Arc::new(JobControllerCtx {
         client: client.clone(),
-        ctrl_client: Mutex::new(ctrl_client),
+        ctrl_client: Mutex::new(ControllerClient::new(&controller_addr)),
         pod_tracker: Mutex::new(HashMap::new()),
         failures: StdMutex::new(HashMap::new()),
     });
