@@ -449,7 +449,7 @@ impl SlurmAgent for VirtualAgent {
         let (hostname, subdomain) = if num_peers > 1 && !target_node.is_empty() {
             (
                 Some(sanitize_k8s_name(&target_node)),
-                Some(format!("spur-job-{}", job_id)),
+                Some(job_service_name(job_id)),
             )
         } else {
             (None, None)
@@ -575,7 +575,7 @@ impl SlurmAgent for VirtualAgent {
 
         // Also clean up the headless service if it exists
         let services: Api<Service> = Api::namespaced(self.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_service_name(job_id);
         match services.delete(&svc_name, &DeleteParams::default()).await {
             Ok(_) => debug!(job_id, "deleted headless Service"),
             Err(kube::Error::Api(e)) if e.code == 404 => {}
@@ -857,7 +857,7 @@ impl VirtualAgent {
         namespace: &str,
     ) -> Result<(), kube::Error> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_service_name(job_id);
 
         let selector = BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
 
@@ -965,12 +965,18 @@ fn sanitize_k8s_name(s: &str) -> String {
         .to_string()
 }
 
+/// The headless Service of a job. The Pod `subdomain` and the peer DNS names
+/// only resolve while they use this exact name.
+fn job_service_name(job_id: u32) -> String {
+    format!("spur-job-{job_id}")
+}
+
 /// The DNS names under which the Pods of a multi-node job reach each other.
 ///
 /// `launch_job` gives each Pod `hostname = sanitize_k8s_name(target_node)` and
-/// `subdomain = spur-job-<id>`, and `ensure_headless_service` publishes that
-/// Service, so every peer answers at
-/// `<hostname>.spur-job-<id>.<namespace>.svc.cluster.local`. The order follows
+/// `subdomain = job_service_name(id)`, and `ensure_headless_service` publishes
+/// that Service, so every peer answers at
+/// `<hostname>.<service>.<namespace>.svc.cluster.local`. The order follows
 /// the nodelist, so index N is the peer whose SPUR_NODE_RANK is N.
 ///
 /// A single node job gets no headless Service and therefore no name to return.
@@ -987,9 +993,9 @@ fn headless_peer_dns(nodelist: &str, job_id: u32, namespace: &str) -> Vec<String
         .iter()
         .map(|n| {
             format!(
-                "{}.spur-job-{}.{}.svc.cluster.local",
+                "{}.{}.{}.svc.cluster.local",
                 sanitize_k8s_name(n),
-                job_id,
+                job_service_name(job_id),
                 namespace
             )
         })
