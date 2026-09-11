@@ -352,7 +352,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     if let Some(job_id) = status.spur_job_id {
         if !is_terminal(&status.state) {
             let mut ctrl = ctx.ctrl_client.lock().await;
-            let _ = ctrl
+            if let Err(e) = ctrl
                 .call(|mut c| async move {
                     c.cancel_job(CancelJobRequest {
                         job_id,
@@ -361,7 +361,10 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
                     })
                     .await
                 })
-                .await;
+                .await
+            {
+                warn!(spurjob = %name, job_id, error = %e, "failed to cancel Spur job on deletion");
+            }
         }
 
         // Delete all Pods by label
