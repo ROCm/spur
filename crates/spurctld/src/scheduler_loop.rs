@@ -3064,9 +3064,10 @@ mod tests {
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
             register_delay: Duration,
-            /// launch_job returns a ResourceExhausted status, standing in for a
-            /// node whose local allocation table already holds the GPUs.
-            reject_resources: bool,
+            /// launch_job fails with this gRPC status instead of answering, for
+            /// example ResourceExhausted from a node whose local allocation table
+            /// already holds the GPUs, or NotFound from an operator with no SpurJob.
+            reject_with_status: Option<tonic::Status>,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
@@ -3087,10 +3088,8 @@ mod tests {
                 if !self.launch_delay.is_zero() {
                     tokio::time::sleep(self.launch_delay).await;
                 }
-                if self.reject_resources {
-                    return Err(tonic::Status::resource_exhausted(
-                        "controller-allocated GPUs unavailable on this node",
-                    ));
+                if let Some(status) = &self.reject_with_status {
+                    return Err(status.clone());
                 }
                 if let Some(kind) = self.reject_launch_as {
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
@@ -3360,7 +3359,7 @@ mod tests {
                 reject_launch_as,
                 launch_delay,
                 register_delay,
-                reject_resources: false,
+                reject_with_status: None,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
             };
             tokio::spawn(async move {
@@ -3374,8 +3373,10 @@ mod tests {
             (addr, cancel_calls, release_pmix_calls, fanout_calls)
         }
 
-        /// Mock agent whose launch_job always rejects with ResourceExhausted.
-        async fn spawn_mock_agent_rejecting_resources() -> std::net::SocketAddr {
+        /// Mock agent whose launch_job always fails with `status`.
+        async fn spawn_mock_agent_rejecting_with_status(
+            status: tonic::Status,
+        ) -> std::net::SocketAddr {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
@@ -3383,7 +3384,7 @@ mod tests {
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
-                reject_resources: true,
+                reject_with_status: Some(status),
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
             };
@@ -3396,6 +3397,15 @@ mod tests {
                     .await;
             });
             addr
+        }
+
+        /// Mock agent whose launch_job always rejects with ResourceExhausted,
+        /// standing in for a node whose local allocation table already holds the GPUs.
+        async fn spawn_mock_agent_rejecting_resources() -> std::net::SocketAddr {
+            spawn_mock_agent_rejecting_with_status(tonic::Status::resource_exhausted(
+                "controller-allocated GPUs unavailable on this node",
+            ))
+            .await
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -5208,6 +5218,57 @@ mod tests {
                  1 gpu/resource allocation mismatch)",
                 "operators need the specific failure category, not a generic count"
             );
+        }
+
+        /// An agent that answers NOT_FOUND or FAILED_PRECONDITION was reached and
+        /// refused the launch. The job fails as rejected, and the node keeps
+        /// taking work: a cooldown here would hide a healthy node for a fault
+        /// that belongs to the job.
+        async fn assert_status_is_agent_rejected_without_cooldown(
+            status: tonic::Status,
+            job_name: &str,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_rejecting_with_status(status).await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec(job_name, 1));
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(
+                cm.nodes_on_dispatch_cooldown().is_empty(),
+                "a rejected launch must not put the node on cooldown"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.state_reason(),
+                "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
+                 1 agent rejected launch)",
+                "a refused launch must not read as an unreachable agent"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn not_found_reject_is_agent_rejected_and_does_not_cool_down_the_node() {
+            assert_status_is_agent_rejected_without_cooldown(
+                tonic::Status::not_found("no SpurJob carries the label spur.amd.com/job-id=1"),
+                "not-found-reject",
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn failed_precondition_reject_is_agent_rejected_and_does_not_cool_down_the_node() {
+            assert_status_is_agent_rejected_without_cooldown(
+                tonic::Status::failed_precondition(
+                    "multiple SpurJobs carry spur.amd.com/job-id=1; refusing to guess",
+                ),
+                "failed-precondition-reject",
+            )
+            .await;
         }
     }
 
