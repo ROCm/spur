@@ -8,6 +8,8 @@ use tracing::{debug, warn};
 
 use spur_proto::proto::{HeartbeatRequest, RegisterAgentRequest};
 
+use crate::controller::connect;
+
 // Matches spurd's 30 s interval, well inside `controller.heartbeat_timeout_secs`.
 const INTERVAL_SECS: u64 = 30;
 
@@ -52,7 +54,7 @@ impl HeartbeatManager {
                 continue;
             }
 
-            match crate::controller::connect(&self.controller_addr).await {
+            match connect(&self.controller_addr).await {
                 Ok(mut client) => {
                     for name in &names {
                         let req = HeartbeatRequest {

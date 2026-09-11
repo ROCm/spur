@@ -63,10 +63,12 @@ pub struct ControllerClient {
 }
 
 impl ControllerClient {
-    pub fn connected(addr: &str, client: SlurmControllerClient<Channel>) -> Self {
+    /// The first call opens the channel, so a task can start before the
+    /// controller is ready instead of failing and backing off.
+    pub fn new(addr: &str) -> Self {
         Self {
             addr: addr.to_string(),
-            client: Some(client),
+            client: None,
         }
     }
 
@@ -100,7 +102,10 @@ mod tests {
 
     fn unconnected() -> ControllerClient {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        ControllerClient::connected("127.0.0.1:1", SlurmControllerClient::new(channel))
+        ControllerClient {
+            addr: "127.0.0.1:1".to_string(),
+            client: Some(SlurmControllerClient::new(channel)),
+        }
     }
 
     #[tokio::test]
@@ -137,7 +142,10 @@ mod tests {
         let client = connect(&addr)
             .await
             .expect("the kernel completes the handshake");
-        let mut ctrl = ControllerClient::connected(&addr, client);
+        let mut ctrl = ControllerClient {
+            addr,
+            client: Some(client),
+        };
 
         tokio::time::pause();
         let err = ctrl
@@ -146,7 +154,6 @@ mod tests {
             .expect_err("nothing answers on that socket");
         assert!(is_transport_error(&err), "{err}");
         assert!(ctrl.client.is_none(), "the dead channel must not be reused");
-        drop(listener);
     }
 
     #[test]
