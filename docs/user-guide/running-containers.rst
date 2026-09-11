@@ -154,7 +154,8 @@ tears down its container and cleans up its rootfs without affecting the rest of
 the allocation.
 
 Interactive steps (``srun --pty``) run inside the container too — you get a real
-terminal inside the container rather than on the host. The step uses its own
+terminal inside the container rather than on the host. ``--pty`` still ignores
+``--nodes`` and uses only the first ``-w`` name. The step uses its own
 ``--container-image`` when given one, otherwise a nested ``srun --pty`` inherits
 the image from its containerized ``sbatch`` job:
 

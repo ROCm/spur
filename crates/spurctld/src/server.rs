@@ -2834,6 +2834,15 @@ impl SlurmController for ControllerService {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
+        validate_step_nodes_for_run(
+            job_id,
+            req.step_id,
+            step.state,
+            &step.nodes,
+            &job.allocated_nodes,
+        )
+        .map_err(Status::failed_precondition)?;
+
         let num_nodes = step.nodes.len() as u32;
         let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
         if plan.is_empty() {
@@ -2927,6 +2936,7 @@ impl SlurmController for ControllerService {
             )
         });
         let run_attempt = job.run_attempt;
+        let step_nodelist = step.nodes.join(",");
 
         let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
             if let Some(peers) = pmix_peers.as_ref() {
@@ -3017,6 +3027,7 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             let container = step_container.clone();
+            let step_nodelist = step_nodelist.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -3043,6 +3054,7 @@ impl SlurmController for ControllerService {
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
                         container,
+                        nodelist: step_nodelist.clone(),
                     })
                     .await
                     .map_err(|e| {
@@ -3780,6 +3792,32 @@ fn resolve_step_nodes(
     }
 
     Ok(allocated[..requested_count as usize].to_vec())
+}
+
+fn validate_step_nodes_for_run(
+    job_id: u32,
+    step_id: u32,
+    state: spur_core::step::StepState,
+    step_nodes: &[String],
+    allocated: &[String],
+) -> Result<(), String> {
+    if state != spur_core::step::StepState::Running {
+        return Err(format!(
+            "step {job_id}.{step_id} is {} and cannot run",
+            state.display()
+        ));
+    }
+    if step_nodes.is_empty() {
+        return Err(format!("step {job_id}.{step_id} has no nodes"));
+    }
+    for node in step_nodes {
+        if !allocated.contains(node) {
+            return Err(format!(
+                "step node {node} is not in the job's current allocation"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn map_step_plan_to_nodes(
@@ -7000,6 +7038,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_rejects_completed_step() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "done".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: allocated_nodes,
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+            })
+            .expect("test setup: seed step");
+        svc.cluster
+            .record_step_complete(job_id, 0, 0)
+            .expect("test setup: complete step");
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a completed step must not run");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("COMPLETED"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_rejects_nodes_no_longer_allocated() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "stale".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["gone".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+            })
+            .expect("test setup: seed step with stale nodes");
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a step whose nodes left the allocation must not run");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("not in the job's current allocation"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_step_allows_uid_match_despite_username_mismatch() {
         use spur_core::job::JobState;
         use spur_core::resource::{ResourceAllocations, ResourceSet};
@@ -7845,6 +7974,42 @@ mod tests {
         assert!(resolve_step_nodes(&allocated, 1, "node[001-002]", "")
             .unwrap_err()
             .contains("nodelist names 2"));
+    }
+
+    #[test]
+    fn validate_step_nodes_for_run_requires_running_on_allocated_nodes() {
+        use spur_core::step::StepState;
+        let allocated = vec!["n1".to_string(), "n2".to_string()];
+        validate_step_nodes_for_run(1, 0, StepState::Running, &["n1".into()], &allocated)
+            .expect("running step on an allocated node is valid");
+        assert!(validate_step_nodes_for_run(
+            1,
+            0,
+            StepState::Completed,
+            &["n1".into()],
+            &allocated
+        )
+        .unwrap_err()
+        .contains("COMPLETED"));
+        assert!(
+            validate_step_nodes_for_run(1, 0, StepState::Pending, &["n1".into()], &allocated)
+                .unwrap_err()
+                .contains("PENDING")
+        );
+        assert!(validate_step_nodes_for_run(
+            1,
+            0,
+            StepState::Running,
+            &["gone".into()],
+            &allocated
+        )
+        .unwrap_err()
+        .contains("not in the job's current allocation"));
+        assert!(
+            validate_step_nodes_for_run(1, 0, StepState::Running, &[], &allocated)
+                .unwrap_err()
+                .contains("has no nodes")
+        );
     }
 
     #[test]

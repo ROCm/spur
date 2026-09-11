@@ -1258,6 +1258,9 @@ message RunCommandRequest {
   // Container for this step. Absent/empty image = no container; the step runs
   // on the host or enters the parent job's namespaces when it is containerized.
   ContainerSpec container = 15;
+  // Step node subset (comma-separated names). Empty = use the job allocation
+  // nodelist. Drives SPUR_NODELIST / SPUR_NNODES / SPUR_NODEID for the step.
+  string nodelist = 16;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.

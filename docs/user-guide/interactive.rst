@@ -124,10 +124,14 @@ run without a token.
 
 Inside that shell, ``srun`` runs as a job step. With no step-level ``-N`` or
 ``-w``, it uses the allocation's nodes and inherits the allocation's task count
-(``SPUR_NTASKS`` / ``SLURM_NTASKS``). ``-N``/``--nodes`` limits the step to that
-many allocated nodes without dropping that inherited task count. ``-w``/
-``--nodelist`` selects an exact subset of allocated nodes. A step cannot request
-more nodes than its allocation.
+(``SPUR_NTASKS`` / ``SLURM_NTASKS``). For **buffered** steps, ``-N``/``--nodes``
+limits the step to that many allocated nodes without dropping that inherited
+task count, and ``-w``/``--nodelist`` selects an exact subset of allocated
+nodes. A step cannot request more nodes than its allocation.
+
+``--pty`` does not follow those node-selection rules: it still ignores
+``--nodes`` (one task on one node) and, with ``-w``, uses only the first listed
+name.
 
 The ``-N``/``-n`` defaults of 1 apply when ``srun`` submits a **new** job, not
 when it runs as a step inside ``salloc``/``sbatch``. Common options: ``--nodes``/
