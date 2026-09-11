@@ -51,15 +51,10 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SprioArgs::try_parse_from(&args)?;
 
-    // Parse job ID filter
     let job_ids = args
         .jobs
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|j| j.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+        .as_deref()
+        .map(crate::job_id_arg::parse_job_ids)
         .unwrap_or_default();
 
     let channel = crate::authclient::connect(&args.controller)

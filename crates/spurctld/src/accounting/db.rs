@@ -492,15 +492,23 @@ pub struct JobRecord {
     pub preempt_qos: String,
 }
 
+/// Filters for [`get_job_history`]. A `None` or empty-slice field is an
+/// unconstrained dimension; the default value matches everything.
+#[derive(Default)]
+pub struct JobHistoryQuery<'a> {
+    pub user: Option<&'a str>,
+    pub account: Option<&'a str>,
+    pub start_after: Option<DateTime<Utc>>,
+    pub start_before: Option<DateTime<Utc>>,
+    pub states: &'a [String],
+    pub job_ids: &'a [JobId],
+    pub limit: u32,
+}
+
 /// Query job history.
 pub async fn get_job_history(
     pool: &PgPool,
-    user: Option<&str>,
-    account: Option<&str>,
-    start_after: Option<DateTime<Utc>>,
-    start_before: Option<DateTime<Utc>>,
-    states: &[String],
-    limit: u32,
+    query: &JobHistoryQuery<'_>,
 ) -> anyhow::Result<Vec<JobRecord>> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
@@ -510,29 +518,37 @@ pub async fn get_job_history(
          FROM jobs WHERE 1=1",
     );
 
-    if let Some(u) = user.filter(|u| !u.is_empty()) {
+    if let Some(u) = query.user.filter(|u| !u.is_empty()) {
         qb.push(" AND user_name = ").push_bind(u);
     }
-    if let Some(a) = account.filter(|a| !a.is_empty()) {
+    if let Some(a) = query.account.filter(|a| !a.is_empty()) {
         qb.push(" AND account = ").push_bind(a);
     }
-    if let Some(after) = start_after {
+    if let Some(after) = query.start_after {
         qb.push(" AND start_time >= ").push_bind(after);
     }
-    if let Some(before) = start_before {
+    if let Some(before) = query.start_before {
         qb.push(" AND start_time <= ").push_bind(before);
     }
-    if !states.is_empty() {
+    if !query.states.is_empty() {
         qb.push(" AND state IN (");
         let mut sep = qb.separated(", ");
-        for s in states {
+        for s in query.states {
             sep.push_bind(s.clone());
+        }
+        sep.push_unseparated(")");
+    }
+    if !query.job_ids.is_empty() {
+        qb.push(" AND job_id IN (");
+        let mut sep = qb.separated(", ");
+        for id in query.job_ids {
+            sep.push_bind(*id as i64);
         }
         sep.push_unseparated(")");
     }
 
     qb.push(" ORDER BY submit_time DESC LIMIT ")
-        .push_bind(effective_query_limit(limit));
+        .push_bind(effective_query_limit(query.limit));
 
     let rows = qb.build().fetch_all(pool).await?;
 
@@ -1691,12 +1707,27 @@ mod job_history_tests {
         .await?;
         end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5), 0, 0).await?;
 
-        let by_user = get_job_history(&pool, Some(&user_a), None, None, None, &[], 100).await?;
+        let by_user = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some(&user_a),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
         assert_eq!(by_user.len(), 2);
         assert!(by_user.iter().all(|r| r.user_name == user_a));
 
-        let by_account =
-            get_job_history(&pool, None, Some(&account_one), None, None, &[], 100).await?;
+        let by_account = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                account: Some(&account_one),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
         assert_eq!(
             by_account
                 .iter()
@@ -1707,24 +1738,24 @@ mod job_history_tests {
 
         let completed = get_job_history(
             &pool,
-            Some(&user_a),
-            None,
-            None,
-            None,
-            &[String::from("COMPLETED")],
-            100,
+            &JobHistoryQuery {
+                user: Some(&user_a),
+                states: &[String::from("COMPLETED")],
+                limit: 100,
+                ..Default::default()
+            },
         )
         .await?;
         assert_eq!(completed.len(), 2);
 
         let failed = get_job_history(
             &pool,
-            Some(&user_b),
-            None,
-            None,
-            None,
-            &[String::from("FAILED")],
-            100,
+            &JobHistoryQuery {
+                user: Some(&user_b),
+                states: &[String::from("FAILED")],
+                limit: 100,
+                ..Default::default()
+            },
         )
         .await?;
         assert_eq!(failed.len(), 1);
@@ -1732,13 +1763,84 @@ mod job_history_tests {
         assert_eq!(failed[0].exit_signal, 9);
         assert_eq!(failed[0].derived_exit_code, 137);
 
-        let after = get_job_history(&pool, Some(&user_a), None, Some(t2), None, &[], 100).await?;
+        let after = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some(&user_a),
+                start_after: Some(t2),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].job_id, id2);
 
-        let limited = get_job_history(&pool, Some(&user_a), None, None, None, &[], 1).await?;
+        let limited = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some(&user_a),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await?;
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].job_id, id2);
+
+        let one = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                job_ids: &[id1],
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].job_id, id1);
+
+        let subset = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                job_ids: &[id0, id2],
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut got: Vec<JobId> = subset
+            .iter()
+            .map(|r| r.job_id)
+            .filter(|id| ids.contains(id))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![id0, id2]);
+
+        let missing = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                job_ids: &[404_040_404],
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(missing.is_empty());
+
+        // Filters compose: a job-ID set intersected with a user still scopes by user.
+        let scoped = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some(&user_a),
+                job_ids: &[id0, id1],
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].job_id, id0);
 
         delete_jobs(&pool, &ids).await?;
         Ok(())
@@ -1775,11 +1877,17 @@ mod job_history_tests {
         )
         .await?;
 
-        let history = get_job_history(&pool, None, None, None, None, &[], 100)
-            .await?
-            .into_iter()
-            .find(|r| r.job_id == id)
-            .expect("reused job_id should still be queryable");
+        let history = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?
+        .into_iter()
+        .find(|r| r.job_id == id)
+        .expect("reused job_id should still be queryable");
         assert_eq!(history.name, "new-job");
         assert_eq!(history.user_name, "vm");
         assert_eq!(history.account, "acct-new");
@@ -1829,7 +1937,15 @@ mod job_history_tests {
         .await?;
         drop(conn);
 
-        let history = get_job_history(&pool, Some(&user), None, None, None, &[], 100).await?;
+        let history = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some(&user),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
         let row = history
             .iter()
             .find(|r| r.job_id == id)
@@ -1883,7 +1999,15 @@ mod job_history_tests {
 
         migrate(pool).await?;
 
-        let history = get_job_history(pool, Some(user), None, None, None, &[], 100).await?;
+        let history = get_job_history(
+            pool,
+            &JobHistoryQuery {
+                user: Some(user),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await?;
         let row = history.first().expect("the migrated row must be returned");
         assert_eq!(
             row.job_id, id,

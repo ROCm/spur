@@ -160,6 +160,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_default();
 
+    let job_ids = args
+        .jobs
+        .as_deref()
+        .map(crate::job_id_arg::parse_job_ids)
+        .unwrap_or_default();
+
     let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to controller")?;
@@ -183,6 +189,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             start_after,
             start_before,
             states,
+            job_ids,
             limit: args.limit,
         })
         .await
