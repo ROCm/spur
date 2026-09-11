@@ -4,6 +4,7 @@
 mod accounting;
 mod agent_client;
 mod association_cache;
+mod audit;
 mod auth_middleware;
 mod cluster;
 mod cluster_k8s;

@@ -897,17 +897,56 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
+    // Defaulted because `audit_rpcs` gave this section its first reason to exist
+    // in a config file, and requiring the two inert fields alongside it is noise.
+    #[serde(default = "default_log_level")]
     pub level: String,
+    #[serde(default = "default_log_format")]
     pub format: String,
     pub file: Option<String>,
+    /// Every authenticated controller RPC, reads included, on the `audit_rpc`
+    /// target. Slurm's `DebugFlags=AuditRPCs`; off by default as the largest log.
+    #[serde(default)]
+    pub audit_rpcs: bool,
+}
+
+fn default_log_level() -> String {
+    "info".into()
+}
+
+fn default_log_format() -> String {
+    "text".into()
+}
+
+#[cfg(test)]
+mod logging_config_tests {
+    use super::*;
+
+    #[test]
+    fn audit_rpcs_alone_parses() {
+        // Enabling the audit log must not force an operator to also restate the
+        // two fields no daemon reads.
+        let cfg: LoggingConfig = toml::from_str("audit_rpcs = true").expect("must parse");
+        assert!(cfg.audit_rpcs);
+        assert_eq!(cfg.level, "info");
+        assert_eq!(cfg.format, "text");
+    }
+
+    #[test]
+    fn an_empty_logging_section_keeps_the_defaults() {
+        let cfg: LoggingConfig = toml::from_str("").expect("must parse");
+        assert!(!cfg.audit_rpcs);
+        assert_eq!(cfg.level, "info");
+    }
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "info".into(),
-            format: "text".into(),
+            level: default_log_level(),
+            format: default_log_format(),
             file: None,
+            audit_rpcs: false,
         }
     }
 }

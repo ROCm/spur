@@ -1012,7 +1012,10 @@ def _wait_txn_rows(c, res_name: str, predicate, timeout: int = 60) -> list[dict]
     deadline = time.time() + timeout
     last: list[dict] = []
     while time.time() < deadline:
-        rows = _parse_txn_rows(c.sacctmgr(["show", "txn", f"Name={res_name}", fmt]), where)
+        # Entity= as well as Name=, now that other entities share the log.
+        rows = _parse_txn_rows(
+            c.sacctmgr(["show", "txn", "Entity=reservation", f"Name={res_name}", fmt]), where
+        )
         if any(predicate(r) for r in rows):
             return rows
         last = rows
@@ -1128,3 +1131,55 @@ class TestReservationAudit:
             assert denied[0]["actor"] == submit_user, denied
         finally:
             c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+
+def _delimited_txn_rows(c, node: str, fields: str) -> list[list[str]]:
+    """Rows for a node. Delimited rather than column-aligned because an
+    unauthenticated `UpdateNode` leaves Actor empty, which splitting would lose."""
+    out = c.sacctmgr(["-P", "show", "txn", "Entity=node", f"Name={node}", f"format={fields}"])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) == len(fields.split(",")) and parts[0] in ("create", "update", "delete"):
+            rows.append(parts)
+    return rows
+
+
+class TestNodeAudit:
+    """Node state changes are audited, which is the question the audit log was
+    built to answer: who drained this node, and when."""
+
+    def test_drain_recorded_in_txn_log(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        reason = f"e2e-drain-{int(time.time())}"
+
+        try:
+            c.cli_as_user(
+                "root",
+                ["scontrol", "update", f"NodeName={node}", "State=DRAIN", f"Reason={reason}"],
+            )
+
+            # Audit writes are async, so poll for the row rather than racing it.
+            deadline = time.time() + 60
+            rows: list[list[str]] = []
+            while time.time() < deadline:
+                rows = _delimited_txn_rows(c, node, "Action,Where,Outcome,Peer,Info")
+                if any(r[0] == "update" and r[2] == "success" for r in rows):
+                    break
+                time.sleep(2)
+
+            drained = [r for r in rows if r[0] == "update" and r[2] == "success"]
+            assert drained, f"no successful node update recorded: {rows}"
+            action, where, _outcome, peer, info = drained[0]
+            assert where == f"node:{node}", drained
+            assert reason in info, f"the requested reason must be captured: {info}"
+            # No jwt_key here and no user field on UpdateNode, so the peer
+            # address is the only attribution left — which is why it exists.
+            assert peer, f"an unauthenticated action must still record a peer: {drained[0]}"
+
+            # #860's node-record attribution and the audit log must agree.
+            assert reason in c.cli(["sinfo", "-R"]), "sinfo -R should show the drain reason"
+        finally:
+            # Leaving a node drained would starve every later test.
+            c.cli_as_user("root", ["scontrol", "update", f"NodeName={node}", "State=RESUME"])

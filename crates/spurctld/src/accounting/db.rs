@@ -174,7 +174,8 @@ DECLARE
 BEGIN
     FOR target IN
         SELECT *
-        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'))
+        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'),
+                     ('txn', 'actor_uid'))
              AS t(tbl, col)
     LOOP
         IF EXISTS (
@@ -224,9 +225,8 @@ WHERE default_account IS NOT NULL
 CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
     ON users (name) WHERE default_account IS NOT NULL;
 
--- Administrative action / audit log. Records who ran reservation admin commands
--- (create/update/delete) and their outcome. Entity-agnostic so other admin ops
--- can reuse it later. `details` is a JSON string (sqlx has no json feature).
+-- Administrative action / audit log: who ran a mutating action, from where, and
+-- its outcome. `details` is a JSON string (sqlx has no json feature).
 CREATE TABLE IF NOT EXISTS txn (
     id           BIGSERIAL PRIMARY KEY,
     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -243,6 +243,8 @@ CREATE TABLE IF NOT EXISTS txn (
 CREATE INDEX IF NOT EXISTS idx_txn_ts ON txn(ts);
 CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
 CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
+-- Added after the table shipped, so it must follow the CREATE above.
+ALTER TABLE txn ADD COLUMN IF NOT EXISTS peer_addr TEXT NOT NULL DEFAULT '';
 "#;
 
 /// What accounting persists when a job starts. Named fields rather than positional
@@ -595,6 +597,7 @@ pub struct TxnRow {
     pub entity_name: String,
     pub outcome: String,
     pub details: String,
+    pub peer_addr: String,
 }
 
 /// Optional filters for `get_transactions`. Empty string filters are ignored.
@@ -605,6 +608,7 @@ pub struct TxnFilter<'a> {
     pub entity_name: Option<&'a str>,
     pub action: Option<&'a str>,
     pub outcome: Option<&'a str>,
+    pub peer_addr: Option<&'a str>,
     pub start_after: Option<DateTime<Utc>>,
     pub start_before: Option<DateTime<Utc>>,
     pub limit: u32,
@@ -619,8 +623,8 @@ pub async fn record_txn(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO txn (ts, actor, actor_uid, verified, source, action, entity_type, entity_name, outcome, details)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO txn (ts, actor, actor_uid, verified, source, action, entity_type, entity_name, outcome, details, peer_addr)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
     )
     .bind(rec.ts)
@@ -633,6 +637,7 @@ pub async fn record_txn(
     .bind(&rec.entity_name)
     .bind(rec.outcome.as_str())
     .bind(&rec.details)
+    .bind(&rec.peer_addr)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -659,7 +664,7 @@ pub async fn get_transactions(
 ) -> anyhow::Result<Vec<TxnRow>> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT id, ts, actor, actor_uid, verified, source, action, entity_type, \
-         entity_name, outcome, details FROM txn WHERE 1=1",
+         entity_name, outcome, details, peer_addr FROM txn WHERE 1=1",
     );
     if let Some(v) = filter.actor.filter(|s| !s.is_empty()) {
         qb.push(" AND actor = ").push_bind(v);
@@ -675,6 +680,15 @@ pub async fn get_transactions(
     }
     if let Some(v) = filter.outcome.filter(|s| !s.is_empty()) {
         qb.push(" AND outcome = ").push_bind(v);
+    }
+    // Match the `host:port` boundary, not a raw prefix: a bare host must find
+    // every port it used without `10.0.0.4` also returning `10.0.0.42`.
+    if let Some(v) = filter.peer_addr.filter(|s| !s.is_empty()) {
+        qb.push(" AND (peer_addr = ")
+            .push_bind(v)
+            .push(" OR peer_addr LIKE ")
+            .push_bind(format!("{}:%", escape_like(v)))
+            .push(")");
     }
     if let Some(after) = filter.start_after {
         qb.push(" AND ts >= ").push_bind(after);
@@ -701,9 +715,19 @@ pub async fn get_transactions(
             entity_name: row.get("entity_name"),
             outcome: row.get("outcome"),
             details: row.get("details"),
+            peer_addr: row.get("peer_addr"),
         })
         .collect();
     Ok(records)
+}
+
+/// Neutralize `LIKE` wildcards so a filter value containing `%` or `_` matches
+/// literally instead of widening the query.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
 }
 
 /// Delete audit rows older than `older_than`, returning the number removed.
@@ -3705,6 +3729,7 @@ mod txn_tests {
             actor: format!("actor_{}", std::process::id()),
             actor_uid: Some(1000),
             verified: true,
+            peer_addr: "10.11.99.42:51234".to_string(),
             source: TxnSource::Api,
             action,
             entity_type: TxnEntity::Reservation,
@@ -3765,6 +3790,7 @@ mod txn_tests {
         assert_eq!(rows[0].actor, actor);
         assert_eq!(rows[0].actor_uid, Some(1000));
         assert!(rows[0].verified);
+        assert_eq!(rows[0].peer_addr, "10.11.99.42:51234");
 
         let denied = get_transactions(
             &pool,
@@ -3777,6 +3803,45 @@ mod txn_tests {
         .await?;
         assert_eq!(denied.len(), 1);
         assert_eq!(denied[0].action, "delete");
+
+        // A bare host matches whichever ephemeral port the caller used.
+        let by_host = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                peer_addr: Some("10.11.99.42"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(by_host.len(), 2);
+
+        // But a shorter host must not match a longer one that shares its prefix.
+        let near_miss = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                peer_addr: Some("10.11.99.4"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            near_miss.is_empty(),
+            "10.11.99.4 must not match 10.11.99.42"
+        );
+
+        // An exact host:port still works, for narrowing to one connection.
+        let exact = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                peer_addr: Some("10.11.99.42:51234"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(exact.len(), 2);
 
         sqlx::query("DELETE FROM txn WHERE entity_name = $1")
             .bind(&entity)
