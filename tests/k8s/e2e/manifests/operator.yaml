@@ -60,6 +60,10 @@ spec:
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 10
+            # Shared runners are slow enough that the 1s default expires before
+            # /readyz finishes its two live round-trips, so the operator never
+            # goes Ready and every k8s test errors at fixture setup.
+            timeoutSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
