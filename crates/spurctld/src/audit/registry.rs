@@ -143,9 +143,12 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         "ResetDiagStats" => RpcClass::ReadOnly,
 
         // --- Daemon-to-daemon ---
-        "RegisterAgent" | "Heartbeat" | "ReportJobStatus" | "RecordJobStart" | "RecordJobEnd" => {
-            RpcClass::Internal
-        }
+        "RegisterAgent"
+        | "Heartbeat"
+        | "ReportStepdRecovery"
+        | "ReportJobStatus"
+        | "RecordJobStart"
+        | "RecordJobEnd" => RpcClass::Internal,
         // User-initiated, but srun/salloc drive these per step or per poll
         // rather than per operator decision.
         "JobKeepalive" | "CreateJobStep" | "CompleteJobStep" | "CompleteJob" => RpcClass::Internal,

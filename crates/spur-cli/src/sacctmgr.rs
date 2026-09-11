@@ -2645,6 +2645,30 @@ mod tests {
         (style.header_lines(&fields), row)
     }
 
+    /// An unauthenticated `UpdateNode` records an empty actor, and dropping the
+    /// column would silently shift every field after it for a parser.
+    #[test]
+    fn delimited_txn_output_keeps_an_empty_actor_column() {
+        let t = TransactionRecord {
+            actor: String::new(),
+            action: "update".into(),
+            entity_type: "node".into(),
+            entity_name: "node07".into(),
+            outcome: "success".into(),
+            peer_addr: "10.11.99.42:51234".into(),
+            ..Default::default()
+        };
+        let fields = txn_format_fields(Some("Action,Actor,Where,Outcome,Peer"))
+            .expect("txn format must parse");
+        let style = SacctmgrArgs::try_parse_from(["sacctmgr", "-n", "-P", "show", "txn"])
+            .expect("flags must parse")
+            .output_style();
+
+        let row = style.row(&fields, &|spec| resolve_txn_field(&t, spec));
+        assert_eq!(row, "update||node:node07|success|10.11.99.42:51234");
+        assert_eq!(row.split('|').count(), 5);
+    }
+
     #[test]
     fn txn_honours_noheader_and_delimited_output() {
         let (header, row) = txn_render(&["-n", "-P"], "Action,Actor");
