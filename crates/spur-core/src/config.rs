@@ -2611,6 +2611,26 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_example_config_parses() {
+        // The Kubernetes guide tells operators to build the spur-config Secret
+        // from this file as it is, so it must load without edits.
+        let example = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/k8s/spur.conf"
+        ));
+        let cfg = SlurmConfig::load_from_str(example).expect("examples/k8s/spur.conf parses");
+        assert_eq!(
+            cfg.controller.peers.len(),
+            3,
+            "example runs a three-controller raft"
+        );
+        assert!(
+            !cfg.accounting.enabled(),
+            "the template must not ship a credential"
+        );
+    }
+
+    #[test]
     fn swap_percent_above_100_is_accepted() {
         // Slurm applies no upper bound to AllowedSwapSpace, so a `cgroup.conf`
         // carrying one must not stop the controller from starting.
