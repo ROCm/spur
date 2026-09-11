@@ -108,7 +108,7 @@ and the plugin set also require a daemon restart.
 **Leader-only, in an HA cluster.** ``reconfigure`` is handled by the Raft leader and
 swaps only that controller's in-memory config; no Raft log entry carries the new
 file, so followers keep the config they loaded at startup until they restart (in
-Kubernetes they re-read the same ConfigMap). ``[[partitions]]`` is the exception —
+Kubernetes they re-read the same Secret). ``[[partitions]]`` is the exception —
 partition changes replicate through the write-ahead log — but a follower re-derives
 node features and weight from its own pre-reconfigure ``[[nodes]]`` blocks. Do not
 rely on reconfigured non-partition state surviving an immediate failover; roll the

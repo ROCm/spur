@@ -41,9 +41,21 @@ Apply manifests in order:
 .. code-block:: bash
 
    kubectl apply -f examples/k8s/namespace.yaml
-   kubectl apply -f examples/k8s/configmap.yaml
    kubectl apply -f examples/k8s/rbac.yaml
    kubectl apply -f examples/k8s/spurjob-crd.yaml
+
+``spurctld`` reads ``spur.conf`` from a Secret, because the file carries the
+accounting database password. Fill in ``database_url`` in
+``examples/k8s/spur.conf`` and build the Secret from it before you apply the
+controller:
+
+.. code-block:: bash
+
+   kubectl create secret generic spur-config \
+     --from-file=spur.conf=examples/k8s/spur.conf -n spur
+
+.. code-block:: bash
+
    kubectl apply -f examples/k8s/spurctld.yaml
    kubectl apply -f examples/k8s/spurd.yaml
    kubectl apply -f examples/k8s/operator.yaml
@@ -52,7 +64,13 @@ Apply manifests in order:
 Configuration
 -------------
 
-The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
+``examples/k8s/spur.conf`` is the controller configuration. The controllers
+run with the Secret ``spur-config`` that you build from it. The whole file goes
+into the Secret, not only the password: the configuration loader reads one TOML
+file and has no separate source for ``accounting.database_url`` or
+``auth.jwt_key``. A cluster with no accounting and no ``auth.jwt_key`` can hold
+the same file in a ConfigMap instead, built with ``kubectl create configmap
+--from-file``. The file sets:
 
 .. code-block:: toml
 
@@ -89,8 +107,8 @@ is running, ``scontrol reconfigure`` applies many sections live, while others
 need a controller or agent restart — see
 :ref:`the configuration reference <reload-scope>` for the per-field breakdown.
 ``reconfigure`` runs on the Raft leader only — followers keep their startup
-config until restarted, at which point they re-read this same ConfigMap and
-converge. To roll all controllers onto an updated ConfigMap, restart the
+config until restarted, at which point they re-read this same Secret and
+converge. To roll all controllers onto an updated Secret, restart the
 StatefulSet pods.
 
 Submitting Jobs
