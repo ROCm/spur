@@ -8,8 +8,10 @@
 
 static char g_peer_hosts[2][256];
 
+#define SPUR_TEST_STEP_ID 0xFFFFFFFEu
+
 static spur_modex_session_t *make_session(uint32_t job_id) {
-    return spur_modex_session_create(job_id, 2, 0, g_peer_hosts, 2, NULL);
+    return spur_modex_session_create(job_id, SPUR_TEST_STEP_ID, 2, 0, g_peer_hosts, 2, NULL);
 }
 
 static void server_stop_modex_cleanup(spur_modex_session_t *modex) {
@@ -82,6 +84,36 @@ static int test_extra_retain_leaks_listener(void) {
     return 0;
 }
 
+/* Pinned against spur_core::mpi::modex_port_for_step's own test vectors: the two
+ * derivations are a cross-node wire contract and drift is silent. */
+static int test_port_matches_rust_derivation(void) {
+    struct {
+        uint32_t job_id;
+        uint32_t step_id;
+        uint16_t port;
+    } cases[] = {
+        {0, 0, 16819},
+        {1, 0, 20580},
+        {42, 0, 24381},
+        {42, 0xFFFFFFFEu, 24379},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint16_t got = spur_modex_port_for_step(cases[i].job_id, cases[i].step_id);
+        if (got != cases[i].port) {
+            fprintf(
+                stderr,
+                "port for job %u step %u was %u, expected %u\n",
+                cases[i].job_id,
+                cases[i].step_id,
+                got,
+                cases[i].port
+            );
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     strncpy(g_peer_hosts[0], "127.0.0.1", sizeof(g_peer_hosts[0]) - 1);
     strncpy(g_peer_hosts[1], "127.0.0.2", sizeof(g_peer_hosts[1]) - 1);
@@ -90,6 +122,9 @@ int main(void) {
         return 1;
     }
     if (test_extra_retain_leaks_listener() != 0) {
+        return 1;
+    }
+    if (test_port_matches_rust_derivation() != 0) {
         return 1;
     }
     return 0;

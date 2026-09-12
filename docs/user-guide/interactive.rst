@@ -184,8 +184,9 @@ pauses for the restart and resumes where it was.
 
 Two cases are not covered: a step given its own ``--container-image``, and an
 ``srun --pty`` that allocates its own job rather than running inside an existing
-allocation. Both end when the agent stops. To keep a terminal across a restart,
-take an allocation first and run ``srun --pty`` inside it:
+allocation. Both end when the agent stops, and a container step also leaves its
+unpacked rootfs behind. To keep a terminal across a restart, take an allocation
+first and run ``srun --pty`` inside it:
 
 .. code-block:: bash
 

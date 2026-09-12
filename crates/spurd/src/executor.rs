@@ -691,10 +691,8 @@ async fn spawn_job_process(
 
     // --- Non-container jobs: existing tokio::Command path ---
 
-    // Issue #99: If root, wrap job with namespace isolation.
-    // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
-    // namespace so Open MPI's PMIx client can reach spurd's embedded server
-    // (same as standalone `srun` via `run_command`, which never uses unshare).
+    // If root, wrap the job in fresh namespaces. A `--mpi=pmix` multi-rank
+    // wrapper stays in the host's: its PMIx server runs outside them.
     let use_namespaces = would_use_namespaces(cfg, nix::unistd::geteuid().is_root());
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = spool_dir.join(namespace_wrapper_name(cfg.step_id));
@@ -3247,6 +3245,20 @@ mod tests {
 
         let normal = holder_cfg(false);
         assert!(would_use_namespaces(&normal, true));
+    }
+
+    // A `--mpi=pmix` parent has no namespaces of its own, so its step joins
+    // none — leaving only this term between the ranks and a fresh PID namespace
+    // their server sits outside of.
+    #[test]
+    fn a_multi_rank_pmix_step_stays_in_the_hosts_namespaces() {
+        let step = JobLaunchConfig {
+            pmix_multi_task: true,
+            step_id: 3,
+            ..holder_cfg(false)
+        };
+
+        assert!(!would_use_namespaces(&step, true));
     }
 
     #[test]

@@ -124,7 +124,15 @@ The two daemons are configured with command-line flags. The most common are belo
    Two launches are still unsupervised and do **not** survive a restart: a step
    given its own ``--container-image``, and an ``srun --pty`` that allocates its
    own job. A terminal opened *inside* an existing allocation is supervised —
-   see :doc:`../user-guide/interactive`.
+   see :doc:`../user-guide/interactive`. A container step killed that way also
+   leaks its unpacked rootfs, which nothing reclaims. Containerized *jobs* are
+   supervised and survive a restart normally.
+
+   ``--mpi=pmix`` work survives a restart the same way: a job and an inner
+   ``srun --mpi=pmix`` step each host their PMIx server inside their own
+   supervisor. A step given its own ``--container-image`` is the exception —
+   its server stays in ``spurd``, so restarting the agent breaks its
+   rendezvous along with the step itself.
 
    Setting ``[auth] jwt_key`` (or ``jwt_key_file``) to the same value on the
    controller and every agent lets the controller verify a supervisor an agent
@@ -568,6 +576,14 @@ MPI (PMIx)
 Spur supports Open MPI jobs via ``--mpi=pmix`` on **single-node and multi-node**
 allocations. The controller and CLI do not link libpmix; each compute node loads
 ``spur_mpi_pmix.so`` from ``[mpi].plugin_dir`` when a PMIx job starts.
+
+The PMIx server runs inside the supervisor (``spurstepd``) that owns the ranks —
+one per ``(job, step)``, so a job and each of its ``srun --mpi=pmix`` steps get
+their own — rather than inside ``spurd``. It lives and dies with the ranks it
+serves, not with the node agent. The supervisor inherits the agent's
+environment, so ``[Service]`` settings such as ``Environment=PMIX_MCA_gds=hash``
+still reach the server. The plugin is loaded by the supervisor and must be
+readable at ``[mpi].plugin_dir`` on every agent.
 
 .. _mpi-pmix-install:
 

@@ -963,6 +963,7 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
         session->modex_timeouts = modex_timeouts_from_plan(plan);
         session->modex = spur_modex_session_create(
             plan->job_id,
+            plan->step_id,
             session->num_nodes,
             session->node_index,
             session->peer_hosts,

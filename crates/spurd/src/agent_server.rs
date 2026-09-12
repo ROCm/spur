@@ -50,6 +50,7 @@ struct StepdLaunchOptions {
     container_rootfs_mode: Option<crate::container::RootfsMode>,
     hooks: HooksConfig,
     plugstack_path: String,
+    pmix: Option<crate::stepd::StepdPmix>,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -189,6 +190,7 @@ async fn launch_stepd(
     launch_spec.container_rootfs_mode = options.container_rootfs_mode;
     launch_spec.hooks = options.hooks;
     launch_spec.plugstack_path = options.plugstack_path;
+    launch_spec.pmix = options.pmix;
     let store = crate::stepd::StepdStore::new(state_dir);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt, launch_spec.step_id)
@@ -697,8 +699,8 @@ struct CompletedJob {
 
 async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginHost) {
     if mpi == MPI_PMIX {
-        if let Err(e) = mpi_host.release_pmix_server(job_id) {
-            warn!(job_id, error = %e, "PMIx batch ref release failed");
+        if let Err(e) = mpi_host.stop_pmix_job(job_id) {
+            warn!(job_id, error = %e, "PMIx teardown on job completion failed");
         }
     }
 }
@@ -1589,28 +1591,16 @@ type PmixLaunchSetup = (
     Option<Vec<HashMap<String, String>>>,
 );
 
+/// Agent-hosted PMIx, for the launch paths that have no supervisor of their own.
 fn start_pmix_launch(
     mpi_host: Arc<MpiPluginHost>,
     proto_plan: &spur_proto::proto::PmixLaunchPlan,
-    pmix_prepared: bool,
     task_offset: u32,
     tasks_on_node: u32,
 ) -> Result<PmixLaunchSetup, Status> {
     let plan = mpi_plugin::plan_from_proto(proto_plan).map_err(Status::failed_precondition)?;
-    let guard = if pmix_prepared {
-        match PmixLaunchGuard::join_prepared(mpi_host.clone(), &plan) {
-            Ok(guard) => guard,
-            Err(err) if err.contains("PMIx was not prepared") => {
-                // Step inside a running `--mpi=pmix` batch job: the batch
-                // launch already started/joined this namespace via start().
-                PmixLaunchGuard::start(mpi_host.clone(), &plan)
-                    .map_err(Status::failed_precondition)?
-            }
-            Err(err) => return Err(Status::failed_precondition(err)),
-        }
-    } else {
-        PmixLaunchGuard::start(mpi_host.clone(), &plan).map_err(Status::failed_precondition)?
-    };
+    let guard =
+        PmixLaunchGuard::start(mpi_host.clone(), &plan).map_err(Status::failed_precondition)?;
     // Per-rank direct fork under Spur's embedded PMIx server.
     let per_local_rank_env = if tasks_on_node > 1 {
         Some(
@@ -2072,6 +2062,41 @@ async fn wait_for_reparented_exit(pid: i32) -> i32 {
 /// cannot be handed to a supervisor. Entering a parent job's namespaces can.
 fn step_can_be_supervised(container_image: &str) -> bool {
     container_image.is_empty()
+}
+
+/// The plan a step's supervisor hosts its PMIx server from. Re-keyed to the step
+/// being launched: a server and a plan naming different steps rendezvous nowhere.
+fn supervised_step_pmix(
+    proto: &spur_proto::proto::PmixLaunchPlan,
+    config: spur_core::config::MpiConfig,
+    step_id: spur_core::step::StepId,
+    tasks_on_node: u32,
+) -> Result<crate::stepd::StepdPmix, Status> {
+    let mut plan = mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)?;
+    // The supervisor sizes the rank wrapper from the plan, so a plan that
+    // disagrees with the launch would silently start the wrong rank count.
+    if plan.local_procs.len() as u32 != tasks_on_node {
+        return Err(Status::failed_precondition(format!(
+            "PMIx plan carries {} local ranks but this node launches {tasks_on_node}",
+            plan.local_procs.len()
+        )));
+    }
+    plan.rekey_to_step(step_id);
+    Ok(crate::stepd::StepdPmix {
+        plan,
+        config,
+        user_script_path: String::new(),
+        wrapper_path: String::new(),
+    })
+}
+
+/// The user-script and wrapper file names for one step. Concurrent steps of a
+/// job share a scratch directory, so the step id has to be part of the name.
+fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
+    (
+        format!("cmd_{node_id}_{step_id}.sh"),
+        format!("wrapper_{node_id}_{step_id}.sh"),
+    )
 }
 
 /// The script a supervised step runs. A step joining a running job enters its
@@ -2703,6 +2728,15 @@ impl AgentService {
         self
     }
 
+    /// Take the supervised dispatch a test would otherwise never reach. The
+    /// spawn fails without a built `spurstepd`, which is enough to pin the
+    /// decisions made before it.
+    #[cfg(test)]
+    fn with_supervised_launch(mut self) -> Self {
+        self.force_legacy_launch = false;
+        self
+    }
+
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
     pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
         self.k0s.clone()
@@ -2764,6 +2798,7 @@ impl AgentService {
     async fn run_supervised_step_to_spool(
         &self,
         cfg: &executor::JobLaunchConfig,
+        pmix: Option<crate::stepd::StepdPmix>,
         step_files: crate::executor::StepOutputFiles,
         step_key: (u32, u32),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
@@ -2796,6 +2831,7 @@ impl AgentService {
                 container_rootfs_mode: None,
                 hooks: (*self.hooks).clone(),
                 plugstack_path: self.plugstack_path.clone(),
+                pmix,
             },
         )
         .await;
@@ -4083,23 +4119,33 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
+        // A supervised launch hosts its own server, so the agent only forwards
+        // the plan: an agent restart must not take the rendezvous down with it.
         let mut pmix_guard = None;
+        let mut supervised_pmix = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
         if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) {
             let proto = req.pmix_plan.as_ref().ok_or_else(|| {
                 Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
             })?;
-            let (guard, plan, per_local_rank_env) = start_pmix_launch(
-                self.mpi_host.clone(),
-                proto,
-                req.pmix_prepared,
-                task_offset,
-                tasks_per_node,
-            )?;
-            pmix_guard = Some(guard);
-            pmix_plan = Some(plan);
-            pmix_per_local_rank_env = per_local_rank_env;
+            if stepd_enabled {
+                let mut plan =
+                    mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)?;
+                plan.rekey_to_step(launch_step);
+                supervised_pmix = Some(crate::stepd::StepdPmix {
+                    plan,
+                    config: self.mpi_host.config().clone(),
+                    user_script_path: String::new(),
+                    wrapper_path: String::new(),
+                });
+            } else {
+                let (guard, plan, per_local_rank_env) =
+                    start_pmix_launch(self.mpi_host.clone(), proto, task_offset, tasks_per_node)?;
+                pmix_guard = Some(guard);
+                pmix_plan = Some(plan);
+                pmix_per_local_rank_env = per_local_rank_env;
+            }
         }
 
         // Batch scripts run once per node unless fan-out is requested. Spur fans
@@ -4123,15 +4169,22 @@ impl SlurmAgent for AgentService {
 
                 if spec.mpi == MPI_PMIX {
                     warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
-                    build_multi_task_pmix_wrapper(
-                        &user_script_path,
-                        tasks_per_node,
-                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                            Status::internal("missing PMIx per-rank env for multi-task launch")
-                        })?,
-                        Some(&spec.environment),
-                    )
-                    .map_err(Status::failed_precondition)?
+                    // The per-rank wrapper needs each rank's PMIx environment,
+                    // which only the process hosting the server can hand out.
+                    if let Some(pmix) = supervised_pmix.as_mut() {
+                        pmix.user_script_path = user_script_path.clone();
+                        launch_script
+                    } else {
+                        build_multi_task_pmix_wrapper(
+                            &user_script_path,
+                            tasks_per_node,
+                            pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                                Status::internal("missing PMIx per-rank env for multi-task launch")
+                            })?,
+                            Some(&spec.environment),
+                        )
+                        .map_err(Status::failed_precondition)?
+                    }
                 } else {
                     build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
                 }
@@ -4310,6 +4363,7 @@ impl SlurmAgent for AgentService {
                         .map(|_| rootfs_mode.clone()),
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
+                    pmix: supervised_pmix,
                 },
             )
             .await
@@ -4337,7 +4391,7 @@ impl SlurmAgent for AgentService {
                             run_attempt,
                             "stepd superseded by a newer attempt before it could be tracked; aborting"
                         );
-                        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                        if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                             warn!(job_id, error = %e, "PMIx stop failed after superseded stepd");
                         }
                         if let Err(error) = stop_stepd_process(&descriptor).await {
@@ -4385,7 +4439,7 @@ impl SlurmAgent for AgentService {
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
                     );
-                    if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                    if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -4521,9 +4575,9 @@ impl SlurmAgent for AgentService {
             .and_then(|proto| {
                 mpi_plugin::plan_from_proto(proto).map_err(Status::invalid_argument)
             })?;
-        // PMIx support inside a Stepd lands in a follow-up PR; this
-        // always prepares the legacy (non-runtime) PMIx server for now.
-        match self.mpi_host.prepare_pmix_server(&plan, req.run_attempt) {
+        // A pre-flight, not a server: the ranks' server belongs to the
+        // supervisor that will own them, and it does not exist yet.
+        match self.mpi_host.validate_pmix_dispatch(&plan) {
             Ok(()) => Ok(Response::new(PreparePmixResponse {
                 success: true,
                 error: String::new(),
@@ -4539,10 +4593,9 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
-        let job_id = request.into_inner().job_id;
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
-            warn!(job_id, error = %err, "PMIx prepare release failed");
-        }
+        // PreparePmix only validates, so a prepare that never launched left no
+        // server here to roll back. Kept on the wire for controller compatibility.
+        let _ = request.into_inner().job_id;
         Ok(Response::new(ReleasePmixResponse {}))
     }
 
@@ -4650,8 +4703,8 @@ impl SlurmAgent for AgentService {
             ));
         }
 
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
-            warn!(job_id, error = %err, "PMIx prepare release on cancel failed");
+        if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
+            warn!(job_id, error = %err, "PMIx teardown on cancel failed");
         }
 
         Ok(Response::new(()))
@@ -5004,6 +5057,7 @@ impl SlurmAgent for AgentService {
                     container_rootfs_mode: None,
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
+                    pmix: None,
                 },
             )
             .await
@@ -5304,38 +5358,45 @@ impl SlurmAgent for AgentService {
                 "step mpi=pmix requires a PMIx launch plan",
             ));
         }
-        // Logical steps inside a Stepd land in a follow-up PR; a step
-        // always spawns directly here for now, even against a runtime-backed
-        // allocation (so it won't survive an spurd restart, unlike its job).
-        let runtime_step_pmix = false;
+        // Decided here rather than at the dispatch chain below because who runs
+        // the step also decides who hosts its PMIx server.
+        let supervise_step =
+            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
+        #[cfg(test)]
+        let supervise_step = supervise_step && !self.force_legacy_launch;
 
+        // A supervised step hosts its own server, so the agent only forwards the
+        // plan: an agent restart must not take the rendezvous down with it.
         let mut pmix_step_guard = None;
+        let mut supervised_pmix: Option<crate::stepd::StepdPmix> = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
-        if step_mpi && !runtime_step_pmix {
+        if step_mpi {
             let proto = req
                 .pmix_plan
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))?;
-            let (guard, plan, per_local_rank_env) = start_pmix_launch(
-                self.mpi_host.clone(),
-                proto,
-                req.pmix_prepared,
-                req.task_offset,
-                num_tasks,
-            )?;
-            pmix_step_guard = Some(guard);
-            pmix_plan = Some(plan);
-            pmix_per_local_rank_env = per_local_rank_env;
+            if supervise_step {
+                supervised_pmix = Some(supervised_step_pmix(
+                    proto,
+                    self.mpi_host.config().clone(),
+                    step_id,
+                    num_tasks,
+                )?);
+            } else {
+                let (guard, plan, per_local_rank_env) =
+                    start_pmix_launch(self.mpi_host.clone(), proto, req.task_offset, num_tasks)?;
+                pmix_step_guard = Some(guard);
+                pmix_plan = Some(plan);
+                pmix_per_local_rank_env = per_local_rank_env;
+            }
         }
 
         if step_cancel_requested(&self.active_steps, step_key).await {
             return Ok(Response::new(cancelled_step_response()));
         }
 
-        let (program, program_args, step_script_cleanup) = if (num_tasks > 1 && !runtime_step_pmix)
-            || req.label
-        {
+        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
             let step_dir =
                 crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
                     .map_err(|e| {
@@ -5346,40 +5407,56 @@ impl SlurmAgent for AgentService {
                 paths: Vec::new(),
             };
 
-            let user_script_path = step_dir.join(format!("cmd_{node_id}.sh"));
+            let (user_script_name, wrapper_name) = step_scratch_names(node_id, step_id);
+            let user_script_path = step_dir.join(user_script_name);
             let user_script = build_one_shot_command_script(&req.command)?;
             crate::executor::write_job_scratch(&user_script_path, &user_script, req.uid, req.gid)
                 .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
             guard.paths.push(user_script_path.clone());
 
-            let wrapper_path = step_dir.join(format!("wrapper_{node_id}.sh"));
+            let wrapper_path = step_dir.join(wrapper_name);
             let wrapper = if num_tasks > 1 {
                 if step_mpi {
-                    build_multi_task_pmix_wrapper(
-                        user_script_path.to_string_lossy().as_ref(),
-                        num_tasks,
-                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                            Status::internal("missing PMIx per-rank env for multi-task step")
-                        })?,
-                        Some(&req.environment),
-                    )
-                    .map_err(Status::failed_precondition)?
+                    match supervised_pmix.as_mut() {
+                        // Only the process hosting the server can hand out each
+                        // rank's environment, so it writes this file itself.
+                        Some(pmix) => {
+                            pmix.user_script_path = user_script_path.to_string_lossy().into_owned();
+                            pmix.wrapper_path = wrapper_path.to_string_lossy().into_owned();
+                            None
+                        }
+                        None => Some(
+                            build_multi_task_pmix_wrapper(
+                                user_script_path.to_string_lossy().as_ref(),
+                                num_tasks,
+                                pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                                    Status::internal(
+                                        "missing PMIx per-rank env for multi-task step",
+                                    )
+                                })?,
+                                Some(&req.environment),
+                            )
+                            .map_err(Status::failed_precondition)?,
+                        ),
+                    }
                 } else {
-                    build_multi_task_wrapper(
+                    Some(build_multi_task_wrapper(
                         user_script_path.to_string_lossy().as_ref(),
                         num_tasks,
                         Some(&req.environment),
-                    )
+                    ))
                 }
             } else {
-                spur_core::task_launch::build_labeled_single_task_wrapper(
+                Some(spur_core::task_launch::build_labeled_single_task_wrapper(
                     user_script_path.to_string_lossy().as_ref(),
                     req.task_offset,
                     Some(&req.environment),
-                )
+                ))
             };
-            crate::executor::write_job_scratch(&wrapper_path, &wrapper, req.uid, req.gid)
-                .map_err(|e| Status::internal(format!("failed to write step wrapper: {e}")))?;
+            if let Some(wrapper) = wrapper {
+                crate::executor::write_job_scratch(&wrapper_path, &wrapper, req.uid, req.gid)
+                    .map_err(|e| Status::internal(format!("failed to write step wrapper: {e}")))?;
+            }
             guard.paths.push(wrapper_path.clone());
 
             if num_tasks > 1 {
@@ -5423,7 +5500,7 @@ impl SlurmAgent for AgentService {
         if num_tasks > 1 && step_mpi {
             mpi_plugin::strip_launcher_mpi_env(&mut env);
         }
-        if step_mpi && pmix_per_local_rank_env.is_none() && !runtime_step_pmix {
+        if step_mpi && pmix_per_local_rank_env.is_none() && supervised_pmix.is_none() {
             let plan = pmix_plan
                 .as_ref()
                 .ok_or_else(|| Status::internal("missing PMIx plan for step"))?;
@@ -5464,13 +5541,7 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        // Built before the dispatch chain so the arms stay a plain match on
-        // where the step runs, not on whether it is supervised.
-        let supervise_step =
-            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
-        #[cfg(test)]
-        let supervise_step = supervise_step && !self.force_legacy_launch;
         let mut supervised_step_cfg = if supervise_step {
             let run_attempt = self
                 .running
@@ -5521,7 +5592,7 @@ impl SlurmAgent for AgentService {
                 memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
-                pmix_multi_task: false,
+                pmix_multi_task: step_mpi && num_tasks > 1,
             })
         } else {
             None
@@ -5535,8 +5606,13 @@ impl SlurmAgent for AgentService {
             // Supervised: the step gets its own spurstepd and outlives a restart
             // of this agent. Its script enters the parent's namespaces, if any,
             // so the supervisor itself stays outside them.
-            self.run_supervised_step_to_spool(&step_cfg, step_files, step_key)
-                .await?
+            self.run_supervised_step_to_spool(
+                &step_cfg,
+                supervised_pmix.take(),
+                step_files,
+                step_key,
+            )
+            .await?
         } else if job_entry.has_namespaces() && job_entry.pid > 0 {
             // Case 1: parent job is containerized — enter its namespaces via nsenter
             // (srun inside sbatch/salloc --container-image).
@@ -6592,7 +6668,7 @@ impl AgentService {
                 warn!(job_id, %error, "failed to record runtime resource release");
             }
         }
-        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+        if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %e, "PMIx stop failed on job drop");
         }
     }
@@ -9133,6 +9209,141 @@ mod tests {
     #[test]
     fn a_step_building_its_own_container_is_not_supervisable() {
         assert!(!step_can_be_supervised("docker://alpine"));
+    }
+
+    fn proto_pmix_plan(
+        job_id: u32,
+        step_id: u32,
+        local_count: u32,
+    ) -> spur_proto::proto::PmixLaunchPlan {
+        spur_proto::proto::PmixLaunchPlan {
+            job_id,
+            step_id,
+            namespace: String::new(),
+            universe_size: local_count,
+            task_offset: 0,
+            local_procs: (0..local_count)
+                .map(|local_rank| spur_proto::proto::PmixLocalProc {
+                    rank: local_rank,
+                    local_rank,
+                })
+                .collect(),
+            tmpdir: "/tmp/spur-pmix".into(),
+            job_uid: 1000,
+            job_gid: 1000,
+            num_nodes: 1,
+            node_index: 0,
+            peer_hosts: Vec::new(),
+            modex_connect_timeout_secs: 5,
+            modex_fence_timeout_secs: 60,
+            modex_verify_timeout_secs: 5,
+        }
+    }
+
+    // The controller keys the plan; the launching step is the authority. A
+    // disagreement puts the server and its peers on different modex ports.
+    #[test]
+    fn a_supervised_steps_plan_is_rekeyed_to_the_step_that_launches_it() {
+        let plan = supervised_step_pmix(&proto_pmix_plan(42, 0, 2), MpiConfig::default(), 7, 2)
+            .expect("a well-formed plan")
+            .plan;
+
+        assert_eq!(plan.step_id, 7);
+        assert_eq!(plan.namespace, "spur.42.7");
+    }
+
+    // The supervisor sizes the rank wrapper from the plan, so a disagreement
+    // here would start the wrong number of ranks with nothing to report it.
+    #[test]
+    fn a_supervised_steps_plan_must_agree_with_the_launch_on_rank_count() {
+        let error = supervised_step_pmix(&proto_pmix_plan(42, 0, 2), MpiConfig::default(), 7, 4)
+            .expect_err("the plan carries two ranks, the launch asks for four");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("2 local ranks"),
+            "unexpected error: {}",
+            error.message()
+        );
+    }
+
+    // The supervised dispatch is unreachable without `with_supervised_launch`,
+    // so this is the only unit-level cover for who hosts a step's PMIx server.
+    #[tokio::test]
+    async fn a_supervised_pmix_step_leaves_the_agent_hosting_no_server() {
+        let svc = AgentService::with_cluster_config(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits {
+                memlock: spur_core::config::MemlockLimit::Unlimited,
+            },
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            // Named explicitly so the outcome does not depend on whether the
+            // runner happens to have a PMIx plugin installed.
+            MpiConfig {
+                pmix_plugin: "/nonexistent/spur/spur_mpi_pmix.so".into(),
+                ..MpiConfig::default()
+            },
+            new_running_jobs(),
+            spur_core::config::AuthConfig::default().allow_root_jobs,
+        )
+        .with_root_override(false)
+        .with_runtime_state_dir(
+            std::env::temp_dir().join(format!("spur-test-runtime-{}", uuid::Uuid::new_v4())),
+        )
+        .with_supervised_launch();
+
+        let job_id = 7754;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let step_id = 3;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec!["true".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: work_dir.path().to_string_lossy().into_owned(),
+            environment: HashMap::new(),
+            job_id,
+            step_id,
+            num_tasks: 2,
+            mpi: MPI_PMIX.into(),
+            pmix_plan: Some(proto_pmix_plan(job_id, step_id, 2)),
+            ..Default::default()
+        });
+
+        let error = svc
+            .run_command(req)
+            .await
+            .expect_err("no spurstepd is built alongside the test binary");
+
+        assert!(
+            !svc.mpi_host.has_active_pmix(job_id, step_id),
+            "a supervised step's server belongs to its supervisor, not the agent"
+        );
+        assert!(
+            error.message().contains("step supervisor"),
+            "the step must reach its supervisor rather than fail in the agent's \
+             PMIx setup, got: {}",
+            error.message()
+        );
+    }
+
+    // Concurrent steps of one job share a scratch dir, and a supervised step's
+    // wrapper is written after its launch, so a shared name is a silent swap.
+    #[test]
+    fn concurrent_steps_on_one_node_get_their_own_scratch_scripts() {
+        let (first_script, first_wrapper) = step_scratch_names(0, 1);
+        let (second_script, second_wrapper) = step_scratch_names(0, 2);
+
+        assert_ne!(first_script, second_script);
+        assert_ne!(first_wrapper, second_wrapper);
+        assert_ne!(first_script, first_wrapper);
     }
 
     #[test]
@@ -12919,9 +13130,7 @@ mod tests {
     // A launch that aborts before entering `running` must tear down its PMI
     // server, since the monitor loop's completion cleanup never runs for it.
     #[tokio::test]
-    async fn completion_cleanup_releases_batch_pmix_ref_without_force_stop() {
-        use crate::mpi_plugin::ActiveNamespace;
-
+    async fn completion_cleanup_stops_every_pmix_namespace_the_agent_hosts_for_the_job() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -12929,20 +13138,22 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
 
-        svc.mpi_host.active_namespaces.lock().unwrap().insert(
-            99,
-            ActiveNamespace {
-                namespace: "spur.99".into(),
-                refs: 2,
-            },
-        );
+        for step_id in [spur_core::step::STEP_BATCH, 0] {
+            svc.mpi_host
+                .active_namespaces
+                .lock()
+                .unwrap()
+                .insert((99, step_id), format!("spur.99.{step_id}"));
+        }
 
         cleanup_completed_job_mpi(99, MPI_PMIX, &svc.mpi_host).await;
 
-        assert!(
-            svc.mpi_host.has_active_pmix(99),
-            "batch completion must release one ref, not force-stop an active step namespace"
-        );
+        for step_id in [spur_core::step::STEP_BATCH, 0] {
+            assert!(
+                !svc.mpi_host.has_active_pmix(99, step_id),
+                "a finished job must leave no PMIx namespace hosted on the agent"
+            );
+        }
     }
 
     // A guard dropped while another task holds the steps lock must still

@@ -3456,6 +3456,7 @@ impl SlurmController for ControllerService {
                             peers,
                             node_dispatch.node_tasks.node_index,
                             job_id,
+                            step.step_id,
                             step_num_tasks,
                             node_dispatch.node_tasks.task_offset,
                             node_dispatch.node_tasks.tasks_on_node,

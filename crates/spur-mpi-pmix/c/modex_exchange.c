@@ -288,6 +288,7 @@ static void *accept_loop(void *arg) {
 
 spur_modex_session_t *spur_modex_session_create(
     uint32_t job_id,
+    uint32_t step_id,
     uint32_t num_nodes,
     uint32_t node_index,
     const char peer_hosts[][256],
@@ -311,7 +312,7 @@ spur_modex_session_t *spur_modex_session_create(
     session->job_id = job_id;
     session->num_nodes = num_nodes;
     session->node_index = node_index;
-    session->port = spur_modex_port_for_job(job_id);
+    session->port = spur_modex_port_for_step(job_id, step_id);
     session->listen_fd = -1;
     atomic_store(&session->accept_running, false);
     session->aborted = false;

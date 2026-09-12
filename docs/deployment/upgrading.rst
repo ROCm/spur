@@ -268,6 +268,12 @@ Follow this order for any cluster upgrade:
    compute node. The agent resolves it beside its own executable and does not
    search ``$PATH``, so if it is missing every job launch on that node fails.
 
+   ``spur_mpi_pmix.so`` is versioned against the binaries that load it, and this
+   release bumps that version. Replace the plugin in ``[mpi].plugin_dir`` in the
+   same window, or ``--mpi=pmix`` jobs fail with ``unsupported MPI plugin API
+   version``. The plugin is now loaded by ``spurstepd`` rather than ``spurd``, for
+   steps as well as jobs.
+
 .. note::
 
    *Once this release is in place*, restarting ``spurd`` no longer kills the work

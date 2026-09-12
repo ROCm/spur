@@ -1371,6 +1371,8 @@ fn build_pmix_plan_proto(
         mpi,
         spur_core::mpi::PmixLocalDispatch {
             job_id: params.job_id,
+            // The batch dispatch always launches the batch step on the agent.
+            step_id: spur_core::step::STEP_BATCH,
             universe_size: spec.num_tasks,
             task_offset: params.task_offset,
             local_count: tasks_per_node,
