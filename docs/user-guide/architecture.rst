@@ -1,9 +1,10 @@
 Architecture
 ============
 
-Spur runs as three binaries: a controller daemon (``spurctld``), a node agent
-(``spurd``), and a command-line client (``spur``). This page describes what each
-component does, which ports they use, and the core scheduling concepts.
+Spur runs as four binaries: a controller daemon (``spurctld``), a node agent
+(``spurd``), a per-job supervisor (``spurstepd``), and a command-line client
+(``spur``). This page describes what each component does, which ports they use,
+and the core scheduling concepts.
 
 Components
 ----------
@@ -30,6 +31,20 @@ sends periodic heartbeats, and receives job launch and cancel commands over gRPC
 (the ``SlurmAgent`` service) on port ``6818``. Interactive sessions and live job
 output stream directly between the client and the agent.
 
+``spurstepd`` — Job supervisor
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The agent does not parent the work it launches. It spawns a supervisor per job,
+and a further one per numbered ``srun`` step, detached into its own session so
+it is reparented to init. The supervisor owns the process tree, its cgroup and
+its exit status, and the agent talks to it over a Unix socket.
+
+That is what lets ``spurd`` be restarted or upgraded under running work: on
+start it rediscovers the supervisors on disk and re-adopts them, and a step that
+finished meanwhile still reports its exit status over the reconnect. Users never
+invoke ``spurstepd`` directly. See :doc:`interactive` for what survives a
+restart and what does not.
+
 ``spur`` — Command-line client
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -43,8 +58,8 @@ full command map.
 
    Unlike Slurm, Spur has **no** separate accounting or REST daemons — there is
    no ``slurmdbd`` and no ``slurmrestd``. The controller (``spurctld``) handles
-   accounting and the REST API itself. The entire distribution is three binaries:
-   ``spurctld``, ``spurd``, and ``spur``.
+   accounting and the REST API itself. The entire distribution is four binaries:
+   ``spurctld``, ``spurd``, ``spurstepd``, and ``spur``.
 
 Ports
 -----

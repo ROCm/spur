@@ -12,6 +12,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -115,6 +116,7 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
 const SPOOL_ROOT: &str = "/var/spool/spur";
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
@@ -137,6 +139,9 @@ pub enum LaunchIo {
 
 pub struct JobLaunchConfig {
     pub job_id: JobId,
+    pub run_attempt: u32,
+    /// Step whose processes this launch owns; its cgroup is a child of the job's.
+    pub step_id: spur_core::step::StepId,
     pub script: String,
     pub work_dir: String,
     /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
@@ -160,6 +165,7 @@ pub struct JobLaunchConfig {
     pub prolog_script: Option<String>,
     pub partition: String,
     pub nodelist: String,
+    pub mpi: String,
     /// Registry-based device injection plan for host (non-container) jobs.
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
@@ -170,6 +176,13 @@ pub struct JobLaunchConfig {
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
     pub pmix_multi_task: bool,
+    /// The launch command enters a running job's namespaces itself, so wrapping
+    /// it in a fresh one here would land the work in the wrong place.
+    pub joins_parent_namespaces: bool,
+    /// Holds a companion node's slice of an allocation and runs no user code.
+    /// Isolating it would make it PID 1 of a namespace, where the kernel drops
+    /// unhandled signals and nothing can then tear it down.
+    pub allocation_holder: bool,
 }
 
 pub struct LaunchResult {
@@ -364,6 +377,10 @@ fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
 }
 
 impl RunningJob {
+    pub fn managed(child: tokio::process::Child) -> Self {
+        Self::Managed { child }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
@@ -479,6 +496,7 @@ async fn spawn_job_process(
 ) -> Result<LaunchResult, LaunchError> {
     let JobLaunchConfig {
         job_id,
+        run_attempt,
         ref script,
         ref work_dir,
         ref environment,
@@ -500,7 +518,11 @@ async fn spawn_job_process(
     // Set up cgroup for isolation
     let device_paths = allocated_device_paths(cfg.host_device_plan.as_ref());
     let cgroup_path = CgroupGuard(setup_cgroup(
-        job_id,
+        CgroupScope {
+            job_id,
+            run_attempt,
+            step_id: cfg.step_id,
+        },
         &cfg.cgroup,
         cpus,
         memory_mb,
@@ -509,17 +531,8 @@ async fn spawn_job_process(
     )?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
-    // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
-    // the job can still run; absolute output paths in the spec are unaffected.
-    let effective_work_dir: String = if create_dir_as_user(Path::new(work_dir), uid, gid) {
-        work_dir.to_string()
-    } else {
-        warn!(
-            job_id,
-            work_dir, "work_dir unavailable on this node, using /tmp"
-        );
-        "/tmp".to_string()
-    };
+    // node); falls back to a per-job scratch directory when it can't be created here.
+    let effective_work_dir = resolve_effective_work_dir(job_id, run_attempt, work_dir, uid, gid);
     let work_dir = effective_work_dir.as_str();
 
     // The directive is per job, so it comes from the job's environment. Reading
@@ -533,7 +546,9 @@ async fn spawn_job_process(
     // Script + wrapper live in the node-local spool dir, not work_dir (see
     // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
     let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
-    let script_path = spool_dir.join("spur_job.sh");
+    // Per step: a job's own script and each of its steps' share this directory,
+    // and rewriting one under a running bash corrupts it mid-execution.
+    let script_path = spool_dir.join(launch_script_name(cfg.step_id));
     write_job_scratch(&script_path, script, uid, gid)
         .context("failed to write job script")
         .map_err(|e| classify_spool_error(&spool_dir, e))?;
@@ -680,9 +695,9 @@ async fn spawn_job_process(
     // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
     // namespace so Open MPI's PMIx client can reach spurd's embedded server
     // (same as standalone `srun` via `run_command`, which never uses unshare).
-    let use_namespaces = nix::unistd::geteuid().is_root() && !cfg.pmix_multi_task;
+    let use_namespaces = would_use_namespaces(cfg, nix::unistd::geteuid().is_root());
     let (launch_cmd, launch_args) = if use_namespaces {
-        let wrapper_path = spool_dir.join("spur_ns.sh");
+        let wrapper_path = spool_dir.join(namespace_wrapper_name(cfg.step_id));
         let visible_devices = cfg
             .host_device_plan
             .as_ref()
@@ -712,10 +727,13 @@ async fn spawn_job_process(
     // Launch the process
     let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
     let mut cmd = Command::new(&launch_cmd);
-    cmd.args(&launch_args).current_dir(work_dir).envs(&env);
-    if !cfg.pmix_multi_task {
-        cmd.process_group(0);
-    }
+    // Always its own process group (run_command does the same for pmix step
+    // launches) so signal()/kill_signal's group-kill reaches the whole job
+    // regardless of PMIx — only namespace isolation is pmix-conditional above.
+    cmd.args(&launch_args)
+        .current_dir(work_dir)
+        .envs(&env)
+        .process_group(0);
     if piped_mpi_stdio {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -781,11 +799,9 @@ async fn spawn_job_process(
     // Must set supplementary groups (video, render) so the process can
     // access GPU device nodes.
     //
-    // Issue #128: when use_namespaces is true, the wrapper handles the priv
-    // drop *after* unshare runs (via setpriv). Dropping priv here would cause
-    // unshare(2) to fail with EPERM since the unprivileged user lacks
-    // CAP_SYS_ADMIN.
-    if !use_namespaces {
+    // Both namespace shapes drop privilege themselves via setpriv, after the
+    // unshare or nsenter that needs CAP_SYS_ADMIN; dropping here fails those.
+    if !use_namespaces && !cfg.joins_parent_namespaces {
         if let Some(pd) = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid) {
             unsafe {
                 cmd.pre_exec(move || {
@@ -946,21 +962,58 @@ fn allocated_device_paths(plan: Option<&spur_devices::inject::HostInjectionPlan>
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
-pub(crate) fn setup_cgroup(
+// Keyed by attempt, not just job_id: a redispatch must never land in a
+// still-occupied cgroup left by a not-yet-reaped prior attempt.
+fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathBuf {
+    cgroup_root.join(format!("job_{}_{}", job_id, run_attempt))
+}
+
+/// A step's leaf under its job. cgroup v2 forbids processes in a node that has
+/// children with controllers enabled, so limits live on the job and every
+/// step's processes live one level down — the shape Slurm uses.
+fn step_cgroup_path_for(
+    cgroup_root: &Path,
     job_id: JobId,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> PathBuf {
+    cgroup_path_for(cgroup_root, job_id, run_attempt).join(format!("step_{}", step_id))
+}
+
+/// Reconstructs a job's cgroup path from its identity alone — usable even
+/// when the session descriptor that would normally carry it is unreadable.
+pub fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
+    cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt)
+}
+
+/// Which step's cgroup a launch is preparing.
+#[derive(Clone, Copy)]
+pub(crate) struct CgroupScope {
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    pub step_id: spur_core::step::StepId,
+}
+
+pub(crate) fn setup_cgroup(
+    scope: CgroupScope,
     cgroup: &CgroupConfig,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
     device_paths: &[String],
 ) -> anyhow::Result<Option<PathBuf>> {
+    let CgroupScope {
+        job_id,
+        run_attempt,
+        step_id,
+    } = scope;
     let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
         debug!(job_id, "cgroup enforcement disabled by config");
         return Ok(None);
     };
 
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
+    let cgroup_path = cgroup_path_for(&cgroup_root, job_id, run_attempt);
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -991,7 +1044,15 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
-    if let Err(e) = claim_cgroup_dir(&cgroup_path) {
+    // Claiming reaps whatever is in the directory, so only the step that owns the
+    // job's lifetime may claim it — a numbered step would kill its siblings.
+    let owns_job_cgroup = !spur_core::step::is_user_step(step_id);
+    let claim = if owns_job_cgroup {
+        claim_cgroup_dir(&cgroup_path)
+    } else {
+        std::fs::create_dir_all(&cgroup_path)
+    };
+    if let Err(e) = claim {
         match classify_cgroup_claim_failure(
             &e,
             nix::unistd::geteuid().is_root(),
@@ -1081,7 +1142,23 @@ pub(crate) fn setup_cgroup(
         "cgroup created"
     );
 
-    Ok(Some(cgroup_path))
+    // cgroup v2 refuses processes in a node whose children have controllers, so
+    // the job node carries the limits and each step gets a leaf of its own.
+    let job_subtree = cgroup_path.join("cgroup.subtree_control");
+    for ctrl in ["+memory", "+cpu", "+pids", "+cpuset"] {
+        if let Err(e) = std::fs::write(&job_subtree, ctrl) {
+            debug!(job_id, controller = ctrl, error = %e, "job cgroup controller not delegated to steps");
+        }
+    }
+    let step_path = step_cgroup_path_for(&cgroup_root, job_id, run_attempt, step_id);
+    if let Err(e) = std::fs::create_dir_all(&step_path) {
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the step cgroup is unavailable: {e}");
+        }
+        warn!(job_id, step_id, error = %e, "step cgroup unavailable; falling back to the job cgroup");
+        return Ok(Some(cgroup_path));
+    }
+    Ok(Some(step_path))
 }
 
 /// Parse a cgroup cpu list (`"0-3"`, `"0-1,4"`, `""`) into core ids.
@@ -1220,6 +1297,27 @@ pub(crate) fn cgroup_has_pid(cgroup_path: &Path, pid: u32) -> bool {
     procs.lines().any(|line| line.trim() == pid.to_string())
 }
 
+/// Atomically SIGKILLs every process in the cgroup (cgroup-v2 `cgroup.kill`),
+/// reaching descendants that detached from the signaled process group.
+pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
+    std::fs::write(cgroup_path.join("cgroup.kill"), b"1")
+}
+
+/// Signals every pid in the cgroup with any signal (unlike `cgroup_kill`,
+/// SIGKILL-only). Returns the count signaled; `Ok(0)` means no tracked pids.
+pub fn cgroup_signal(cgroup_path: &Path, sig: Signal) -> std::io::Result<usize> {
+    let pids = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
+    let mut signaled = 0;
+    for pid_str in pids.lines() {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            if signal::kill(Pid::from_raw(pid), sig).is_ok() {
+                signaled += 1;
+            }
+        }
+    }
+    Ok(signaled)
+}
+
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
 /// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
 pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
@@ -1310,7 +1408,35 @@ fn classify_cgroup_claim_failure(
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
+/// Every cgroup this agent creates is `job_<id>_<attempt>` or a `step_<id>` leaf
+/// beneath one. A path that is neither was derived wrongly — walking up from a
+/// job node reaches the shared root — and reaping it would destroy a directory
+/// that is not ours.
+fn is_own_cgroup(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("job_") || name.starts_with("step_"))
+}
+
 pub fn cleanup_cgroup(cgroup_path: &Path) {
+    if !is_own_cgroup(cgroup_path) {
+        warn!(
+            path = %cgroup_path.display(),
+            "refusing to reap a cgroup that is not a job or step of ours"
+        );
+        return;
+    }
+
+    // Steps live in leaves under the job, and rmdir only works bottom-up, so
+    // reaping a job has to clear its steps first.
+    if let Ok(entries) = std::fs::read_dir(cgroup_path) {
+        for child in entries.flatten() {
+            if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                cleanup_cgroup(&child.path());
+            }
+        }
+    }
+
     // Kill any remaining processes
     if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
         for pid_str in pids.lines() {
@@ -1398,11 +1524,7 @@ pub(crate) struct StepOutputFiles {
 /// roots [`open_step_output_files`] (via [`create_job_spool_dir`]) chooses
 /// between. A reader that did not open the file cannot see which root the writer
 /// picked, so it checks both. Kept in sync with `open_step_output_files`' names.
-pub(crate) fn step_output_path_candidates(
-    job_id: JobId,
-    step_id: u32,
-    stderr: bool,
-) -> Vec<PathBuf> {
+pub fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: bool) -> Vec<PathBuf> {
     let name = format!("step{step_id}.{}", if stderr { "err" } else { "out" });
     [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]
         .into_iter()
@@ -1471,7 +1593,7 @@ pub(crate) fn open_step_output_files(
 }
 
 /// Send file descriptors to a peer over a Unix socket via SCM_RIGHTS.
-fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
+pub(crate) fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
     let iov = [std::io::IoSlice::new(b"F")];
     let cmsgs = [ControlMessage::ScmRights(fds)];
@@ -1481,7 +1603,7 @@ fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
 
 /// Receive file descriptors sent via SCM_RIGHTS. Returns an empty vec if the
 /// peer closed without sending (e.g. the helper failed before passing fds).
-fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
+pub(crate) fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
     let mut buf = [0u8; 8];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
@@ -1668,6 +1790,37 @@ fn open_job_output(
     }
 }
 
+/// Resolves the work_dir a job runs in. Falls back to a per-job scratch
+/// directory (not shared /tmp directly) if the submitted path can't be
+/// created here, since a relative output path anchored to bare /tmp can
+/// collide with another job's or user's file of the same name.
+fn resolve_effective_work_dir(
+    job_id: JobId,
+    run_attempt: u32,
+    work_dir: &str,
+    uid: u32,
+    gid: u32,
+) -> String {
+    // `create_dir_all("")` is a silent no-op success (no path components to
+    // create), so an empty work_dir must be checked explicitly — otherwise
+    // it would be treated as already resolved instead of falling through to
+    // the scratch-dir default below.
+    if !work_dir.is_empty() && create_dir_as_user(Path::new(work_dir), uid, gid) {
+        return work_dir.to_string();
+    }
+    let scratch_dir = std::env::temp_dir().join(format!("spur-job_{job_id}_{run_attempt}"));
+    if create_dir_as_user(&scratch_dir, uid, gid) {
+        warn!(job_id, work_dir, scratch_dir = %scratch_dir.display(),
+            "work_dir unavailable on this node, using a per-job scratch directory");
+        return scratch_dir.to_string_lossy().into_owned();
+    }
+    warn!(
+        job_id,
+        work_dir, "work_dir and per-job scratch directory both unavailable, using /tmp"
+    );
+    "/tmp".to_string()
+}
+
 /// Create `dir` and any missing parents as the submitting user (forking to drop
 /// privilege when spurd is root), so directory creation resolves symlinks and
 /// permissions with the user's authority. Returns whether the tree now exists.
@@ -1795,10 +1948,41 @@ pub fn cleanup_job_spool(job_id: JobId) {
     }
 }
 
+/// Remove just one step's output, for a supervisor that does not own the job's
+/// spool — its siblings are still writing to theirs.
+pub fn cleanup_step_spool(job_id: JobId, step_id: u32) {
+    for stderr in [false, true] {
+        for path in step_output_path_candidates(job_id, step_id, stderr) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Whether a launch wraps the job in fresh namespaces. A PMIx rank needs the
+/// host's, a step entering a parent's brings its own, and a holder must stay
+/// signalable.
+fn would_use_namespaces(cfg: &JobLaunchConfig, is_root: bool) -> bool {
+    is_root && !cfg.pmix_multi_task && !cfg.joins_parent_namespaces && !cfg.allocation_holder
+}
+
+pub(crate) fn launch_script_name(step_id: spur_core::step::StepId) -> String {
+    match spur_core::step::is_user_step(step_id) {
+        true => format!("spur_step{step_id}.sh"),
+        false => "spur_job.sh".to_string(),
+    }
+}
+
+pub(crate) fn namespace_wrapper_name(step_id: spur_core::step::StepId) -> String {
+    match spur_core::step::is_user_step(step_id) {
+        true => format!("spur_ns_step{step_id}.sh"),
+        false => "spur_ns.sh".to_string(),
+    }
+}
+
 /// Resolve output path patterns (%j → job_id, etc.)
 /// Resolve a pattern against the *effective* work_dir (may be the `/tmp`
 /// fallback) via the shared resolver, so agent and controller paths match.
-fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern: &str) -> String {
+pub(crate) fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern: &str) -> String {
     spur_core::job::resolve_output_pattern(
         pattern,
         &spur_core::job::OutputPathContext {
@@ -1831,6 +2015,7 @@ async fn launch_container_job(
     let job_id = cfg.job_id;
 
     // Sync pipe: child writes status, parent reads.
+    // Convert OwnedFd to raw fds for manual lifecycle management across fork.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
     // Prevent read end from leaking into exec'd process
     nix::fcntl::fcntl(
@@ -1840,6 +2025,10 @@ async fn launch_container_job(
     .ok();
     let ready_r = pipe_r.as_raw_fd();
     let ready_w = pipe_w.as_raw_fd();
+    // Owners close these; the raw copies are only for the forked child, which
+    // execs or _exits without running destructors.
+    let pipe_r_owner = pipe_r;
+    let pipe_w_owner = pipe_w;
 
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
@@ -1871,7 +2060,9 @@ async fn launch_container_job(
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
             // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
-            drop(pipe_r);
+            unsafe {
+                libc::close(ready_r);
+            }
 
             // Reset signal handlers
             unsafe {
@@ -1914,8 +2105,8 @@ async fn launch_container_job(
             // Signal parent: setup complete
             unsafe {
                 libc::write(ready_w, b"OK".as_ptr() as *const _, 2);
+                libc::close(ready_w);
             }
-            drop(pipe_w);
 
             // Build final environment: base + container_env + hook environ.d
             let mut final_env = env_snapshot;
@@ -1960,9 +2151,8 @@ async fn launch_container_job(
         }
 
         nix::unistd::ForkResult::Parent { child } => {
-            drop(pipe_w);
+            drop(pipe_w_owner);
             unsafe {
-                libc::close(ready_w);
                 if cgroup_log_fd >= 0 {
                     libc::close(cgroup_log_fd);
                 }
@@ -1982,7 +2172,7 @@ async fn launch_container_job(
             let mut buf = [0u8; 512];
             let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
             let n = n.max(0) as usize;
-            drop(pipe_r);
+            drop(pipe_r_owner);
 
             if n < 2 || &buf[..2] != b"OK" {
                 let msg = String::from_utf8_lossy(&buf[..n]);
@@ -2355,6 +2545,165 @@ mod tests {
     use super::*;
 
     #[test]
+    fn purging_one_step_leaves_its_siblings_output() {
+        let root = std::env::temp_dir().join("spur");
+        let job_dir = root.join("job771");
+        std::fs::create_dir_all(&job_dir).expect("job spool");
+        let mine = job_dir.join("step0.out");
+        let sibling = job_dir.join("step1.out");
+        std::fs::write(&mine, "mine").expect("mine");
+        std::fs::write(&sibling, "sibling").expect("sibling");
+
+        cleanup_step_spool(771, 0);
+
+        assert!(!mine.exists(), "the step's own output is purged");
+        assert!(sibling.exists(), "a live sibling's output must survive");
+        let _ = std::fs::remove_dir_all(&job_dir);
+    }
+
+    #[test]
+    fn reaping_a_job_clears_its_step_leaves_first() {
+        // rmdir is bottom-up, so a job whose steps still have directories was
+        // previously left behind entirely.
+        let dir = tempfile::tempdir().expect("cgroup root");
+        let job = dir.path().join("job_9_1");
+        let step = job.join("step_0");
+        std::fs::create_dir_all(&step).expect("step leaf");
+
+        cleanup_cgroup(&job);
+
+        assert!(!step.exists(), "the step leaf must be removed");
+        assert!(!job.exists(), "the job node must be removed once empty");
+    }
+
+    #[test]
+    fn a_steps_cgroup_is_a_leaf_under_its_job() {
+        let root = Path::new("/sys/fs/cgroup/spur");
+        let job = cgroup_path_for(root, 4, 1);
+        let batch = step_cgroup_path_for(root, 4, 1, spur_core::step::STEP_BATCH);
+        let user = step_cgroup_path_for(root, 4, 1, 0);
+
+        // Limits live on the job; every step's processes sit one level down, so
+        // two steps never share a directory.
+        assert_eq!(batch.parent(), Some(job.as_path()));
+        assert_eq!(user.parent(), Some(job.as_path()));
+        assert_ne!(batch, user);
+        // Reaping the job still reaches every step.
+        assert!(user.starts_with(&job));
+    }
+
+    #[test]
+    fn cgroup_path_is_scoped_to_the_attempt_not_just_the_job() {
+        let root = Path::new("/sys/fs/cgroup/spur");
+        let first = cgroup_path_for(root, 4, 1);
+        let second = cgroup_path_for(root, 4, 2);
+        assert_ne!(
+            first, second,
+            "a redispatch must never share a cgroup with a not-yet-reaped prior attempt"
+        );
+        // Nor sit beneath it: reaping is recursive, so a stale attempt's cancel
+        // would take a live one with it.
+        assert!(
+            !second.starts_with(&first),
+            "{second:?} nested under {first:?}"
+        );
+    }
+
+    #[test]
+    fn cgroup_signal_delivers_to_every_tracked_pid() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(cgroup.path().join("cgroup.procs"), child.id().to_string())
+            .expect("seed cgroup.procs");
+
+        let signaled =
+            cgroup_signal(cgroup.path(), Signal::SIGKILL).expect("signal every tracked pid");
+
+        assert_eq!(signaled, 1);
+        let status = child.wait().expect("wait for signaled child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn cgroup_signal_reports_the_read_failure_when_theres_no_cgroup() {
+        let missing = std::path::Path::new("/nonexistent/spur-cgroup-signal-test");
+        assert!(cgroup_signal(missing, Signal::SIGTERM).is_err());
+    }
+
+    #[test]
+    fn an_attemptless_cancel_names_no_live_cgroup() {
+        // run_attempt is zero on a legacy cancel; a real attempt starts at one,
+        // so the path it derives belongs to no running job.
+        let legacy = expected_cgroup_path(5, 0);
+
+        for attempt in 1..=4 {
+            assert_ne!(legacy, expected_cgroup_path(5, attempt));
+        }
+    }
+
+    #[test]
+    fn a_job_or_step_cgroup_is_ours_to_reap() {
+        assert!(is_own_cgroup(Path::new("/sys/fs/cgroup/spur/job_7_1")));
+        assert!(is_own_cgroup(Path::new(
+            "/sys/fs/cgroup/spur/job_7_1/step_0"
+        )));
+    }
+
+    #[test]
+    fn the_shared_root_is_never_reapable() {
+        // Walking up from a job node lands here; reaping it would take out
+        // every other job on the node.
+        assert!(!is_own_cgroup(Path::new("/sys/fs/cgroup/spur")));
+        assert!(!is_own_cgroup(Path::new("/sys/fs/cgroup")));
+        assert!(!is_own_cgroup(Path::new("/")));
+    }
+
+    #[test]
+    fn a_path_we_did_not_name_is_not_reapable() {
+        assert!(!is_own_cgroup(Path::new("/sys/fs/cgroup/system.slice")));
+        assert!(!is_own_cgroup(Path::new("/tmp/.tmpAbC123")));
+    }
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_cgroup_retries_past_a_transient_removal_failure() {
+        let root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let cgroup = root.path().join("job_7_1");
+        std::fs::create_dir(&cgroup).expect("job cgroup");
+        let cgroup = TestDir(cgroup);
+        // A directory (not a plain file) at the cgroup.kill path makes the
+        // write fail, so cleanup_cgroup falls back to the per-pid sweep and
+        // this blocker is the only thing standing in remove_dir's way.
+        let blocker = cgroup.path().join("cgroup.kill");
+        std::fs::create_dir(&blocker).expect("seed blocker directory");
+
+        let blocker_removed = blocker.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
+        });
+
+        cleanup_cgroup(cgroup.path());
+
+        assert!(
+            !cgroup.path().exists(),
+            "cleanup_cgroup must retry past a transient removal failure"
+        );
+    }
+
+    #[test]
     fn decode_wait_status_splits_exit_and_signal() {
         use nix::sys::wait::WaitStatus;
         use nix::unistd::Pid;
@@ -2605,6 +2954,52 @@ mod tests {
     }
 
     #[test]
+    fn resolve_effective_work_dir_uses_the_submitted_path_when_creatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().join("job-work-dir");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let resolved = resolve_effective_work_dir(1, 1, &work_dir.to_string_lossy(), uid, gid);
+
+        assert_eq!(resolved, work_dir.to_string_lossy());
+        assert!(work_dir.is_dir());
+    }
+
+    #[test]
+    fn resolve_effective_work_dir_treats_empty_as_unset_not_already_resolved() {
+        // create_dir_all("") is a silent no-op success, so an empty work_dir
+        // must not be mistaken for an already-usable path.
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let resolved = resolve_effective_work_dir(9001, 2, "", uid, gid);
+
+        let expected = std::env::temp_dir().join("spur-job_9001_2");
+        assert_eq!(resolved, expected.to_string_lossy());
+        assert!(expected.is_dir());
+        std::fs::remove_dir(&expected).ok();
+    }
+
+    #[test]
+    fn resolve_effective_work_dir_falls_back_to_a_scoped_scratch_dir_not_bare_tmp() {
+        // A path nested under a plain file can never be created — deterministic,
+        // uid-independent way to force the fallback branch.
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let unusable_work_dir = blocker.path().join("subdir");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let resolved =
+            resolve_effective_work_dir(4242, 3, &unusable_work_dir.to_string_lossy(), uid, gid);
+
+        let expected = std::env::temp_dir().join("spur-job_4242_3");
+        assert_eq!(resolved, expected.to_string_lossy());
+        assert!(expected.is_dir(), "scratch dir must actually be created");
+        std::fs::remove_dir(&expected).ok();
+    }
+
+    #[test]
     fn open_job_output_creates_files_and_parent_dirs() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -2780,6 +3175,53 @@ mod tests {
     }
 
     #[test]
+    fn an_allocation_holder_is_not_isolated() {
+        // PID 1 of a namespace has unhandled signals dropped by the kernel, so a
+        // holder isolated that way can never be torn down.
+        let cfg = holder_cfg(true);
+        assert!(!would_use_namespaces(&cfg, true));
+
+        let normal = holder_cfg(false);
+        assert!(would_use_namespaces(&normal, true));
+    }
+
+    #[test]
+    fn an_unprivileged_launch_is_never_isolated() {
+        assert!(!would_use_namespaces(&holder_cfg(false), false));
+    }
+
+    #[test]
+    fn a_step_does_not_reuse_the_jobs_script_path() {
+        // A step overwriting the job's script corrupts it under a running bash.
+        assert_ne!(
+            launch_script_name(0),
+            launch_script_name(spur_core::step::STEP_BATCH)
+        );
+        assert_ne!(
+            namespace_wrapper_name(0),
+            namespace_wrapper_name(spur_core::step::STEP_BATCH)
+        );
+    }
+
+    #[test]
+    fn two_steps_of_one_job_get_different_scripts() {
+        assert_ne!(launch_script_name(0), launch_script_name(1));
+        assert_ne!(namespace_wrapper_name(0), namespace_wrapper_name(1));
+    }
+
+    #[test]
+    fn a_jobs_own_steps_keep_the_original_script_names() {
+        for owning in [
+            spur_core::step::STEP_BATCH,
+            spur_core::step::STEP_EXTERN,
+            spur_core::step::STEP_INTERACTIVE,
+        ] {
+            assert_eq!(launch_script_name(owning), "spur_job.sh");
+            assert_eq!(namespace_wrapper_name(owning), "spur_ns.sh");
+        }
+    }
+
+    #[test]
     fn job_spool_dir_round_trips_create_and_cleanup() {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
@@ -2860,9 +3302,21 @@ mod tests {
         assert!(received.is_empty());
     }
 
+    fn holder_cfg(allocation_holder: bool) -> JobLaunchConfig {
+        JobLaunchConfig {
+            allocation_holder,
+            ..launch_cfg_for_paths(1, "n", "u", "node")
+        }
+    }
+
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
+            joins_parent_namespaces: false,
+            allocation_holder: false,
+            step_id: spur_core::step::STEP_BATCH,
             job_id,
+            run_attempt: 1,
+            mpi: String::new(),
             script: String::new(),
             work_dir: String::new(),
             name: name.to_string(),

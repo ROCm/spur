@@ -173,6 +173,25 @@ the local login name, matching step-mode ``srun`` under JWT authentication.
    sattach 1024
    sattach 1024 --output-only --output stderr
 
+Surviving an Agent Restart
+--------------------------
+
+Work is supervised by a process that outlives the node agent, so an
+administrator restarting or upgrading ``spurd`` does not kill it. An allocation
+stays held, a running ``srun`` step keeps running and still reports its exit
+status, and a terminal opened inside an allocation is reattached — the session
+pauses for the restart and resumes where it was.
+
+Two cases are not covered: a step given its own ``--container-image``, and an
+``srun --pty`` that allocates its own job rather than running inside an existing
+allocation. Both end when the agent stops. To keep a terminal across a restart,
+take an allocation first and run ``srun --pty`` inside it:
+
+.. code-block:: bash
+
+   salloc -N1
+   srun --pty bash     # inside the allocation shell
+
 Requesting GPUs
 ---------------
 

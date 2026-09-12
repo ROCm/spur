@@ -81,7 +81,19 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let first_node = nodes
         .first()
         .with_context(|| format!("sattach: job {} has no allocated nodes", job_id))?;
-    let agent_addr = format!("http://{}:6818", first_node);
+    let nodes_info = client
+        .get_nodes(spur_proto::proto::GetNodesRequest {
+            nodelist: first_node.clone(),
+            ..Default::default()
+        })
+        .await
+        .map(|response| response.into_inner().nodes)
+        .unwrap_or_default();
+    let agent_addr = format!(
+        "http://{}:{}",
+        first_node,
+        agent_port_for(&nodes_info, first_node)
+    );
     let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 
     if args.output_only {
@@ -137,6 +149,15 @@ async fn stream_output_only(
     Ok(())
 }
 
+fn agent_port_for(nodes: &[spur_proto::proto::NodeInfo], node: &str) -> u32 {
+    crate::interactive::agent_port_or_default(
+        nodes
+            .iter()
+            .find(|info| info.name == node)
+            .map_or(0, |info| info.agent_port),
+    )
+}
+
 /// Interactive attach via InteractiveSession RPC. Returns the remote exit code.
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
@@ -152,4 +173,30 @@ fn state_name(state: i32) -> &'static str {
     spur_core::job::JobState::from_proto_i32(state)
         .map(|s| s.display())
         .unwrap_or("UNKNOWN")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str, agent_port: u32) -> spur_proto::proto::NodeInfo {
+        spur_proto::proto::NodeInfo {
+            name: name.into(),
+            agent_port,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn agent_port_prefers_what_the_node_reported() {
+        let nodes = vec![node("n1", 7818), node("n2", 9000)];
+        assert_eq!(agent_port_for(&nodes, "n2"), 9000);
+    }
+
+    #[test]
+    fn agent_port_falls_back_when_the_node_reports_none() {
+        // A node registered before the field existed reports 0.
+        assert_eq!(agent_port_for(&[node("n1", 0)], "n1"), 6818);
+        assert_eq!(agent_port_for(&[], "n1"), 6818);
+    }
 }

@@ -1144,17 +1144,17 @@ async fn try_stream_output(
         return false;
     };
 
-    if controller
+    let Ok(node_info) = controller
         .get_node(GetNodeRequest {
             name: first_node.clone(),
         })
         .await
-        .is_err()
-    {
+    else {
         return false;
-    }
+    };
 
-    let agent_addr = format!("http://{first_node}:6818");
+    let agent_port = crate::interactive::agent_port_or_default(node_info.into_inner().agent_port);
+    let agent_addr = format!("http://{first_node}:{agent_port}");
 
     let mut agent = match crate::interactive::connect_agent(&agent_addr).await {
         Ok(c) => c,
@@ -1233,19 +1233,21 @@ async fn stream_step_output_live(
     step_id: u32,
     user: &str,
 ) -> bool {
-    if controller
+    let Ok(node_info) = controller
         .get_node(GetNodeRequest {
             name: node.to_string(),
         })
         .await
-        .is_err()
-    {
+    else {
         return false;
-    }
-    let agent_addr = format!("http://{node}:6818");
+    };
+    let agent_port = crate::interactive::agent_port_or_default(node_info.into_inner().agent_port);
+    let agent_addr = format!("http://{node}:{agent_port}");
     let req = |stream: &str| StreamJobOutputRequest {
         job_id,
         step_id,
+        step: Some(step_id),
+        start_offset: 0,
         stream: stream.to_string(),
         user: user.to_string(),
     };

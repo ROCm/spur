@@ -2,7 +2,7 @@ Deploying with Ansible (recommended)
 ====================================
 
 The ``spur-toolkit`` Ansible playbooks are the recommended way to stand up a real
-cluster. They install the three Spur binaries, render ``spur.conf``, create
+cluster. They install the Spur binaries, render ``spur.conf``, create
 systemd-managed daemons and the Slurm-compatible symlinks (``sbatch``, ``squeue``,
 ``sinfo``, …), and stand up PostgreSQL accounting — a single ``ansible-playbook``
 run takes a set of hosts from bare SSH to a working cluster. The playbooks live in
@@ -45,7 +45,7 @@ Target hosts
 Quickstart
 ----------
 
-Build the three binaries in the ``ROCm/spur`` repository, point Ansible at them, edit
+Build the binaries in the ``ROCm/spur`` repository, point Ansible at them, edit
 the inventory, and deploy.
 
 .. code-block:: bash
@@ -54,7 +54,7 @@ the inventory, and deploy.
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
    SPUR_BUILD="$(pwd)/target/release"
    cd -
 

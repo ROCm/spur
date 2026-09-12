@@ -130,13 +130,13 @@ For a multi-node cluster, the Ansible toolkit is the recommended upgrade path. T
 playbooks are supported; both reuse the same install, config, and health-check roles as
 ``deploy.yml``, so their behavior stays consistent.
 
-Rebuild all three binaries from the same source tree together — they share a Raft
+Rebuild all binaries from the same source tree together — they share a Raft
 write-ahead-log schema, and mixing binaries from different builds can leave a controller
 unable to parse a log written by a differently-versioned peer:
 
 .. code-block:: bash
 
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 
 Binaries roll out by content, not version string: Ansible compares checksums, so an
 unchanged re-run is a near no-op.
@@ -228,7 +228,7 @@ Safe Upgrade Order
 
 Follow this order for any cluster upgrade:
 
-1. **Rebuild all three binaries together** from the same source tree — they share a Raft
+1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
    controller at a time to preserve quorum.
@@ -253,6 +253,15 @@ Follow this order for any cluster upgrade:
    newer build cannot parse them. A newer controller reads older logs fine, so the
    supported recovery from a bad upgrade is to roll forward, not to reinstall the
    previous version over a log the new one has already written.
+
+.. note::
+
+   Restarting ``spurd`` does not kill the work on that node: jobs, ``srun``
+   steps and held allocations run under supervisors that outlive the agent, and
+   the restarted agent re-adopts them. Draining first is still the recommended
+   order — it keeps new work off a node mid-swap — but it is no longer what
+   protects running jobs from the restart itself. See :doc:`native-host` for
+   the two launches that remain unsupervised.
 
 Behavior Changes Between Releases
 ---------------------------------
