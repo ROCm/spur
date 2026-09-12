@@ -67,9 +67,12 @@ class TestMpiSingleNode:
         try:
             code, out = cluster.srun_with_exit(["--mpi=pmix", "-n1", "/bin/true"])
             assert code != 0, f"expected failure without plugin, got success:\n{out}"
-            combined = f"{out}\n{cluster.spurd_log(0)}"
-            assert "MPI plugin not found" in combined or "plugin not found" in combined.lower(), (
-                f"expected plugin-not-found error, got:\n{combined}"
+            # srun's own output, not a node log: an operator who forgot to deploy
+            # the plugin never reads anything else.
+            logs = "\n".join(cluster.spurd_log(i) for i in range(len(cluster.nodes)))
+            assert "plugin not found" in out.lower(), (
+                f"expected plugin-not-found error in srun output, got:\n{out}\n"
+                f"node logs:\n{logs}"
             )
         finally:
             cluster.teardown()

@@ -25,6 +25,16 @@ def _sessions(cluster, node_index: int = 0) -> list[str]:
     return [name for name in listing.split() if name[:1].isdigit()]
 
 
+def _parse_probe(content: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in content.splitlines():
+        if "=" not in line or line.startswith(" ") or line.startswith("\x1b"):
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
 class TestStepdRestartSurvival:
     def test_running_job_survives_an_agent_restart_and_completes(self, cluster):
         out_path = f"{cluster.remote_dir}/survive.out"
@@ -120,3 +130,93 @@ class TestStepdRestartSurvival:
                 return
             time.sleep(2)
         assert False, "the cancelled job's supervisor was never reaped"
+
+
+class TestSupervisedGpuAdoption:
+    """Adoption is what hands a job's resources back to the agent, and a step
+    reads its GPU set from the job it joins. An empty set there is not "unset":
+    it is read as *no devices* and pins every visibility variable to ``-1``.
+    """
+
+    def test_a_jobs_gpu_set_survives_an_agent_restart(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+
+        probe = cluster.ship_fixture("gpu_env_probe.sh")
+        for node in cluster.nodes:
+            node.exec(f"chmod +x '{probe}'")
+        hold = cluster.write_file(
+            "gpu-adopt-hold.sh", "#!/bin/bash\nsleep 300\n", all_nodes=True
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(
+                [
+                    "-J", "gpu-adopt", "-N", "1", "-w", cluster.node_names[0],
+                    "--gres=gpu:1", hold,
+                ]
+            )
+        )
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+        # Taken before the probe step so the set holds only the holder's own
+        # supervisor; a step's supervisor exits and would leave the set itself.
+        before_pids = _supervisor_pids(cluster)
+        assert before_pids, "a running job must have a supervisor"
+
+        try:
+            code, out = cluster.srun_in_allocation(job_id, [probe])
+            before = _parse_probe(out)
+            assert "PROBE_OK" in out, (
+                f"the pre-restart step did not run to completion (exit {code})\n"
+                f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+            )
+            # Asserted before the restart as well, so a probe that never saw the
+            # allocation fails here instead of matching a denied set afterwards.
+            assert before.get("SPUR_COUNT") == "1", (
+                f"the step must start out holding the job's one GPU\noutput:\n{out}"
+            )
+            assert before.get("ROCR_VISIBLE_DEVICES") not in (None, "", "-1"), (
+                f"the step must start out with a real device index\noutput:\n{out}"
+            )
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            # Identity, not count: a supervisor killed with the agent and
+            # respawned afterwards would satisfy any "still one running" check.
+            after_pids = _supervisor_pids(cluster)
+            assert before_pids <= after_pids, (
+                "the job must be adopted rather than relaunched: "
+                f"{sorted(before_pids)} before the restart, {sorted(after_pids)} after"
+            )
+
+            code, out = cluster.srun_in_allocation(job_id, [probe])
+            after = _parse_probe(out)
+            assert "PROBE_OK" in out, (
+                f"the post-restart step did not run to completion (exit {code})\n"
+                f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+            )
+            # The deny path empties SPUR_JOB_GPUS but writes `-1` into the
+            # visibility vars, and `-1` is one CSV element like a real index is.
+            assert after.get("SPUR_COUNT") == "1", (
+                f"the adopted job lost its GPU set, so the step was denied every "
+                f"device\noutput:\n{out}"
+            )
+            assert after.get("ROCR_VISIBLE_DEVICES") != "-1", (
+                f"`-1` is the no-devices sentinel, not the GPU the job holds\n"
+                f"output:\n{out}"
+            )
+            assert after.get("ROCR_VISIBLE_DEVICES") == before.get(
+                "ROCR_VISIBLE_DEVICES"
+            ), (
+                f"the visible device changed across the restart: "
+                f"{before.get('ROCR_VISIBLE_DEVICES')!r} -> "
+                f"{after.get('ROCR_VISIBLE_DEVICES')!r}\noutput:\n{out}"
+            )
+            assert after.get("SPUR_JOB_GPUS") == before.get("SPUR_JOB_GPUS"), (
+                f"the job's GPU set changed across the restart: "
+                f"{before.get('SPUR_JOB_GPUS')!r} -> "
+                f"{after.get('SPUR_JOB_GPUS')!r}\noutput:\n{out}"
+            )
+        finally:
+            cluster.scancel(str(job_id))

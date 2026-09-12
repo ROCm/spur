@@ -161,6 +161,85 @@ class TestNumberedStepSupervision:
         )
 
 
+def _job_session_name(cluster, job_id: int) -> str | None:
+    """The session of the step that owns the job's lifetime — the one that
+    exists for as long as the job does, unlike a numbered step's."""
+    for name in _sessions(cluster):
+        parts = name.split(".")
+        if len(parts) == 3 and parts[0] == str(job_id):
+            if int(parts[2]) >= RESERVED_STEP_MIN:
+                return name
+    return None
+
+
+def _stat_mode(cluster, path: str, node_index: int = 0) -> str:
+    return cluster.nodes[node_index].exec_allow_fail(
+        f"stat -c %a '{path}' 2>/dev/null"
+    ).strip()
+
+
+def _wait_for_record(cluster, session_dir: str, record: str, timeout: int = 90) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _stat_mode(cluster, f"{session_dir}/{record}"):
+            return True
+        time.sleep(2)
+    return False
+
+
+class TestSessionRecordPermissions:
+    """A session record carries the capability the supervisor compares on every
+    connection, plus the job's environment. Anyone who can read one can speak
+    for the step, so the directory and its records are owner-only.
+    """
+
+    def test_a_sessions_records_are_owner_only(self, cluster):
+        node = cluster.node_names[0]
+        script = cluster.write_file(
+            "session-perms.sh", "#!/bin/bash\nsleep 15\n", all_nodes=True
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "session-perms", "-w", node, script])
+        )
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+
+        name = _job_session_name(cluster, job_id)
+        assert name, f"job {job_id} has no session: {_sessions(cluster)}"
+        session_dir = f"{cluster.state_dir}/runtime/{name}"
+
+        assert _stat_mode(cluster, session_dir) == "700", (
+            f"{session_dir} must be owner-only, got "
+            f"{_stat_mode(cluster, session_dir)!r}"
+        )
+        for record in ("descriptor.json", "launch.json"):
+            path = f"{session_dir}/{record}"
+            assert _stat_mode(cluster, path) == "600", (
+                f"{path} must be owner-only, got {_stat_mode(cluster, path)!r}"
+            )
+        # The modes only mean anything on a record that really holds the
+        # credential, so confirm this one does.
+        assert '"capability"' in cluster.nodes[0].read_file(
+            f"{session_dir}/descriptor.json"
+        ), f"{session_dir}/descriptor.json carries no capability to protect"
+
+        # The obligation log is written when the payload exits, and a session
+        # whose completion nothing acknowledged is kept rather than pruned.
+        cluster.stop_agents()
+        try:
+            assert _wait_for_record(cluster, session_dir, "obligations.jsonl"), (
+                f"the supervisor recorded no obligation under {session_dir}"
+            )
+            path = f"{session_dir}/obligations.jsonl"
+            assert _stat_mode(cluster, path) == "600", (
+                f"{path} must be owner-only, got {_stat_mode(cluster, path)!r}"
+            )
+        finally:
+            # Bring the agents back so the orphaned supervisor is adopted and
+            # reaped instead of outliving the test.
+            cluster.start_agents()
+
+
 def _job_cgroups(cluster, job_id: int, node_index: int = 0) -> list[str]:
     """This job's cgroups only. `/sys/fs/cgroup/spur` outlives any one cluster
     and job ids restart at 1, so an earlier run's leftovers are not ours."""

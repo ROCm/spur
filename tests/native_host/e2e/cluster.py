@@ -977,6 +977,22 @@ class SpurCluster:
         node.exec(self._spurd_start_cmd(node_index))
         time.sleep(5)
 
+    def wait_agent_serving(self, node_index: int = 0, timeout: int = 60):
+        """Block until a restarted spurd is answering RPCs again.
+
+        The agent adopts its supervisors before it starts serving, so this is
+        also the earliest a step may be launched into an adopted job.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if "agent gRPC server listening" in self.spurd_log(node_index):
+                return
+            time.sleep(1)
+        raise TimeoutError(
+            f"spurd on {self.node_names[node_index]} did not start serving "
+            f"within {timeout}s"
+        )
+
     def restart_controller(self):
         """Restart spurctld without touching the agents. State is recovered
         from the Raft log on the existing state-dir. Waits for the controller

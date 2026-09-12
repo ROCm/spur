@@ -1191,12 +1191,21 @@ async fn try_stream_output(
     }
 }
 
+/// How long a live tail waits for a restarted agent before giving up and
+/// letting the caller print the buffered output instead. Covers the
+/// controller's own re-attach window, so the tail outlives the RunStep it
+/// accompanies rather than the other way round.
+const STEP_TAIL_RECONNECT_ATTEMPTS: u32 = 30;
+const STEP_TAIL_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Write a step output stream's chunks to this process's stdout/stderr as they
-/// arrive, returning true on a clean eof. The lock is held only across each
-/// synchronous write, never an await.
+/// arrive, returning true on a clean eof and advancing `printed` by the bytes
+/// handed over. The lock is held only across each synchronous write, never an
+/// await.
 async fn drain_step_stream(
     mut stream: tonic::Streaming<StreamJobOutputChunk>,
     to_stderr: bool,
+    printed: &mut u64,
 ) -> bool {
     loop {
         match stream.message().await {
@@ -1213,6 +1222,7 @@ async fn drain_step_stream(
                     let _ = h.write_all(&chunk.data);
                     let _ = h.flush();
                 }
+                *printed += chunk.data.len() as u64;
             }
             Ok(None) => return true,
             Err(_) => return false,
@@ -1220,12 +1230,71 @@ async fn drain_step_stream(
     }
 }
 
+/// Open one of a step's spool streams on the agent, resuming at `start_offset`.
+async fn open_step_stream(
+    agent_addr: &str,
+    job_id: u32,
+    step_id: u32,
+    user: &str,
+    to_stderr: bool,
+    start_offset: u64,
+) -> Option<tonic::Streaming<StreamJobOutputChunk>> {
+    let mut agent = crate::interactive::connect_agent(agent_addr).await.ok()?;
+    let response = agent
+        .stream_job_output(StreamJobOutputRequest {
+            job_id,
+            step_id,
+            step: Some(step_id),
+            start_offset,
+            stream: if to_stderr { "stderr" } else { "stdout" }.to_string(),
+            user: user.to_string(),
+        })
+        .await
+        .ok()?;
+    Some(response.into_inner())
+}
+
+/// Tail one of a step's spool streams to a clean eof. A supervised step outlives
+/// a restart of the agent that launched it, so a mid-tail transport loss
+/// reconnects from the byte offset already printed instead of giving up — giving
+/// up would make the caller reprint the whole spool from its buffered fallback.
+async fn tail_step_stream(
+    agent_addr: &str,
+    job_id: u32,
+    step_id: u32,
+    user: &str,
+    to_stderr: bool,
+) -> bool {
+    let mut printed: u64 = 0;
+    // A first connection that fails means live streaming is simply unavailable;
+    // only a tail that was already running waits for the agent to come back.
+    let Some(stream) = open_step_stream(agent_addr, job_id, step_id, user, to_stderr, 0).await
+    else {
+        return false;
+    };
+    if drain_step_stream(stream, to_stderr, &mut printed).await {
+        return true;
+    }
+    for _ in 0..STEP_TAIL_RECONNECT_ATTEMPTS {
+        tokio::time::sleep(STEP_TAIL_RECONNECT_BACKOFF).await;
+        let Some(stream) =
+            open_step_stream(agent_addr, job_id, step_id, user, to_stderr, printed).await
+        else {
+            continue;
+        };
+        if drain_step_stream(stream, to_stderr, &mut printed).await {
+            return true;
+        }
+    }
+    false
+}
+
 /// Tail a step's stdout and stderr live from the agent on `node`, writing chunks
-/// to this process's stdout/stderr as they arrive. Returns true only if it
-/// connected and both streams reached a clean eof, so the caller can suppress
-/// the buffered response; any failure returns false and the caller falls back to
-/// printing the buffered output. Runs concurrently with the blocking RunStep and
-/// ends when the step leaves the agent's active_steps.
+/// to this process's stdout/stderr as they arrive. Returns true only if both
+/// streams reached a clean eof, so the caller can suppress the buffered
+/// response; any failure returns false and the caller falls back to printing the
+/// buffered output. Runs concurrently with the blocking RunStep and ends when
+/// the step leaves the agent's active_steps.
 async fn stream_step_output_live(
     controller: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     node: &str,
@@ -1243,30 +1312,10 @@ async fn stream_step_output_live(
     };
     let agent_port = crate::interactive::agent_port_or_default(node_info.into_inner().agent_port);
     let agent_addr = format!("http://{node}:{agent_port}");
-    let req = |stream: &str| StreamJobOutputRequest {
-        job_id,
-        step_id,
-        step: Some(step_id),
-        start_offset: 0,
-        stream: stream.to_string(),
-        user: user.to_string(),
-    };
-    let Ok(mut agent_out) = crate::interactive::connect_agent(&agent_addr).await else {
-        return false;
-    };
-    let Ok(mut agent_err) = crate::interactive::connect_agent(&agent_addr).await else {
-        return false;
-    };
-    let out = match agent_out.stream_job_output(req("stdout")).await {
-        Ok(r) => r.into_inner(),
-        Err(_) => return false,
-    };
-    let err = match agent_err.stream_job_output(req("stderr")).await {
-        Ok(r) => r.into_inner(),
-        Err(_) => return false,
-    };
-    let (out_ok, err_ok) =
-        tokio::join!(drain_step_stream(out, false), drain_step_stream(err, true));
+    let (out_ok, err_ok) = tokio::join!(
+        tail_step_stream(&agent_addr, job_id, step_id, user, false),
+        tail_step_stream(&agent_addr, job_id, step_id, user, true),
+    );
     out_ok && err_ok
 }
 
@@ -3035,5 +3084,38 @@ mod tests {
             "the mock reports every node missing, so streaming is unavailable"
         );
         assert_eq!(capture.get_node_requests(), vec!["node001".to_string()]);
+    }
+
+    /// A supervised step survives a restart of the agent that launched it, so
+    /// srun's live tail loses its stream mid-step and has to reconnect. It must
+    /// resume at the byte offset it already printed: reconnecting at 0 reprints
+    /// the step's early output, and failing the tail outright makes the caller
+    /// reprint the whole spool from the buffered RunStep response.
+    #[tokio::test]
+    async fn step_tail_resumes_at_the_printed_offset_after_the_agent_restarts() {
+        use crate::mock_agent::ScriptedStream;
+        let (addr, capture) = crate::mock_agent::spawn().await;
+        capture.script(vec![
+            ScriptedStream {
+                data: b"numbered-step-start\n".to_vec(),
+                then_eof: false,
+            },
+            ScriptedStream {
+                data: b"numbered-step-end\n".to_vec(),
+                then_eof: true,
+            },
+        ]);
+
+        let tailed = tail_step_stream(&format!("http://{addr}"), 42, 1, "tester", false).await;
+
+        assert!(
+            tailed,
+            "a tail that resumed to a clean eof must suppress the buffered fallback"
+        );
+        assert_eq!(
+            capture.start_offsets(),
+            vec![0, "numbered-step-start\n".len() as u64],
+            "the reconnect must resume past what was already printed"
+        );
     }
 }

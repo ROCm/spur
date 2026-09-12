@@ -5449,12 +5449,25 @@ impl SlurmAgent for AgentService {
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))?;
             if supervise_step {
-                supervised_pmix = Some(supervised_step_pmix(
+                let pmix = supervised_step_pmix(
                     proto,
                     self.mpi_host.config().clone(),
                     step_id,
                     num_tasks,
-                )?);
+                )?;
+                // The supervisor starts the server, but only this RPC can still
+                // answer the caller: a plugin this node cannot load is reported
+                // here or reaches the user as a bare SIGKILL. Same pre-flight
+                // PreparePmix runs for a multi-node step, which never reaches here.
+                self.mpi_host
+                    .validate_pmix_dispatch(&pmix.plan)
+                    .map_err(|error| {
+                        // Also on this node: the caller sees it over gRPC, but an
+                        // operator triaging from the node has nowhere else to look.
+                        warn!(job_id, step_id, %error, "refusing a pmix step this node cannot host");
+                        Status::failed_precondition(error)
+                    })?;
+                supervised_pmix = Some(pmix);
             } else {
                 let (guard, plan, per_local_rank_env) =
                     start_pmix_launch(self.mpi_host.clone(), proto, req.task_offset, num_tasks)?;
@@ -6145,6 +6158,12 @@ impl SlurmAgent for AgentService {
                 // Resume where a reconnecting reader left off rather than
                 // repeating output it has already printed.
                 let mut offset: u64 = start_offset;
+                // An offset past the end means this is not the file the reader
+                // was reading, so replay it whole: reprinting output is
+                // recoverable for the user, dropping it silently is not.
+                if matches!(file.metadata().await, Ok(meta) if meta.len() < offset) {
+                    offset = 0;
+                }
                 loop {
                     if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
                         let mut buf = Vec::new();
@@ -9360,11 +9379,10 @@ mod tests {
         );
     }
 
-    // The supervised dispatch is unreachable without `with_supervised_launch`,
-    // so this is the only unit-level cover for who hosts a step's PMIx server.
-    #[tokio::test]
-    async fn a_supervised_pmix_step_leaves_the_agent_hosting_no_server() {
-        let svc = AgentService::with_cluster_config(
+    /// An agent that takes the supervised dispatch, with the MPI plugin named
+    /// explicitly so an outcome never depends on what the runner has installed.
+    fn supervised_agent(pmix_plugin: &str) -> AgentService {
+        AgentService::with_cluster_config(
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
@@ -9376,10 +9394,8 @@ mod tests {
                 enabled: false,
                 ..CgroupConfig::default()
             },
-            // Named explicitly so the outcome does not depend on whether the
-            // runner happens to have a PMIx plugin installed.
             MpiConfig {
-                pmix_plugin: "/nonexistent/spur/spur_mpi_pmix.so".into(),
+                pmix_plugin: pmix_plugin.into(),
                 ..MpiConfig::default()
             },
             new_running_jobs(),
@@ -9389,7 +9405,14 @@ mod tests {
         .with_runtime_state_dir(
             std::env::temp_dir().join(format!("spur-test-runtime-{}", uuid::Uuid::new_v4())),
         )
-        .with_supervised_launch();
+        .with_supervised_launch()
+    }
+
+    // The supervised dispatch is unreachable without `with_supervised_launch`,
+    // so this is the only unit-level cover for who hosts a step's PMIx server.
+    #[tokio::test]
+    async fn a_supervised_pmix_step_leaves_the_agent_hosting_no_server() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
 
         let job_id = 7754;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
@@ -9413,16 +9436,95 @@ mod tests {
         let error = svc
             .run_command(req)
             .await
-            .expect_err("no spurstepd is built alongside the test binary");
+            .expect_err("the plugin is absent");
 
+        // The pre-flight only proves this node could serve the plan; validating
+        // is not hosting, and the server still belongs to the supervisor.
         assert!(
             !svc.mpi_host.has_active_pmix(job_id, step_id),
             "a supervised step's server belongs to its supervisor, not the agent"
         );
         assert!(
+            error.message().contains("MPI plugin not found"),
+            "the operator's reason must reach the caller, got: {}",
+            error.message()
+        );
+    }
+
+    // The reason only reaches srun's terminal through the buffered RunStep
+    // response, which srun suppresses whenever its live tail of the step's spool
+    // file reached a clean eof. Rejecting before that file exists is what keeps
+    // the tail from claiming the output.
+    #[tokio::test]
+    async fn a_rejected_pmix_step_never_opens_the_spool_that_would_swallow_its_reason() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
+
+        let job_id = 7755;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let step_id = 4;
+        // The spool path is keyed by job and step alone, so a file left by an
+        // earlier run of this test would read as one this run opened.
+        crate::executor::cleanup_step_spool(job_id, step_id);
+
+        let req = Request::new(RunCommandRequest {
+            command: vec!["true".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: work_dir.path().to_string_lossy().into_owned(),
+            environment: HashMap::new(),
+            job_id,
+            step_id,
+            num_tasks: 1,
+            mpi: MPI_PMIX.into(),
+            pmix_plan: Some(proto_pmix_plan(job_id, step_id, 1)),
+            ..Default::default()
+        });
+
+        svc.run_command(req)
+            .await
+            .expect_err("the plugin is absent");
+
+        for stderr in [false, true] {
+            assert_eq!(
+                crate::executor::existing_step_output_path(job_id, step_id, stderr),
+                None,
+                "the step was rejected before its spool file could be opened"
+            );
+        }
+    }
+
+    // The pre-flight is scoped to PMIx: a step that asked for no MPI must still
+    // be handed to its supervisor rather than judged by the agent.
+    #[tokio::test]
+    async fn a_supervised_step_without_mpi_still_reaches_its_supervisor() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
+
+        let job_id = 7756;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let step_id = 5;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec!["true".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: work_dir.path().to_string_lossy().into_owned(),
+            environment: HashMap::new(),
+            job_id,
+            step_id,
+            num_tasks: 1,
+            ..Default::default()
+        });
+
+        let error = svc
+            .run_command(req)
+            .await
+            .expect_err("no spurstepd is built alongside the test binary");
+
+        assert!(
             error.message().contains("step supervisor"),
-            "the step must reach its supervisor rather than fail in the agent's \
-             PMIx setup, got: {}",
+            "a non-MPI step must not be stopped by the PMIx pre-flight, got: {}",
             error.message()
         );
     }
@@ -10802,6 +10904,84 @@ mod tests {
         assert_eq!(rest, b"part2\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An srun tail that lost its agent mid-step reconnects carrying the byte
+    /// count it already printed. Honoring it is what keeps the reconnect from
+    /// reprinting the step's early output; clamping a nonsensical offset back to
+    /// the start is what keeps it from dropping output it never printed.
+    #[tokio::test]
+    async fn stream_job_output_resumes_a_reconnecting_reader_at_its_offset() {
+        use tokio_stream::StreamExt as _;
+        for (start_offset, expected) in [(6u64, &b"part2\n"[..]), (999, &b"part1\npart2\n"[..])] {
+            let svc = AgentService::new(
+                test_reporter(),
+                HooksConfig::default(),
+                Arc::new(Mutex::new(DeviceRegistry::new())),
+                spur_core::config::MemlockLimit::Unlimited,
+            );
+            let job_id = 78;
+            svc.insert_test_job(job_id, TrackedJob::dummy(std::process::id()))
+                .await;
+
+            // The step's spool survived the agent restart with all its output,
+            // and the step has since finished (so the tail eofs promptly).
+            let step_id = 6;
+            let dir = std::env::temp_dir().join(format!(
+                "spur-resume-test-{}-{start_offset}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("step6.out");
+            std::fs::write(&path, b"part1\npart2\n").unwrap();
+            svc.active_steps.lock().await.insert(
+                (job_id, step_id),
+                ActiveStep {
+                    stdout_path: path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+            );
+
+            let mut stream = svc
+                .stream_job_output(Request::new(StreamJobOutputRequest {
+                    start_offset,
+                    step: None,
+                    job_id,
+                    step_id,
+                    stream: "stdout".into(),
+                    user: "testuser".into(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+
+            // Let the tail resolve the spool file through active_steps (as it
+            // does for a step the restarted agent has re-adopted) before the
+            // step settles and the stream eofs.
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("a chunk should arrive")
+                .expect("stream still open")
+                .unwrap();
+            assert!(!first.eof);
+            svc.active_steps.lock().await.remove(&(job_id, step_id));
+
+            let mut resumed = first.data;
+            loop {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("a chunk should arrive")
+                    .expect("stream still open")
+                    .unwrap();
+                if chunk.eof {
+                    break;
+                }
+                resumed.extend_from_slice(&chunk.data);
+            }
+            assert_eq!(resumed, expected, "start_offset {start_offset}");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
