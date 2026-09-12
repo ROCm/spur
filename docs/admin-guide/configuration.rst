@@ -576,8 +576,8 @@ How client requests are authenticated.
        rejected rather than silently ignored, and ``"none"`` with
        ``mode = "required"`` is refused as contradictory. Nothing reads it
        afterwards — whether a presented credential is verified is decided by
-       ``mode`` and ``jwt_key`` alone, so ``plugin = "none"`` does **not** turn
-       verification off.
+       ``mode`` and the configured signing key alone, so ``plugin = "none"``
+       does **not** turn verification off.
    * - ``mode``
      - string
      - ``"permissive"``
@@ -591,8 +591,17 @@ How client requests are authenticated.
      - none
      - Restart
      - Signing key for user credentials (``spur token user``) and node admission
-       tokens, given as a file path or inline value. Deliberately not reloadable:
-       swapping it live would immediately invalidate every outstanding token.
+       tokens, given inline. The value is used literally as the secret — a path
+       here is the secret itself, not a file to read from. Deliberately not
+       reloadable: swapping it live would immediately invalidate every
+       outstanding token.
+   * - ``jwt_key_file``
+     - string
+     - none
+     - Restart
+     - Path to a regular file whose contents are the signing key, for keeping the
+       secret out of ``spur.conf``. A single trailing line ending is ignored.
+       Mutually exclusive with ``jwt_key``: setting both is rejected at startup.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -605,16 +614,16 @@ How client requests are authenticated.
    credential is unauthenticated, and the username it asserts in the request is
    taken at face value. Identity-dependent decisions — job ownership, reservation
    management, job-info visibility — are then only as trustworthy as the network.
-   Set ``mode = "required"`` (with a ``jwt_key``) to make them enforceable, and
-   restrict the controller port at the network layer either way. ``spurctld``
-   warns at startup whenever it binds a non-loopback address without
+   Set ``mode = "required"`` (with ``jwt_key`` or ``jwt_key_file``) to make them
+   enforceable, and restrict the controller port at the network layer either way.
+   ``spurctld`` warns at startup whenever it binds a non-loopback address without
    ``required``.
 
 .. note::
 
-   When ``jwt_key`` is unset, admission tokens are signed with a well-known
-   built-in key and are therefore forgeable; set an explicit key before enabling
-   token admission (``[admission] mode = "token"``).
+   When neither ``jwt_key`` nor ``jwt_key_file`` is set, admission tokens are
+   signed with a well-known built-in key and are therefore forgeable; set an
+   explicit key before enabling token admission (``[admission] mode = "token"``).
 
 .. _privileged-operations:
 

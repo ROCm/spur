@@ -219,10 +219,16 @@ impl NodeAllocation {
     /// same job id superseded this one) — either way the caller must not treat
     /// the job as backed by an allocation.
     pub fn commit_job(&mut self, job_id: u32, run_attempt: u32) -> bool {
-        self.launching.remove(&job_id);
-        self.owners
+        let owned = self
+            .owners
             .get(&job_id)
-            .is_some_and(|owned| owned.run_attempt == run_attempt)
+            .is_some_and(|owned| owned.run_attempt == run_attempt);
+        // The marker is keyed by job id alone, so a late commit for a superseded
+        // attempt would clear the one protecting the attempt that replaced it.
+        if owned {
+            self.launching.remove(&job_id);
+        }
+        owned
     }
 
     /// Release a job's allocation by id, regardless of which attempt owns it.
@@ -640,6 +646,29 @@ mod tests {
             node.free_cpus(),
             56,
             "the newer attempt's resources must remain allocated"
+        );
+    }
+
+    #[test]
+    fn test_a_superseded_commit_leaves_the_replacement_launch_protected() {
+        // Attempt 1's reservation is reclaimed, attempt 2 takes the job id, and
+        // attempt 1's late commit lands while attempt 2 is still mid-launch.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        node.release_job(7);
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+
+        assert!(!node.commit_job(7, 1), "a superseded attempt cannot commit");
+
+        assert!(
+            node.reconcile(&HashSet::new(), Instant::now(), Duration::from_secs(120))
+                .is_empty(),
+            "a stale commit must not strip the launching marker sparing attempt 2"
+        );
+        assert_eq!(
+            node.free_cpus(),
+            56,
+            "attempt 2's mid-launch reservation must survive"
         );
     }
 

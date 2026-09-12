@@ -542,6 +542,15 @@ impl SlurmAgent for VirtualAgent {
         Ok(Response::new(ReleasePmixResponse {}))
     }
 
+    /// A pod has no supervisor holding it at a gate — it runs as soon as it is
+    /// created — so there is nothing here to release.
+    async fn start_job(
+        &self,
+        _request: Request<spur_proto::proto::AgentStartJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,

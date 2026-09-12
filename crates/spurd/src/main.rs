@@ -201,11 +201,14 @@ fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32, spur_core
 /// The cgroup to reap for a stale session. A descriptor written before its
 /// cgroup was recorded still names the job, and the path follows from identity.
 fn stale_cgroup_path(descriptor: &stepd::StepdDescriptor) -> std::path::PathBuf {
-    if descriptor.cgroup_path.as_os_str().is_empty() {
-        executor::expected_cgroup_path(descriptor.job_id, descriptor.run_attempt)
-    } else {
-        descriptor.cgroup_path.clone()
+    if !descriptor.cgroup_path.as_os_str().is_empty() {
+        return descriptor.cgroup_path.clone();
     }
+    executor::reapable_cgroup_path(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    )
 }
 
 /// True when retrying a runtime-recovery report can never help: the
@@ -327,8 +330,12 @@ async fn main() -> anyhow::Result<()> {
     }
     // A corrupted descriptor has no cgroup_path to read, but the path is
     // reconstructable from identity alone — reap it the same way.
-    for &(job_id, run_attempt, _) in &corrupted_stepds {
-        executor::cleanup_cgroup(&executor::expected_cgroup_path(job_id, run_attempt));
+    for &(job_id, run_attempt, step_id) in &corrupted_stepds {
+        executor::cleanup_cgroup(&executor::reapable_cgroup_path(
+            job_id,
+            run_attempt,
+            step_id,
+        ));
     }
     if !recovered_stepds.is_empty() {
         warn!(
@@ -864,6 +871,31 @@ mod tests {
         assert_eq!(
             stale_cgroup_path(&descriptor),
             std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2")
+        );
+    }
+
+    #[test]
+    fn a_stale_numbered_step_without_a_recorded_cgroup_names_only_its_own_leaf() {
+        let mut descriptor = stepd::StepdDescriptor::new(
+            7,
+            2,
+            3,
+            0,
+            0,
+            std::path::PathBuf::from("/run/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert_eq!(
+            stale_cgroup_path(&descriptor),
+            executor::expected_step_cgroup_path(7, 2, 3),
+            "reaping recurses and SIGKILLs, so the job node would take this \
+             step's live siblings with it"
+        );
+
+        descriptor.cgroup_path = std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2/step_3");
+        assert_eq!(
+            stale_cgroup_path(&descriptor),
+            std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2/step_3")
         );
     }
 

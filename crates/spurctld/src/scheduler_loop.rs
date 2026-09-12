@@ -439,6 +439,7 @@ async fn process_assignment(
         (None, false)
     };
 
+    let dispatched = dispatch_spec.is_some();
     if let Some(dspec) = dispatch_spec {
         // The run epoch start_job_impl is about to persist for this
         // dispatch. Safe to read ahead of that call: this iteration is
@@ -505,7 +506,94 @@ async fn process_assignment(
         return false;
     }
 
+    // The job is Running and committed, so anything it launches can now be
+    // resolved by the controller. Only here is the workload let go.
+    if dispatched
+        && !start_job_on_nodes(&cluster, job_id, prospective_run_attempt, &dispatch_nodes).await
+    {
+        cancel_job_on_nodes(
+            &cluster,
+            job_id,
+            prospective_run_attempt,
+            &dispatch_nodes,
+            0,
+        )
+        .await;
+        return false;
+    }
+
     true
+}
+
+/// Release every dispatched node's workload, reporting whether all of them
+/// took it. A node that does not leaves its supervisor at the gate, where it
+/// times out — so the caller has to tear the run down rather than leave a job
+/// Running with nothing behind it on some of its nodes.
+async fn start_job_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+) -> bool {
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(start_one_agent(agent_addr, job_id, run_attempt));
+    }
+    let mut released = 0usize;
+    let mut expected = 0usize;
+    while let Some(outcome) = set.join_next().await {
+        expected += 1;
+        if outcome.unwrap_or(false) {
+            released += 1;
+        }
+    }
+    if released != expected || expected != node_names.len() {
+        warn!(
+            job_id,
+            run_attempt,
+            released,
+            expected = node_names.len(),
+            "could not release the job on every node"
+        );
+        return false;
+    }
+    true
+}
+
+async fn start_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    use spur_proto::proto::AgentStartJobRequest;
+
+    let attempt = async {
+        let mut client = crate::agent_client::connect(agent_addr.clone())
+            .await
+            .map(|c| {
+                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+            })
+            .ok()?;
+        client
+            .start_job(AgentStartJobRequest {
+                job_id,
+                run_attempt,
+            })
+            .await
+            .ok()
+    };
+    match tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            warn!(job_id, node_addr = %agent_addr, "failed to release the job on node");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node_addr = %agent_addr, "timed out releasing the job on node");
+            false
+        }
+    }
 }
 
 /// Compute the resource set to record against the cluster for an assignment.
@@ -3123,6 +3211,13 @@ mod tests {
                 tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
             type InteractiveSessionStream =
                 tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
+
+            async fn start_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
 
             async fn await_step(
                 &self,

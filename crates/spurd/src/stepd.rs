@@ -378,6 +378,9 @@ pub async fn reclaim_pty_master(
 const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
+/// Oldest session format this build still adopts. Raise it only when a change
+/// genuinely cannot be read, since anything older is abandoned, not adopted.
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
 const CONTROL_LINE_LIMIT: usize = 64 * 1024;
 
@@ -1068,14 +1071,65 @@ pub async fn shutdown_allocation(
     }
 }
 
+/// Bounds one whole control exchange: connect, hello, request, reply. Every
+/// request here is an ack the supervisor answers at once, so nothing on this
+/// path legitimately blocks — a wedged peer that accepts but never answers must
+/// not pin a cancel, a signal, or a dispatch forever.
+const STEPD_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// Paused-time tests drive a real socket, and tokio auto-advances the virtual
+// clock to the nearest timer whenever the runtime looks idle, firing the bound
+// mid-handshake. Per-thread because a `#[tokio::test]` runtime is current-thread.
+#[cfg(test)]
+thread_local! {
+    static REQUEST_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(Some(STEPD_REQUEST_TIMEOUT)) };
+}
+
+#[cfg(test)]
+fn request_timeout() -> Option<std::time::Duration> {
+    REQUEST_TIMEOUT.with(|timeout| timeout.get())
+}
+
+#[cfg(not(test))]
+fn request_timeout() -> Option<std::time::Duration> {
+    Some(STEPD_REQUEST_TIMEOUT)
+}
+
+/// Lifts the control-exchange bound on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct UnboundedRequests(Option<std::time::Duration>);
+
+#[cfg(test)]
+impl UnboundedRequests {
+    pub(crate) fn new() -> Self {
+        Self(REQUEST_TIMEOUT.with(|timeout| timeout.replace(None)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for UnboundedRequests {
+    fn drop(&mut self) {
+        REQUEST_TIMEOUT.with(|timeout| timeout.set(self.0));
+    }
+}
+
 async fn stepd_request(
     descriptor: &StepdDescriptor,
     spurd_instance_id: String,
     request: StepdRequest,
 ) -> io::Result<StepdResponse> {
-    let (mut reader, mut writer) = stepd_connect(descriptor, spurd_instance_id).await?;
-    write_request(&mut writer, &request).await?;
-    read_response(&mut reader).await
+    let exchange = async {
+        let (mut reader, mut writer) = stepd_connect(descriptor, spurd_instance_id).await?;
+        write_request(&mut writer, &request).await?;
+        read_response(&mut reader).await
+    };
+    let Some(bound) = request_timeout() else {
+        return exchange.await;
+    };
+    tokio::time::timeout(bound, exchange)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "runtime did not answer"))?
 }
 
 async fn stepd_connect(
@@ -1513,9 +1567,16 @@ fn rootfs_base(job_id: u32, step_id: spur_core::step::StepId) -> String {
     }
 }
 
+const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
+     Per-step supervisor. spurd spawns this; it is not meant to be run by hand.";
+
 pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{STEPD_USAGE}");
+        return Ok(0);
+    }
     if args.len() != 4 {
-        anyhow::bail!("usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>");
+        anyhow::bail!("{STEPD_USAGE}");
     }
     let state_dir = PathBuf::from(&args[0]);
     let job_id: u32 = args[1]
@@ -1705,17 +1766,20 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // unbounded operator code, and a crash in them must not read as "never ran".
     obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
     teardown(cgroup).await;
-    let epilog_failed = if let Some(epilog) = hooks.epilog.as_deref() {
-        if let Err(error) = spur_core::hooks::run_hook(epilog, &hook_context).await {
-            tracing::error!(job_id, %error, "runtime epilog hook failed");
-            true
-        } else {
-            false
-        }
-    } else {
-        false
+    // The node epilog and SPANK exit hooks are per-job-per-node, so only the step
+    // that owns the job's lifetime runs them — a numbered step would re-run them.
+    let owns_job_lifetime = !spur_core::step::is_user_step(step_id);
+    let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
+        Some(epilog) => match spur_core::hooks::run_hook(epilog, &hook_context).await {
+            Err(error) => {
+                tracing::error!(job_id, %error, "runtime epilog hook failed");
+                true
+            }
+            Ok(_) => false,
+        },
+        None => false,
     };
-    if let Some(spank) = spank.as_ref() {
+    if let Some(spank) = spank.as_ref().filter(|_| owns_job_lifetime) {
         let context = spur_spank::SpankContext {
             job_id,
             uid: hook_context.uid,
@@ -1961,7 +2025,22 @@ impl StepdStore {
             let mut observed_exit = None;
             let mut acknowledged = false;
             let mut epilog_failed = false;
-            for obligation in obligations.read()? {
+            // Skipped like an unreadable descriptor above: this runs at startup, so
+            // propagating one damaged session's error would stop the agent booting.
+            let recorded = match obligations.read() {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = descriptor.job_id,
+                        run_attempt = descriptor.run_attempt,
+                        step_id = descriptor.step_id,
+                        %error,
+                        "unreadable runtime obligations; skipping this session"
+                    );
+                    continue;
+                }
+            };
+            for obligation in recorded {
                 match obligation {
                     StepdObligation::ExitObserved { exit_code, signal } => {
                         observed_exit = Some((exit_code, signal));
@@ -2075,7 +2154,9 @@ impl StepdStore {
                 format!("invalid {}: {e}", descriptor_path.display()),
             )
         })?;
-        if descriptor.format_version != FORMAT_VERSION {
+        // A range, not equality: a descriptor this build still understands must
+        // survive a version bump, because rejecting one reaps its job's cgroup.
+        if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3247,6 +3328,106 @@ mod tests {
         assert_eq!(job_id, 7);
     }
 
+    /// Supervise `step_id` for real and return the notice spurd receives. The
+    /// epilog cannot spawn, so whether it ran shows up as `epilog_failed`.
+    async fn supervised_completion_notice(step_id: spur_core::step::StepId) -> AgentNotification {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = StepdStore::new(state_dir.path());
+        create_private_dir_all(store.root()).expect("create runtime dir");
+        let listener = UnixListener::bind(store.agent_socket()).expect("bind agent socket");
+        let agent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept notification");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read notice");
+            let payload =
+                serde_json::to_vec(&AgentNotificationResponse::Acknowledged).expect("encode");
+            writer.write_all(&payload).await.expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+            serde_json::from_str::<AgentNotification>(&line).expect("decode notice")
+        });
+
+        let job_id = 987_654;
+        let run_attempt = 1;
+        let mut spec = launch_spec();
+        spec.job_id = job_id;
+        spec.step_id = step_id;
+        spec.run_attempt = run_attempt;
+        spec.allocation_only = true;
+        spec.work_dir = state_dir.path().display().to_string();
+        spec.hooks.epilog = Some(
+            state_dir
+                .path()
+                .join("epilog-that-cannot-spawn")
+                .display()
+                .to_string(),
+        );
+        let capability = spec.capability.clone();
+        let spec_path = state_dir.path().join("launch.json");
+        fs::write(&spec_path, serde_json::to_vec(&spec).expect("encode spec"))
+            .expect("write launch spec");
+
+        let args = vec![
+            state_dir.path().display().to_string(),
+            job_id.to_string(),
+            run_attempt.to_string(),
+            spec_path.display().to_string(),
+        ];
+        let supervisor = tokio::spawn(async move { run_process(&args).await });
+
+        let socket_path = store
+            .session_dir(job_id, run_attempt, step_id)
+            .join("runtime.sock");
+        for _ in 0..10_000 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut descriptor = StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            socket_path,
+            PathBuf::new(),
+        );
+        descriptor.capability = capability;
+        shutdown_allocation(&descriptor, "agent-1".into())
+            .await
+            .expect("shut the allocation down");
+
+        supervisor
+            .await
+            .expect("supervisor task")
+            .expect("supervisor exits cleanly");
+        agent.await.expect("agent task")
+    }
+
+    // The node epilog is per-job-per-node: a numbered step re-running it would
+    // tear down an allocation its live siblings are still using.
+    #[tokio::test]
+    async fn a_numbered_step_does_not_run_the_node_epilog() {
+        let AgentNotification::StepdCompleted { epilog_failed, .. } =
+            supervised_completion_notice(3).await;
+        assert!(
+            !epilog_failed,
+            "a numbered step must leave the node epilog to the step owning the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_step_owning_the_job_still_runs_the_node_epilog() {
+        let AgentNotification::StepdCompleted { epilog_failed, .. } =
+            supervised_completion_notice(spur_core::step::STEP_BATCH).await;
+        assert!(
+            epilog_failed,
+            "the batch step must still run the node epilog"
+        );
+    }
+
     fn gate_descriptor() -> StepdDescriptor {
         StepdDescriptor::new(
             7,
@@ -3346,5 +3527,69 @@ mod tests {
             tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
         drop(client_stream);
         assert!(!server.await.expect("join").expect("serve"));
+    }
+
+    /// How long a wedged supervisor in the tests below stays silent. It hangs up
+    /// eventually rather than never, so losing the bound fails an assertion
+    /// instead of hanging the suite. Paused time makes the wait free.
+    fn longer_than_the_bound() -> std::time::Duration {
+        STEPD_REQUEST_TIMEOUT * 6
+    }
+
+    fn wedged_supervisor(dir: &tempfile::TempDir) -> (StepdDescriptor, UnixListener) {
+        let socket_path = dir.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path;
+        (descriptor, listener)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_never_answers_the_hello_fails_the_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (descriptor, listener) = wedged_supervisor(&dir);
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(longer_than_the_bound()).await;
+            drop(stream);
+        });
+
+        let error = shutdown_allocation(&descriptor, "wedged".into())
+            .await
+            .expect_err("a supervisor that never answers must not hang the cancel");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    // Dispatch goes through the same request path, so a supervisor that greets
+    // the agent and then wedges must not stall the controller's scheduler loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_stops_answering_after_hello_fails_the_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (descriptor, listener) = wedged_supervisor(&dir);
+
+        let greeting = descriptor.clone();
+        let greeted = Arc::new(AtomicBool::new(false));
+        let server_greeted = greeted.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = accept_hello(&listener, &greeting, &greeting.capability).await
+            else {
+                return;
+            };
+            server_greeted.store(true, Ordering::Release);
+            tokio::time::sleep(longer_than_the_bound()).await;
+            drop(stream);
+        });
+
+        let error = start_job(&descriptor, "wedged".into())
+            .await
+            .expect_err("a supervisor that stops answering must not hang dispatch");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            greeted.load(Ordering::Acquire),
+            "the bound must cover the request, not just the handshake"
+        );
     }
 }

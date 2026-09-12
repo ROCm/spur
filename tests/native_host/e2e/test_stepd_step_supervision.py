@@ -48,6 +48,49 @@ def _wait_for_numbered_step(cluster, job_id: int, timeout: int = 90) -> set[int]
     return set()
 
 
+class TestStepStartOrdering:
+    def test_a_step_on_the_scripts_first_line_runs(self, cluster):
+        # Coverage for the earliest a step can be launched, and for the release
+        # RPC the job now waits on. Not a regression test for the start race:
+        # the window is a single commit wide, so this passes against the
+        # ordering it documents as well as the one it wants.
+        node = cluster.node_names[0]
+        script = cluster.write_file(
+            "first-line-srun.sh",
+            "#!/bin/bash\n"
+            "scontrol show job $SPUR_JOB_ID | grep -o 'JobState=[A-Z]*' | head -1\n"
+            "srun hostname\n"
+            'echo "step-rc=$?"\n',
+            all_nodes=True,
+        )
+        jobs = []
+        for run in range(3):
+            out_path = f"{cluster.remote_dir}/first-line-srun-{run}.out"
+            job_id = parse_job_id(
+                cluster.sbatch(
+                    ["-J", f"first-srun-{run}", "-w", node, "-o", out_path, script]
+                )
+            )
+            assert job_id is not None
+            jobs.append((job_id, out_path))
+
+        for job_id, out_path in jobs:
+            assert wait_job(cluster, job_id, timeout=120) == "CD", (
+                f"job {job_id} did not complete:\n{cluster.scontrol('show', 'job', str(job_id))}"
+            )
+            content = cluster.read_output_on_any_node(out_path)
+            # The invariant, asserted directly rather than by whether the step
+            # happened to win: by the time the script runs at all, the cluster
+            # already agrees the job is running.
+            assert "JobState=RUNNING" in content, (
+                f"job {job_id} ran its script before the controller committed "
+                f"it Running:\n{content}"
+            )
+            assert "step-rc=0" in content, (
+                f"the first-line step was refused in job {job_id}:\n{content}"
+            )
+
+
 class TestNumberedStepSupervision:
     def test_a_numbered_step_gets_its_own_supervisor(self, cluster):
         # The step's own supervisor is what lets it outlive the agent; before

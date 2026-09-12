@@ -366,16 +366,21 @@ class TestStepAndExecDeviceIsolation:
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "dev-iso-step-cgroup", [])
-        procs = f"/sys/fs/cgroup/spur/job_{job_id}_1/cgroup.procs"
+        job_cg = f"/spur/job_{job_id}_1"
+        # A step runs in a `step_` leaf under the job, so membership is being
+        # inside the job's subtree — the job node itself holds no processes.
         probe = cluster.write_file(
             "dev-iso-step-cgroup-probe.sh",
             f"""#!/bin/bash
-if grep -qx "$$" {procs} 2>/dev/null; then
-  echo STEP_CGROUP=JOINED
-else
-  echo STEP_CGROUP=OUTSIDE
-fi
-echo "STEP_PID=$$ PROCS=$(tr '\\n' ' ' < {procs} 2>/dev/null)"
+CG=""
+while IFS= read -r line; do
+  case "$line" in 0::*) CG="${{line#0::}}" ;; esac
+done < /proc/self/cgroup
+case "$CG" in
+  {job_cg}|{job_cg}/*) echo STEP_CGROUP=JOINED ;;
+  *) echo STEP_CGROUP=OUTSIDE ;;
+esac
+echo "STEP_PID=$$ STEP_CG=$CG"
 """,
         )
         try:
@@ -384,7 +389,8 @@ echo "STEP_PID=$$ PROCS=$(tr '\\n' ' ' < {procs} 2>/dev/null)"
             cluster.scancel(str(job_id))
 
         assert "STEP_CGROUP=JOINED" in out, (
-            f"the step's pid must appear in {procs} (exit {code})\noutput:\n{out}"
+            f"the step must run inside {job_cg} or one of its step leaves, so the "
+            f"job's device filter applies to it (exit {code})\noutput:\n{out}"
         )
 
 

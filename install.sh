@@ -163,7 +163,11 @@ mkdir -p "${INSTALL_DIR}"
 EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
 [ -n "${EXTRACTED}" ] || err "Could not find extracted directory"
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
-for _bin in ${BINARIES}; do chmod +x "${INSTALL_DIR}/${_bin}"; done
+# An older pinned release ships fewer binaries, and the copy above has already
+# replaced the installed ones — aborting here would leave them non-executable.
+for _bin in ${BINARIES}; do
+    if [ -f "${INSTALL_DIR}/${_bin}" ]; then chmod +x "${INSTALL_DIR}/${_bin}"; fi
+done
 
 PLUGIN_DIR="$(dirname "${INSTALL_DIR}")/lib/spur"
 if [ -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" ]; then

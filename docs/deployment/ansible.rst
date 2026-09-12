@@ -67,7 +67,9 @@ the inventory, and deploy.
    ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD"
 
 ``spur_binary_src`` points at the build-output directory; the ``spur_install`` role
-reads ``spur``, ``spurctld``, and ``spurd`` from it by name. Omit it to install a
+reads ``spur``, ``spurctld``, ``spurd``, and ``spurstepd`` from it by name.
+``spurstepd`` must land next to ``spurd`` on every compute node — the agent looks
+for it beside its own executable and does not search ``$PATH``. Omit it to install a
 published release via ``install.sh`` instead, selected by ``spur_version``
 (``latest`` | ``nightly`` | ``vX.Y.Z``):
 

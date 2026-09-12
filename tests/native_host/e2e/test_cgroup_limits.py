@@ -21,13 +21,18 @@ MIB = 1024 * 1024
 
 # Pure bash on purpose: the minimal container image has no awk or cut, and the
 # same probe is reused there.
+# A step's processes live in a `step_` leaf under the job, so limits are read
+# from the job node above it — that is where they bind the whole job.
 _PROBE = """#!/bin/bash
 CG=""
 while IFS= read -r line; do
   case "$line" in 0::*) CG="${line#0::}" ;; esac
 done < /proc/self/cgroup
 echo "CGROUP_PATH=$CG"
-B="/sys/fs/cgroup$CG"
+JOB_CG="$CG"
+case "$CG" in */step_*) JOB_CG="${CG%/step_*}" ;; esac
+echo "JOB_CGROUP_PATH=$JOB_CG"
+B="/sys/fs/cgroup$JOB_CG"
 for f in cpu.max cpuset.cpus memory.max memory.high memory.swap.max \
          memory.oom.group pids.max; do
   if [ -r "$B/$f" ]; then echo "$f=$(cat "$B/$f")"; else echo "$f=UNREADABLE"; fi
@@ -112,10 +117,16 @@ def _run_probe(
 
     probe = _Probe(_parse(content), job_id, content)
     if expect_enforced:
-        assert probe.values.get("CGROUP_PATH") == f"/spur/job_{job_id}_1", (
+        job_cgroup = f"/spur/job_{job_id}_1"
+        assert probe.values.get("JOB_CGROUP_PATH") == job_cgroup, (
             f"job ran outside its own cgroup, so no limit was applied to it "
             f"(agent user: {cluster.spurd_agent_user(0)!r})\n{probe.context()}\n"
             f"spurd log:\n{cluster.spurd_log(0)[-2000:]}"
+        )
+        # Belt and braces: the process must sit in the job's subtree, either in
+        # the job node itself or one of its step leaves.
+        assert probe.values.get("CGROUP_PATH", "").startswith(job_cgroup), (
+            f"job process escaped its job cgroup\n{probe.context()}"
         )
     return probe
 
@@ -182,9 +193,9 @@ class TestCgroupDefaults:
             ["--cpus-per-task=1", "--mem=256", f"--container-image={image}"],
             "cg-container",
         )
-        assert probe.values["CGROUP_PATH"] == f"/spur/job_{probe.job_id}_1", (
-            probe.context()
-        )
+        assert probe.values["CGROUP_PATH"].startswith(
+            f"/spur/job_{probe.job_id}_1"
+        ), probe.context()
 
 
 class TestCgroupCpuQuota:
@@ -283,6 +294,12 @@ def _step_mem_probe(marker: str) -> str:
 
 
 class TestCgroupOomGroupKill:
+    # An OOM only happens when memory.max is a hard ceiling. Leaving swap
+    # unbounded lets the allocation spill to swap on any host that has some.
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"cgroup": {"constrain_swap": True, "allowed_swap_percent": 0}}
+
     # Default `oom_kill_job = true`: the existing tests assert memory.oom.group
     # reads 1; this asserts the effect.
     def test_oom_kill_group_takes_the_whole_job(self, cgroup_cluster):
@@ -299,9 +316,17 @@ class TestCgroupOomGroupKill:
 
 
 class TestCgroupOomSingleKill:
+    # An OOM only happens when memory.max is a hard ceiling. Leaving swap
+    # unbounded lets the allocation spill to swap on any host that has some.
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {"cgroup": {"oom_kill_job": False}}
+        return {
+            "cgroup": {
+                "oom_kill_job": False,
+                "constrain_swap": True,
+                "allowed_swap_percent": 0,
+            }
+        }
 
     def test_oom_kill_disabled_spares_the_siblings(self, cgroup_cluster):
         # Only the offending process is killed, so the parent outlives the child's
@@ -324,6 +349,11 @@ class TestCgroupStepMemoryBudget:
     counts against the job's ``memory.max``. Before it, a step ran cgroup-free and
     could allocate past the job's ceiling unchecked.
     """
+    # An OOM only happens when memory.max is a hard ceiling. Leaving swap
+    # unbounded lets the allocation spill to swap on any host that has some.
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"cgroup": {"constrain_swap": True, "allowed_swap_percent": 0}}
 
     def test_a_step_is_bound_by_the_jobs_memory_max(self, cgroup_cluster):
         cluster = cgroup_cluster
@@ -519,6 +549,32 @@ class TestCgroupRequired:
             f"{_spurd_logs(cluster)[-2000:]}"
         )
         cluster.scancel(str(job_id))
+
+    def test_a_step_runs_when_enforcement_is_required(self, cgroup_cluster):
+        # A step holds no cores of its own, so reconfiguring the job cgroup from the
+        # step's limits degrades enforcement and `required` then refuses the step.
+        cluster = cgroup_cluster
+        marker = f"{cluster.remote_dir}/cg-required-step-marker.txt"
+        step = cluster.write_file(
+            "cg-required-step-probe.sh", f"#!/bin/bash\necho STEP_RAN > {marker}\n"
+        )
+        script = cluster.write_file(
+            "cg-required-step.sh", "#!/bin/bash\n" f"srun bash {step}\n"
+        )
+        sb = cluster.sbatch(
+            ["-J", "cg-required-step", "-N", "1", "-w", cluster.node_names[0],
+             "-t", "2", "--cpus-per-task=1", "--mem=256", script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+        state = wait_job(cluster, job_id, timeout=120)
+        marker_out = cluster.nodes[0].read_file(marker)
+
+        assert "STEP_RAN" in marker_out, (
+            f"a step must join the job's cgroup rather than reconfigure it: under "
+            f"[cgroup] required it was refused instead (state {state})\n"
+            f"{cluster.debug_job(job_id)}\nmarker:\n{marker_out!r}"
+        )
 
 
 class TestCgroupConfigValidation:

@@ -478,6 +478,10 @@ service SlurmAgent {
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
   // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
   rpc ReleasePmix(ReleasePmixRequest) returns (ReleasePmixResponse);
+  // Release a dispatched job for execution. The agent holds the workload at a
+  // gate until this arrives, so the controller has committed the job Running
+  // before anything the job runs can ask about it.
+  rpc StartJob(AgentStartJobRequest) returns (google.protobuf.Empty);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
@@ -996,6 +1000,11 @@ message LaunchJobResponse {
   string stdout_path = 3;  // absolute resolved output path on the launching node
   string stderr_path = 4;
   LaunchFailureKind failure_kind = 5;
+}
+
+message AgentStartJobRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
 }
 
 message AgentCancelJobRequest {

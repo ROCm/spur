@@ -138,7 +138,9 @@ pub struct ControllerService {
 
 enum StepdRecoveryCohortState {
     Tracking(std::time::Instant),
-    Fencing,
+    // Timestamped so the sweep can expire it: fencing can fail after this is set,
+    // and an entry that never expires bars the cohort from ever fencing again.
+    Fencing(std::time::Instant),
 }
 
 struct LeaderProxy {
@@ -302,17 +304,20 @@ impl ControllerService {
         // path; sweep entries stuck well past the grace period so this map
         // can't grow without bound.
         incomplete.retain(|_, state| match state {
-            StepdRecoveryCohortState::Tracking(first_seen) => {
+            StepdRecoveryCohortState::Tracking(first_seen)
+            | StepdRecoveryCohortState::Fencing(first_seen) => {
                 first_seen.elapsed() < STEPD_RECOVERY_COHORT_GRACE * 10
             }
-            StepdRecoveryCohortState::Fencing => true,
         });
         let key = (job_id, run_attempt);
         match incomplete.get(&key) {
-            Some(StepdRecoveryCohortState::Fencing) => false,
+            Some(StepdRecoveryCohortState::Fencing(_)) => false,
             Some(StepdRecoveryCohortState::Tracking(first_seen)) => {
                 if first_seen.elapsed() >= STEPD_RECOVERY_COHORT_GRACE {
-                    incomplete.insert(key, StepdRecoveryCohortState::Fencing);
+                    incomplete.insert(
+                        key,
+                        StepdRecoveryCohortState::Fencing(std::time::Instant::now()),
+                    );
                     true
                 } else {
                     false
@@ -354,6 +359,13 @@ impl ControllerService {
             ));
         }
 
+        // A numbered step may run on a subset of the job's nodes, so a job-wide
+        // cohort counts the non-participants as missing and requeues the whole job.
+        // Only the steps that span the allocation can be checked this way.
+        if spur_core::step::is_user_step(step_id) {
+            return Ok(StepdRecoveryProbe::Retained);
+        }
+
         let expected_nodes = job.allocated_nodes.clone();
         let mut missing = Vec::new();
         let mut set = tokio::task::JoinSet::new();
@@ -373,6 +385,9 @@ impl ControllerService {
             let node_name = node_name.clone();
             let probed_node = node_name.clone();
             let handle = set.spawn(async move {
+                // `None` for a node that could not answer: failing to ask is not
+                // evidence the supervisor died, and fencing on it requeues a
+                // healthy job. Only a node that answers counts against the cohort.
                 match crate::agent_client::connect(endpoint).await {
                     Ok(mut client) => client
                         .probe_stepd(StepdProbeRequest {
@@ -381,14 +396,14 @@ impl ControllerService {
                             step_id,
                         })
                         .await
-                        .map(|response| response.into_inner().active)
+                        .map(|response| Some(response.into_inner().active))
                         .unwrap_or_else(|error| {
                             warn!(job_id, run_attempt, node = %probed_node, %error, "runtime recovery probe RPC failed");
-                            false
+                            None
                         }),
                     Err(error) => {
                         warn!(job_id, run_attempt, node = %probed_node, %error, "runtime recovery probe failed to connect to agent");
-                        false
+                        None
                     }
                 }
             });
@@ -396,20 +411,17 @@ impl ControllerService {
         }
         while let Some(result) = set.join_next_with_id().await {
             match result {
-                Ok((id, active)) => {
-                    if !active {
-                        if let Some(node_name) = handle_to_node.remove(&id) {
-                            missing.push(node_name);
-                        }
-                    }
-                }
-                // A probe task panicking tells us nothing about the node's
-                // liveness; treat it the same as a failed probe rather than
-                // silently counting the node as confirmed-active.
-                Err(error) => {
-                    if let Some(node_name) = handle_to_node.remove(&error.id()) {
+                Ok((id, Some(false))) => {
+                    if let Some(node_name) = handle_to_node.remove(&id) {
                         missing.push(node_name);
                     }
+                }
+                // A node that answered "alive", or one that could not answer at
+                // all: neither is grounds for tearing the job down.
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(job_id, run_attempt, %error, "runtime recovery probe task failed");
+                    handle_to_node.remove(&error.id());
                 }
             }
         }
@@ -451,7 +463,7 @@ impl ControllerService {
         &self,
         hostname: &str,
         node_token: &str,
-    ) -> Result<(), Status> {
+    ) -> Result<StepdReporter, Status> {
         // Without a signing key there is nothing to verify the node against, so
         // the report is taken on trust rather than dropping a live supervisor.
         if !self.node_identity_key_configured {
@@ -460,13 +472,26 @@ impl ControllerService {
                 "accepting unverified stepd recovery ([auth] jwt_key unset); \
                  set jwt_key to have the node prove its identity"
             );
-            return Ok(());
+            return Ok(StepdReporter::Unproven);
         }
         if hostname.is_empty() {
             return Err(Status::invalid_argument("hostname required"));
         }
         if node_token.is_empty() {
-            return Err(Status::unauthenticated("node token required"));
+            // Only token admission issues a node credential, so only there does its
+            // absence mean a bad caller rather than a normally-registered agent.
+            if matches!(
+                self.cluster.config().admission.mode,
+                spur_core::config::AdmissionMode::Token
+            ) {
+                return Err(Status::unauthenticated("node token required"));
+            }
+            warn!(
+                hostname,
+                "accepting unverified stepd recovery (admission.mode = open); \
+                 set admission.mode = \"token\" to have the node prove its identity"
+            );
+            return Ok(StepdReporter::Unproven);
         }
         let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
             .map_err(|error| Status::unauthenticated(error.to_string()))?;
@@ -478,7 +503,19 @@ impl ControllerService {
                 "node {hostname} is not registered"
             )));
         }
-        Ok(())
+        Ok(StepdReporter::Proven)
+    }
+
+    // Fencing requeues a job and cancels it cluster-wide, so it is reserved for a
+    // reporter that proved its node identity at admission.
+    fn refuse_unproven_fence(&self, job_id: u32, run_attempt: u32, hostname: &str) {
+        warn!(
+            job_id,
+            run_attempt,
+            node = %hostname,
+            "not fencing an incomplete runtime recovery reported by an unproven node; \
+             set admission.mode = \"token\" so a node proves its identity before it can fence"
+        );
     }
 
     /// Re-send a cancel to a node still holding an allocation the controller no
@@ -899,21 +936,23 @@ impl ControllerService {
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
-            if join_token.is_empty() {
-                return Err(Status::unauthenticated("admission token required"));
-            }
-
-            let (token_id, secret) = spur_core::admission::parse_token(join_token)
-                .map_err(|e| Status::permission_denied(e.to_string()))?;
-
-            let token_store = self.cluster.get_tokens();
-            spur_core::admission::validate_token(token_id, secret, &token_store)
-                .map_err(|e| Status::permission_denied(e.to_string()))?;
+        // Open admission lets a caller assert any hostname, so a credential minted
+        // there would attest nothing and still authorize a fence.
+        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
+            return Ok(String::new());
         }
 
-        // Minted independently of admission so stepd works under open admission;
-        // there the token attests the registered name, not an admitted one.
+        if join_token.is_empty() {
+            return Err(Status::unauthenticated("admission token required"));
+        }
+
+        let (token_id, secret) = spur_core::admission::parse_token(join_token)
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        let token_store = self.cluster.get_tokens();
+        spur_core::admission::validate_token(token_id, secret, &token_store)
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
         if !self.node_identity_key_configured {
             return Ok(String::new());
         }
@@ -921,6 +960,14 @@ impl ControllerService {
         spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
     }
+}
+
+/// Whether a runtime recovery report came from a node that proved its identity.
+/// An unproven report may keep a job alive but never tear one down.
+#[derive(Clone, Copy, Debug)]
+enum StepdReporter {
+    Proven,
+    Unproven,
 }
 
 enum StepdRecoveryProbe {
@@ -2240,7 +2287,8 @@ impl SlurmController for ControllerService {
         }
 
         let request = request.into_inner();
-        self.authorize_stepd_recovery_report(&request.hostname, &request.node_token)?;
+        let reporter =
+            self.authorize_stepd_recovery_report(&request.hostname, &request.node_token)?;
 
         let probe = self
             .probe_stepd_recovery(
@@ -2252,6 +2300,17 @@ impl SlurmController for ControllerService {
             .await?;
 
         if request.stale_descriptor {
+            // A numbered step losing its supervisor is that step's failure, not the
+            // job's; fencing here would requeue the batch script and every sibling.
+            if spur_core::step::is_user_step(request.step_id) {
+                self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                    .await;
+                return Ok(Response::new(StepdRecoveryResponse {
+                    retained: false,
+                    fenced: false,
+                    message: "step descriptor has no live supervisor".into(),
+                }));
+            }
             match probe {
                 StepdRecoveryProbe::Stale => {
                     self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
@@ -2262,9 +2321,41 @@ impl SlurmController for ControllerService {
                         message: "stepd belongs to an inactive or superseded run".into(),
                     }));
                 }
-                StepdRecoveryProbe::Retained | StepdRecoveryProbe::Incomplete { .. } => {
+                StepdRecoveryProbe::Retained => {
                     self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
                         .await;
+                    // The probe just found every participant alive, which outranks
+                    // one agent's claim that its own descriptor is unreadable.
+                    warn!(
+                        job_id = request.job_id,
+                        run_attempt = request.run_attempt,
+                        node = %request.hostname,
+                        "node reports a stale descriptor for a job whose supervisors are all live"
+                    );
+                    return Ok(Response::new(StepdRecoveryResponse {
+                        retained: true,
+                        fenced: false,
+                        message: "stepd descriptor is unreadable but its supervisors are live"
+                            .into(),
+                    }));
+                }
+                StepdRecoveryProbe::Incomplete { .. } => {
+                    self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    if matches!(reporter, StepdReporter::Unproven) {
+                        self.refuse_unproven_fence(
+                            request.job_id,
+                            request.run_attempt,
+                            &request.hostname,
+                        );
+                        return Ok(Response::new(StepdRecoveryResponse {
+                            retained: false,
+                            fenced: false,
+                            message: "stepd descriptor has no live supervisor, but an unproven \
+                                      node may not fence the job"
+                                .into(),
+                        }));
+                    }
                     let fenced = self
                         .fence_stepd_recovery(request.job_id, request.run_attempt)
                         .await?;
@@ -2300,15 +2391,32 @@ impl SlurmController for ControllerService {
                 expected_nodes,
                 missing,
             } => {
+                // Retained with no message so the agent stops retrying and keeps its
+                // supervisor: the job outlives the report rather than being abandoned.
+                if matches!(reporter, StepdReporter::Unproven) {
+                    self.refuse_unproven_fence(
+                        request.job_id,
+                        request.run_attempt,
+                        &request.hostname,
+                    );
+                    return Ok(Response::new(StepdRecoveryResponse {
+                        retained: true,
+                        fenced: false,
+                        message: String::new(),
+                    }));
+                }
                 if self
                     .claim_stepd_recovery_fence(request.job_id, request.run_attempt)
                     .await
                 {
+                    // Clear before propagating: a fence that fails must leave the
+                    // cohort claimable, not stuck until the sweep expires it.
                     let fenced = self
                         .fence_stepd_recovery(request.job_id, request.run_attempt)
-                        .await?;
+                        .await;
                     self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
                         .await;
+                    let fenced = fenced?;
                     return Ok(Response::new(StepdRecoveryResponse {
                         retained: false,
                         fenced,
@@ -6539,6 +6647,13 @@ mod tests {
         ) -> Result<Response<spur_proto::proto::LaunchJobResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
+        async fn start_job(
+            &self,
+            _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            Ok(tonic::Response::new(()))
+        }
+
         async fn await_step(
             &self,
             _request: Request<spur_proto::proto::AwaitStepRequest>,
@@ -6685,11 +6800,23 @@ mod tests {
         addr
     }
 
-    // Open admission must not mint an identity for a caller-asserted
-    // hostname — otherwise anyone can claim to be any node and later use
-    // the token to falsely report stepd recovery for that node's job.
+    /// A service under token admission, where registration makes a caller prove
+    /// an identity rather than merely assert a hostname.
+    async fn test_service_with_token_admission(dir: &tempfile::TempDir) -> ControllerService {
+        let mut config = step_test_config();
+        config.auth.plugin = "jwt".into();
+        config.auth.jwt_key = Some("test-node-identity-key".into());
+        config.admission.mode = spur_core::config::AdmissionMode::Token;
+        let mut svc = test_service_with(dir, config).await;
+        svc.jwt_key = "test-node-identity-key".into();
+        svc.node_identity_key_configured = true;
+        svc
+    }
+
+    // Open admission must not mint an identity for a caller-asserted hostname —
+    // otherwise anyone can claim to be any node and fence that node's job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn validate_admission_mints_a_node_token_under_open_admission() {
+    async fn validate_admission_mints_no_node_token_under_open_admission() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_node_identity(&dir).await;
         assert_eq!(
@@ -6702,37 +6829,30 @@ mod tests {
             .validate_admission("", "n1")
             .expect("open admission registration is not an error");
         assert!(
-            !token.is_empty(),
-            "an identity key must mint a node token even under open admission, \
-             or stepd cannot run on a default cluster"
+            token.is_empty(),
+            "a hostname nobody had to prove must not be handed a node credential"
         );
-        let identity = spur_core::admission::verify_node_token(&token, svc.jwt_key.as_bytes())
-            .expect("minted token verifies");
-        assert_eq!(identity.hostname, "n1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validate_admission_mints_no_node_token_without_an_identity_key() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let svc = test_service_with(&dir, step_test_config()).await;
+        let mut config = step_test_config();
+        config.admission.mode = spur_core::config::AdmissionMode::Token;
+        let svc = test_service_with(&dir, config).await;
         assert!(!svc.node_identity_key_configured);
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
 
         let token = svc
-            .validate_admission("", "n1")
-            .expect("open admission registration is not an error");
+            .validate_admission(&join_token, "n1")
+            .expect("an admitted registration is not an error");
         assert!(token.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validate_admission_mints_a_node_token_with_a_valid_join_token() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut config = step_test_config();
-        config.auth.plugin = "jwt".into();
-        config.auth.jwt_key = Some("test-node-identity-key".into());
-        config.admission.mode = spur_core::config::AdmissionMode::Token;
-        let mut svc = test_service_with(&dir, config).await;
-        svc.jwt_key = "test-node-identity-key".into();
-        svc.node_identity_key_configured = true;
+        let svc = test_service_with_token_admission(&dir).await;
 
         let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
 
@@ -6778,11 +6898,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authorize_stepd_recovery_report_rejects_missing_node_token() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let svc = test_service_with_node_identity(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let error = svc
             .authorize_stepd_recovery_report("n1", "")
             .expect_err("a missing node token must be rejected");
         assert_eq!(error.code(), Code::Unauthenticated);
+    }
+
+    // Under open admission a real agent is never issued a node token, so refusing
+    // the report would abandon a supervisor that is still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authorize_stepd_recovery_report_downgrades_an_untokened_open_admission_report() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let reporter = svc
+            .authorize_stepd_recovery_report("n1", "")
+            .expect("an untokened report under open admission is still accepted");
+        assert!(matches!(reporter, StepdReporter::Unproven));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6869,24 +7001,8 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_node_identity(&dir).await;
         let job_id = running_job_owned_by(&svc, "alice").await;
-        svc.cluster
-            .register_node(
-                "n1".into(),
-                "n1".into(),
-                spur_core::resource::ResourceSet {
-                    cpus: 8,
-                    memory_mb: 16000,
-                    ..Default::default()
-                },
-                "127.0.0.1".into(),
-                1,
-                String::new(),
-                String::new(),
-                spur_core::node::NodeSource::NativeHost,
-                std::collections::HashMap::new(),
-                true,
-            )
-            .expect("update recovery probe address");
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
         let run_attempt = svc
             .cluster
             .get_job(job_id)
@@ -6909,6 +7025,342 @@ mod tests {
         assert!(response.message.contains("missing 1 of 1 participants"));
         let job = svc.cluster.get_job(job_id).expect("running job");
         assert_eq!(job.state, JobState::Running);
+    }
+
+    /// A numbered `srun` step may cover only part of the allocation, so the
+    /// job-wide cohort must not decide its fate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stepd_recovery_probe_retains_a_user_step_without_a_cohort() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        // The sole participant disowns the step, so anything that consults the
+        // cohort reports the whole allocation as missing.
+        let user_step = svc
+            .probe_stepd_recovery("n1", job_id, run_attempt, 0)
+            .await
+            .expect("user step probe");
+        assert!(
+            matches!(user_step, StepdRecoveryProbe::Retained),
+            "a numbered step must be retained without probing the allocation"
+        );
+
+        let batch_step = svc
+            .probe_stepd_recovery("n1", job_id, run_attempt, spur_core::step::STEP_BATCH)
+            .await
+            .expect("batch step probe");
+        assert!(
+            matches!(batch_step, StepdRecoveryProbe::Incomplete { .. }),
+            "a job-spanning step must still be decided by the cohort"
+        );
+    }
+
+    /// Register a node the recovery probe can address but never reach, so the
+    /// probe gets no answer at all rather than a "supervisor gone" answer.
+    fn register_unreachable_probe_node(svc: &ControllerService, name: &str) {
+        svc.cluster
+            .register_node(
+                name.into(),
+                name.into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                1,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                true,
+            )
+            .expect("update recovery probe address");
+    }
+
+    /// Re-point a registered node at a probe agent and wait for the change to
+    /// land, so a recovery probe reaches that agent and not the old address.
+    async fn point_node_at_probe_agent(svc: &ControllerService, name: &str, port: u16) {
+        svc.cluster
+            .register_node(
+                name.into(),
+                name.into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                port,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                true,
+            )
+            .expect("point the node at its probe agent");
+        for _ in 0..200 {
+            if svc.cluster.get_node(name).map(|node| node.port) == Some(port) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    // The escalation end to end: a caller who proved nothing registers under a
+    // node's name and reports that the node's job lost its supervisor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unproven_registration_cannot_fence_another_users_job() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        // Re-registering n1 points the cohort probe at an agent that disowns the
+        // job, which is what makes the cohort incomplete and therefore fenceable.
+        let impostor = spawn_probe_agent(false).await;
+        let registered = svc
+            .register_agent(Request::new(RegisterAgentRequest {
+                hostname: "n1".into(),
+                address: "127.0.0.1".into(),
+                port: impostor.port() as u32,
+                ..Default::default()
+            }))
+            .await
+            .expect("open admission accepts a caller-asserted hostname")
+            .into_inner();
+        assert!(
+            registered.node_token.is_empty(),
+            "a hostname nobody had to prove must not be handed a node credential"
+        );
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").map(|node| node.port) == Some(impostor.port()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let response = svc
+            .report_stepd_recovery(Request::new(StepdRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt,
+                node_token: registered.node_token,
+                stale_descriptor: true,
+                step_id: spur_core::step::STEP_BATCH,
+            }))
+            .await
+            .expect("an unproven report is accepted rather than dropped")
+            .into_inner();
+
+        assert!(
+            !response.fenced,
+            "an unproven reporter must not fence another user's job"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Running,
+            "alice's job must still be running and still hold its allocation"
+        );
+    }
+
+    // Open admission issues no node token, so a real restarted agent reports
+    // untokened; refusing it would abandon the supervisor it just re-adopted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_agent_under_open_admission_still_reports_recovery() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+        let agent = spawn_probe_agent(true).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+
+        let response = svc
+            .report_stepd_recovery(Request::new(StepdRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt,
+                node_token: String::new(),
+                stale_descriptor: false,
+                step_id: spur_core::step::STEP_BATCH,
+            }))
+            .await
+            .expect("an untokened report under open admission must still be served")
+            .into_inner();
+
+        assert!(response.retained, "the live supervisor must be kept");
+        assert!(!response.fenced);
+        assert!(
+            response.message.is_empty(),
+            "an empty message stops the agent's retry loop"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Running
+        );
+    }
+
+    // The gate must not disable fencing outright: a node admitted with a join
+    // token holds a credential the controller issued, and may still fence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proven_reporter_still_fences_an_incomplete_cohort() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        let node_token = svc
+            .validate_admission(&join_token, "n1")
+            .expect("a valid join token mints a node identity");
+        assert!(!node_token.is_empty());
+
+        let response = svc
+            .report_stepd_recovery(Request::new(StepdRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt,
+                node_token,
+                stale_descriptor: true,
+                step_id: spur_core::step::STEP_BATCH,
+            }))
+            .await
+            .expect("a proven report is served")
+            .into_inner();
+
+        assert!(response.fenced, "a proven reporter must still fence");
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Pending
+        );
+    }
+
+    /// A numbered step losing its supervisor is that step's failure. Fencing
+    /// would requeue the batch script and every sibling step with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_user_step_descriptor_does_not_fence_the_job() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        // The only participant disowns the step, so dropping the user-step
+        // carve-out would make the cohort incomplete and requeue the job.
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_stepd_recovery(Request::new(StepdRecoveryRequest {
+                step_id: 3,
+                ..stepd_recovery_request(&svc, "n1", job_id, run_attempt, true)
+            }))
+            .await
+            .expect("stale user step report")
+            .into_inner();
+
+        assert!(!response.retained);
+        assert!(!response.fenced);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Running,
+            "one numbered step's dead supervisor must not requeue its siblings"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_batch_step_descriptor_still_fences_the_job() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        // Answering "gone" is what makes the cohort incomplete; a node that
+        // cannot answer is deliberately not evidence its supervisor died.
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_stepd_recovery(Request::new(stepd_recovery_request(
+                &svc,
+                "n1",
+                job_id,
+                run_attempt,
+                true,
+            )))
+            .await
+            .expect("stale batch step report")
+            .into_inner();
+
+        assert!(!response.retained);
+        assert!(response.fenced);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Pending,
+            "the step owning the job's lifetime still fences it"
+        );
+    }
+
+    /// Failing to ask a node is not evidence its supervisor died, so an
+    /// unanswerable probe must leave the job running rather than requeue it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_participant_does_not_fence_the_job() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        register_unreachable_probe_node(&svc, "n1");
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_stepd_recovery(Request::new(stepd_recovery_request(
+                &svc,
+                "n1",
+                job_id,
+                run_attempt,
+                true,
+            )))
+            .await
+            .expect("stale batch step report")
+            .into_inner();
+
+        assert!(response.retained);
+        assert!(!response.fenced);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Running,
+            "a cohort nobody could answer for must not requeue a healthy job"
+        );
     }
 
     /// A node that restarts and reports recovery must not drag down a
@@ -7046,29 +7498,49 @@ mod tests {
         );
     }
 
+    // A fence whose reporter never comes back leaves the cohort marked Fencing;
+    // that entry must expire too, or the run is never fenceable again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stepd_recovery_cohort_map_expires_an_abandoned_fencing_entry() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        svc.incomplete_stepd_recoveries.lock().await.insert(
+            (1, 1),
+            StepdRecoveryCohortState::Fencing(
+                std::time::Instant::now() - STEPD_RECOVERY_COHORT_GRACE * 10,
+            ),
+        );
+
+        svc.claim_stepd_recovery_fence(2, 1).await;
+
+        assert!(
+            !svc.incomplete_stepd_recoveries
+                .lock()
+                .await
+                .contains_key(&(1, 1)),
+            "an abandoned fencing entry must be swept once it's far past its grace period"
+        );
+
+        assert!(
+            !svc.claim_stepd_recovery_fence(1, 1).await,
+            "a swept run starts a fresh cohort, so its first claim only tracks"
+        );
+        assert!(
+            matches!(
+                svc.incomplete_stepd_recoveries.lock().await.get(&(1, 1)),
+                Some(StepdRecoveryCohortState::Tracking(_))
+            ),
+            "the same run must be claimable for fencing again rather than stay stuck fencing"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stepd_recovery_fences_a_cohort_that_exhausted_its_grace_period() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_node_identity(&dir).await;
         let job_id = running_job_owned_by(&svc, "alice").await;
-        svc.cluster
-            .register_node(
-                "n1".into(),
-                "n1".into(),
-                spur_core::resource::ResourceSet {
-                    cpus: 8,
-                    memory_mb: 16000,
-                    ..Default::default()
-                },
-                "127.0.0.1".into(),
-                1,
-                String::new(),
-                String::new(),
-                spur_core::node::NodeSource::NativeHost,
-                std::collections::HashMap::new(),
-                true,
-            )
-            .expect("update recovery probe address");
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
         let run_attempt = svc
             .cluster
             .get_job(job_id)
@@ -7147,6 +7619,8 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_node_identity(&dir).await;
         let job_id = running_job_owned_by(&svc, "alice").await;
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
         let run_attempt = svc
             .cluster
             .get_job(job_id)

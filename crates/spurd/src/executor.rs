@@ -986,6 +986,70 @@ pub fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
     cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt)
 }
 
+/// The same reconstruction for a single step's leaf, so reaping a dead step
+/// cannot reach the job node and take its live siblings with it.
+pub fn expected_step_cgroup_path(
+    job_id: JobId,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> PathBuf {
+    step_cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt, step_id)
+}
+
+/// Where a dead session may be reaped when its descriptor recorded no cgroup.
+/// Reaping recurses and SIGKILLs, so a user step resolves to its own leaf.
+pub fn reapable_cgroup_path(
+    job_id: JobId,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> PathBuf {
+    if spur_core::step::is_user_step(step_id) {
+        expected_step_cgroup_path(job_id, run_attempt, step_id)
+    } else {
+        expected_cgroup_path(job_id, run_attempt)
+    }
+}
+
+/// Place a user step in its own leaf beneath an already-configured job cgroup.
+/// The leaf inherits the job's limits and device filter, so neither is rewritten.
+fn join_job_cgroup(
+    cgroup_root: &Path,
+    scope: CgroupScope,
+    cgroup: &CgroupConfig,
+    job_path: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let CgroupScope {
+        job_id,
+        run_attempt,
+        step_id,
+    } = scope;
+    // Creating it here would produce a job cgroup carrying no device filter, so an
+    // absent one means the job is uncontained and the step must not pretend otherwise.
+    if !job_path.is_dir() {
+        if cgroup.required {
+            anyhow::bail!(
+                "[cgroup] required but the job cgroup is missing: {}",
+                job_path.display()
+            );
+        }
+        warn!(
+            job_id,
+            step_id, "job cgroup missing; step runs without isolation"
+        );
+        return Ok(None);
+    }
+
+    let step_path = step_cgroup_path_for(cgroup_root, job_id, run_attempt, step_id);
+    if let Err(e) = std::fs::create_dir_all(&step_path) {
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the step cgroup is unavailable: {e}");
+        }
+        warn!(job_id, step_id, error = %e, "step cgroup unavailable; falling back to the job cgroup");
+        return Ok(Some(job_path.to_path_buf()));
+    }
+    Ok(Some(step_path))
+}
+
 /// Which step's cgroup a launch is preparing.
 #[derive(Clone, Copy)]
 pub(crate) struct CgroupScope {
@@ -1014,6 +1078,12 @@ pub(crate) fn setup_cgroup(
 
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_path_for(&cgroup_root, job_id, run_attempt);
+
+    // A user step joins the job's cgroup rather than configuring it: the limits and
+    // the device filter there describe the job, not the step that happens to enter.
+    if spur_core::step::is_user_step(step_id) {
+        return join_job_cgroup(&cgroup_root, scope, cgroup, &cgroup_path);
+    }
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -1044,15 +1114,9 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
-    // Claiming reaps whatever is in the directory, so only the step that owns the
-    // job's lifetime may claim it — a numbered step would kill its siblings.
-    let owns_job_cgroup = !spur_core::step::is_user_step(step_id);
-    let claim = if owns_job_cgroup {
-        claim_cgroup_dir(&cgroup_path)
-    } else {
-        std::fs::create_dir_all(&cgroup_path)
-    };
-    if let Err(e) = claim {
+    // Claiming reaps whatever is in the directory, which only the step owning the
+    // job's lifetime may do — user steps took the join path above.
+    if let Err(e) = claim_cgroup_dir(&cgroup_path) {
         match classify_cgroup_claim_failure(
             &e,
             nix::unistd::geteuid().is_root(),
@@ -1961,7 +2025,7 @@ pub fn cleanup_step_spool(job_id: JobId, step_id: u32) {
 /// Whether a launch wraps the job in fresh namespaces. A PMIx rank needs the
 /// host's, a step entering a parent's brings its own, and a holder must stay
 /// signalable.
-fn would_use_namespaces(cfg: &JobLaunchConfig, is_root: bool) -> bool {
+pub(crate) fn would_use_namespaces(cfg: &JobLaunchConfig, is_root: bool) -> bool {
     is_root && !cfg.pmix_multi_task && !cfg.joins_parent_namespaces && !cfg.allocation_holder
 }
 

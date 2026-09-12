@@ -254,14 +254,30 @@ Follow this order for any cluster upgrade:
    supported recovery from a bad upgrade is to roll forward, not to reinstall the
    previous version over a log the new one has already written.
 
+.. warning::
+
+   **Upgrading to the release that introduces** ``spurstepd`` **requires an empty
+   cluster.** Drain every node and let all running jobs finish, or cancel them,
+   before swapping binaries. Sessions written by the previous build are not
+   adopted, the two builds disagree on where a step's processes live, and a
+   mixed-version cluster is not supported across this upgrade — a new controller
+   dispatching to a not-yet-upgraded agent tears the job down. Upgrade every
+   controller and agent in the same maintenance window.
+
+   ``spurstepd`` is a new binary and must be installed next to ``spurd`` on every
+   compute node. The agent resolves it beside its own executable and does not
+   search ``$PATH``, so if it is missing every job launch on that node fails.
+
 .. note::
 
-   Restarting ``spurd`` does not kill the work on that node: jobs, ``srun``
-   steps and held allocations run under supervisors that outlive the agent, and
-   the restarted agent re-adopts them. Draining first is still the recommended
-   order — it keeps new work off a node mid-swap — but it is no longer what
-   protects running jobs from the restart itself. See :doc:`native-host` for
-   the two launches that remain unsupervised.
+   *Once this release is in place*, restarting ``spurd`` no longer kills the work
+   on that node: jobs, ``srun`` steps and held allocations run under supervisors
+   that outlive the agent, and the restarted agent re-adopts them. This requires
+   ``KillMode=process`` in the ``spurd`` unit — the systemd default,
+   ``control-group``, kills the whole cgroup on stop and takes the supervisors
+   with it. See :doc:`native-host` for the unit file and for the two launches
+   that remain unsupervised. Draining first is still the recommended order
+   because it keeps new work off a node mid-swap.
 
 Behavior Changes Between Releases
 ---------------------------------
