@@ -6087,6 +6087,7 @@ impl SlurmAgent for AgentService {
         // srun step stream live and terminate at step exit (#781).
         if let Some(requested_step) = requested_step_of(&req) {
             let active_steps = self.active_steps.clone();
+            let stepds = self.stepds.clone();
             let want_stderr = req.stream == "stderr";
             let step_id = requested_step;
             let start_offset = req.start_offset;
@@ -6183,7 +6184,12 @@ impl SlurmAgent for AgentService {
                             }
                         }
                     }
-                    let still_running = active_steps.lock().await.contains_key(&step_key);
+                    // Adoption restores a supervised step to `stepds`, never to
+                    // `active_steps`, so a tail that reconnects after a restart
+                    // would read an adopted step as finished and drop the rest
+                    // of its output.
+                    let still_running = active_steps.lock().await.contains_key(&step_key)
+                        || stepds.lock().await.contains_key(&step_key);
                     if !still_running {
                         // Final read to drain anything written after the last poll.
                         if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
@@ -10904,6 +10910,85 @@ mod tests {
         assert_eq!(rest, b"part2\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart leaves a supervised step running with nothing in `active_steps`
+    /// to say so, so a tail that reconnects to it must take the adopted session
+    /// as proof the step is live. Reading the empty spool as a finished step
+    /// eofs the stream, and srun suppresses its buffered fallback on a clean
+    /// eof, so everything the step prints afterwards is lost.
+    #[tokio::test]
+    async fn stream_job_output_keeps_tailing_a_step_the_restart_adopted() {
+        use tokio_stream::StreamExt as _;
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let job_id = 44;
+        let step_id = 3;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        svc.adopt_stepds(&[publish_session(&store, step_id, None)])
+            .await;
+
+        // The spool file the step wrote before the restart, at the path the
+        // agent rebuilds from the job and step ids alone.
+        let dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("step{step_id}.out"));
+        std::fs::write(&path, b"before-restart\n").unwrap();
+
+        let mut stream = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                start_offset: 0,
+                step: None,
+                job_id,
+                step_id,
+                stream: "stdout".into(),
+                user: "testuser".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("a chunk should arrive")
+            .expect("stream still open")
+            .unwrap();
+        assert_eq!(first.data, b"before-restart\n");
+        assert!(!first.eof);
+
+        // Nothing more is due while the step is merely quiet, so a chunk
+        // arriving here is the premature eof: it is the only thing the tail
+        // sends when it reads the adopted step as finished. Asserting on the
+        // silence is what makes this fail against that bug — waiting for the
+        // next write instead lets the eof-and-final-read path serve it and pass.
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.next()).await;
+        assert!(
+            quiet.is_err(),
+            "the tail ended an adopted step that is still running: {:?}",
+            quiet.ok().flatten()
+        );
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"after-restart\n").unwrap();
+        }
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the tail must deliver what the step wrote after the restart")
+            .expect("stream still open")
+            .unwrap();
+        assert_eq!(next.data, b"after-restart\n");
+        assert!(!next.eof);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// An srun tail that lost its agent mid-step reconnects carrying the byte
