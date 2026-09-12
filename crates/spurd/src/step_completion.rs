@@ -3,8 +3,9 @@
 
 //! Completion rendezvous for supervised steps.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use spur_core::step::StepId;
 use tokio::sync::{oneshot, Mutex};
@@ -17,15 +18,44 @@ pub struct StepOutcome {
     pub signal: i32,
 }
 
+/// Comfortably longer than the controller's re-attach window, so a caller that
+/// lost its call while the step was settling still finds the answer waiting.
+/// `stepd` keeps a settled step's durable record for the same span, so the
+/// memo and the disk it is a fast path for expire together.
+pub(crate) const SETTLED_RETENTION: Duration = Duration::from_secs(600);
+/// A hard ceiling independent of retention, so step churn cannot grow the memo
+/// or the durable records it is a fast path for.
+pub(crate) const SETTLED_CAPACITY: usize = 1024;
+
+struct SettledStep {
+    key: (JobId, StepId),
+    outcome: StepOutcome,
+    settled_at: Instant,
+}
+
 /// A supervised step is owned by `spurstepd`, not by a child handle the agent
 /// can wait on, so the RPC that launched one parks here until the supervisor's
 /// completion notification arrives over the agent socket.
 #[derive(Clone, Default)]
 pub struct StepCompletions {
     waiters: Arc<Mutex<Waiters>>,
+    settled: Arc<Mutex<VecDeque<SettledStep>>>,
 }
 
 type Waiters = HashMap<(JobId, StepId), oneshot::Sender<StepOutcome>>;
+
+/// Oldest first, so both bounds are satisfied by dropping from the front.
+fn evict_settled(settled: &mut VecDeque<SettledStep>, now: Instant) {
+    while settled
+        .front()
+        .is_some_and(|oldest| now.saturating_duration_since(oldest.settled_at) > SETTLED_RETENTION)
+    {
+        settled.pop_front();
+    }
+    while settled.len() > SETTLED_CAPACITY {
+        settled.pop_front();
+    }
+}
 
 impl StepCompletions {
     pub fn new() -> Self {
@@ -41,12 +71,37 @@ impl StepCompletions {
     }
 
     /// Returns whether a waiter was still parked, so the caller can tell a
-    /// delivered outcome apart from one nobody is listening for.
+    /// delivered outcome apart from one nobody is listening for. Either way the
+    /// outcome is remembered: a caller that arrives late must not be told the
+    /// step is unknown when its exit is settled and sitting right here.
     pub async fn complete(&self, job_id: JobId, step_id: StepId, outcome: StepOutcome) -> bool {
+        let now = Instant::now();
+        let mut settled = self.settled.lock().await;
+        settled.retain(|entry| entry.key != (job_id, step_id));
+        settled.push_back(SettledStep {
+            key: (job_id, step_id),
+            outcome,
+            settled_at: now,
+        });
+        evict_settled(&mut settled, now);
+        drop(settled);
+
         let Some(sender) = self.waiters.lock().await.remove(&(job_id, step_id)) else {
             return false;
         };
         sender.send(outcome).is_ok()
+    }
+
+    /// The outcome of a step that already settled, for a caller whose
+    /// rendezvous is gone — the agent restarted, or nobody was parked when the
+    /// supervisor's exit was consumed.
+    pub async fn settled(&self, job_id: JobId, step_id: StepId) -> Option<StepOutcome> {
+        let settled = self.settled.lock().await;
+        settled
+            .iter()
+            .rev()
+            .find(|entry| entry.key == (job_id, step_id))
+            .map(|entry| entry.outcome)
     }
 
     /// Take over a step whose waiter is gone, for a client reconnecting after it
@@ -184,5 +239,82 @@ mod tests {
         let completions = StepCompletions::new();
 
         assert!(completions.reregister(42, 0).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_outcome_nobody_was_parked_for_is_still_answerable() {
+        let completions = StepCompletions::new();
+
+        assert!(!completions.complete(42, 0, OUTCOME).await);
+
+        assert_eq!(completions.settled(42, 0).await, Some(OUTCOME));
+    }
+
+    #[tokio::test]
+    async fn a_delivered_outcome_stays_answerable_for_a_reconnect() {
+        let completions = StepCompletions::new();
+        let waiter = completions.register(42, 0).await;
+
+        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert_eq!(waiter.await.expect("outcome delivered"), OUTCOME);
+
+        assert_eq!(completions.settled(42, 0).await, Some(OUTCOME));
+    }
+
+    #[tokio::test]
+    async fn a_step_that_never_settled_is_not_answerable() {
+        let completions = StepCompletions::new();
+        completions.register(42, 0).await;
+
+        assert_eq!(completions.settled(42, 0).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_of_a_key_replaces_the_remembered_outcome() {
+        let completions = StepCompletions::new();
+        completions.complete(42, 0, OUTCOME).await;
+
+        let rerun = StepOutcome {
+            exit_code: 0,
+            signal: 0,
+        };
+        completions.complete(42, 0, rerun).await;
+
+        assert_eq!(completions.settled(42, 0).await, Some(rerun));
+    }
+
+    fn settled_at(key: (JobId, StepId), settled_at: Instant) -> SettledStep {
+        SettledStep {
+            key,
+            outcome: OUTCOME,
+            settled_at,
+        }
+    }
+
+    #[test]
+    fn eviction_caps_the_number_of_remembered_outcomes() {
+        let now = Instant::now();
+        let mut settled: VecDeque<_> = (0..SETTLED_CAPACITY as u32 + 10)
+            .map(|step_id| settled_at((42, step_id), now))
+            .collect();
+
+        evict_settled(&mut settled, now);
+
+        assert_eq!(settled.len(), SETTLED_CAPACITY);
+        assert_eq!(settled.front().map(|entry| entry.key), Some((42, 10)));
+    }
+
+    #[test]
+    fn eviction_drops_outcomes_past_their_retention() {
+        let now = Instant::now();
+        let mut settled = VecDeque::from(vec![
+            settled_at((42, 0), now - SETTLED_RETENTION - Duration::from_secs(1)),
+            settled_at((42, 1), now),
+        ]);
+
+        evict_settled(&mut settled, now);
+
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled.front().map(|entry| entry.key), Some((42, 1)));
     }
 }

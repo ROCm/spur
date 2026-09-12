@@ -25,6 +25,7 @@
 #define SPUR_MODEX_ERR_BLOB -5
 #define SPUR_MODEX_ERR_NOMEM -6
 #define SPUR_MODEX_ERR_PROTOCOL -7
+#define SPUR_MODEX_ERR_FOREIGN -8
 
 typedef struct spur_modex_session spur_modex_session_t;
 
@@ -77,6 +78,13 @@ int spur_modex_fence_collect(
 int spur_modex_session_refs_for_testing(spur_modex_session_t *session);
 
 bool spur_modex_session_accept_running_for_testing(spur_modex_session_t *session);
+
+bool spur_modex_session_aborted_for_testing(spur_modex_session_t *session);
+
+bool spur_modex_session_remote_present_for_testing(
+    spur_modex_session_t *session,
+    uint32_t node_index
+);
 #endif
 
 #endif

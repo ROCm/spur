@@ -939,9 +939,12 @@ Operational notes
   ``spur-k8s`` in-cluster agent returns ``Unimplemented`` for ``PreparePmix``).
 - Multi-node ``--mpi=pmix`` requires agent addresses in the cluster registry to
   be reachable from every node in the allocation. Hostnames and IPv4 literals
-  are resolved via DNS; modex TCP listens on port ``16819 + (job_id % 8000)``.
-  Only one active multi-node PMIx job should use a given port slot at a time:
-  concurrent jobs whose IDs differ by a multiple of 8000 can collide.
+  are resolved via DNS; modex TCP listens on a port hashed from the job and step
+  ids into ``16819``-``24818``. Unrelated steps can hash onto the same port. The
+  step that loses the race fails to start and logs ``modex bind port <port> for
+  job <j> step <s> failed: Address already in use``; the step already holding the
+  port keeps running, because every modex frame is checked against the listener's
+  job and step before it is acted on.
 - Modex timeouts travel with ``PreparePmix`` in ``PmixLaunchPlan`` (``0`` =
   agent ``[mpi]`` defaults). Keep ``[mpi]`` modex timeout settings identical
   across all agents when not passing explicit values.

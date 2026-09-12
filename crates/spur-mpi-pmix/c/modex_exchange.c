@@ -20,7 +20,9 @@
 #include <unistd.h>
 
 #define SPUR_MODEX_MAGIC 0x53505552u
-#define SPUR_MODEX_VERSION 2u
+/* Bumped to 3 when step_id joined the frame; a v2 peer that reaches a v3
+ * listener must be rejected outright rather than parsed at the wrong offsets. */
+#define SPUR_MODEX_VERSION 3u
 #define SPUR_MODEX_NO_ROUND UINT32_MAX
 #define SPUR_MODEX_FLAG_ABORT 0x00000001u
 #define SPUR_MODEX_CONNECT_SLEEP_US 100000
@@ -30,11 +32,14 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
     uint32_t job_id;
+    uint32_t step_id;
     uint32_t node_index;
     uint32_t fence_seq;
     uint32_t data_len;
     uint32_t flags;
 } spur_modex_hdr_t;
+
+_Static_assert(sizeof(spur_modex_hdr_t) == 32, "modex frame header is a wire struct");
 
 struct spur_modex_blob {
     char *data;
@@ -45,6 +50,7 @@ struct spur_modex_blob {
 
 struct spur_modex_session {
     uint32_t job_id;
+    uint32_t step_id;
     uint32_t num_nodes;
     uint32_t node_index;
     uint16_t port;
@@ -80,6 +86,8 @@ const char *spur_modex_strerror(int code) {
         return "out of memory";
     case SPUR_MODEX_ERR_PROTOCOL:
         return "modex protocol error";
+    case SPUR_MODEX_ERR_FOREIGN:
+        return "modex frame for a different job or step";
     default:
         return "unknown modex error";
     }
@@ -134,12 +142,26 @@ static int write_full(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-static int recv_blob(int fd, spur_modex_hdr_t *hdr, char **payload) {
+/* The listen port is a hash of (job, step) into a fixed span, so an unrelated
+ * session can and does land on it; identity gates every frame before its flags. */
+static bool frame_is_for_session(const spur_modex_session_t *session, const spur_modex_hdr_t *hdr) {
+    return hdr->job_id == session->job_id && hdr->step_id == session->step_id;
+}
+
+static int recv_blob(
+    int fd,
+    const spur_modex_session_t *session,
+    spur_modex_hdr_t *hdr,
+    char **payload
+) {
     if (read_full(fd, hdr, sizeof(*hdr)) != 0) {
         return SPUR_MODEX_ERR_CONNECT;
     }
     if (hdr->magic != SPUR_MODEX_MAGIC || hdr->version != SPUR_MODEX_VERSION) {
         return SPUR_MODEX_ERR_PROTOCOL;
+    }
+    if (!frame_is_for_session(session, hdr)) {
+        return SPUR_MODEX_ERR_FOREIGN;
     }
     if ((hdr->flags & SPUR_MODEX_FLAG_ABORT) != 0) {
         return SPUR_MODEX_ERR_ABORT;
@@ -253,7 +275,9 @@ static void *accept_loop(void *arg) {
         set_socket_timeouts(client, (int)session->timeouts.fence_sec);
         spur_modex_hdr_t hdr;
         char *payload = NULL;
-        int recv_rc = recv_blob(client, &hdr, &payload);
+        int recv_rc = recv_blob(client, session, &hdr, &payload);
+        /* Safe to honour only because recv_blob established the frame is ours;
+         * a stranger sharing this port must never abort us. */
         if (recv_rc == SPUR_MODEX_ERR_ABORT) {
             mark_aborted(session);
             close(client);
@@ -264,17 +288,13 @@ static void *accept_loop(void *arg) {
             close(client);
             continue;
         }
-        if (hdr.job_id != session->job_id) {
-            free(payload);
-            close(client);
-            continue;
-        }
         store_remote_blob(session, hdr.node_index, hdr.fence_seq, payload, hdr.data_len);
 
         spur_modex_hdr_t ack = {
             .magic = SPUR_MODEX_MAGIC,
             .version = SPUR_MODEX_VERSION,
             .job_id = session->job_id,
+            .step_id = session->step_id,
             .node_index = session->node_index,
             .fence_seq = hdr.fence_seq,
             .data_len = 0,
@@ -310,6 +330,7 @@ spur_modex_session_t *spur_modex_session_create(
         return NULL;
     }
     session->job_id = job_id;
+    session->step_id = step_id;
     session->num_nodes = num_nodes;
     session->node_index = node_index;
     session->port = spur_modex_port_for_step(job_id, step_id);
@@ -387,6 +408,18 @@ int spur_modex_session_start(spur_modex_session_t *session) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(session->port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int bind_errno = errno;
+        fprintf(
+            stderr,
+            "spur_mpi_pmix: modex bind port %u for job %u step %u failed: %s%s\n",
+            (unsigned)session->port,
+            session->job_id,
+            session->step_id,
+            strerror(bind_errno),
+            bind_errno == EADDRINUSE
+                ? " (another process already holds the modex port for this job/step)"
+                : ""
+        );
         close(fd);
         return SPUR_MODEX_ERR_CONNECT;
     }
@@ -499,6 +532,7 @@ int spur_modex_session_abort(spur_modex_session_t *session) {
         .magic = SPUR_MODEX_MAGIC,
         .version = SPUR_MODEX_VERSION,
         .job_id = session->job_id,
+        .step_id = session->step_id,
         .node_index = session->node_index,
         .fence_seq = 0,
         .data_len = 0,
@@ -533,6 +567,7 @@ static int push_local_blob(
         .magic = SPUR_MODEX_MAGIC,
         .version = SPUR_MODEX_VERSION,
         .job_id = session->job_id,
+        .step_id = session->step_id,
         .node_index = session->node_index,
         .fence_seq = fence_seq,
         .data_len = (uint32_t)local_len,
@@ -558,7 +593,7 @@ static int push_local_blob(
         }
         spur_modex_hdr_t ack;
         char *ignored = NULL;
-        int ack_rc = recv_blob(fd, &ack, &ignored);
+        int ack_rc = recv_blob(fd, session, &ack, &ignored);
         free(ignored);
         close(fd);
         if (ack_rc == SPUR_MODEX_ERR_ABORT) {
@@ -706,5 +741,28 @@ bool spur_modex_session_accept_running_for_testing(spur_modex_session_t *session
         return false;
     }
     return atomic_load(&session->accept_running);
+}
+
+bool spur_modex_session_aborted_for_testing(spur_modex_session_t *session) {
+    if (session == NULL) {
+        return false;
+    }
+    pthread_mutex_lock(&session->lock);
+    bool aborted = session->aborted;
+    pthread_mutex_unlock(&session->lock);
+    return aborted;
+}
+
+bool spur_modex_session_remote_present_for_testing(
+    spur_modex_session_t *session,
+    uint32_t node_index
+) {
+    if (session == NULL || node_index >= SPUR_MODEX_MAX_NODES) {
+        return false;
+    }
+    pthread_mutex_lock(&session->lock);
+    bool present = session->remote[node_index].present;
+    pthread_mutex_unlock(&session->lock);
+    return present;
 }
 #endif

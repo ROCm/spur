@@ -1046,6 +1046,57 @@ pub async fn recover_stepds(
     }
 }
 
+/// A recovered session whose supervisor has finished. Claiming first keeps a
+/// completion push or the crash watchdog from reporting the same exit twice;
+/// `None` means one of them got there first and this poll owes nothing.
+#[allow(clippy::too_many_arguments)]
+async fn settle_recovered_stepd(
+    running: &RunningJobs,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    stepds: &Arc<Mutex<StepdMap>>,
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+    exit_code: i32,
+    signal: i32,
+) -> Option<crate::stepd::PendingStepdCompletion> {
+    if !claim_stepd(stepds, descriptor).await {
+        return None;
+    }
+    release_stepd_tracking(
+        running,
+        allocation,
+        stepds,
+        descriptor,
+        "runtime completion",
+    )
+    .await;
+    // The controller report this poll goes on to make does not reach a client
+    // that reattached to this step after the agent restarted.
+    completions
+        .complete(
+            descriptor.job_id,
+            descriptor.step_id,
+            crate::step_completion::StepOutcome { exit_code, signal },
+        )
+        .await;
+    let epilog_failed = store
+        .epilog_failed(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        )
+        .unwrap_or(false);
+    Some(crate::stepd::PendingStepdCompletion {
+        job_id: descriptor.job_id,
+        run_attempt: descriptor.run_attempt,
+        step_id: descriptor.step_id,
+        exit_code,
+        signal,
+        epilog_failed,
+    })
+}
+
 pub(crate) fn monitor_recovered_stepds(
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
@@ -1115,12 +1166,20 @@ pub(crate) fn monitor_recovered_stepds(
                     None
                 };
                 if let Some((exit_code, signal)) = exit {
-                    // Claim before reporting: a completion push or the crash
-                    // watchdog racing this poll must not both report the exit.
-                    if claim_stepd(&stepds, descriptor).await {
-                        newly_completed.push((*key, descriptor.run_attempt, exit_code, signal));
-                    } else {
-                        released.push(*key);
+                    match settle_recovered_stepd(
+                        &running,
+                        &allocation,
+                        &stepds,
+                        &completions,
+                        &store,
+                        descriptor,
+                        exit_code,
+                        signal,
+                    )
+                    .await
+                    {
+                        Some(completion) => newly_completed.push((*key, completion)),
+                        None => released.push(*key),
                     }
                 } else if !tracked {
                     released.push(*key);
@@ -1129,41 +1188,8 @@ pub(crate) fn monitor_recovered_stepds(
             for key in released {
                 pending.remove(&key);
             }
-            for (key, run_attempt, exit_code, signal) in newly_completed {
-                let (job_id, step_id) = key;
-                if let Some(descriptor) = pending.get(&key) {
-                    release_stepd_tracking(
-                        &running,
-                        &allocation,
-                        &stepds,
-                        descriptor,
-                        "runtime completion",
-                    )
-                    .await;
-                }
-                // The controller report below does not reach a client that
-                // reattached to this step after the agent restarted.
-                completions
-                    .complete(
-                        job_id,
-                        step_id,
-                        crate::step_completion::StepOutcome { exit_code, signal },
-                    )
-                    .await;
-                let epilog_failed = store
-                    .epilog_failed(job_id, run_attempt, step_id)
-                    .unwrap_or(false);
-                completed.insert(
-                    key,
-                    crate::stepd::PendingStepdCompletion {
-                        job_id,
-                        run_attempt,
-                        step_id,
-                        exit_code,
-                        signal,
-                        epilog_failed,
-                    },
-                );
+            for (key, completion) in newly_completed {
+                completed.insert(key, completion);
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
@@ -1580,6 +1606,11 @@ pub fn retry_unacknowledged_stepd_completions(
                 Err(error) => {
                     tracing::warn!(%error, "failed to replay durable runtime completions");
                 }
+            }
+            // A settled user step's record is held past its completion report so
+            // a restart can still answer for it; nothing else sweeps it later.
+            if let Err(error) = store.prune_finalized() {
+                tracing::warn!(%error, "failed to prune finalized runtime sessions");
             }
         }
     });
@@ -2751,6 +2782,47 @@ impl AgentService {
         let mut sessions = self.stepds.lock().await;
         for descriptor in descriptors {
             sessions.insert(stepd_key(descriptor), descriptor.clone());
+        }
+    }
+
+    /// A stale session's supervisor is confirmed dead, so nothing adopts it and
+    /// nothing else will ever speak for it: carry any exit it recorded to the
+    /// caller still waiting on the step, and release it so it can be pruned.
+    pub async fn settle_stale_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        for descriptor in descriptors {
+            match durable_runtime_exit(&store, descriptor) {
+                Ok(Some((exit_code, signal))) => {
+                    self.step_completions
+                        .complete(
+                            descriptor.job_id,
+                            descriptor.step_id,
+                            crate::step_completion::StepOutcome { exit_code, signal },
+                        )
+                        .await;
+                }
+                // An exit nobody observed is not a success; leave it to the
+                // recovery report so the controller decides the step's fate.
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        job_id = descriptor.job_id,
+                        run_attempt = descriptor.run_attempt,
+                        step_id = descriptor.step_id,
+                        %error,
+                        "failed to read a stale session's recorded exit"
+                    );
+                }
+            }
+            if let Err(error) = crate::stepd::record_resources_released(descriptor) {
+                warn!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    step_id = descriptor.step_id,
+                    %error,
+                    "failed to record runtime resource release for a stale session"
+                );
+            }
         }
     }
 
@@ -5930,17 +6002,38 @@ impl SlurmAgent for AgentService {
         self.check_job_access(req.job_id, identity.as_ref(), &req.user, "await a step of")
             .await?;
 
-        let descriptor = self
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        let tracked = self
             .stepds
             .lock()
             .await
             .get(&(req.job_id, req.step_id))
-            .cloned()
-            .ok_or_else(|| Status::not_found("this node is not running that step"))?;
+            .cloned();
+        let Some(descriptor) = tracked else {
+            // Untracked is not unknown: a step whose exit was consumed before
+            // this caller re-attached is settled, and answering not_found here
+            // is what turns a successful step into a synthesised failure. The
+            // memo answers within this agent's life, the ledger across restarts.
+            let settled = match self.step_completions.settled(req.job_id, req.step_id).await {
+                Some(outcome) => Some((outcome.exit_code, outcome.signal)),
+                None => store
+                    .recorded_step_exit(req.job_id, req.step_id)
+                    .unwrap_or_else(|error| {
+                        warn!(job_id = req.job_id, step_id = req.step_id, %error,
+                            "failed to read a settled step's recorded exit");
+                        None
+                    }),
+            };
+            let Some((exit_code, signal)) = settled else {
+                return Err(Status::not_found("this node is not running that step"));
+            };
+            return Ok(Response::new(
+                awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
+            ));
+        };
 
         // A supervisor that finished while nobody was listening recorded its exit
         // durably; the rendezvous is in memory and does not survive a restart.
-        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         if let Ok(Some((exit_code, signal))) = durable_runtime_exit(&store, &descriptor) {
             return Ok(Response::new(
                 awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
@@ -11030,6 +11123,222 @@ mod tests {
             .expect("a recorded exit must be returned, not parked on");
 
         assert_eq!(response.into_inner().exit_code, 5);
+    }
+
+    /// One session of job 44's second attempt, on disk the way a supervisor
+    /// leaves it, with `exit` recorded when the supervisor observed one.
+    fn publish_session(
+        store: &crate::stepd::StepdStore,
+        step_id: u32,
+        exit: Option<i32>,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(44, 1, step_id).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+        if let Some(exit_code) = exit {
+            store
+                .obligations(44, 1, step_id)
+                .append(&crate::stepd::StepdObligation::ExitObserved {
+                    exit_code,
+                    signal: 0,
+                })
+                .expect("record the step's exit");
+        }
+        descriptor
+    }
+
+    /// A restarted agent serving job 44, whose batch supervisor came back and
+    /// holds the allocation, so a step of it may still be awaited.
+    async fn restarted_agent(state_dir: &std::path::Path) -> AgentService {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.to_path_buf());
+        svc.insert_test_job(
+            44,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::dummy(std::process::id())
+            },
+        )
+        .await;
+        let store = crate::stepd::StepdStore::new(state_dir);
+        let batch = publish_session(&store, spur_core::step::STEP_BATCH, None);
+        svc.adopt_stepds(&[batch]).await;
+        svc
+    }
+
+    #[tokio::test]
+    async fn await_step_answers_a_recovery_that_consumed_the_exit_first() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        // The supervisor outlived its workload, so the restart adopts it live
+        // and the recovery poll settles it before any re-attach lands.
+        let descriptor = publish_session(&store, 3, Some(0));
+        svc.adopt_stepds(std::slice::from_ref(&descriptor)).await;
+        settle_recovered_stepd(
+            &svc.running,
+            &svc.allocation,
+            &svc.stepds,
+            &svc.step_completions,
+            &store,
+            &descriptor,
+            0,
+            0,
+        )
+        .await
+        .expect("the recovery poll owns this session's completion");
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("a step settled before the re-attach must still report its exit");
+
+        assert_eq!(response.into_inner().exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn await_step_reports_the_exit_a_stale_session_recorded() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = publish_session(&store, 3, Some(7));
+        svc.settle_stale_stepds(&[descriptor]).await;
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("a step that exited during the outage must still report its exit");
+
+        assert_eq!(response.into_inner().exit_code, 7);
+    }
+
+    /// The startup replay reports a stale session's exit before anything else
+    /// runs, so by the time it is settled the release is its last open
+    /// obligation. Returns the descriptor and its directory.
+    fn acknowledged_stale_session(
+        store: &crate::stepd::StepdStore,
+        exit_code: i32,
+    ) -> (crate::stepd::StepdDescriptor, std::path::PathBuf) {
+        let descriptor = publish_session(store, 3, Some(exit_code));
+        store
+            .obligations(44, 1, 3)
+            .append(&crate::stepd::StepdObligation::CompletionAcknowledged)
+            .expect("record the completion acknowledgement");
+        (descriptor, store.session_dir(44, 1, 3))
+    }
+
+    fn age_beyond_retention(session_dir: &std::path::Path) {
+        let aged = std::time::SystemTime::now()
+            - crate::step_completion::SETTLED_RETENTION
+            - std::time::Duration::from_secs(1);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(session_dir.join("obligations.jsonl"))
+            .expect("open the obligation log")
+            .set_modified(aged)
+            .expect("age the obligation log");
+    }
+
+    #[tokio::test]
+    async fn a_settled_session_is_kept_so_a_later_restart_can_still_answer() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let (descriptor, session_dir) = acknowledged_stale_session(&store, 7);
+
+        svc.settle_stale_stepds(&[descriptor]).await;
+
+        assert!(
+            session_dir.exists(),
+            "a settled step's only surviving answer must outlive the report nobody reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_session_is_pruned_once_its_answer_has_aged_out() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let (descriptor, session_dir) = acknowledged_stale_session(&store, 7);
+        svc.settle_stale_stepds(&[descriptor]).await;
+        age_beyond_retention(&session_dir);
+
+        store.prune_finalized().expect("sweep finalized sessions");
+
+        assert!(
+            !session_dir.exists(),
+            "a retained answer past its window must be swept, not left to accumulate"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_step_answers_from_the_ledger_after_the_memo_is_gone() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let (descriptor, _) = acknowledged_stale_session(&store, 7);
+        restarted_agent(state_dir.path())
+            .await
+            .settle_stale_stepds(&[descriptor])
+            .await;
+        // A second restart: this agent never saw the step settle, so only the
+        // record the first one deliberately kept can answer for it.
+        let svc = restarted_agent(state_dir.path()).await;
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("a restart must not lose a step's exit");
+
+        assert_eq!(response.into_inner().exit_code, 7);
+    }
+
+    #[tokio::test]
+    async fn await_step_still_rejects_a_step_with_no_recorded_exit() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        // A supervisor that died before observing an exit: the outcome is
+        // genuinely unknown, so it must not be answered as a success -- least
+        // of all with the exit its sibling step happens to have left behind.
+        let sibling = publish_session(&store, 4, Some(0));
+        let descriptor = publish_session(&store, 3, None);
+        svc.settle_stale_stepds(&[sibling, descriptor]).await;
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("an unobserved exit must not be invented");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

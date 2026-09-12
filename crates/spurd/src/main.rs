@@ -560,6 +560,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
+    // After the replay above, so an exit it has already reported is still on
+    // disk to be read here, and before the server accepts its first re-attach.
+    agent_service.settle_stale_stepds(&stale_stepds).await;
     // stepd_state_dir is shared with spurctld's own state_dir when the operator
     // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
     // exclusively spurd's — use the runtime/ subdir spurd already owns.
@@ -706,6 +709,17 @@ async fn main() -> anyhow::Result<()> {
 
     let unreportable_sessions = stale_stepds
         .iter()
+        // A session kept only so a re-attach can still read its exit has already
+        // been reported; reporting it again would fence a step that finished.
+        .filter(|descriptor| {
+            !stepds
+                .completion_reported(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                )
+                .unwrap_or(false)
+        })
         .map(|descriptor| {
             (
                 descriptor.job_id,
