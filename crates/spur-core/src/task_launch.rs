@@ -151,8 +151,12 @@ pub fn step_needs_pmix_prepare(
 ///
 /// The batch script runs only on the first allocated node; companions hold
 /// their slice of the allocation until the controller tears them down.
+///
+/// Backgrounded and waited on: a non-interactive bash defers a signal until its
+/// foreground child exits, so sleeping in the foreground would hold the whole
+/// job in Completing until the current sleep ran out.
 pub fn batch_companion_hold_script() -> &'static str {
-    "#!/bin/bash\nwhile true; do sleep 60; done\n"
+    "#!/bin/bash\ntrap 'exit 0' TERM INT\nwhile true; do sleep 60 & wait $!; done\n"
 }
 
 /// Per-node task launch parameters derived from a step's task distribution.
@@ -694,6 +698,21 @@ pub fn build_labeled_single_task_wrapper(
     };
     let taskset_prefix = cpu_bind_bash_prefix(&bind, &map_cpus);
     format!("#!/bin/bash\n{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n")
+}
+
+#[cfg(test)]
+mod hold_script_tests {
+    use super::batch_companion_hold_script;
+
+    #[test]
+    fn the_holder_never_sleeps_in_the_foreground() {
+        let script = batch_companion_hold_script();
+
+        // A foreground sleep would make bash defer the controller's signal until
+        // it returned, stalling the whole job in Completing.
+        assert!(script.contains("sleep 60 & wait"), "{script}");
+        assert!(script.contains("trap"), "{script}");
+    }
 }
 
 #[cfg(test)]

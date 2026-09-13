@@ -8,7 +8,7 @@
 #[cfg(test)]
 mod tests {
     #[test]
-    fn modex_server_stop_releases_listener() {
+    fn modex_exchange_c_suite_passes() {
         let exe = std::path::PathBuf::from(env!("OUT_DIR")).join("modex_exchange_test");
         assert!(
             exe.exists(),

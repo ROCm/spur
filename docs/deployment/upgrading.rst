@@ -130,13 +130,13 @@ For a multi-node cluster, the Ansible toolkit is the recommended upgrade path. T
 playbooks are supported; both reuse the same install, config, and health-check roles as
 ``deploy.yml``, so their behavior stays consistent.
 
-Rebuild all three binaries from the same source tree together — they share a Raft
+Rebuild all binaries from the same source tree together — they share a Raft
 write-ahead-log schema, and mixing binaries from different builds can leave a controller
 unable to parse a log written by a differently-versioned peer:
 
 .. code-block:: bash
 
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 
 Binaries roll out by content, not version string: Ansible compares checksums, so an
 unchanged re-run is a near no-op.
@@ -228,7 +228,7 @@ Safe Upgrade Order
 
 Follow this order for any cluster upgrade:
 
-1. **Rebuild all three binaries together** from the same source tree — they share a Raft
+1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
    controller at a time to preserve quorum.
@@ -253,6 +253,37 @@ Follow this order for any cluster upgrade:
    newer build cannot parse them. A newer controller reads older logs fine, so the
    supported recovery from a bad upgrade is to roll forward, not to reinstall the
    previous version over a log the new one has already written.
+
+.. warning::
+
+   **Upgrading to the release that introduces** ``spurstepd`` **requires an empty
+   cluster.** Drain every node and let all running jobs finish, or cancel them,
+   before swapping binaries. Sessions written by the previous build are not
+   adopted, the two builds disagree on where a step's processes live, and a
+   mixed-version cluster is not supported across this upgrade — a new controller
+   dispatching to a not-yet-upgraded agent tears the job down. Upgrade every
+   controller and agent in the same maintenance window.
+
+   ``spurstepd`` is a new binary and must be installed next to ``spurd`` on every
+   compute node. The agent resolves it beside its own executable and does not
+   search ``$PATH``, so if it is missing every job launch on that node fails.
+
+   ``spur_mpi_pmix.so`` is versioned against the binaries that load it, and this
+   release bumps that version. Replace the plugin in ``[mpi].plugin_dir`` in the
+   same window, or ``--mpi=pmix`` jobs fail with ``unsupported MPI plugin API
+   version``. The plugin is now loaded by ``spurstepd`` rather than ``spurd``, for
+   steps as well as jobs.
+
+.. note::
+
+   *Once this release is in place*, restarting ``spurd`` no longer kills the work
+   on that node: jobs, ``srun`` steps and held allocations run under supervisors
+   that outlive the agent, and the restarted agent re-adopts them. This requires
+   ``KillMode=process`` in the ``spurd`` unit — the systemd default,
+   ``control-group``, kills the whole cgroup on stop and takes the supervisors
+   with it. See :doc:`native-host` for the unit file and for the two launches
+   that remain unsupervised. Draining first is still the recommended order
+   because it keeps new work off a node mid-swap.
 
 Behavior Changes Between Releases
 ---------------------------------

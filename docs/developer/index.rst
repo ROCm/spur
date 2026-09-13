@@ -1,8 +1,8 @@
 Developer Guide
 ===============
 
-Spur is a Rust workspace (Cargo) that builds three binaries — ``spurctld``,
-``spurd``, and ``spur``. This guide covers working on it.
+Spur is a Rust workspace (Cargo) that builds four binaries — ``spurctld``,
+``spurd``, ``spurstepd``, and ``spur``. This guide covers working on it.
 
 - :doc:`building` — build from source, run the unit and end-to-end test suites.
   The end-to-end tests need real hardware.

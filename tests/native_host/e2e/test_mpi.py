@@ -9,7 +9,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
-from cluster import SpurCluster, ensure_bins, make_remote_dir, parse_job_id, wait_job, wait_job_state
+from cluster import (
+    SpurCluster,
+    ensure_bins,
+    job_state,
+    make_remote_dir,
+    parse_job_id,
+    wait_job,
+    wait_job_state,
+)
 
 MPI_SOAK_ITERATIONS = max(1, int(os.environ.get("SPUR_MPI_SOAK_ITERATIONS", "1")))
 
@@ -67,9 +75,45 @@ class TestMpiSingleNode:
         try:
             code, out = cluster.srun_with_exit(["--mpi=pmix", "-n1", "/bin/true"])
             assert code != 0, f"expected failure without plugin, got success:\n{out}"
-            combined = f"{out}\n{cluster.spurd_log(0)}"
-            assert "MPI plugin not found" in combined or "plugin not found" in combined.lower(), (
-                f"expected plugin-not-found error, got:\n{combined}"
+            # srun's own output, not a node log: an operator who forgot to deploy
+            # the plugin never reads anything else.
+            logs = "\n".join(cluster.spurd_log(i) for i in range(len(cluster.nodes)))
+            assert "plugin not found" in out.lower(), (
+                f"expected plugin-not-found error in srun output, got:\n{out}\n"
+                f"node logs:\n{logs}"
+            )
+        finally:
+            cluster.teardown()
+
+    def test_mpi_batch_job_never_starts_without_plugin(self, ssh_nodes, remote_bin_dir):
+        """A batch job reaches the supervisor, where a plugin failure would
+        otherwise surface as a bare SIGKILL rather than a launch refusal."""
+        import os
+        import time
+        from pathlib import Path
+
+        binaries_dir = os.environ.get(
+            "SPUR_TEST_BINARIES_DIR",
+            str(Path(__file__).resolve().parents[3] / "target" / "release"),
+        )
+        ensure_bins(ssh_nodes, binaries_dir, remote_bin_dir, with_mpi_plugin=False)
+        cluster = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+        cluster.deploy(config_overrides={"mpi": {"plugin_dir": "/nonexistent/spur-mpi"}})
+        try:
+            script = cluster.write_file("mpi-no-plugin.sh", "#!/bin/bash\n/bin/true\n")
+            job_id = parse_job_id(
+                cluster.sbatch(["--mpi=pmix", "-N", "1", "-n", "1", script])
+            )
+            assert job_id is not None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                assert job_state(cluster.squeue_all(), job_id) != "R", (
+                    f"job {job_id} started despite a plugin this node cannot load"
+                )
+                time.sleep(2)
+            logs = "\n".join(cluster.spurd_log(i) for i in range(len(cluster.nodes)))
+            assert "cannot host" in logs, (
+                f"the node must record why it refused the launch, got:\n{logs}"
             )
         finally:
             cluster.teardown()

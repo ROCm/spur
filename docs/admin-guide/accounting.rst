@@ -1314,17 +1314,19 @@ identity:
 
 ``jwt``
    Require a signed JSON Web Token. Tokens carry the subject, UID, admin flag, and
-   expiry, and are signed with ``jwt_key`` (HS256). Expired tokens are rejected as
-   ``token expired``; malformed ones as ``invalid token``.
+   expiry, and are signed with the configured key (HS256). Expired tokens are
+   rejected as ``token expired``; malformed ones as ``invalid token``.
 
 .. code-block:: toml
 
    [auth]
    plugin = "jwt"
-   jwt_key = "/etc/spur/jwt.key"
+   jwt_key_file = "/etc/spur/jwt.key"
 
-``jwt_key`` is the signing secret, given as a file path or inline value. Only
-``none`` and ``jwt`` are supported.
+``jwt_key_file`` reads the signing secret from a file, ignoring a single trailing
+line ending. ``jwt_key`` gives the secret inline instead — its value is used
+literally, so a path written there is the secret rather than a file to read.
+Setting both is rejected at startup. Only ``none`` and ``jwt`` are supported.
 
 Admission tokens for node join
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

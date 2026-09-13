@@ -148,6 +148,17 @@ impl SlurmAgent for VirtualAgent {
     type InteractiveSessionStream =
         tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    /// Steps here run as pods the kubelet owns, so there is no supervisor
+    /// session for a lost caller to re-park on.
+    async fn await_step(
+        &self,
+        _request: Request<spur_proto::proto::AwaitStepRequest>,
+    ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
+        Err(Status::unimplemented(
+            "a virtual agent does not supervise steps",
+        ))
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -531,6 +542,15 @@ impl SlurmAgent for VirtualAgent {
         Ok(Response::new(ReleasePmixResponse {}))
     }
 
+    /// A pod has no supervisor holding it at a gate — it runs as soon as it is
+    /// created — so there is nothing here to release.
+    async fn start_job(
+        &self,
+        _request: Request<spur_proto::proto::AgentStartJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,
@@ -600,6 +620,15 @@ impl SlurmAgent for VirtualAgent {
             total: Some(ResourceSet::default()),
             used: Some(spur_proto::proto::ResourceAllocations::default()),
         }))
+    }
+
+    async fn probe_stepd(
+        &self,
+        _request: Request<StepdProbeRequest>,
+    ) -> Result<Response<StepdProbeResponse>, Status> {
+        // k8s-backed jobs run as pods, never under a native Stepd, so
+        // they never enter the native recovery/fencing path that calls this.
+        Ok(Response::new(StepdProbeResponse { active: false }))
     }
 
     async fn exec_in_job(

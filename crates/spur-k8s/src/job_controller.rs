@@ -617,6 +617,8 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     )
                 };
                 let req = ReportJobStatusRequest {
+                    // Pod-level report: it speaks for the job, not one step.
+                    step_id: None,
                     job_id,
                     state: report_state.to_proto_i32(),
                     exit_code: report_exit,

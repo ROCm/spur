@@ -67,6 +67,17 @@ pub fn spawn_keepalive(
     KeepaliveGuard(handle)
 }
 
+/// The agent's own port, since a cluster may run it anywhere. A node that
+/// predates the field reports zero, which falls back to the default.
+pub(crate) fn agent_port_or_default(port: u32) -> u32 {
+    const DEFAULT_AGENT_PORT: u32 = 6818;
+    if port > 0 {
+        port
+    } else {
+        DEFAULT_AGENT_PORT
+    }
+}
+
 /// Connect to a spurd agent, presenting the caller's credential if one is available.
 ///
 /// The agent authenticates callers with the same JWT mechanism as the controller. A user token
@@ -496,5 +507,15 @@ mod tests {
             envs.get("SPUR_AUTH_TOKEN").and_then(|v| v.as_deref()),
             Some("test-jwt-token")
         );
+    }
+
+    #[test]
+    fn a_reported_agent_port_is_used_verbatim() {
+        assert_eq!(agent_port_or_default(7818), 7818);
+    }
+
+    #[test]
+    fn an_unreported_agent_port_falls_back_to_the_default() {
+        assert_eq!(agent_port_or_default(0), 6818);
     }
 }

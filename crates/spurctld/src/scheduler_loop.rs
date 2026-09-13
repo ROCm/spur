@@ -346,6 +346,11 @@ async fn process_assignment(
         }
     }
 
+    // `start_job_impl` advances the run epoch after the allocation has been
+    // registered. Give agents that impending epoch so their Stepds
+    // identify the controller-owned run rather than the pending job record.
+    let prospective_run_attempt = job.run_attempt.saturating_add(1);
+
     if spec.srun_job && srun_step_dispatch {
         match register_allocation_on_nodes(
             cluster.clone(),
@@ -354,13 +359,14 @@ async fn process_assignment(
             &spec,
             per_node_allocs.clone(),
             allocated_nodelist.clone(),
+            prospective_run_attempt,
         )
         .await
         {
             // Both arms tear down identically: with a deadline in play, even "all failed" can mean
             // every node registered and answered too late, so none of them may be left holding one.
             AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
-                cancel_job_on_nodes(&cluster, job_id, &all_nodes, 9).await;
+                cancel_job_on_nodes(&cluster, job_id, prospective_run_attempt, &all_nodes, 9).await;
                 // The job never left Pending, so plain requeue is a no-op here — the same
                 // Pending-aware backoff the launch path uses is what actually throttles a retry.
                 if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
@@ -433,14 +439,13 @@ async fn process_assignment(
         (None, false)
     };
 
+    let dispatched = dispatch_spec.is_some();
     if let Some(dspec) = dispatch_spec {
         // The run epoch start_job_impl is about to persist for this
         // dispatch. Safe to read ahead of that call: this iteration is
         // the only place that can advance a Pending job's run_attempt,
         // and nothing here yields back to another iteration for the
         // same job in between.
-        let prospective_run_attempt = job.run_attempt.saturating_add(1);
-
         match confirm_dispatch_on_nodes(
             cluster.clone(),
             job_id,
@@ -485,7 +490,14 @@ async fn process_assignment(
         // start_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+        cancel_job_on_nodes(
+            &cluster,
+            job_id,
+            prospective_run_attempt,
+            &dispatch_nodes,
+            0,
+        )
+        .await;
         debug!(
             job_id = assignment.job_id,
             error = %e,
@@ -494,7 +506,94 @@ async fn process_assignment(
         return false;
     }
 
+    // The job is Running and committed, so anything it launches can now be
+    // resolved by the controller. Only here is the workload let go.
+    if dispatched
+        && !start_job_on_nodes(&cluster, job_id, prospective_run_attempt, &dispatch_nodes).await
+    {
+        cancel_job_on_nodes(
+            &cluster,
+            job_id,
+            prospective_run_attempt,
+            &dispatch_nodes,
+            0,
+        )
+        .await;
+        return false;
+    }
+
     true
+}
+
+/// Release every dispatched node's workload, reporting whether all of them
+/// took it. A node that does not leaves its supervisor at the gate, where it
+/// times out — so the caller has to tear the run down rather than leave a job
+/// Running with nothing behind it on some of its nodes.
+async fn start_job_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+) -> bool {
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(start_one_agent(agent_addr, job_id, run_attempt));
+    }
+    let mut released = 0usize;
+    let mut expected = 0usize;
+    while let Some(outcome) = set.join_next().await {
+        expected += 1;
+        if outcome.unwrap_or(false) {
+            released += 1;
+        }
+    }
+    if released != expected || expected != node_names.len() {
+        warn!(
+            job_id,
+            run_attempt,
+            released,
+            expected = node_names.len(),
+            "could not release the job on every node"
+        );
+        return false;
+    }
+    true
+}
+
+async fn start_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    use spur_proto::proto::AgentStartJobRequest;
+
+    let attempt = async {
+        let mut client = crate::agent_client::connect(agent_addr.clone())
+            .await
+            .map(|c| {
+                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+            })
+            .ok()?;
+        client
+            .start_job(AgentStartJobRequest {
+                job_id,
+                run_attempt,
+            })
+            .await
+            .ok()
+    };
+    match tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            warn!(job_id, node_addr = %agent_addr, "failed to release the job on node");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node_addr = %agent_addr, "timed out releasing the job on node");
+            false
+        }
+    }
 }
 
 /// Compute the resource set to record against the cluster for an assignment.
@@ -758,7 +857,12 @@ pub(crate) async fn try_preempt(
             } else {
                 None
             };
-            match cluster.preempt_job(candidate.job_id, mode, pending.job_id, preempt_qos) {
+            match cluster.preempt_job_with_provenance(
+                candidate.job_id,
+                mode,
+                Some(pending.job_id),
+                preempt_qos,
+            ) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
@@ -1267,6 +1371,8 @@ fn build_pmix_plan_proto(
         mpi,
         spur_core::mpi::PmixLocalDispatch {
             job_id: params.job_id,
+            // The batch dispatch always launches the batch step on the agent.
+            step_id: spur_core::step::STEP_BATCH,
             universe_size: spec.num_tasks,
             task_offset: params.task_offset,
             local_count: tasks_per_node,
@@ -1319,6 +1425,7 @@ struct AllocationRegisterParams {
     allocated_nodelist: String,
     allocated: spur_core::resource::ResourceAllocations,
     work_dir: String,
+    run_attempt: u32,
 }
 
 /// Register a srun-only allocation on a node agent without launching a batch process.
@@ -1350,6 +1457,7 @@ async fn register_allocation_to_agent(
             mpi: params.mpi.clone(),
             work_dir: params.work_dir.clone(),
             user: params.user.clone(),
+            run_attempt: params.run_attempt,
         })
         .await?;
 
@@ -1370,6 +1478,7 @@ async fn register_allocation_on_nodes(
     spec: &spur_core::job::JobSpec,
     per_node_allocs: std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
     allocated_nodelist: String,
+    run_attempt: u32,
 ) -> AllocationRegisterOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
@@ -1415,6 +1524,7 @@ async fn register_allocation_on_nodes(
             allocated_nodelist: allocated_nodelist.clone(),
             allocated,
             work_dir: spec.work_dir.clone(),
+            run_attempt,
         };
         set.spawn(async move {
             let register = register_allocation_to_agent(&agent_addr, &params);
@@ -1836,7 +1946,7 @@ async fn confirm_dispatch_on_nodes(
 
     // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
     // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
-    cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 9).await;
+    cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -2072,7 +2182,14 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
                     }
 
                     // SIGKILL on the run's current nodes, not the stale snapshot.
-                    send_cancel_to_nodes(&cluster, job_id, &fresh.allocated_nodes, 9).await;
+                    send_cancel_to_nodes(
+                        &cluster,
+                        job_id,
+                        fresh.run_attempt,
+                        &fresh.allocated_nodes,
+                        9,
+                    )
+                    .await;
                     signaled.remove(&job_id);
                 }
             }
@@ -2145,7 +2262,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
     }
 
     if !missing.is_empty() {
-        cancel_job_on_nodes(cluster, job.job_id, &missing, 9).await;
+        cancel_job_on_nodes(cluster, job.job_id, job.run_attempt, &missing, 9).await;
     }
 
     info!(
@@ -2255,7 +2372,14 @@ pub async fn send_cancel_to_agents(
     job: &spur_core::job::Job,
     signal: i32,
 ) {
-    send_cancel_to_nodes(cluster, job.job_id, &job.allocated_nodes, signal).await;
+    send_cancel_to_nodes(
+        cluster,
+        job.job_id,
+        job.run_attempt,
+        &job.allocated_nodes,
+        signal,
+    )
+    .await;
 }
 
 /// Send CancelJob RPC to an explicit set of nodes for a job with a specific
@@ -2270,11 +2394,12 @@ pub async fn send_cancel_to_agents(
 pub async fn send_cancel_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     node_names: &[String],
     signal: i32,
 ) {
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, signal));
+        tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
     }
 }
 
@@ -2285,12 +2410,13 @@ pub async fn send_cancel_to_nodes(
 pub async fn cancel_job_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     node_names: &[String],
     signal: i32,
 ) {
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_agent(agent_addr, job_id, signal));
+        set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
     }
     while set.join_next().await.is_some() {}
 }
@@ -2408,7 +2534,12 @@ fn cancel_agent_addrs(
 /// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
 /// timeouts are logged, never propagated: a cancel is best-effort cleanup and
 /// must not block the caller past the timeout.
-async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, signal: i32) {
+async fn cancel_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    signal: i32,
+) {
     let attempt = async {
         match crate::agent_client::connect(agent_addr.clone())
             .await
@@ -2418,7 +2549,11 @@ async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, sig
             }) {
             Ok(mut client) => {
                 if let Err(e) = client
-                    .cancel_job(AgentCancelJobRequest { job_id, signal })
+                    .cancel_job(AgentCancelJobRequest {
+                        job_id,
+                        signal,
+                        run_attempt,
+                    })
                     .await
                 {
                     warn!(
@@ -3079,6 +3214,21 @@ mod tests {
             type InteractiveSessionStream =
                 tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
 
+            async fn start_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
+
+            async fn await_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AwaitStepRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
             async fn launch_job(
                 &self,
                 request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
@@ -3160,6 +3310,14 @@ mod tests {
                 &self,
                 _request: tonic::Request<()>,
             ) -> Result<tonic::Response<spur_proto::proto::NodeResourcesResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn probe_stepd(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StepdProbeRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::StepdProbeResponse>, tonic::Status>
             {
                 Ok(tonic::Response::new(Default::default()))
             }

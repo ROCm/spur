@@ -332,6 +332,10 @@ message NodeInfo {
   // marks a system/automatic reason.
   optional uint32 reason_uid = 56;
   google.protobuf.Timestamp reason_time = 57;
+
+  // Port the node's agent listens on, so a client dialling it directly does not
+  // have to assume the default.
+  uint32 agent_port = 58;
 }
 
 message PartitionInfo {
@@ -426,6 +430,7 @@ service SlurmController {
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportStepdRecovery(StepdRecoveryRequest) returns (StepdRecoveryResponse);
 
   // Admission token management
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
@@ -473,9 +478,14 @@ service SlurmAgent {
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
   // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
   rpc ReleasePmix(ReleasePmixRequest) returns (ReleasePmixResponse);
+  // Release a dispatched job for execution. The agent holds the workload at a
+  // gate until this arrives, so the controller has committed the job Running
+  // before anything the job runs can ask about it.
+  rpc StartJob(AgentStartJobRequest) returns (google.protobuf.Empty);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
+  rpc ProbeStepd(StepdProbeRequest) returns (StepdProbeResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
@@ -483,6 +493,9 @@ service SlurmAgent {
   rpc CancelStep(CancelStepRequest) returns (google.protobuf.Empty);
   // Record an allocation on this node without launching a batch process.
   rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
+  // Re-park on a step this agent is already running, after a client lost its
+  // RunCommand call (e.g. the agent restarted under a supervised step).
+  rpc AwaitStep(AwaitStepRequest) returns (RunCommandResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // PTY-backed interactive session (srun --pty, sattach, srun --overlap --pty)
   rpc InteractiveSession(stream InteractiveInput) returns (stream InteractiveOutput);
@@ -883,6 +896,22 @@ message RunningJobStatus {
 
 message HeartbeatResponse {}
 
+message StepdRecoveryRequest {
+  string hostname = 1;
+  uint32 job_id = 2;
+  uint32 run_attempt = 3;
+  string node_token = 4;
+  bool stale_descriptor = 5;
+  // Supervisors are per (job, attempt, step); 0 is the batch step.
+  uint32 step_id = 6;
+}
+
+message StepdRecoveryResponse {
+  bool retained = 1;
+  bool fenced = 2;
+  string message = 3;
+}
+
 message PmixLocalProc {
   uint32 rank = 1;
   uint32 local_rank = 2;
@@ -904,6 +933,9 @@ message PmixLaunchPlan {
   uint32 modex_connect_timeout_secs = 12;
   uint32 modex_fence_timeout_secs = 13;
   uint32 modex_verify_timeout_secs = 14;
+  // Rendezvous key alongside job_id: two steps of one job may run on the same
+  // node. 0 from an older controller is the numbered step 0, not "unset".
+  uint32 step_id = 15;
 }
 
 // -- Agent --
@@ -973,9 +1005,18 @@ message LaunchJobResponse {
   LaunchFailureKind failure_kind = 5;
 }
 
+message AgentStartJobRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+}
+
 message AgentCancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;
+  // Epoch of the run being cancelled; 0 means unspecified (cancel whichever
+  // attempt is currently tracked). Guards a still-launching reservation
+  // release against a concurrent redispatch under the same job_id.
+  uint32 run_attempt = 3;
 }
 
 message AgentSuspendJobRequest {
@@ -986,6 +1027,17 @@ message AgentSuspendJobRequest {
 message NodeResourcesResponse {
   ResourceSet total = 1;
   ResourceAllocations used = 2;
+}
+
+message StepdProbeRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  // Supervisors are per (job, attempt, step); 0 is the batch step.
+  uint32 step_id = 3;
+}
+
+message StepdProbeResponse {
+  bool active = 1;
 }
 
 message ExecInJobRequest {
@@ -1277,6 +1329,7 @@ message RegisterJobAllocationRequest {
   string mpi = 10;
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
+  uint32 run_attempt = 13;
 }
 
 message RegisterJobAllocationResponse {}
@@ -1293,11 +1346,19 @@ message CancelStepRequest {
   int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
 }
 
+message AwaitStepRequest {
+  uint32 job_id = 1;
+  uint32 step_id = 2;
+  string user = 3;
+}
+
 message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
   string user = 3;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
-  uint32 step_id = 4; // 0 = the batch job's own output; >0 = tail that step's per-step spool file
+  uint32 step_id = 4; // Legacy: 0 means the job's own output, so it cannot name step 0
+  uint64 start_offset = 5; // Resume a reconnecting reader without repeating what it already printed
+  optional uint32 step = 6; // Names a step even when that step is 0; absent means the job's own output
 }
 
 message StreamJobOutputChunk {
@@ -1465,6 +1526,9 @@ message ReportJobStatusRequest {
   // Echoed from LaunchJobRequest.run_attempt; controller drops this report if
   // older than the job's current epoch. 0 = unset (legacy), check off.
   uint32 run_attempt = 9;
+  // Step whose supervisor is reporting. Absent from a legacy agent, and from a
+  // report that speaks for the whole node rather than one step.
+  optional uint32 step_id = 10;
 }
 
 // ============================================================

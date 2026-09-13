@@ -12,6 +12,8 @@ mod job_id_arg;
 mod jobtime;
 mod k8s;
 #[cfg(test)]
+mod mock_agent;
+#[cfg(test)]
 mod mock_controller;
 mod net;
 mod node;
