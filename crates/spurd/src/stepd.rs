@@ -906,6 +906,19 @@ fn retained_settled_answer(
     }))
 }
 
+/// Whether nothing has spoken for a session long enough to call it abandoned.
+/// Falls back to the directory when no obligation was ever recorded.
+fn session_is_abandoned(session_dir: &Path, now: SystemTime) -> bool {
+    let obligations = session_dir.join(OBLIGATION_FILE);
+    let touched = fs::metadata(&obligations)
+        .or_else(|_| fs::metadata(session_dir))
+        .and_then(|meta| meta.modified());
+    touched.is_ok_and(|touched| {
+        now.duration_since(touched)
+            .is_ok_and(|age| age > crate::step_completion::ORPHAN_RETENTION)
+    })
+}
+
 /// What a sweep did with one session, so a caller can bound the answers it
 /// chose to keep rather than rediscovering which ones those were.
 enum SweptSession {
@@ -957,6 +970,31 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     file.write_all(contents)
+}
+
+/// Records why a launch never produced a workload, on the node and to the user.
+pub(crate) fn record_launch_failure(
+    session_dir: &Path,
+    stderr_path: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let failure_path = session_dir.join(FAILURE_FILE);
+    if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
+        tracing::warn!(%write_error, path = %failure_path.display(),
+            "failed to record stepd failure");
+    }
+    // Only append to a stream the launch already opened: creating it here would
+    // leave a root-owned file the job's own user cannot read.
+    if stderr_path.is_empty() || !Path::new(stderr_path).exists() {
+        return;
+    }
+    match fs::OpenOptions::new().append(true).open(stderr_path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "spurstepd: {error}");
+        }
+        Err(write_error) => tracing::warn!(%write_error, stderr_path,
+            "failed to report a launch failure to the job's error stream"),
+    }
 }
 
 pub fn validate_hello(
@@ -1823,6 +1861,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         tokio::spawn(serve_pty_custody(custody));
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+    let stderr_path = launch_spec.stderr_path.clone();
     let hooks = launch_spec.hooks.clone();
     let spank = load_runtime_spank(&launch_spec.plugstack_path);
     let hook_context = spur_core::hooks::HookContext {
@@ -1849,11 +1888,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // Nothing launched, so only the session's own artifacts need clearing
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
-            let failure_path = session_dir.join(FAILURE_FILE);
-            if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
-                tracing::warn!(%write_error, path = %failure_path.display(),
-                    "failed to record stepd failure");
-            }
+            record_launch_failure(&session_dir, &stderr_path, &error);
             if spur_core::step::is_user_step(step_id) {
                 crate::executor::cleanup_step_spool(job_id, step_id);
             } else {
@@ -1865,11 +1900,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // The workload never ran, so nothing will report an exit and the watchdog
     // synthesises a SIGKILL — record the real reason the way a failed spawn does.
     let cleanup_failed_launch = |error: &dyn std::fmt::Display| {
-        let failure_path = session_dir.join(FAILURE_FILE);
-        if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
-            tracing::warn!(%write_error, path = %failure_path.display(),
-                "failed to record stepd failure");
-        }
+        record_launch_failure(&session_dir, &stderr_path, error);
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
@@ -1958,10 +1989,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     };
     if let Err(error) = result {
         teardown(cgroup).await;
-        let failure_path = session_dir.join(FAILURE_FILE);
-        if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
-            tracing::warn!(%write_error, path = %failure_path.display(), "failed to record stepd failure");
-        }
+        record_launch_failure(&session_dir, &stderr_path, &error);
         return Err(error.into());
     }
     let snapshot = session.snapshot().await;
@@ -2110,6 +2138,21 @@ impl StepdStore {
         step_id: spur_core::step::StepId,
     ) -> PathBuf {
         self.root.join(format!("{job_id}.{run_attempt}.{step_id}"))
+    }
+
+    /// The reason a supervisor recorded before dying, if it wrote one.
+    pub fn recorded_failure(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> Option<String> {
+        let path = self
+            .session_dir(job_id, run_attempt, step_id)
+            .join(FAILURE_FILE);
+        let recorded = fs::read_to_string(path).ok()?;
+        let trimmed = recorded.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     pub fn obligations(
@@ -2286,11 +2329,20 @@ impl StepdStore {
 
     pub fn prune_finalized(&self) -> io::Result<usize> {
         let mut pruned = 0;
+        let now = SystemTime::now();
         let mut retained: Vec<(SystemTime, PathBuf)> = Vec::new();
         for session_dir in self.session_dirs()? {
             let descriptor = match self.load_descriptor(&session_dir) {
                 Ok(descriptor) => descriptor,
-                Err(_) => continue,
+                // Nothing can ever finalize a session whose descriptor will not
+                // load, and it still holds the job's environment on disk.
+                Err(_) => {
+                    if session_is_abandoned(&session_dir, now) {
+                        fs::remove_dir_all(&session_dir)?;
+                        pruned += 1;
+                    }
+                    continue;
+                }
             };
             let obligations = self.obligations(
                 descriptor.job_id,
@@ -2302,7 +2354,16 @@ impl StepdStore {
                 SweptSession::RetainedAnswer { settled_at } => {
                     retained.push((settled_at, session_dir))
                 }
-                SweptSession::Unfinalized => {}
+                // A supervisor that died before recording an exit leaves a session
+                // no one can finalize; only its own death makes it safe to sweep.
+                SweptSession::Unfinalized => {
+                    if matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale))
+                        && session_is_abandoned(&session_dir, now)
+                    {
+                        fs::remove_dir_all(&session_dir)?;
+                        pruned += 1;
+                    }
+                }
             }
         }
         // Age alone lets step churn grow the retained set without limit, and
@@ -3652,6 +3713,152 @@ mod tests {
                 .session_dir(21, 1, (capacity + excess - 1) as u32)
                 .exists(),
             "the newest answer must survive"
+        );
+    }
+
+    fn abandoned_moment() -> SystemTime {
+        SystemTime::now()
+            - crate::step_completion::ORPHAN_RETENTION
+            - std::time::Duration::from_secs(1)
+    }
+
+    #[test]
+    fn a_session_no_one_can_finalize_is_swept_once_it_is_abandoned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        // Released but never observed: what a supervisor killed before it could
+        // record an exit leaves behind, holding the job's environment.
+        user_step_session(&store, 3, &[StepdObligation::ResourcesReleased]);
+
+        assert_eq!(store.prune_finalized().expect("prune"), 0);
+        assert!(
+            store.session_dir(21, 1, 3).exists(),
+            "an orphan must survive while it is still worth triaging"
+        );
+
+        date_user_step_session(&store, 3, abandoned_moment());
+        assert_eq!(store.prune_finalized().expect("prune"), 1);
+        assert!(
+            !store.session_dir(21, 1, 3).exists(),
+            "an orphan past its window must not hold the job's environment forever"
+        );
+    }
+
+    #[test]
+    fn an_old_session_survives_while_its_supervisor_still_lives() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let descriptor = descriptor(21, 1, std::process::id());
+        store.publish(&descriptor).expect("publish descriptor");
+        let log = store.obligations(21, 1, spur_core::step::STEP_BATCH);
+        log.append(&StepdObligation::ResourcesReleased)
+            .expect("append released");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(
+                store
+                    .session_dir(21, 1, spur_core::step::STEP_BATCH)
+                    .join(OBLIGATION_FILE),
+            )
+            .expect("open the obligation log")
+            .set_modified(abandoned_moment())
+            .expect("date the session");
+
+        assert_eq!(store.prune_finalized().expect("prune"), 0);
+        assert!(
+            store
+                .session_dir(21, 1, spur_core::step::STEP_BATCH)
+                .exists(),
+            "a running job's session must never be swept, however old its log"
+        );
+    }
+
+    #[test]
+    fn a_session_whose_descriptor_will_not_load_is_swept_once_abandoned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let session_dir = store.session_dir(21, 1, 9);
+        fs::create_dir_all(&session_dir).expect("create session directory");
+        fs::write(session_dir.join(DESCRIPTOR_FILE), b"{ not json").expect("write descriptor");
+        fs::write(session_dir.join(OBLIGATION_FILE), b"").expect("write obligation log");
+
+        assert_eq!(store.prune_finalized().expect("prune"), 0);
+        assert!(session_dir.exists());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(session_dir.join(OBLIGATION_FILE))
+            .expect("open the obligation log")
+            .set_modified(abandoned_moment())
+            .expect("date the session");
+
+        assert_eq!(store.prune_finalized().expect("prune"), 1);
+        assert!(
+            !session_dir.exists(),
+            "a session nothing can read must still be swept, or it is kept forever"
+        );
+    }
+
+    #[test]
+    fn a_launch_failure_reaches_the_ledger_and_the_job_s_error_stream() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session directory");
+        let stderr_path = temp.path().join("job.err");
+        fs::write(&stderr_path, b"earlier output\n").expect("seed the error stream");
+
+        record_launch_failure(
+            &session_dir,
+            stderr_path.to_str().expect("utf-8 path"),
+            &"failed to start the PMIx server: plugin not found",
+        );
+
+        let recorded = fs::read_to_string(session_dir.join(FAILURE_FILE)).expect("read failure");
+        assert!(recorded.contains("plugin not found"));
+        let reported = fs::read_to_string(&stderr_path).expect("read the error stream");
+        assert!(
+            reported.starts_with("earlier output\n"),
+            "reporting a failure must not truncate what the job already wrote"
+        );
+        assert!(
+            reported.contains("plugin not found"),
+            "a launch that produced no workload must still say why in the job's own output"
+        );
+    }
+
+    #[test]
+    fn a_launch_failure_never_creates_an_error_stream_the_user_cannot_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session directory");
+        let stderr_path = temp.path().join("never-opened.err");
+
+        record_launch_failure(
+            &session_dir,
+            stderr_path.to_str().expect("utf-8 path"),
+            &"failed before the launch opened its streams",
+        );
+
+        assert!(session_dir.join(FAILURE_FILE).exists());
+        assert!(
+            !stderr_path.exists(),
+            "creating the stream here would leave a root-owned file the job's user cannot read"
+        );
+    }
+
+    #[test]
+    fn a_recorded_failure_is_readable_by_the_agent_that_outlives_the_supervisor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let session_dir = store.session_dir(21, 1, 4);
+        fs::create_dir_all(&session_dir).expect("create session directory");
+
+        assert_eq!(store.recorded_failure(21, 1, 4), None);
+
+        record_launch_failure(&session_dir, "", &"the node cannot host this plugin");
+        assert_eq!(
+            store.recorded_failure(21, 1, 4).as_deref(),
+            Some("the node cannot host this plugin")
         );
     }
 

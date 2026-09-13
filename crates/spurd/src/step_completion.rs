@@ -26,6 +26,9 @@ pub(crate) const SETTLED_RETENTION: Duration = Duration::from_secs(600);
 /// A hard ceiling independent of retention, so step churn cannot grow the memo
 /// or the durable records it is a fast path for.
 pub(crate) const SETTLED_CAPACITY: usize = 1024;
+/// How long a session nothing can finalize is kept for triage. It holds the
+/// job's environment, so it cannot be retained on the chance someone looks.
+pub(crate) const ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct SettledStep {
     key: (JobId, StepId),

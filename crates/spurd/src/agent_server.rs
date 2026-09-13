@@ -1323,6 +1323,14 @@ async fn fence_dead_stepd(
     let (exit_code, signal) =
         recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
     if recorded_exit.is_none() {
+        if let Some(reason) = store.recorded_failure(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        ) {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %reason,
+                "stepd recorded why its launch failed before dying");
+        }
         if let Err(error) =
             obligations.append(&crate::stepd::StepdObligation::ExitObserved { exit_code, signal })
         {
@@ -2781,7 +2789,20 @@ impl AgentService {
     pub async fn adopt_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         let mut sessions = self.stepds.lock().await;
         for descriptor in descriptors {
-            sessions.insert(stepd_key(descriptor), descriptor.clone());
+            let mut descriptor = descriptor.clone();
+            // A recorded path is treated as authoritative for teardown, so one
+            // that no longer exists has to fall back to answering for the workload.
+            if !descriptor.cgroup_path.as_os_str().is_empty() && !descriptor.cgroup_path.is_dir() {
+                warn!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    step_id = descriptor.step_id,
+                    cgroup_path = %descriptor.cgroup_path.display(),
+                    "adopted a stepd whose recorded cgroup is gone; deriving instead"
+                );
+                descriptor.cgroup_path = std::path::PathBuf::new();
+            }
+            sessions.insert(stepd_key(&descriptor), descriptor);
         }
     }
 
@@ -4205,6 +4226,14 @@ impl SlurmAgent for AgentService {
                 let mut plan =
                     mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)?;
                 plan.rekey_to_step(launch_step);
+                // Only this RPC can still answer the caller; once the supervisor
+                // owns the launch a plugin it cannot load reads as a bare SIGKILL.
+                self.mpi_host
+                    .validate_pmix_dispatch(&plan)
+                    .map_err(|error| {
+                        warn!(job_id, %error, "refusing a pmix job this node cannot host");
+                        Status::failed_precondition(error)
+                    })?;
                 supervised_pmix = Some(crate::stepd::StepdPmix {
                     plan,
                     config: self.mpi_host.config().clone(),
@@ -5455,15 +5484,11 @@ impl SlurmAgent for AgentService {
                     step_id,
                     num_tasks,
                 )?;
-                // The supervisor starts the server, but only this RPC can still
-                // answer the caller: a plugin this node cannot load is reported
-                // here or reaches the user as a bare SIGKILL. Same pre-flight
-                // PreparePmix runs for a multi-node step, which never reaches here.
+                // Only this RPC can still answer the caller; once the supervisor
+                // owns the launch a plugin it cannot load reads as a bare SIGKILL.
                 self.mpi_host
                     .validate_pmix_dispatch(&pmix.plan)
                     .map_err(|error| {
-                        // Also on this node: the caller sees it over gRPC, but an
-                        // operator triaging from the node has nowhere else to look.
                         warn!(job_id, step_id, %error, "refusing a pmix step this node cannot host");
                         Status::failed_precondition(error)
                     })?;
@@ -11442,6 +11467,39 @@ mod tests {
         let batch = publish_session(&store, spur_core::step::STEP_BATCH, None);
         svc.adopt_stepds(&[batch]).await;
         svc
+    }
+
+    #[tokio::test]
+    async fn adoption_keeps_a_recorded_cgroup_only_while_it_still_exists() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let live_cgroup = state_dir.path().join("live-cgroup");
+        std::fs::create_dir_all(&live_cgroup).expect("create the surviving cgroup");
+
+        let mut present = publish_session(&store, 5, None);
+        present.cgroup_path = live_cgroup.clone();
+        let mut vanished = publish_session(&store, 6, None);
+        vanished.cgroup_path = state_dir.path().join("swept-cgroup");
+        svc.adopt_stepds(&[present, vanished]).await;
+
+        let sessions = svc.stepds.lock().await;
+        assert_eq!(
+            sessions
+                .get(&(44, 5))
+                .expect("the live session is adopted")
+                .cgroup_path,
+            live_cgroup,
+            "a cgroup that still exists stays authoritative for teardown"
+        );
+        assert_eq!(
+            sessions
+                .get(&(44, 6))
+                .expect("the stale session is adopted")
+                .cgroup_path,
+            std::path::PathBuf::new(),
+            "a cgroup that is gone must not be read as a confirmed-empty one"
+        );
     }
 
     #[tokio::test]

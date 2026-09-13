@@ -239,6 +239,48 @@ class TestSessionRecordPermissions:
             # reaped instead of outliving the test.
             cluster.start_agents()
 
+    def test_a_settled_steps_retained_records_stay_owner_only(self, cluster):
+        """A settled step's session is kept so a late caller still gets its
+        exit — holding the job's environment for that whole window."""
+        node = cluster.node_names[0]
+        script = cluster.write_file(
+            "settled-perms.sh",
+            "#!/bin/bash\nsrun /bin/true\nsleep 20\n",
+            all_nodes=True,
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "settled-perms", "-w", node, script])
+        )
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+        numbered = _wait_for_numbered_step(cluster, job_id)
+        assert numbered, f"the step never got a supervisor: {_sessions(cluster)}"
+
+        step = sorted(numbered)[0]
+        attempt = next(
+            name.split(".")[1]
+            for name in _sessions(cluster)
+            if name.startswith(f"{job_id}.") and name.endswith(f".{step}")
+        )
+        session_dir = f"{cluster.state_dir}/runtime/{job_id}.{attempt}.{step}"
+
+        assert _wait_for_record(cluster, session_dir, "obligations.jsonl"), (
+            f"the step recorded no obligation under {session_dir}"
+        )
+        assert _stat_mode(cluster, session_dir) == "700", (
+            f"{session_dir} must stay owner-only once settled, got "
+            f"{_stat_mode(cluster, session_dir)!r}"
+        )
+        for record in ("descriptor.json", "launch.json"):
+            path = f"{session_dir}/{record}"
+            assert _stat_mode(cluster, path) == "600", (
+                f"{path} must stay owner-only once settled, got "
+                f"{_stat_mode(cluster, path)!r}"
+            )
+
+        cluster.scancel(str(job_id))
+        wait_job(cluster, job_id, timeout=120)
+
 
 def _job_cgroups(cluster, job_id: int, node_index: int = 0) -> list[str]:
     """This job's cgroups only. `/sys/fs/cgroup/spur` outlives any one cluster

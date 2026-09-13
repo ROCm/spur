@@ -186,13 +186,16 @@ record is kept for ten minutes after the step settles, and the restarted agent
 answers the waiting caller with the exit and the step's output instead of
 reporting the step as lost. Any number of restarts inside that window are
 covered; a caller that only comes back after it is still told the step is
-unknown.
+unknown. A session that nothing can ever settle — one whose supervisor was
+killed before it recorded an exit — is kept for a day and then swept.
 
-Two cases are not covered: a step given its own ``--container-image``, and an
-``srun --pty`` that allocates its own job rather than running inside an existing
-allocation. Both end when the agent stops, and a container step also leaves its
-unpacked rootfs behind. To keep a terminal across a restart, take an allocation
-first and run ``srun --pty`` inside it:
+One case is not covered: a step given its own ``--container-image``. It ends
+when the agent stops, and leaves its unpacked rootfs behind. A standalone
+``srun --pty`` that allocates its own job is also lost across a restart, but for
+a different reason: the terminal itself is held and could be reattached, yet
+``srun`` cancels the job it created as soon as its connection drops. To keep a
+terminal across a restart, take an allocation first and run ``srun --pty``
+inside it:
 
 .. code-block:: bash
 
