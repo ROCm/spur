@@ -371,6 +371,64 @@ An agent without them logs ``device filter not installed`` and runs the job with
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
 
+Job preemption policy (``preempt_type``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing ``scheduler.preempt_type`` makes preemption **opt-in**
+and narrows what makes a running job eligible. Both changes apply to a
+``spur.conf`` that is not edited.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Behavior
+     - Before
+     - After
+     - Effect
+   * - Whether preemption runs
+     - On whenever the pending job's partition set a non-``off``
+       ``preempt_mode``
+     - Off unless ``scheduler.preempt_type = "qos_priority"``
+     - **A cluster that preempted before stops preempting entirely** until the
+       new field is set.
+   * - What makes a job eligible
+     - An effective-priority gap of more than 2×
+     - The pending job's QOS lists the victim's QOS in ``preempt`` **and** has
+       a strictly higher QOS ``priority``
+     - **Preemption no longer fires without a QOS allow-list.** Fair-share, job
+       age, and ``--priority`` no longer affect eligibility at all;
+       ``priority_tier`` matters only for the active-reservation guard.
+
+To restore preemption, enable the engine in ``spur.conf`` on the controller:
+
+.. code-block:: toml
+
+   [scheduler]
+   preempt_type = "qos_priority"
+
+then give each preempting QOS an allow-list and a higher priority than the QOS
+it should displace:
+
+.. code-block:: bash
+
+   sacctmgr modify qos name=burst set priority=100
+   sacctmgr modify qos name=normal set priority=10000 preempt=burst
+
+Both are live: ``preempt_type`` applies on ``scontrol reconfigure``, and QOS
+changes take effect without a restart. Each victim still needs a non-``off``
+action from its QOS ``preemptmode`` or one of its partitions' ``preempt_mode``,
+as before. See :doc:`/admin-guide/accounting` for the full decision table.
+
+A pending job's own partition ``preempt_mode`` no longer gates whether it may
+preempt. Previously a job sitting in an ``off`` partition could never trigger
+preemption; now only the victim's scope decides. Partitions used to hold
+pending work away from preemption need their *victims* protected instead.
+
+Leaving ``preempt_type`` at its ``"none"`` default is safe but silent: nothing
+logs that preemption was skipped, so verify with a test job rather than
+assuming the old behavior carried over.
+
 See Also
 --------
 

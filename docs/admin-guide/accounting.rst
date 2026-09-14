@@ -437,16 +437,21 @@ QOS keys
      - Base priority seed for jobs submitted under this QOS. When a job is
        submitted without an explicit ``--priority``, this value becomes the
        job's base priority and is amplified by the multiplicative scheduling
-       formula (fair-share × age × partition tier). Higher values run sooner
-       and are more likely to preempt lower-priority running jobs. ``0``
-       leaves the job at the scheduler default (1000).
+       formula (fair-share × age × partition tier). Higher values run sooner.
+       ``0`` leaves the job at the scheduler default (1000).
+
+       Preemption reads this raw QOS ``priority`` directly and never the job's
+       effective priority, so eligibility does not drift as fair-share and age
+       change. A higher number on its own never authorizes preemption: the
+       pending job's QOS must *also* list the victim's QOS in its ``preempt``
+       allow-list.
    * - ``preemptmode``
-     - ``off``
-     - What happens to a job in this QOS when it gets kicked out by a
-       higher-priority job. This setting overrides whatever the partition says,
-       but only for *how* the job is removed — it does not control *whether*
-       preemption happens (that depends on the partition's ``preempt_mode``
-       and the priority gap).
+     - unset
+     - What happens to a job in this QOS when an eligible pending job kicks it
+       out. A value other than unset or ``off`` overrides whatever the victim's
+       partitions say, for that job only. Unset (the default) and ``off``
+       both mean "no QOS override"; they resolve identically and differ only in
+       that ``sacctmgr show qos`` leaves the column blank when unset.
 
        ``cancel`` — the job is stopped and removed from the queue. Its final
        state is ``CANCELLED`` (``PREEMPTED`` in accounting records).
@@ -454,9 +459,9 @@ QOS keys
        start again automatically once a slot is free.
        ``suspend`` — the job is paused, keeping its node allocation. It
        resumes automatically once the higher-priority job finishes.
-       ``off`` (default) — no change from what the partition says. Setting
-       ``preemptmode=off`` on a QOS is the same as leaving it unset. It does
-       **not** protect the job from being preempted.
+       ``off`` (default) — no QOS override; the partition's ``preempt_mode``
+       decides what happens. It does **not** protect the job from being
+       preempted.
 
        **Example of the override:** a partition is set to ``cancel`` but a
        specific QOS is set to ``preemptmode=requeue``. When a job in that QOS
@@ -466,15 +471,21 @@ QOS keys
        to any other QOS's ``preempt`` allow-list. When
        ``preempt_type = "qos_priority"`` is enabled (see :doc:`configuration`),
        a QOS that nobody has permission to preempt will never lose its running
-       jobs, no matter how large the priority gap is.
+       jobs. ``preemptmode=off`` does not do this — it only defers the action
+       to the partition, which may itself be set to ``cancel``.
    * - ``preempt``
-     - ``""`` (no restriction)
+     - ``""`` (preempt nothing)
      - Comma-separated list of QOS names that jobs in this QOS are allowed to
        preempt. Only enforced when ``scheduler.preempt_type = "qos_priority"``
        (see :doc:`configuration`). An empty value means this QOS may not preempt
        any other QOS under that mode. Example: ``preempt=low,batch`` allows jobs
-       in this QOS to preempt ``low`` and ``batch`` jobs. To clear the list:
-       ``sacctmgr modify qos name=<name> set preempt=`` (empty value).
+       in this QOS to preempt ``low`` and ``batch`` jobs. Being listed is
+       necessary but not sufficient — the preempting QOS must also have a
+       strictly higher ``priority`` than the QOS it preempts, unless the two are
+       the same QOS, where submit order decides instead (see
+       :ref:`preempting within a QOS <qos-preempt-same-qos>`).
+       To clear the list: ``sacctmgr modify qos name=<name> set preempt=``
+       (empty value).
    * - ``preemptexempttime``
      - unset (inherits partition / global)
      - Per-QOS override for the minimum seconds a job must have been running
@@ -741,115 +752,142 @@ database available.
    upgrading starts from zero and fills over the following
    ``grp_wall_window_days``.
 
-How the priority gap is computed
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+QOS preemption hierarchy
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-By default, Spur's preemption eligibility is based purely on the numeric
-priority gap: a pending job may preempt a running job when
+Preemption is off by default. To restrict which QOS tiers may preempt which —
+and to enable preemption at all — turn on the QOS preemption hierarchy in
+``spur.conf``:
+
+.. code-block:: toml
+
+   [scheduler]
+   preempt_type = "qos_priority"
+
+With ``preempt_type = "qos_priority"``, a job may only preempt a running job
+when the pending job's QOS lists the running job's QOS name in its ``preempt``
+allow-list. An empty allow-list means the QOS may not preempt anything.
 
 .. code-block:: text
 
-   candidate_effective_priority < pending_effective_priority / 2
+   can_preempt =
+     scheduler.preempt_type == qos_priority
+     AND pending job needs a node the victim currently occupies
+     AND (victim is not in an active reservation
+          OR pending partition priority_tier > victim partition priority_tier)
+     AND pending_qos.preempt contains victim_qos.name
+     AND (pending_qos.priority > victim_qos.priority
+          OR (pending_qos.name == victim_qos.name
+              AND pending.submit_time > victim.submit_time))
+     AND victim has been running at least its preempt_exempt_time
+     AND resolved_action != off
 
-Effective priority is:
+   resolved_action =
+     victim_qos.preemptmode                            if it is not off
+     else most aggressive preempt_mode among the victim's partitions
+          (cancel > requeue > suspend > off)
+     else off
 
-.. code-block:: text
+Nothing else is consulted. Fair-share, job age, partition ``priority_tier``,
+and an explicit ``--priority`` order pending jobs for scheduling but have no
+bearing on preemption eligibility; the sole exception is the reservation guard
+below, which compares partition tiers.
 
-   effective_priority = base_priority × min(fair_share, 10.0) × age_factor × max(partition_tier, 1)
-   age_factor = 1.0 + min(waiting_minutes / 10080, 1.0)   # 1.0 -> 2.0 over 7 days
+.. list-table:: Resolved victim action under ``preempt_type = "qos_priority"``
+   :header-rows: 1
+   :widths: 28 26 46
 
-``base_priority`` is the explicit ``--priority`` if given; otherwise it is
-``1000 + qos.priority`` (see the QOS ``priority`` field, above) — so a QOS's
-priority contributes to the base *before* the multiplicative factors, and is
-scaled by fair-share/age/tier along with everything else, not added on top of
-them. Both sides of the comparison go through the same formula: a pending
-job's stored priority is kept refreshed with it every scheduling pass, and a
-running job's is recomputed the same way at preemption-check time (a running
-job's own priority field is frozen at whatever it was when dispatched).
+   * - Victim partition ``preempt_mode``
+     - Victim QOS ``preemptmode``
+     - Resolved action
+   * - unset (default) or ``off``
+     - unset (default) or ``off``
+     - None — the victim is skipped
+   * - unset or ``off``
+     - ``cancel`` / ``requeue`` / ``suspend``
+     - The QOS action. A QOS action overrides a partition ``off``.
+   * - ``cancel`` / ``requeue`` / ``suspend``
+     - unset or ``off``
+     - The partition action
+   * - ``cancel``
+     - ``requeue``
+     - ``requeue`` — the QOS action overrides the partition's
+   * - Several partitions, e.g. ``suspend`` and ``cancel``
+     - unset or ``off``
+     - ``cancel`` — the most aggressive matched partition action wins
 
-The gap must exceed 2× — not merely be larger — for preemption to fire.
+The table assumes the allow-list, rank, node-overlap, reservation, and exempt-time
+guards have all passed; any of those failing skips the victim regardless of the
+action configured.
 
-**Scenarios where preemption fires**
+``preemptmode=off`` on a QOS is **not** a protection — it means "no override,
+use the partition's action". Equally, ``preempt_mode = "off"`` on a partition
+is not absolute, because a QOS action overrides it. The only way to keep a
+QOS's jobs from ever being selected is to keep its name out of every other
+QOS's ``preempt`` allow-list.
+
+``suspend`` is a fully selectable action: the victim is paused with SIGSTOP and
+keeps its node allocation. Nothing resumes it automatically — that needs an
+explicit ``scontrol resume`` — and the node stays occupied either way, so
+choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
+
+.. _qos-preempt-same-qos:
+
+**Preempting within a QOS**
+
+The rank test is strict, so two different QOSes with equal ``priority`` can
+never preempt each other. There is one deliberate exception: a QOS that lists
+*its own name* in its ``preempt`` field may preempt its own jobs. This is the
+only way to express "work in this tier may displace older work in the same
+tier", since a strict rank test can never hold between a QOS and itself.
+
+.. code-block:: bash
+
+   sacctmgr modify qos name=burst set preempt=burst
+
+Use ``modify``, not ``add`` — the allow-list is validated against existing QOS
+names, so a QOS cannot name itself in the command that creates it.
+
+Within one QOS the rank test can never separate two jobs, so **submit order
+decides**: a pending job may only displace a job submitted before it. That order
+never changes, so a victim requeued by preemption can never turn around and
+preempt the job that displaced it. Without that rule a self-listing QOS using
+``preemptmode=requeue`` would ping-pong indefinitely and neither job would
+finish.
+
+Victims are considered least-important-first (by QOS priority, then job ID), so
+within a single QOS the oldest eligible job is picked. At most one victim is
+preempted per pending job per scheduling cycle.
+
+**Guards checked before a victim is selected**
+
+Every guard below must pass. They are checked in this order, and the first
+failure moves the scheduler on to the next candidate.
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 40 30
-
-   * - Cause
-     - Example
-     - Result
-   * - Higher base priority
-     - Pending base 1000 vs. running base 100 (both otherwise equal)
-     - ``100 × 1.0 = 100 < 1000 / 2 = 500`` → fires
-   * - Higher QOS priority
-     - Pending on a QOS with ``priority=2000`` (base ``1000+2000=3000``) vs.
-       running with no QOS (base 1000), otherwise equal
-     - ``1000 < 3000 / 2 = 1500`` → fires
-   * - Fair-share divergence alone
-     - Same base/QOS/tier; pending's user has low usage
-       (``fair_share=2.0``, fully aged), running's user is heavy
-       (``fair_share=0.1``, no age boost)
-     - ``1000×0.1×1.0=100 < (1000×2.0×2.0)/2=2000`` → fires
-   * - Higher partition tier (≥ 3×)
-     - Pending on a ``priority_tier=3`` partition vs. running on
-       ``priority_tier=1``, otherwise equal
-     - ``1000 < 3000 / 2 = 1500`` → fires
-   * - Combination of smaller gaps
-     - No single factor differs by 2×, but several compound: base 500 both
-       sides; pending has ``fair_share=2.0``, full age boost, ``tier=2``;
-       running has ``fair_share=0.5``, no age boost, ``tier=1``
-     - ``250 < 4000 / 2 = 2000`` → fires
-
-A 2×+ gap in fair-share, age, or partition tier alone is exactly as effective
-as a 2×+ base-priority gap — this is the main **silent** path: two jobs
-submitted with identical priority and QOS by different users can still
-trigger preemption purely from fair-share divergence, with no priority or
-QOS change involved.
-
-**Scenarios where the priority gap alone cannot fire preemption**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 45 55
-
-   * - Scenario
-     - Why it cannot fire
-   * - Same base, QOS, fair-share, and partition tier
-     - The age factor tops out at 2.0×, exactly cancelling the 2× threshold:
-       worst case is pending at ``2P`` and running at ``P``, and ``P < P`` is
-       false (strict ``<`` is required).
-   * - Pending on ``priority_tier=2`` vs. running on ``priority_tier=1``,
-       otherwise equal
-     - Same cancellation: ``2000 / 2 = 1000``, not strictly less than the
-       running job's 1000.
-
-**Configuration guards checked after the priority gap** (any one blocks
-preemption regardless of how large the gap is):
-
-.. list-table::
-   :header-rows: 1
-   :widths: 45 55
+   :widths: 30 70
 
    * - Guard
-     - Condition
-   * - Pending partition preempt mode
-     - The pending job's own partition ``preempt_mode`` (no QOS override
-       here) is ``off`` — checked once per pending job, before any
-       candidate is considered.
-   * - QOS allow-list
-     - ``preempt_type = "qos_priority"`` and the pending job's QOS does not
-       list the running job's QOS in its ``preempt`` field.
-   * - Preempt mode
-     - The running job's effective ``preempt_mode`` (QOS override, else
-       partition) is ``off``.
+     - Condition to pass
+   * - Node overlap
+     - The pending job must need a node the running job currently occupies. A
+       running job elsewhere in the cluster is never a candidate.
+   * - Active reservation
+     - If the running job is executing inside an active reservation, the
+       pending job's partition ``priority_tier`` must be **strictly greater**
+       than the running job's. Outside a reservation this guard does not apply
+       and tiers are not compared at all.
+   * - QOS allow-list and rank
+     - The pending job's QOS must list the running job's QOS in ``preempt``,
+       and must either outrank it on QOS ``priority`` or be that same QOS with
+       the running job submitted earlier.
    * - Exempt time
-     - The running job has not yet been running for ``preempt_exempt_time``
-       (QOS > partition > global).
-   * - Reservation protection
-     - The running job is in an active reservation and the pending job's
-       partition tier is not strictly higher than the running job's.
-   * - No node overlap
-     - The pending job does not need any node the running job occupies.
+     - The running job must already have run for its effective
+       ``preempt_exempt_time`` — the QOS value, else the highest override among
+       its matched partitions, else the global
+       ``scheduler.preempt_exempt_time``. A job with no recorded start time
+       gets no protection from this guard.
 
 **Comparison with Slurm**
 
@@ -861,37 +899,21 @@ preemption regardless of how large the gap is):
      - Spur
      - Slurm (``PreemptType=preempt/qos``)
    * - Preemption gate
-     - Effective priority gap > 2×
-     - QOS ``Preempt=`` allow-list only
+     - QOS ``preempt`` allow-list plus a strictly higher QOS priority
+     - QOS ``Preempt=`` allow-list
    * - Does fair-share affect preemption?
-     - Yes, via the effective-priority formula
      - No — fair-share affects scheduling order only
-   * - Does age affect preemption?
-     - Yes, via the effective-priority formula
+     - No — fair-share affects scheduling order only
+   * - Does job age affect preemption?
+     - No
      - No
    * - Can priority alone trigger preemption with no QOS config?
-     - Yes (``preempt_type = "none"``, the default)
+     - No — preemption is disabled unless ``preempt_type`` is set, and always
+       requires an explicit allow-list
      - No — QOS preemption always requires an explicit allow-list
 
-The practical difference: in Spur, preemption eligibility can shift day to
-day as fair-share and age change, even with no configuration change. In
-Slurm's QOS-priority model, eligibility is fixed by the allow-list and does
-not drift on its own.
-
-QOS preemption hierarchy
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-To restrict which QOS tiers may preempt which, enable the QOS preemption
-hierarchy in ``spur.conf``:
-
-.. code-block:: toml
-
-   [scheduler]
-   preempt_type = "qos_priority"
-
-With ``preempt_type = "qos_priority"``, a job may only preempt a running job
-when the pending job's QOS lists the running job's QOS name in its ``preempt``
-allow-list. An empty allow-list means the QOS may not preempt anything.
+Eligibility is therefore fixed by configuration in both schedulers: it does not
+drift on its own as usage and queue times change.
 
 **Example: two-tier system**
 
@@ -909,13 +931,14 @@ allow-list. An empty allow-list means the QOS may not preempt anything.
 
 With this setup:
 
-- A ``priority`` job preempts ``burst`` jobs when the priority gap is large enough.
+- A ``priority`` job preempts ``burst`` jobs because its QOS priority is higher
+  and its allow-list contains ``burst``.
 - A ``priority`` job cannot preempt ``reserved`` jobs (``reserved`` is not in
   ``priority``'s allow-list).
 - A ``burst`` job never preempts anyone (empty allow-list).
 - ``reserved`` jobs are never kicked out because no other QOS lists
   ``reserved`` in its ``preempt`` field. That is what provides the protection
-  — not ``preemptmode=off``, which simply means "use the partition default".
+  — not ``preemptmode=off``, which simply means "use the partition's action".
 
 **Minimum exempt time**
 
@@ -974,8 +997,9 @@ With this setup:
 - ``burst`` jobs can never kick out ``normal`` jobs — ``burst`` has no
   entries in its ``preempt`` allow-list.
 - A QOS that no other QOS lists in its ``preempt`` field (for example, a
-  ``reserved`` tier) will never have its jobs kicked out, regardless of how
-  large a priority gap exists.
+  ``reserved`` tier) will never have its jobs kicked out, whatever the
+  priorities are. Setting ``preemptmode=off`` on that QOS adds nothing — it
+  only defers the action to the partition.
 
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

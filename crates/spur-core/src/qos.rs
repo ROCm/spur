@@ -20,13 +20,12 @@ impl From<QosPreemptMode> for PreemptMode {
     }
 }
 
-/// A QOS-level preempt mode override, or `None` if unset. `Off` can't be
-/// told apart from "unset" on the wire, so it's treated as no override.
+/// A QOS-level preempt mode override. Unset and explicit `Off` both mean
+/// "no override"; the partition action applies.
 pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
-    match qos.preempt_mode {
-        QosPreemptMode::Off => None,
-        other => Some(other.into()),
-    }
+    qos.preempt_mode
+        .filter(|mode| *mode != QosPreemptMode::Off)
+        .map(Into::into)
 }
 
 /// Result of QOS limit check.
@@ -1113,7 +1112,7 @@ mod tests {
     #[test]
     fn test_qos_preempt_override_off_is_none() {
         let qos = Qos {
-            preempt_mode: QosPreemptMode::Off,
+            preempt_mode: Some(QosPreemptMode::Off),
             ..Default::default()
         };
         assert_eq!(qos_preempt_override(&qos), None);
@@ -1122,19 +1121,19 @@ mod tests {
     #[test]
     fn test_qos_preempt_override_maps_variants() {
         let requeue = Qos {
-            preempt_mode: QosPreemptMode::Requeue,
+            preempt_mode: Some(QosPreemptMode::Requeue),
             ..Default::default()
         };
         assert_eq!(qos_preempt_override(&requeue), Some(PreemptMode::Requeue));
 
         let cancel = Qos {
-            preempt_mode: QosPreemptMode::Cancel,
+            preempt_mode: Some(QosPreemptMode::Cancel),
             ..Default::default()
         };
         assert_eq!(qos_preempt_override(&cancel), Some(PreemptMode::Cancel));
 
         let suspend = Qos {
-            preempt_mode: QosPreemptMode::Suspend,
+            preempt_mode: Some(QosPreemptMode::Suspend),
             ..Default::default()
         };
         assert_eq!(qos_preempt_override(&suspend), Some(PreemptMode::Suspend));

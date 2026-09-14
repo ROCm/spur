@@ -4,8 +4,6 @@
 //! Accounting data models: accounts, users, QOS, associations, TRES.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -294,7 +292,8 @@ pub struct Qos {
     pub name: String,
     pub description: String,
     pub priority: i32,
-    pub preempt_mode: QosPreemptMode,
+    #[serde(default)]
+    pub preempt_mode: Option<QosPreemptMode>,
     pub limits: QosLimits,
     /// Usage factor — multiplier for fair-share usage accounting.
     /// 0.0 = don't charge, 1.0 = normal, 2.0 = double charge.
@@ -321,16 +320,29 @@ pub enum QosPreemptMode {
     Suspend,
 }
 
-impl FromStr for QosPreemptMode {
-    type Err = Infallible;
+/// Parse a configured QOS preempt mode. Empty means "not configured", which
+/// resolves the same as `off`.
+pub fn parse_qos_preempt_mode(value: &str) -> Result<Option<QosPreemptMode>, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "none" => Ok(None),
+        "off" => Ok(Some(QosPreemptMode::Off)),
+        "cancel" => Ok(Some(QosPreemptMode::Cancel)),
+        "requeue" => Ok(Some(QosPreemptMode::Requeue)),
+        "suspend" => Ok(Some(QosPreemptMode::Suspend)),
+        other => Err(format!(
+            "unknown preemptmode '{other}'; expected none, off, cancel, requeue, or suspend"
+        )),
+    }
+}
 
-    fn from_str(s: &str) -> Result<Self, Infallible> {
-        Ok(match s.to_lowercase().as_str() {
-            "cancel" => Self::Cancel,
-            "requeue" => Self::Requeue,
-            "suspend" => Self::Suspend,
-            _ => Self::Off,
-        })
+/// Wire form of a configured QOS preempt mode; empty when unset.
+pub fn qos_preempt_mode_str(mode: Option<QosPreemptMode>) -> &'static str {
+    match mode {
+        None => "",
+        Some(QosPreemptMode::Off) => "off",
+        Some(QosPreemptMode::Cancel) => "cancel",
+        Some(QosPreemptMode::Requeue) => "requeue",
+        Some(QosPreemptMode::Suspend) => "suspend",
     }
 }
 
@@ -377,7 +389,7 @@ impl Default for Qos {
             name: String::new(),
             description: String::new(),
             priority: 0,
-            preempt_mode: QosPreemptMode::Off,
+            preempt_mode: None,
             limits: QosLimits::default(),
             usage_factor: 1.0,
             preempt: Vec::new(),
@@ -577,17 +589,26 @@ mod tests {
     #[test]
     fn test_qos_preempt_mode() {
         assert_eq!(
-            "cancel".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Cancel
+            parse_qos_preempt_mode("cancel"),
+            Ok(Some(QosPreemptMode::Cancel))
         );
-        assert_eq!(
-            "off".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Off
-        );
-        assert_eq!(
-            "unknown".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Off
-        );
+        assert_eq!(parse_qos_preempt_mode("off"), Ok(Some(QosPreemptMode::Off)));
+        assert_eq!(parse_qos_preempt_mode(""), Ok(None));
+        assert_eq!(parse_qos_preempt_mode("none"), Ok(None));
+        assert!(parse_qos_preempt_mode("unknown").is_err());
+    }
+
+    #[test]
+    fn qos_preempt_mode_str_round_trips() {
+        for mode in [
+            None,
+            Some(QosPreemptMode::Off),
+            Some(QosPreemptMode::Cancel),
+            Some(QosPreemptMode::Requeue),
+            Some(QosPreemptMode::Suspend),
+        ] {
+            assert_eq!(parse_qos_preempt_mode(qos_preempt_mode_str(mode)), Ok(mode));
+        }
     }
 
     #[test]
