@@ -24,6 +24,8 @@ use tracing::{debug, info, warn};
 
 use spur_core::wal::WalOperation;
 
+use crate::logging::WAL_REPLAY_SPAN;
+
 pub type NodeId = u64;
 
 openraft::declare_raft_types!(
@@ -113,19 +115,11 @@ struct StoreInner {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     applied_count: u64,
-    /// Highest log index present on disk at startup. Everything up to it is
-    /// replayed, not new, thus its side effects must not be reported as
-    /// events that happen now. See [`WAL_REPLAY_SPAN`].
+    /// Highest log index on disk at startup; entries up to it are replays.
+    /// See [`WAL_REPLAY_SPAN`].
     #[serde(skip)]
     replay_upto: Option<u64>,
 }
-
-/// Name of the span that wraps every replayed WAL operation. `spurctld` filters
-/// INFO and below inside it, because a restart re-applies the whole log: without
-/// this, one node removal is reported once per controller process, and a reader
-/// who greps the journal chases a fault that did not happen. WARN and ERROR stay,
-/// because a bad transition during a replay is a real defect.
-pub const WAL_REPLAY_SPAN: &str = "wal_replay";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedSnapshot {
