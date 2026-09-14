@@ -456,6 +456,9 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
+        if inner.replay_upto.is_some_and(|upto| upto >= log_id.index) {
+            inner.replay_upto = log_id.index.checked_sub(1);
+        }
         Ok(())
     }
 
@@ -1440,6 +1443,41 @@ mod tests {
 
         let restarted = SpurStore::new(dir.path(), noop_applier()).unwrap();
         assert_eq!(restarted.inner.read().replay_upto, Some(17));
+    }
+
+    /// The leader's replacement entries after a conflict truncation are new to
+    /// this node, thus they must be logged as live events.
+    #[tokio::test]
+    async fn conflict_truncation_lowers_replay_upto() {
+        use openraft::RaftStorage;
+        let dir = TempDir::new().unwrap();
+        let log_id = |index| LogId {
+            leader_id: openraft::LeaderId {
+                term: 1,
+                node_id: 1,
+            },
+            index,
+        };
+        {
+            let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+            for index in 1..=5 {
+                store
+                    .persist_log_entry(&Entry {
+                        log_id: log_id(index),
+                        payload: EntryPayload::Blank,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let mut restarted = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
+        assert_eq!(restarted.inner.read().replay_upto, Some(5));
+
+        restarted
+            .delete_conflict_logs_since(log_id(4))
+            .await
+            .unwrap();
+        assert_eq!(restarted.inner.read().replay_upto, Some(3));
     }
 
     #[test]
