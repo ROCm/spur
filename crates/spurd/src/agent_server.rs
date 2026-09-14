@@ -435,6 +435,41 @@ fn stepd_key(descriptor: &crate::stepd::StepdDescriptor) -> StepdKey {
     (descriptor.job_id, descriptor.step_id)
 }
 
+/// One descriptor per adopted job, ranked rather than taken first: directory
+/// order is arbitrary and only batch and allocation ones record the cores.
+fn replayable_allocations(
+    descriptors: &[crate::stepd::StepdDescriptor],
+) -> Vec<&crate::stepd::StepdDescriptor> {
+    let mut best: std::collections::HashMap<u32, &crate::stepd::StepdDescriptor> =
+        std::collections::HashMap::new();
+    for descriptor in descriptors {
+        let rank =
+            |d: &crate::stepd::StepdDescriptor| (d.run_attempt, !d.resources.cpu_ids.is_empty());
+        match best.get(&descriptor.job_id) {
+            Some(current) if rank(current) >= rank(descriptor) => {}
+            _ => {
+                best.insert(descriptor.job_id, descriptor);
+            }
+        }
+    }
+    let mut chosen: Vec<&crate::stepd::StepdDescriptor> = best.into_values().collect();
+    chosen.sort_by_key(|d| (d.resources.cpu_ids.is_empty(), d.job_id));
+    chosen
+}
+
+/// A descriptor with no recorded cores — a step, or one written before they
+/// were persisted; the lowest free cores keep occupancy right if not identity.
+fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
+    allocation
+        .allocated_cpus
+        .iter()
+        .enumerate()
+        .filter(|(_, &taken)| !taken)
+        .map(|(index, _)| index as u32)
+        .take(cpus as usize)
+        .collect()
+}
+
 /// Every supervisor a job currently holds. Job-level operations (signal,
 /// cancel, teardown) act on all of its steps, not just the batch one.
 fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDescriptor> {
@@ -464,9 +499,17 @@ fn stepds_for_attempt(
         .collect()
 }
 
-/// Whether a supervisor holds the job's own processes. An allocation's extern
-/// step only tracks its lifetime — its steps still run under the agent.
+/// Whether a supervisor holds the job's own processes, so the agent has no
+/// child handle of its own. A step supervisor speaks only for that step.
 fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
+    descriptors
+        .iter()
+        .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
+}
+
+/// Whether a supervisor is running the job's teardown, so the agent must not
+/// retire its tracking underneath one and strand its completion.
+fn supervisor_owns_teardown(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
     descriptors
         .iter()
         .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
@@ -1008,6 +1051,23 @@ fn cleanup_stepd_files(descriptor: &crate::stepd::StepdDescriptor) {
     }
 }
 
+/// Tear down a supervisor whose launch is being abandoned: stop the process,
+/// reap its cgroup, and drop the session it left on disk.
+async fn discard_stepd_session(descriptor: &crate::stepd::StepdDescriptor) {
+    let job_id = descriptor.job_id;
+    let run_attempt = descriptor.run_attempt;
+    if let Err(error) = stop_stepd_process(descriptor).await {
+        warn!(job_id, run_attempt, %error, "failed to stop abandoned stepd");
+    }
+    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)) {
+        warn!(
+            job_id,
+            run_attempt, "could not confirm the abandoned stepd's cgroup is empty"
+        );
+    }
+    cleanup_stepd_files(descriptor);
+}
+
 /// Build an empty running-jobs map to share between the reporter and the agent.
 pub fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
@@ -1021,7 +1081,7 @@ pub async fn recover_stepds(
     for descriptor in descriptors {
         let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
             .then(|| descriptor.cgroup_path.clone());
-        jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
+        let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             job: executor::RunningJob::AllocationOnly,
             cgroup_path,
             rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -1043,6 +1103,20 @@ pub async fn recover_stepds(
             mpi: descriptor.resources.mpi.clone(),
             run_attempt: descriptor.run_attempt,
         });
+        // Sessions arrive in directory order, so only take these from the job's
+        // own: a step's spool file and rootfs are the step's, not the job's.
+        if spur_core::step::is_user_step(descriptor.step_id) {
+            continue;
+        }
+        if !descriptor.stdout_path.is_empty() {
+            tracked.stdout_path = descriptor.stdout_path.clone();
+        }
+        if !descriptor.stderr_path.is_empty() {
+            tracked.stderr_path = descriptor.stderr_path.clone();
+        }
+        if let Some(mode) = descriptor.container_rootfs_mode.clone() {
+            tracked.rootfs_mode = mode;
+        }
     }
 }
 
@@ -1076,6 +1150,7 @@ async fn settle_recovered_stepd(
     completions
         .complete(
             descriptor.job_id,
+            descriptor.run_attempt,
             descriptor.step_id,
             crate::step_completion::StepOutcome { exit_code, signal },
         )
@@ -1385,6 +1460,7 @@ async fn fence_dead_stepd(
     if completions
         .complete(
             descriptor.job_id,
+            descriptor.run_attempt,
             descriptor.step_id,
             crate::step_completion::StepOutcome { exit_code, signal },
         )
@@ -1529,6 +1605,7 @@ async fn handle_completion_notification(
                 .step_completions
                 .complete(
                     job_id,
+                    run_attempt,
                     step_id,
                     crate::step_completion::StepOutcome { exit_code, signal },
                 )
@@ -1563,11 +1640,15 @@ fn durable_runtime_exit(
     )
 }
 
+/// One runtime session: a step of one attempt of one job. Two sessions of the
+/// same attempt are distinct, so dedup keyed on the job alone over-matches.
+pub type SessionIdentity = (u32, u32, spur_core::step::StepId);
+
 pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
     controller_addr: &str,
     reporting_node: &str,
-) -> anyhow::Result<Vec<(u32, u32)>> {
+) -> anyhow::Result<Vec<SessionIdentity>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
         if report_completion(
@@ -1587,7 +1668,11 @@ pub async fn replay_unacknowledged_stepd_completions(
         .await
         {
             store.acknowledge_completion(&completion)?;
-            reconciled.push((completion.job_id, completion.run_attempt));
+            reconciled.push((
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+            ));
         }
     }
     Ok(reconciled)
@@ -2806,6 +2891,55 @@ impl AgentService {
         }
     }
 
+    /// Put adopted jobs back on the node's ledger, which is built empty — only
+    /// correct back when a restart killed every job it could have held.
+    pub async fn replay_adopted_allocations(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
+        let mut allocation = self.allocation.lock().await;
+        for descriptor in replayable_allocations(descriptors) {
+            let resources = &descriptor.resources;
+            // Dropping a contested core costs this job some occupancy; dropping
+            // the whole replay would leave its live GPUs reading free.
+            let cpu_ids = if resources.cpu_ids.is_empty() {
+                fallback_cpu_ids(&allocation, resources.cpus)
+            } else {
+                allocation.claimable_cpu_ids(descriptor.job_id, &resources.cpu_ids)
+            };
+            if cpu_ids.len() < resources.cpus as usize {
+                warn!(
+                    job_id = descriptor.job_id,
+                    wanted = resources.cpus,
+                    got = cpu_ids.len(),
+                    "fewer free cores than an adopted job recorded; its cores are \
+                     under-counted until it ends"
+                );
+            }
+            match allocation.restore_for_job(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                &cpu_ids,
+                resources.memory_mb,
+                &resources.gpu_devices,
+            ) {
+                Ok(_) => info!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    cpus = cpu_ids.len(),
+                    gpus = resources.gpu_devices.len(),
+                    "restored an adopted job's allocation"
+                ),
+                // Refusing to serve would strand the adopted job with no agent to
+                // report it, and nothing reconciles a job the ledger never saw.
+                Err(error) => warn!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    ?error,
+                    "could not restore an adopted job's allocation; this node's \
+                     accounting is short until the job ends"
+                ),
+            }
+        }
+    }
+
     /// A stale session's supervisor is confirmed dead, so nothing adopts it and
     /// nothing else will ever speak for it: carry any exit it recorded to the
     /// caller still waiting on the step, and release it so it can be pruned.
@@ -2817,13 +2951,14 @@ impl AgentService {
                     self.step_completions
                         .complete(
                             descriptor.job_id,
+                            descriptor.run_attempt,
                             descriptor.step_id,
                             crate::step_completion::StepOutcome { exit_code, signal },
                         )
                         .await;
                 }
-                // An exit nobody observed is not a success; leave it to the
-                // recovery report so the controller decides the step's fate.
+                // A job-level session is usually given a synthetic exit at
+                // startup; whatever is left here the recovery report speaks for.
                 Ok(None) => {}
                 Err(error) => {
                     warn!(
@@ -2896,11 +3031,12 @@ impl AgentService {
         step_key: (u32, u32),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
         let (job_id, step_id) = step_key;
+        let run_attempt = cfg.run_attempt;
         // The supervisor opens the spool files itself from the launch spec;
         // holding our own copies would pin the fds for the life of the step.
         drop(step_files);
 
-        fence_displaced_stepd(&self.stepds, job_id, step_id, cfg.run_attempt)
+        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
             .await
             .map_err(|error| {
                 Status::internal(format!(
@@ -2910,11 +3046,14 @@ impl AgentService {
 
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
-        let waiter = self.step_completions.register(job_id, step_id).await;
+        let waiter = self
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
 
         let launched = launch_stepd(
             cfg,
-            cfg.run_attempt,
+            run_attempt,
             &self.reporter.controller_addr,
             &self.reporter.hostname,
             &self.stepd_state_dir,
@@ -2931,7 +3070,9 @@ impl AgentService {
         let descriptor = match launched {
             Ok((_, descriptor)) => descriptor,
             Err(error) => {
-                self.step_completions.deregister(job_id, step_id).await;
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
                 return Err(Status::internal(format!(
                     "step supervisor failed to start: {error}"
                 )));
@@ -2939,11 +3080,10 @@ impl AgentService {
         };
 
         if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
-            self.step_completions.deregister(job_id, step_id).await;
-            if let Err(error) = stop_stepd_process(&descriptor).await {
-                warn!(job_id, step_id, %error, "failed to stop a superseded step supervisor");
-            }
-            cleanup_stepd_files(&descriptor);
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            discard_stepd_session(&descriptor).await;
             return Err(Status::aborted(
                 "step supervisor superseded before it could be tracked",
             ));
@@ -2953,7 +3093,9 @@ impl AgentService {
             crate::stepd::start_job(&descriptor, uuid::Uuid::new_v4().to_string()).await
         {
             // The gate is still shut, so the workload never ran.
-            self.step_completions.deregister(job_id, step_id).await;
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
             if let Err(stop_error) = stop_stepd_process(&descriptor).await {
                 warn!(job_id, step_id, %stop_error, "failed to stop an unreleased step supervisor");
             }
@@ -3405,6 +3547,11 @@ mod controller_rpc_tests {
 /// monitor loop no longer polls it, so without this a killed `Forked` run would
 /// linger as a zombie until spurd exits.
 async fn reap_killed_job(mut job: executor::RunningJob) {
+    // An allocation owns no process, so try_wait never settles: polling it would
+    // spin for the lifetime of the agent, pinning whatever the task captured.
+    if job.is_allocation_only() {
+        return;
+    }
     loop {
         match job.try_wait() {
             Ok(Some(_)) | Err(_) => break,
@@ -4495,20 +4642,9 @@ impl SlurmAgent for AgentService {
                         if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                             warn!(job_id, error = %e, "PMIx stop failed after superseded stepd");
                         }
-                        if let Err(error) = stop_stepd_process(&descriptor).await {
-                            warn!(job_id, run_attempt, %error, "failed to stop superseded stepd");
-                        }
                         // This session never entered `stepds`, so the
                         // crash watchdog will never see it either — reap it here.
-                        let cgroup_path = effective_cgroup_path(&descriptor);
-                        if !runtime_cgroup_reaped(&cgroup_path) {
-                            warn!(
-                                job_id,
-                                run_attempt,
-                                "could not confirm the superseded stepd's cgroup is empty"
-                            );
-                        }
-                        cleanup_stepd_files(&descriptor);
+                        discard_stepd_session(&descriptor).await;
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
                         return Ok(Response::new(LaunchJobResponse {
@@ -4542,6 +4678,13 @@ impl SlurmAgent for AgentService {
                     );
                     if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
+                    }
+                    // `kill_signal` cannot reach a supervised workload, and the tracked
+                    // session would otherwise be fenced into a completion for this failure.
+                    if let Some(ref descriptor) = runtime_descriptor {
+                        if claim_stepd(&self.stepds, descriptor).await {
+                            discard_stepd_session(descriptor).await;
+                        }
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.cgroup_path.take();
@@ -4817,6 +4960,17 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        // Step ids restart at 0 on a requeue, so a cancel from a superseded
+        // attempt would otherwise signal the redispatch's step of the same id.
+        if !self.runs_attempt(req.job_id, req.run_attempt).await {
+            warn!(
+                job_id = req.job_id,
+                run_attempt = req.run_attempt,
+                step_id = req.step_id,
+                "dropping a step cancel for a superseded run"
+            );
+            return Ok(Response::new(()));
+        }
         let step_key = (req.job_id, req.step_id);
         let signal = if req.signal > 0 {
             req.signal
@@ -5047,6 +5201,9 @@ impl SlurmAgent for AgentService {
                         "job {} was superseded by a newer attempt on this node",
                         req.job_id
                     )),
+                    AllocError::CpusUnavailable => {
+                        Status::resource_exhausted("allocated cores unavailable on this node")
+                    }
                 })?;
             result
         };
@@ -5119,7 +5276,7 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
                 gpu_devices: controller_gpu_ids.clone(),
-                cpu_ids: Vec::new(),
+                cpu_ids: alloc_result.cpu_ids.clone(),
                 open_mode: None,
                 uid: req.uid,
                 gid: req.gid,
@@ -5327,7 +5484,7 @@ impl SlurmAgent for AgentService {
             .as_ref()
             .map(|state| std::path::PathBuf::from(&state.cgroup_path))
             .filter(|path| !path.as_os_str().is_empty());
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry, job_attempt) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -5368,6 +5525,7 @@ impl SlurmAgent for AgentService {
                 nodelist,
                 tracked.mpi.clone(),
                 entry,
+                tracked.run_attempt,
             )
         };
 
@@ -5653,20 +5811,13 @@ impl SlurmAgent for AgentService {
 
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
         let mut supervised_step_cfg = if supervise_step {
-            let run_attempt = self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|tracked| tracked.run_attempt)
-                .unwrap_or_default();
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
                 .collect();
             Some(executor::JobLaunchConfig {
                 step_id,
                 job_id,
-                run_attempt,
+                run_attempt: job_attempt,
                 script: supervised_step_script(&job_entry, req.uid, req.gid, &command)?,
                 joins_parent_namespaces,
                 allocation_holder: false,
@@ -6010,8 +6161,7 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back. #781 replaces this with a client-side
-        // StreamJobOutput tail and drops the read-back, removing the memory bound.
+        // reading the spool files back, which is what bounds it in memory.
         let read_back = |path: String| async move {
             match tokio::fs::read(&path).await {
                 Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -6046,22 +6196,30 @@ impl SlurmAgent for AgentService {
             .lock()
             .await
             .get(&(req.job_id, req.step_id))
-            .cloned();
+            .cloned()
+            // Step ids restart at 0 on a requeue, so a supervisor from another
+            // attempt is a different run of this step, not this caller's.
+            .filter(|descriptor| req.run_attempt == 0 || descriptor.run_attempt == req.run_attempt);
         let Some(descriptor) = tracked else {
             // Untracked is not unknown: a step whose exit was consumed before
             // this caller re-attached is settled, and answering not_found here
             // is what turns a successful step into a synthesised failure. The
             // memo answers within this agent's life, the ledger across restarts.
-            let settled = match self.step_completions.settled(req.job_id, req.step_id).await {
-                Some(outcome) => Some((outcome.exit_code, outcome.signal)),
-                None => store
-                    .recorded_step_exit(req.job_id, req.step_id)
-                    .unwrap_or_else(|error| {
-                        warn!(job_id = req.job_id, step_id = req.step_id, %error,
-                            "failed to read a settled step's recorded exit");
-                        None
-                    }),
+            let recorded = match self
+                .step_completions
+                .settled(req.job_id, req.run_attempt, req.step_id)
+                .await
+            {
+                Some(outcome) => Ok(Some((outcome.exit_code, outcome.signal))),
+                None if req.run_attempt == 0 => store.recorded_step_exit(req.job_id, req.step_id),
+                None => store.observed_exit(req.job_id, req.run_attempt, req.step_id),
             };
+            let settled = recorded.unwrap_or_else(|error| {
+                warn!(job_id = req.job_id, run_attempt = req.run_attempt,
+                    step_id = req.step_id, %error,
+                    "failed to read a settled step's recorded exit");
+                None
+            });
             let Some((exit_code, signal)) = settled else {
                 return Err(Status::not_found("this node is not running that step"));
             };
@@ -6080,7 +6238,7 @@ impl SlurmAgent for AgentService {
 
         let waiter = self
             .step_completions
-            .reregister(req.job_id, req.step_id)
+            .reregister(req.job_id, descriptor.run_attempt, req.step_id)
             .await
             .ok_or_else(|| Status::already_exists("that step already has a caller awaiting it"))?;
 
@@ -6109,7 +6267,7 @@ impl SlurmAgent for AgentService {
         // Step output: tail the per-step spool file recorded by run_command and
         // finish when the step leaves active_steps (rather than the batch file,
         // which ends only when the whole allocation does). This is what lets an
-        // srun step stream live and terminate at step exit (#781).
+        // srun step stream live and terminate at step exit.
         if let Some(requested_step) = requested_step_of(&req) {
             let active_steps = self.active_steps.clone();
             let stepds = self.stepds.clone();
@@ -6247,8 +6405,7 @@ impl SlurmAgent for AgentService {
         // No retry on a miss, same as run_command: a Running job has been
         // confirmed on every node (confirm_dispatch_on_nodes). Callers here
         // (srun --attach, sattach) hit the agent directly with no controller
-        // proxy, so they inherit their own job.state check. Restart mid-job
-        // (empty `running`) is the one uncovered case.
+        // proxy, so they inherit their own job.state check.
         let file_path = {
             let jobs = self.running.lock().await;
             match jobs.get(&job_id) {
@@ -6267,6 +6424,18 @@ impl SlurmAgent for AgentService {
                 }
             }
         };
+        // An allocation has no job-level output, and a session adopted from a
+        // descriptor written before this was recorded has none to give either.
+        if file_path.is_empty() {
+            return Err(Status::not_found(format!(
+                "job {job_id} has no {} file on this node",
+                if req.stream == "stderr" {
+                    "stderr"
+                } else {
+                    "stdout"
+                }
+            )));
+        }
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let running = self.running.clone();
@@ -6922,6 +7091,14 @@ impl AgentService {
                     "job {job_id} was superseded by a newer attempt on this node"
                 )));
             }
+            // Only a replay of recorded cores can raise this; dispatch derives
+            // its own, so reaching here means the ledger disagrees with the node.
+            Err(AllocError::CpusUnavailable) => {
+                warn!(job_id, "rejecting launch: allocated cores unavailable");
+                return Err(Status::resource_exhausted(
+                    "allocated cores unavailable on this node",
+                ));
+            }
         };
 
         let gpu_ids = controller_gpu_ids;
@@ -6990,7 +7167,7 @@ impl AgentService {
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = owns_job_processes(&runtimes);
+        let supervised = supervisor_owns_teardown(&runtimes);
         for descriptor in runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 &descriptor,
@@ -7003,6 +7180,9 @@ impl AgentService {
                     "runtime signal request failed");
             }
         }
+        // A step without a supervisor of its own still runs under the agent, so
+        // a supervised sibling must not spare it.
+        self.cancel_active_steps_for_job(job_id, signal).await;
         if supervised {
             return;
         }
@@ -7013,7 +7193,6 @@ impl AgentService {
                 .map(|tracked| tracked.run_attempt)
         };
         if let Some(run_attempt) = allocation_only_attempt {
-            self.cancel_active_steps_for_job(job_id, signal).await;
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -7037,22 +7216,23 @@ impl AgentService {
         };
         info!(job_id, resume, "sending suspend/resume signal to job");
 
-        // A supervised job's processes belong to its supervisor, so freeze the
-        // whole tree through it rather than the agent's own (absent) handle.
+        // A supervised process belongs to its supervisor, so freeze the whole
+        // tree through it rather than the agent's own (absent) handle.
         let runtimes = stepds_for_job(&*self.stepds.lock().await, job_id);
-        if owns_job_processes(&runtimes) {
-            for descriptor in runtimes {
-                if let Err(error) = crate::stepd::signal_allocation(
-                    &descriptor,
-                    uuid::Uuid::new_v4().to_string(),
-                    sig as i32,
-                )
-                .await
-                {
-                    warn!(job_id, step_id = descriptor.step_id, %error,
-                        "runtime suspend/resume request failed");
-                }
+        let supervised = owns_job_processes(&runtimes);
+        for descriptor in runtimes {
+            if let Err(error) = crate::stepd::signal_allocation(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                sig as i32,
+            )
+            .await
+            {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime suspend/resume request failed");
             }
+        }
+        if supervised {
             return;
         }
 
@@ -7076,7 +7256,14 @@ impl AgentService {
     /// dropped. Only SIGKILL and SIGSTOP are force-delivered. So the requested
     /// signal is sent first (graceful for host steps), then SIGKILL after a short
     /// grace period guarantees a container init dies.
+    /// Steps with a supervisor are skipped: it runs its own ordered shutdown,
+    /// and the escalation below would cut that short.
     async fn cancel_active_steps_for_job(&self, job_id: u32, signal: i32) {
+        let supervised: Vec<spur_core::step::StepId> =
+            stepds_for_job(&*self.stepds.lock().await, job_id)
+                .iter()
+                .map(|descriptor| descriptor.step_id)
+                .collect();
         // Snapshot (key, pid, epoch) under the lock, then signal *outside* it:
         // signal_step_tree walks /proc, so holding active_steps across it would
         // block every concurrent run_command (and the ActiveStepGuard's try_lock
@@ -7085,7 +7272,7 @@ impl AgentService {
             let mut steps = self.active_steps.lock().await;
             let mut targets = Vec::new();
             for (key, step) in steps.iter_mut() {
-                if key.0 == job_id {
+                if key.0 == job_id && !supervised.contains(&key.1) {
                     step.cancel_requested = true;
                     if let Some(pid) = step.pid {
                         targets.push((*key, pid, step.epoch));
@@ -7131,7 +7318,7 @@ impl AgentService {
             return;
         }
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = owns_job_processes(&runtimes);
+        let supervised = supervisor_owns_teardown(&runtimes);
         for descriptor in runtimes {
             match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
                 .await
@@ -7171,6 +7358,10 @@ impl AgentService {
                 }
             }
         }
+        // A step without a supervisor of its own still runs under the agent, so
+        // a supervised sibling must not spare it.
+        self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
         if supervised {
             return;
         }
@@ -7181,8 +7372,6 @@ impl AgentService {
                 .map(|tracked| tracked.run_attempt)
         };
         if let Some(run_attempt) = allocation_only_attempt {
-            self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
-                .await;
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -8832,8 +9021,14 @@ mod tests {
         assert!(owns_job_processes(&[descriptor(
             spur_core::step::STEP_BATCH
         )]));
-        assert!(owns_job_processes(&[
+        // A supervised step speaks only for itself: the allocation's own steps
+        // may still be running under the agent.
+        assert!(!owns_job_processes(&[
             descriptor(spur_core::step::STEP_EXTERN),
+            descriptor(7),
+        ]));
+        assert!(owns_job_processes(&[
+            descriptor(spur_core::step::STEP_BATCH),
             descriptor(7),
         ]));
     }
@@ -9048,7 +9243,7 @@ mod tests {
             .insert(stepd_key(&descriptor), descriptor.clone());
 
         let completions = crate::step_completion::StepCompletions::new();
-        let mut waiter = completions.register(43, step_id).await;
+        let mut waiter = completions.register(43, 7, step_id).await;
 
         fence_dead_stepd(
             &fence_context(&running, &allocation, &sessions, &completions, &store),
@@ -9439,6 +9634,66 @@ mod tests {
         .with_supervised_launch()
     }
 
+    /// Pins the attempt the supervised dispatch carries. It keys the session
+    /// directory and the cgroup leaf, so 0 escapes the job's enforced limits.
+    #[tokio::test]
+    async fn a_supervised_step_takes_the_attempt_of_the_job_it_joins() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
+        let job_id = 7755;
+        let step_id = 3;
+        svc.insert_test_job(
+            job_id,
+            TrackedJob {
+                run_attempt: 5,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+
+        // A session left by an earlier attempt of this step. Displacing it is
+        // refused unless the launch names an attempt that supersedes it.
+        let sockets = tempfile::tempdir().expect("socket dir");
+        let displaced = crate::stepd::StepdDescriptor::new(
+            job_id,
+            3,
+            step_id,
+            0,
+            0,
+            sockets.path().join("displaced.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&displaced), displaced);
+
+        let work_dir = tempfile::tempdir().expect("work dir");
+        let error = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                work_dir: work_dir.path().to_string_lossy().into_owned(),
+                job_id,
+                step_id,
+                num_tasks: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("spurstepd is not built beside the test binary");
+
+        assert!(
+            !error
+                .message()
+                .contains("fence a displaced step supervisor"),
+            "a step keyed to attempt 0 cannot supersede attempt 3, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("step supervisor failed to start"),
+            "the launch must reach the spawn, got: {}",
+            error.message()
+        );
+    }
+
     // The supervised dispatch is unreachable without `with_supervised_launch`,
     // so this is the only unit-level cover for who hosts a step's PMIx server.
     #[tokio::test]
@@ -9642,7 +9897,7 @@ mod tests {
         const STEP: spur_core::step::StepId = 3;
         let (context, _running, _sessions, _state_dir, completions) =
             completion_listener_fixture_for_step("http://127.0.0.1:1", STEP).await;
-        let mut waiter = completions.register(42, STEP).await;
+        let mut waiter = completions.register(42, 7, STEP).await;
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
             tokio::spawn(
@@ -11302,6 +11557,7 @@ mod tests {
             cpus: 8,
             memory_mb: 4096,
             gpu_devices: vec![2, 3],
+            cpu_ids: vec![0, 1, 2, 3, 4, 5, 6, 7],
             partition: "gpu".into(),
             nodelist: "node-a,node-b".into(),
             mpi: "pmix".into(),
@@ -11335,6 +11591,7 @@ mod tests {
                 job_id: 44,
                 step_id: 0,
                 user: "intruder".into(),
+                run_attempt: 0,
             }))
             .await
             .expect_err("a non-owner must not await another user's step");
@@ -11360,6 +11617,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect_err("an unknown step must not park the caller forever");
@@ -11408,11 +11666,189 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a recorded exit must be returned, not parked on");
 
         assert_eq!(response.into_inner().exit_code, 5);
+    }
+
+    /// A batch session as its supervisor published it, recording where the
+    /// job's output landed so an agent that restarts can still find it.
+    fn published_batch_descriptor(
+        store: &crate::stepd::StepdStore,
+        stdout_path: &str,
+    ) -> crate::stepd::StepdDescriptor {
+        let step_id = spur_core::step::STEP_BATCH;
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(44, 1, step_id).join("runtime.sock");
+        descriptor.owner = "testuser".into();
+        descriptor.stdout_path = stdout_path.into();
+        store.publish(&descriptor).expect("publish descriptor");
+        descriptor
+    }
+
+    // Adoption rebuilds the tracked job from the descriptor alone; a field it
+    // leaves at a default is one every consumer of `running` then reads wrong.
+    #[tokio::test]
+    async fn adoption_restores_the_output_paths_and_rootfs_mode_it_recorded() {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.stdout_path = "/spool/job44.out".into();
+        descriptor.stderr_path = "/spool/job44.err".into();
+        descriptor.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+
+        let running = new_running_jobs();
+        recover_stepds(&running, vec![descriptor]).await;
+
+        let jobs = running.lock().await;
+        let tracked = jobs.get(&44).expect("the adopted job is tracked");
+        assert_eq!(tracked.stdout_path, "/spool/job44.out");
+        assert_eq!(tracked.stderr_path, "/spool/job44.err");
+        assert_eq!(
+            tracked.rootfs_mode,
+            crate::container::RootfsMode::Overlay,
+            "guessing Extracted would skip the unmount and leak the overlay"
+        );
+    }
+
+    // Sessions are adopted in directory order, so a job whose step supervisor
+    // is enumerated first must still report the job's own output, not the step's.
+    #[tokio::test]
+    async fn a_steps_session_never_supplies_the_jobs_output_paths() {
+        let mut step = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            0,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        step.stdout_path = "/spool/job44/step0.out".into();
+        step.stderr_path = "/spool/job44/step0.err".into();
+        let mut batch = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        batch.stdout_path = "/spool/job44.out".into();
+        batch.stderr_path = "/spool/job44.err".into();
+        batch.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+
+        for order in [
+            vec![step.clone(), batch.clone()],
+            vec![batch.clone(), step.clone()],
+        ] {
+            let seen: Vec<_> = order.iter().map(|d| d.step_id).collect();
+            let running = new_running_jobs();
+            recover_stepds(&running, order).await;
+
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&44).expect("the adopted job is tracked");
+            assert_eq!(
+                tracked.stdout_path, "/spool/job44.out",
+                "a step's spool file is not the job's output (order {seen:?})"
+            );
+            assert_eq!(tracked.stderr_path, "/spool/job44.err", "order {seen:?}");
+            assert_eq!(
+                tracked.rootfs_mode,
+                crate::container::RootfsMode::Overlay,
+                "a step carries no rootfs mode and must not reset the job's (order {seen:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_job_output_tails_a_job_the_restart_adopted() {
+        use tokio_stream::StreamExt as _;
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let output = state_dir.path().join("job44.out");
+        std::fs::write(&output, b"before-restart\n").expect("seed the job's output");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = published_batch_descriptor(&store, &output.to_string_lossy());
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        recover_stepds(&svc.running, vec![descriptor.clone()]).await;
+        svc.adopt_stepds(&[descriptor]).await;
+
+        let mut stream = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                start_offset: 0,
+                step: None,
+                job_id: 44,
+                step_id: 0,
+                stream: "stdout".into(),
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("an adopted job's output must still be attachable")
+            .into_inner();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("a chunk should arrive")
+            .expect("stream still open")
+            .expect("chunk");
+        assert_eq!(first.data, b"before-restart\n");
+    }
+
+    // Waiting forever on a path that cannot be resolved is the worst outcome:
+    // the caller sees a banner, no output, no error, and never returns.
+    #[tokio::test]
+    async fn stream_job_output_refuses_a_job_whose_output_path_is_unknown() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = published_batch_descriptor(&store, "");
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        recover_stepds(&svc.running, vec![descriptor.clone()]).await;
+        svc.adopt_stepds(&[descriptor]).await;
+
+        let status = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                start_offset: 0,
+                step: None,
+                job_id: 44,
+                step_id: 0,
+                stream: "stdout".into(),
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("an unresolvable output path must be an error, not a silent wait");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     /// One session of job 44's second attempt, on disk the way a supervisor
@@ -11529,6 +11965,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a step settled before the re-attach must still report its exit");
@@ -11549,6 +11986,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a step that exited during the outage must still report its exit");
@@ -11633,11 +12071,62 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a restart must not lose a step's exit");
 
         assert_eq!(response.into_inner().exit_code, 7);
+    }
+
+    #[tokio::test]
+    async fn await_step_does_not_hand_a_caller_the_next_attempts_exit() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+
+        // The redispatch after a requeue. Step ids restart, so attempt 2 has a
+        // step 3 of its own, and its exit is the newest one on disk.
+        let mut redispatch = crate::stepd::StepdDescriptor::new(
+            44,
+            2,
+            3,
+            0,
+            0,
+            Default::default(),
+            Default::default(),
+        );
+        redispatch.socket_path = store.session_dir(44, 2, 3).join("runtime.sock");
+        store.publish(&redispatch).expect("publish the redispatch");
+        store
+            .obligations(44, 2, 3)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            })
+            .expect("record the redispatch's exit");
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 1,
+            }))
+            .await
+            .expect_err("a superseded attempt must not be answered with the redispatch's exit");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 2,
+            }))
+            .await
+            .expect("the attempt that ran it is still answerable");
+        assert_eq!(response.into_inner().exit_code, 9);
     }
 
     #[tokio::test]
@@ -11657,6 +12146,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect_err("an unobserved exit must not be invented");
@@ -12504,6 +12994,158 @@ mod tests {
         assert!(exited, "the in-flight step process must be signaled dead");
     }
 
+    /// Unbound socket paths: the supervisors are unreachable on purpose, so a
+    /// cancel fans out over them without the test hosting one.
+    async fn track_test_stepds(
+        svc: &AgentService,
+        job_id: u32,
+        run_attempt: u32,
+        step_ids: &[spur_core::step::StepId],
+        sockets: &std::path::Path,
+    ) {
+        for step_id in step_ids {
+            let mut descriptor = crate::stepd::StepdDescriptor::new(
+                job_id,
+                run_attempt,
+                *step_id,
+                0,
+                0,
+                sockets.join(format!("{step_id}.sock")),
+                std::path::PathBuf::new(),
+            );
+            descriptor.capability = "cancel-fanout-test".into();
+            svc.stepds
+                .lock()
+                .await
+                .insert(stepd_key(&descriptor), descriptor);
+        }
+    }
+
+    /// The supervisor runs its own ordered shutdown, so the agent's escalation
+    /// must not reach a step that has one.
+    #[tokio::test]
+    async fn a_cancel_leaves_a_supervised_step_to_its_own_supervisor() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("state dir");
+        track_test_stepds(&svc, 79, 1, &[spur_core::step::STEP_BATCH, 4], state.path()).await;
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        svc.register_test_step(79, 4, Some(child.id())).await;
+
+        svc.cancel_active_steps_for_job(79, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+
+        assert!(
+            !svc.step_cancel_requested(79, 4).await,
+            "a supervised step's shutdown belongs to its supervisor"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the agent must not signal a step its supervisor is shutting down"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The job's own supervisor says nothing about a step that has none: a
+    /// `--container-image` step still runs under the agent and must be reached.
+    #[tokio::test]
+    async fn a_supervised_batch_job_does_not_spare_its_unsupervised_step() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(
+            80,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        let state = tempfile::tempdir().expect("state dir");
+        track_test_stepds(&svc, 80, 1, &[spur_core::step::STEP_BATCH], state.path()).await;
+        svc.register_test_step(80, 6, None).await;
+
+        svc.graceful_cancel(80, 1).await;
+
+        assert!(
+            svc.step_cancel_requested(80, 6).await,
+            "a batch job's supervisor does not own its unsupervised step"
+        );
+    }
+
+    /// A `--container-image` step has no supervisor, so it runs under the agent
+    /// beside supervised siblings. A cancel must reach both.
+    #[tokio::test]
+    async fn a_supervised_sibling_does_not_spare_an_unsupervised_step() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 78,
+            cpus: 1,
+            run_attempt: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect("register allocation");
+
+        let state = tempfile::tempdir().expect("state dir");
+        track_test_stepds(
+            &svc,
+            78,
+            1,
+            &[spur_core::step::STEP_EXTERN, 1],
+            state.path(),
+        )
+        .await;
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        svc.register_test_step(78, 2, Some(child.id())).await;
+
+        svc.graceful_cancel(78, 1).await;
+
+        assert!(
+            svc.step_cancel_requested(78, 2).await,
+            "an unsupervised step must be cancelled beside its supervised sibling"
+        );
+        let mut exited = false;
+        for _ in 0..50 {
+            if child.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            exited,
+            "the unsupervised step's process must be signaled dead"
+        );
+    }
+
     #[tokio::test]
     async fn run_command_uses_provided_work_dir() {
         // The bug repro: the user's workflow is `salloc; srun hostname`.
@@ -12543,8 +13185,8 @@ mod tests {
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         // The step's stdout must live in a spool file the agent can tail, not
-        // only in the RPC response — this file is what StreamJobOutput follows
-        // (#781). step_id defaults to 0 here, so the file is step0.out.
+        // only in the RPC response — this file is what StreamJobOutput follows.
+        // step_id defaults to 0 here, so the file is step0.out.
         let contents = [
             std::path::PathBuf::from("/var/spool/spur"),
             std::env::temp_dir().join("spur"),
@@ -12570,10 +13212,51 @@ mod tests {
             job_id: 10,
             step_id: 1,
             signal: 0,
+            run_attempt: 0,
         }))
         .await
         .unwrap();
         assert!(svc.step_cancel_requested(10, 1).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_step_ignores_a_superseded_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // The redispatch: step ids restart, so its step 1 wears the id the
+        // superseded attempt's cancel names.
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            10,
+            4,
+            1,
+            0,
+            0,
+            Default::default(),
+            Default::default(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+        svc.register_test_step(10, 1, None).await;
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id: 10,
+            step_id: 1,
+            signal: 0,
+            run_attempt: 3,
+        }))
+        .await
+        .expect("a superseded cancel is dropped, not an error");
+
+        assert!(
+            !svc.step_cancel_requested(10, 1).await,
+            "a cancel for a superseded attempt must not reach the redispatch's step"
+        );
     }
 
     #[tokio::test]
@@ -12605,6 +13288,7 @@ mod tests {
             job_id,
             step_id,
             signal: 0,
+            run_attempt: 0,
         }))
         .await
         .unwrap();
@@ -12649,6 +13333,7 @@ mod tests {
             job_id,
             step_id,
             signal: 0,
+            run_attempt: 0,
         }))
         .await
         .unwrap();
@@ -14532,6 +15217,75 @@ mod tests {
         );
     }
 
+    /// Aborting a supervised launch spawns a reaper over an allocation, whose
+    /// `try_wait` never settles — it must not poll for the life of the agent.
+    #[tokio::test(start_paused = true)]
+    async fn reap_killed_job_returns_for_an_allocation_with_no_process() {
+        // Paused time: a looping reaper burns its virtual sleeps instantly, so
+        // this resolves without ever depending on how fast the machine is.
+        let reaped = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            reap_killed_job(executor::RunningJob::AllocationOnly),
+        )
+        .await;
+
+        assert!(
+            reaped.is_ok(),
+            "reap_killed_job must return for an allocation instead of polling forever"
+        );
+    }
+
+    /// The reclaimed-reservation abort has to reach a supervised workload, which
+    /// `kill_signal` cannot touch: only stopping the supervisor ends the run.
+    #[tokio::test]
+    async fn discarding_a_stepd_session_stops_the_supervisor_and_its_state() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(77, 3, spur_core::step::STEP_BATCH)
+            .expect("session directory");
+        // Named job_* so cleanup_cgroup accepts it as one of ours.
+        let cgroup_dir = state.path().join("job_77_3");
+        std::fs::create_dir_all(&cgroup_dir).expect("stand-in cgroup directory");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in supervisor");
+        let pid = child.id();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            77,
+            3,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            session_dir.join("runtime.sock"),
+            cgroup_dir.clone(),
+        );
+        assert_eq!(
+            crate::stepd::stepd_liveness(&descriptor).expect("liveness check"),
+            crate::stepd::StepdLiveness::Live,
+            "the stand-in supervisor must be live before the abort tears it down"
+        );
+
+        discard_stepd_session(&descriptor).await;
+
+        assert_eq!(
+            await_proc_state(pid as i32, &['Z', 'X']).await,
+            'Z',
+            "the abort must stop the supervisor, not leave it parked"
+        );
+        assert!(
+            !cgroup_dir.exists(),
+            "the abort must reap the abandoned supervisor's cgroup"
+        );
+        assert!(
+            !session_dir.exists(),
+            "the abort must drop the abandoned session's on-disk state"
+        );
+        let _ = child.wait();
+    }
+
     #[tokio::test]
     async fn suspend_then_resume_toggles_process_state() {
         let svc = AgentService::new(
@@ -14849,6 +15603,191 @@ mod tests {
             .lock()
             .await
             .contains_key(&(902, spur_core::step::STEP_BATCH)));
+    }
+
+    // Two descriptors recording the same core is the corrupt case the ledger
+    // guards; losing the loser's GPUs to it would be worse than the overlap.
+    #[tokio::test]
+    async fn a_contested_core_costs_an_adopted_job_occupancy_not_its_gpus() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let descriptor = |job_id: u32, cpu_ids: Vec<u32>, gpu: u32| {
+            let mut descriptor = crate::stepd::StepdDescriptor::new(
+                job_id,
+                1,
+                spur_core::step::STEP_BATCH,
+                0,
+                0,
+                state.path().join(format!("{job_id}.sock")),
+                std::path::PathBuf::new(),
+            );
+            descriptor.resources = crate::stepd::StepdJobResources {
+                cpus: cpu_ids.len() as u32,
+                memory_mb: 1024,
+                gpu_devices: vec![gpu],
+                cpu_ids,
+                ..Default::default()
+            };
+            descriptor
+        };
+        let first = descriptor(910, vec![1, 2], 0);
+        let second = descriptor(911, vec![2, 3], 1);
+
+        svc.replay_adopted_allocations(&[first, second]).await;
+
+        let mut alloc = svc.allocation.lock().await;
+        // Job 911 yields core 2 to job 910, but its GPU and memory stay on.
+        assert_eq!(alloc.allocated_gpu_ids(), vec![0, 1]);
+        assert_eq!(alloc.free_gpus(None), 0);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 2048);
+        assert!(alloc.allocated_cpus[1] && alloc.allocated_cpus[2] && alloc.allocated_cpus[3]);
+        assert!(!alloc.allocated_cpus[0]);
+        assert_eq!(alloc.conflicting_owners(&[1]), vec![911]);
+
+        // Core 2 is 910's alone: had 911 replayed it verbatim, releasing 911
+        // would clear a core 910 is still running on.
+        alloc.release_job(911);
+        assert!(alloc.allocated_cpus[2]);
+        assert!(!alloc.allocated_cpus[3]);
+    }
+
+    // An empty ledger was only correct while a restart killed every job: it now
+    // lets a later dispatch hand out cores and GPUs an adopted job still holds.
+    #[tokio::test]
+    async fn an_adopted_job_puts_its_resources_back_on_the_ledger() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            903,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("adopted.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices: vec![1],
+            cpu_ids: vec![2, 3],
+            ..Default::default()
+        };
+
+        svc.adopt_stepds(std::slice::from_ref(&descriptor)).await;
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_cpus(), 2);
+        assert!(alloc.allocated_cpus[2] && alloc.allocated_cpus[3]);
+        assert!(!alloc.allocated_cpus[0] && !alloc.allocated_cpus[1]);
+        assert_eq!(alloc.allocated_gpu_ids(), vec![1]);
+        assert_eq!(alloc.free_gpus(None), 1);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+    }
+
+    // Only the batch descriptor records the cores, and sessions are discovered
+    // in arbitrary order, so a step must not decide the job's replayed cpuset.
+    #[tokio::test]
+    async fn a_step_descriptor_does_not_displace_the_cores_its_job_recorded() {
+        for step_first in [false, true] {
+            let svc = AgentService::new(
+                test_reporter_with_gpus(&[0, 1]),
+                HooksConfig::default(),
+                Arc::new(Mutex::new(DeviceRegistry::new())),
+                spur_core::config::MemlockLimit::Unlimited,
+            );
+            let state = tempfile::tempdir().expect("runtime state directory");
+            let mut batch = crate::stepd::StepdDescriptor::new(
+                905,
+                1,
+                spur_core::step::STEP_BATCH,
+                0,
+                0,
+                state.path().join("batch.sock"),
+                std::path::PathBuf::new(),
+            );
+            batch.resources = crate::stepd::StepdJobResources {
+                cpus: 2,
+                memory_mb: 1024,
+                gpu_devices: vec![0],
+                cpu_ids: vec![2, 3],
+                ..Default::default()
+            };
+            let mut step = batch.clone();
+            step.step_id = 0;
+            step.socket_path = state.path().join("step.sock");
+            step.resources.cpu_ids = Vec::new();
+
+            let descriptors = if step_first {
+                vec![step, batch]
+            } else {
+                vec![batch, step]
+            };
+            svc.replay_adopted_allocations(&descriptors).await;
+
+            let alloc = svc.allocation.lock().await;
+            assert!(
+                alloc.allocated_cpus[2] && alloc.allocated_cpus[3],
+                "step_first={step_first}: the job's recorded cores must be held"
+            );
+            assert!(
+                !alloc.allocated_cpus[0] && !alloc.allocated_cpus[1],
+                "step_first={step_first}: cores the job never held must stay free"
+            );
+            assert_eq!(alloc.free_cpus(), 2);
+        }
+    }
+
+    // Adoption replays every step of a job, and each carries the job's
+    // resources: counting them once is what keeps the ledger honest.
+    #[tokio::test]
+    async fn replaying_an_adopted_job_twice_counts_it_once() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let mut batch = crate::stepd::StepdDescriptor::new(
+            904,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("batch.sock"),
+            std::path::PathBuf::new(),
+        );
+        batch.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices: vec![0],
+            cpu_ids: vec![0, 1],
+            ..Default::default()
+        };
+        let mut step = batch.clone();
+        step.step_id = 0;
+        step.socket_path = state.path().join("step.sock");
+
+        svc.replay_adopted_allocations(&[batch.clone(), step]).await;
+        svc.replay_adopted_allocations(&[batch]).await;
+
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_cpus(), 2);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+        assert_eq!(alloc.allocated_gpu_ids(), vec![0]);
     }
 
     #[tokio::test]

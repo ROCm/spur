@@ -30,6 +30,10 @@ pub struct StepdLaunchSpec {
     pub name: String,
     pub user: String,
     pub node: String,
+    #[serde(default)]
+    pub array_job_id: Option<spur_core::job::JobId>,
+    #[serde(default)]
+    pub array_task_id: Option<u32>,
     pub environment: std::collections::HashMap<String, String>,
     pub stdout_path: String,
     pub stderr_path: String,
@@ -146,6 +150,10 @@ pub struct StepdJobResources {
     pub memory_mb: u64,
     #[serde(default)]
     pub gpu_devices: Vec<u32>,
+    /// The exact cores, so a restart replays the binding the job is pinned to
+    /// instead of re-deriving one that overlaps it.
+    #[serde(default)]
+    pub cpu_ids: Vec<u32>,
     #[serde(default)]
     pub partition: String,
     #[serde(default)]
@@ -168,6 +176,8 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             name: config.name.clone(),
             user: config.user.clone(),
             node: config.node.clone(),
+            array_job_id: config.array_job_id,
+            array_task_id: config.array_task_id,
             environment: config.environment.clone(),
             stdout_path: config.stdout_path.clone(),
             stderr_path: config.stderr_path.clone(),
@@ -203,6 +213,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 cpus: config.cpus,
                 memory_mb: config.memory_mb,
                 gpu_devices: config.gpu_devices.clone(),
+                cpu_ids: config.cpu_ids.clone(),
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
                 mpi: config.mpi.clone(),
@@ -224,8 +235,8 @@ impl StepdLaunchSpec {
             name: self.name,
             user: self.user,
             node: self.node,
-            array_job_id: None,
-            array_task_id: None,
+            array_job_id: self.array_job_id,
+            array_task_id: self.array_task_id,
             mpi: self.resources.mpi.clone(),
             environment: self.environment,
             stdout_path: self.stdout_path,
@@ -809,6 +820,16 @@ pub struct StepdDescriptor {
     pub workload_pid: u32,
     #[serde(default)]
     pub workload_start_ticks: u64,
+    /// Where the workload's output actually landed, resolved at launch: an
+    /// agent that restarts has no spec left to re-derive it from.
+    #[serde(default)]
+    pub stdout_path: String,
+    #[serde(default)]
+    pub stderr_path: String,
+    /// `None` for an uncontainerized job. Cleanup has to unmount an overlay
+    /// before removing it, so guessing the mode leaks the mounts.
+    #[serde(default)]
+    pub container_rootfs_mode: Option<crate::container::RootfsMode>,
 }
 
 impl StepdDescriptor {
@@ -842,6 +863,9 @@ impl StepdDescriptor {
             resources: StepdJobResources::default(),
             workload_pid: 0,
             workload_start_ticks: 0,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            container_rootfs_mode: None,
         }
     }
 }
@@ -1847,6 +1871,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_user_namespace = launch_spec.has_user_namespace;
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
+    descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
@@ -1920,11 +1945,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None)
+    let (job, launched_cgroup, launched_output) = if launch_spec.allocation_only {
+        (RunningJob::AllocationOnly, None, None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
-            Ok(result) => (result.job, result.cgroup_path),
+            Ok(result) => (
+                result.job,
+                result.cgroup_path,
+                Some((result.stdout_path, result.stderr_path)),
+            ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
                     pmix.stop();
@@ -1942,7 +1971,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
     }
-    if workload_pid > 0 || launched_cgroup.is_some() {
+    let recorded_output = launched_output.is_some();
+    if let Some((stdout_path, stderr_path)) = launched_output {
+        descriptor.stdout_path = stdout_path;
+        descriptor.stderr_path = stderr_path;
+    }
+    if workload_pid > 0 || launched_cgroup.is_some() || recorded_output {
         if let Err(error) = store.publish(&descriptor) {
             tracing::warn!(job_id, %error, "failed to republish the runtime descriptor");
         }
@@ -2155,6 +2189,41 @@ impl StepdStore {
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
+    /// Invent the exit a supervisor that died while the agent was down never
+    /// recorded, so the ordinary completion replay can report its loss.
+    pub fn record_lost_supervisor_exit(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        // Re-checked here, not trusted from the caller's classification: a
+        // supervisor that survived must never be reported as lost.
+        if !matches!(stepd_liveness(descriptor), Ok(StepdLiveness::Stale)) {
+            return Ok(false);
+        }
+        // A numbered step's loss is that step's failure; only a job-level
+        // session speaks for the allocation the controller is holding.
+        if spur_core::step::is_user_step(descriptor.step_id) {
+            return Ok(false);
+        }
+        if self
+            .observed_exit(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.obligations(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        )
+        .append(&StepdObligation::ExitObserved {
+            exit_code: 0,
+            signal: nix::sys::signal::Signal::SIGKILL as i32,
+        })?;
+        Ok(true)
+    }
+
     pub fn obligations(
         &self,
         job_id: u32,
@@ -2332,38 +2401,16 @@ impl StepdStore {
         let now = SystemTime::now();
         let mut retained: Vec<(SystemTime, PathBuf)> = Vec::new();
         for session_dir in self.session_dirs()? {
-            let descriptor = match self.load_descriptor(&session_dir) {
-                Ok(descriptor) => descriptor,
-                // Nothing can ever finalize a session whose descriptor will not
-                // load, and it still holds the job's environment on disk.
-                Err(_) => {
-                    if session_is_abandoned(&session_dir, now) {
-                        fs::remove_dir_all(&session_dir)?;
-                        pruned += 1;
-                    }
-                    continue;
-                }
-            };
-            let obligations = self.obligations(
-                descriptor.job_id,
-                descriptor.run_attempt,
-                descriptor.step_id,
-            );
-            match sweep_finalized_session(&session_dir, &obligations, descriptor.step_id)? {
-                SweptSession::Pruned => pruned += 1,
-                SweptSession::RetainedAnswer { settled_at } => {
-                    retained.push((settled_at, session_dir))
-                }
-                // A supervisor that died before recording an exit leaves a session
-                // no one can finalize; only its own death makes it safe to sweep.
-                SweptSession::Unfinalized => {
-                    if matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale))
-                        && session_is_abandoned(&session_dir, now)
-                    {
-                        fs::remove_dir_all(&session_dir)?;
-                        pruned += 1;
-                    }
-                }
+            match self.sweep_session(&session_dir, now, &mut retained) {
+                Ok(true) => pruned += 1,
+                Ok(false) => {}
+                // This sweep also runs at startup, so one damaged session must
+                // not fail the rest of it and stop the agent booting.
+                Err(error) => tracing::warn!(
+                    session = %session_dir.display(),
+                    %error,
+                    "failed to sweep a runtime session"
+                ),
             }
         }
         // Age alone lets step churn grow the retained set without limit, and
@@ -2374,11 +2421,62 @@ impl StepdStore {
         if excess > 0 {
             retained.sort_by_key(|(settled_at, _)| *settled_at);
             for (_, session_dir) in retained.iter().take(excess) {
-                fs::remove_dir_all(session_dir)?;
-                pruned += 1;
+                match fs::remove_dir_all(session_dir) {
+                    Ok(()) => pruned += 1,
+                    Err(error) => tracing::warn!(
+                        session = %session_dir.display(),
+                        %error,
+                        "failed to drop an over-capacity runtime session"
+                    ),
+                }
             }
         }
         Ok(pruned)
+    }
+
+    /// Whether the session was removed. Retained answers are collected rather
+    /// than capped here, so the caller can bound them across every session.
+    fn sweep_session(
+        &self,
+        session_dir: &Path,
+        now: SystemTime,
+        retained: &mut Vec<(SystemTime, PathBuf)>,
+    ) -> io::Result<bool> {
+        let descriptor = match self.load_descriptor(session_dir) {
+            Ok(descriptor) => descriptor,
+            // Nothing can ever finalize a session whose descriptor will not
+            // load, and it still holds the job's environment on disk.
+            Err(_) => {
+                if !session_is_abandoned(session_dir, now) {
+                    return Ok(false);
+                }
+                fs::remove_dir_all(session_dir)?;
+                return Ok(true);
+            }
+        };
+        let obligations = self.obligations(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        );
+        match sweep_finalized_session(session_dir, &obligations, descriptor.step_id)? {
+            SweptSession::Pruned => Ok(true),
+            SweptSession::RetainedAnswer { settled_at } => {
+                retained.push((settled_at, session_dir.to_path_buf()));
+                Ok(false)
+            }
+            // A supervisor that died before recording an exit leaves a session
+            // no one can finalize; only its own death makes it safe to sweep.
+            SweptSession::Unfinalized => {
+                if !matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale))
+                    || !session_is_abandoned(session_dir, now)
+                {
+                    return Ok(false);
+                }
+                fs::remove_dir_all(session_dir)?;
+                Ok(true)
+            }
+        }
     }
 
     pub(crate) fn acknowledge_completion(
@@ -2712,6 +2810,15 @@ mod launch_spec_compat {
         assert!(spec.pmix.is_none());
     }
 
+    #[test]
+    fn an_older_launch_spec_carries_no_array_identity_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.array_job_id.is_none());
+        assert!(spec.array_task_id.is_none());
+    }
+
     /// Captured from the build that first shipped `pmix` in launch.json, before
     /// `wrapper_path` existed. A supervisor started by an older agent mid-upgrade
     /// reads exactly this, so it has to keep decoding.
@@ -2824,6 +2931,23 @@ mod tests {
         )
     }
 
+    fn descriptor_for_step(
+        job_id: u32,
+        run_attempt: u32,
+        pid: u32,
+        step_id: spur_core::step::StepId,
+    ) -> StepdDescriptor {
+        StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            pid,
+            process_start_ticks(pid).unwrap_or(0),
+            PathBuf::from("/run/spur/runtime.sock"),
+            PathBuf::from("/sys/fs/cgroup/spur/test"),
+        )
+    }
+
     fn write_descriptor(store: &StepdStore, descriptor: &StepdDescriptor) -> PathBuf {
         let session_dir = store.session_dir(
             descriptor.job_id,
@@ -2855,6 +2979,8 @@ mod tests {
             name: "runtime-test".into(),
             user: "spur".into(),
             node: "node-a".into(),
+            array_job_id: None,
+            array_task_id: None,
             environment: HashMap::new(),
             stdout_path: String::new(),
             stderr_path: String::new(),
@@ -3091,6 +3217,27 @@ mod tests {
         );
     }
 
+    // Drives the whole agent -> launch.json -> supervisor boundary: the array
+    // identity has to survive it or every task expands to the same filename.
+    #[test]
+    fn a_supervised_array_task_keeps_the_identity_its_output_name_expands() {
+        let mut config = launch_spec().into_launch_config();
+        config.array_job_id = Some(100);
+        config.array_task_id = Some(3);
+        config.stdout_path = "out-%A_%a.out".into();
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
+        let encoded = serde_json::to_vec(&spec).expect("encode launch spec");
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&encoded).expect("decode launch spec");
+        let restored = restored.into_launch_config();
+
+        assert_eq!(
+            crate::executor::resolve_output_path(&restored, "/work", &restored.stdout_path),
+            "/work/out-100_3.out"
+        );
+    }
+
     #[test]
     fn legacy_launch_spec_deserializes_runtime_defaults() {
         let mut serialized = serde_json::to_value(launch_spec()).expect("encode launch spec");
@@ -3111,6 +3258,8 @@ mod tests {
             "capability",
             "allocation_only",
             "pmix_multi_task",
+            "array_job_id",
+            "array_task_id",
         ] {
             fields.remove(field);
         }
@@ -3132,6 +3281,8 @@ mod tests {
         assert!(restored.reporting_node.is_empty());
         assert_eq!(restored.run_attempt, 0);
         assert!(restored.capability.is_empty());
+        assert!(restored.array_job_id.is_none());
+        assert!(restored.array_task_id.is_none());
         assert!(!restored.allocation_only);
         assert!(!restored.pmix_multi_task);
     }
@@ -3143,7 +3294,17 @@ mod tests {
         let fields = serialized
             .as_object_mut()
             .expect("descriptor must encode as an object");
-        for field in ["step_id", "capability", "owner", "uid", "gid", "work_dir"] {
+        for field in [
+            "step_id",
+            "capability",
+            "owner",
+            "uid",
+            "gid",
+            "work_dir",
+            "stdout_path",
+            "stderr_path",
+            "container_rootfs_mode",
+        ] {
             fields.remove(field);
         }
         let restored: StepdDescriptor =
@@ -3154,6 +3315,9 @@ mod tests {
         assert_eq!(restored.uid, 0);
         assert_eq!(restored.gid, 0);
         assert!(restored.work_dir.is_empty());
+        assert!(restored.stdout_path.is_empty());
+        assert!(restored.stderr_path.is_empty());
+        assert_eq!(restored.container_rootfs_mode, None);
     }
 
     #[test]
@@ -3292,6 +3456,133 @@ mod tests {
                 "{signal:?} must not end session"
             );
         }
+    }
+
+    // A supervisor killed while the agent was down records no exit, so without
+    // a synthetic one nothing ever reports the job and it holds its allocation.
+    #[test]
+    fn a_lost_job_supervisor_gets_an_exit_the_completion_replay_reports() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = descriptor(43, 1, 999_999);
+        write_descriptor(&store, &lost);
+
+        let discovered = store.discover_live().expect("discover live sessions");
+        assert_eq!(
+            discovered.stale,
+            vec![lost.clone()],
+            "fixture must be stale"
+        );
+        assert!(
+            store
+                .record_lost_supervisor_exit(&lost)
+                .expect("record the lost supervisor's exit"),
+            "a job-level session with no recorded exit must gain one"
+        );
+
+        let pending = store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions");
+        let reported: Vec<_> = pending
+            .iter()
+            .map(|c| (c.job_id, c.run_attempt, c.step_id, c.exit_code, c.signal))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![(
+                43,
+                1,
+                spur_core::step::STEP_BATCH,
+                0,
+                nix::sys::signal::Signal::SIGKILL as i32
+            )],
+            "the ordinary completion replay must pick the loss up"
+        );
+    }
+
+    // The headline of supervised execution is that a job survives an agent
+    // restart; reporting a live supervisor as lost would turn that into a kill.
+    #[test]
+    fn a_surviving_supervisor_is_never_recorded_as_lost() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let survived = descriptor(42, 3, std::process::id());
+        write_descriptor(&store, &survived);
+
+        let discovered = store.discover_live().expect("discover live sessions");
+        assert_eq!(
+            discovered.live,
+            vec![survived.clone()],
+            "fixture must be live"
+        );
+        assert!(
+            !store
+                .record_lost_supervisor_exit(&survived)
+                .expect("classify the surviving supervisor"),
+            "a supervisor still running must not be given an exit"
+        );
+        assert!(
+            store
+                .observed_exit(42, 3, spur_core::step::STEP_BATCH)
+                .expect("read observed exit")
+                .is_none(),
+            "nothing may be recorded against a live session"
+        );
+        assert!(
+            store
+                .discover_unacknowledged_completions()
+                .expect("discover unacknowledged completions")
+                .is_empty(),
+            "a live session must never reach the completion replay"
+        );
+    }
+
+    #[test]
+    fn a_lost_numbered_step_is_left_to_its_own_reporting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step = descriptor_for_step(44, 1, 999_999, 0);
+        write_descriptor(&store, &step);
+
+        assert!(
+            !store
+                .record_lost_supervisor_exit(&step)
+                .expect("classify the lost step"),
+            "a numbered step's loss is that step's failure, not the job's"
+        );
+        assert!(store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_session_that_recorded_its_own_exit_is_not_given_a_synthetic_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let settled = descriptor(45, 1, 999_999);
+        write_descriptor(&store, &settled);
+        store
+            .obligations(45, 1, spur_core::step::STEP_BATCH)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 7,
+                signal: 0,
+            })
+            .expect("record the real exit");
+
+        assert!(
+            !store
+                .record_lost_supervisor_exit(&settled)
+                .expect("classify the settled session"),
+            "a recorded exit is the real outcome and must stand"
+        );
+        assert_eq!(
+            store
+                .observed_exit(45, 1, spur_core::step::STEP_BATCH)
+                .expect("read observed exit"),
+            Some((7, 0)),
+            "the workload's own exit must not be overwritten"
+        );
     }
 
     #[test]
@@ -3643,6 +3934,51 @@ mod tests {
         assert_eq!(store.prune_finalized().expect("prune"), 0);
         assert!(store
             .session_dir(17, 1, spur_core::step::STEP_BATCH)
+            .exists());
+    }
+
+    #[test]
+    fn a_damaged_session_neither_fails_the_sweep_nor_spares_the_rest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+
+        let damaged = descriptor(31, 1, std::process::id());
+        store.publish(&damaged).expect("publish damaged descriptor");
+        fs::write(
+            store
+                .session_dir(31, 1, spur_core::step::STEP_BATCH)
+                .join("obligations.jsonl"),
+            b"{not valid json}\n",
+        )
+        .expect("corrupt the obligation log");
+
+        let finalized = descriptor(32, 1, std::process::id());
+        store
+            .publish(&finalized)
+            .expect("publish finalized descriptor");
+        let obligations = store.obligations(32, 1, spur_core::step::STEP_BATCH);
+        for obligation in [
+            StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            },
+            StepdObligation::CompletionAcknowledged,
+            StepdObligation::ResourcesReleased,
+        ] {
+            obligations.append(&obligation).expect("append obligation");
+        }
+
+        assert_eq!(
+            store
+                .prune_finalized()
+                .expect("a damaged session fails one session, not the sweep"),
+            1
+        );
+        assert!(!store
+            .session_dir(32, 1, spur_core::step::STEP_BATCH)
+            .exists());
+        assert!(store
+            .session_dir(31, 1, spur_core::step::STEP_BATCH)
             .exists());
     }
 

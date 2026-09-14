@@ -241,6 +241,18 @@ The ``deploy.yml`` play runs in this order:
    Raft leader).
 5. **Start agents** in parallel: installs ``spurd.service`` pointing at all controllers,
    restarts ``spurd``, and waits for port 6818.
+
+   .. important::
+
+      The ``spurd`` unit must set ``KillMode=process``. systemd's default,
+      ``control-group``, signals every process in the unit's cgroup on stop or
+      restart, which terminates the detached job supervisors along with the
+      agent — so ``systemctl restart spurd``, including the restart this step
+      performs, kills running jobs instead of leaving them untouched. The unit
+      is installed by the ``spur_agent`` role; confirm the deployed
+      ``/etc/systemd/system/spurd.service`` carries the setting. See
+      :doc:`native-host` for the full unit.
+
 6. **Login nodes** (empty group → no-op): sets client environment only.
 7. **Verify** on the first controller: waits for agents to register, prints
    ``spur nodes``, submits a single-node test job (and a multi-node one when there is

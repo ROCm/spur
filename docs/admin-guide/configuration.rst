@@ -184,9 +184,14 @@ and Raft high-availability topology.
    * - ``state_dir``
      - string
      - ``"/var/spool/spur"``
-     - Not implemented
-     - Ignored. The controller always uses its ``--state-dir`` flag, which
-       defaults to ``/var/spool/spur``.
+     - Restart
+     - Ignored by ``spurctld``, which always uses its ``--state-dir`` flag
+       (itself defaulting to ``/var/spool/spur``). Read by ``spurd`` as the
+       fallback root for the supervisor session spool that lets running jobs
+       survive an agent restart, used when neither the agent's ``--state-dir``
+       flag nor ``SPUR_STEPD_STATE_DIR`` is set. Changing it relocates that
+       spool on every node sharing this file, so restarted agents no longer
+       find the sessions they left behind; drain the nodes before changing it.
    * - ``max_job_id``
      - integer
      - ``999999999``
@@ -621,9 +626,13 @@ How client requests are authenticated.
 
 .. note::
 
-   When neither ``jwt_key`` nor ``jwt_key_file`` is set, admission tokens are
-   signed with a well-known built-in key and are therefore forgeable; set an
-   explicit key before enabling token admission (``[admission] mode = "token"``).
+   Token admission needs a signing key to attest node identity. When neither
+   ``jwt_key`` nor ``jwt_key_file`` is set, ``[admission] mode = "token"`` still
+   gates which nodes may register — the join token is checked — but registered
+   agents are issued no node credential and none is demanded of them afterwards,
+   so a caller that reaches the controller port can act as any registered node.
+   ``spurctld`` warns at startup in this configuration; set an explicit key
+   before relying on token admission.
 
 .. _privileged-operations:
 
@@ -1214,8 +1223,11 @@ Job isolation layers.
 
 cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
 process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
-exec``, and interactive attach — runs in a cgroup at
-``/sys/fs/cgroup/spur/job_<id>_<attempt>``, and the limits are derived from the **per-node
+exec``, and interactive attach — is confined beneath
+``/sys/fs/cgroup/spur/job_<id>_<attempt>``. That directory carries the limits and
+the device filter; each step runs in its own ``step_<n>`` leaf underneath it and
+inherits both, because cgroup v2 will not hold processes in a node whose
+children have controllers enabled. The limits are derived from the **per-node
 budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
 the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
 cgroups.
@@ -1226,8 +1238,9 @@ cgroups.
    default ``required = false`` a host that cannot apply a constraint — missing
    ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
    unconstrained. Set ``required = true`` to make that case fail closed instead.
-   See :ref:`cgroup-containment-gaps` for what remains even then: per-step
-   granularity, and the site-supplied task hooks that run outside the job cgroup.
+   See :ref:`cgroup-containment-gaps` for what remains even then: a step leaf
+   carries no budget of its own, and the site-supplied task hooks run outside
+   the job cgroup.
 
 .. note::
 

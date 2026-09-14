@@ -902,7 +902,8 @@ message StepdRecoveryRequest {
   uint32 run_attempt = 3;
   string node_token = 4;
   bool stale_descriptor = 5;
-  // Supervisors are per (job, attempt, step); 0 is the batch step.
+  // Supervisors are per (job, attempt, step). 0 from an older controller is
+  // the numbered step 0, not "unset"; the batch step is 0xFFFFFFFE.
   uint32 step_id = 6;
 }
 
@@ -1032,7 +1033,8 @@ message NodeResourcesResponse {
 message StepdProbeRequest {
   uint32 job_id = 1;
   uint32 run_attempt = 2;
-  // Supervisors are per (job, attempt, step); 0 is the batch step.
+  // Supervisors are per (job, attempt, step). 0 from an older controller is
+  // the numbered step 0, not "unset"; the batch step is 0xFFFFFFFE.
   uint32 step_id = 3;
 }
 
@@ -1344,12 +1346,14 @@ message CancelStepRequest {
   uint32 job_id = 1;
   uint32 step_id = 2;
   int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
+  uint32 run_attempt = 4;  // Step ids restart each attempt; 0 names any attempt
 }
 
 message AwaitStepRequest {
   uint32 job_id = 1;
   uint32 step_id = 2;
   string user = 3;
+  uint32 run_attempt = 4;  // Step ids restart each attempt; 0 names any attempt
 }
 
 message StreamJobOutputRequest {

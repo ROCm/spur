@@ -295,6 +295,37 @@ class TestArrayDependencies:
             assert f"TID={tid}" in content, f"task {tid} env output:\n{content}"
             assert f"JID={parent}" in content, f"task {tid} env output:\n{content}"
 
+    def test_array_output_pattern_expands_per_task(self, cluster):
+        # Unexpanded %A/%a leaves one literal filename every task clobbers.
+        script = cluster.write_file(
+            "arr-pat.sh",
+            '#!/bin/bash\necho "TID=${SLURM_ARRAY_TASK_ID}"\n',
+            all_nodes=True,
+        )
+        sb = cluster.sbatch(
+            [
+                "-J",
+                "arrpat",
+                "-N",
+                "1",
+                "-a",
+                "1-3",
+                "-o",
+                f"{cluster.remote_dir}/arr-pat-%A_%a.out",
+                script,
+            ]
+        )
+        parent = parse_job_id(sb)
+        assert parent is not None
+
+        for tid in range(3):
+            wait_job(cluster, parent + 1 + tid, timeout=60)
+
+        for tid in range(1, 4):
+            path = f"{cluster.remote_dir}/arr-pat-{parent}_{tid}.out"
+            content = cluster.read_output_on_any_node(path)
+            assert f"TID={tid}" in content, f"task {tid} output at {path}:\n{content}"
+
     def test_afterok_on_array_parent_releases_child(self, cluster):
         # THE core repro: afterok against an array parent must not deadlock.
         out_c = f"{cluster.remote_dir}/arr-dep-c.out"

@@ -519,6 +519,17 @@ async fn process_assignment(
             0,
         )
         .await;
+        // Already Running, so without a transition it would hold its nodes. Both
+        // calls name this attempt: the awaits above give a requeue time to land.
+        let detail = format!(
+            "job started but was not released on every node ({})",
+            dispatch_nodes.join(",")
+        );
+        if let Err(e) =
+            cluster.evict_job_attempt(job_id, Some(prospective_run_attempt), Some(detail))
+        {
+            error!(job_id, error = %e, "failed to evict a job that could not be released");
+        }
         return false;
     }
 
@@ -2426,13 +2437,20 @@ pub async fn cancel_job_on_nodes(
 pub async fn cancel_step_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     step_id: u32,
     node_names: &[String],
     signal: i32,
 ) {
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_step_agent(agent_addr, job_id, step_id, signal));
+        set.spawn(cancel_one_step_agent(
+            agent_addr,
+            job_id,
+            run_attempt,
+            step_id,
+            signal,
+        ));
     }
     while set.join_next().await.is_some() {}
 }
@@ -2441,6 +2459,7 @@ pub async fn cancel_step_on_nodes(
 async fn cancel_one_step_agent(
     agent_addr: String,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     step_id: u32,
     signal: i32,
 ) {
@@ -2459,6 +2478,7 @@ async fn cancel_one_step_agent(
                         job_id,
                         step_id,
                         signal,
+                        run_attempt,
                     })
                     .await
                 {
@@ -3205,6 +3225,9 @@ mod tests {
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
+            /// start_job fails, standing in for a node that confirmed its
+            /// launch but could not then release the workload.
+            reject_start: bool,
         }
 
         #[tonic::async_trait]
@@ -3218,6 +3241,9 @@ mod tests {
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
+                if self.reject_start {
+                    return Err(tonic::Status::internal("job has not been started yet"));
+                }
                 Ok(tonic::Response::new(()))
             }
 
@@ -3520,6 +3546,7 @@ mod tests {
                 register_delay,
                 reject_resources: false,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
+                reject_start: false,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3544,6 +3571,7 @@ mod tests {
                 reject_resources: true,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
+                reject_start: false,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3554,6 +3582,33 @@ mod tests {
                     .await;
             });
             addr
+        }
+
+        /// Mock agent that confirms its launch but refuses the release that
+        /// follows, leaving the controller with a job already committed Running.
+        async fn spawn_mock_agent_rejecting_start() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancel_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: cancel_calls.clone(),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_resources: false,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: true,
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancel_calls)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -5180,6 +5235,76 @@ mod tests {
                 "n2 cancelled after start_job rejected the assignment",
                 || cancel2.load(Ordering::SeqCst) >= 1,
             );
+        }
+
+        // The release runs after the job is committed Running, so a node that
+        // refuses it strands the allocation unless the job is explicitly moved on.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_evicts_a_job_no_node_would_release() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancel_calls) = spawn_mock_agent_rejecting_start().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("unreleasable", 1));
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(!started, "a job no node released must not count as started");
+            wait_for("n1 cancelled after refusing the release", || {
+                cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.state,
+                JobState::NodeFail,
+                "the job would hold its allocation forever if left Running"
+            );
+            assert!(
+                job.launch_failure_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("n1")),
+                "the eviction must say which nodes would not take the job, got {:?}",
+                job.launch_failure_detail
+            );
+            assert!(
+                cm.get_node("n1")
+                    .expect("n1 registered")
+                    .alloc_resources
+                    .is_empty(),
+                "the node's resources must be given back, not left allocated"
+            );
+        }
+
+        // The cancel above is awaited, which is long enough for a requeue to
+        // land; evicting then would take down a run that is doing nothing wrong.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn evicting_a_superseded_attempt_leaves_the_current_run_alone() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("superseded", 1));
+            assert!(
+                process_assignment(cm.clone(), assignment(job_id, &["n1"])).await,
+                "the job must reach Running first"
+            );
+            let current = cm.get_job(job_id).unwrap().run_attempt;
+
+            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
+                .expect("a stale eviction must be a no-op, not an error");
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.state,
+                JobState::Running,
+                "an eviction naming an older attempt must not touch the current run"
+            );
+            assert_eq!(job.run_attempt, current);
         }
 
         fn make_script(body: &str) -> tempfile::TempPath {

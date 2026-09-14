@@ -30,8 +30,12 @@ pub(crate) const SETTLED_CAPACITY: usize = 1024;
 /// job's environment, so it cannot be retained on the chance someone looks.
 pub(crate) const ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Keyed by attempt as well: step ids restart at 0 on a requeue, so a caller
+/// from a superseded attempt must not be answered with the redispatch's exit.
+type StepKey = (JobId, u32, StepId);
+
 struct SettledStep {
-    key: (JobId, StepId),
+    key: StepKey,
     outcome: StepOutcome,
     settled_at: Instant,
 }
@@ -45,7 +49,7 @@ pub struct StepCompletions {
     settled: Arc<Mutex<VecDeque<SettledStep>>>,
 }
 
-type Waiters = HashMap<(JobId, StepId), oneshot::Sender<StepOutcome>>;
+type Waiters = HashMap<StepKey, oneshot::Sender<StepOutcome>>;
 
 /// Oldest first, so both bounds are satisfied by dropping from the front.
 fn evict_settled(settled: &mut VecDeque<SettledStep>, now: Instant) {
@@ -67,9 +71,17 @@ impl StepCompletions {
 
     /// Register before spawning the supervisor: a step that finishes faster
     /// than the launching RPC can park would otherwise report to nobody.
-    pub async fn register(&self, job_id: JobId, step_id: StepId) -> oneshot::Receiver<StepOutcome> {
+    pub async fn register(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: StepId,
+    ) -> oneshot::Receiver<StepOutcome> {
         let (sender, receiver) = oneshot::channel();
-        self.waiters.lock().await.insert((job_id, step_id), sender);
+        self.waiters
+            .lock()
+            .await
+            .insert((job_id, run_attempt, step_id), sender);
         receiver
     }
 
@@ -77,19 +89,26 @@ impl StepCompletions {
     /// delivered outcome apart from one nobody is listening for. Either way the
     /// outcome is remembered: a caller that arrives late must not be told the
     /// step is unknown when its exit is settled and sitting right here.
-    pub async fn complete(&self, job_id: JobId, step_id: StepId, outcome: StepOutcome) -> bool {
+    pub async fn complete(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: StepId,
+        outcome: StepOutcome,
+    ) -> bool {
+        let key = (job_id, run_attempt, step_id);
         let now = Instant::now();
         let mut settled = self.settled.lock().await;
-        settled.retain(|entry| entry.key != (job_id, step_id));
+        settled.retain(|entry| entry.key != key);
         settled.push_back(SettledStep {
-            key: (job_id, step_id),
+            key,
             outcome,
             settled_at: now,
         });
         evict_settled(&mut settled, now);
         drop(settled);
 
-        let Some(sender) = self.waiters.lock().await.remove(&(job_id, step_id)) else {
+        let Some(sender) = self.waiters.lock().await.remove(&key) else {
             return false;
         };
         sender.send(outcome).is_ok()
@@ -97,13 +116,22 @@ impl StepCompletions {
 
     /// The outcome of a step that already settled, for a caller whose
     /// rendezvous is gone — the agent restarted, or nobody was parked when the
-    /// supervisor's exit was consumed.
-    pub async fn settled(&self, job_id: JobId, step_id: StepId) -> Option<StepOutcome> {
+    /// supervisor's exit was consumed. Attempt 0 names whichever attempt ran.
+    pub async fn settled(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: StepId,
+    ) -> Option<StepOutcome> {
         let settled = self.settled.lock().await;
         settled
             .iter()
             .rev()
-            .find(|entry| entry.key == (job_id, step_id))
+            .find(|entry| {
+                entry.key.0 == job_id
+                    && entry.key.2 == step_id
+                    && (run_attempt == 0 || entry.key.1 == run_attempt)
+            })
             .map(|entry| entry.outcome)
     }
 
@@ -112,22 +140,24 @@ impl StepCompletions {
     pub async fn reregister(
         &self,
         job_id: JobId,
+        run_attempt: u32,
         step_id: StepId,
     ) -> Option<oneshot::Receiver<StepOutcome>> {
+        let key = (job_id, run_attempt, step_id);
         let mut waiters = self.waiters.lock().await;
-        if waiters
-            .get(&(job_id, step_id))
-            .is_some_and(|parked| !parked.is_closed())
-        {
+        if waiters.get(&key).is_some_and(|parked| !parked.is_closed()) {
             return None;
         }
         let (sender, receiver) = oneshot::channel();
-        waiters.insert((job_id, step_id), sender);
+        waiters.insert(key, sender);
         Some(receiver)
     }
 
-    pub async fn deregister(&self, job_id: JobId, step_id: StepId) {
-        self.waiters.lock().await.remove(&(job_id, step_id));
+    pub async fn deregister(&self, job_id: JobId, run_attempt: u32, step_id: StepId) {
+        self.waiters
+            .lock()
+            .await
+            .remove(&(job_id, run_attempt, step_id));
     }
 
     #[cfg(test)]
@@ -148,9 +178,9 @@ mod tests {
     #[tokio::test]
     async fn a_registered_step_receives_its_outcome() {
         let completions = StepCompletions::new();
-        let waiter = completions.register(42, 0).await;
+        let waiter = completions.register(42, 1, 0).await;
 
-        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert!(completions.complete(42, 1, 0, OUTCOME).await);
 
         assert_eq!(waiter.await.expect("outcome delivered"), OUTCOME);
     }
@@ -159,27 +189,27 @@ mod tests {
     async fn completing_an_unregistered_step_reports_no_waiter() {
         let completions = StepCompletions::new();
 
-        assert!(!completions.complete(42, 0, OUTCOME).await);
+        assert!(!completions.complete(42, 1, 0, OUTCOME).await);
     }
 
     #[tokio::test]
     async fn a_step_id_is_scoped_to_its_job() {
         let completions = StepCompletions::new();
-        let waiter = completions.register(42, 0).await;
+        let waiter = completions.register(42, 1, 0).await;
 
-        assert!(!completions.complete(43, 0, OUTCOME).await);
+        assert!(!completions.complete(43, 1, 0, OUTCOME).await);
 
-        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert!(completions.complete(42, 1, 0, OUTCOME).await);
         assert_eq!(waiter.await.expect("outcome delivered"), OUTCOME);
     }
 
     #[tokio::test]
     async fn two_steps_of_one_job_settle_independently() {
         let completions = StepCompletions::new();
-        let first = completions.register(42, 0).await;
-        let second = completions.register(42, 1).await;
+        let first = completions.register(42, 1, 0).await;
+        let second = completions.register(42, 1, 1).await;
 
-        assert!(completions.complete(42, 1, OUTCOME).await);
+        assert!(completions.complete(42, 1, 1, OUTCOME).await);
 
         assert_eq!(second.await.expect("outcome delivered"), OUTCOME);
         assert_eq!(completions.parked().await, 1);
@@ -189,21 +219,21 @@ mod tests {
     #[tokio::test]
     async fn deregistering_abandons_the_waiter() {
         let completions = StepCompletions::new();
-        let waiter = completions.register(42, 0).await;
+        let waiter = completions.register(42, 1, 0).await;
 
-        completions.deregister(42, 0).await;
+        completions.deregister(42, 1, 0).await;
 
-        assert!(!completions.complete(42, 0, OUTCOME).await);
+        assert!(!completions.complete(42, 1, 0, OUTCOME).await);
         assert!(waiter.await.is_err(), "abandoned waiter must not resolve");
     }
 
     #[tokio::test]
     async fn a_dropped_waiter_leaves_the_slot_reclaimable() {
         let completions = StepCompletions::new();
-        drop(completions.register(42, 0).await);
+        drop(completions.register(42, 1, 0).await);
 
         assert!(
-            !completions.complete(42, 0, OUTCOME).await,
+            !completions.complete(42, 1, 0, OUTCOME).await,
             "a dropped receiver must not read as a delivered outcome"
         );
         assert_eq!(completions.parked().await, 0);
@@ -212,28 +242,28 @@ mod tests {
     #[tokio::test]
     async fn a_reconnecting_client_takes_over_an_abandoned_slot() {
         let completions = StepCompletions::new();
-        drop(completions.register(42, 0).await);
+        drop(completions.register(42, 1, 0).await);
 
         let mut resumed = completions
-            .reregister(42, 0)
+            .reregister(42, 1, 0)
             .await
             .expect("an abandoned slot is available");
 
-        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert!(completions.complete(42, 1, 0, OUTCOME).await);
         assert_eq!(resumed.try_recv().expect("outcome delivered"), OUTCOME);
     }
 
     #[tokio::test]
     async fn reregistering_never_displaces_a_live_waiter() {
         let completions = StepCompletions::new();
-        let mut original = completions.register(42, 0).await;
+        let mut original = completions.register(42, 1, 0).await;
 
         assert!(
-            completions.reregister(42, 0).await.is_none(),
+            completions.reregister(42, 1, 0).await.is_none(),
             "a parked waiter must keep its slot"
         );
 
-        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert!(completions.complete(42, 1, 0, OUTCOME).await);
         assert_eq!(original.try_recv().expect("outcome delivered"), OUTCOME);
     }
 
@@ -241,52 +271,69 @@ mod tests {
     async fn a_step_nobody_ever_awaited_can_be_registered_by_a_reconnect() {
         let completions = StepCompletions::new();
 
-        assert!(completions.reregister(42, 0).await.is_some());
+        assert!(completions.reregister(42, 1, 0).await.is_some());
     }
 
     #[tokio::test]
     async fn an_outcome_nobody_was_parked_for_is_still_answerable() {
         let completions = StepCompletions::new();
 
-        assert!(!completions.complete(42, 0, OUTCOME).await);
+        assert!(!completions.complete(42, 1, 0, OUTCOME).await);
 
-        assert_eq!(completions.settled(42, 0).await, Some(OUTCOME));
+        assert_eq!(completions.settled(42, 1, 0).await, Some(OUTCOME));
     }
 
     #[tokio::test]
     async fn a_delivered_outcome_stays_answerable_for_a_reconnect() {
         let completions = StepCompletions::new();
-        let waiter = completions.register(42, 0).await;
+        let waiter = completions.register(42, 1, 0).await;
 
-        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert!(completions.complete(42, 1, 0, OUTCOME).await);
         assert_eq!(waiter.await.expect("outcome delivered"), OUTCOME);
 
-        assert_eq!(completions.settled(42, 0).await, Some(OUTCOME));
+        assert_eq!(completions.settled(42, 1, 0).await, Some(OUTCOME));
     }
 
     #[tokio::test]
     async fn a_step_that_never_settled_is_not_answerable() {
         let completions = StepCompletions::new();
-        completions.register(42, 0).await;
+        completions.register(42, 1, 0).await;
 
-        assert_eq!(completions.settled(42, 0).await, None);
+        assert_eq!(completions.settled(42, 1, 0).await, None);
     }
 
     #[tokio::test]
     async fn a_rerun_of_a_key_replaces_the_remembered_outcome() {
         let completions = StepCompletions::new();
-        completions.complete(42, 0, OUTCOME).await;
+        completions.complete(42, 1, 0, OUTCOME).await;
 
         let rerun = StepOutcome {
             exit_code: 0,
             signal: 0,
         };
-        completions.complete(42, 0, rerun).await;
+        completions.complete(42, 1, 0, rerun).await;
 
-        assert_eq!(completions.settled(42, 0).await, Some(rerun));
+        assert_eq!(completions.settled(42, 1, 0).await, Some(rerun));
     }
 
-    fn settled_at(key: (JobId, StepId), settled_at: Instant) -> SettledStep {
+    #[tokio::test]
+    async fn a_superseded_attempts_caller_is_not_woken_by_the_redispatch() {
+        let completions = StepCompletions::new();
+        let mut superseded = completions.register(42, 1, 0).await;
+
+        assert!(!completions.complete(42, 2, 0, OUTCOME).await);
+
+        assert!(
+            superseded.try_recv().is_err(),
+            "a redispatch must not resolve the attempt it replaced"
+        );
+        assert_eq!(completions.settled(42, 1, 0).await, None);
+        assert_eq!(completions.settled(42, 2, 0).await, Some(OUTCOME));
+        // An older client names no attempt and takes whichever one ran.
+        assert_eq!(completions.settled(42, 0, 0).await, Some(OUTCOME));
+    }
+
+    fn settled_at(key: StepKey, settled_at: Instant) -> SettledStep {
         SettledStep {
             key,
             outcome: OUTCOME,
@@ -298,26 +345,26 @@ mod tests {
     fn eviction_caps_the_number_of_remembered_outcomes() {
         let now = Instant::now();
         let mut settled: VecDeque<_> = (0..SETTLED_CAPACITY as u32 + 10)
-            .map(|step_id| settled_at((42, step_id), now))
+            .map(|step_id| settled_at((42, 1, step_id), now))
             .collect();
 
         evict_settled(&mut settled, now);
 
         assert_eq!(settled.len(), SETTLED_CAPACITY);
-        assert_eq!(settled.front().map(|entry| entry.key), Some((42, 10)));
+        assert_eq!(settled.front().map(|entry| entry.key), Some((42, 1, 10)));
     }
 
     #[test]
     fn eviction_drops_outcomes_past_their_retention() {
         let now = Instant::now();
         let mut settled = VecDeque::from(vec![
-            settled_at((42, 0), now - SETTLED_RETENTION - Duration::from_secs(1)),
-            settled_at((42, 1), now),
+            settled_at((42, 1, 0), now - SETTLED_RETENTION - Duration::from_secs(1)),
+            settled_at((42, 1, 1), now),
         ]);
 
         evict_settled(&mut settled, now);
 
         assert_eq!(settled.len(), 1);
-        assert_eq!(settled.front().map(|entry| entry.key), Some((42, 1)));
+        assert_eq!(settled.front().map(|entry| entry.key), Some((42, 1, 1)));
     }
 }

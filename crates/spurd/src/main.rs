@@ -198,6 +198,49 @@ fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32, spur_core
     Some((job_id, run_attempt, step_id))
 }
 
+fn session_identity(completion: stepd::PendingStepdCompletion) -> agent_server::SessionIdentity {
+    (
+        completion.job_id,
+        completion.run_attempt,
+        completion.step_id,
+    )
+}
+
+/// Sessions a stale-recovery report still has to speak for: everything stale or
+/// corrupted whose own completion is neither already reported nor queued.
+fn sessions_needing_recovery_report(
+    stepds: &stepd::StepdStore,
+    stale: &[stepd::StepdDescriptor],
+    corrupted: Vec<agent_server::SessionIdentity>,
+    reported_or_queued: &std::collections::HashSet<agent_server::SessionIdentity>,
+) -> Vec<agent_server::SessionIdentity> {
+    stale
+        .iter()
+        // A session kept only so a re-attach can still read its exit has already
+        // been reported; reporting it again would fence a step that finished.
+        .filter(|descriptor| {
+            !stepds
+                .completion_reported(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                )
+                .unwrap_or(false)
+        })
+        .map(|descriptor| {
+            (
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+        })
+        .chain(corrupted)
+        // Keyed per session, not per job: a sibling step's pending completion
+        // says nothing about whether this one still needs fencing.
+        .filter(|id| !reported_or_queued.contains(id))
+        .collect()
+}
+
 /// The cgroup to reap for a stale session. A descriptor written before its
 /// cgroup was recorded still names the job, and the path follows from identity.
 fn stale_cgroup_path(descriptor: &stepd::StepdDescriptor) -> std::path::PathBuf {
@@ -327,6 +370,24 @@ async fn main() -> anyhow::Result<()> {
     // orphan. Reap it locally instead of leaving it running indefinitely.
     for descriptor in &stale_stepds {
         executor::cleanup_cgroup(&stale_cgroup_path(descriptor));
+    }
+    // The workload is reaped above but the controller still holds the job in
+    // Running; give the completion replay below an exit to report for it.
+    for descriptor in &stale_stepds {
+        match stepds.record_lost_supervisor_exit(descriptor) {
+            Ok(true) => warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                "supervisor lost while the agent was down; reporting its job as killed"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "failed to record a lost supervisor's exit; the job stays Running until fenced"
+            ),
+        }
     }
     // A corrupted descriptor has no cgroup_path to read, but the path is
     // reconstructable from identity alone — reap it the same way.
@@ -488,13 +549,13 @@ async fn main() -> anyhow::Result<()> {
     let unacknowledged_stepd_completions: std::collections::HashSet<_> = stepds
         .discover_unacknowledged_completions()?
         .into_iter()
-        .map(|completion| (completion.job_id, completion.run_attempt))
+        .map(session_identity)
         .collect();
-    let reconciled_stepd_completions =
-        agent_server::replay_unacknowledged_stepd_completions(&stepds, &args.controller, &hostname)
-            .await?;
     let reconciled_stepd_completions: std::collections::HashSet<_> =
-        reconciled_stepd_completions.into_iter().collect();
+        agent_server::replay_unacknowledged_stepd_completions(&stepds, &args.controller, &hostname)
+            .await?
+            .into_iter()
+            .collect();
     // Runs for the daemon's life, not just when this scan found something —
     // a push notification deferred later needs the same reconciliation.
     agent_server::retry_unacknowledged_stepd_completions(
@@ -502,9 +563,12 @@ async fn main() -> anyhow::Result<()> {
         args.controller.clone(),
         hostname.clone(),
     );
-    let pruned_stepds = stepds.prune_finalized()?;
-    if pruned_stepds > 0 {
-        info!(sessions = pruned_stepds, "pruned finalized stepd state");
+    // Housekeeping, and the periodic sweeper retries it; failing to read the
+    // runtime root is not a reason to refuse to start.
+    match stepds.prune_finalized() {
+        Ok(pruned) if pruned > 0 => info!(sessions = pruned, "pruned finalized stepd state"),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to prune finalized stepd state"),
     }
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
@@ -560,6 +624,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
+    agent_service
+        .replay_adopted_allocations(&recovered_stepds)
+        .await;
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
@@ -707,32 +774,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let unreportable_sessions = stale_stepds
-        .iter()
-        // A session kept only so a re-attach can still read its exit has already
-        // been reported; reporting it again would fence a step that finished.
-        .filter(|descriptor| {
-            !stepds
-                .completion_reported(
-                    descriptor.job_id,
-                    descriptor.run_attempt,
-                    descriptor.step_id,
-                )
-                .unwrap_or(false)
-        })
-        .map(|descriptor| {
-            (
-                descriptor.job_id,
-                descriptor.run_attempt,
-                descriptor.step_id,
-            )
-        })
-        .chain(corrupted_stepds)
-        .filter(|(job_id, run_attempt, _)| {
-            let id = (*job_id, *run_attempt);
-            !reconciled_stepd_completions.contains(&id)
-                && !unacknowledged_stepd_completions.contains(&id)
-        });
+    let mut reported_or_queued = unacknowledged_stepd_completions;
+    reported_or_queued.extend(reconciled_stepd_completions);
+    let unreportable_sessions = sessions_needing_recovery_report(
+        &stepds,
+        &stale_stepds,
+        corrupted_stepds,
+        &reported_or_queued,
+    );
     for (job_id, run_attempt, step_id) in unreportable_sessions {
         let recovery_reporter = reporter.clone();
         tokio::spawn(async move {
@@ -943,6 +992,63 @@ mod tests {
         // A typo'd --config must not be silently ignored.
         let err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(!absent_optional_config(true, &err));
+    }
+
+    // Sessions of one attempt share a job id, so a dedup keyed on the job alone
+    // lets a finished step suppress the fencing report its batch session needs.
+    #[test]
+    fn a_siblings_pending_completion_does_not_suppress_this_sessions_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = stepd::StepdStore::new(temp.path());
+        let batch = stepd::StepdDescriptor::new(
+            21,
+            1,
+            spur_core::step::STEP_BATCH,
+            999_999,
+            0,
+            std::path::PathBuf::from("/run/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        let sibling = stepd::StepdDescriptor::new(
+            21,
+            1,
+            0,
+            999_999,
+            0,
+            std::path::PathBuf::from("/run/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        for descriptor in [&batch, &sibling] {
+            store.publish(descriptor).expect("publish descriptor");
+        }
+        // Only the numbered step finished; the batch session never reported.
+        store
+            .obligations(21, 1, 0)
+            .append(&stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record the step's exit");
+
+        let queued: std::collections::HashSet<_> = store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions")
+            .into_iter()
+            .map(session_identity)
+            .collect();
+        assert_eq!(
+            queued.len(),
+            1,
+            "only the sibling step is queued for completion"
+        );
+
+        let needing =
+            sessions_needing_recovery_report(&store, &[batch, sibling], Vec::new(), &queued);
+        assert_eq!(
+            needing,
+            vec![(21, 1, spur_core::step::STEP_BATCH)],
+            "the batch session still needs fencing; its sibling is already queued"
+        );
     }
 
     #[test]
