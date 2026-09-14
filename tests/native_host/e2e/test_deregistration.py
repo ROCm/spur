@@ -189,6 +189,14 @@ class TestAgentSelfDeregistration:
         time.sleep(35)
         assert cluster.sinfo_nodes().get(node1, "").startswith("down")
 
+        # WAL replay stamps a heartbeat on every node; the restarted
+        # controller must still hold the node down with its reason.
+        cluster.restart_controller()
+        reasons = cluster.cli(["sinfo", "-R"])
+        assert "agent shutdown" in reasons and node1 in reasons, reasons
+        time.sleep(35)
+        assert cluster.sinfo_nodes().get(node1, "").startswith("down")
+
         cluster.restart_agent(1)
         _wait_node_state(cluster, node1, ["idle"], timeout=90)
 
