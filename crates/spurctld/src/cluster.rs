@@ -3495,6 +3495,12 @@ impl ClusterManager {
             reason_uid,
             reason_time,
         })?;
+        // The agent's last heartbeat is still fresh, so the next health tick
+        // would recover the node with no agent behind it. Clearing it holds
+        // Down until the restarted agent heartbeats again.
+        if let Some(n) = self.nodes.write().get_mut(name) {
+            n.last_heartbeat = None;
+        }
         self.k8s_metrics
             .set_node_up(&self.config().cluster_name, name, false);
         self.run_all_finalized_side_effects(&resp);
@@ -24516,6 +24522,35 @@ mod tests {
             "system action carries a timestamp"
         );
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+    }
+
+    /// The agent's last heartbeat is still fresh when it shuts down, so a
+    /// health tick must not recover the node until the agent heartbeats again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_shutdown_down_holds_until_heartbeat_resumes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.mark_node_down("n1", Some("agent shutdown".into()))
+            .unwrap();
+        wait_for("n1 down", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down, "no agent, no recovery");
+        assert_eq!(node.state_reason.as_deref(), Some("agent shutdown"));
+
+        assert!(cm.update_heartbeat("n1", 0, 0));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("n1 recovered", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+        assert_eq!(cm.get_node("n1").unwrap().state_reason, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
