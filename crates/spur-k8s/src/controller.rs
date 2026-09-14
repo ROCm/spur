@@ -9,6 +9,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Status;
 
+use spur_proto::controller_rpc_retryable;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
 // A Service with no ready endpoint drops the SYN and the kernel retries it for
@@ -54,24 +55,6 @@ pub async fn probe(addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A channel whose peer is gone answers nothing until the kernel gives up on
-/// it, and the request bound alone does not close it, so the next call would
-/// wait on the same dead connection. Drop it after a transport error instead.
-pub fn is_transport_error(status: &Status) -> bool {
-    use tonic::Code;
-    // tonic maps hyper transport errors other than a failed connect to Unknown,
-    // and an h2 GOAWAY or protocol error from a dying peer to Internal. A
-    // needless reconnect on an application Internal is harmless.
-    matches!(
-        status.code(),
-        Code::Unavailable
-            | Code::Unknown
-            | Code::Cancelled
-            | Code::DeadlineExceeded
-            | Code::Internal
-    )
-}
-
 /// The one long-lived client of a task: reconnects after a transport error.
 pub struct ControllerClient {
     addr: String,
@@ -86,6 +69,11 @@ impl ControllerClient {
             addr: addr.to_string(),
             client: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_channel(&self) -> bool {
+        self.client.is_some()
     }
 
     pub async fn call<T, F, Fut>(&mut self, rpc: F) -> Result<T, Status>
@@ -103,8 +91,11 @@ impl ControllerClient {
             }
         };
         let result = rpc(client).await;
+        // A dead peer answers nothing until the kernel gives up, and the request
+        // bound alone does not close the channel, so the next call would wait
+        // on the same dead connection.
         if let Err(status) = &result {
-            if is_transport_error(status) {
+            if controller_rpc_retryable(status) {
                 self.client = None;
             }
         }
@@ -168,7 +159,7 @@ mod tests {
             .call(|mut c| async move { c.ping(()).await })
             .await
             .expect_err("nothing answers on that socket");
-        assert!(is_transport_error(&err), "{err}");
+        assert!(controller_rpc_retryable(&err), "{err}");
         assert!(ctrl.client.is_none(), "the dead channel must not be reused");
     }
 
@@ -207,25 +198,6 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
         assert!(ctrl.client.is_none());
-    }
-
-    #[test]
-    fn transport_errors_are_the_codes_a_dead_peer_produces() {
-        assert!(is_transport_error(&Status::unavailable(
-            "tcp connect error"
-        )));
-        assert!(is_transport_error(&Status::unknown("transport error")));
-        assert!(is_transport_error(&Status::cancelled("Timeout expired")));
-        assert!(is_transport_error(&Status::deadline_exceeded("deadline")));
-        assert!(is_transport_error(&Status::internal("h2 protocol error")));
-
-        assert!(!is_transport_error(&Status::ok("")));
-        assert!(!is_transport_error(&Status::not_found("no such job")));
-        assert!(!is_transport_error(&Status::invalid_argument("bad")));
-        assert!(!is_transport_error(&Status::permission_denied("no")));
-        assert!(!is_transport_error(&Status::failed_precondition(
-            "not the leader"
-        )));
     }
 
     #[test]
