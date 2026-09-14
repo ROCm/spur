@@ -3495,12 +3495,6 @@ impl ClusterManager {
             reason_uid,
             reason_time,
         })?;
-        // The agent's last heartbeat is still fresh, so the next health tick
-        // would recover the node with no agent behind it. Clearing it holds
-        // Down until the restarted agent heartbeats again.
-        if let Some(n) = self.nodes.write().get_mut(name) {
-            n.last_heartbeat = None;
-        }
         self.k8s_metrics
             .set_node_up(&self.config().cluster_name, name, false);
         self.run_all_finalized_side_effects(&resp);
@@ -6485,6 +6479,12 @@ impl ClusterManager {
                     node.reason_uid = *reason_uid;
                     node.reason_time = *reason_time;
                     node.admin_locked = *admin_locked;
+                    // A Down node has no live heartbeat. Register and update
+                    // stamp one during replay too, and a fresh stamp would
+                    // recover the node at the next health tick with no agent.
+                    if *new_state == NodeState::Down {
+                        node.last_heartbeat = None;
+                    }
                 }
                 if *new_state == NodeState::Down {
                     Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
@@ -24590,6 +24590,54 @@ mod tests {
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
         assert_eq!(cm.get_node("n1").unwrap().state_reason, None);
+    }
+
+    /// Replay stamps a heartbeat on every registered node, so a restarted
+    /// controller must not recover a Down node that has no agent behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn down_node_has_no_heartbeat_after_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("agent shutdown".into()),
+            admin_locked: false,
+            reason_uid: Some(0),
+            reason_time: Some(Utc::now()),
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.last_heartbeat, None, "replayed Down has no heartbeat");
+
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+
+        assert!(cm.update_heartbeat("n1", 0, 0));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("n1 recovered", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
