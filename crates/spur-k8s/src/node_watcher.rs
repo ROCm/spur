@@ -12,14 +12,12 @@ use k8s_openapi::api::core::v1::Node as K8sNode;
 use kube::api::Api;
 use kube::runtime::watcher::{self, Event};
 use kube::Client;
-use tonic::transport::Channel;
-use tonic::Status;
 use tracing::{debug, error, info, warn};
 
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_proto::controller_rpc_retryable;
 use spur_proto::proto::{NodeState, RegisterAgentRequest, ResourceSet, UpdateNodeRequest};
 
-use crate::controller::{connect, is_transport_error};
+use crate::controller::ControllerClient;
 use crate::heartbeat::HeartbeatManager;
 
 /// Tracks the taint state of a K8s node and whether spurctld has been notified.
@@ -59,11 +57,7 @@ fn fingerprint(resources: &ResourceSet) -> u64 {
     hasher.finish()
 }
 
-async fn sync_taint_state(
-    name: &str,
-    entry: &mut NodeTaintState,
-    client: &mut SlurmControllerClient<Channel>,
-) {
+async fn sync_taint_state(name: &str, entry: &mut NodeTaintState, client: &mut ControllerClient) {
     let (state, reason) = if entry.tainted {
         (NodeState::NodeDown as i32, Some("K8s node NotReady".into()))
     } else {
@@ -78,7 +72,10 @@ async fn sync_taint_state(
         remove_labels: Vec::new(),
     };
 
-    match client.update_node(req).await {
+    match client
+        .call(|mut c| async move { c.update_node(req).await })
+        .await
+    {
         Ok(_) => {
             entry.synced = true;
             if entry.tainted {
@@ -108,7 +105,7 @@ pub async fn run(
 
     info!(selector = %label_selector, "starting K8s node watcher");
 
-    let mut ctrl_client = connect(&controller_addr).await?;
+    let mut ctrl = ControllerClient::new(&controller_addr);
     let mut fingerprints: HashMap<String, u64> = HashMap::new();
     let mut taint_states: HashMap<String, NodeTaintState> = HashMap::new();
 
@@ -138,9 +135,16 @@ pub async fn run(
                         join_token: String::new(),
                     };
 
-                    match ctrl_client.register_agent(req.clone()).await {
+                    let reg = req.clone();
+                    match ctrl
+                        .call(|mut c| async move { c.register_agent(reg).await })
+                        .await
+                    {
                         Ok(_) => {}
-                        Err(status) if registration_failure_restarts_watcher(&status) => {
+                        // Restart to list every node again: the fingerprint is stored only
+                        // after success, and a quiet node may produce no event for minutes,
+                        // so the relist is the only prompt retry of a lost registration.
+                        Err(status) if controller_rpc_retryable(&status) => {
                             return Err(status).context(format!("register K8s node {name}"));
                         }
                         Err(status) => {
@@ -165,7 +169,7 @@ pub async fn run(
                 }
 
                 if !entry.synced {
-                    sync_taint_state(&name, entry, &mut ctrl_client).await;
+                    sync_taint_state(&name, entry, &mut ctrl).await;
                 }
             }
             Event::Delete(node) => {
@@ -183,7 +187,10 @@ pub async fn run(
                     remove_labels: Vec::new(),
                 };
 
-                if let Err(e) = ctrl_client.update_node(req).await {
+                if let Err(e) = ctrl
+                    .call(|mut c| async move { c.update_node(req).await })
+                    .await
+                {
                     error!(node = %name, error = %e, "failed to mark K8s node DOWN");
                 }
             }
@@ -197,14 +204,6 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-/// A transport error means the controller may be gone; ending the watcher lets
-/// its retry loop open a fresh channel and list every node again. Any other
-/// refusal, such as a missing admission token, would repeat on every restart
-/// and stop taint and drain sync for all nodes, so it is logged instead.
-fn registration_failure_restarts_watcher(status: &Status) -> bool {
-    is_transport_error(status)
 }
 
 /// Check if a K8s node has the not-ready taint.
@@ -763,26 +762,19 @@ mod tests {
         assert_eq!(fingerprint(&r), fingerprint(&r));
     }
 
-    #[test]
-    fn a_transport_error_during_registration_restarts_the_watcher() {
-        assert!(registration_failure_restarts_watcher(&Status::unavailable(
-            "tcp connect error"
-        )));
-        assert!(registration_failure_restarts_watcher(&Status::cancelled(
-            "Timeout expired"
-        )));
-    }
+    /// Nothing listens on port 1, so the kernel refuses the connect at once.
+    /// The entry stays unsynced, so the node's next event retries the sync.
+    #[tokio::test]
+    async fn a_taint_sync_against_an_unreachable_controller_stays_unsynced() {
+        let mut ctrl = ControllerClient::new("127.0.0.1:1");
+        let mut entry = NodeTaintState {
+            tainted: true,
+            synced: false,
+        };
 
-    #[test]
-    fn a_refused_registration_keeps_the_watcher_running() {
-        assert!(!registration_failure_restarts_watcher(
-            &Status::unauthenticated("admission token required")
-        ));
-        assert!(!registration_failure_restarts_watcher(
-            &Status::invalid_argument("bad resources")
-        ));
-        assert!(!registration_failure_restarts_watcher(
-            &Status::permission_denied("no")
-        ));
+        sync_taint_state("node-1", &mut entry, &mut ctrl).await;
+
+        assert!(!entry.synced);
+        assert!(!ctrl.has_channel(), "no channel survives a refused connect");
     }
 }
