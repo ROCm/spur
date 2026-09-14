@@ -46,10 +46,12 @@ pub async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<Channel
         .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE))
 }
 
-/// The readiness probe only asks whether the controller accepts a connection,
-/// and kubelet bounds the probe itself, so it needs none of the channel bounds.
+/// The readiness probe only asks whether the controller accepts a connection.
+/// kubelet's own timeout decides readiness; the connect bound only frees the
+/// handler, which a dropped SYN would otherwise hold for the kernel's SYN retries.
 pub async fn probe(addr: &str) -> anyhow::Result<()> {
     Endpoint::from_shared(controller_url(addr))?
+        .connect_timeout(CONNECT_TIMEOUT)
         .connect()
         .await?;
     Ok(())
@@ -198,6 +200,12 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
         assert!(ctrl.client.is_none());
+    }
+
+    /// Nothing listens on port 1, so the kernel refuses the connect at once.
+    #[tokio::test]
+    async fn a_probe_of_a_refused_port_fails() {
+        assert!(probe("127.0.0.1:1").await.is_err());
     }
 
     #[test]
