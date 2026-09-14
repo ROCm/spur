@@ -880,7 +880,10 @@ matches, and the first matching entry wins.
    registers with the controller, so adding a block here does not create a node,
    and removing one does not remove a node — it only clears that node's features
    and weight. Remove a node with ``spur node remove <node>``, which takes a
-   :ref:`cluster admin <privileged-operations>`. This differs from Slurm, where
+   :ref:`cluster admin <privileged-operations>`. When ``spurd`` stops, the node
+   stays in the inventory as ``down`` with the reason ``agent shutdown``. It
+   returns to service when the agent registers and sends heartbeats again. An
+   operator drain is kept through the restart. This differs from Slurm, where
    ``NodeName=`` lines in ``slurm.conf`` define the roster.
 
 ``[network]``

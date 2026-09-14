@@ -161,11 +161,11 @@ fn update_provisioning_clock(
 /// Run one reconcile tick for the current phase. Extracted from `run` so it is testable.
 ///
 /// Ready and Provisioning both run the assignment + converge reconcile so the cluster self-heals: a
-/// node that is removed then re-added (a spurd restart deregisters on SIGTERM, dropping the node +
-/// its k0s assignment) or a node added while Ready gets (re)assigned a role/IP/CIDR, (re)joined, and
-/// rejoins the mesh membership on the next ApplyMesh tick. Idempotent — assigned + active nodes are
-/// skipped — so a converged cluster does no work beyond the per-node status probes. Without running
-/// this in Ready, a re-added node stays un-roled (out of the mesh) until the next manual `spur k8s up`.
+/// node that is removed then re-added or a node added while Ready gets (re)assigned a role/IP/CIDR,
+/// (re)joined, and rejoins the mesh membership on the next ApplyMesh tick. Idempotent — assigned +
+/// active nodes are skipped — so a converged cluster does no work beyond the per-node status probes.
+/// Without running this in Ready, a re-added node stays un-roled (out of the mesh) until the next
+/// manual `spur k8s up`.
 pub(crate) async fn reconcile_phase(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
