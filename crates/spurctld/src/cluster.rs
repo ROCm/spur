@@ -3338,18 +3338,10 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    // An admin hold's reason takes precedence over the liveness
-                    // reason it would otherwise be marked with; keep that hold's
-                    // original attribution too. Otherwise this is a system
-                    // (heartbeat) action attributed to uid 0 at this instant.
-                    let held = admin_locked
-                        .then(|| self.get_node(&name))
-                        .flatten()
-                        .filter(|n| n.state_reason.is_some());
-                    let (reason, reason_uid, reason_time) = match held {
-                        Some(n) => (n.state_reason, n.reason_uid, n.reason_time),
-                        None => (Some("Not responding".into()), Some(0), Some(Utc::now())),
-                    };
+                    let (reason, reason_uid, reason_time) = down_reason_attribution(
+                        self.get_node(&name).as_ref(),
+                        Some("Not responding".into()),
+                    );
                     match self.propose(WalOperation::NodeStateChange {
                         name: name.clone(),
                         old_state,
@@ -3480,31 +3472,19 @@ impl ClusterManager {
         name: &str,
         reason: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        // An admin hold's reason, lock and attribution outrank the shutdown
-        // reason, so an operator's drain is not silently cleared when the
-        // agent restarts. Otherwise this is a system action: uid 0, now.
         let (old_state, admin_locked, reason, reason_uid, reason_time) = {
             let nodes = self.nodes.read();
             let node = nodes
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
-            if node.admin_locked && node.state_reason.is_some() {
-                (
-                    node.state,
-                    node.admin_locked,
-                    node.state_reason.clone(),
-                    node.reason_uid,
-                    node.reason_time,
-                )
-            } else {
-                (
-                    node.state,
-                    node.admin_locked,
-                    reason,
-                    Some(0),
-                    Some(Utc::now()),
-                )
-            }
+            let (reason, reason_uid, reason_time) = down_reason_attribution(Some(node), reason);
+            (
+                node.state,
+                node.admin_locked,
+                reason,
+                reason_uid,
+                reason_time,
+            )
         };
         let resp = self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
@@ -8012,6 +7992,21 @@ fn reason_attribution(
     match reason {
         Some(_) => (reason_uid, Some(Utc::now())),
         None => (None, None),
+    }
+}
+
+/// Reason and provenance for a system-initiated Down transition. An admin
+/// hold keeps its reason and attribution so an operator's drain survives a
+/// heartbeat timeout or an agent restart; anything else is uid 0, now.
+fn down_reason_attribution(
+    node: Option<&Node>,
+    fallback: Option<String>,
+) -> (Option<String>, Option<u32>, Option<DateTime<Utc>>) {
+    match node {
+        Some(n) if n.admin_locked && n.state_reason.is_some() => {
+            (n.state_reason.clone(), n.reason_uid, n.reason_time)
+        }
+        _ => (fallback, Some(0), Some(Utc::now())),
     }
 }
 
