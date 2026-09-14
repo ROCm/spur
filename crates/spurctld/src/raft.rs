@@ -492,20 +492,15 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(op) => {
-                    debug!(index = entry.log_id.index, "raft: applying WalOperation");
                     inner.applied_count += 1;
-                    // An entry that was already on disk when this process started is
-                    // a replay of history, not something happening now.
                     let replaying = inner
                         .replay_upto
                         .is_some_and(|upto| entry.log_id.index <= upto);
-                    if replaying {
-                        let span = tracing::info_span!(WAL_REPLAY_SPAN, index = entry.log_id.index);
-                        let _enter = span.enter();
-                        results.push(self.applier.apply_operation(op));
-                    } else {
-                        results.push(self.applier.apply_operation(op));
-                    }
+                    let _replay_span = replaying.then(|| {
+                        tracing::info_span!(WAL_REPLAY_SPAN, index = entry.log_id.index).entered()
+                    });
+                    debug!(index = entry.log_id.index, "raft: applying WalOperation");
+                    results.push(self.applier.apply_operation(op));
                 }
                 EntryPayload::Membership(mem) => {
                     inner.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
