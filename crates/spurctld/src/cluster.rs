@@ -24524,6 +24524,45 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
     }
 
+    /// An operator's drain outranks the shutdown reason: the hold keeps its
+    /// reason, uid, time and lock through the agent stop and restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_shutdown_preserves_admin_hold_attribution() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()), Some(1000))
+            .unwrap();
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.reason_uid == Some(1000))
+        });
+        let held = cm.get_node("n1").unwrap();
+
+        cm.mark_node_down("n1", Some("agent shutdown".into()))
+            .unwrap();
+        wait_for("n1 down", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state_reason.as_deref(), Some("hw swap"));
+        assert_eq!(node.reason_uid, Some(1000), "admin-hold uid preserved");
+        assert_eq!(node.reason_time, held.reason_time, "set-time preserved");
+        assert!(node.admin_locked, "operator lock survives the shutdown");
+
+        assert!(cm.update_heartbeat("n1", 0, 0));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Down,
+            "a heartbeat does not lift a hold"
+        );
+        assert!(node.admin_locked);
+    }
+
     /// The agent's last heartbeat is still fresh when it shuts down, so a
     /// health tick must not recover the node until the agent heartbeats again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
