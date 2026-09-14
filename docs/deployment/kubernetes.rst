@@ -131,9 +131,10 @@ The operator opens each channel to ``spurctld`` with these bounds:
 - HTTP/2 keepalive pings every 10 s. A ping with no answer in 5 s closes the channel.
 - A bound of 30 s on each request.
 
-The job controller keeps one channel open. After a transport error it drops the channel and opens a
-new one on the next call. A refusal from the controller, for example ``NOT_FOUND``, is an answer and
-keeps the channel.
+The job controller and the node watcher each keep one channel open. After a transport error they
+drop the channel and open a new one on the next call. A refusal from the controller, for example
+``NOT_FOUND``, is an answer and keeps the channel. A request that reaches the 30 s bound is a
+transport error and is retried.
 
 The node watcher registers each Kubernetes node with the controller. A transport error during a
 registration restarts the node watcher, which lists every node again. A refusal that is not a
