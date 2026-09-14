@@ -45,3 +45,52 @@ class TestMeshBringUp:
         assert peer.endpoint is not None, (
             f"worker↔worker peer has no endpoint (hub-and-spoke regression): {peer}"
         )
+
+
+class TestPeerPersistence:
+    """`net add-peer`/`join` must persist to the config file, not just the live
+    interface — otherwise a peer silently vanishes on the next interface reload
+    (host reboot, `wg-quick` restart), even though it's still live right now."""
+
+    def test_peers_survive_an_interface_reload(self, raw_wg_mesh):
+        indices = list(range(len(raw_wg_mesh.nodes)))
+        others = [i for i in indices if i != 0]
+        expected = {raw_wg_mesh.pubkeys[i] for i in others}
+
+        # The bring-up already ran net_join/net_add_peer, so every peer must be
+        # in node 0's persisted conf, not just its live wg state.
+        persisted = set(raw_wg_mesh.conf_peer_keys(0))
+        assert expected <= persisted, (
+            f"peers missing from the persisted config: {expected - persisted}"
+        )
+
+        # Simulate a reboot/service restart: the interface is torn down and
+        # rebuilt strictly from that conf file.
+        raw_wg_mesh.reload_interface(0)
+
+        live = set(raw_wg_mesh.wg_peer_keys(0))
+        assert expected <= live, (
+            f"peers dropped after an interface reload: {expected - live}"
+        )
+        # And connectivity actually still works, not just the peer table.
+        raw_wg_mesh.assert_all_to_all(indices)
+
+    def test_add_peer_keeps_directives_spur_does_not_manage(self, raw_wg_mesh):
+        """`add-peer` rewrites a file operators also hand-maintain: silently
+        dropping an `MTU` or a `PostUp` changes the interface on its next reload."""
+        indices = list(range(len(raw_wg_mesh.nodes)))
+        raw_wg_mesh.add_interface_directive(0, "MTU = 1380")
+
+        # Re-adding a peer that is already there triggers the read-modify-write
+        # while leaving the mesh membership unchanged.
+        peer = 1 if len(indices) > 1 else 0
+        raw_wg_mesh.net_add_peer(
+            0, raw_wg_mesh.pubkeys[peer], f"{raw_wg_mesh.mesh_ip_for(peer)}/32"
+        )
+
+        conf = raw_wg_mesh.conf_text(0)
+        assert "MTU = 1380" in conf, f"unmanaged directive dropped by add-peer:\n{conf}"
+
+        # And the result is still a conf wg-quick accepts, with the mesh intact.
+        raw_wg_mesh.reload_interface(0)
+        raw_wg_mesh.assert_all_to_all(indices)

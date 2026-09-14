@@ -96,6 +96,30 @@ Enable the ``wg-quick@<iface>`` unit so the interface is recreated on reboot fro
 The Ansible toolkit does this automatically when ``spur_wg_persist=true`` (the
 default).
 
+``add-peer``, ``remove-peer``, and ``mesh`` also persist their result to
+``/etc/wireguard/<iface>.conf`` (in addition to applying it live), so a peer
+added this way survives the interface being recreated on reboot. Point
+``--config-dir`` at the same directory used for ``init``/``join`` if it isn't
+the default ``/etc/wireguard``.
+
+Rewriting the file preserves directives Spur does not manage itself — ``PostUp``,
+``MTU``, ``Table``, per-peer ``PresharedKey`` and so on are carried through
+unchanged. Comments and blank lines are not preserved.
+
+Under a SPUR-managed k0s cluster, the peers in a k0s-meshed node's persisted
+config are also protected from the k0s reconcile loop's prune pass (see below):
+the reconcile only removes a peer that is both outside its own k0s membership
+*and* absent from that node's config, so a peer you added for something outside
+the k0s cluster is never pruned out from under you. Note this covers every peer
+in the file, including ones a previous ``spur net mesh`` wrote — so if you ran
+``mesh`` before enabling k0s, that membership is pinned too.
+
+If ``spurd`` runs with a non-default config directory, set
+``SPUR_WG_CONFIG_DIR`` in its environment to match the ``--config-dir`` you pass
+to ``spur net``. ``spurd`` reads the persisted config from that directory to
+decide what to protect, and defaults to ``/etc/wireguard``; if the two disagree,
+it finds no config and protects nothing.
+
 Removing a node from the mesh
 =============================
 

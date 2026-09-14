@@ -41,6 +41,9 @@ pub struct NodeReporter {
     /// re-read on every register/heartbeat via [`wg_pubkey`](Self::wg_pubkey) so a key that appears
     /// or changes after startup (late mesh join, `spur0` recreated) reaches the controller.
     pub wg_iface: String,
+    /// Directory holding `<wg_iface>.conf` (e.g. `/etc/wireguard`), so `apply_mesh` can read which
+    /// peers were persisted by `spur net add-peer` and exempt them from the k0s reconcile's prune.
+    pub wg_config_dir: std::path::PathBuf,
     node_token: RwLock<String>,
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
@@ -59,6 +62,7 @@ impl NodeReporter {
         labels: HashMap<String, String>,
         join_token: String,
         wg_iface: String,
+        wg_config_dir: std::path::PathBuf,
         held_jobs: Arc<dyn HeldJobs>,
     ) -> Self {
         Self {
@@ -71,6 +75,7 @@ impl NodeReporter {
             cpu_load: AtomicU64::new(0),
             join_token,
             wg_iface,
+            wg_config_dir,
             node_token: RwLock::new(String::new()),
             held_jobs,
             k0s_status: std::sync::OnceLock::new(),
