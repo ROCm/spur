@@ -5,7 +5,8 @@
 E2E tests for node deregistration.
 
 Covers: graceful drain+remove, forced eviction, dead-node auto-cleanup,
-agent self-deregistration, and the bug fix for failing jobs on downed nodes.
+agent shutdown keeping the node as down, and the bug fix for failing jobs
+on downed nodes.
 """
 
 import time
@@ -170,14 +171,34 @@ class TestForcedEviction:
 
 
 class TestAgentSelfDeregistration:
-    """Test SIGTERM-based agent self-deregistration."""
+    """A SIGTERM'd agent leaves its node in the inventory as down, and the
+    node returns to idle once the agent is back."""
 
-    def test_agent_sigterm_deregisters(self, multi_node_cluster):
+    def test_agent_sigterm_marks_node_down_and_keeps_it(self, multi_node_cluster):
         cluster = multi_node_cluster
         node1 = cluster.node_names[1]
 
         _sigterm_agent(cluster, 1)
-        _wait_node_gone(cluster, node1, timeout=30)
+        _wait_node_state(cluster, node1, ["down"], timeout=30)
+        assert node1 in cluster.sinfo_nodes()
+        reasons = cluster.cli(["sinfo", "-R"])
+        assert "agent shutdown" in reasons and node1 in reasons, reasons
+
+        # One health tick (30s) must pass without the node flapping to idle
+        # while no agent is running.
+        time.sleep(35)
+        assert cluster.sinfo_nodes().get(node1, "").startswith("down")
+
+        # WAL replay stamps a heartbeat on every node; the restarted
+        # controller must still hold the node down with its reason.
+        cluster.restart_controller()
+        reasons = cluster.cli(["sinfo", "-R"])
+        assert "agent shutdown" in reasons and node1 in reasons, reasons
+        time.sleep(35)
+        assert cluster.sinfo_nodes().get(node1, "").startswith("down")
+
+        cluster.restart_agent(1)
+        _wait_node_state(cluster, node1, ["idle"], timeout=90)
 
 
 class TestDownNodeFailsJobs:

@@ -3338,18 +3338,10 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    // An admin hold's reason takes precedence over the liveness
-                    // reason it would otherwise be marked with; keep that hold's
-                    // original attribution too. Otherwise this is a system
-                    // (heartbeat) action attributed to uid 0 at this instant.
-                    let held = admin_locked
-                        .then(|| self.get_node(&name))
-                        .flatten()
-                        .filter(|n| n.state_reason.is_some());
-                    let (reason, reason_uid, reason_time) = match held {
-                        Some(n) => (n.state_reason, n.reason_uid, n.reason_time),
-                        None => (Some("Not responding".into()), Some(0), Some(Utc::now())),
-                    };
+                    let (reason, reason_uid, reason_time) = down_reason_attribution(
+                        self.get_node(&name).as_ref(),
+                        Some("Not responding".into()),
+                    );
                     match self.propose(WalOperation::NodeStateChange {
                         name: name.clone(),
                         old_state,
@@ -3463,6 +3455,51 @@ impl ClusterManager {
                 JobState::Running | JobState::Completing | JobState::Suspended
             ) && j.allocated_nodes.iter().any(|n| n == name)
         })
+    }
+
+    /// Mark a node Down because its agent is stopping (reboot, service restart).
+    /// Returns finalized jobs from eviction so callers can send cancel RPCs.
+    ///
+    /// An agent that stops is down, not gone: the node record — with its
+    /// `wg_pubkey` and mesh IP — is what holds the WireGuard membership
+    /// together (`cluster_k8s::mesh_from_nodes`), and removing it makes every
+    /// other node prune this node's peer, which leaves the node unable to
+    /// register again over the mesh it needs. The record therefore stays, and
+    /// `check_node_health` recovers the node when its heartbeat returns.
+    /// Removal stays an operator action (`spur node remove`, `spur k8s down`).
+    pub fn mark_node_down(
+        &self,
+        name: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<Vec<JobFinalized>> {
+        let (old_state, admin_locked, reason, reason_uid, reason_time) = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
+            let (reason, reason_uid, reason_time) = down_reason_attribution(Some(node), reason);
+            (
+                node.state,
+                node.admin_locked,
+                reason,
+                reason_uid,
+                reason_time,
+            )
+        };
+        let resp = self.propose(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state,
+            new_state: NodeState::Down,
+            reason,
+            admin_locked,
+            reason_uid,
+            reason_time,
+        })?;
+        self.k8s_metrics
+            .set_node_up(&self.config().cluster_name, name, false);
+        self.run_all_finalized_side_effects(&resp);
+        info!(node = %name, "node marked DOWN (agent shutdown), record kept");
+        Ok(resp.jobs_finalized)
     }
 
     /// Remove a node from the cluster. If `force`, evict running jobs first.
@@ -6442,6 +6479,12 @@ impl ClusterManager {
                     node.reason_uid = *reason_uid;
                     node.reason_time = *reason_time;
                     node.admin_locked = *admin_locked;
+                    // A Down node has no live heartbeat. Register and update
+                    // stamp one during replay too, and a fresh stamp would
+                    // recover the node at the next health tick with no agent.
+                    if *new_state == NodeState::Down {
+                        node.last_heartbeat = None;
+                    }
                 }
                 if *new_state == NodeState::Down {
                     Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
@@ -8000,6 +8043,21 @@ fn reason_attribution(
     match reason {
         Some(_) => (reason_uid, Some(Utc::now())),
         None => (None, None),
+    }
+}
+
+/// Reason and provenance for a system-initiated Down transition. An admin
+/// hold keeps its reason and attribution so an operator's drain survives a
+/// heartbeat timeout or an agent restart; anything else is uid 0, now.
+fn down_reason_attribution(
+    node: Option<&Node>,
+    fallback: Option<String>,
+) -> (Option<String>, Option<u32>, Option<DateTime<Utc>>) {
+    match node {
+        Some(n) if n.admin_locked && n.state_reason.is_some() => {
+            (n.state_reason.clone(), n.reason_uid, n.reason_time)
+        }
+        _ => (fallback, Some(0), Some(Utc::now())),
     }
 }
 
@@ -24618,6 +24676,159 @@ mod tests {
         wait_for("n1 removed", || cm.get_node("n1").is_none());
 
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+    }
+
+    /// A stopping agent must not delete its node: the record carries the
+    /// `wg_pubkey` that keeps the node in the WireGuard membership, and
+    /// without it every other node prunes the peer and the node cannot
+    /// register again after a reboot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_shutdown_marks_node_down_and_keeps_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.update_node_wg_pubkey("n1", "pubkey1");
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        cm.mark_node_down("n1", Some("agent shutdown".into()))
+            .unwrap();
+        wait_for("n1 down", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        let node = cm.get_node("n1").expect("node must survive a shutdown");
+        assert_eq!(node.wg_pubkey.as_deref(), Some("pubkey1"));
+        assert!(!node.admin_locked, "must stay recoverable on heartbeat");
+        assert_eq!(node.state_reason.as_deref(), Some("agent shutdown"));
+        assert_eq!(
+            node.reason_uid,
+            Some(0),
+            "system action is attributed to root"
+        );
+        assert!(
+            node.reason_time.is_some(),
+            "system action carries a timestamp"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+    }
+
+    /// An operator's drain outranks the shutdown reason: the hold keeps its
+    /// reason, uid, time and lock through the agent stop and restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_shutdown_preserves_admin_hold_attribution() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()), Some(1000))
+            .unwrap();
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.reason_uid == Some(1000))
+        });
+        let held = cm.get_node("n1").unwrap();
+
+        cm.mark_node_down("n1", Some("agent shutdown".into()))
+            .unwrap();
+        wait_for("n1 down", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state_reason.as_deref(), Some("hw swap"));
+        assert_eq!(node.reason_uid, Some(1000), "admin-hold uid preserved");
+        assert_eq!(node.reason_time, held.reason_time, "set-time preserved");
+        assert!(node.admin_locked, "operator lock survives the shutdown");
+
+        assert!(cm.update_heartbeat("n1", 0, 0));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Down,
+            "a heartbeat does not lift a hold"
+        );
+        assert!(node.admin_locked);
+    }
+
+    /// The agent's last heartbeat is still fresh when it shuts down, so a
+    /// health tick must not recover the node until the agent heartbeats again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_shutdown_down_holds_until_heartbeat_resumes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.mark_node_down("n1", Some("agent shutdown".into()))
+            .unwrap();
+        wait_for("n1 down", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down, "no agent, no recovery");
+        assert_eq!(node.state_reason.as_deref(), Some("agent shutdown"));
+
+        assert!(cm.update_heartbeat("n1", 0, 0));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("n1 recovered", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+        assert_eq!(cm.get_node("n1").unwrap().state_reason, None);
+    }
+
+    /// Replay stamps a heartbeat on every registered node, so a restarted
+    /// controller must not recover a Down node that has no agent behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn down_node_has_no_heartbeat_after_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("agent shutdown".into()),
+            admin_locked: false,
+            reason_uid: Some(0),
+            reason_time: Some(Utc::now()),
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.last_heartbeat, None, "replayed Down has no heartbeat");
+
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+
+        assert!(cm.update_heartbeat("n1", 0, 0));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("n1 recovered", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

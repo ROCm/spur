@@ -1866,11 +1866,14 @@ impl SlurmController for ControllerService {
         if self.cluster.get_node(&req.hostname).is_none() {
             return Ok(Response::new(()));
         }
+        // A stopping agent is Down, not gone. Deleting the record here would
+        // drop the node from the WireGuard membership, every other node would
+        // prune its peer, and the node could not register again over the mesh
+        // after a reboot. See `ClusterManager::mark_node_down`.
         let evicted = self
             .cluster
-            .remove_node(
+            .mark_node_down(
                 &req.hostname,
-                true,
                 Some(req.reason.clone()).filter(|r| !r.is_empty()),
             )
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -6943,14 +6946,19 @@ mod tests {
         }))
         .await
         .expect("the same node must be able to deregister cleanly");
-        // Deregistering an unknown node is also Ok, so assert the node really went.
+        // Deregistering an unknown node is also Ok, so assert the node really
+        // went Down. The record itself stays, it carries the mesh membership.
         for _ in 0..200 {
-            if svc.cluster.get_node("n1").is_none() {
+            if svc
+                .cluster
+                .get_node("n1")
+                .is_some_and(|n| n.state == spur_core::node::NodeState::Down)
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        panic!("deregistration left the node registered");
+        panic!("deregistration left the node up");
     }
 
     // The relaxation keys on the controller having no key, never on the request
