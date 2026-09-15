@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         args.log_format.as_deref(),
         "",
         "",
-    );
+    )?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

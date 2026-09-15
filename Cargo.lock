@@ -3774,6 +3774,7 @@ version = "0.13.0"
 dependencies = [
  "chrono",
  "serde_json",
+ "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
 ]

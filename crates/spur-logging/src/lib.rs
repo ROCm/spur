@@ -18,6 +18,7 @@ use std::io::IsTerminal;
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::prelude::*;
@@ -29,6 +30,19 @@ use tracing_subscriber::EnvFilter;
 pub enum Format {
     Json,
     Text,
+}
+
+/// A logging value that could not be resolved into a subscriber.
+///
+/// Surfaced from [`init`] so a daemon fails fast on a bad `--log-level` /
+/// `--log-format` or `[logging]` value instead of starting up silent or in the
+/// wrong format.
+#[derive(Debug, thiserror::Error)]
+pub enum LoggingError {
+    #[error("invalid log level/filter {value:?}: {reason}")]
+    InvalidFilter { value: String, reason: String },
+    #[error("invalid log format {value:?} (expected \"json\" or \"text\")")]
+    InvalidFormat { value: String },
 }
 
 /// Install the global subscriber for a daemon.
@@ -43,22 +57,25 @@ pub fn init(
     cli_format: Option<&str>,
     config_level: &str,
     config_format: &str,
-) {
-    let filter = resolve_filter(cli_level, config_level, "info");
-    let format = resolve_format(cli_format, config_format, std::io::stderr().is_terminal());
+) -> Result<(), LoggingError> {
+    let filter = resolve_filter(cli_level, config_level, "info")?;
+    let format = resolve_format(cli_format, config_format, std::io::stderr().is_terminal())?;
     install(component, filter, format, false);
+    Ok(())
 }
 
 /// Install the global subscriber for the CLI.
 ///
 /// The CLI ignores `spur.conf` for logging and defaults to `warn` so library
-/// diagnostics stay quiet next to the command's own output. Text mode is
-/// compact (no timestamp/target) to match the CLI's historical behaviour;
-/// piped output still emits the shared JSON schema.
+/// diagnostics stay quiet next to the command's own output. Output is always
+/// compact text: the CLI writes its results to stdout and its own errors to
+/// stderr as plain text, so emitting JSON tracing lines on stderr would mix
+/// formats for a script capturing it. `RUST_LOG` still tunes the level.
 pub fn init_cli(component: &'static str) {
-    let filter = resolve_filter(None, "", "warn");
-    let format = resolve_format(None, "", std::io::stderr().is_terminal());
-    install(component, filter, format, true);
+    // Inputs are constant and valid, so resolution cannot fail here; fall back
+    // to `warn` rather than unwrap on the impossible error.
+    let filter = resolve_filter(None, "", "warn").unwrap_or_else(|_| EnvFilter::new("warn"));
+    install(component, filter, Format::Text, true);
 }
 
 fn install(component: &'static str, filter: EnvFilter, format: Format, compact_text: bool) {
@@ -105,15 +122,46 @@ fn resolve_level(cli_level: Option<&str>, config_level: &str, default_level: &st
     default_level.to_string()
 }
 
-fn resolve_filter(cli_level: Option<&str>, config_level: &str, default_level: &str) -> EnvFilter {
+fn resolve_filter(
+    cli_level: Option<&str>,
+    config_level: &str,
+    default_level: &str,
+) -> Result<EnvFilter, LoggingError> {
     // RUST_LOG (including per-module directives) wins when present and valid.
     if let Ok(filter) = EnvFilter::try_from_default_env() {
-        return filter;
+        return Ok(filter);
     }
-    EnvFilter::new(resolve_level(cli_level, config_level, default_level))
+    parse_filter(&resolve_level(cli_level, config_level, default_level))
 }
 
-fn resolve_format(cli_format: Option<&str>, config_format: &str, is_tty: bool) -> Format {
+/// Build an `EnvFilter` from a resolved level/directive string, rejecting a
+/// bare token that is not a real level. `EnvFilter` otherwise accepts e.g.
+/// `notalevel` as a per-target directive matching nothing, so the process
+/// starts and emits zero log lines. Pure (no env), so it is deterministically
+/// testable.
+fn parse_filter(level: &str) -> Result<EnvFilter, LoggingError> {
+    // A single bare token (no per-target directives) must name a valid level;
+    // strings with `=`/`,` are RUST_LOG-style directives and parse as-is.
+    if !level.contains('=') && !level.contains(',') && level.parse::<LevelFilter>().is_err() {
+        return Err(LoggingError::InvalidFilter {
+            value: level.to_string(),
+            reason: "expected one of trace, debug, info, warn, error".to_string(),
+        });
+    }
+    match level.parse::<EnvFilter>() {
+        Ok(filter) => Ok(filter),
+        Err(e) => Err(LoggingError::InvalidFilter {
+            value: level.to_string(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+fn resolve_format(
+    cli_format: Option<&str>,
+    config_format: &str,
+    is_tty: bool,
+) -> Result<Format, LoggingError> {
     let config_choice = if config_format.is_empty() {
         None
     } else {
@@ -121,11 +169,15 @@ fn resolve_format(cli_format: Option<&str>, config_format: &str, is_tty: bool) -
     };
     let choice = cli_format.filter(|s| !s.is_empty()).or(config_choice);
     match choice {
-        Some("json") => Format::Json,
-        Some("text") => Format::Text,
-        // Unset (or "auto"/unrecognized): text on a terminal, JSON otherwise.
-        _ if is_tty => Format::Text,
-        _ => Format::Json,
+        Some("json") => Ok(Format::Json),
+        Some("text") => Ok(Format::Text),
+        // An explicit but unrecognized value is a typo, not a request for the
+        // TTY default — reject it so it can't silently flip text/JSON by env.
+        Some(other) => Err(LoggingError::InvalidFormat {
+            value: other.to_owned(),
+        }),
+        None if is_tty => Ok(Format::Text),
+        None => Ok(Format::Json),
     }
 }
 
@@ -189,7 +241,20 @@ struct JsonVisitor<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
 
 impl JsonVisitor<'_> {
     fn insert(&mut self, field: &Field, value: serde_json::Value) {
-        self.0.insert(field.name().to_string(), value);
+        let name = field.name();
+        // The formatter writes `timestamp`/`level`/`component`/`target` before
+        // recording fields, so a call-site field with one of those names would
+        // otherwise overwrite the canonical value and silently break the fixed
+        // schema (e.g. `target = %node` turning `target` into a hostname). Rename
+        // the collision to `field_<name>` so both survive. `message` is not
+        // renamed: the event's own message is recorded as a field named
+        // `message`, so it must keep that key — call sites that also pass an
+        // explicit `message` field are renamed at the source instead.
+        let key = match name {
+            "timestamp" | "level" | "component" | "target" => format!("field_{name}"),
+            _ => name.to_string(),
+        };
+        self.0.insert(key, value);
     }
 }
 
@@ -325,13 +390,48 @@ mod tests {
     }
 
     #[test]
+    fn reserved_keys_are_not_clobbered_by_event_fields() {
+        let v = capture_json("spurd", || {
+            tracing::warn!(target = "gpu-07", "node drained");
+        });
+        // The canonical `target` stays the module path; the colliding call-site
+        // field is preserved under `field_target` instead of overwriting it.
+        assert!(v["target"].as_str().unwrap().contains("spur_logging"));
+        assert_eq!(v["field_target"], "gpu-07");
+        // The event's own message still occupies the canonical `message` key.
+        assert_eq!(v["message"], "node drained");
+    }
+
+    #[test]
     fn format_resolution() {
-        assert_eq!(resolve_format(Some("json"), "text", true), Format::Json);
-        assert_eq!(resolve_format(Some("text"), "json", false), Format::Text);
-        assert_eq!(resolve_format(None, "json", true), Format::Json);
-        assert_eq!(resolve_format(None, "text", false), Format::Text);
-        assert_eq!(resolve_format(None, "", true), Format::Text);
-        assert_eq!(resolve_format(None, "", false), Format::Json);
-        assert_eq!(resolve_format(Some(""), "", false), Format::Json);
+        assert_eq!(
+            resolve_format(Some("json"), "text", true).unwrap(),
+            Format::Json
+        );
+        assert_eq!(
+            resolve_format(Some("text"), "json", false).unwrap(),
+            Format::Text
+        );
+        assert_eq!(resolve_format(None, "json", true).unwrap(), Format::Json);
+        assert_eq!(resolve_format(None, "text", false).unwrap(), Format::Text);
+        assert_eq!(resolve_format(None, "", true).unwrap(), Format::Text);
+        assert_eq!(resolve_format(None, "", false).unwrap(), Format::Json);
+        assert_eq!(resolve_format(Some(""), "", false).unwrap(), Format::Json);
+        // An explicit but unrecognized value is rejected, not silently defaulted
+        // by the TTY rule.
+        assert!(resolve_format(Some("jason"), "", true).is_err());
+        assert!(resolve_format(None, "jsonn", false).is_err());
+    }
+
+    #[test]
+    fn filter_rejects_bare_non_level() {
+        // Valid bare levels and RUST_LOG-style directives parse.
+        assert!(parse_filter("info").is_ok());
+        assert!(parse_filter("debug").is_ok());
+        assert!(parse_filter("spurctld=debug,spur_net=trace").is_ok());
+        // A typo that EnvFilter would otherwise accept as a match-nothing target
+        // directive (silencing the daemon) is rejected instead.
+        assert!(parse_filter("notalevel").is_err());
+        assert!(parse_filter("infoo").is_err());
     }
 }
