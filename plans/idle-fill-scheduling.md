@@ -386,7 +386,8 @@ their QOS is marked `idle_fill_preemptable` keep counting in full, for the reaso
 
 ### 7.1 The borrow cap
 
-If borrowed nodes do not count toward quota, borrowing is bounded only by idle capacity.
+Once borrowed nodes are excluded from the aggregates at both gates (§7), **neither the QOS
+group node cap nor the association node cap bounds borrowing** — only idle capacity does.
 One team can borrow every idle node in the cluster. Reclaim makes that recoverable rather
 than permanent, and tail ordering shares it out among borrowers, so uncapped borrowing is
 self-limiting and not a correctness problem. **Review decided to add a cap anyway**, as a
@@ -758,6 +759,11 @@ Placement is all-or-nothing (`backfill.rs:577`).
 - **Collection**: only when enabled; het, burst-buffer, licensed, and unbounded jobs are
   never collected; the account credit is re-checked; `preferred_nodes` cleared;
   `reserved.reserve` called.
+- **Packing credit under exclusion**: a candidate packing onto a *legitimate* sibling's
+  node still gets the reduced charge and the `preferred_nodes` hint, while a
+  borrowed-only node grants neither. The two must move together — excluding a node from
+  `sum_running_tres` while leaving it in `occupied_nodes` would credit a reuse the
+  aggregate does not count, admitting one node over cap.
 - **Placement ordering**: an in-quota job outranks a candidate for the same node; a
   candidate takes a node nobody wants; it does not take a node reserved for an in-quota
   future start; it *does* when its time limit fits before that start; it takes no future
