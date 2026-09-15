@@ -10,6 +10,8 @@ mod job_controller;
 mod node_watcher;
 mod quota;
 mod quota_controller;
+#[cfg(test)]
+mod test_support;
 
 use std::net::SocketAddr;
 use std::time::Duration;
