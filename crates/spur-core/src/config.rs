@@ -671,6 +671,16 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Master switch for idle-fill scheduling. `false` (default) means no
+    /// behavior change anywhere: an over-quota job never borrows spare capacity.
+    #[serde(default)]
+    pub idle_fill_enabled: bool,
+    /// Minimum seconds a borrowed (idle-fill) job must have been running before
+    /// it may be reclaimed. Deliberately separate from `preempt_exempt_time`,
+    /// which is unbounded and user-raisable; this is the only guard on reclaim,
+    /// so it is short and bounded.
+    #[serde(default = "default_idle_fill_exempt_secs")]
+    pub idle_fill_exempt_secs: u32,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -696,6 +706,9 @@ fn default_complete_wait() -> u32 {
 fn default_max_user_priority() -> u32 {
     crate::job::DEFAULT_PRIORITY
 }
+fn default_idle_fill_exempt_secs() -> u32 {
+    60
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -712,6 +725,8 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            idle_fill_enabled: false,
+            idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
         }
     }
 }
@@ -3852,6 +3867,30 @@ max_launch_backoff_secs = 90
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.max_launch_backoff_secs, 90);
+    }
+
+    #[test]
+    fn idle_fill_scheduler_defaults_are_off_and_bounded() {
+        let toml = r#"
+cluster_name = "test"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.scheduler.idle_fill_enabled);
+        assert_eq!(config.scheduler.idle_fill_exempt_secs, 60);
+    }
+
+    #[test]
+    fn idle_fill_scheduler_settings_parse() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+idle_fill_enabled = true
+idle_fill_exempt_secs = 120
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(config.scheduler.idle_fill_enabled);
+        assert_eq!(config.scheduler.idle_fill_exempt_secs, 120);
     }
 
     #[test]

@@ -260,6 +260,8 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
         },
         usage_factor: r.usage_factor,
         deny_on_limit: parse_deny_on_limit(&r.flags),
+        // No stored column yet; surfacing lands with the accounting schema work.
+        idle_fill_preemptable: false,
     }
 }
 

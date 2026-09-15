@@ -873,6 +873,15 @@ pub struct Job {
     #[serde(default)]
     pub preempt_qos: Option<String>,
 
+    /// This run started on spare capacity the job's QOS group node quota did not
+    /// cover (idle-fill). A stamped job is borrowed: it is held outside every
+    /// QOS quota aggregate and is reclaimable on demand. `#[serde(default)]` is
+    /// mandatory — `Job` is serialized whole into the cluster snapshot, whose
+    /// restore hard-fails on a deserialize error, so a missing default would
+    /// crash a controller replaying older state.
+    #[serde(default)]
+    pub idle_fill: bool,
+
     /// Nodes the QOS/account grp-node admission check credited this job for
     /// reusing (they had spare capacity), recomputed fresh every scheduling
     /// pass. Consulted by `NodePlacement` as a nodelist fallback so placement
@@ -938,6 +947,7 @@ impl Job {
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
+            idle_fill: false,
             preferred_nodes: HashSet::new(),
             last_sched_eval: None,
         }
