@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{HeartbeatRequest, RegisterAgentRequest};
+
+use crate::controller::connect;
 
 // Matches spurd's 30 s interval, well inside `controller.heartbeat_timeout_secs`.
 const INTERVAL_SECS: u64 = 30;
@@ -75,18 +76,6 @@ impl HeartbeatManager {
             }
         }
     }
-}
-
-async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<tonic::transport::Channel>> {
-    let url = if addr.starts_with("http") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    };
-    Ok(SlurmControllerClient::connect(url)
-        .await?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE))
 }
 
 #[cfg(test)]

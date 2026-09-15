@@ -25,12 +25,20 @@ pub const MAX_GRPC_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 /// while allowing large outbound responses.
 pub const MAX_GRPC_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
-/// Only transient RPC failures are retried; a spec rejection would repeat forever.
+/// Transient and transport failures, including a client-side request timeout,
+/// are retried; a spec rejection would repeat forever, so it is not.
 pub fn controller_rpc_retryable(status: &tonic::Status) -> bool {
     use tonic::Code;
+    // tonic maps a request timeout to Cancelled, hyper transport errors other
+    // than a failed connect to Unknown, and an h2 GOAWAY from a dying peer to
+    // Internal.
     matches!(
         status.code(),
-        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+        Code::Unavailable
+            | Code::Internal
+            | Code::DeadlineExceeded
+            | Code::Unknown
+            | Code::Cancelled
     )
 }
 
@@ -109,6 +117,10 @@ mod tests {
             &tonic::Status::permission_denied("account denied")
         ));
         assert!(!controller_rpc_retryable(&tonic::Status::not_found("x")));
+        assert!(!controller_rpc_retryable(&tonic::Status::ok("")));
+        assert!(!controller_rpc_retryable(
+            &tonic::Status::failed_precondition("not the leader")
+        ));
     }
 
     #[test]
@@ -122,6 +134,10 @@ mod tests {
         )));
         assert!(controller_rpc_retryable(&tonic::Status::deadline_exceeded(
             "timed out"
+        )));
+        // What tonic returns when the client-side request bound expires.
+        assert!(controller_rpc_retryable(&tonic::Status::cancelled(
+            "Timeout expired"
         )));
     }
 }
