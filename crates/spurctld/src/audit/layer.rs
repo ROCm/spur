@@ -22,38 +22,33 @@ use super::AuditSlot;
 use crate::accounting::{txn, TxnOutcome, TxnRecord, TxnSource};
 use crate::auth_middleware::Verified;
 use crate::cluster::ClusterManager;
-use crate::raft::RaftHandle;
 use crate::rpc_middleware::{grpc_operation_name, peer_addr};
 
 /// Not `audit`, which already carries job-submit hook decisions; interleaving
 /// the two would leave neither stream filterable.
 const AUDIT_RPC_TARGET: &str = "audit_rpc";
 
-/// Behind a trait so the middleware can be driven as a plain `Service` in
-/// tests, without a `ClusterManager` or an elected Raft leader.
+/// Set by a controller forwarding to the Raft leader. Mirrors the constant in
+/// `server`, which owns the forwarding itself.
+const FORWARDED_HEADER: &str = "x-spur-forwarded";
+
+/// Where finished rows go. Behind a trait so the middleware can be driven as a
+/// plain `Service` in tests, without standing up a `ClusterManager`.
 pub(crate) trait AuditContext: Send + Sync + 'static {
-    /// Whether this controller applied the mutation, so a leader-scoped row is
-    /// ours to write rather than the leader's.
-    fn is_leader(&self) -> bool;
     fn record(&self, record: TxnRecord);
 }
 
 pub(crate) struct ControllerAudit {
     cluster: Arc<ClusterManager>,
-    raft: Arc<RaftHandle>,
 }
 
 impl ControllerAudit {
-    pub(crate) fn new(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) -> Self {
-        Self { cluster, raft }
+    pub(crate) fn new(cluster: Arc<ClusterManager>) -> Self {
+        Self { cluster }
     }
 }
 
 impl AuditContext for ControllerAudit {
-    fn is_leader(&self) -> bool {
-        self.raft.is_leader()
-    }
-
     fn record(&self, record: TxnRecord) {
         self.cluster.record_txn(record);
     }
@@ -113,6 +108,9 @@ where
         // The marker, not the identity's presence: a future path deriving an
         // identity without checking a credential must not record as verified.
         let verified = req.extensions().get::<Verified>().is_some();
+        // The hop replaced the client's connection, so `peer` is the forwarding
+        // controller. A forged flag only casts doubt on the sender's own row.
+        let forwarded = req.headers().contains_key(FORWARDED_HEADER);
         let peer = peer_addr(req.extensions());
 
         // Only mutating RPCs get a slot, so a read cannot annotate its way into
@@ -137,7 +135,6 @@ where
         }
 
         let context = self.context.clone();
-        let is_leader = context.is_leader();
         let log_rpcs = self.log_rpcs;
         let mut inner = self.inner.clone();
 
@@ -164,8 +161,9 @@ where
             }
 
             if let Some(m) = mutating {
-                if should_record(m.scope, is_leader) {
-                    let annotation = slot.and_then(|s| s.take());
+                let slot = slot.expect("a mutating RPC is always given a slot");
+                if should_record(m.scope, slot.executed_locally()) {
+                    let annotation = slot.take();
                     if m.targeted && annotation.is_none() {
                         warn!(
                             method = %method,
@@ -175,9 +173,12 @@ where
                     }
                     let record = build_record(
                         m,
-                        identity.as_ref(),
-                        verified,
-                        peer,
+                        Caller {
+                            identity: identity.as_ref(),
+                            verified,
+                            peer,
+                            forwarded,
+                        },
                         annotation,
                         outcome,
                         error.as_deref(),
@@ -191,11 +192,11 @@ where
     }
 }
 
-/// A follower forwards every mutating controller RPC to the leader, so only the
-/// leader may record it. Accounting bypasses Raft and records wherever it ran.
-fn should_record(scope: AuditScope, is_leader: bool) -> bool {
+/// Only the node that applied the action records it, per its own `check_leader`.
+/// Accounting bypasses Raft and records wherever it ran.
+fn should_record(scope: AuditScope, executed_locally: bool) -> bool {
     match scope {
-        AuditScope::LeaderOnly => is_leader,
+        AuditScope::LeaderOnly => executed_locally,
         AuditScope::Local => true,
     }
 }
@@ -214,21 +215,38 @@ fn outcome_of(headers: &HeaderMap) -> (TxnOutcome, Option<String>) {
     }
 }
 
-/// Assemble the row from the layer's half (who, where from, how it ended) and
-/// the handler's half (which object, which parameters).
-fn build_record(
-    m: Mutating,
-    identity: Option<&Identity>,
+/// What the layer knows about a caller without decoding the request body.
+struct Caller<'a> {
+    identity: Option<&'a Identity>,
     verified: bool,
     peer: Option<String>,
+    forwarded: bool,
+}
+
+/// Assembles the layer's half (who, from where, how it ended) with the
+/// handler's half (which object, which parameters).
+fn build_record(
+    m: Mutating,
+    caller: Caller<'_>,
     annotation: Option<super::Annotation>,
     outcome: TxnOutcome,
     error: Option<&str>,
 ) -> TxnRecord {
-    let (target, details, asserted) = match annotation {
+    let Caller {
+        identity,
+        verified,
+        peer,
+        forwarded,
+    } = caller;
+    let (target, mut details, asserted) = match annotation {
         Some(a) => (a.target, a.details, a.asserted_actor),
         None => (String::new(), serde_json::json!({}), None),
     };
+    if forwarded {
+        if let Some(obj) = details.as_object_mut() {
+            obj.insert("forwarded".into(), serde_json::Value::Bool(true));
+        }
+    }
     // An identity always wins over the wire, verified or not; the asserted name
     // is consulted only when there is no identity at all.
     let actor = match identity {
@@ -288,9 +306,12 @@ mod tests {
     fn a_verified_identity_supplies_the_actor_and_uid() {
         let rec = build_record(
             node_update(),
-            Some(&identity("alice", 1000)),
-            true,
-            Some("10.11.99.42:51234".into()),
+            Caller {
+                identity: Some(&identity("alice", 1000)),
+                verified: true,
+                peer: Some("10.11.99.42:51234".into()),
+                forwarded: false,
+            },
             Some(annotation("n1", None)),
             TxnOutcome::Success,
             None,
@@ -310,9 +331,12 @@ mod tests {
     fn a_credential_is_never_overridden_by_the_wire() {
         let rec = build_record(
             node_update(),
-            Some(&identity("alice", 1000)),
-            true,
-            None,
+            Caller {
+                identity: Some(&identity("alice", 1000)),
+                verified: true,
+                peer: None,
+                forwarded: false,
+            },
             Some(annotation("n1", Some("root"))),
             TxnOutcome::Success,
             None,
@@ -330,9 +354,12 @@ mod tests {
         // but must be marked unverified so it is never read as proof.
         let rec = build_record(
             node_update(),
-            None,
-            false,
-            None,
+            Caller {
+                identity: None,
+                verified: false,
+                peer: None,
+                forwarded: false,
+            },
             Some(annotation("daily", Some("bob"))),
             TxnOutcome::Denied,
             Some("user 'bob' cannot modify"),
@@ -353,9 +380,12 @@ mod tests {
     fn an_unverified_identity_names_the_actor_but_claims_no_proof() {
         let rec = build_record(
             node_update(),
-            Some(&identity("root", 0)),
-            false,
-            None,
+            Caller {
+                identity: Some(&identity("root", 0)),
+                verified: false,
+                peer: None,
+                forwarded: false,
+            },
             Some(annotation("n1", None)),
             TxnOutcome::Success,
             None,
@@ -372,13 +402,56 @@ mod tests {
         );
     }
 
+    /// The leader's `peer` is the forwarding controller, so the row says so
+    /// rather than passing that address off as the caller's.
+    #[test]
+    fn a_forwarded_row_marks_its_peer_as_a_hop() {
+        let rec = build_record(
+            node_update(),
+            Caller {
+                identity: Some(&identity("alice", 1000)),
+                verified: true,
+                peer: Some("10.11.99.184:6817".into()),
+                forwarded: true,
+            },
+            Some(annotation("n1", None)),
+            TxnOutcome::Success,
+            None,
+        );
+
+        let details: serde_json::Value = serde_json::from_str(&rec.details).expect("json");
+        assert_eq!(details["forwarded"], true);
+        // The credential survives the hop, so the actor is still trustworthy.
+        assert_eq!(rec.actor, "alice");
+        assert!(rec.verified);
+
+        // A direct request carries no such marker.
+        let direct = build_record(
+            node_update(),
+            Caller {
+                identity: Some(&identity("alice", 1000)),
+                verified: true,
+                peer: Some("10.0.0.5:51234".into()),
+                forwarded: false,
+            },
+            Some(annotation("n1", None)),
+            TxnOutcome::Success,
+            None,
+        );
+        let details: serde_json::Value = serde_json::from_str(&direct.details).expect("json");
+        assert!(details.get("forwarded").is_none());
+    }
+
     #[test]
     fn a_uid_above_i32_max_is_not_wrapped_negative() {
         let rec = build_record(
             node_update(),
-            Some(&identity("svc", 4_000_000_000)),
-            true,
-            None,
+            Caller {
+                identity: Some(&identity("svc", 4_000_000_000)),
+                verified: true,
+                peer: None,
+                forwarded: false,
+            },
             Some(annotation("n1", None)),
             TxnOutcome::Success,
             None,
@@ -392,9 +465,12 @@ mod tests {
         // cannot make the action disappear.
         let rec = build_record(
             node_update(),
-            None,
-            false,
-            None,
+            Caller {
+                identity: None,
+                verified: false,
+                peer: None,
+                forwarded: false,
+            },
             None,
             TxnOutcome::Error,
             Some("boom"),
@@ -455,26 +531,22 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingContext {
-        leader: bool,
         rows: Mutex<Vec<TxnRecord>>,
     }
 
     impl AuditContext for RecordingContext {
-        fn is_leader(&self) -> bool {
-            self.leader
-        }
-
         fn record(&self, record: TxnRecord) {
             self.rows.lock().expect("rows lock").push(record);
         }
     }
 
-    /// Inner service standing in for a tonic handler: optionally annotates the
-    /// slot the layer put in extensions, then returns `status`.
+    /// Inner service standing in for a tonic handler. `executes_locally` mimics
+    /// `check_leader` accepting the request instead of forwarding it.
     #[derive(Clone)]
     struct StubHandler {
         annotate_target: Option<&'static str>,
         status: Option<Code>,
+        executes_locally: bool,
     }
 
     impl Service<Request<()>> for StubHandler {
@@ -487,6 +559,11 @@ mod tests {
         }
 
         fn call(&mut self, req: Request<()>) -> Self::Future {
+            if self.executes_locally {
+                if let Some(slot) = req.extensions().get::<Arc<AuditSlot>>() {
+                    slot.mark_executed_locally();
+                }
+            }
             if let Some(target) = self.annotate_target {
                 let slot = req
                     .extensions()
@@ -506,18 +583,20 @@ mod tests {
     /// Drive one request through the layer and return the rows it recorded.
     async fn rows_for(
         method: &str,
-        leader: bool,
         handler: StubHandler,
         identity: Option<Identity>,
     ) -> Vec<TxnRecord> {
         let context = Arc::new(RecordingContext {
-            leader,
             rows: Mutex::new(Vec::new()),
         });
         let mut req = Request::builder()
             .uri(format!("/slurm.SlurmController/{method}"))
             .body(())
             .expect("request");
+        assert!(
+            !req.headers().contains_key(FORWARDED_HEADER),
+            "a direct request must not look forwarded"
+        );
         // Mirrors `AuthLayer`, which inserts both together on a verified token.
         if let Some(id) = identity {
             req.extensions_mut().insert(id);
@@ -535,29 +614,36 @@ mod tests {
         rows
     }
 
-    fn annotating(target: &'static str) -> StubHandler {
+    /// Handler that applies the action locally and names its target.
+    fn applied(target: &'static str) -> StubHandler {
         StubHandler {
             annotate_target: Some(target),
             status: None,
+            executes_locally: true,
         }
     }
 
-    fn silent() -> StubHandler {
+    /// Applies locally but contributes no annotation.
+    fn applied_silent() -> StubHandler {
         StubHandler {
             annotate_target: None,
             status: None,
+            executes_locally: true,
+        }
+    }
+
+    /// Forwards to the leader instead of applying, as a follower does.
+    fn forwarded(target: &'static str) -> StubHandler {
+        StubHandler {
+            annotate_target: Some(target),
+            status: None,
+            executes_locally: false,
         }
     }
 
     #[tokio::test]
     async fn the_slot_survives_the_round_trip_to_the_handler() {
-        let rows = rows_for(
-            "UpdateNode",
-            true,
-            annotating("n1"),
-            Some(identity("alice", 1000)),
-        )
-        .await;
+        let rows = rows_for("UpdateNode", applied("n1"), Some(identity("alice", 1000))).await;
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -579,8 +665,9 @@ mod tests {
         let handler = StubHandler {
             annotate_target: Some("n1"),
             status: Some(Code::PermissionDenied),
+            executes_locally: true,
         };
-        let rows = rows_for("UpdateNode", true, handler, None).await;
+        let rows = rows_for("UpdateNode", handler, None).await;
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, TxnOutcome::Denied);
@@ -589,7 +676,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_mutating_handler_that_forgets_to_annotate_still_produces_a_row() {
-        let rows = rows_for("UpdateNode", true, silent(), Some(identity("alice", 1000))).await;
+        let rows = rows_for(
+            "UpdateNode",
+            applied_silent(),
+            Some(identity("alice", 1000)),
+        )
+        .await;
 
         assert_eq!(rows.len(), 1, "the action must not vanish from the log");
         assert_eq!(rows[0].entity_name, "");
@@ -599,31 +691,34 @@ mod tests {
     #[tokio::test]
     async fn reads_and_daemon_traffic_write_nothing() {
         for method in ["GetNodes", "Heartbeat", "Ping", "GetTransactions"] {
-            let rows = rows_for(method, true, silent(), Some(identity("alice", 1000))).await;
+            let rows = rows_for(method, applied_silent(), Some(identity("alice", 1000))).await;
             assert!(rows.is_empty(), "{method} must not be recorded");
         }
     }
 
+    /// The row follows the handler's own execute-vs-forward decision; a separate
+    /// sample could disagree across an election and duplicate or drop it.
     #[tokio::test]
-    async fn a_follower_records_nothing_for_a_leader_scoped_rpc() {
-        // It forwarded the work, so the leader writes the row.
-        let rows = rows_for(
-            "UpdateNode",
-            false,
-            annotating("n1"),
-            Some(identity("alice", 1000)),
-        )
-        .await;
-        assert!(rows.is_empty());
+    async fn recording_follows_the_handlers_decision_not_a_separate_sample() {
+        let forwarded_rows =
+            rows_for("UpdateNode", forwarded("n1"), Some(identity("alice", 1000))).await;
+        assert!(
+            forwarded_rows.is_empty(),
+            "the node that forwarded must not record; the leader does"
+        );
+
+        let applied_rows =
+            rows_for("UpdateNode", applied("n1"), Some(identity("alice", 1000))).await;
+        assert_eq!(applied_rows.len(), 1, "the node that applied must record");
     }
 
     #[tokio::test]
-    async fn a_follower_still_records_an_accounting_mutation() {
-        // Accounting bypasses Raft, so gating on leadership would lose the row.
+    async fn an_accounting_mutation_records_without_a_leader_decision() {
+        // Accounting bypasses Raft and never calls `check_leader`, so its rows
+        // cannot depend on the local-execution flag.
         let rows = rows_for(
             "CreateAccount",
-            false,
-            silent(),
+            forwarded("acct"),
             Some(identity("alice", 1000)),
         )
         .await;
@@ -634,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unclassified_method_is_not_recorded() {
-        let rows = rows_for("NoSuchRpc", true, silent(), Some(identity("alice", 1000))).await;
+        let rows = rows_for("NoSuchRpc", applied_silent(), Some(identity("alice", 1000))).await;
         assert!(rows.is_empty());
     }
 }

@@ -681,13 +681,16 @@ pub async fn get_transactions(
     if let Some(v) = filter.outcome.filter(|s| !s.is_empty()) {
         qb.push(" AND outcome = ").push_bind(v);
     }
-    // Match the `host:port` boundary, not a raw prefix: a bare host must find
-    // every port it used without `10.0.0.4` also returning `10.0.0.42`.
+    // Host:port boundary, not a raw prefix, so `10.0.0.4` misses `10.0.0.42`.
+    // The bracketed arm covers IPv6, rendered `[addr]:port` by `SocketAddr`.
     if let Some(v) = filter.peer_addr.filter(|s| !s.is_empty()) {
+        let host = escape_like(v);
         qb.push(" AND (peer_addr = ")
             .push_bind(v)
             .push(" OR peer_addr LIKE ")
-            .push_bind(format!("{}:%", escape_like(v)))
+            .push_bind(format!("{host}:%"))
+            .push(" OR peer_addr LIKE ")
+            .push_bind(format!("[{host}]:%"))
             .push(")");
     }
     if let Some(after) = filter.start_after {
@@ -3842,6 +3845,31 @@ mod txn_tests {
         )
         .await?;
         assert_eq!(exact.len(), 2);
+
+        // IPv6 is stored bracketed by `SocketAddr`, so a bare address must
+        // still find it.
+        let v6_entity = format!("{entity}_v6");
+        let mut v6 = sample(&v6_entity, TxnAction::Create, TxnOutcome::Success, now);
+        v6.peer_addr = "[2001:db8::1]:6817".to_string();
+        record_txn(&mut conn, &v6).await?;
+        let by_v6_host = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&v6_entity),
+                peer_addr: Some("2001:db8::1"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            by_v6_host.len(),
+            1,
+            "a bare IPv6 host must match [addr]:port"
+        );
+        sqlx::query("DELETE FROM txn WHERE entity_name = $1")
+            .bind(&v6_entity)
+            .execute(&pool)
+            .await?;
 
         sqlx::query("DELETE FROM txn WHERE entity_name = $1")
             .bind(&entity)
