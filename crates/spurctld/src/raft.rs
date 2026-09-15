@@ -24,6 +24,8 @@ use tracing::{debug, info, warn};
 
 use spur_core::wal::WalOperation;
 
+use crate::logging::WAL_REPLAY_SPAN;
+
 pub type NodeId = u64;
 
 openraft::declare_raft_types!(
@@ -113,6 +115,10 @@ struct StoreInner {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     applied_count: u64,
+    /// Highest log index on disk at startup; entries up to it are replays.
+    /// See [`WAL_REPLAY_SPAN`].
+    #[serde(skip)]
+    replay_upto: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -254,9 +260,12 @@ impl SpurStore {
             );
         }
 
+        inner.replay_upto = inner.log.keys().next_back().copied();
+
         info!(
             log_entries = inner.log.len(),
             vote = ?inner.vote,
+            replay_upto = ?inner.replay_upto,
             "raft store recovered from disk"
         );
         if skipped_records > 0 {
@@ -447,6 +456,9 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
+        if inner.replay_upto.is_some_and(|upto| upto >= log_id.index) {
+            inner.replay_upto = log_id.index.checked_sub(1);
+        }
         Ok(())
     }
 
@@ -483,8 +495,14 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(op) => {
-                    debug!(index = entry.log_id.index, "raft: applying WalOperation");
                     inner.applied_count += 1;
+                    let replaying = inner
+                        .replay_upto
+                        .is_some_and(|upto| entry.log_id.index <= upto);
+                    let _replay_span = replaying.then(|| {
+                        tracing::info_span!(WAL_REPLAY_SPAN, index = entry.log_id.index).entered()
+                    });
+                    debug!(index = entry.log_id.index, "raft: applying WalOperation");
                     results.push(self.applier.apply_operation(op));
                 }
                 EntryPayload::Membership(mem) => {
@@ -1397,6 +1415,69 @@ mod tests {
         let mut store2 = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
         let state = store2.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id, Some(log_id));
+    }
+
+    /// Everything on disk at startup is history, thus its log events must be
+    /// marked as a replay. A fresh store replays nothing.
+    #[test]
+    fn replay_upto_is_the_highest_index_on_disk() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+            assert_eq!(store.inner.read().replay_upto, None, "fresh store");
+            for index in [3u64, 17, 9] {
+                store
+                    .persist_log_entry(&Entry {
+                        log_id: LogId {
+                            leader_id: openraft::LeaderId {
+                                term: 1,
+                                node_id: 1,
+                            },
+                            index,
+                        },
+                        payload: EntryPayload::Blank,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let restarted = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        assert_eq!(restarted.inner.read().replay_upto, Some(17));
+    }
+
+    /// The leader's replacement entries after a conflict truncation are new to
+    /// this node, thus they must be logged as live events.
+    #[tokio::test]
+    async fn conflict_truncation_lowers_replay_upto() {
+        use openraft::RaftStorage;
+        let dir = TempDir::new().unwrap();
+        let log_id = |index| LogId {
+            leader_id: openraft::LeaderId {
+                term: 1,
+                node_id: 1,
+            },
+            index,
+        };
+        {
+            let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+            for index in 1..=5 {
+                store
+                    .persist_log_entry(&Entry {
+                        log_id: log_id(index),
+                        payload: EntryPayload::Blank,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let mut restarted = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
+        assert_eq!(restarted.inner.read().replay_upto, Some(5));
+
+        restarted
+            .delete_conflict_logs_since(log_id(4))
+            .await
+            .unwrap();
+        assert_eq!(restarted.inner.read().replay_upto, Some(3));
     }
 
     #[test]
