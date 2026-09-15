@@ -853,6 +853,7 @@ impl SlurmAccounting for AccountingService {
             entity_name: (!req.entity_name.is_empty()).then_some(req.entity_name.as_str()),
             action: (!req.action.is_empty()).then_some(req.action.as_str()),
             outcome: (!req.outcome.is_empty()).then_some(req.outcome.as_str()),
+            peer_addr: (!req.peer_addr.is_empty()).then_some(req.peer_addr.as_str()),
             start_after,
             start_before,
             limit: req.limit,
@@ -876,6 +877,7 @@ impl SlurmAccounting for AccountingService {
                 entity_name: r.entity_name,
                 outcome: r.outcome,
                 details: r.details,
+                peer_addr: r.peer_addr,
             })
             .collect();
 
