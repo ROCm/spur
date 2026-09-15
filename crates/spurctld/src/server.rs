@@ -284,6 +284,9 @@ impl ControllerService {
     #[allow(clippy::result_large_err)]
     fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if self.raft.is_leader() {
+            // The single point that decides execute-vs-forward, so the audit
+            // layer keys off this rather than sampling leadership again.
+            crate::audit::mark_executed_locally(request);
             return Ok(());
         }
 
@@ -1552,8 +1555,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    let fwd = Self::forward_request(request);
                     return client.requeue_job(fwd).await;
                 }
                 Err(e) => {
@@ -3824,8 +3826,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    let fwd = Self::forward_request(request);
                     return client.cluster_add_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -3834,7 +3835,9 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
         if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
             return Err(Status::permission_denied(
                 "k0s cluster add-nodes requires cluster admin",
@@ -3904,8 +3907,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    let fwd = Self::forward_request(request);
                     return client.cluster_remove_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -3914,7 +3916,9 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
         if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
             return Err(Status::permission_denied(
                 "k0s cluster remove-nodes requires cluster admin",
@@ -4229,10 +4233,7 @@ pub async fn serve(
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
     let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &auth_verification_key);
     let audit_layer = crate::audit::AuditLayer::new(
-        Arc::new(crate::audit::ControllerAudit::new(
-            audit_cluster,
-            raft_handle,
-        )),
+        Arc::new(crate::audit::ControllerAudit::new(audit_cluster)),
         audit_rpcs,
     );
 
@@ -11250,6 +11251,40 @@ mod tests {
         );
     }
 
+    /// `caller` is client-supplied, so a verified non-admin must not reach the
+    /// k0s gate by asserting `root`. Every k0s RPC binds it from the identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_membership_rejects_a_spoofed_root_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut add = Request::new(spur_proto::proto::ClusterAddNodesRequest {
+            caller: "root".into(), // spoofed on the wire
+            ..Default::default()
+        });
+        add.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_add_nodes(add)
+                .await
+                .expect_err("a spoofed root caller must not add k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut remove = Request::new(spur_proto::proto::ClusterRemoveNodesRequest {
+            caller: "root".into(),
+            ..Default::default()
+        });
+        remove.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_remove_nodes(remove)
+                .await
+                .expect_err("a spoofed root caller must not remove k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+
     /// Draining and removing a node both take it out of service and evict
     /// running work, so neither may be reachable by a valid non-admin token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11285,9 +11320,8 @@ mod tests {
         );
     }
 
-    /// `spurd` drains a node from its launch-failure path over an unauthenticated
-    /// channel, so the gate must keep waving through a caller with no identity —
-    /// which is also how `update_node` has always behaved.
+    /// `spurd` drains a node over an unauthenticated channel on launch failure,
+    /// so the gate must keep admitting a caller with no identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unidentified_caller_still_passes_the_node_gates() {
         let dir = tempfile::TempDir::new().unwrap();
