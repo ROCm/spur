@@ -149,9 +149,15 @@ A job is borrowed if **either** holds:
    started on spare capacity.
 2. It belongs to a QOS marked `idle_fill_preemptable`, whatever its own quota position.
 
-The second source is not redundant, and review corrected the design here. A burst QOS is
-configured with quota equal to the whole cluster, so a burst job is never over quota,
-never fails the sole-blocker test in §6.2, and is therefore never stamped. Keying the
+The two are a union, not a partition, and nothing stops one job satisfying both — an
+operator is free to give a burst-style QOS a group node cap and mark it preemptable. Such a
+job is borrowed once, appears in the victim set once, and takes the stricter treatment of
+the two wherever the rules below differ.
+
+The second source is not redundant, and review corrected the design here. The burst QOS as
+documented (`accounting.rst:952-964`) is created with a priority and a preempt mode and
+**no group TRES cap at all** — so a burst job has no group node cap to exceed, never fails
+the sole-blocker test in §6.2, and is therefore never stamped. Keying the
 victim set on the stamp alone would mean idle-fill can never reclaim a burst job — and
 during a burst-to-idle-fill migration, live burst jobs are exactly what is holding the
 capacity a legitimate reclaim needs to call back. The flag is kept *because* burst is
@@ -160,8 +166,8 @@ by name.
 
 The two sources are not interchangeable, and three places must treat them differently:
 
-- **Quota aggregates (§7) key on the stamp only.** A burst job is inside its own
-  cluster-wide quota and must keep counting toward it. Excluding it would misreport the
+- **Quota aggregates (§7) key on the stamp only.** A burst job is not over any quota and
+  must keep counting toward the ones it has. Excluding it would misreport the
   burst QOS's usage and break the burst pattern's own accounting for operators who are
   still running it.
 - **Re-evaluation (D13) differs in kind.** A stamped job's eligibility is re-derived at
@@ -675,7 +681,7 @@ zero-behavior-change deployment for every existing cluster.
 | Reclaim honors `preempt_exempt_time` | It must use a bounded window instead (§8.5) |
 | Whether to refuse unbounded jobs is an open question | It is a correctness requirement (D14) |
 | Observability can ship later | It is in the delivery unit (§12) |
-| Draft 3: `idle_fill_preemptable` should probably be dropped as a third overlapping mechanism | Wrong, and it was the reverse of the truth. A burst QOS is never over quota, so it is never stamped, so without the flag reclaim can never call back a burst job — the case that matters most during migration (§4.1) |
+| Draft 3: `idle_fill_preemptable` should probably be dropped as a third overlapping mechanism | Wrong, and it was the reverse of the truth. The documented burst QOS has no group node cap, so it is never stamped, so without the flag reclaim can never call back a burst job — the case that matters most during migration (§4.1) |
 | Draft 3: D1's exclusion is "the QOS dimension" of the aggregates | Too narrow. It must cover the job-count limits too, and `max_jobs_per_user` is checked before the TRES breach, so a node-only exclusion fixes nothing (§7) |
 | Draft 3: no borrow cap for a first cut | A cap is in scope as a churn control, on a counter kept strictly separate from the quota aggregates (§7.1) |
 
@@ -786,10 +792,10 @@ cluster. Additive, sequenced after the D1 exclusion, and a churn control rather 
 correctness fix. §7.1.
 
 **Q5 — Does `idle_fill_preemptable` still have a purpose? → Keep it.** The draft-3
-inclination to drop it was backwards. A burst QOS has cluster-wide quota, so it is never
-over quota, never fails the sole-blocker test, and is never stamped — meaning without this
-flag reclaim can never call back a burst job, which is the case that matters most while
-burst is being migrated away from. §4.1.
+inclination to drop it was backwards. The documented burst QOS carries no group TRES cap at
+all, so a burst job has none to exceed, never fails the sole-blocker test, and is never
+stamped — meaning without this flag reclaim can never call back a burst job, which is the
+case that matters most while burst is being migrated away from. §4.1.
 
 ### Still open
 
@@ -800,11 +806,18 @@ quotas needs a second predicate and a second collection point. Worth knowing bef
 implementation starts, because it decides whether §6 covers the real cases.
 
 **Q6 — Fairshare treatment.** D9 proposes not charging usage for a reclaimed run of a
-stamped job, and §4.1 keeps today's treatment for burst victims. Exempting is consistent
-with the loan model and removes the feedback loop where an evicted borrower becomes the
-preferred next victim, but it means borrowed compute is free, which could encourage
-deliberate over-quota submission. Charge it and accept the feedback loop, or exempt it and
-accept free compute?
+stamped job, and §4.1 keeps today's treatment for burst victims. The objection to exempting
+is that borrowed compute becomes free, which could encourage deliberate over-quota
+submission. Two things weigh against that objection.
+
+The Q3 borrow cap bounds the abuse case by construction, where fairshare only discourages it
+after the fact. And the charge lands more widely than the feedback loop in D9 suggests:
+usage is recorded at job end as elapsed time times tasks times CPUs per task with no
+reference to how the job ended (`db.rs:440-458`), and the factor is
+`target_share / actual_share` (`fairshare.rs:11`) keyed on **(user, account)** rather than
+QOS. So charging a reclaimed run lowers the priority of every job that user runs under that
+account, including their in-quota work, because capacity was taken back from them. The
+proposal is therefore to exempt, but the call is not mine.
 
 **Q7 — What happens to `idle_fill_atomic`?** It has no behavior to configure: placement is
 already whole-job-or-nothing, so `true` is the status quo and `false` would mean building
