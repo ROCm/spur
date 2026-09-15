@@ -310,6 +310,12 @@ pub struct Qos {
     /// `DenyOnLimit` flag; the submit-count family always denies regardless.
     #[serde(default)]
     pub deny_on_limit: bool,
+    /// Marks a QOS whose running jobs are reclaimable by idle-fill even though
+    /// they are inside quota. Read live, so clearing it immediately stops the
+    /// QOS's jobs being reclaim victims. Exists for the burst pattern, which has
+    /// no group node cap to exceed and so is never stamped `idle_fill`.
+    #[serde(default)]
+    pub idle_fill_preemptable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -382,6 +388,7 @@ impl Default for Qos {
             usage_factor: 1.0,
             preempt: Vec::new(),
             deny_on_limit: false,
+            idle_fill_preemptable: false,
         }
     }
 }
