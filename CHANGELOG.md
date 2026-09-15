@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.12.0](https://github.com/ROCm/spur/compare/v0.11.0...v0.12.0) (2026-09-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurd:** supervise every job with spurstepd by default ([#754](https://github.com/ROCm/spur/issues/754))
+* **core:** two-field colon time values now mean minutes:seconds rather than hours:minutes, so they resolve to 1/60th of their previous duration. This affects `-t`/`--time` on sbatch, srun and salloc, and partition `MaxTime`/`DefaultTime`. Job scripts and site configs relying on the old reading should switch to the explicit `HH:MM:SS` form, which was and remains unambiguous. Bare `days-hours` now produces a real limit where it previously produced an unlimited job.
+
+### Features
+
+* node health checks as controller-submitted jobs ([#836](https://github.com/ROCm/spur/issues/836)) ([cee3f97](https://github.com/ROCm/spur/commit/cee3f974a2e865cef0ef867713a952f8627be556))
+* **spur-cli:** add sinfo -R with node reason provenance (user/time) ([#860](https://github.com/ROCm/spur/issues/860)) ([018310d](https://github.com/ROCm/spur/commit/018310d8f97bac995f46597b343a0c1ed345d8cf))
+* **spurd:** supervise every job with spurstepd by default ([#754](https://github.com/ROCm/spur/issues/754)) ([befe312](https://github.com/ROCm/spur/commit/befe3128f6ec0ea13421b6af6f4247ebe7d71adb))
+
+
+### Bug Fixes
+
+* **core:** read `-t MM:SS` as minutes:seconds and accept bare `days-hours` ([#811](https://github.com/ROCm/spur/issues/811)) ([127a99d](https://github.com/ROCm/spur/commit/127a99d349cf16c877600f55957811079811080b))
+* **spur-cli:** honor sacct -j/--jobs job-ID filter ([#703](https://github.com/ROCm/spur/issues/703)) ([1fd143f](https://github.com/ROCm/spur/commit/1fd143fa8fcfd5eaa84d642a1a83cb785e07eab0))
+* **spur-cli:** honor srun -N/-w for nested job steps ([#868](https://github.com/ROCm/spur/issues/868)) ([6e7276c](https://github.com/ROCm/spur/commit/6e7276ce4cf84ec98408b864274f929fe97f229e))
+* **spur-core:** honor pod/service CIDR under kuberouter, not just calico ([#813](https://github.com/ROCm/spur/issues/813)) ([b9bf629](https://github.com/ROCm/spur/commit/b9bf629d43264b7a02fe4d9011884dcf11b7fdf7))
+* **spurctld:** require cluster admin to drain or remove a node ([#869](https://github.com/ROCm/spur/issues/869)) ([943d16d](https://github.com/ROCm/spur/commit/943d16d07f538b65da762f0c71c20d3e167f8852))
+
+
+### Performance
+
+* **spurctld:** aggregate assoc_mgr scope usage in a single pass ([#797](https://github.com/ROCm/spur/issues/797)) ([86fc9e7](https://github.com/ROCm/spur/commit/86fc9e7bb0c76cc6f0ad2bf1ec08f69e09bc9bc1))
+
 ## [0.11.0](https://github.com/ROCm/spur/compare/v0.10.0...v0.11.0) (2026-09-08)
 
 
