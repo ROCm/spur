@@ -965,19 +965,22 @@ fn limit_consumed(cap: u32, used: u32) -> String {
     format!("{}({})", cap_or_n(cap), used)
 }
 
+/// Wall-clock minutes as `HH:MM:SS`, or `N` for the INFINITE sentinel — no limit
+/// in a cap slot, spend the controller could not read in a consumed slot.
+fn wall_or_n(minutes: u32) -> String {
+    if minutes == spur_core::accounting::INFINITE {
+        "N".to_string()
+    } else {
+        spur_core::config::format_time(Some(minutes))
+    }
+}
+
 /// The group wall budget beside its spend, `cap(consumed)` like the other group
 /// figures but formatted as wall-clock time. `N` in the cap slot is no budget; `N`
 /// in the consumed slot is spend the controller could not read (its GrpWall cache
 /// holds no snapshot), not zero.
 fn grp_wall_limit_consumed(cap: u32, consumed: u32) -> String {
-    let render = |minutes: u32| {
-        if minutes == spur_core::accounting::INFINITE {
-            "N".to_string()
-        } else {
-            spur_core::config::format_time(Some(minutes))
-        }
-    };
-    format!("{}({})", render(cap), render(consumed))
+    format!("{}({})", wall_or_n(cap), wall_or_n(consumed))
 }
 
 /// The same shape per TRES dimension: `cpu=N(24),node=16(9)`. Dimensions are the
