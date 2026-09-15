@@ -7287,10 +7287,18 @@ fn account_block_with(
     let user = &job.spec.user;
     let limits = assoc_cache.limits(user, account);
 
+    // Idle-fill borrowed jobs (`idle_fill` stamped) sit outside every quota
+    // aggregate, the association's included. The account gate runs first and
+    // returns early, so a borrowed job counted here blocks its team's legitimate
+    // job before it ever reaches the QOS gate — dropping it from the pending
+    // list where reclaim can never see it (§7, D1). The exclusion keys on the
+    // stamp alone; a job reclaimable only via `idle_fill_preemptable` is inside
+    // its quota and keeps counting in full (§4.1).
     let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
+                && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
         })
@@ -7301,13 +7309,15 @@ fn account_block_with(
         .values()
         .filter(|j| {
             j.job_id < job.job_id
+                && !j.idle_fill
                 && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
         })
         .count() as u32;
-    let mut account_running_tres =
-        sum_running_tres(jobs, |j| j.spec.account.as_deref() == Some(account));
+    let mut account_running_tres = sum_running_tres(jobs, |j| {
+        !j.idle_fill && j.spec.account.as_deref() == Some(account)
+    });
 
     running_count += reserved
         .account_user_count
@@ -7319,11 +7329,12 @@ fn account_block_with(
     }
 
     let already_claimed = reserved.account_claimed_nodes.get(account);
-    let account_occupied: HashSet<String> =
-        occupied_nodes(jobs, |j| j.spec.account.as_deref() == Some(account))
-            .into_iter()
-            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-            .collect();
+    let account_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
+        !j.idle_fill && j.spec.account.as_deref() == Some(account)
+    })
+    .into_iter()
+    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
+    .collect();
     let (grp_node_charge, reusable_nodes) =
         new_distinct_nodes_needed(job, &account_occupied, nodes);
 
@@ -25785,5 +25796,262 @@ mod idle_fill_aggregate_tests {
             gate(&mut cand, &qos, &jobs),
             Err(PendingReason::QoSMaxJobsPerUser)
         );
+    }
+
+    // --- Account/association gate (D1, §7): the gate that runs FIRST ---
+
+    fn running_in_account(
+        job_id: JobId,
+        user: &str,
+        account: &str,
+        nodes: &[&str],
+        idle_fill: bool,
+    ) -> Job {
+        let spec = JobSpec {
+            name: "j".into(),
+            user: user.into(),
+            account: Some(account.into()),
+            num_nodes: nodes.len().max(1) as u32,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let mut job = Job::new(job_id, spec);
+        job.state = JobState::Running;
+        job.idle_fill = idle_fill;
+        job.allocated_nodes = nodes.iter().map(|n| (*n).to_string()).collect();
+        job
+    }
+
+    fn candidate_in_account(job_id: JobId, user: &str, account: &str, num_nodes: u32) -> Job {
+        let spec = JobSpec {
+            name: "cand".into(),
+            user: user.into(),
+            account: Some(account.into()),
+            num_nodes,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        Job::new(job_id, spec)
+    }
+
+    fn assoc_with(user: &str, account: &str, limits: AccountLimits) -> AssociationCache {
+        let cache = AssociationCache::new();
+        cache.insert_limits(user, account, limits);
+        cache
+    }
+
+    fn node_cap(n: u64) -> AccountLimits {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, n);
+        AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        }
+    }
+
+    fn account_gate(
+        job: &mut Job,
+        assoc: &AssociationCache,
+        jobs: &HashMap<JobId, Job>,
+    ) -> Result<u64, PendingReason> {
+        account_block_with(
+            job,
+            assoc,
+            jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+        )
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_its_account_node_quota() {
+        let assoc = assoc_with("alice", "acct", node_cap(1));
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(
+            account_gate(&mut cand, &assoc, &jobs).is_ok(),
+            "a borrowed sibling must not occupy the association node quota"
+        );
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_assoc_max_running_jobs() {
+        let assoc = assoc_with(
+            "alice",
+            "acct",
+            AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(account_gate(&mut cand, &assoc, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocMaxJobsLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_assoc_max_submit_jobs() {
+        let assoc = assoc_with(
+            "alice",
+            "acct",
+            AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(account_gate(&mut cand, &assoc, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocMaxSubmitJobLimit)
+        );
+    }
+
+    #[test]
+    fn preemptable_only_job_still_counts_at_account_gate() {
+        // The account gate never reads the QOS flag; the stamp alone governs, so
+        // an unstamped job counts in full even if some other route would make it
+        // reclaimable (§4.1).
+        let assoc = assoc_with(
+            "alice",
+            "acct",
+            AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocMaxJobsLimit)
+        );
+    }
+
+    #[test]
+    fn legitimate_multi_node_job_admitted_while_borrowed_jobs_hold_account_nodes() {
+        // The D1 reproduction at the account gate: association cap node=6, three
+        // legitimate single-node jobs plus two borrowed ones (5 nodes occupied).
+        // A legitimate two-node job must be admitted — the borrowed pair must not
+        // push the account over its cap where the job is dropped before reclaim.
+        let assoc = assoc_with("alice", "acct", node_cap(6));
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        jobs.insert(2, running_in_account(2, "alice", "acct", &["n2"], false));
+        jobs.insert(3, running_in_account(3, "alice", "acct", &["n3"], false));
+        jobs.insert(4, running_in_account(4, "alice", "acct", &["n4"], true));
+        jobs.insert(5, running_in_account(5, "alice", "acct", &["n5"], true));
+        let mut cand = candidate_in_account(6, "alice", "acct", 2);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Ok(2),
+            "3 legitimate + 2 new = 5 <= 6; the borrowed pair is outside the quota"
+        );
+
+        // Control: with the same five jobs all unstamped, 5 + 2 > 6 blocks the
+        // legitimate job — the exact permanently-unrecallable loan D1 describes.
+        let mut jobs = HashMap::new();
+        for id in 1..=5 {
+            jobs.insert(
+                id,
+                running_in_account(id, "alice", "acct", &[LEAF[id as usize]], false),
+            );
+        }
+        let mut cand = candidate_in_account(6, "alice", "acct", 2);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocGrpNodeLimit)
+        );
+    }
+
+    const LEAF: [&str; 6] = ["n0", "n1", "n2", "n3", "n4", "n5"];
+
+    #[test]
+    fn packing_credit_survives_for_legitimate_nodes_but_not_borrowed_ones() {
+        // The grp-node charge credits packing onto a node the account already
+        // occupies. Excluding borrowed jobs from the occupied set must not break
+        // that credit for legitimate nodes — and must correctly withhold it for a
+        // node occupied only by a borrowed job, since from the legitimate-quota
+        // view that node is genuinely new.
+        let mut shared = Node::new(
+            "shared".into(),
+            ResourceSet {
+                cpus: 8,
+                ..Default::default()
+            },
+        );
+        shared.alloc_resources = ResourceAllocations::with_scalar(2, 0);
+        shared.state = NodeState::Mixed; // partially allocated, still schedulable
+        let mut nodes = HashMap::new();
+        nodes.insert("shared".to_string(), shared);
+
+        let assoc = assoc_with("alice", "acct", node_cap(4));
+
+        // Legitimate sibling on `shared`: the candidate packs onto it, charge 0.
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            1,
+            running_in_account(1, "alice", "acct", &["shared"], false),
+        );
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let charge = account_block_with(
+            &mut cand,
+            &assoc,
+            &jobs,
+            &nodes,
+            &PassReservations::default(),
+        )
+        .expect("within cap");
+        assert_eq!(
+            charge, 0,
+            "packing onto a legitimate occupied node is credited"
+        );
+        assert!(cand.preferred_nodes.contains("shared"));
+
+        // Borrowed sibling on `shared`: the node is outside the account's
+        // occupied set, so the candidate is charged a full new node and gets no
+        // packing hint — consistent with the node being excluded from the aggregate.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["shared"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let charge = account_block_with(
+            &mut cand,
+            &assoc,
+            &jobs,
+            &nodes,
+            &PassReservations::default(),
+        )
+        .expect("within cap");
+        assert_eq!(charge, 1, "a borrowed-only node grants no reuse credit");
+        assert!(!cand.preferred_nodes.contains("shared"));
     }
 }
