@@ -3584,14 +3584,7 @@ impl ClusterManager {
     fn classify_pending_jobs(&self) -> PendingJobClassification {
         let jobs = self.jobs.read();
         let now = Utc::now();
-        let running_array_counts: HashMap<JobId, u32> = jobs
-            .values()
-            .filter(|job| job.state == JobState::Running)
-            .filter_map(|job| job.spec.array_job_id)
-            .fold(HashMap::new(), |mut counts, array_id| {
-                *counts.entry(array_id).or_insert(0) += 1;
-                counts
-            });
+        let running_array_counts = running_array_counts(&jobs);
         let mut candidates: Vec<PendingJobCandidate> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending)
@@ -7204,10 +7197,18 @@ fn qos_block_with(
         return Ok(0);
     };
     let user = &job.spec.user;
+    // Idle-fill borrowed jobs (`idle_fill` stamped) are held outside every QOS
+    // quota aggregate: a borrowed job runs on capacity outside the quota, so it
+    // must not count toward the quota that gates its team's legitimate jobs —
+    // otherwise a legitimate sibling is blocked at this gate and dropped from
+    // the pending list before reclaim can ever see it (§7, D1). The exclusion
+    // keys on the stamp alone; a job reclaimable only via `idle_fill_preemptable`
+    // is inside its quota and keeps counting in full (§4.1).
     let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
+                && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
@@ -7218,16 +7219,18 @@ fn qos_block_with(
         .values()
         .filter(|j| {
             j.job_id < job.job_id
+                && !j.idle_fill
                 && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
     let mut user_running_tres = sum_running_tres(jobs, |j| {
-        j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
+        !j.idle_fill && j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
     });
-    let mut qos_running_tres =
-        sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
+    let mut qos_running_tres = sum_running_tres(jobs, |j| {
+        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
+    });
 
     let user_key = (user.clone(), qos_name.clone());
     running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
@@ -7239,11 +7242,12 @@ fn qos_block_with(
     }
 
     let already_claimed = reserved.qos_claimed_nodes.get(qos_name);
-    let qos_occupied: HashSet<String> =
-        occupied_nodes(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()))
-            .into_iter()
-            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-            .collect();
+    let qos_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
+        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
+    })
+    .into_iter()
+    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
+    .collect();
     let (grp_node_charge, reusable_nodes) = new_distinct_nodes_needed(job, &qos_occupied, nodes);
 
     match check_qos_limits_with_grp_node_charge(
@@ -7499,6 +7503,21 @@ impl<'a> RunningTresAccumulator<'a> {
         );
         self.tres
     }
+}
+
+/// Running task count per array job, keyed on the array's job ID. Idle-fill
+/// borrowed jobs are excluded so a borrowed task never consumes an array's
+/// `array_max_concurrent` slot — counting it would block the array's own
+/// legitimate tasks at the concurrency gate, where reclaim cannot reach them
+/// (§7, D1).
+fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
+    jobs.values()
+        .filter(|job| job.state == JobState::Running && !job.idle_fill)
+        .filter_map(|job| job.spec.array_job_id)
+        .fold(HashMap::new(), |mut counts, array_id| {
+            *counts.entry(array_id).or_insert(0) += 1;
+            counts
+        })
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
@@ -25581,6 +25600,190 @@ mod tests {
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("premium"),
             "the resolved default QoS must be recorded on the job"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_fill_aggregate_tests {
+    use super::*;
+    use spur_core::accounting::{QosLimits, TresType};
+
+    fn team_qos(name: &str) -> Qos {
+        Qos {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn grp_node_qos(name: &str, node_cap: u64) -> Qos {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, node_cap);
+        Qos {
+            name: name.into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..team_qos(name)
+        }
+    }
+
+    fn running_in_qos(
+        job_id: JobId,
+        user: &str,
+        qos: &str,
+        nodes: &[&str],
+        idle_fill: bool,
+    ) -> Job {
+        let mut spec = JobSpec {
+            name: "j".into(),
+            user: user.into(),
+            qos: Some(qos.into()),
+            num_nodes: nodes.len().max(1) as u32,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.num_nodes = nodes.len().max(1) as u32;
+        let mut job = Job::new(job_id, spec);
+        job.state = JobState::Running;
+        job.idle_fill = idle_fill;
+        job.allocated_nodes = nodes.iter().map(|n| (*n).to_string()).collect();
+        job
+    }
+
+    fn candidate(job_id: JobId, user: &str, qos: &str, num_nodes: u32) -> Job {
+        let spec = JobSpec {
+            name: "cand".into(),
+            user: user.into(),
+            qos: Some(qos.into()),
+            num_nodes,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        Job::new(job_id, spec)
+    }
+
+    fn gate(job: &mut Job, qos: &Qos, jobs: &HashMap<JobId, Job>) -> Result<u64, PendingReason> {
+        qos_block_with(
+            job,
+            qos,
+            jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_its_qos_node_quota() {
+        let qos = grp_node_qos("team", 1);
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert!(
+            gate(&mut cand, &qos, &jobs).is_ok(),
+            "a borrowed sibling must not occupy the group node quota"
+        );
+
+        // Control: the identical sibling, unstamped, does block — proving the
+        // node exclusion is what admits the legitimate job.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QosGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_max_jobs_per_user() {
+        let qos = Qos {
+            limits: QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert!(gate(&mut cand, &qos, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QoSMaxJobsPerUser)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_max_submit_jobs() {
+        let qos = Qos {
+            limits: QosLimits {
+                max_submit_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert!(gate(&mut cand, &qos, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QosMaxSubmitJobPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_task_does_not_consume_array_concurrency() {
+        let mut jobs = HashMap::new();
+        let mut legit = running_in_qos(1, "alice", "team", &["n1"], false);
+        legit.spec.array_job_id = Some(100);
+        let mut borrowed = running_in_qos(2, "alice", "team", &["n2"], true);
+        borrowed.spec.array_job_id = Some(100);
+        jobs.insert(1, legit);
+        jobs.insert(2, borrowed);
+
+        let counts = running_array_counts(&jobs);
+        assert_eq!(
+            counts.get(&100).copied(),
+            Some(1),
+            "only the unstamped task counts toward array_max_concurrent"
+        );
+    }
+
+    #[test]
+    fn preemptable_only_job_still_counts_in_full() {
+        // A job that is reclaimable solely because its QOS is marked
+        // idle_fill_preemptable is inside its quota and unstamped, so it keeps
+        // counting — the exclusion keys on the stamp alone (§4.1).
+        let qos = Qos {
+            idle_fill_preemptable: true,
+            limits: QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("burst")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "burst", &["n1"], false));
+        let mut cand = candidate(2, "alice", "burst", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QoSMaxJobsPerUser)
         );
     }
 }
