@@ -16,13 +16,13 @@ spur-sched = { path = "../spur-sched" }
 spur-net = { path = "../spur-net" }
 spur-metrics = { path = "../spur-metrics" }
 spur-update = { path = "../spur-update" }
+spur-logging = { path = "../spur-logging" }
 sqlx = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }

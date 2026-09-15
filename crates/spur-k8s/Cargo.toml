@@ -16,6 +16,7 @@ path = "examples/export_crd.rs"
 [dependencies]
 spur-core = { path = "../spur-core" }
 spur-proto = { path = "../spur-proto" }
+spur-logging = { path = "../spur-logging" }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
@@ -25,7 +26,6 @@ tower = { workspace = true }
 http = "1"
 prost-types = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
