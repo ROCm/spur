@@ -341,7 +341,7 @@ test too and is neither scheduled nor collected. It pends forever.
 **The fix, and the principle:** borrowed capacity is outside the quota, so it must be
 outside the aggregate that enforces the quota.
 
-The exclusion has to cover **every** quota aggregate, not only the node TRES dimension:
+The exclusion has to cover **every** quota aggregate, at **both** gates. At the QOS gate:
 
 - `sum_running_tres` (`cluster.rs:7449-7472`)
 - `occupied_nodes` (`cluster.rs:7589`)
@@ -349,11 +349,36 @@ The exclusion has to cover **every** quota aggregate, not only the node TRES dim
 - the submitted count behind `max_submit_jobs` (`qos.rs:216-239`)
 - the concurrency count behind `array_max_concurrent` (`cluster.rs:3666-3691`)
 
-Partial exclusion is not a partial fix, it is no fix, and `max_jobs_per_user` is the
-proof. That limit is checked *before* the TRES breach, so lifting only the node dimension
-leaves the legitimate job blocked, failing the sole-blocker test as well, neither
-scheduled nor collected — pending forever. This is why the ordering constraint in §11 is
-absolute rather than a preference.
+And the same four aggregates inside `account_block_with` (`cluster.rs:7280-7345`), which
+computes its own `running_count`, `submitted_count`, `sum_running_tres` and
+`occupied_nodes` over the account.
+
+Partial exclusion is not a partial fix, it is no fix. Two independent proofs.
+
+`max_jobs_per_user` is checked *before* the TRES breach, so lifting only the node
+dimension leaves the legitimate job blocked, failing the sole-blocker test as well,
+neither scheduled nor collected — pending forever.
+
+The account gate is the worse one, because it runs first and returns early, so a job
+blocked there never reaches the QOS gate at all. Associations carry a node dimension
+(`accounting.rs:189`), and `account_block_with` derives `grp_node_charge` from
+`occupied_nodes` across the whole account before calling
+`check_account_limits_with_grp_node_charge`. With an association cap of `node=6` and a QOS
+`grptres=node=4`: the team runs 4 legitimate and borrows 2, reaching 6 at the account. One
+legitimate job ends, leaving 3 legitimate plus 2 borrowed, so 5 occupied. A legitimate job
+wanting 2 nodes is charged 2, breaches `5 + 2 > 6`, is blocked, and is stripped by
+`retain_eligible` — never scheduled, never in `unscheduled`, never able to reclaim. D1
+verbatim, with borrowed nodes as the cause, and invisible to an exclusion applied only at
+the QOS gate.
+
+This is why the ordering constraint in §11 is absolute rather than a preference.
+
+Excluding at the account gate means borrowed nodes do not count toward the association cap
+either, so that cap does not bound borrowing. This follows the same principle — borrowed
+capacity sits outside *every* quota, not merely outside the one it exceeded — and bounding
+borrowing is §7.1's job. Note this does not let an account-capped job borrow: to be
+collected at all a job must first pass the account gate, so an account-blocked job is never
+a candidate. That remains Q4.
 
 The exclusion keys on the `idle_fill` stamp alone. Jobs that are reclaimable only because
 their QOS is marked `idle_fill_preemptable` keep counting in full, for the reason given in
@@ -547,7 +572,7 @@ Everything found by verification, with a fix. This is the implementation checkli
 
 | # | Severity | Defect | Fix |
 |---|---|---|---|
-| D1 | Blocker | Borrowed jobs count in QOS aggregates, blocking their own team's legitimate jobs at the gate where reclaim cannot see them (`cluster.rs:7449`, `:7099`) | Exclude stamped jobs from **every** quota aggregate — `sum_running_tres`, `occupied_nodes`, `max_jobs_per_user` and `max_submit_jobs` counts (`qos.rs:216-239`), `array_max_concurrent` (`cluster.rs:3666-3691`). Node TRES alone is not enough. §7 |
+| D1 | Blocker | Borrowed jobs count in the quota aggregates, blocking their own team's legitimate jobs at a gate where reclaim cannot see them (`cluster.rs:7449`, `:7099`) | Exclude stamped jobs from **every** quota aggregate at **both** gates — `sum_running_tres`, `occupied_nodes`, the `max_jobs_per_user` and `max_submit_jobs` counts (`qos.rs:216-239`), `array_max_concurrent` (`cluster.rs:3666-3691`), and the same four inside `account_block_with` (`cluster.rs:7280-7345`). Node TRES alone is not enough, and the QOS gate alone is not enough. §7 |
 | D2 | Blocker | Victim selection never checks an eviction helps, so an unplaceable job evicts one borrowed job per cycle forever (`scheduler_loop.rs:808-818`) | Reclaim is its own routine with an atomic satisfiable-victim-set test. §8.2 |
 | D3 | Blocker | Eviction frees the node before the agent has killed anything; no `Completing` handshake (`cluster.rs:5756`, `scheduler_loop.rs:2267`) | Use the awaiting `cancel_job_on_nodes`; hold freed nodes out until confirmed. §8.3 |
 | D4 | Blocker | Candidate collection loses the account gate's packing credit: clearing `preferred_nodes` un-enforces the reduced `grp_node_charge` the job was admitted on (`cluster.rs:7596-7601`) | Before collecting, re-check `account_block_with` with `grp_node_charge = num_nodes` (no credit). Only then is clearing sound |
@@ -603,7 +628,7 @@ a judgment call.
 | 1 | `spur-core/src/qos.rs` | Sole-blocker predicate and tests (§6.2) |
 | 2 | `spur-core/src/config.rs`, QOS record | The §3.1 settings, fields and `Default` entries; `idle_fill_preemptable` on the QOS |
 | 3 | `spur-core/src/job.rs`, `wal.rs` | `idle_fill` on `Job` and `JobStart`, apply-handler copy, frozen-payload test following `wal.rs:750-769` |
-| 4 | `spurctld/src/cluster.rs`, `spur-core/src/qos.rs` | Exclude stamped jobs from **every** quota aggregate (D1, §7) — do this before anything reads the flag |
+| 4 | `spurctld/src/cluster.rs` | Exclude stamped jobs from **every** quota aggregate, at the QOS gate *and* in `account_block_with` (D1, §7) — do this before anything reads the flag |
 | 5 | `spurctld/src/cluster.rs` | Collect candidates: exclusions D5/D6/D7, credit re-check D4, `preferred_nodes` clear, `reserved.reserve` D8 |
 | 6 | `spurctld/src/scheduler_loop.rs` | Append at the right point (D16); tag assignments; the four exclusions in §5.4; refuse unbounded jobs (D14) |
 | 7 | `spur-sched/src/backfill.rs` | Suppress future-slot reservations for candidates (D15) |
@@ -684,6 +709,7 @@ zero-behavior-change deployment for every existing cluster.
 | Draft 3: `idle_fill_preemptable` should probably be dropped as a third overlapping mechanism | Wrong, and it was the reverse of the truth. The documented burst QOS has no group node cap, so it is never stamped, so without the flag reclaim can never call back a burst job — the case that matters most during migration (§4.1) |
 | Draft 3: D1's exclusion is "the QOS dimension" of the aggregates | Too narrow. It must cover the job-count limits too, and `max_jobs_per_user` is checked before the TRES breach, so a node-only exclusion fixes nothing (§7) |
 | Draft 3: no borrow cap for a first cut | A cap is in scope as a churn control, on a counter kept strictly separate from the quota aggregates (§7.1) |
+| Draft 4: D1's aggregate list, though introduced as "every quota aggregate", enumerated only the QOS gate | Incomplete in a way that reproduces D1 in full. `account_block_with` computes the same four aggregates and runs *first*, so a job it blocks never reaches the QOS gate where the exclusion was applied. §7 carries the scenario |
 
 ### Outside this feature
 
@@ -724,7 +750,11 @@ Placement is all-or-nothing (`backfill.rs:577`).
   legitimate sibling is admitted while a borrowed job runs; one case per excluded
   aggregate, since a node-only exclusion passes a node-only test — `max_jobs_per_user`,
   `max_submit_jobs`, and `array_max_concurrent` each need their own; a job reclaimable
-  only via `idle_fill_preemptable` still counts in full (§4.1).
+  only via `idle_fill_preemptable` still counts in full (§4.1). Every one of these repeated
+  at the **account** gate, including the §7 scenario directly: a legitimate multi-node job
+  is admitted while borrowed jobs occupy nodes that would otherwise breach the association
+  cap. Each case needs an unstamped-sibling control that *does* block, or it can pass
+  vacuously.
 - **Collection**: only when enabled; het, burst-buffer, licensed, and unbounded jobs are
   never collected; the account credit is re-checked; `preferred_nodes` cleared;
   `reserved.reserve` called.
