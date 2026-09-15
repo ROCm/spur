@@ -57,6 +57,11 @@ pub enum WalOperation {
         /// Run epoch for this dispatch (0 for pre-upgrade entries).
         #[serde(default)]
         run_attempt: u32,
+        /// This run started on spare capacity outside the QOS group node quota
+        /// (idle-fill). Travels in the WAL so the stamp lands on followers; the
+        /// `Job` field is what survives snapshot and failover.
+        #[serde(default)]
+        idle_fill: bool,
     },
     JobComplete {
         job_id: JobId,
@@ -430,6 +435,7 @@ impl WalOperation {
             per_node_alloc,
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         }
     }
 }
@@ -765,6 +771,56 @@ mod tests {
                 assert!(!spec.pty);
                 assert!(!spec.srun_job);
                 assert!(spec.gpus.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-idle-fill JobStart entry (no idle_fill field); must still
+    // deserialize or spurctld crashes on upgrade replay, with idle_fill
+    // defaulting to false. Never regenerate — a failure means a new field needs
+    // #[serde(default)].
+    #[test]
+    fn job_start_pre_idle_fill_payload_still_deserializes() {
+        const JOB_START_PRE_IDLE_FILL: &str = r#"{"JobStart":{"job_id":5,"nodes":["n1"],"resources":{"cpus":4,"memory_mb":1024,"devices":{}},"per_node_alloc":{"n1":{"cpus":4,"memory_mb":1024,"devices":{}}},"srun_step_dispatch":false,"run_attempt":1}}"#;
+        let op: WalOperation = serde_json::from_str(JOB_START_PRE_IDLE_FILL)
+            .expect("pre-idle-fill JobStart must deserialize; idle_fill needs #[serde(default)]");
+        match op {
+            WalOperation::JobStart {
+                job_id,
+                srun_step_dispatch,
+                run_attempt,
+                idle_fill,
+                ..
+            } => {
+                assert_eq!(job_id, 5);
+                assert!(!srun_step_dispatch);
+                assert_eq!(run_attempt, 1);
+                assert!(!idle_fill, "an entry without the field defaults to false");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_start_idle_fill_stamp_round_trips() {
+        let op = WalOperation::JobStart {
+            job_id: 8,
+            nodes: vec!["n1".into()],
+            resources: ResourceAllocations::default(),
+            per_node_alloc: HashMap::new(),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+            idle_fill: true,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStart {
+                job_id, idle_fill, ..
+            } => {
+                assert_eq!(job_id, 8);
+                assert!(idle_fill, "the stamp must survive the WAL round-trip");
             }
             _ => panic!("wrong variant"),
         }

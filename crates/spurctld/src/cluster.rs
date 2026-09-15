@@ -1637,6 +1637,9 @@ impl ClusterManager {
             per_node_alloc: per_node_alloc.clone(),
             srun_step_dispatch,
             run_attempt,
+            // Nothing collects idle-fill candidates yet, so no dispatch is ever
+            // stamped; the flag is threaded through when placement lands.
+            idle_fill: false,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -6027,6 +6030,7 @@ impl ClusterManager {
                 per_node_alloc,
                 srun_step_dispatch,
                 run_attempt,
+                idle_fill,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
@@ -6036,6 +6040,7 @@ impl ClusterManager {
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
+                    job.idle_fill = *idle_fill;
                     job.launch_failure_detail = None;
                     // A new run supersedes any prior preemption provenance; clear so
                     // this run's accounting record does not inherit the previous one's.
@@ -9829,6 +9834,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], resources),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -9863,6 +9869,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -10917,6 +10924,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -10958,6 +10966,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11000,6 +11009,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11065,6 +11075,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -11126,6 +11137,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
@@ -11190,6 +11202,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         };
 
         cm.apply_operation(&WalOperation::JobSubmit {
@@ -11296,6 +11309,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11346,6 +11360,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -11385,6 +11400,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -11442,6 +11458,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -11478,6 +11495,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.node_complete(1, "n1", 0, 9, 0).unwrap();
@@ -11664,6 +11682,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -11699,6 +11718,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.node_complete(1, "n1", 42, 0, 0).unwrap();
@@ -11737,6 +11757,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 2,
+            idle_fill: false,
         });
 
         // Stale SIGKILL report from epoch 1 must be ignored.
@@ -11776,6 +11797,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11843,6 +11865,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -13492,6 +13515,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -13785,6 +13809,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -13872,6 +13897,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -24451,6 +24477,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
     }
 
@@ -24467,6 +24494,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: true,
             run_attempt: 0,
+            idle_fill: false,
         });
     }
 
