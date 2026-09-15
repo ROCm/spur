@@ -6946,14 +6946,19 @@ mod tests {
         }))
         .await
         .expect("the same node must be able to deregister cleanly");
-        // Deregistering an unknown node is also Ok, so assert the node really went.
+        // Deregistering an unknown node is also Ok, so assert the node really
+        // went Down. The record itself stays, it carries the mesh membership.
         for _ in 0..200 {
-            if svc.cluster.get_node("n1").is_none() {
+            if svc
+                .cluster
+                .get_node("n1")
+                .is_some_and(|n| n.state == spur_core::node::NodeState::Down)
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        panic!("deregistration left the node registered");
+        panic!("deregistration left the node up");
     }
 
     // The relaxation keys on the controller having no key, never on the request
