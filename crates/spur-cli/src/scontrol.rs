@@ -1021,18 +1021,21 @@ fn render_assoc_mgr(
 
     let pu = section.per_user;
     for r in records {
-        let max_wall = if r.max_wall_minutes == spur_core::accounting::INFINITE {
-            "N".to_string()
-        } else {
-            spur_core::config::format_time(Some(r.max_wall_minutes))
-        };
         out.push_str(&format!(
-            "{}={} MaxWall={} MaxTRESPJ={}",
+            "{}={} MaxWall={}",
             section.scope,
             r.scope,
-            max_wall,
-            tres_cap_or_n(&r.max_tres_per_job),
+            wall_or_n(r.max_wall_minutes),
         ));
+        // A QOS applies one per-job TRES cap to every job it governs, so it belongs
+        // on the scope line. An association's is per (user, account) and rides on
+        // each User= line instead.
+        if section.is_qos {
+            out.push_str(&format!(
+                " MaxTRESPJ={}",
+                tres_cap_or_n(&r.max_tres_per_job)
+            ));
+        }
         // A scope that caps every user the same way says so once, here, so the caps
         // stay visible with nobody using it. An association has no such caps; its
         // users carry their own.
@@ -1079,6 +1082,12 @@ fn render_assoc_mgr(
                 limit_consumed(u.max_submit_jobs, u.submitted_jobs),
                 tres_limit_consumed(&u.max_tres, &u.running_tres),
             ));
+            if !section.is_qos {
+                out.push_str(&format!(
+                    " MaxTRESPJ={}",
+                    tres_cap_or_n(&u.max_tres_per_job)
+                ));
+            }
             if !u.over_limit.is_empty() {
                 out.push_str(&format!(" OverLimit={}", u.over_limit.join(",")));
             }
@@ -2301,6 +2310,7 @@ mod tests {
                 max_jobs: 2,
                 max_submit_jobs: INFINITE,
                 max_tres: "node=4".into(),
+                max_tres_per_job: "cpu=8".into(),
                 over_limit: vec!["MaxJobsPU".into(), "MaxTRESPU".into()],
             }],
             over_limit: Vec::new(),
@@ -2338,15 +2348,15 @@ mod tests {
         // The controller names a breach for the hierarchy it came from.
         record.users[0].over_limit = vec!["MaxJobs".into()];
         let out = render_assoc_mgr(ASSOC_SECTION, &[record]);
-        // The per-job TRES cap still shows, but the QOS-only MaxSubmitJobsPA does not.
-        // An association names its own per-user cap `MaxTRES`, so the per-job cap must
-        // stay `MaxTRESPJ` for the two to be told apart within one record.
-        assert!(out.contains("Account=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=8\n"));
+        // The per-job cap is per (user, account), so it rides on the User= line, not
+        // the scope line where one row would hide every other user's cap. It stays
+        // `MaxTRESPJ` so it reads distinctly from the association's own `MaxTRES`.
+        assert!(out.contains("Account=highprio MaxWall=01:00:00\n"));
         assert!(!out.contains("MaxJobsPU"));
         assert!(!out.contains("MaxSubmitJobsPA"));
         assert!(!out.contains("GrpWall"));
         assert!(out.contains(
-            "   User=alice MaxJobs=2(6) MaxSubmitJobs=N(7) MaxTRES=cpu=N(24),node=4(6) OverLimit=MaxJobs\n"
+            "   User=alice MaxJobs=2(6) MaxSubmitJobs=N(7) MaxTRES=cpu=N(24),node=4(6) MaxTRESPJ=cpu=8 OverLimit=MaxJobs\n"
         ));
     }
 

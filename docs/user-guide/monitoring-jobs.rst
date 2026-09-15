@@ -590,9 +590,9 @@ it:
       User=bob MaxJobsPU=2(1) MaxSubmitJobsPU=N(1) MaxTRESPU=cpu=N(4),node=4(1)
 
    Association Records
-   Account=tenant-a MaxWall=N MaxTRESPJ=node=4
+   Account=tenant-a MaxWall=N
       GrpJobs=N(1) GrpSubmitJobs=N(1) GrpTRES=node=N(1)
-      User=alice MaxJobs=4(1) MaxSubmitJobs=N(1) MaxTRES=cpu=N(4),node=N(1)
+      User=alice MaxJobs=4(1) MaxSubmitJobs=N(1) MaxTRES=cpu=N(4),node=N(1) MaxTRESPJ=node=4
 
 Reading it:
 
@@ -601,7 +601,7 @@ Reading it:
   six in use, and ``N`` marks no cap. ``GrpWall`` follows the same shape as a
   wall-clock time, ``budget(spent)``; an ``N`` in its consumed slot means the
   controller has not read spend yet (its usage cache holds no snapshot), which is
-  not the same as none spent. The scope-line per-job and per-account caps
+  not the same as none spent. The per-job and per-account caps
   (``MaxWall``, ``MaxTRESPJ``, ``MaxSubmitJobsPA``) and the per-user caps print
   bare, with no consumption beside them, because they bound each job, account, or
   user rather than a total the scope accrues.
@@ -613,19 +613,21 @@ Reading it:
   admits a job. Node counts are distinct occupied nodes, so two jobs sharing a
   node hold one node, not two. A TRES dimension appears when either the cap or
   the usage has something to say about it.
-* The scope line carries what belongs to the scope: its per-job caps
-  (``MaxWall`` and ``MaxTRESPJ``, the ceiling on any one job), and — for a QOS,
-  which caps every user identically — the per-user caps it enforces
-  (``MaxJobsPU``, ``MaxSubmitJobsPU``, ``MaxTRESPU``) plus the per-account submit
-  cap ``MaxSubmitJobsPA``. The ``PJ``/``PU`` suffixes are Slurm's and matter here:
+* The scope line carries what belongs to the scope: its wall-clock ceiling
+  ``MaxWall``, and — for a QOS, which caps every user identically — its per-job
+  cap ``MaxTRESPJ``, the per-user caps it enforces (``MaxJobsPU``,
+  ``MaxSubmitJobsPU``, ``MaxTRESPU``), and the per-account submit cap
+  ``MaxSubmitJobsPA``. An association caps each ``(user, account)`` pair on its
+  own, so its per-user caps — and its per-job ``MaxTRESPJ`` — ride on each
+  ``User=`` line instead, where a single scope-line value would show one user's
+  cap and hide the rest. The ``PJ``/``PU`` suffixes are Slurm's and matter here:
   ``MaxTRESPJ`` bounds one job, ``MaxTRESPU`` one user's total, and an
   association's own per-user cap is named plainly ``MaxTRES`` on each ``User=``
   line — so within one association record ``MaxTRESPJ`` and ``MaxTRES`` are
   different caps, not a contradiction. A QOS carries ``MaxSubmitJobsPA`` and
   ``GrpWall``; an association cannot, so those never appear in its records, but
-  the per-job ``MaxTRESPJ`` a QOS and an association both enforce shows in both.
-  An association's per-user caps are per ``(user, account)``, so they appear on
-  each user's line instead.
+  the per-job ``MaxTRESPJ`` a QOS and an association both enforce shows in both —
+  on the QOS scope line, and on each association ``User=`` line.
 * ``Grp*`` figures are the whole scope's, summed across every user, and stay on
   the scope line. ``GrpWall`` is the QOS's wall-clock budget beside the spend
   measured over ``grp_wall_window_days`` (see :doc:`/admin-guide/accounting`);

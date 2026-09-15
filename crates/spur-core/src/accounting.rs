@@ -166,6 +166,10 @@ pub struct PerUserCaps {
     pub max_jobs: Option<u32>,
     pub max_submit_jobs: Option<u32>,
     pub max_tres: Option<TresRecord>,
+    /// Per-job TRES cap for this user, where the scope keys it per user — an
+    /// association does. A QOS applies one per-job cap scope-wide, so it stays
+    /// `None` here and rides on the scope record instead.
+    pub max_tres_per_job: Option<TresRecord>,
 }
 
 /// One user's holdings under a scope, beside the caps that govern that user.

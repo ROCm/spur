@@ -5061,6 +5061,7 @@ fn assoc_mgr_to_proto(
                 max_jobs: opt_cap(user.caps.max_jobs),
                 max_submit_jobs: opt_cap(user.caps.max_submit_jobs),
                 max_tres: opt_tres(&user.caps.max_tres),
+                max_tres_per_job: opt_tres(&user.caps.max_tres_per_job),
                 over_limit: cap_names(user.exceeded_caps(), scope),
             })
             .collect(),

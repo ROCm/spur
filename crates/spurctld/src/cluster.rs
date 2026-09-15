@@ -5134,6 +5134,7 @@ impl ClusterManager {
                     max_jobs: l.max_jobs_per_user,
                     max_submit_jobs: l.max_submit_jobs_per_user,
                     max_tres: l.max_tres_per_user.clone(),
+                    max_tres_per_job: None,
                 });
                 let mut record = scope_usage(&jobs, &scope, qos_of, only_user, &[], |_| {
                     user_caps.clone().unwrap_or_default()
@@ -5187,6 +5188,10 @@ impl ClusterManager {
                             max_jobs: limits.and_then(|l| l.max_running_jobs),
                             max_submit_jobs: limits.and_then(|l| l.max_submit_jobs),
                             max_tres: None,
+                            // Per (user, account), so it rides on each user record
+                            // rather than the scope line, where one row would hide
+                            // every other user's cap.
+                            max_tres_per_job: limits.and_then(|l| l.max_tres_per_job.clone()),
                         }
                     },
                 )?;
@@ -5195,7 +5200,6 @@ impl ClusterManager {
                 // rather than inventing a merge across rows that disagree.
                 if let Some((_, limits)) = rows.and_then(|rows| rows.first()) {
                     record.max_wall_minutes = limits.max_wall_minutes;
-                    record.max_tres_per_job = limits.max_tres_per_job.clone();
                     record.grp_tres = limits.grp_tres.clone();
                     record.grp_submit_jobs = limits.grp_submit_jobs;
                 }
@@ -12145,9 +12149,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assoc_mgr_info_surfaces_the_association_per_job_tres_cap_only() {
-        // An association enforces a per-job TRES cap too, so its record carries it,
-        // but it has no per-account submit cap or group wall budget to report.
+    async fn assoc_mgr_info_surfaces_the_association_per_job_tres_cap_per_user() {
+        // An association's per-job TRES cap is per (user, account), so it rides on
+        // the user record rather than the scope, and the account carries no
+        // per-account submit cap or group wall budget.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.association_cache()
@@ -12167,8 +12172,15 @@ mod tests {
             .into_iter()
             .find(|r| r.scope == "tenant-a")
             .expect("the defined association is reported");
+        assert!(record.max_tres_per_job.is_none());
+        let alice = record
+            .users
+            .iter()
+            .find(|u| u.user == "alice")
+            .expect("the association's user is reported");
         assert_eq!(
-            record
+            alice
+                .caps
                 .max_tres_per_job
                 .as_ref()
                 .map(|t| t.get(TresType::Node)),
