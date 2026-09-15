@@ -100,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         args.log_format.as_deref(),
         &logging.level,
         &logging.format,
-    );
+    )?;
 
     info!(version = %spur_core::version::version_string(), "spurctld starting");
 

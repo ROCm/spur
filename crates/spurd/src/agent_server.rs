@@ -4236,9 +4236,9 @@ impl SlurmAgent for AgentService {
         match result {
             Ok((applied, peers, message)) => {
                 if applied {
-                    info!(peers, message = %message, "applied WireGuard mesh");
+                    info!(peers, detail = %message, "applied WireGuard mesh");
                 } else {
-                    warn!(message = %message, "mesh not applied");
+                    warn!(detail = %message, "mesh not applied");
                 }
                 Ok(Response::new(ApplyMeshResponse {
                     applied,

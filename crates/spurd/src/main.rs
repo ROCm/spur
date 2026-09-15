@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
         args.log_format.as_deref(),
         &logging.level,
         &logging.format,
-    );
+    )?;
 
     // Raised before anything reads or inherits it, so a `memlock = "inherit"` job
     // does not depend on whether a BPF load ran first. Needs the subscriber to log.

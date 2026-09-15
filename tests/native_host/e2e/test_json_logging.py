@@ -96,7 +96,6 @@ class TestJsonLogging:
             f"expected a 'job submitted' line with job_id={job_id}; "
             f"job_id-bearing lines: {[o for o in ctrl if 'job_id' in o]}"
         )
-        # The whole point of the typed visitor: the id is a JSON number, not a string.
         for o in submitted:
             assert isinstance(o["job_id"], int) and not isinstance(o["job_id"], bool), (
                 f"job_id must be a JSON number, got {type(o['job_id'])}: {o}"

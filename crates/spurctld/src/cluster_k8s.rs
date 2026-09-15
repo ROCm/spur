@@ -1385,7 +1385,7 @@ fn spawn_apply_mesh(cluster: &ClusterManager, node: &str, mesh: &MeshMembership)
             Ok(Ok(resp)) => {
                 let r = resp.into_inner();
                 if !r.applied {
-                    warn!(node = %node, message = %r.message, "apply_mesh not applied");
+                    warn!(node = %node, detail = %r.message, "apply_mesh not applied");
                 }
             }
             Ok(Err(e)) => warn!(node = %node, error = %e, "apply_mesh RPC failed"),

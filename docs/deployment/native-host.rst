@@ -72,7 +72,11 @@ The two daemons are configured with command-line flags. The most common are belo
      - Raft and scheduler state directory.
    * - ``--log-level <LEVEL>``
      - ``info``
-     - Log verbosity.
+     - Log verbosity. Overrides ``[logging].level``; ``RUST_LOG`` overrides this.
+   * - ``--log-format <FORMAT>``
+     - *(unset)*
+     - ``json`` or ``text``. Overrides ``[logging].format``; when unset, text on
+       a TTY and JSON otherwise.
    * - ``-D, --foreground``
      - off
      - Run in the foreground instead of daemonizing.
@@ -103,7 +107,11 @@ The two daemons are configured with command-line flags. The most common are belo
      - Agent gRPC listen address.
    * - ``--log-level <LEVEL>``
      - ``info``
-     - Log verbosity.
+     - Log verbosity. Overrides ``[logging].level``; ``RUST_LOG`` overrides this.
+   * - ``--log-format <FORMAT>``
+     - *(unset)*
+     - ``json`` or ``text``. Overrides ``[logging].format``; when unset, text on
+       a TTY and JSON otherwise.
 
 .. note::
 
