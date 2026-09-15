@@ -104,7 +104,7 @@ pub fn exec(plugin: &Plugin, args: &[String]) -> std::io::Error {
 }
 
 /// `spur <name> ...` with no built-in match: run a plugin or explain why not.
-pub fn dispatch(args: &[String], is_builtin: impl Fn(&str) -> bool) -> ! {
+pub fn dispatch(args: &[String]) -> ! {
     let dirs = path_dirs();
     if let Some((plugin, rest)) = resolve(&dirs, args) {
         let err = exec(&plugin, &rest);
@@ -113,17 +113,6 @@ pub fn dispatch(args: &[String], is_builtin: impl Fn(&str) -> bool) -> ! {
     }
     eprintln!("spur: unknown command '{}'", args[0]);
     eprintln!("spur: no plugin named spur-{} on PATH either", args[0]);
-    let shadowed: Vec<String> = list(&dirs)
-        .into_iter()
-        .filter(|p| is_builtin(&p.name))
-        .map(|p| p.name)
-        .collect();
-    if !shadowed.is_empty() {
-        eprintln!(
-            "spur: these plugins shadow a built-in command and never run: {}",
-            shadowed.join(", ")
-        );
-    }
     std::process::exit(1);
 }
 

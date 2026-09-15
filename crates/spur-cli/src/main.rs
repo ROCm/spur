@@ -310,7 +310,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        _ => plugin::dispatch(&args[1..], is_builtin),
+        _ => plugin::dispatch(&args[1..]),
     }
 }
 
