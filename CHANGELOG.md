@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/ROCm/spur/compare/v0.12.0...v0.12.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **spur-cli:** accept --noconvert on accounting commands ([#859](https://github.com/ROCm/spur/issues/859)) ([467d521](https://github.com/ROCm/spur/commit/467d5215373795bbb4e29a0c090a96f341682817))
+
 ## [0.12.0](https://github.com/ROCm/spur/compare/v0.11.0...v0.12.0) (2026-09-15)
 
 
