@@ -12091,10 +12091,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn assoc_mgr_info_surfaces_the_new_qos_caps_and_grp_wall_spend() {
-        // The three caps the record could not previously explain: the per-job TRES
-        // cap, the per-account submit cap, and the group wall budget with its spend
-        // read from the GrpWall cache. Spend has reached the budget, so the scope
-        // record must also name GrpWall as a live breach.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(capped_qos(
