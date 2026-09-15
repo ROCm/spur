@@ -4,16 +4,20 @@
 //! MPI launch planning and `--mpi` validation helpers.
 
 /// One process entry in a PMIx launch plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PmixLocalProc {
     pub rank: u32,
     pub local_rank: u32,
 }
 
 /// Controller-derived PMIx bootstrap payload for a single agent dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PmixLaunchPlan {
     pub job_id: u32,
+    /// The rendezvous is per-step, not per-job: two steps of one job can run on
+    /// the same node at once and must not share a namespace or a modex port.
+    #[serde(default = "crate::step::default_step_id")]
+    pub step_id: crate::step::StepId,
     pub namespace: String,
     pub universe_size: u32,
     pub task_offset: u32,
@@ -30,14 +34,15 @@ pub struct PmixLaunchPlan {
 }
 
 impl PmixLaunchPlan {
-    pub fn namespace_for_job(job_id: u32) -> String {
-        format!("spur.{job_id}")
+    pub fn namespace_for_step(job_id: u32, step_id: crate::step::StepId) -> String {
+        format!("spur.{job_id}.{step_id}")
     }
 
     /// Build a plan for all tasks running locally on one agent.
     #[allow(clippy::too_many_arguments)]
     pub fn local_tasks(
         job_id: u32,
+        step_id: crate::step::StepId,
         universe_size: u32,
         task_offset: u32,
         local_count: u32,
@@ -56,7 +61,8 @@ impl PmixLaunchPlan {
             .collect();
         Self {
             job_id,
-            namespace: Self::namespace_for_job(job_id),
+            step_id,
+            namespace: Self::namespace_for_step(job_id, step_id),
             universe_size,
             task_offset,
             local_procs,
@@ -70,6 +76,13 @@ impl PmixLaunchPlan {
             modex_fence_timeout_secs: 0,
             modex_verify_timeout_secs: 0,
         }
+    }
+
+    /// Re-key a controller-built plan to the step this node is actually
+    /// launching, so it cannot disagree with the process that owns the server.
+    pub fn rekey_to_step(&mut self, step_id: crate::step::StepId) {
+        self.step_id = step_id;
+        self.namespace = Self::namespace_for_step(self.job_id, step_id);
     }
 
     pub fn with_modex_timeouts(
@@ -200,6 +213,7 @@ pub fn validate_pmix_plan(plan: &PmixLaunchPlan) -> Result<(), String> {
 #[derive(Debug, Clone)]
 pub struct PmixLocalDispatch {
     pub job_id: u32,
+    pub step_id: crate::step::StepId,
     pub universe_size: u32,
     pub task_offset: u32,
     pub local_count: u32,
@@ -221,6 +235,7 @@ pub fn maybe_local_pmix_plan(mpi: &str, dispatch: PmixLocalDispatch) -> Option<P
     Some(
         PmixLaunchPlan::local_tasks(
             dispatch.job_id,
+            dispatch.step_id,
             dispatch.universe_size,
             dispatch.task_offset,
             dispatch.local_count,
@@ -293,6 +308,7 @@ pub fn pmix_local_dispatch_for_step(
     peers: &PmixStepPeers,
     allocation_node_index: u32,
     job_id: u32,
+    step_id: crate::step::StepId,
     universe_size: u32,
     task_offset: u32,
     local_count: u32,
@@ -310,6 +326,7 @@ pub fn pmix_local_dispatch_for_step(
         })?;
     Ok(PmixLocalDispatch {
         job_id,
+        step_id,
         universe_size,
         task_offset,
         local_count,
@@ -325,11 +342,15 @@ pub fn pmix_local_dispatch_for_step(
     })
 }
 
-/// TCP port used for cross-agent PMIx modex exchange.
-pub fn modex_port_for_job(job_id: u32) -> u16 {
+/// TCP port used for cross-agent PMIx modex exchange. Mirrored byte-for-byte by
+/// `spur_modex_port_for_step` in the C plugin: it is a cross-node wire contract.
+pub fn modex_port_for_step(job_id: u32, step_id: crate::step::StepId) -> u16 {
     const BASE: u32 = 16819;
     const SPAN: u32 = 8000;
-    (BASE + (job_id % SPAN)) as u16
+    // Knuth multiplicative hash, so neighbouring job ids running the same step
+    // land far apart rather than on adjacent ports.
+    let key = job_id.wrapping_mul(2_654_435_761).wrapping_add(step_id);
+    (BASE + (key % SPAN)) as u16
 }
 
 /// Parse `--mpi` / `#SBATCH --mpi`. Returns `None` for `list`.
@@ -364,6 +385,7 @@ pub fn resolve_step_mpi<'a>(step_mpi: &'a str, job_mpi: &'a str) -> &'a str {
 pub fn plan_to_proto(plan: PmixLaunchPlan) -> spur_proto::proto::PmixLaunchPlan {
     spur_proto::proto::PmixLaunchPlan {
         job_id: plan.job_id,
+        step_id: plan.step_id,
         namespace: plan.namespace,
         universe_size: plan.universe_size,
         task_offset: plan.task_offset,
@@ -419,6 +441,7 @@ mod tests {
     fn local_tasks_plan() {
         let plan = PmixLaunchPlan::local_tasks(
             42,
+            crate::step::STEP_BATCH,
             4,
             0,
             4,
@@ -429,7 +452,7 @@ mod tests {
             0,
             vec!["10.0.0.1".into()],
         );
-        assert_eq!(plan.namespace, "spur.42");
+        assert_eq!(plan.namespace, "spur.42.4294967294");
         assert_eq!(plan.universe_size, 4);
         assert_eq!(plan.local_procs.len(), 4);
         assert_eq!(plan.local_procs[0].rank, 0);
@@ -465,6 +488,7 @@ mod tests {
     fn build_validated_pmix_plan_proto_rejects_invalid_multi_node() {
         let dispatch = PmixLocalDispatch {
             job_id: 1,
+            step_id: crate::step::STEP_BATCH,
             universe_size: 5,
             task_offset: 0,
             local_count: 2,
@@ -486,6 +510,7 @@ mod tests {
     fn build_validated_pmix_plan_proto_none_for_non_pmix() {
         let dispatch = PmixLocalDispatch {
             job_id: 1,
+            step_id: crate::step::STEP_BATCH,
             universe_size: 4,
             task_offset: 0,
             local_count: 4,
@@ -508,6 +533,7 @@ mod tests {
     fn validate_multi_node_pmix_plan_rejects_non_uniform_tasks() {
         let plan = PmixLaunchPlan::local_tasks(
             1,
+            crate::step::STEP_BATCH,
             5,
             0,
             2,
@@ -526,6 +552,7 @@ mod tests {
     fn validate_multi_node_pmix_plan_rejects_local_count_mismatch() {
         let plan = PmixLaunchPlan::local_tasks(
             1,
+            crate::step::STEP_BATCH,
             4,
             0,
             3,
@@ -544,6 +571,7 @@ mod tests {
     fn validate_multi_node_pmix_plan_accepts_peer_hosts() {
         let plan = PmixLaunchPlan::local_tasks(
             1,
+            crate::step::STEP_BATCH,
             4,
             2,
             2,
@@ -561,6 +589,7 @@ mod tests {
     fn validate_multi_node_pmix_plan_rejects_peer_mismatch() {
         let plan = PmixLaunchPlan::local_tasks(
             1,
+            crate::step::STEP_BATCH,
             4,
             0,
             2,
@@ -592,7 +621,19 @@ mod tests {
 
     #[test]
     fn validate_pmix_plan_rejects_empty_tmpdir() {
-        let mut plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0, 1, 0, vec![]);
+        let mut plan = PmixLaunchPlan::local_tasks(
+            1,
+            crate::step::STEP_BATCH,
+            1,
+            0,
+            1,
+            "/tmp/pmix",
+            0,
+            0,
+            1,
+            0,
+            vec![],
+        );
         plan.tmpdir.clear();
         assert!(validate_pmix_plan(&plan).is_err());
     }
@@ -601,6 +642,7 @@ mod tests {
     fn validate_pmix_plan_rejects_inconsistent_ranks() {
         let plan = PmixLaunchPlan {
             job_id: 1,
+            step_id: crate::step::STEP_BATCH,
             namespace: "spur.1".into(),
             universe_size: 2,
             task_offset: 0,
@@ -631,6 +673,7 @@ mod tests {
     fn validate_pmix_plan_rejects_local_procs_beyond_universe_size() {
         let plan = PmixLaunchPlan {
             job_id: 1,
+            step_id: crate::step::STEP_BATCH,
             namespace: "spur.1".into(),
             universe_size: 2,
             task_offset: 1,
@@ -658,9 +701,23 @@ mod tests {
     }
 
     #[test]
-    fn modex_port_for_job_is_stable() {
-        assert_eq!(modex_port_for_job(42), 16861);
-        assert_eq!(modex_port_for_job(8042), 16819 + (8042 % 8000));
+    fn modex_port_for_step_is_stable() {
+        assert_eq!(modex_port_for_step(0, 0), 16819);
+        assert_eq!(modex_port_for_step(1, 0), 20580);
+        assert_eq!(modex_port_for_step(42, 0), 24381);
+        assert_eq!(modex_port_for_step(42, crate::step::STEP_BATCH), 24379);
+    }
+
+    #[test]
+    fn modex_port_for_step_separates_steps_of_one_job_and_stays_in_span() {
+        let batch = modex_port_for_step(7, crate::step::STEP_BATCH);
+        let first = modex_port_for_step(7, 0);
+        let second = modex_port_for_step(7, 1);
+        assert_ne!(batch, first);
+        assert_ne!(first, second);
+        for port in [batch, first, second] {
+            assert!((16819..=24818).contains(&port), "port {port} left the span");
+        }
     }
 
     #[test]
@@ -678,7 +735,7 @@ mod tests {
         assert_eq!(peers.modex_node_index(1), None);
 
         let dispatch =
-            pmix_local_dispatch_for_step(&peers, 2, 9, 2, 1, 1, "/tmp/pmix", 0, 0, 0, 0, 0)
+            pmix_local_dispatch_for_step(&peers, 2, 9, 3, 2, 1, 1, "/tmp/pmix", 0, 0, 0, 0, 0)
                 .unwrap();
         assert_eq!(dispatch.num_nodes, 2);
         assert_eq!(dispatch.node_index, 1);

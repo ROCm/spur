@@ -22,6 +22,12 @@ pub enum AllocError {
     /// still mid-launch, not yet committed or released). A second concurrent
     /// launch would double-count resources, so it is rejected.
     DuplicateJob,
+    /// A newer run_attempt already owns this job id's reservation; this
+    /// (older or duplicate) attempt lost the race and must not proceed.
+    Superseded,
+    /// A core being replayed does not exist on this node (the node's CPU count
+    /// shrank since the allocation was made), or another job still holds it.
+    CpusUnavailable,
 }
 
 /// Per-node resource allocation state.
@@ -44,7 +50,7 @@ pub struct NodeAllocation {
     /// Per-job ownership, so an allocation can be released by job id and
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
-    owners: HashMap<u32, AllocationResult>,
+    owners: HashMap<u32, Owned>,
     /// Reserved but not yet committed, with reserve time. Reconcile spares
     /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
@@ -93,7 +99,7 @@ impl NodeAllocation {
         self.owners
             .iter()
             .filter(|(id, _)| !self.launching.contains_key(id))
-            .filter(|(_, alloc)| alloc.gpu_ids.iter().any(|g| device_ids.contains(g)))
+            .filter(|(_, owned)| owned.result.gpu_ids.iter().any(|g| device_ids.contains(g)))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -142,10 +148,12 @@ impl NodeAllocation {
     /// flight for the same job id → `DuplicateJob`. CPU is best-effort since the
     /// controller owns placement. Memory is always accounted so release stays
     /// symmetric. Marked `launching` until `commit_job`/`release_job` so
-    /// reconcile spares an in-flight launch.
+    /// reconcile spares an in-flight launch. `run_attempt` is recorded so a
+    /// later `commit_job` for a different (superseded) attempt is rejected.
     pub fn allocate_for_job(
         &mut self,
         job_id: u32,
+        run_attempt: u32,
         cpus: u32,
         memory_mb: u64,
         gpu_device_ids: &[u32],
@@ -155,12 +163,14 @@ impl NodeAllocation {
         if self.launching.contains_key(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
-        // A committed reservation still owned here means a prior run's teardown
-        // has not released yet (e.g. a preempted-then-requeued job re-dispatched
-        // under the same id before the agent reaped the killed process). The
-        // controller only re-issues LaunchJob after freeing the job, so this
-        // reservation is stale — supersede it rather than reject, releasing it
-        // first so CPU/memory stay symmetric and the owner entry is not orphaned.
+        // A committed owner from the same or an older attempt is stale (a prior
+        // run's teardown hasn't released yet) — supersede it. A NEWER attempt's
+        // owner already won this job id; a late reservation must not clobber it.
+        if let Some(existing) = self.owners.get(&job_id) {
+            if existing.run_attempt > run_attempt {
+                return Err(AllocError::Superseded);
+            }
+        }
         self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
@@ -194,29 +204,151 @@ impl NodeAllocation {
             gpu_ids: gpu_device_ids.to_vec(),
             memory_mb,
         };
-        self.owners.insert(job_id, result.clone());
+        self.owners.insert(
+            job_id,
+            Owned {
+                run_attempt,
+                result: result.clone(),
+            },
+        );
         self.launching.insert(job_id, Instant::now());
+        Ok(result)
+    }
+
+    /// On this node, and either free or already this job's. Narrowing and the
+    /// replay check share it so the two can never disagree about one core.
+    fn cpu_is_claimable(&self, held: &[u32], cpu: u32) -> bool {
+        self.allocated_cpus
+            .get(cpu as usize)
+            .is_some_and(|&taken| !taken || held.contains(&cpu))
+    }
+
+    /// The cores of `cpu_ids` this job may claim: free, or already its own.
+    /// Lets a replay under-count rather than be refused over a contested core.
+    pub fn claimable_cpu_ids(&self, job_id: u32, cpu_ids: &[u32]) -> Vec<u32> {
+        let held: &[u32] = self
+            .owners
+            .get(&job_id)
+            .map_or(&[], |owned| owned.result.cpu_ids.as_slice());
+        cpu_ids
+            .iter()
+            .copied()
+            .filter(|&cpu| self.cpu_is_claimable(held, cpu))
+            .collect()
+    }
+
+    /// Re-record the allocation of a job adopted after an agent restart. Cores
+    /// are replayed verbatim; narrow with `claimable_cpu_ids` to drop, not reject.
+    pub fn restore_for_job(
+        &mut self,
+        job_id: u32,
+        run_attempt: u32,
+        cpu_ids: &[u32],
+        memory_mb: u64,
+        gpu_device_ids: &[u32],
+    ) -> Result<AllocationResult, AllocError> {
+        if let Some(existing) = self.owners.get(&job_id) {
+            if existing.run_attempt > run_attempt {
+                return Err(AllocError::Superseded);
+            }
+        }
+        // Resolved before releasing, so a rejected replay leaves the ledger
+        // exactly as it found it rather than dropping the outgoing owner.
+        let owned = self.owners.get(&job_id).map(|owned| &owned.result);
+        let held_cpus: &[u32] = owned.map_or(&[], |result| result.cpu_ids.as_slice());
+        let held_gpus: &[u32] = owned.map_or(&[], |result| result.gpu_ids.as_slice());
+        for &cpu in cpu_ids {
+            // A core another job still holds would be freed by the first
+            // release, handing both jobs an overlapping cpuset.
+            if !self.cpu_is_claimable(held_cpus, cpu) {
+                return Err(AllocError::CpusUnavailable);
+            }
+        }
+        let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
+        for &id in gpu_device_ids {
+            let idx = self
+                .gpus
+                .iter()
+                .position(|g| g.device_id == id)
+                .ok_or(AllocError::GpusUnavailable)?;
+            if (self.gpu_allocated[idx] && !held_gpus.contains(&id)) || gpu_indices.contains(&idx) {
+                return Err(AllocError::GpusUnavailable);
+            }
+            gpu_indices.push(idx);
+        }
+        self.release_job(job_id);
+
+        for &cpu in cpu_ids {
+            self.allocated_cpus[cpu as usize] = true;
+        }
+        self.allocated_memory_mb += memory_mb;
+        for &idx in &gpu_indices {
+            self.gpu_allocated[idx] = true;
+        }
+
+        let result = AllocationResult {
+            cpu_ids: cpu_ids.to_vec(),
+            gpu_ids: gpu_device_ids.to_vec(),
+            memory_mb,
+        };
+        // Committed outright: an adopted job is already running, and leaving it
+        // `launching` would let reconcile reclaim it once the TTL elapsed.
+        self.owners.insert(
+            job_id,
+            Owned {
+                run_attempt,
+                result: result.clone(),
+            },
+        );
         Ok(result)
     }
 
     /// Mark a job's allocation as committed (its process is now tracked), so it
     /// is no longer exempt from reconcile. Returns false if the reservation no
-    /// longer exists — reconcile reclaimed it after the launch exceeded the TTL,
-    /// so the caller must not treat the job as backed by an allocation.
-    pub fn commit_job(&mut self, job_id: u32) -> bool {
-        self.launching.remove(&job_id);
-        self.owners.contains_key(&job_id)
+    /// longer exists (reconcile reclaimed it after the launch exceeded the TTL)
+    /// or now belongs to a different `run_attempt` (a newer reservation for the
+    /// same job id superseded this one) — either way the caller must not treat
+    /// the job as backed by an allocation.
+    pub fn commit_job(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        let owned = self
+            .owners
+            .get(&job_id)
+            .is_some_and(|owned| owned.run_attempt == run_attempt);
+        // The marker is keyed by job id alone, so a late commit for a superseded
+        // attempt would clear the one protecting the attempt that replaced it.
+        if owned {
+            self.launching.remove(&job_id);
+        }
+        owned
     }
 
-    /// Release a job's allocation by id. Idempotent: releasing an unknown or
-    /// already-released job is a no-op returning false.
+    /// Release a job's allocation by id, regardless of which attempt owns it.
+    /// Idempotent: releasing an unknown or already-released job is a no-op
+    /// returning false. Only for callers that genuinely don't have a specific
+    /// attempt to compare (reconcile, foreign-owner reclaim) — everyone else
+    /// should use `release_job_if`.
     pub fn release_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
-        let Some(alloc) = self.owners.remove(&job_id) else {
+        let Some(owned) = self.owners.remove(&job_id) else {
             return false;
         };
-        self.release(&alloc);
+        self.release(&owned.result);
         true
+    }
+
+    /// Release a job's allocation only if `run_attempt` is still the current
+    /// owner, so a stale caller can't free a different, newer attempt's
+    /// reservation that has since superseded the one it thinks it owns.
+    pub fn release_job_if(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        if self
+            .owners
+            .get(&job_id)
+            .is_some_and(|owned| owned.run_attempt == run_attempt)
+        {
+            self.release_job(job_id)
+        } else {
+            false
+        }
     }
 
     /// Release owned allocations whose job is neither live nor launching within
@@ -249,6 +381,14 @@ impl NodeAllocation {
         }
         orphaned
     }
+}
+
+/// An owned reservation, tagged with the attempt that created it so a later
+/// operation for a superseded attempt can be told apart from the current one.
+#[derive(Debug, Clone)]
+struct Owned {
+    run_attempt: u32,
+    result: AllocationResult,
 }
 
 /// Result of a successful allocation.
@@ -329,7 +469,7 @@ mod tests {
     #[test]
     fn test_allocate_cpus() {
         let mut node = make_node(64, 256_000, 0, "");
-        let alloc = node.allocate_for_job(1, 16, 0, &[]).unwrap();
+        let alloc = node.allocate_for_job(1, 1, 16, 0, &[]).unwrap();
         assert_eq!(alloc.cpu_ids.len(), 16);
         assert_eq!(node.free_cpus(), 48);
     }
@@ -337,7 +477,7 @@ mod tests {
     #[test]
     fn test_allocate_gpus_by_device_id() {
         let mut node = make_node(64, 256_000, 8, "mi300x");
-        let alloc = node.allocate_for_job(1, 0, 0, &[0, 1, 2, 3]).unwrap();
+        let alloc = node.allocate_for_job(1, 1, 0, 0, &[0, 1, 2, 3]).unwrap();
         assert_eq!(alloc.gpu_ids, vec![0, 1, 2, 3]);
         assert_eq!(node.free_gpus(None), 4);
     }
@@ -349,7 +489,7 @@ mod tests {
         // return to the free pool or it is rejected forever.
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
 
-        assert!(node.allocate_for_job(1, 0, 0, &[129, 131]).is_ok());
+        assert!(node.allocate_for_job(1, 1, 0, 0, &[129, 131]).is_ok());
         assert_eq!(node.free_gpus(None), 2);
 
         assert!(node.release_job(1));
@@ -361,7 +501,7 @@ mod tests {
 
         // The whole point: the device is re-allocatable after release.
         assert!(
-            node.allocate_for_job(2, 0, 0, &[129, 131]).is_ok(),
+            node.allocate_for_job(2, 1, 0, 0, &[129, 131]).is_ok(),
             "device_ids must be re-allocatable after release"
         );
     }
@@ -369,7 +509,7 @@ mod tests {
     #[test]
     fn test_allocate_rejects_unknown_device_id() {
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129], "mi350x");
-        assert!(node.allocate_for_job(1, 0, 0, &[200]).is_err());
+        assert!(node.allocate_for_job(1, 1, 0, 0, &[200]).is_err());
         // A rejected allocation must not leave partial state behind.
         assert_eq!(node.free_gpus(None), 2);
         assert!(!node.release_job(1));
@@ -380,12 +520,12 @@ mod tests {
         // If a multi-GPU allocation hits a conflict partway, it must not leave
         // the earlier device_ids marked allocated — that is itself a leak.
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130], "mi350x");
-        assert!(node.allocate_for_job(1, 0, 0, &[129]).is_ok());
+        assert!(node.allocate_for_job(1, 1, 0, 0, &[129]).is_ok());
         // [128, 129] — 129 already taken, so the whole call must fail and 128
         // must remain free.
-        assert!(node.allocate_for_job(2, 0, 0, &[128, 129]).is_err());
+        assert!(node.allocate_for_job(2, 1, 0, 0, &[128, 129]).is_err());
         assert!(
-            node.allocate_for_job(3, 0, 0, &[128]).is_ok(),
+            node.allocate_for_job(3, 1, 0, 0, &[128]).is_ok(),
             "128 must remain free after the failed partial allocation"
         );
     }
@@ -394,7 +534,7 @@ mod tests {
     fn test_allocate_for_job_release_by_id() {
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
         let alloc = node
-            .allocate_for_job(1, 8, 32_000, &[129, 131])
+            .allocate_for_job(1, 1, 8, 32_000, &[129, 131])
             .expect("allocation should succeed");
         assert_eq!(alloc.gpu_ids, vec![129, 131]);
         assert_eq!(node.free_cpus(), 56);
@@ -415,16 +555,16 @@ mod tests {
         // committed or released) is a genuine concurrent duplicate: rejecting it
         // avoids double-counting CPU/mem and orphaning the prior owner entry.
         let mut node = make_node(64, 256_000, 0, "");
-        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_ok());
+        assert!(node.allocate_for_job(1, 1, 8, 16_000, &[]).is_ok());
         assert_eq!(
-            node.allocate_for_job(1, 8, 16_000, &[]),
+            node.allocate_for_job(1, 1, 8, 16_000, &[]),
             Err(AllocError::DuplicateJob)
         );
         assert_eq!(node.free_cpus(), 56);
         assert_eq!(node.free_memory_mb(), 240_000);
         // After release the id is free to reserve again.
         assert!(node.release_job(1));
-        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_ok());
+        assert!(node.allocate_for_job(1, 1, 8, 16_000, &[]).is_ok());
     }
 
     #[test]
@@ -435,13 +575,13 @@ mod tests {
         // otherwise the legitimate re-launch fails and the job never runs. The
         // stale reservation is released first, so resources are not double-counted.
         let mut node = make_node(64, 256_000, 0, "");
-        node.allocate_for_job(7, 8, 16_000, &[]).unwrap();
-        node.commit_job(7); // prior run committed, then preempted (not released).
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        node.commit_job(7, 1); // prior run committed, then preempted (not released).
         assert_eq!(node.free_cpus(), 56);
 
         // Re-dispatch under the same id succeeds and does not double-count.
         let alloc = node
-            .allocate_for_job(7, 8, 16_000, &[])
+            .allocate_for_job(7, 1, 8, 16_000, &[])
             .expect("re-dispatch of a stale committed job id must succeed");
         assert_eq!(alloc.cpu_ids.len(), 8);
         assert_eq!(node.free_cpus(), 56);
@@ -449,7 +589,7 @@ mod tests {
         // Exactly one owner entry remains, and the fresh reservation is again
         // treated as in-flight until it commits or releases.
         assert_eq!(
-            node.allocate_for_job(7, 8, 16_000, &[]),
+            node.allocate_for_job(7, 1, 8, 16_000, &[]),
             Err(AllocError::DuplicateJob)
         );
     }
@@ -457,10 +597,10 @@ mod tests {
     #[test]
     fn test_allocate_for_job_rejects_conflicting_gpu() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
-        assert!(node.allocate_for_job(1, 4, 0, &[0]).is_ok());
+        assert!(node.allocate_for_job(1, 1, 4, 0, &[0]).is_ok());
         // Second job wanting the same device id must fail with no state change.
         assert_eq!(
-            node.allocate_for_job(2, 4, 0, &[0]),
+            node.allocate_for_job(2, 1, 4, 0, &[0]),
             Err(AllocError::GpusUnavailable)
         );
         assert_eq!(node.free_gpus(None), 1);
@@ -472,10 +612,10 @@ mod tests {
     fn test_conflicting_owners_reports_committed_but_not_launching() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
         // job 1: committed, owns GPUs 0 and 1.
-        node.allocate_for_job(1, 4, 8_000, &[0, 1]).unwrap();
-        node.commit_job(1);
+        node.allocate_for_job(1, 1, 4, 8_000, &[0, 1]).unwrap();
+        node.commit_job(1, 1);
         // job 2: still launching (reserved, not committed), owns GPU 2.
-        node.allocate_for_job(2, 4, 8_000, &[2]).unwrap();
+        node.allocate_for_job(2, 1, 4, 8_000, &[2]).unwrap();
 
         // A new dispatch onto GPU 1 conflicts with committed job 1.
         assert_eq!(node.conflicting_owners(&[1]), vec![1]);
@@ -492,13 +632,13 @@ mod tests {
     fn test_reconcile_reclaims_orphans_but_spares_live_and_launching() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
         // job 1: committed and live.
-        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
-        node.commit_job(1);
+        node.allocate_for_job(1, 1, 4, 8_000, &[0]).unwrap();
+        node.commit_job(1, 1);
         // job 2: committed but NOT live (teardown failed to release — orphan).
-        node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
-        node.commit_job(2);
+        node.allocate_for_job(2, 1, 4, 8_000, &[1]).unwrap();
+        node.commit_job(2, 1);
         // job 3: launching within TTL — spared.
-        node.allocate_for_job(3, 4, 8_000, &[2]).unwrap();
+        node.allocate_for_job(3, 1, 4, 8_000, &[2]).unwrap();
 
         let live: HashSet<u32> = [1].into_iter().collect();
         let ttl = Duration::from_secs(120);
@@ -516,7 +656,7 @@ mod tests {
     fn test_reconcile_reclaims_launching_past_ttl() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
         // A launch reserved but never committed must be reclaimed past the TTL.
-        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
+        node.allocate_for_job(1, 1, 4, 8_000, &[0]).unwrap();
 
         let live: HashSet<u32> = HashSet::new();
         let ttl = Duration::from_secs(120);
@@ -532,21 +672,21 @@ mod tests {
     #[test]
     fn test_commit_job_reports_reclaimed_reservation() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
-        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
+        node.allocate_for_job(1, 1, 4, 8_000, &[0]).unwrap();
         assert!(
-            node.commit_job(1),
+            node.commit_job(1, 1),
             "commit of a live reservation returns true"
         );
 
         // A launch whose reservation reconcile reclaimed before commit: the
         // owner is gone, so commit must report false and stay a no-op. Keep
         // job 1 in the live set so only the past-TTL launch (job 2) is reclaimed.
-        node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
+        node.allocate_for_job(2, 1, 4, 8_000, &[1]).unwrap();
         let live: HashSet<u32> = [1].into_iter().collect();
         let past = Instant::now() + Duration::from_secs(121);
         node.reconcile(&live, past, Duration::from_secs(120));
         assert!(
-            !node.commit_job(2),
+            !node.commit_job(2, 1),
             "commit of a reclaimed reservation returns false"
         );
         assert_eq!(
@@ -557,12 +697,254 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_job_rejects_a_superseded_attempt() {
+        // Attempt 1 reserves job 7, then something (a cancel, or the TTL
+        // reconcile) releases it believing it's gone before it ever commits —
+        // freeing the job id for a redispatch (attempt 2) to reserve and
+        // commit. Attempt 1, unaware it was superseded, must not have its own,
+        // now-stale commit adopt attempt 2's reservation as its own.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        node.release_job(7);
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+        assert!(node.commit_job(7, 2), "the current attempt commits");
+
+        assert!(
+            !node.commit_job(7, 1),
+            "a superseded attempt's late commit must not succeed"
+        );
+        assert_eq!(
+            node.free_cpus(),
+            56,
+            "the current attempt's resources must remain allocated"
+        );
+    }
+
+    #[test]
+    fn test_allocate_for_job_rejects_a_stale_attempt_superseding_a_committed_newer_one() {
+        // Attempt 2 reserves and commits job 7. A late/duplicate LaunchJob for
+        // the older attempt 1 must not be allowed to supersede it — that would
+        // hand attempt 2's live, running resources to a stale relaunch.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+        assert!(node.commit_job(7, 2));
+
+        assert_eq!(
+            node.allocate_for_job(7, 1, 8, 16_000, &[]),
+            Err(AllocError::Superseded)
+        );
+        assert_eq!(
+            node.free_cpus(),
+            56,
+            "the newer attempt's resources must remain allocated"
+        );
+    }
+
+    #[test]
+    fn test_a_superseded_commit_leaves_the_replacement_launch_protected() {
+        // Attempt 1's reservation is reclaimed, attempt 2 takes the job id, and
+        // attempt 1's late commit lands while attempt 2 is still mid-launch.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        node.release_job(7);
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+
+        assert!(!node.commit_job(7, 1), "a superseded attempt cannot commit");
+
+        assert!(
+            node.reconcile(&HashSet::new(), Instant::now(), Duration::from_secs(120))
+                .is_empty(),
+            "a stale commit must not strip the launching marker sparing attempt 2"
+        );
+        assert_eq!(
+            node.free_cpus(),
+            56,
+            "attempt 2's mid-launch reservation must survive"
+        );
+    }
+
+    #[test]
+    fn test_allocate_for_job_supersedes_a_committed_same_or_older_attempt() {
+        // A same-attempt retry, or a genuinely newer attempt reserving after a
+        // stale committed owner, must still supersede as before.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        assert!(node.commit_job(7, 1));
+
+        assert!(node.allocate_for_job(7, 2, 8, 16_000, &[]).is_ok());
+        assert_eq!(node.free_cpus(), 56);
+    }
+
+    #[test]
+    fn test_restore_for_job_rejects_a_core_another_job_holds() {
+        let mut node = make_node(8, 64_000, 0, "");
+        node.allocate_for_job(1, 1, 4, 8_000, &[]).unwrap();
+        assert!(node.commit_job(1, 1));
+        assert_eq!(node.free_cpus(), 4);
+
+        // Replaying a descriptor that names core 3 — job 1's — would hand both
+        // an overlapping cpuset the moment either one released.
+        assert_eq!(
+            node.restore_for_job(2, 1, &[3, 4], 8_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(node.free_cpus(), 4, "rejected replay changed the ledger");
+        assert_eq!(node.free_memory_mb(), 56_000);
+        assert!(!node.release_job(2), "rejected replay left an owner entry");
+
+        // Job 1's cores are still exclusively its own to release.
+        assert!(node.release_job(1));
+        assert_eq!(node.free_cpus(), 8);
+    }
+
+    #[test]
+    fn test_restore_for_job_replays_a_jobs_own_cores_again() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        node.restore_for_job(5, 2, &[1, 2], 8_000, &[0]).unwrap();
+        assert_eq!(node.free_cpus(), 6);
+
+        // A second adoption pass replays the same descriptor; the job's own
+        // cores and GPUs must not read as someone else's conflict.
+        node.restore_for_job(5, 2, &[1, 2], 8_000, &[0]).unwrap();
+        assert_eq!(node.free_cpus(), 6);
+        assert_eq!(node.free_memory_mb(), 56_000);
+        assert_eq!(node.free_gpus(None), 1);
+    }
+
+    #[test]
+    fn test_restore_for_job_rejects_a_superseded_attempt() {
+        let mut node = make_node(8, 64_000, 0, "");
+        node.allocate_for_job(9, 3, 2, 8_000, &[]).unwrap();
+        assert!(node.commit_job(9, 3));
+
+        // A newer attempt already owns this id; a stale adoption must not
+        // clobber it or release the cores it is running on.
+        assert_eq!(
+            node.restore_for_job(9, 2, &[4, 5], 8_000, &[]),
+            Err(AllocError::Superseded)
+        );
+        assert_eq!(node.free_cpus(), 6);
+        assert!(node.release_job_if(9, 3));
+        assert_eq!(node.free_cpus(), 8);
+    }
+
+    #[test]
+    fn test_restore_for_job_commits_outright_instead_of_leaving_it_launching() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        node.restore_for_job(4, 1, &[0, 1], 8_000, &[0]).unwrap();
+
+        // conflicting_owners skips mid-launch owners, so reporting one proves
+        // the adopted job committed rather than staying reclaimable.
+        assert_eq!(node.conflicting_owners(&[0]), vec![4]);
+        let live: HashSet<u32> = HashSet::new();
+        let ttl = Duration::from_secs(600);
+        assert_eq!(node.reconcile(&live, Instant::now(), ttl), vec![4]);
+        assert_eq!(node.free_cpus(), 8);
+
+        // A job still mid-launch when the agent restarted: adoption must clear
+        // the launching marker it left behind.
+        node.allocate_for_job(7, 1, 2, 8_000, &[1]).unwrap();
+        assert!(node.conflicting_owners(&[1]).is_empty());
+        node.restore_for_job(7, 1, &[2, 3], 8_000, &[1]).unwrap();
+        assert_eq!(node.conflicting_owners(&[1]), vec![7]);
+    }
+
+    #[test]
+    fn test_restore_for_job_keeps_an_incumbent_owner_when_it_rejects() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        node.restore_for_job(5, 1, &[1, 2], 8_000, &[0]).unwrap();
+        node.restore_for_job(9, 1, &[3], 8_000, &[1]).unwrap();
+
+        // Job 5 replays a descriptor that has grown job 9's core. Rejecting
+        // after the release would drop job 5's own entry along with it.
+        assert_eq!(
+            node.restore_for_job(5, 1, &[1, 2, 3], 8_000, &[0]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(node.free_cpus(), 5);
+        assert_eq!(node.free_memory_mb(), 48_000);
+        assert_eq!(node.free_gpus(None), 0);
+        assert!(node.release_job_if(5, 1), "job 5 lost its owner entry");
+        assert_eq!(node.free_cpus(), 7);
+    }
+
+    #[test]
+    fn test_restore_for_job_rejects_a_gpu_another_job_holds() {
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        node.allocate_for_job(1, 1, 2, 8_000, &[0]).unwrap();
+        assert!(node.commit_job(1, 1));
+
+        assert_eq!(
+            node.restore_for_job(2, 1, &[4, 5], 8_000, &[0]),
+            Err(AllocError::GpusUnavailable)
+        );
+        assert_eq!(node.free_gpus(None), 1);
+        assert_eq!(node.free_cpus(), 6, "rejected replay claimed cores anyway");
+        assert!(!node.release_job(2));
+    }
+
+    #[test]
+    fn test_restore_for_job_records_memory_and_gpus_with_no_cores() {
+        let mut node = make_node_with_ids(4, 64_000, vec![0], "mi300x");
+
+        // Narrowing can strip every recorded core. The GPU and memory still
+        // have to land, or a live job's device reads free.
+        node.restore_for_job(6, 1, &[], 8_000, &[0]).unwrap();
+        assert_eq!(node.free_gpus(None), 0);
+        assert_eq!(node.free_memory_mb(), 56_000);
+        assert_eq!(node.conflicting_owners(&[0]), vec![6]);
+    }
+
+    #[test]
+    fn test_claimable_cpu_ids_drops_only_the_contested_cores() {
+        let mut node = make_node(8, 64_000, 0, "");
+        node.allocate_for_job(1, 1, 2, 8_000, &[]).unwrap();
+
+        // Another job's cores and cores the node lost are dropped; the job's
+        // own survive so a repeated replay does not shrink it.
+        assert_eq!(node.claimable_cpu_ids(2, &[0, 1, 4, 9]), vec![4]);
+        node.restore_for_job(2, 1, &[4, 5], 8_000, &[]).unwrap();
+        assert_eq!(node.claimable_cpu_ids(2, &[4, 5, 0]), vec![4, 5]);
+        assert!(node.claimable_cpu_ids(3, &[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn test_restore_for_job_rejects_a_core_the_node_no_longer_has() {
+        let mut node = make_node(4, 64_000, 0, "");
+        assert_eq!(
+            node.restore_for_job(1, 1, &[3, 4], 8_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(node.free_cpus(), 4);
+        assert!(!node.release_job(1));
+    }
+
+    #[test]
+    fn test_release_job_if_spares_a_reused_job_ids_reservation() {
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        node.release_job(7);
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+
+        assert!(
+            !node.release_job_if(7, 1),
+            "a stale attempt must not release a different, current attempt's reservation"
+        );
+        assert_eq!(node.free_cpus(), 56);
+        assert!(
+            node.release_job_if(7, 2),
+            "the current attempt can release its own"
+        );
+        assert_eq!(node.free_cpus(), 64);
+    }
+
+    #[test]
     fn test_memory_released_symmetrically_with_zero_cpus() {
         // A job with 0 cpus must still have its memory reserved and released
         // symmetrically, or release drives allocated_memory_mb below what was
         // added.
         let mut node = make_node(64, 256_000, 0, "");
-        node.allocate_for_job(1, 0, 16_000, &[]).unwrap();
+        node.allocate_for_job(1, 1, 0, 16_000, &[]).unwrap();
         assert_eq!(node.free_memory_mb(), 240_000);
         node.release_job(1);
         assert_eq!(node.free_memory_mb(), 256_000);
@@ -571,8 +953,8 @@ mod tests {
     #[test]
     fn test_multiple_allocations() {
         let mut node = make_node(64, 256_000, 8, "mi300x");
-        let a1 = node.allocate_for_job(1, 16, 64_000, &[0, 1]).unwrap();
-        let a2 = node.allocate_for_job(2, 16, 64_000, &[2, 3]).unwrap();
+        let a1 = node.allocate_for_job(1, 1, 16, 64_000, &[0, 1]).unwrap();
+        let a2 = node.allocate_for_job(2, 1, 16, 64_000, &[2, 3]).unwrap();
         assert_eq!(node.free_cpus(), 32);
         assert_eq!(node.free_gpus(None), 4);
 

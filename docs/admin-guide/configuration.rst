@@ -184,9 +184,14 @@ and Raft high-availability topology.
    * - ``state_dir``
      - string
      - ``"/var/spool/spur"``
-     - Not implemented
-     - Ignored. The controller always uses its ``--state-dir`` flag, which
-       defaults to ``/var/spool/spur``.
+     - Restart
+     - Ignored by ``spurctld``, which always uses its ``--state-dir`` flag
+       (itself defaulting to ``/var/spool/spur``). Read by ``spurd`` as the
+       fallback root for the supervisor session spool that lets running jobs
+       survive an agent restart, used when neither the agent's ``--state-dir``
+       flag nor ``SPUR_STEPD_STATE_DIR`` is set. Changing it relocates that
+       spool on every node sharing this file, so restarted agents no longer
+       find the sessions they left behind; drain the nodes before changing it.
    * - ``max_job_id``
      - integer
      - ``999999999``
@@ -576,8 +581,8 @@ How client requests are authenticated.
        rejected rather than silently ignored, and ``"none"`` with
        ``mode = "required"`` is refused as contradictory. Nothing reads it
        afterwards — whether a presented credential is verified is decided by
-       ``mode`` and ``jwt_key`` alone, so ``plugin = "none"`` does **not** turn
-       verification off.
+       ``mode`` and the configured signing key alone, so ``plugin = "none"``
+       does **not** turn verification off.
    * - ``mode``
      - string
      - ``"permissive"``
@@ -591,8 +596,17 @@ How client requests are authenticated.
      - none
      - Restart
      - Signing key for user credentials (``spur token user``) and node admission
-       tokens, given as a file path or inline value. Deliberately not reloadable:
-       swapping it live would immediately invalidate every outstanding token.
+       tokens, given inline. The value is used literally as the secret — a path
+       here is the secret itself, not a file to read from. Deliberately not
+       reloadable: swapping it live would immediately invalidate every
+       outstanding token.
+   * - ``jwt_key_file``
+     - string
+     - none
+     - Restart
+     - Path to a regular file whose contents are the signing key, for keeping the
+       secret out of ``spur.conf``. A single trailing line ending is ignored.
+       Mutually exclusive with ``jwt_key``: setting both is rejected at startup.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -605,16 +619,20 @@ How client requests are authenticated.
    credential is unauthenticated, and the username it asserts in the request is
    taken at face value. Identity-dependent decisions — job ownership, reservation
    management, job-info visibility — are then only as trustworthy as the network.
-   Set ``mode = "required"`` (with a ``jwt_key``) to make them enforceable, and
-   restrict the controller port at the network layer either way. ``spurctld``
-   warns at startup whenever it binds a non-loopback address without
+   Set ``mode = "required"`` (with ``jwt_key`` or ``jwt_key_file``) to make them
+   enforceable, and restrict the controller port at the network layer either way.
+   ``spurctld`` warns at startup whenever it binds a non-loopback address without
    ``required``.
 
 .. note::
 
-   When ``jwt_key`` is unset, admission tokens are signed with a well-known
-   built-in key and are therefore forgeable; set an explicit key before enabling
-   token admission (``[admission] mode = "token"``).
+   Token admission needs a signing key to attest node identity. When neither
+   ``jwt_key`` nor ``jwt_key_file`` is set, ``[admission] mode = "token"`` still
+   gates which nodes may register — the join token is checked — but registered
+   agents are issued no node credential and none is demanded of them afterwards,
+   so a caller that reaches the controller port can act as any registered node.
+   ``spurctld`` warns at startup in this configuration; set an explicit key
+   before relying on token admission.
 
 .. _privileged-operations:
 
@@ -1206,8 +1224,11 @@ Job isolation layers.
 
 cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
 process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
-exec``, and interactive attach — runs in a cgroup at
-``/sys/fs/cgroup/spur/job_<id>``, and the limits are derived from the **per-node
+exec``, and interactive attach — is confined beneath
+``/sys/fs/cgroup/spur/job_<id>_<attempt>``. That directory carries the limits and
+the device filter; each step runs in its own ``step_<n>`` leaf underneath it and
+inherits both, because cgroup v2 will not hold processes in a node whose
+children have controllers enabled. The limits are derived from the **per-node
 budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
 the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
 cgroups.
@@ -1218,8 +1239,9 @@ cgroups.
    default ``required = false`` a host that cannot apply a constraint — missing
    ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
    unconstrained. Set ``required = true`` to make that case fail closed instead.
-   See :ref:`cgroup-containment-gaps` for what remains even then: per-step
-   granularity, and the site-supplied task hooks that run outside the job cgroup.
+   See :ref:`cgroup-containment-gaps` for what remains even then: a step leaf
+   carries no budget of its own, and the site-supplied task hooks run outside
+   the job cgroup.
 
 .. note::
 
@@ -1439,11 +1461,11 @@ Verify what a running job actually got:
 
 .. code-block:: bash
 
-   cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus       # allocated cores
-   cat /sys/fs/cgroup/spur/job_1234/memory.max        # hard ceiling, bytes
-   cat /sys/fs/cgroup/spur/job_1234/memory.high       # reclaim threshold
-   cat /sys/fs/cgroup/spur/job_1234/memory.swap.max   # swap ceiling
-   bpftool cgroup show /sys/fs/cgroup/spur/job_1234   # attached device filter
+   cat /sys/fs/cgroup/spur/job_1234_1/cpuset.cpus       # allocated cores
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.max        # hard ceiling, bytes
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.high       # reclaim threshold
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.swap.max   # swap ceiling
+   bpftool cgroup show /sys/fs/cgroup/spur/job_1234_1   # attached device filter
 
 Migrating from ``cgroup.conf``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

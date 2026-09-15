@@ -22,21 +22,22 @@ to ``~/.local/bin`` (no sudo required):
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
    export PATH="$HOME/.local/bin:$PATH"
 
-This installs the three binaries — ``spur``, ``spurctld``, and ``spurd`` — and makes the
+This installs the four binaries — ``spur``, ``spurctld``, ``spurd``, and the per-job
+supervisor ``spurstepd`` — and makes the
 CLI reachable under its Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
 
 For ``--mpi=pmix``, use a **nightly** tarball (includes ``spur_mpi_pmix.so``);
 see :ref:`mpi-pmix-install`.
 
 To build from source instead, install the Rust toolchain and ``protobuf-compiler``, then
-build the three binaries:
+build the binaries:
 
 .. code-block:: bash
 
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 
 The binaries land in ``target/release/``. For a fuller build walkthrough see
 :doc:`/developer/building`.
@@ -101,9 +102,55 @@ The two daemons are configured with command-line flags. The most common are belo
    * - ``--listen <ADDR>``
      - ``[::]:6818``
      - Agent gRPC listen address.
+   * - ``--state-dir <PATH>``
+     - *(*\ ``[controller] state_dir``\ *, then* ``/var/spool/spur`` *)*
+     - Directory for this agent's own persisted runtime state (job supervisor
+       sessions that survive an ``spurd`` restart). Falls back to
+       ``[controller] state_dir`` from the config file. Also settable via
+       ``SPUR_STEPD_STATE_DIR``. Sessions live in a ``runtime/`` subdirectory
+       the agent owns, so sharing the controller's directory is safe and is the
+       default. Give each ``spurd`` its own path when co-locating multiple
+       agents on one host (e.g. dev/test setups) — two agents must not share one.
    * - ``--log-level <LEVEL>``
      - ``info``
      - Log verbosity.
+
+.. note::
+
+   Work runs under a supervisor — one per job, plus one per numbered ``srun``
+   step — so batch, container, allocation and MPI jobs and the steps inside
+   them keep running across an ``spurd`` restart or upgrade. A step's exit
+   status is reported over the reconnect, so a job whose agent restarted
+   mid-step still completes with the right exit code.
+
+   Two launches are still unsupervised and do **not** survive a restart: a step
+   given its own ``--container-image``, and an ``srun --pty`` that allocates its
+   own job. A terminal opened *inside* an existing allocation is supervised —
+   see :doc:`../user-guide/interactive`. A container step killed that way also
+   leaks its unpacked rootfs, which nothing reclaims. Containerized *jobs* are
+   supervised and survive a restart normally.
+
+   ``--mpi=pmix`` work survives a restart the same way: a job and an inner
+   ``srun --mpi=pmix`` step each host their PMIx server inside their own
+   supervisor. A step given its own ``--container-image`` is the exception —
+   its server stays in ``spurd``, so restarting the agent breaks its
+   rendezvous along with the step itself.
+
+   Before the controller will *fence* a supervisor belonging to a superseded
+   run, the reporting node has to prove its identity, and that takes **two**
+   settings together: ``[auth] jwt_key`` (or ``jwt_key_file``) **and**
+   ``[admission] mode = "token"``. The credential a recovery report is checked
+   against is only minted when an agent registers with an admission token, so
+   a signing key on its own — the common case, since admission defaults to
+   ``open`` — proves nothing.
+
+   With either setting missing, recovery still works and is simply taken on
+   trust: the agent supervises and re-adopts as normal, and the controller
+   keeps the job alive rather than dropping a supervisor it cannot verify. What
+   it will not do is fence one, so a supervisor left over from a superseded run
+   is not torn down by this path. See :doc:`../admin-guide/configuration` for
+   both settings, and note that without a signing key no node credential is
+   issued or demanded at all, so node identity is unattested cluster-wide.
 
 .. note::
 
@@ -353,12 +400,23 @@ For production, run the agent as a systemd service:
    ExecStart=/usr/local/bin/spurd --controller http://10.44.0.1:6817 --hostname gpu-node-1 --address 10.44.0.2 --listen 0.0.0.0:6818 --log-level info
    Restart=on-failure
    RestartSec=3
+   KillMode=process
    User=root
    LimitMEMLOCK=infinity
    LimitNOFILE=65536
 
    [Install]
    WantedBy=multi-user.target
+
+.. important::
+
+   ``KillMode=process`` is required for jobs to survive an agent restart.
+   systemd's default, ``control-group``, signals every process in the unit's
+   cgroup on stop or restart. Job supervisors are deliberately detached from
+   the agent — their own session, reparented to init — so that
+   ``systemctl restart spurd`` leaves running work untouched. They nonetheless
+   remain in the unit's cgroup, so the default kill mode terminates them and
+   the next agent startup reclaims the now-orphaned job.
 
 Verify:
 
@@ -420,9 +478,12 @@ CPU, Memory, and Device Limits (cgroups)
 ----------------------------------------
 
 ``spurd`` puts the processes it starts for a job into a cgroup-v2 group at
-``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
-allocated** — the cores and memory the scheduler actually granted this node, not
-what the job asked for.
+``/sys/fs/cgroup/spur/job_<id>_<attempt>`` and enforces the **per-node budget the
+controller allocated** — the cores and memory the scheduler actually granted this
+node, not what the job asked for. The attempt suffix keys the cgroup by run
+attempt rather than job ID alone, so a job launched again after a failure never
+lands in a still-occupied cgroup left by a prior attempt that has not been
+reaped yet.
 
 This covers every process the agent starts for a job: ``sbatch`` scripts,
 ``--pty`` jobs, containerized jobs (a container's process tree inherits the job
@@ -456,11 +517,18 @@ Inspect what a running job actually got:
 
 .. code-block:: bash
 
-   ls /sys/fs/cgroup/spur/                            # one dir per running job
-   cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus
-   cat /sys/fs/cgroup/spur/job_1234/memory.max
-   cat /sys/fs/cgroup/spur/job_1234/memory.swap.max
-   bpftool cgroup show /sys/fs/cgroup/spur/job_1234   # the device filter, if attached
+   ls /sys/fs/cgroup/spur/                            # one dir per running job attempt
+   cat /sys/fs/cgroup/spur/job_1234_1/cpuset.cpus
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.max
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.swap.max
+   bpftool cgroup show /sys/fs/cgroup/spur/job_1234_1 # the device filter, if attached
+   ls /sys/fs/cgroup/spur/job_1234_1/                 # one step_<n> leaf per step
+   cat /sys/fs/cgroup/spur/job_1234_1/step_0/cpu.stat # that step's own CPU usage
+
+The job directory normally holds the limits and no processes — those live in the
+leaves; a step whose leaf could not be created falls back into the job directory
+itself. ``srun`` steps are numbered from ``step_0``; the batch payload uses the
+reserved step id it was launched under, so its leaf is a large number, not ``0``.
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -473,10 +541,13 @@ Slurm's ``cgroup.conf``.
 What is not contained yet
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Every process the agent starts for a job joins ``job_<id>`` — the batch payload,
-``srun`` steps, ``spur exec``, and interactive attach alike — so all of them are
-bounded by the job's limits and checked against its device filter. What remains
-is a granularity gap *inside* the job rather than a hole between jobs:
+Every process the agent starts for a job is confined beneath ``job_<id>_<attempt>``
+— the batch payload, ``srun`` steps, ``spur exec``, and interactive attach alike
+— so all of them are bounded by the job's limits and checked against its device
+filter. Each step runs in its own ``step_<n>`` leaf under that directory: cgroup
+v2 refuses to hold processes in a node whose children have controllers enabled,
+so the job node carries the limits and the steps sit beneath it. What remains is
+a granularity gap *inside* the job rather than a hole between jobs:
 
 .. list-table::
    :header-rows: 1
@@ -484,16 +555,18 @@ is a granularity gap *inside* the job rather than a hole between jobs:
 
    * - What is missing
      - Where it stands
-   * - Per-step limits and accounting
-     - Steps join the **job's** cgroup, not one of their own, so every step in a
-       job draws on one shared budget and there is no per-step CPU or memory
-       reading to attribute. Nested ``job_<id>/step_<n>`` cgroups are planned; a
-       BPF device filter attached at ``job_<id>`` is inherited by descendant
-       cgroups, so the filter will keep working unchanged when they arrive.
+   * - Per-step **limits**
+     - Each step gets its own ``step_<n>`` cgroup, but that leaf carries no
+       budget of its own: it inherits the job's limits and device filter, so
+       every step in a job still draws on one shared budget. Where the host lets
+       the job delegate its controllers, per-step CPU and memory *readings* show
+       up in the leaf's ``cpu.stat`` and ``memory.current``; Spur does not yet
+       collect them into step accounting.
    * - Precise kill-by-step
-     - Cancelling one step signals its process group rather than a cgroup of its
-       own, so a step process that leaves that group (``setsid``) is missed.
-       Cancelling the whole *job* is exact, because that is a cgroup operation.
+     - Cancelling one step signals its process tree rather than its cgroup, so a
+       step process that leaves that tree (``setsid``) is missed even though the
+       step now has a cgroup that would catch it. Cancelling the whole *job* is
+       exact, because that is a cgroup operation.
    * - ``task_prolog`` / ``task_epilog``
      - Run by ``spurd`` around each step, as root and in ``spurd``'s own cgroup.
        They are site-supplied rather than user code, but they are neither
@@ -506,7 +579,7 @@ node-wide setup and teardown.
 .. note::
 
    **A step now counts against the job's budget.** An ``srun`` step used to run
-   outside ``job_<id>``, with no memory ceiling and no CPU pinning of its own; it
+   outside ``job_<id>_<attempt>``, with no memory ceiling and no CPU pinning of its own; it
    now shares the job's ``memory.max``, ``memory.high``, and ``cpuset.cpus``. A
    site whose steps routinely overrun what the job asked for will start seeing
    OOM kills where the same workload previously ran. Size ``--mem`` for the whole
@@ -527,6 +600,14 @@ MPI (PMIx)
 Spur supports Open MPI jobs via ``--mpi=pmix`` on **single-node and multi-node**
 allocations. The controller and CLI do not link libpmix; each compute node loads
 ``spur_mpi_pmix.so`` from ``[mpi].plugin_dir`` when a PMIx job starts.
+
+The PMIx server runs inside the supervisor (``spurstepd``) that owns the ranks —
+one per ``(job, step)``, so a job and each of its ``srun --mpi=pmix`` steps get
+their own — rather than inside ``spurd``. It lives and dies with the ranks it
+serves, not with the node agent. The supervisor inherits the agent's
+environment, so ``[Service]`` settings such as ``Environment=PMIX_MCA_gds=hash``
+still reach the server. The plugin is loaded by the supervisor and must be
+readable at ``[mpi].plugin_dir`` on every agent.
 
 .. _mpi-pmix-install:
 
@@ -882,9 +963,12 @@ Operational notes
   ``spur-k8s`` in-cluster agent returns ``Unimplemented`` for ``PreparePmix``).
 - Multi-node ``--mpi=pmix`` requires agent addresses in the cluster registry to
   be reachable from every node in the allocation. Hostnames and IPv4 literals
-  are resolved via DNS; modex TCP listens on port ``16819 + (job_id % 8000)``.
-  Only one active multi-node PMIx job should use a given port slot at a time:
-  concurrent jobs whose IDs differ by a multiple of 8000 can collide.
+  are resolved via DNS; modex TCP listens on a port hashed from the job and step
+  ids into ``16819``-``24818``. Unrelated steps can hash onto the same port. The
+  step that loses the race fails to start and logs ``modex bind port <port> for
+  job <j> step <s> failed: Address already in use``; the step already holding the
+  port keeps running, because every modex frame is checked against the listener's
+  job and step before it is acted on.
 - Modex timeouts travel with ``PreparePmix`` in ``PmixLaunchPlan`` (``0`` =
   agent ``[mpi]`` defaults). Keep ``[mpi]`` modex timeout settings identical
   across all agents when not passing explicit values.

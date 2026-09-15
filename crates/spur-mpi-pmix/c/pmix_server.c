@@ -963,6 +963,7 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
         session->modex_timeouts = modex_timeouts_from_plan(plan);
         session->modex = spur_modex_session_create(
             plan->job_id,
+            plan->step_id,
             session->num_nodes,
             session->node_index,
             session->peer_hosts,
@@ -978,7 +979,14 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
             session->active = 0;
             session->namespace_[0] = '\0';
             if (errbuf != NULL && errlen > 0) {
-                snprintf(errbuf, errlen, "PMIx modex listener failed to start");
+                snprintf(
+                    errbuf,
+                    errlen,
+                    "PMIx modex listener failed to start on port %u (job %u step %u)",
+                    (unsigned)spur_modex_port_for_step(plan->job_id, plan->step_id),
+                    plan->job_id,
+                    plan->step_id
+                );
             }
             pthread_mutex_unlock(&g_session_lock);
             return -1;

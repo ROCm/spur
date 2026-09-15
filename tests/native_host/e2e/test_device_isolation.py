@@ -144,6 +144,53 @@ class TestDeviceIsolation:
             f"base pseudo-devices must stay reachable\noutput:\n{content}"
         )
 
+    def test_zero_gpu_job_stays_denied_after_its_agent_restarts(self, gpu_cluster):
+        # A denial that lapses when the agent is upgraded is worse than one that
+        # never existed, because nothing on the node reports that it went away.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+        _require_unfiltered_access(cluster)
+
+        job_id = _hold_job(cluster, "dev-iso-restart-zero", [])
+        probe = cluster.write_file(
+            "dev-iso-restart-zero-probe.sh",
+            _probe_script(f"probe_open {KFD}\nprobe_open /dev/null\n"),
+        )
+        try:
+            code, before = cluster.srun_in_allocation(job_id, [probe])
+            assert "DEVICE_PROBE_OK" in before, (
+                f"the pre-restart step did not run to completion (exit {code})\n"
+                f"{cluster.debug_job(job_id)}\noutput:\n{before}"
+            )
+            # Without this the post-restart deny could be inherited from a job
+            # that was never allowed the node in the first place.
+            assert f"{KFD}=EPERM" in before, (
+                f"a zero-GPU job must be denied {KFD} before any restart\n"
+                f"output:\n{before}"
+            )
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            code, after = cluster.srun_in_allocation(job_id, [probe])
+            assert "DEVICE_PROBE_OK" in after, (
+                f"the post-restart step did not run to completion (exit {code})\n"
+                f"{cluster.debug_job(job_id)}\noutput:\n{after}"
+            )
+            assert f"{KFD}=EPERM" in after, (
+                f"the kernel deny must survive the agent that installed it\n"
+                f"output:\n{after}"
+            )
+            # Guards against a step that fails for some unrelated reason and
+            # reports every open as denied.
+            assert "/dev/null=OPEN" in after, (
+                f"base pseudo-devices must stay reachable after the restart\n"
+                f"output:\n{after}"
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
     def test_allocated_gpu_job_can_open_the_control_node(self, gpu_cluster):
         # The other half of the property: isolation must not cost a job the
         # hardware it was actually given.
@@ -366,16 +413,21 @@ class TestStepAndExecDeviceIsolation:
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "dev-iso-step-cgroup", [])
-        procs = f"/sys/fs/cgroup/spur/job_{job_id}/cgroup.procs"
+        job_cg = f"/spur/job_{job_id}_1"
+        # A step runs in a `step_` leaf under the job, so membership is being
+        # inside the job's subtree — the job node itself holds no processes.
         probe = cluster.write_file(
             "dev-iso-step-cgroup-probe.sh",
             f"""#!/bin/bash
-if grep -qx "$$" {procs} 2>/dev/null; then
-  echo STEP_CGROUP=JOINED
-else
-  echo STEP_CGROUP=OUTSIDE
-fi
-echo "STEP_PID=$$ PROCS=$(tr '\\n' ' ' < {procs} 2>/dev/null)"
+CG=""
+while IFS= read -r line; do
+  case "$line" in 0::*) CG="${{line#0::}}" ;; esac
+done < /proc/self/cgroup
+case "$CG" in
+  {job_cg}|{job_cg}/*) echo STEP_CGROUP=JOINED ;;
+  *) echo STEP_CGROUP=OUTSIDE ;;
+esac
+echo "STEP_PID=$$ STEP_CG=$CG"
 """,
         )
         try:
@@ -384,7 +436,8 @@ echo "STEP_PID=$$ PROCS=$(tr '\\n' ' ' < {procs} 2>/dev/null)"
             cluster.scancel(str(job_id))
 
         assert "STEP_CGROUP=JOINED" in out, (
-            f"the step's pid must appear in {procs} (exit {code})\noutput:\n{out}"
+            f"the step must run inside {job_cg} or one of its step leaves, so the "
+            f"job's device filter applies to it (exit {code})\noutput:\n{out}"
         )
 
 
@@ -461,7 +514,7 @@ class TestDeviceFilterLifecycle:
         assert baseline >= 0, "could not read the loaded cgroup_device program count"
 
         probe = _run_probe(cluster, "dev-iso-life", "true\n", ["--gres=gpu:1"])
-        cgroup = f"/sys/fs/cgroup/spur/job_{probe.job_id}"
+        cgroup = f"/sys/fs/cgroup/spur/job_{probe.job_id}_1"
 
         # Scoped to this job's cgroup rather than every job_* directory, so a
         # job belonging to another test cannot decide this one.

@@ -2,7 +2,7 @@ Deploying with Ansible (recommended)
 ====================================
 
 The ``spur-toolkit`` Ansible playbooks are the recommended way to stand up a real
-cluster. They install the three Spur binaries, render ``spur.conf``, create
+cluster. They install the Spur binaries, render ``spur.conf``, create
 systemd-managed daemons and the Slurm-compatible symlinks (``sbatch``, ``squeue``,
 ``sinfo``, …), and stand up PostgreSQL accounting — a single ``ansible-playbook``
 run takes a set of hosts from bare SSH to a working cluster. The playbooks live in
@@ -45,7 +45,7 @@ Target hosts
 Quickstart
 ----------
 
-Build the three binaries in the ``ROCm/spur`` repository, point Ansible at them, edit
+Build the binaries in the ``ROCm/spur`` repository, point Ansible at them, edit
 the inventory, and deploy.
 
 .. code-block:: bash
@@ -54,7 +54,7 @@ the inventory, and deploy.
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
    SPUR_BUILD="$(pwd)/target/release"
    cd -
 
@@ -67,7 +67,9 @@ the inventory, and deploy.
    ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD"
 
 ``spur_binary_src`` points at the build-output directory; the ``spur_install`` role
-reads ``spur``, ``spurctld``, and ``spurd`` from it by name. Omit it to install a
+reads ``spur``, ``spurctld``, ``spurd``, and ``spurstepd`` from it by name.
+``spurstepd`` must land next to ``spurd`` on every compute node — the agent looks
+for it beside its own executable and does not search ``$PATH``. Omit it to install a
 published release via ``install.sh`` instead, selected by ``spur_version``
 (``latest`` | ``nightly`` | ``vX.Y.Z``):
 
@@ -239,6 +241,18 @@ The ``deploy.yml`` play runs in this order:
    Raft leader).
 5. **Start agents** in parallel: installs ``spurd.service`` pointing at all controllers,
    restarts ``spurd``, and waits for port 6818.
+
+   .. important::
+
+      The ``spurd`` unit must set ``KillMode=process``. systemd's default,
+      ``control-group``, signals every process in the unit's cgroup on stop or
+      restart, which terminates the detached job supervisors along with the
+      agent — so ``systemctl restart spurd``, including the restart this step
+      performs, kills running jobs instead of leaving them untouched. The unit
+      is installed by the ``spur_agent`` role; confirm the deployed
+      ``/etc/systemd/system/spurd.service`` carries the setting. See
+      :doc:`native-host` for the full unit.
+
 6. **Login nodes** (empty group → no-op): sets client environment only.
 7. **Verify** on the first controller: waits for agents to register, prints
    ``spur nodes``, submits a single-node test job (and a multi-node one when there is

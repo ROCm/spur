@@ -32,7 +32,7 @@ use spur_core::qos::{
 };
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
-use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
+use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
@@ -1810,18 +1810,26 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Preempt a running job per its partition's PreemptMode, without
+    /// recording a triggering job (e.g. controller-initiated fencing rather
+    /// than scheduler priority preemption). See `preempt_job_with_provenance`.
+    pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_with_provenance(job_id, mode, None, None)
+    }
+
     /// Preempt a running job per its partition's PreemptMode. Does the
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
     ///
     /// `preempted_by` is the job that triggered the preemption (recorded for
-    /// provenance). `preempt_qos` is the authorizing QOS name when
-    /// `preempt_type = QosPriority`; `None` for plain priority-based preemption.
-    pub fn preempt_job(
+    /// provenance), or `None` when there isn't one. `preempt_qos` is the
+    /// authorizing QOS name when `preempt_type = QosPriority`; `None` for
+    /// plain priority-based preemption.
+    pub fn preempt_job_with_provenance(
         &self,
         job_id: JobId,
         mode: PreemptMode,
-        preempted_by: JobId,
+        preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
     ) -> anyhow::Result<PreemptOutcome> {
         {
@@ -1844,7 +1852,7 @@ impl ClusterManager {
                 let resp = self.propose(WalOperation::JobSuspend {
                     job_id,
                     at: chrono::Utc::now(),
-                    preempted_by: Some(preempted_by),
+                    preempted_by,
                     preempt_qos: preempt_qos.clone(),
                 })?;
                 self.run_all_finalized_side_effects(&resp);
@@ -1854,7 +1862,7 @@ impl ClusterManager {
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
                     job_id,
-                    preempted_by: Some(preempted_by),
+                    preempted_by,
                     preempt_qos,
                 })?;
                 self.run_all_finalized_side_effects(&resp);
@@ -1885,7 +1893,7 @@ impl ClusterManager {
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
                     job_id,
                     begin_time,
-                    preempted_by: Some(preempted_by),
+                    preempted_by,
                     preempt_qos,
                 })?;
                 self.run_all_finalized_side_effects(&resp);
@@ -2431,17 +2439,8 @@ impl ClusterManager {
     /// node goes Down, but scoped to a single job. Unlike the health-check
     /// path, this does not by itself cancel the job on nodes that *did*
     /// launch it — a caller evicting a job with launched-but-unconfirmed
-    /// nodes is responsible for sending the cancel RPC once eviction
-    /// succeeds.
-    ///
-    /// No longer called from `scheduler_loop`: batch dispatch is now
-    /// confirmed on every assigned node *before* a job is allowed to become
-    /// Running (see `confirm_dispatch_on_nodes`), so a job can no longer
-    /// reach Running with only some of its nodes actually launched — this
-    /// function's original trigger. Kept as a public primitive, with its
-    /// back-off/requeue contract still exercised directly by this module's
-    /// tests, for any other caller that needs to evict an already-Running
-    /// job (e.g. a future admin-initiated NodeFail).
+    /// nodes owns sending the cancel RPC, and should send it before evicting
+    /// so the cancel still names the attempt being torn down.
     #[allow(dead_code)]
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.evict_job_with_detail(job_id, None)
@@ -2452,12 +2451,26 @@ impl ClusterManager {
         job_id: JobId,
         detail: Option<String>,
     ) -> anyhow::Result<()> {
+        self.evict_job_attempt(job_id, None, detail)
+    }
+
+    /// Evict only while `run_attempt` is still the job's current one. A caller
+    /// that awaited anything may be holding an epoch the job has already left.
+    pub fn evict_job_attempt(
+        &self,
+        job_id: JobId,
+        run_attempt: Option<u32>,
+        detail: Option<String>,
+    ) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
+                return Ok(());
+            }
+            if run_attempt.is_some_and(|attempt| job.run_attempt != attempt) {
                 return Ok(());
             }
         }
@@ -6271,7 +6284,7 @@ impl ClusterManager {
                     // step is excluded — it carries the job's own exit, not a step
                     // result). Maintained live so `scontrol show job` reflects it
                     // mid-run, matching Slurm.
-                    if *step_id < STEP_RESERVED_MIN {
+                    if spur_core::step::is_user_step(*step_id) {
                         if let Some(job) = jobs.get_mut(job_id) {
                             job.derived_exit_code = job.derived_exit_code.max(*exit_code);
                         }
@@ -10810,7 +10823,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job1 = run_job_on(&cm, "victim-1", "worker1");
-        cm.preempt_job(job1, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job1, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job1, JobState::Pending);
         assert_eq!(
@@ -10820,7 +10833,8 @@ mod tests {
         );
 
         let job2 = run_job_on(&cm, "victim-2", "worker1");
-        cm.preempt_job(job2, PreemptMode::Cancel, 99, None).unwrap();
+        cm.preempt_job_with_provenance(job2, PreemptMode::Cancel, Some(99), None)
+            .unwrap();
         settle(&cm, job2, JobState::Cancelled);
         assert_eq!(
             stats.snapshot().jobs_preempted,
@@ -12827,7 +12841,7 @@ mod tests {
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
         let outcome = cm
-            .preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Pending);
@@ -12884,7 +12898,7 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -12904,7 +12918,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-reason", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert_eq!(
@@ -12929,7 +12943,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-expiry", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -13395,7 +13409,7 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
         let outcome = cm
-            .preempt_job(job_id, PreemptMode::Cancel, 99, None)
+            .preempt_job_with_provenance(job_id, PreemptMode::Cancel, Some(99), None)
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Cancelled);
@@ -13646,7 +13660,12 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-suspend", "worker1");
         let outcome = cm
-            .preempt_job(job_id, PreemptMode::Suspend, 42, Some("highprio".into()))
+            .preempt_job_with_provenance(
+                job_id,
+                PreemptMode::Suspend,
+                Some(42),
+                Some("highprio".into()),
+            )
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Suspended);
         settle(&cm, job_id, JobState::Suspended);
@@ -13668,7 +13687,9 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "preempt-off", "worker1");
-        assert!(cm.preempt_job(job_id, PreemptMode::Off, 99, None).is_err());
+        assert!(cm
+            .preempt_job_with_provenance(job_id, PreemptMode::Off, Some(99), None)
+            .is_err());
         // Job keeps running; nothing was preempted.
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
     }
@@ -13680,7 +13701,7 @@ mod tests {
 
         let job_id = submit_and_wait(&cm, basic_spec("still-pending"));
         assert!(cm
-            .preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .is_err());
     }
 
@@ -13867,8 +13888,13 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "prov-clear", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue, 77, Some("burst".into()))
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            PreemptMode::Requeue,
+            Some(77),
+            Some("burst".into()),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let after_preempt = cm.get_job(job_id).unwrap();
@@ -16007,7 +16033,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let parent_id = run_job_on(&cm, "parent", "worker1");
-        cm.preempt_job(parent_id, PreemptMode::Cancel, 99, None)
+        cm.preempt_job_with_provenance(parent_id, PreemptMode::Cancel, Some(99), None)
             .unwrap();
         settle(&cm, parent_id, JobState::Cancelled);
 
@@ -16671,7 +16697,7 @@ mod tests {
 
         let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
         for _ in 0..(max + 3) {
-            cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
                 .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
@@ -16689,7 +16715,7 @@ mod tests {
             .unwrap();
             settle(&cm, job_id, JobState::Running);
         }
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -16732,7 +16758,7 @@ mod tests {
             )
             .unwrap();
             settle(&cm, job_id, JobState::Running);
-            cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
                 .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {

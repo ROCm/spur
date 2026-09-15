@@ -22,7 +22,9 @@ MPI plugin (optional)
 ~~~~~~~~~~~~~~~~~~~~~
 
 Open MPI jobs use ``--mpi=pmix``, which loads ``spur_mpi_pmix.so`` on compute
-nodes at runtime (``spurd`` itself does not link libpmix).
+nodes at runtime (no Spur binary links libpmix). The supervisor
+(``spurstepd``) is what loads it and hosts the PMIx server, for an
+``srun --mpi=pmix`` step as well as for a job.
 
 **For production clusters**, use a **release or nightly tarball** from GitHub
 Releases (or your artifactory mirror). Both ship ``lib/spur/spur_mpi_pmix.so``
@@ -46,7 +48,7 @@ Do not mix vendor Open MPI PMIx headers (often 3.x under ``/usr/mpi``) with
 distro OpenPMIx 5 ``libpmix.so.2``. After install, ``ldd`` the plugin and
 confirm it loads the intended ``libpmix``.
 
-``spurd`` launches multi-rank ``--mpi=pmix`` jobs via per-rank fork and
+The supervisor launches multi-rank ``--mpi=pmix`` jobs via per-rank fork and
 ``PMIx_server_setup_fork`` (see :doc:`/deployment/native-host`). Agents need
 Open MPI libraries matching the application build; ``mpirun`` is not used for
 bootstrap.

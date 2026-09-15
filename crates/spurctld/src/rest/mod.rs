@@ -102,8 +102,9 @@ pub async fn serve(
     let jwt_key = cluster
         .config()
         .auth
-        .jwt_key
-        .clone()
+        .resolved_jwt_key()
+        .ok()
+        .flatten()
         .unwrap_or_default()
         .into_bytes();
     let state = Arc::new(RestState { cluster, raft });

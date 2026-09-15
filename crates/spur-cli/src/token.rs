@@ -90,7 +90,12 @@ fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &st
     };
     let cfg = spur_core::config::SlurmConfig::load_from_file(std::path::Path::new(config_path))
         .map_err(|e| anyhow::anyhow!("read {config_path}: {e}"))?;
-    let key = cfg.auth.jwt_key.as_deref().unwrap_or_default();
+    let resolved = cfg
+        .auth
+        .resolved_jwt_key()
+        .map_err(|e| anyhow::anyhow!("read signing key from {config_path}: {e}"))?
+        .unwrap_or_default();
+    let key = resolved.as_str();
     if key.is_empty() {
         anyhow::bail!(
             "[auth] jwt_key is not set in {config_path}; a signing key is required to mint user \

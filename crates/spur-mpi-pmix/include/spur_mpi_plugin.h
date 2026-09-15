@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define SPUR_MPI_PLUGIN_API_VERSION 3
+#define SPUR_MPI_PLUGIN_API_VERSION 4
 #define SPUR_MPI_MAX_PEER_HOSTS 64
 
 /* Use when the controller did not supply job credentials; plugin falls back to spurd. */
@@ -24,6 +24,7 @@ typedef struct spur_mpi_proc {
 
 typedef struct spur_mpi_launch_plan {
     uint32_t job_id;
+    uint32_t step_id;
     char namespace_[256];
     uint32_t universe_size;
     uint32_t task_offset;

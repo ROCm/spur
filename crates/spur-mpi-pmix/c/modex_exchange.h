@@ -25,6 +25,7 @@
 #define SPUR_MODEX_ERR_BLOB -5
 #define SPUR_MODEX_ERR_NOMEM -6
 #define SPUR_MODEX_ERR_PROTOCOL -7
+#define SPUR_MODEX_ERR_FOREIGN -8
 
 typedef struct spur_modex_session spur_modex_session_t;
 
@@ -34,14 +35,18 @@ typedef struct spur_modex_timeouts {
     uint32_t verify_sec;
 } spur_modex_timeouts_t;
 
-static inline uint16_t spur_modex_port_for_job(uint32_t job_id) {
-    return (uint16_t)(SPUR_MODEX_PORT_BASE + (job_id % SPUR_MODEX_PORT_SPAN));
+/* Mirrors spur_core::mpi::modex_port_for_step; the two must agree exactly or
+ * peers on different nodes listen on different ports and never rendezvous. */
+static inline uint16_t spur_modex_port_for_step(uint32_t job_id, uint32_t step_id) {
+    uint32_t key = job_id * 2654435761u + step_id;
+    return (uint16_t)(SPUR_MODEX_PORT_BASE + (key % SPUR_MODEX_PORT_SPAN));
 }
 
 const char *spur_modex_strerror(int code);
 
 spur_modex_session_t *spur_modex_session_create(
     uint32_t job_id,
+    uint32_t step_id,
     uint32_t num_nodes,
     uint32_t node_index,
     const char peer_hosts[][256],
@@ -73,6 +78,13 @@ int spur_modex_fence_collect(
 int spur_modex_session_refs_for_testing(spur_modex_session_t *session);
 
 bool spur_modex_session_accept_running_for_testing(spur_modex_session_t *session);
+
+bool spur_modex_session_aborted_for_testing(spur_modex_session_t *session);
+
+bool spur_modex_session_remote_present_for_testing(
+    spur_modex_session_t *session,
+    uint32_t node_index
+);
 #endif
 
 #endif
