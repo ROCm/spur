@@ -1261,6 +1261,15 @@ Each record captures:
 - **Peer** — the address the request arrived from. Often the only attribution
   left for an unauthenticated caller under ``permissive``, and what lets a host's
   login records be matched against a Spur action.
+
+  Under Raft HA a client may reach a non-leader, which forwards to the leader;
+  the hop replaces the client's connection, so **Peer** is then the forwarding
+  controller. Such rows carry ``"forwarded": true`` in **Info** so a controller
+  address is never mistaken for the caller's. The caller itself is still
+  attributed correctly — the credential survives the hop, so **Actor** and
+  **Verified** are unaffected. To recover the client address in that case,
+  enable ``logging.audit_rpcs``: the controller the client actually reached logs
+  the request with its real peer.
 - **Action** — ``create``, ``update``, or ``delete``.
 - **Where** — the target, rendered ``entity_type:entity_name`` (e.g.
   ``node:node07``).
@@ -1332,7 +1341,16 @@ match Slurm (``Time,Action,Actor,Where,Info``); additional ``format=`` fields ar
 
 ``Peer=`` matches on the ``host:port`` boundary, so a bare address finds every
 ephemeral port that host connected from, while ``10.0.0.4`` does not also match
-``10.0.0.42``.
+``10.0.0.42``. Both plain and bracketed forms are matched, so a bare IPv6
+address finds the ``[2001:db8::1]:6817`` form it is stored as.
+
+.. note::
+
+   The controller listens dual-stack, so an IPv4 caller arrives as the mapped
+   address ``::ffff:10.0.0.42``. Peers are recorded unwrapped to plain
+   ``10.0.0.42``, so search for the address you know rather than the mapped
+   form. Rows written before this normalization store the mapped form and are
+   found by querying ``Peer=[::ffff:10.0.0.42]:<port>``.
 
 .. note::
 

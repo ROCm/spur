@@ -7,6 +7,7 @@
 mod layer;
 mod registry;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) use layer::{AuditLayer, ControllerAudit};
@@ -23,26 +24,45 @@ pub(crate) struct Annotation {
     pub asserted_actor: Option<String>,
 }
 
-/// One request's annotation, shared between the handler and the layer. A
-/// `Mutex` not a `OnceLock`: a handler may refine it after parsing the request.
+/// One request's shared state, written by the handler and read by the layer.
 #[derive(Debug, Default)]
-pub(crate) struct AuditSlot(Mutex<Option<Annotation>>);
+pub(crate) struct AuditSlot {
+    /// A `Mutex` not a `OnceLock`: a handler may refine it after parsing.
+    annotation: Mutex<Option<Annotation>>,
+    executed_locally: AtomicBool,
+}
 
 impl AuditSlot {
     fn take(&self) -> Option<Annotation> {
         // A poisoned lock would mean a handler panicked mid-annotation. Audit
         // must not turn that into a second failure, so recover the value.
-        match self.0.lock() {
+        match self.annotation.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         }
     }
 
     fn set(&self, annotation: Annotation) {
-        match self.0.lock() {
+        match self.annotation.lock() {
             Ok(mut guard) => *guard = Some(annotation),
             Err(poisoned) => *poisoned.into_inner() = Some(annotation),
         }
+    }
+
+    pub(crate) fn executed_locally(&self) -> bool {
+        self.executed_locally.load(Ordering::Relaxed)
+    }
+
+    fn mark_executed_locally(&self) {
+        self.executed_locally.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Set by `check_leader` when this controller applies the action itself, so the
+/// layer never samples leadership again and disagrees with it.
+pub(crate) fn mark_executed_locally<T>(request: &tonic::Request<T>) {
+    if let Some(slot) = request.extensions().get::<Arc<AuditSlot>>() {
+        slot.mark_executed_locally();
     }
 }
 

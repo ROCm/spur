@@ -288,6 +288,9 @@ impl ControllerService {
     fn check_leader<T: prost::Message>(&self, request: &Request<T>) -> Result<(), Status> {
         Self::enforce_forward_binding(request)?;
         if self.raft.is_leader() {
+            // The single point that decides execute-vs-forward, so the audit
+            // layer keys off this rather than sampling leadership again.
+            crate::audit::mark_executed_locally(request);
             return Ok(());
         }
 
@@ -4411,10 +4414,7 @@ pub async fn serve(
         auth_layer = auth_layer.with_peer(peer);
     }
     let audit_layer = crate::audit::AuditLayer::new(
-        Arc::new(crate::audit::ControllerAudit::new(
-            audit_cluster,
-            raft_handle,
-        )),
+        Arc::new(crate::audit::ControllerAudit::new(audit_cluster)),
         audit_rpcs,
     );
 
@@ -11647,6 +11647,40 @@ mod tests {
         );
     }
 
+    /// `caller` is client-supplied, so a verified non-admin must not reach the
+    /// k0s gate by asserting `root`. Every k0s RPC binds it from the identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_membership_rejects_a_spoofed_root_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut add = Request::new(spur_proto::proto::ClusterAddNodesRequest {
+            caller: "root".into(), // spoofed on the wire
+            ..Default::default()
+        });
+        add.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_add_nodes(add)
+                .await
+                .expect_err("a spoofed root caller must not add k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut remove = Request::new(spur_proto::proto::ClusterRemoveNodesRequest {
+            caller: "root".into(),
+            ..Default::default()
+        });
+        remove.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_remove_nodes(remove)
+                .await
+                .expect_err("a spoofed root caller must not remove k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+
     /// Draining and removing a node both take it out of service and evict
     /// running work, so neither may be reachable by a valid non-admin token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11682,9 +11716,8 @@ mod tests {
         );
     }
 
-    /// `spurd` drains a node from its launch-failure path over an unauthenticated
-    /// channel, so the gate must keep waving through a caller with no identity —
-    /// which is also how `update_node` has always behaved.
+    /// `spurd` drains a node over an unauthenticated channel on launch failure,
+    /// so the gate must keep admitting a caller with no identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unidentified_caller_still_passes_the_node_gates() {
         let dir = tempfile::TempDir::new().unwrap();
