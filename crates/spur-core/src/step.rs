@@ -39,6 +39,24 @@ pub fn default_step_id() -> StepId {
     STEP_BATCH
 }
 
+/// Render a step id the way Slurm does for user-facing output: the reserved
+/// sentinels become `batch`/`extern`/`interactive`, a numbered `srun` step stays
+/// its decimal index. Shared by CLI output and (prefixed) the cgroup leaf name.
+pub fn step_display_name(step_id: StepId) -> String {
+    match step_id {
+        STEP_BATCH => "batch".to_string(),
+        STEP_EXTERN => "extern".to_string(),
+        STEP_INTERACTIVE => "interactive".to_string(),
+        id => id.to_string(),
+    }
+}
+
+/// The cgroup leaf directory for a step, matching Slurm's `step_batch`,
+/// `step_extern`, `step_interactive`, and `step_<n>` layout.
+pub fn step_dir_name(step_id: StepId) -> String {
+    format!("step_{}", step_display_name(step_id))
+}
+
 /// A step within a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStep {
@@ -359,6 +377,24 @@ mod tests {
         assert_ne!(STEP_BATCH, STEP_EXTERN);
         assert_ne!(STEP_BATCH, STEP_INTERACTIVE);
         assert_ne!(STEP_EXTERN, STEP_INTERACTIVE);
+    }
+
+    #[test]
+    fn step_display_name_renders_slurm_names() {
+        assert_eq!(step_display_name(STEP_BATCH), "batch");
+        assert_eq!(step_display_name(STEP_EXTERN), "extern");
+        assert_eq!(step_display_name(STEP_INTERACTIVE), "interactive");
+        assert_eq!(step_display_name(0), "0");
+        assert_eq!(step_display_name(42), "42");
+    }
+
+    #[test]
+    fn step_dir_name_matches_slurm_cgroup_layout() {
+        assert_eq!(step_dir_name(STEP_BATCH), "step_batch");
+        assert_eq!(step_dir_name(STEP_EXTERN), "step_extern");
+        assert_eq!(step_dir_name(STEP_INTERACTIVE), "step_interactive");
+        assert_eq!(step_dir_name(0), "step_0");
+        assert_eq!(step_dir_name(42), "step_42");
     }
 
     #[test]

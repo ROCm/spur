@@ -163,6 +163,9 @@ pub struct JobLaunchConfig {
     pub gid: u32,
     pub container: Option<ContainerLaunchConfig>,
     pub prolog_script: Option<String>,
+    /// TaskProlog script, run as the job user inside the step cgroup before the
+    /// workload — distinct from the node `prolog_script` (root, outside cgroups).
+    pub task_prolog_script: Option<String>,
     pub partition: String,
     pub nodelist: String,
     pub mpi: String,
@@ -194,6 +197,9 @@ pub struct LaunchResult {
     /// The job's cgroup, released to the caller now that the launch succeeded.
     /// The caller owns its removal from here on.
     pub cgroup_path: Option<PathBuf>,
+    /// The task environment after TaskProlog's `export`/`unset`, so the supervisor
+    /// can run TaskEpilog with the same environment the workload saw.
+    pub task_environment: HashMap<String, String>,
 }
 
 /// Owns the resolved fds for a job's stdio, built once and consumed by both
@@ -252,6 +258,86 @@ impl JobIo {
             JobIo::File { .. } => None,
         }
     }
+
+    /// Write `bytes` (a TaskProlog `print`) before the workload, returning the count
+    /// written. PTY mode truncates instead of blocking when the terminal buffer fills.
+    fn write_prefix(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        match self {
+            JobIo::File { stdout, .. } => write_fd_all(stdout.as_raw_fd(), bytes),
+            JobIo::Pty { slave, .. } => write_fd_nonblocking(slave.as_raw_fd(), bytes),
+        }
+    }
+}
+
+fn write_fd_all(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    let mut off = 0;
+    while off < bytes.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            break;
+        }
+        off += n as usize;
+    }
+    Ok(off)
+}
+
+/// Non-blocking write to a PTY slave that restores the fd's flags so the forked
+/// child still inherits a blocking terminal. Stops at the first `WouldBlock` (buffer
+/// full, no reader yet) so it can never stall the launch.
+fn write_fd_nonblocking(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut off = 0;
+    let outcome = loop {
+        if off >= bytes.len() {
+            break Ok(off);
+        }
+        let n = unsafe {
+            libc::write(
+                fd,
+                bytes[off..].as_ptr() as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => break Ok(off),
+                _ => break Err(err),
+            }
+        }
+        if n == 0 {
+            break Ok(off);
+        }
+        off += n as usize;
+    };
+    // Restore the original flags even on error so the child's terminal stays blocking.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFL, flags);
+    }
+    outcome
 }
 
 impl JobIoRaw {
@@ -671,6 +757,38 @@ async fn spawn_job_process(
         }
     }
 
+    // In-supervisor, before the payload spawns below, so TaskProlog's env edits and
+    // `print` output take effect. TaskEpilog runs post-exit in the supervisor.
+    if let Some(ref task_prolog) = cfg.task_prolog_script {
+        let ctx = spur_core::hooks::HookContext {
+            job_id,
+            work_dir: work_dir.to_string(),
+            uid,
+            gid,
+            partition: cfg.partition.clone(),
+            nodelist: cfg.nodelist.clone(),
+            script_context: "prolog_task".into(),
+            gpu_devices: cfg.gpu_devices.clone(),
+            cpus,
+            memory_mb,
+        };
+        let result = crate::task_hook::run_task_prolog(task_prolog, &ctx, env, cgroup_path.path())
+            .await
+            .context("TaskProlog failed")?;
+        env = result.environment;
+        match job_io.write_prefix(&result.printed) {
+            Ok(written) if written < result.printed.len() => warn!(
+                job_id,
+                dropped = result.printed.len() - written,
+                "TaskProlog print output truncated to avoid stalling the PTY before a reader attached"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(job_id, error = %e, "failed to write TaskProlog print output"),
+        }
+    }
+    // Passed back so the supervisor runs TaskEpilog with the same environment.
+    let task_environment = env.clone();
+
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
     if let Some(ctn) = container {
         if !stdin_path.is_empty() && matches!(job_io, JobIo::File { .. }) {
@@ -686,6 +804,7 @@ async fn spawn_job_process(
             stderr_path: stderr_resolved,
             pty_master,
             cgroup_path: cgroup_path.into_inner(),
+            task_environment,
         });
     }
 
@@ -918,6 +1037,7 @@ async fn spawn_job_process(
         stderr_path: stderr_resolved,
         pty_master,
         cgroup_path: cgroup_path.into_inner(),
+        task_environment,
     })
 }
 
@@ -975,7 +1095,7 @@ fn step_cgroup_path_for(
     run_attempt: u32,
     step_id: spur_core::step::StepId,
 ) -> PathBuf {
-    cgroup_path_for(cgroup_root, job_id, run_attempt).join(format!("step_{}", step_id))
+    cgroup_path_for(cgroup_root, job_id, run_attempt).join(spur_core::step::step_dir_name(step_id))
 }
 
 /// Reconstructs a job's cgroup path from its identity alone — usable even
@@ -1334,6 +1454,17 @@ impl CgroupJoin {
     /// cannot write another cgroup's `cgroup.procs`. Returns whether the join landed.
     pub(crate) fn join(&self) -> bool {
         join_cgroup_self(&self.procs, self.log_fd)
+    }
+
+    /// Like [`join`](Self::join), but a failed join is an error rather than a
+    /// silent degrade — for a short-lived child (a task hook) that may exit
+    /// before parent-side membership verification is meaningful. Async-signal-safe.
+    pub(crate) fn join_required(&self) -> std::io::Result<()> {
+        if self.join() {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
     }
 
     #[cfg(test)]
@@ -3395,6 +3526,7 @@ mod tests {
             mpi: String::new(),
             script: String::new(),
             work_dir: String::new(),
+            task_prolog_script: None,
             name: name.to_string(),
             user: user.to_string(),
             node: node.to_string(),
@@ -3711,6 +3843,48 @@ mod tests {
 
         let status = child.wait().await.expect("wait");
         assert!(status.success());
+    }
+
+    #[test]
+    fn write_prefix_pty_truncates_without_a_reader_and_restores_blocking() {
+        // The deadlock guard: with nothing draining the master, a prefix larger than
+        // the terminal buffer must truncate (non-blocking) rather than hang the launch.
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        let slave_fd = slave.as_raw_fd();
+        let io = JobIo::Pty { master, slave };
+        let big = vec![b'x'; 1 << 20];
+        let written = io.write_prefix(&big).expect("PTY prefix must not error");
+        assert!(
+            written < big.len(),
+            "a full terminal buffer must truncate, not block (wrote {written})"
+        );
+        // The forked child inherits this fd as its terminal, so it must stay blocking.
+        let flags = unsafe { libc::fcntl(slave_fd, libc::F_GETFL) };
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "slave must be restored to blocking"
+        );
+    }
+
+    #[test]
+    fn write_prefix_file_writes_every_byte() {
+        use std::io::{Read, Seek};
+        let mut backing = tempfile::tempfile().expect("tempfile");
+        let stdout = OwnedFd::from(backing.try_clone().expect("clone stdout"));
+        let stderr = OwnedFd::from(tempfile::tempfile().expect("tempfile stderr"));
+        let io = JobIo::File {
+            stdin: None,
+            stdout,
+            stderr,
+        };
+        let payload = b"prolog says hello\n";
+        let written = io.write_prefix(payload).expect("file prefix must write");
+        assert_eq!(written, payload.len());
+        backing.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        let mut got = Vec::new();
+        backing.read_to_end(&mut got).expect("read back");
+        assert_eq!(got, payload);
     }
 
     #[tokio::test]

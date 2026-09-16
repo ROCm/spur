@@ -260,6 +260,7 @@ impl StepdLaunchSpec {
             gid: self.gid,
             container: self.container,
             prolog_script: None,
+            task_prolog_script: self.hooks.task_prolog.clone(),
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
@@ -1922,6 +1923,21 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
+    // TaskEpilog runs as the job user inside the step cgroup on teardown; captured
+    // now because `launch_spec` is consumed by the launch below.
+    let task_epilog_script = hooks.task_epilog.clone();
+    let task_epilog_context = spur_core::hooks::HookContext {
+        job_id,
+        work_dir: launch_spec.work_dir.clone(),
+        uid: launch_spec.uid,
+        gid: launch_spec.gid,
+        partition: launch_spec.partition.clone(),
+        nodelist: launch_spec.nodelist.clone(),
+        script_context: "epilog_task".into(),
+        gpu_devices: launch_spec.gpu_devices.clone(),
+        cpus: launch_spec.cpus,
+        memory_mb: launch_spec.memory_mb,
+    };
     // Hold the workload until spurd has finished its own launch bookkeeping, so
     // an srun on the script's first line cannot outrun the job's start. Only the
     // launch path releases the gate; an allocation has no workload to hold.
@@ -1966,14 +1982,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None, None)
+    let (job, launched_cgroup, launched_output, task_environment) = if launch_spec.allocation_only {
+        (RunningJob::AllocationOnly, None, None, HashMap::new())
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => (
                 result.job,
                 result.cgroup_path,
                 Some((result.stdout_path, result.stderr_path)),
+                result.task_environment,
             ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
@@ -2019,6 +2036,22 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let _ = std::fs::remove_file(socket_path);
     let cgroup = session.take_cgroup().await.or(recorded_cgroup);
     let teardown = |cgroup: Option<PathBuf>| async move {
+        // TaskEpilog runs as the job user inside the step cgroup before it is
+        // reaped; the extern/allocation step runs no task hooks.
+        if step_id != spur_core::step::STEP_EXTERN {
+            if let Some(ref task_epilog) = task_epilog_script {
+                if let Err(error) = crate::task_hook::run_task_epilog(
+                    task_epilog,
+                    &task_epilog_context,
+                    &task_environment,
+                    cgroup.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(job_id, %error, "TaskEpilog failed");
+                }
+            }
+        }
         if let Some(pmix) = pmix.as_ref() {
             pmix.stop();
         }

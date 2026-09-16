@@ -1634,6 +1634,20 @@ Reload scope follows whichever process executes the hook: controller hooks are
 live, node hooks need an agent restart, and ``srun`` hooks are read from the
 submitting host on each invocation.
 
+.. warning::
+
+   Each hook is validated before it runs, or refused: it must be a
+   **fully-qualified absolute path** (a relative one could resolve through
+   ``$PATH``), **not group- or world-writable**, and **owned by root or by the
+   account that launches it**. That launching account varies by hook: the
+   compute-node agent (root) launches ``prolog``/``epilog`` and
+   ``task_prolog``/``task_epilog`` — so these must be root-owned, though task
+   hooks then drop to the job user inside the step cgroup; the controller launches
+   ``prolog_slurmctld``, ``epilog_slurmctld``, ``job_submit``, and
+   ``job_submit_lua`` as its own account (root or a service user); and
+   ``srun_prolog``/``srun_epilog`` are launched by the invoking user, whose own
+   scripts are accepted.
+
 .. list-table::
    :header-rows: 1
    :widths: 22 24 32 22
@@ -1660,11 +1674,11 @@ submitting host on each invocation.
      - Live
    * - ``task_prolog``
      - ``TaskProlog``
-     - compute node, before each step
+     - compute node, before each step — as the job user in the step cgroup; supports ``export``/``unset``/``print``
      - Agent restart
    * - ``task_epilog``
      - ``TaskEpilog``
-     - compute node, after each step
+     - compute node, after each step — as the job user in the step cgroup
      - Agent restart
    * - ``srun_prolog``
      - ``SrunProlog``
