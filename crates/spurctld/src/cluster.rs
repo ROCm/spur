@@ -1725,6 +1725,39 @@ impl ClusterManager {
         self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, false)
     }
 
+    /// Whether a stamped running job is *still* outside its QOS group node quota.
+    ///
+    /// The stamp records what was true when the job started, and reclaim must not
+    /// trust it: raising the cap, or a sibling finishing, can leave a stamped job
+    /// comfortably inside the quota. Evicting it then would contradict the rule that
+    /// a job with a claim is never kicked out, so the question is re-asked live at
+    /// reclaim time (D13). The `idle_fill_preemptable` source needs no equivalent —
+    /// it is read from the QOS on every pass and so is never stale.
+    pub fn borrowed_run_still_over_quota(&self, job: &Job) -> bool {
+        let qos = self.resolve_qos(job);
+        let Some(cap) = qos
+            .limits
+            .grp_tres
+            .as_ref()
+            .map(|grp| grp.get(TresType::Node))
+            .filter(|cap| *cap > 0)
+        else {
+            // No cap to be outside of, so the job has a claim like any other.
+            return false;
+        };
+        let Some(qos_name) = job.spec.qos.as_deref() else {
+            return false;
+        };
+        let jobs = self.jobs.read();
+        // Nodes held by jobs with a genuine claim, this job excluded by its stamp.
+        let legitimate = occupied_nodes(&jobs, |j| {
+            !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name)
+        })
+        .len() as u64;
+        let mine = job.allocated_nodes.len() as u64;
+        legitimate.saturating_add(mine) > cap
+    }
+
     /// Start a job as *borrowed*: it exceeded its QOS group node cap and is running
     /// on capacity nobody with a claim wanted. The stamp is what holds it outside
     /// every quota aggregate and what makes it reclaimable.
@@ -3814,17 +3847,20 @@ impl ClusterManager {
         self.classify_pending_jobs().jobs
     }
 
-    /// Classify pending jobs once, apply pending-reason updates, advance burst-buffer
-    /// stage-in for selected candidates, and return the jobs eligible for scheduling.
+    /// The in-quota half of [`Self::pending_jobs_with_idle_fill_candidates`], for
+    /// tests that do not exercise borrowing.
+    #[cfg(test)]
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
         self.pending_jobs_with_idle_fill_candidates().0
     }
 
-    /// As [`Self::pending_jobs_and_tag_reasons`], additionally returning the
-    /// over-quota jobs that may run on capacity nobody with a claim wants. They are
-    /// kept separate because they are not schedulable in their own right: the caller
-    /// appends them below every in-quota job, and only after deriving the node set
-    /// and depth-limit metric from the in-quota list alone (§5.3, D16).
+    /// Classify pending jobs once, apply pending-reason updates, advance burst-buffer
+    /// stage-in for selected candidates, and return the jobs eligible for scheduling
+    /// alongside the over-quota jobs that may run on capacity nobody with a claim
+    /// wants. The two are kept separate because a borrow candidate is not schedulable
+    /// in its own right: the caller appends them below every in-quota job, and only
+    /// after deriving the node set and depth-limit metric from the in-quota list
+    /// alone (§5.3, D16).
     pub fn pending_jobs_with_idle_fill_candidates(&self) -> (Vec<Job>, Vec<Job>) {
         let classification = self.classify_pending_jobs();
         let evaluated: Vec<JobId> = classification
