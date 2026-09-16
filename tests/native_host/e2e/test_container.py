@@ -428,3 +428,126 @@ class TestContainerMultiNode:
         state = wait_job(cluster, job_id, timeout=60)
         diag = cluster.debug_job(job_id)
         assert state in ("CD", "GONE"), f"2-node container DNS failed, state={state}\n{diag}"
+
+
+# --container-remap-root (Enroot-style rootless root, spur#778): a root-layout
+# image runs uid 0 in a userns while staying the submitter on the host.
+
+# Root-owned /root in the image; -all-root packs it owned by root.
+_REMAP_ROOTFS_EXTRA = 'mkdir -p "$R/root"; chmod 700 "$R/root"'
+
+_REMAP_PROBE = (
+    "echo UID=$(id -u); "
+    "if echo hi > /root/remap-test 2>/dev/null; then echo ROOT_WRITE=ok; "
+    "else echo ROOT_WRITE=fail; fi; "
+    "echo REMAP_PROBE_OK"
+)
+
+
+def _parse_kv(out: str) -> dict:
+    vals: dict[str, str] = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            vals[key.strip()] = value.strip()
+    return vals
+
+
+@pytest.fixture
+def remap_cluster(unstarted_cluster, tmp_path):
+    # Remap only takes effect on a root daemon (chown + userns), so start as root.
+    cluster = unstarted_cluster
+    cluster.container_preflight()
+    cluster.start(agent_as_root=True)
+    cluster.remap_image = cluster.build_container_image(
+        tmp_path, rootfs_extra=_REMAP_ROOTFS_EXTRA, all_root=True
+    )
+    return cluster
+
+
+class TestContainerRemapRootSrun:
+    def test_without_remap_runs_as_submitter(self, remap_cluster):
+        cluster = remap_cluster
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02",
+            f"--container-image={cluster.remap_image}",
+            "bash", "-c", _REMAP_PROBE,
+        ])
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        vals = _parse_kv(out)
+        assert vals.get("UID") not in (None, "0"), (
+            f"without the flag the step must run as the submitter, not root:\n{out}"
+        )
+        assert vals.get("ROOT_WRITE") == "fail", (
+            f"the submitter must NOT be able to write root-owned /root:\n{out}"
+        )
+
+    def test_with_remap_is_root_and_writes_root(self, remap_cluster):
+        cluster = remap_cluster
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02",
+            f"--container-image={cluster.remap_image}",
+            "--container-remap-root",
+            "bash", "-c", _REMAP_PROBE,
+        ])
+        assert code == 0, f"srun --container-remap-root failed (exit {code}):\n{out}"
+        vals = _parse_kv(out)
+        assert vals.get("UID") == "0", (
+            f"with the flag the step must be uid 0 inside the container:\n{out}"
+        )
+        assert vals.get("ROOT_WRITE") == "ok", (
+            f"container-root must be able to write root-owned /root:\n{out}"
+        )
+
+    def test_remap_never_becomes_host_root(self, remap_cluster):
+        # A file created inside the remapped container on a bind-mounted host dir
+        # must be owned by the submitter on the host, proving container-root maps
+        # back to the unprivileged submitter (never real host root).
+        cluster = remap_cluster
+        bind_dir = f"{cluster.remote_dir}/remap-bind"
+        for node in cluster.nodes:
+            node.exec(f"rm -rf '{bind_dir}'; mkdir -p '{bind_dir}'; chmod 777 '{bind_dir}'")
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02",
+            f"--container-image={cluster.remap_image}",
+            "--container-remap-root",
+            f"--container-mounts={bind_dir}:/mnt/out",
+            "bash", "-c", "echo host-owned > /mnt/out/f; echo DONE",
+        ])
+        assert code == 0 and "DONE" in out, f"srun failed (exit {code}):\n{out}"
+
+        owner = None
+        for node in cluster.nodes:
+            res = node.exec_allow_fail(f"stat -c %u '{bind_dir}/f' 2>/dev/null").strip()
+            if res.isdigit():
+                owner = int(res)
+                break
+        assert owner is not None, f"file not created on any node:\n{out}"
+        submitter_uid = int(cluster.nodes[0].exec("id -u").strip())
+        assert owner == submitter_uid, (
+            f"bind-mount file must be owned by the submitter on the host, got uid {owner}"
+        )
+
+
+class TestContainerRemapRootSbatch:
+    def test_with_remap_is_root_and_writes_root(self, remap_cluster):
+        cluster = remap_cluster
+        # Trailing sleep keeps the container alive past the controller's
+        # post-launch dispatch confirmation for a very short job.
+        script = cluster.write_file("remap-batch.sh", f"#!/bin/bash\n{_REMAP_PROBE}\nsleep 3\n")
+        out_path = f"{cluster.remote_dir}/remap-batch.out"
+        job_id = parse_job_id(cluster.sbatch([
+            "-J", "remap", "-N", "1",
+            f"--container-image={cluster.remap_image}",
+            "--container-remap-root",
+            "-o", out_path,
+            script,
+        ]))
+        assert job_id is not None, "sbatch did not return a job id"
+        wait_job(cluster, job_id)
+        content = cluster.wait_output(out_path, "REMAP_PROBE_OK")
+        vals = _parse_kv(content)
+        assert vals.get("UID") == "0", f"batch container must be uid 0 inside:\n{content}"
+        assert vals.get("ROOT_WRITE") == "ok", (
+            f"container-root must be able to write root-owned /root:\n{content}"
+        )

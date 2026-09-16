@@ -2160,10 +2160,11 @@ fn launch_namespaces(cfg: &executor::JobLaunchConfig, is_root: bool) -> LaunchNa
     // the launch never created makes adoption re-enter ones that do not exist.
     let unshared = executor::would_use_namespaces(cfg, is_root);
     let is_container = cfg.container.is_some();
-    // Same predicate as container_init: a user namespace exists exactly when
-    // the mode creates one (rootless), never for a root daemon.
-    let container_user_ns =
-        is_container && crate::container::user_namespace_mode(is_root).creates_user_namespace();
+    let remap_root = cfg.container.as_ref().is_some_and(|c| c.config.remap_root);
+    // Same predicate as container_init: a user namespace exists exactly when the
+    // mode creates one (rootless, or a root daemon under remap).
+    let container_user_ns = is_container
+        && crate::container::user_namespace_mode(is_root, remap_root).creates_user_namespace();
     LaunchNamespaces {
         pid: unshared || is_container,
         user: container_user_ns,
@@ -2400,15 +2401,57 @@ fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
     Ok(())
 }
 
+/// The id-map handshake socket for a remap step, or `None` otherwise. Same
+/// setup as the batch path in `launch_container_job`.
+fn container_map_socket(
+    config: &crate::container::ContainerConfig,
+) -> Result<Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>, Status> {
+    if !crate::container::remap_maps_via_parent(config) {
+        return Ok(None);
+    }
+    let pair = nix::sys::socket::socketpair(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::Stream,
+        None,
+        nix::sys::socket::SockFlag::empty(),
+    )
+    .map_err(|e| Status::internal(format!("id-map handshake socket: {e}")))?;
+    Ok(Some(pair))
+}
+
+/// Parent-side servicing of the remap handshake for a step. Kills and reaps the
+/// child on failure (it would otherwise hang blocked). No-op when `None`.
+fn serve_container_map_handshake(
+    map_parent: Option<std::os::fd::RawFd>,
+    child_pid: nix::unistd::Pid,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Status> {
+    let Some(sock) = map_parent else {
+        return Ok(());
+    };
+    if let Err(e) = crate::container::install_child_id_maps(child_pid.as_raw(), uid, gid, sock) {
+        crate::executor::kill_process_tree(child_pid.as_raw(), nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(child_pid, None);
+        return Err(Status::internal(format!(
+            "step container remap id-map handshake failed: {e:#}"
+        )));
+    }
+    Ok(())
+}
+
 /// Runs in a freshly forked child after its stdio has been wired (spool fds or a
 /// PTY slave): joins the job cgroup while still root, runs `container_init`
 /// (namespace unshare, mounts, device injection, pivot_root, priv drop), signals
 /// readiness on `ready_w`, then execs `cmd`. Never returns. The whole namespace
 /// setup is shared by the buffered and PTY containerized-step paths.
+// A fork/exec helper — each input is a distinct piece of the child's context.
+#[allow(clippy::too_many_arguments)]
 fn container_child_exec(
     container_cfg: &crate::container::ContainerConfig,
     rootfs: &std::path::Path,
     ready_w: std::os::fd::OwnedFd,
+    map_sock: Option<std::os::fd::RawFd>,
     memlock: spur_core::config::MemlockLimit,
     cgroup_join: &Option<executor::CgroupJoin>,
     env_base: HashMap<String, String>,
@@ -2423,10 +2466,13 @@ fn container_child_exec(
         let _ = join.join();
     }
 
-    crate::container::close_inherited_fds(ready_w_fd);
+    // Keep the map socket open for the handshake in container_init.
+    let mut preserve = vec![ready_w_fd];
+    preserve.extend(map_sock);
+    crate::container::close_inherited_fds(&preserve);
     executor::apply_memlock(memlock);
 
-    let init = match crate::container::container_init(container_cfg, rootfs) {
+    let init = match crate::container::container_init(container_cfg, rootfs, map_sock) {
         Ok(init) => init,
         Err(e) => {
             let msg = format!("E:{e:#}");
@@ -2615,6 +2661,11 @@ async fn run_containerized_step(
     // joins itself below while still root, and `required` is verified parent-side.
     let cgroup_join = executor::CgroupJoin::for_cgroup(cgroup);
 
+    let map_sock = container_map_socket(&container_cfg)?;
+    let map_parent_raw = map_sock.as_ref().map(|(p, _)| p.as_raw_fd());
+    let map_child_raw = map_sock.as_ref().map(|(_, c)| c.as_raw_fd());
+    let (map_uid, map_gid) = (container_cfg.uid, container_cfg.gid);
+
     match unsafe { nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))? }
     {
         nix::unistd::ForkResult::Child => {
@@ -2631,6 +2682,7 @@ async fn run_containerized_step(
                 &container_cfg,
                 &rootfs,
                 ready_w,
+                map_child_raw,
                 memlock,
                 &cgroup_join,
                 env_base,
@@ -2642,6 +2694,16 @@ async fn run_containerized_step(
             drop(ready_w);
             // The spool-file fds belong to the child now; close our copies.
             drop(step_files);
+
+            // Close our copy of the child's socket end before the handshake so
+            // its blocking read sees EOF if the child dies early; keep the
+            // parent end until the maps are installed.
+            let map_parent_owned = map_sock.map(|(parent, child)| {
+                drop(child);
+                parent
+            });
+            serve_container_map_handshake(map_parent_raw, child_pid, map_uid, map_gid)?;
+            drop(map_parent_owned);
 
             let workload_pid = container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
 
@@ -3587,29 +3649,28 @@ fn build_nsenter_argv(
     entry: &crate::job_entry::JobEntry,
     priv_drop: Option<&crate::privdrop::PrivDrop>,
     command: &[String],
+    spurd_is_root: bool,
 ) -> Vec<String> {
     let mut args = entry.nsenter_args();
 
-    // Rootless container (the job has its own user namespace). nsenter's default
-    // behaviour on entering a user namespace is to reset credentials — it calls
-    // setgroups() to drop supplementary groups — but the kernel forbids
-    // setgroups() in an unprivileged user namespace, so that fails with EPERM.
-    // A `setpriv --init-groups` drop would hit the same wall. Neither is needed:
-    // the job user is already mapped inside the namespace (host uid -> the
-    // namespace's root), so entering with --preserve-credentials and no setpriv
-    // runs the command as the correct user without ever touching groups.
-    //
-    // This branch only applies to rootless containers. When spurd is root the
-    // job has no user namespace (root containers use pid/mount only), so the
-    // path below — setpriv --init-groups, which preserves GPU groups — is
-    // unchanged.
     if entry.has_user_namespace {
-        args.push("--preserve-credentials".into());
+        // Root-daemon remap: host root is unmapped in the namespace, so let
+        // nsenter reset uid/gid to 0 (the submitter) via the CAP_SETUID/SETGID
+        // it holds there. No in-container binary needed; the group list stays
+        // as spurd's (setgroups is denied in the namespace).
+        //
+        // Rootless: spurd's own uid already maps to namespace root, so preserve
+        // credentials and skip nsenter's reset, whose setgroups() would hit the
+        // namespace's setgroups=deny (EPERM).
+        if !spurd_is_root {
+            args.push("--preserve-credentials".into());
+        }
         args.push("--".into());
         args.extend(command.iter().cloned());
         return args;
     }
 
+    // No user namespace: drop inside via setpriv --init-groups (restores groups).
     args.push("--".into());
     if let Some(pd) = priv_drop {
         args.extend(pd.setpriv_prefix());
@@ -3645,7 +3706,12 @@ fn build_launch_plan(
     if entry.has_namespaces() && entry.pid > 0 {
         LaunchPlan {
             program: "nsenter".to_string(),
-            args: build_nsenter_argv(entry, priv_drop, command),
+            args: build_nsenter_argv(
+                entry,
+                priv_drop,
+                command,
+                crate::privdrop::spurd_runs_as_root(),
+            ),
             apply_priv_in_child: false,
         }
     } else {
@@ -4338,6 +4404,7 @@ impl SlurmAgent for AgentService {
                 &image_path,
                 &crate::container::job_rootfs_base(job_id),
                 cfg.name.as_deref(),
+                crate::container::remap_rootfs_owner(&cfg),
             )
             .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
@@ -6052,6 +6119,7 @@ impl SlurmAgent for AgentService {
                 &image_path,
                 &step_base,
                 container_cfg.name.as_deref(),
+                crate::container::remap_rootfs_owner(&container_cfg),
             )
             .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
             // Tear the rootfs down on any exit from here on. The pid is set
@@ -7882,9 +7950,13 @@ impl AgentService {
         let image_path = crate::container::resolve_image(&container.image, None, Some(entry.uid))
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
         let step_base = crate::container::step_rootfs_base(job_id, step_id);
-        let (rootfs, rootfs_mode) =
-            crate::container::setup_rootfs(&image_path, &step_base, container_cfg.name.as_deref())
-                .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
+        let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
+            &image_path,
+            &step_base,
+            container_cfg.name.as_deref(),
+            crate::container::remap_rootfs_owner(&container_cfg),
+        )
+        .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
         let mut rootfs_guard = StepRootfsGuard {
             base: step_base,
             mode: rootfs_mode,
@@ -7928,6 +8000,11 @@ impl AgentService {
         let cgroup_join = executor::CgroupJoin::for_cgroup(entry.cgroup_path.as_deref());
         let memlock = self.limits.memlock;
 
+        let map_sock = container_map_socket(&container_cfg)?;
+        let map_parent_raw = map_sock.as_ref().map(|(p, _)| p.as_raw_fd());
+        let map_child_raw = map_sock.as_ref().map(|(_, c)| c.as_raw_fd());
+        let (map_uid, map_gid) = (container_cfg.uid, container_cfg.gid);
+
         match unsafe {
             nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))?
         } {
@@ -7948,6 +8025,7 @@ impl AgentService {
                     &container_cfg,
                     &rootfs,
                     ready_w,
+                    map_child_raw,
                     memlock,
                     &cgroup_join,
                     env_base,
@@ -7958,6 +8036,16 @@ impl AgentService {
                 // === PARENT ===
                 drop(ready_w);
                 drop(slave);
+
+                // Close our copy of the child's socket end before the handshake
+                // so its blocking read sees EOF if the child dies early; keep
+                // the parent end until the maps are installed.
+                let map_parent_owned = map_sock.map(|(parent, child)| {
+                    drop(child);
+                    parent
+                });
+                serve_container_map_handshake(map_parent_raw, child_pid, map_uid, map_gid)?;
+                drop(map_parent_owned);
 
                 let workload_pid = container_parent_ready(
                     child_pid,
@@ -10511,7 +10599,7 @@ mod tests {
     fn build_nsenter_argv_non_root_wraps_with_setpriv_init_groups() {
         let entry = nsenter_job_entry(1000, 1000);
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
-        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()]);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()], true);
 
         // nsenter itself must not carry uid/gid: it enters as root so it can
         // read /proc/<pid>/ns/*; priv drop happens inside via setpriv.
@@ -10544,7 +10632,7 @@ mod tests {
         // spawn_pty_in_job passes the resolved shell as the command.
         let entry = nsenter_job_entry(1000, 1000);
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
-        let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()], true);
 
         assert!(
             !argv.iter().any(|a| a.starts_with("--setuid=")),
@@ -10575,7 +10663,7 @@ mod tests {
         // Root job: resolve_if_needed returns None → no setpriv prefix.
         let pd = crate::privdrop::PrivDrop::resolve_if_needed(0, 0);
         assert!(pd.is_none());
-        let argv = build_nsenter_argv(&entry, pd.as_ref(), &["id".to_string()]);
+        let argv = build_nsenter_argv(&entry, pd.as_ref(), &["id".to_string()], true);
 
         assert!(
             !argv.iter().any(|a| a == "setpriv"),
@@ -10594,7 +10682,8 @@ mod tests {
         let mut entry = nsenter_job_entry(1000, 1000);
         entry.has_user_namespace = true;
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
-        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()]);
+        // Rootless: spurd is the submitter (non-root).
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()], false);
 
         assert!(
             argv.iter().any(|a| a == "--preserve-credentials"),
@@ -10613,6 +10702,33 @@ mod tests {
         assert_eq!(&argv[sep..], &["--", "id"]);
     }
 
+    /// Root daemon + --container-remap-root (SubmitterAsRoot): the namespace
+    /// maps container root to the submitter and is owned by the real root. Let
+    /// nsenter's default reset uid/gid to 0 inside (no --preserve-credentials,
+    /// no in-container setpriv); setgroups is permitted since root created it.
+    #[test]
+    fn build_nsenter_argv_remap_root_container_enters_as_namespace_root() {
+        let mut entry = nsenter_job_entry(1000, 1000);
+        entry.has_user_namespace = true;
+        // Root daemon: spurd_is_root = true.
+        let argv = build_nsenter_argv(&entry, None, &["id".to_string()], true);
+
+        assert!(
+            !argv.iter().any(|a| a == "--preserve-credentials"),
+            "remap entry must let nsenter reset to namespace root: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "setpriv"),
+            "remap entry must not depend on an in-container setpriv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--user"),
+            "remap entry must enter the user namespace: {argv:?}"
+        );
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(&argv[sep..], &["--", "id"]);
+    }
+
     #[test]
     fn build_launch_plan_namespaced_job_uses_nsenter_no_child_drop() {
         let entry = nsenter_job_entry(1000, 1000);
@@ -10625,7 +10741,12 @@ mod tests {
         assert!(!plan.apply_priv_in_child);
         assert_eq!(
             plan.args,
-            build_nsenter_argv(&entry, Some(&pd), &["id".to_string()])
+            build_nsenter_argv(
+                &entry,
+                Some(&pd),
+                &["id".to_string()],
+                crate::privdrop::spurd_runs_as_root()
+            )
         );
     }
 

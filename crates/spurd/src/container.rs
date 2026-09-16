@@ -224,25 +224,41 @@ pub enum UserNamespaceMode {
     /// No user namespace; the container drops to the submitter after setup.
     #[default]
     Host,
-    /// Maps namespace id 0 to the current user's uid/gid with `setgroups=deny`;
-    /// already root inside, so no privilege drop.
+    /// Rootless daemon: maps id 0 to the daemon's own uid/gid. The child
+    /// self-writes the map (its own euid, all an unprivileged process may map).
     CurrentUserAsRoot,
+    /// Root daemon + `--container-remap-root`: maps id 0 to the submitter. The
+    /// child loses `CAP_SETUID` on unshare and cannot write this arbitrary map
+    /// for itself, so the still-privileged parent installs it (the runc model).
+    SubmitterAsRoot,
 }
 
 impl UserNamespaceMode {
     pub fn creates_user_namespace(self) -> bool {
         !matches!(self, UserNamespaceMode::Host)
     }
+
+    /// The child cannot self-map `0 -> submitter` after unshare (no
+    /// `CAP_SETUID` in the init userns), so the parent must install it.
+    pub fn maps_via_parent(self) -> bool {
+        matches!(self, UserNamespaceMode::SubmitterAsRoot)
+    }
 }
 
-/// runc/Podman policy: root daemons use the host user namespace, rootless
-/// daemons create their own.
-pub fn user_namespace_mode(is_root: bool) -> UserNamespaceMode {
-    if is_root {
-        UserNamespaceMode::Host
-    } else {
-        UserNamespaceMode::CurrentUserAsRoot
+/// Namespace policy: rootless daemons map themselves to root; a root daemon maps
+/// the submitter to root under remap, else uses the host userns and drops.
+pub fn user_namespace_mode(is_root: bool, remap_root: bool) -> UserNamespaceMode {
+    match (is_root, remap_root) {
+        (false, _) => UserNamespaceMode::CurrentUserAsRoot,
+        (true, true) => UserNamespaceMode::SubmitterAsRoot,
+        (true, false) => UserNamespaceMode::Host,
     }
+}
+
+/// Whether this launch needs the parent-assisted id-map handshake. Decided in
+/// the parent before fork so it can create the socket and service the request.
+pub fn remap_maps_via_parent(config: &ContainerConfig) -> bool {
+    user_namespace_mode(nix::unistd::geteuid().is_root(), config.remap_root).maps_via_parent()
 }
 
 /// Ordered `/proc/self/<file>` writes that install a `CurrentUserAsRoot` map.
@@ -332,11 +348,26 @@ pub fn step_rootfs_base(job_id: u32, step_id: u32) -> String {
     format!("step_{job_id}_{step_id}")
 }
 
+/// The submitter `(uid, gid)` a remap launch must chown its rootfs to, or
+/// `None` for every other launch. See [`setup_rootfs`].
+pub fn remap_rootfs_owner(config: &ContainerConfig) -> Option<(u32, u32)> {
+    remap_maps_via_parent(config).then_some((config.uid, config.gid))
+}
+
 pub fn setup_rootfs(
     image_path: &Path,
     base: &str,
     name: Option<&str>,
+    remap_owner: Option<(u32, u32)>,
 ) -> anyhow::Result<(PathBuf, RootfsMode)> {
+    // A remapped rootfs is chowned to one submitter, so it cannot be shared.
+    if remap_owner.is_some() && name.is_some() {
+        bail!(
+            "--container-remap-root cannot be combined with --container-name: the rootfs is \
+             chowned to the submitting user for the job and must not be shared across users"
+        );
+    }
+
     let cdir = container_dir();
     let base_dir = if let Some(name) = name {
         cdir.join(sanitize_name(name))
@@ -350,8 +381,9 @@ pub fn setup_rootfs(
         return Ok((base_dir, RootfsMode::Extracted));
     }
 
-    // Try overlayfs mount first (unnamed containers only, requires root)
-    if name.is_none() && nix::unistd::geteuid().is_root() {
+    // Try overlayfs mount first (unnamed containers only, requires root). Remap
+    // skips it: the overlay upper is a root-owned tmpfs the submitter can't write.
+    if remap_owner.is_none() && name.is_none() && nix::unistd::geteuid().is_root() {
         if let Ok(merged) = setup_rootfs_overlay(image_path, &base_dir) {
             return Ok((merged, RootfsMode::Overlay));
         }
@@ -360,7 +392,37 @@ pub fn setup_rootfs(
 
     // Fallback: extract with unsquashfs
     setup_rootfs_extract(image_path, &base_dir)?;
+    if let Some((uid, gid)) = remap_owner {
+        chown_tree(&base_dir, uid, gid).with_context(|| {
+            format!("chown remapped rootfs {} to submitter", base_dir.display())
+        })?;
+    }
     Ok((base_dir, RootfsMode::Extracted))
+}
+
+/// Recursively chown an extracted rootfs so container root (mapped to the
+/// submitter) owns every path. `lchown` never follows symlinks, so a symlink in
+/// the image cannot redirect the chown outside the tree.
+fn chown_tree(root: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::lchown;
+
+    lchown(root, Some(uid), Some(gid)).with_context(|| format!("lchown {}", root.display()))?;
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("read dir {}", dir.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            lchown(&path, Some(uid), Some(gid))
+                .with_context(|| format!("lchown {}", path.display()))?;
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Mount squashfs image read-only, then layer a tmpfs overlay on top.
@@ -1039,6 +1101,16 @@ pub fn drop_privileges(uid: u32, gid: u32, supplementary_gids: &[u32]) -> anyhow
     Ok(())
 }
 
+/// Assume container root (uid/gid 0) inside a `SubmitterAsRoot` user namespace.
+/// The caller holds CAP_SETUID/SETGID in the namespace and id 0 maps to the
+/// submitter on the host. Done last, after privileged setup, since the uid
+/// change clears the effective capability set. setgroups is denied here.
+fn assume_container_root() -> anyhow::Result<()> {
+    nix::unistd::setgid(nix::unistd::Gid::from_raw(0)).context("setgid(0) in userns")?;
+    nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).context("setuid(0) in userns")?;
+    Ok(())
+}
+
 fn merge_supplementary_gids(mut gids: Vec<u32>, extra: &[u32]) -> Vec<u32> {
     for &g in extra {
         if g > 0 && !gids.contains(&g) {
@@ -1080,19 +1152,32 @@ pub fn resolve_supplementary_gids(uid: u32, gid: u32) -> Vec<u32> {
 
 /// Create the container's namespaces in runc/Podman order: a requested user
 /// namespace is created and mapped first, so the mount and PID namespaces are
-/// owned by it. `Host` skips the user namespace.
-fn create_namespaces(mode: UserNamespaceMode, uid: u32, gid: u32) -> anyhow::Result<()> {
+/// owned by it. `Host` skips the user namespace. `SubmitterAsRoot` blocks in
+/// the parent handshake over `map_sock` until its maps are installed.
+fn create_namespaces(
+    mode: UserNamespaceMode,
+    uid: u32,
+    gid: u32,
+    map_sock: Option<RawFd>,
+) -> anyhow::Result<()> {
     if mode.creates_user_namespace() {
         nix::sched::unshare(CloneFlags::CLONE_NEWUSER).context("unshare(CLONE_NEWUSER)")?;
-        install_id_maps(mode, uid, gid)?;
+        if mode.maps_via_parent() {
+            let sock =
+                map_sock.context("SubmitterAsRoot requires a parent id-map handshake socket")?;
+            request_parent_id_maps(sock)?;
+        } else {
+            install_id_maps(mode, uid, gid)?;
+        }
     }
     nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
         .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")
 }
 
-/// Install id maps for a mapped user namespace. `setgroups=deny` lets
-/// supplementary groups pass through (crun/podman `keep-groups`): they show as
-/// `nobody` inside but the kernel still honours them for permission checks.
+/// Install id maps for a self-mapped user namespace (`CurrentUserAsRoot`).
+/// `setgroups=deny` lets supplementary groups pass through (crun/podman
+/// `keep-groups`): they show as `nobody` inside but the kernel still honours
+/// them for permission checks.
 fn install_id_maps(mode: UserNamespaceMode, uid: u32, gid: u32) -> anyhow::Result<()> {
     if !mode.creates_user_namespace() {
         return Ok(());
@@ -1100,6 +1185,49 @@ fn install_id_maps(mode: UserNamespaceMode, uid: u32, gid: u32) -> anyhow::Resul
     for (file, contents) in userns_id_map_writes(uid, gid) {
         std::fs::write(format!("/proc/self/{file}"), contents)
             .with_context(|| format!("write {file}"))?;
+    }
+    Ok(())
+}
+
+/// Child side of the map handshake: signal the parent and block for its ack.
+/// One byte each way; the ack means the parent has written our id maps.
+fn request_parent_id_maps(map_sock: RawFd) -> anyhow::Result<()> {
+    let req = [1u8];
+    let n = unsafe { libc::write(map_sock, req.as_ptr() as *const _, req.len()) };
+    if n != 1 {
+        bail!("id-map handshake: failed to signal parent (write returned {n})");
+    }
+    let mut ack = [0u8; 1];
+    let n = unsafe { libc::read(map_sock, ack.as_mut_ptr() as *mut _, ack.len()) };
+    if n != 1 || ack[0] != 1 {
+        bail!("id-map handshake: parent did not install id maps (read returned {n})");
+    }
+    Ok(())
+}
+
+/// Parent side of the map handshake: wait for the child's request, write its
+/// `0 -> submitter` id maps (only the parent still holds `CAP_SETUID` in the
+/// init userns), then ack. `child_pid` is the `fork()` pid; the child asks
+/// before unsharing its PID namespace, so `/proc/<child_pid>` still resolves.
+pub fn install_child_id_maps(
+    child_pid: i32,
+    uid: u32,
+    gid: u32,
+    map_sock: RawFd,
+) -> anyhow::Result<()> {
+    let mut req = [0u8; 1];
+    let n = unsafe { libc::read(map_sock, req.as_mut_ptr() as *mut _, req.len()) };
+    if n != 1 {
+        bail!("id-map handshake: no request from child (read returned {n})");
+    }
+    for (file, contents) in userns_id_map_writes(uid, gid) {
+        std::fs::write(format!("/proc/{child_pid}/{file}"), contents)
+            .with_context(|| format!("write /proc/{child_pid}/{file}"))?;
+    }
+    let ack = [1u8];
+    let n = unsafe { libc::write(map_sock, ack.as_ptr() as *const _, ack.len()) };
+    if n != 1 {
+        bail!("id-map handshake: failed to ack child (write returned {n})");
     }
     Ok(())
 }
@@ -1133,12 +1261,12 @@ fn fork_into_pid_namespace() -> anyhow::Result<Option<i32>> {
     }
 }
 
-/// Close all inherited file descriptors except stdin/stdout/stderr
-/// and the given preserve_fd (the sync pipe).
+/// Close all inherited file descriptors except stdin/stdout/stderr and
+/// `preserve_fds` (the sync pipe, plus the id-map socket for a remap).
 ///
 /// Prevents gRPC sockets, other jobs' output files, etc. from leaking
 /// into the container process.
-pub fn close_inherited_fds(preserve_fd: RawFd) {
+pub fn close_inherited_fds(preserve_fds: &[RawFd]) {
     let fd_dir = Path::new("/proc/self/fd");
     // Collect fds first — iterating /proc/self/fd holds a directory fd
     // that we must not close while the iterator is alive.
@@ -1147,7 +1275,7 @@ pub fn close_inherited_fds(preserve_fd: RawFd) {
         .flatten()
         .flatten()
         .filter_map(|entry| entry.file_name().to_string_lossy().parse::<RawFd>().ok())
-        .filter(|&fd| fd > 2 && fd != preserve_fd)
+        .filter(|&fd| fd > 2 && !preserve_fds.contains(&fd))
         .collect();
     for fd in fds {
         unsafe {
@@ -1168,10 +1296,15 @@ pub struct ContainerInit {
 /// Container setup, run in the forked shepherd: create namespaces
 /// (user-namespace-first when requested), fork the workload as PID 1, set up
 /// the rootfs, and drop to the submitter for `Host` mode. Returns in the
-/// workload process; the shepherd waits on it.
-pub fn container_init(config: &ContainerConfig, rootfs: &Path) -> anyhow::Result<ContainerInit> {
+/// workload process; the shepherd waits on it. `map_sock` is the child end of
+/// the id-map handshake, present only for a remap (see [`create_namespaces`]).
+pub fn container_init(
+    config: &ContainerConfig,
+    rootfs: &Path,
+    map_sock: Option<RawFd>,
+) -> anyhow::Result<ContainerInit> {
     let is_root = nix::unistd::geteuid().is_root();
-    let mode = user_namespace_mode(is_root);
+    let mode = user_namespace_mode(is_root, config.remap_root);
 
     // Resolve supplementary GIDs while host /etc/group is still accessible.
     let mut supplementary_gids = resolve_supplementary_gids(config.uid, config.gid);
@@ -1182,7 +1315,8 @@ pub fn container_init(config: &ContainerConfig, rootfs: &Path) -> anyhow::Result
         }
     }
 
-    create_namespaces(mode, config.uid, config.gid).context("create container namespaces")?;
+    create_namespaces(mode, config.uid, config.gid, map_sock)
+        .context("create container namespaces")?;
 
     set_mount_propagation_private()?;
     let workload_pid = fork_into_pid_namespace()?;
@@ -1207,10 +1341,17 @@ pub fn container_init(config: &ContainerConfig, rootfs: &Path) -> anyhow::Result
     let workdir = config.workdir.as_deref().unwrap_or("/tmp");
     pivot_into_rootfs(rootfs, workdir)?;
 
-    // Only `Host` mode enters as root and must drop to the submitter.
-    // `CurrentUserAsRoot` is already the submitter mapped to namespace root.
-    if !mode.creates_user_namespace() {
-        drop_privileges(config.uid, config.gid, &supplementary_gids)?;
+    match mode {
+        // Real root: drop to the submitter before the workload runs.
+        UserNamespaceMode::Host => {
+            drop_privileges(config.uid, config.gid, &supplementary_gids)?;
+        }
+        // The submitter's own uid is already mapped to namespace root.
+        UserNamespaceMode::CurrentUserAsRoot => {}
+        // Host root is unmapped here (only the submitter is, at id 0), so it
+        // shows as `nobody`. Assume container root so the workload runs as
+        // uid/gid 0 inside (the submitter on the host).
+        UserNamespaceMode::SubmitterAsRoot => assume_container_root()?,
     }
 
     Ok(ContainerInit {
@@ -1287,16 +1428,38 @@ mod tests {
 
     #[test]
     fn root_daemon_uses_host_user_namespace() {
-        let mode = user_namespace_mode(true);
+        let mode = user_namespace_mode(true, false);
         assert_eq!(mode, UserNamespaceMode::Host);
         assert!(!mode.creates_user_namespace());
+        assert!(!mode.maps_via_parent());
     }
 
     #[test]
     fn rootless_daemon_maps_current_user_as_root() {
-        let mode = user_namespace_mode(false);
+        let mode = user_namespace_mode(false, false);
         assert_eq!(mode, UserNamespaceMode::CurrentUserAsRoot);
         assert!(mode.creates_user_namespace());
+        // Rootless self-maps its own euid; no privileged parent needed.
+        assert!(!mode.maps_via_parent());
+    }
+
+    #[test]
+    fn root_daemon_remap_maps_submitter_as_root() {
+        let mode = user_namespace_mode(true, true);
+        assert_eq!(mode, UserNamespaceMode::SubmitterAsRoot);
+        assert!(mode.creates_user_namespace());
+        // The child cannot self-map an arbitrary 0->submitter map; the parent must.
+        assert!(mode.maps_via_parent());
+    }
+
+    #[test]
+    fn rootless_remap_is_already_satisfied() {
+        // A rootless daemon already runs container root as the submitter, so a
+        // remap request collapses to the ordinary rootless mapping (no parent
+        // handshake, which a non-root daemon could not service anyway).
+        let mode = user_namespace_mode(false, true);
+        assert_eq!(mode, UserNamespaceMode::CurrentUserAsRoot);
+        assert!(!mode.maps_via_parent());
     }
 
     #[test]
@@ -1958,6 +2121,39 @@ mod tests {
     // --- Cleanup ---
 
     #[test]
+    fn setup_rootfs_rejects_remap_with_named_container() {
+        // The remapped rootfs is chowned to one submitter, so a shared named
+        // container must be refused before any filesystem work.
+        let err = setup_rootfs(
+            Path::new("/nonexistent-image.sqsh"),
+            "job_1",
+            Some("shared-env"),
+            Some((1000, 1000)),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("container-remap-root") && msg.contains("container-name"),
+            "error must name the rejected combination, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chown_tree_walks_files_dirs_and_symlinks() {
+        // chown-to-self is permitted for an unprivileged runner, so this
+        // exercises the real recursion (including a symlink, which must be
+        // lchowned, not followed) without needing root.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        std::fs::write(root.path().join("a/b/file"), b"x").unwrap();
+        std::os::unix::fs::symlink("file", root.path().join("a/b/link")).unwrap();
+
+        let uid = nix::unistd::Uid::current().as_raw();
+        let gid = nix::unistd::Gid::current().as_raw();
+        chown_tree(root.path(), uid, gid).expect("chown-to-self must succeed");
+    }
+
+    #[test]
     fn test_cleanup_rootfs_nonexistent() {
         // Should not panic when cleaning up a rootfs that doesn't exist
         cleanup_rootfs(&job_rootfs_base(999999), &RootfsMode::Extracted);
@@ -2052,7 +2248,7 @@ mod tests {
                 std::mem::forget(f2);
                 std::mem::forget(preserve);
 
-                close_inherited_fds(preserve_fd);
+                close_inherited_fds(&[preserve_fd]);
 
                 let preserved_ok = fd_is_open(preserve_fd);
                 let f1_closed = !fd_is_open(f1_fd);

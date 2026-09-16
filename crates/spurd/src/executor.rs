@@ -2113,6 +2113,23 @@ async fn launch_container_job(
     let pipe_r_owner = pipe_r;
     let pipe_w_owner = pipe_w;
 
+    // Id-map handshake socket for a remap launch; None otherwise. Same
+    // cross-fork fd handling as the sync pipe above.
+    let (map_parent, map_child) = if crate::container::remap_maps_via_parent(&ctn.config) {
+        let (parent, child) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )
+        .context("create id-map handshake socket")?;
+        (Some(parent), Some(child))
+    } else {
+        (None, None)
+    };
+    let map_parent_raw = map_parent.as_ref().map(|f| f.as_raw_fd());
+    let map_child_raw = map_child.as_ref().map(|f| f.as_raw_fd());
+
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
     // across the fork boundary).
@@ -2168,13 +2185,16 @@ async fn launch_container_job(
                 let _ = join_cgroup_self(procs, cgroup_log_fd);
             }
 
-            crate::container::close_inherited_fds(ready_w);
+            // Keep the map socket open for the handshake in container_init.
+            let mut preserve = vec![ready_w];
+            preserve.extend(map_child_raw);
+            crate::container::close_inherited_fds(&preserve);
 
             // RLIMIT_MEMLOCK: raise while still root, before container_init drops privileges.
             apply_memlock(cfg.memlock);
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
-            let init = match crate::container::container_init(config, &rootfs) {
+            let init = match crate::container::container_init(config, &rootfs, map_child_raw) {
                 Ok(init) => init,
                 Err(e) => {
                     let msg = format!("E:{:#}", e);
@@ -2236,6 +2256,7 @@ async fn launch_container_job(
 
         nix::unistd::ForkResult::Parent { child } => {
             drop(pipe_w_owner);
+            drop(map_child);
             unsafe {
                 if cgroup_log_fd >= 0 {
                     libc::close(cgroup_log_fd);
@@ -2253,6 +2274,18 @@ async fn launch_container_job(
                 debug!("pidfd_open unavailable, falling back to raw PID tracking");
             }
 
+            // Install the remap maps before waiting on readiness; the child
+            // blocks in the handshake until this lands.
+            if let Some(sock) = map_parent_raw {
+                let (uid, gid) = (config.uid, config.gid);
+                if let Err(e) = crate::container::install_child_id_maps(child_pid, uid, gid, sock) {
+                    signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL).ok();
+                    let _ = nix::sys::wait::waitpid(child, None);
+                    bail!("container remap id-map handshake failed for job {job_id}: {e:#}");
+                }
+            }
+            drop(map_parent);
+
             let mut buf = [0u8; 512];
             let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
             let n = n.max(0) as usize;
@@ -2260,7 +2293,13 @@ async fn launch_container_job(
 
             let workload_pid = match crate::container::parse_readiness(&buf[..n]) {
                 Ok(pid) => pid,
-                Err(msg) => bail!("container init failed for job {}: {}", job_id, msg),
+                Err(msg) => {
+                    // Reap the shepherd so a readiness failure does not leave a
+                    // zombie (it self-exits once the workload dies).
+                    signal::kill(Pid::from_raw(child_pid), Signal::SIGKILL).ok();
+                    let _ = nix::sys::wait::waitpid(child, None);
+                    bail!("container init failed for job {}: {}", job_id, msg);
+                }
             };
 
             // Only now is the child's self-join guaranteed to have run. Verify

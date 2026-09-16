@@ -70,8 +70,9 @@ runs inside the container.
      - Shell command run inside the container immediately before the job script
        (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
-     - Not yet implemented. Accepted for forward compatibility but has no effect
-       today. See `How Container Isolation Works`_.
+     - Run the workload as ``root`` (uid 0) *inside* the container while staying
+       your unprivileged self on the host (Enroot-style rootless root). See
+       `How Container Isolation Works`_.
 
 A GPU training job with a read-only data mount:
 
@@ -203,10 +204,21 @@ runc and Podman use. There is no external runtime and no daemon.
   as root, then the job drops to the submitting user's uid, gid, and
   supplementary groups before the workload starts. The container still gets its
   own mount and PID namespaces.
+- **Root node agent with** ``--container-remap-root``. The container creates a
+  user namespace first and maps container root (uid/gid 0) to *your* uid/gid on
+  the host, then creates the mount and PID namespaces so they are owned by that
+  user namespace. Your workload is root inside (it can write ``/root``, install
+  packages into the image's rootfs, and so on), but every action on the host
+  still happens as your unprivileged self: a file the container writes to a
+  bind-mounted host directory is owned by you, never by real root. The per-job
+  rootfs is extracted fresh and chowned to you, so it cannot be shared with
+  ``--container-name`` (the two flags are rejected together).
 - **Rootless node agent.** The container creates a user namespace first and maps
   your uid and gid to root inside it, then creates the mount and PID namespaces
   so they are owned by that user namespace. Your supplementary groups are still
-  honoured for device access.
+  honoured for device access. A rootless agent already runs the workload as the
+  submitter mapped to root, so ``--container-remap-root`` is redundant there and
+  simply has no additional effect.
 
 In both cases a small shepherd process anchors the container's namespaces and
 waits on the workload, which runs as PID 1 inside a fresh PID namespace. Nested
@@ -216,9 +228,12 @@ container down even if a process tries to outlive its supervisor.
 
 .. note::
 
-   ``--container-remap-root`` (mapping the job user to root inside the container
-   on a root node agent) is not yet available. The ordering above is what makes
-   it a purely additive change when it lands.
+   Under ``--container-remap-root`` on a root node agent, only container root
+   (mapped to your uid/gid) is available inside the user namespace; your host
+   supplementary groups are not mapped. Files or devices reachable only through
+   a supplementary group (for example a GPU render node gated on the ``render``
+   group) may therefore be inaccessible to the remapped workload. Run without
+   ``--container-remap-root`` when the job needs those group-gated resources.
 
 See Also
 --------
