@@ -18445,6 +18445,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_after_a_running_job_is_requeued_onto_a_down_node() {
+        // A running job (consuming real quota) requeues onto a now-down node —
+        // it must not keep charging the cap against a job that could run.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut running = make_running_job(101, &["n1"], 1);
+        running.spec.qos = Some("tight".into());
+        running.spec.nodelist = Some("n1".into());
+        cm.jobs.write().insert(101, running);
+
+        cm.requeue_job(101).unwrap();
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+        // Bypass the real backoff window: simulate it having already lapsed.
+        if let Some(job) = cm.jobs.write().get_mut(&101) {
+            job.spec.begin_time = None;
+        }
+
+        let mut placeable = basic_spec("should-still-run-after-requeue");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(101).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "requeued job pinned to a now-down node must be tagged by real node state"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&101));
+        assert!(
+            pending.contains(&placeable_id),
+            "a requeued-but-unplaceable job must not keep charging the QOS cap after requeue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_still_blocks_for_a_job_that_can_place_but_exceeds_cap() {
         // Guard: both nodes up, n1 has no spare capacity, so this must still
         // block on the real cap instead of skipping it as unplaceable.
