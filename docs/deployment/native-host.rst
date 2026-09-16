@@ -527,8 +527,9 @@ Inspect what a running job actually got:
 
 The job directory normally holds the limits and no processes — those live in the
 leaves; a step whose leaf could not be created falls back into the job directory
-itself. ``srun`` steps are numbered from ``step_0``; the batch payload uses the
-reserved step id it was launched under, so its leaf is a large number, not ``0``.
+itself. ``srun`` steps are numbered from ``step_0``, while a job's own lifetime
+runs in Slurm-named reserved leaves — ``step_batch`` for the batch payload and
+``step_extern`` for an allocation's holder.
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -567,12 +568,13 @@ a granularity gap *inside* the job rather than a hole between jobs:
        step process that leaves that tree (``setsid``) is missed even though the
        step now has a cgroup that would catch it. Cancelling the whole *job* is
        exact, because that is a cgroup operation.
-   * - ``task_prolog`` / ``task_epilog``
-     - Run by ``spurd`` around each step, as root and in ``spurd``'s own cgroup.
-       They are site-supplied rather than user code, but they are neither
-       resource-bounded nor device-filtered.
+   * - ``task_prolog`` / ``task_epilog`` for a containerized step
+     - A supervised step runs its task hooks as the job user inside its own
+       ``step_<n>`` cgroup. A containerized ``srun`` step still takes the legacy
+       launch path, where the hooks — like the container workload — run in the
+       parent job's leaf rather than a per-step ``step_<n>`` leaf.
 
-Node-level ``prolog`` and ``epilog`` also run uncontained, and that is by design:
+Node-level ``prolog`` and ``epilog`` run uncontained, and that is by design:
 they run before the job's cgroup exists and after it is gone, and their purpose is
 node-wide setup and teardown.
 

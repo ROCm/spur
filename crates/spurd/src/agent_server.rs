@@ -285,6 +285,7 @@ async fn launch_stepd(
             pty_master: None,
             // Not created until the job is released; steps read it live.
             cgroup_path: None,
+            task_environment: HashMap::new(),
         },
         descriptor,
     ))
@@ -4575,6 +4576,13 @@ impl SlurmAgent for AgentService {
             gid: spec.gid,
             container: container_launch,
             prolog_script: None,
+            // A --pty job takes the legacy path, whose teardown runs no TaskEpilog, so
+            // keep both task hooks off for this deferred mode rather than run an unpaired prolog.
+            task_prolog_script: if spec.pty {
+                None
+            } else {
+                self.hooks.task_prolog.clone()
+            },
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             mpi: spec.mpi.clone(),
@@ -5282,6 +5290,7 @@ impl SlurmAgent for AgentService {
                 gid: req.gid,
                 container: None,
                 prolog_script: None,
+                task_prolog_script: None,
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
                 mpi: req.mpi.clone(),
@@ -5746,24 +5755,6 @@ impl SlurmAgent for AgentService {
         };
         let _step_script_guard = step_script_cleanup;
 
-        if let Some(ref task_prolog) = self.hooks.task_prolog {
-            let ctx = spur_core::hooks::HookContext {
-                job_id,
-                work_dir: work_dir.clone(),
-                uid: req.uid,
-                gid: req.gid,
-                partition: partition.clone(),
-                nodelist: job_nodelist.clone(),
-                script_context: "prolog_task".into(),
-                gpu_devices: gpu_devices.clone(),
-                cpus,
-                memory_mb,
-            };
-            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
-                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
-            }
-        }
-
         let mut env = senv.into_map();
         if num_tasks > 1 && step_mpi {
             mpi_plugin::strip_launcher_mpi_env(&mut env);
@@ -5846,6 +5837,7 @@ impl SlurmAgent for AgentService {
                 gid: req.gid,
                 container: None,
                 prolog_script: None,
+                task_prolog_script: None,
                 partition: partition.clone(),
                 nodelist: job_nodelist.clone(),
                 mpi: job_mpi.clone(),
@@ -5857,6 +5849,47 @@ impl SlurmAgent for AgentService {
             })
         } else {
             None
+        };
+
+        // Legacy (non-supervised) steps run the workload here, so their task hooks
+        // run here too — contained in the job cgroup as the job user. Supervised
+        // steps get task hooks from their own spurstepd.
+        let mut task_prolog_printed: Vec<u8> = Vec::new();
+        if !supervise_step {
+            if let Some(ref task_prolog) = self.hooks.task_prolog {
+                let ctx = spur_core::hooks::HookContext {
+                    job_id,
+                    work_dir: work_dir.clone(),
+                    uid: req.uid,
+                    gid: req.gid,
+                    partition: partition.clone(),
+                    nodelist: job_nodelist.clone(),
+                    script_context: "prolog_task".into(),
+                    gpu_devices: gpu_devices.clone(),
+                    cpus,
+                    memory_mb,
+                };
+                match crate::task_hook::run_task_prolog(
+                    task_prolog,
+                    &ctx,
+                    env,
+                    job_entry.cgroup_path.as_deref(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        env = result.environment;
+                        task_prolog_printed = result.printed;
+                    }
+                    Err(e) => return Err(Status::aborted(format!("TaskProlog failed: {e}"))),
+                }
+            }
+        }
+        // The legacy dispatch consumes `env`; keep a copy for TaskEpilog.
+        let task_epilog_env: HashMap<String, String> = if supervise_step {
+            HashMap::new()
+        } else {
+            env.clone()
         };
 
         // Dispatch paths, each wiring the step's stdio to the spool files above.
@@ -6142,21 +6175,30 @@ impl SlurmAgent for AgentService {
             None => return Ok(Response::new(cancelled_step_response())),
         };
 
-        if let Some(ref task_epilog) = self.hooks.task_epilog {
-            let ctx = spur_core::hooks::HookContext {
-                job_id,
-                work_dir: work_dir.clone(),
-                uid: req.uid,
-                gid: req.gid,
-                partition,
-                nodelist: job_nodelist,
-                script_context: "epilog_task".into(),
-                gpu_devices,
-                cpus,
-                memory_mb,
-            };
-            if let Err(e) = spur_core::hooks::run_hook(task_epilog, &ctx).await {
-                warn!(error = %e, "TaskEpilog failed");
+        if !supervise_step {
+            if let Some(ref task_epilog) = self.hooks.task_epilog {
+                let ctx = spur_core::hooks::HookContext {
+                    job_id,
+                    work_dir: work_dir.clone(),
+                    uid: req.uid,
+                    gid: req.gid,
+                    partition,
+                    nodelist: job_nodelist,
+                    script_context: "epilog_task".into(),
+                    gpu_devices,
+                    cpus,
+                    memory_mb,
+                };
+                if let Err(e) = crate::task_hook::run_task_epilog(
+                    task_epilog,
+                    &ctx,
+                    &task_epilog_env,
+                    job_entry.cgroup_path.as_deref(),
+                )
+                .await
+                {
+                    warn!(error = %e, "TaskEpilog failed");
+                }
             }
         }
 
@@ -6174,9 +6216,17 @@ impl SlurmAgent for AgentService {
                 }
             }
         };
+        let mut stdout = read_back(stdout_path).await;
+        if !task_prolog_printed.is_empty() {
+            stdout = format!(
+                "{}{}",
+                String::from_utf8_lossy(&task_prolog_printed),
+                stdout
+            );
+        }
         Ok(Response::new(RunCommandResponse {
             exit_code: spur_core::process::shell_exit_code(&status),
-            stdout: read_back(stdout_path).await,
+            stdout,
             stderr: read_back(stderr_path).await,
         }))
     }
@@ -11426,6 +11476,7 @@ mod tests {
             gid: 1000,
             container: None,
             prolog_script: None,
+            task_prolog_script: None,
             partition: String::new(),
             nodelist: String::new(),
             mpi: String::new(),
