@@ -491,6 +491,18 @@ struct PendingJobClassification {
     idle_fill_candidates: Vec<Job>,
 }
 
+/// Whether a borrowed run still sits outside its QOS group node quota.
+///
+/// Split from its caller so the rule is testable without standing up a cluster.
+/// `cap` of `None` or `0` means the dimension is unlimited, in which case there is
+/// no quota to be outside of and the run has a claim like any other.
+fn borrowed_run_over_quota(cap: Option<u64>, legitimate_nodes: u64, own_nodes: u64) -> bool {
+    match cap {
+        None | Some(0) => false,
+        Some(cap) => legitimate_nodes.saturating_add(own_nodes) > cap,
+    }
+}
+
 /// Whether a job refused by its group node cap may be lent idle capacity at all.
 /// Separate from the sole-blocker test, which asks about quota; these are the
 /// structural exclusions, each because re-running the gate concerned is either
@@ -1627,28 +1639,22 @@ impl ClusterManager {
     /// reclaim time (D13). The `idle_fill_preemptable` source needs no equivalent —
     /// it is read from the QOS on every pass and so is never stale.
     pub fn borrowed_run_still_over_quota(&self, job: &Job) -> bool {
-        let qos = self.resolve_qos(job);
-        let Some(cap) = qos
-            .limits
-            .grp_tres
-            .as_ref()
-            .map(|grp| grp.get(TresType::Node))
-            .filter(|cap| *cap > 0)
-        else {
-            // No cap to be outside of, so the job has a claim like any other.
-            return false;
-        };
         let Some(qos_name) = job.spec.qos.as_deref() else {
             return false;
         };
+        let cap = self
+            .resolve_qos(job)
+            .limits
+            .grp_tres
+            .as_ref()
+            .map(|grp| grp.get(TresType::Node));
         let jobs = self.jobs.read();
         // Nodes held by jobs with a genuine claim, this job excluded by its stamp.
         let legitimate = occupied_nodes(&jobs, |j| {
             !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name)
         })
         .len() as u64;
-        let mine = job.allocated_nodes.len() as u64;
-        legitimate.saturating_add(mine) > cap
+        borrowed_run_over_quota(cap, legitimate, job.allocated_nodes.len() as u64)
     }
 
     /// Start a job as *borrowed*: it exceeded its QOS group node cap and is running
@@ -26236,6 +26242,120 @@ mod idle_fill_aggregate_tests {
     fn bounded(mut job: Job) -> Job {
         job.spec.time_limit = Some(chrono::Duration::minutes(30));
         job
+    }
+
+    #[test]
+    fn a_stale_stamp_stops_being_reclaimable_once_the_run_fits_the_quota_again() {
+        // The stamp records what was true at start. Raising the cap, or a sibling
+        // finishing, can leave a stamped run comfortably inside quota, and evicting
+        // it then would break the rule that a job with a claim is never kicked out.
+        // Reclaim therefore re-asks rather than trusting the stamp (D13).
+
+        // One legitimate node held, this run holds one: over a cap of 1.
+        assert!(borrowed_run_over_quota(Some(1), 1, 1));
+        // Same run, cap raised to 2 — it now fits, so it must not be reclaimed.
+        assert!(!borrowed_run_over_quota(Some(2), 1, 1));
+        // Same cap of 1, but the legitimate sibling finished: it fits again.
+        assert!(!borrowed_run_over_quota(Some(1), 0, 1));
+        // Exactly at the cap counts as fitting, not as exceeding.
+        assert!(!borrowed_run_over_quota(Some(4), 2, 2));
+        assert!(borrowed_run_over_quota(Some(4), 2, 3));
+        // No cap, or an explicitly unlimited one, is never "over".
+        assert!(!borrowed_run_over_quota(None, 99, 99));
+        assert!(!borrowed_run_over_quota(Some(0), 99, 99));
+        // A pathological node count must saturate rather than wrap into "fits".
+        assert!(borrowed_run_over_quota(Some(1), u64::MAX, 1));
+    }
+
+    #[test]
+    fn one_users_borrowed_job_does_not_bind_another_users_per_user_limit() {
+        // Per-user limits are per *user*, so bob's headroom must be untouched by
+        // alice's job in either tier. With a single-user fixture this would pass
+        // vacuously, which is why it is stated across two users.
+        let qos = Qos {
+            limits: QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+
+        // Alice runs one legitimate job, which binds *her* limit.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut alice_again = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut alice_again, &qos, &jobs),
+            Err(PendingReason::QoSMaxJobsPerUser),
+            "alice's own legitimate job binds alice's per-user limit"
+        );
+        // Bob is unaffected by it.
+        let mut bob = candidate(3, "bob", "team", 1);
+        assert!(
+            gate(&mut bob, &qos, &jobs).is_ok(),
+            "alice's job must not bind bob's per-user limit"
+        );
+
+        // Same again with alice's job borrowed: still no effect on bob, and now no
+        // effect on alice either, since a borrowed job is outside every aggregate.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut bob = candidate(3, "bob", "team", 1);
+        assert!(gate(&mut bob, &qos, &jobs).is_ok());
+        let mut alice_again = candidate(2, "alice", "team", 1);
+        assert!(gate(&mut alice_again, &qos, &jobs).is_ok());
+    }
+
+    #[test]
+    fn a_borrowed_job_frees_group_quota_for_a_different_users_legitimate_job() {
+        // The group node cap spans every user in the QOS, which is the whole point
+        // of the feature: alice borrows spare capacity, and bob — a different user
+        // in the same team, with a genuine claim — must still be admitted. If the
+        // exclusion were keyed on the submitting user rather than the stamp, this
+        // would fail while the single-user tests kept passing.
+        let qos = grp_node_qos("team", 1);
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut bob = candidate(2, "bob", "team", 1);
+        assert!(
+            gate(&mut bob, &qos, &jobs).is_ok(),
+            "alice's borrowed node must not consume the group quota bob has a claim on"
+        );
+
+        // Control: unstamped, alice's job does hold the group quota against bob.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut bob = candidate(2, "bob", "team", 1);
+        assert_eq!(
+            gate(&mut bob, &qos, &jobs),
+            Err(PendingReason::QosGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn a_second_users_job_is_borrow_eligible_when_the_group_cap_is_the_sole_blocker() {
+        // Eligibility is a property of the QOS aggregate, not of who submitted, so a
+        // job belonging to a user with no running jobs at all is still eligible when
+        // a *teammate* has exhausted the shared group cap.
+        let qos = grp_node_qos("team", 1);
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut bob = candidate(2, "bob", "team", 1);
+        let blocked = qos_block_with(
+            &mut bob,
+            &qos,
+            &jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+            None,
+        )
+        .expect_err("bob is over the shared group cap");
+        assert_eq!(blocked.reason, PendingReason::QosGrpNodeLimit);
+        assert!(
+            blocked.grp_node_sole_blocker,
+            "a teammate exhausting the shared cap still leaves bob borrow-eligible"
+        );
     }
 
     #[test]
