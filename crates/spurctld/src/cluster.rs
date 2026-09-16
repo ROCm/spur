@@ -7206,13 +7206,25 @@ fn structural_unplaceable_reason(
         .filter(|n| placement.eligible(n, reservations, now))
         .collect();
 
+    // A k0s-claimed node would otherwise match: unlike a down node, it can
+    // free up on its own, so the block is k0s-flavored, not a dead end.
+    let blocked_by_k0s = || {
+        eligible
+            .iter()
+            .any(|n| n.is_k0s_reserved() && placement.matches_ignoring_k0s(n, reservations, now))
+    };
+
     if placement.additive_listed_node_unavailable(
         eligible.iter().copied(),
         reservations,
         now,
         &required,
     ) {
-        return Some(PendingReason::ReqNodeNotAvail);
+        return Some(if blocked_by_k0s() {
+            PendingReason::K8sReserved
+        } else {
+            PendingReason::ReqNodeNotAvail
+        });
     }
 
     if eligible.len() < needed
@@ -7223,13 +7235,13 @@ fn structural_unplaceable_reason(
         return None;
     }
 
-    Some(
-        if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
-            PendingReason::ReqNodeNotAvail
-        } else {
-            PendingReason::NodeDown
-        },
-    )
+    Some(if blocked_by_k0s() {
+        PendingReason::K8sReserved
+    } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+        PendingReason::ReqNodeNotAvail
+    } else {
+        PendingReason::NodeDown
+    })
 }
 
 /// `Err(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
@@ -18627,7 +18639,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_does_not_charge_when_the_only_up_node_is_k0s_reserved() {
         // n1 is operationally Up but claimed by k0s: is_up() alone would miss
-        // this, but real placement excludes it just like a down node.
+        // that it's unavailable, but unlike a down node it can free up on its
+        // own, so it must still be reported as K8sReserved, not ReqNodeNotAvail.
         use spur_core::k0s::K0sRole;
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -18662,14 +18675,55 @@ mod tests {
         cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(stuck_id).unwrap().pending_reason,
-            PendingReason::ReqNodeNotAvail,
-            "a k0s-claimed node is not a real candidate even though it's operationally up"
+            PendingReason::K8sReserved,
+            "a k0s-claimed node can free up on its own, unlike a down node"
         );
         let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
         assert!(!pending.contains(&stuck_id));
         assert!(
             pending.contains(&placeable_id),
             "a job stuck on a k0s-reserved node must not charge the QOS cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_when_every_node_is_k0s_reserved() {
+        // No nodelist pin: the whole inventory is claimed by the managed k0s
+        // cluster (`spur k8s up` with no --nodes scope). The job must still
+        // be reported K8sReserved, not NodeDown, so squeue/scontrol don't
+        // claim the node is dead.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        for name in ["n1", "n2"] {
+            if let Some(node) = cm.nodes.write().get_mut(name) {
+                node.k0s_role = Some(K0sRole::Worker);
+            }
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("stuck-k8s-reserved-cluster");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 1;
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::K8sReserved,
+            "every node being k0s-reserved is not the same as every node being down"
         );
     }
 
