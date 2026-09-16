@@ -18,10 +18,12 @@ use crate::resource::ResourceAllocations;
 /// Job step identifier.
 pub type StepId = u32;
 
-/// Special step IDs (matching Slurm conventions).
-pub const STEP_BATCH: StepId = 0xFFFF_FFFE;
-pub const STEP_EXTERN: StepId = 0xFFFF_FFFD;
-pub const STEP_INTERACTIVE: StepId = 0xFFFF_FFFC;
+/// Special step IDs — the exact Slurm sentinel values from `slurm.h`
+/// (`SLURM_BATCH_SCRIPT`, `SLURM_EXTERN_CONT`, `SLURM_INTERACTIVE_STEP`), so a
+/// Slurm-compatible client speaks the same ids on the wire and in the C FFI.
+pub const STEP_BATCH: StepId = 0xFFFF_FFFB;
+pub const STEP_EXTERN: StepId = 0xFFFF_FFFC;
+pub const STEP_INTERACTIVE: StepId = 0xFFFF_FFFA;
 
 /// Step IDs at or above this are reserved (batch/extern/interactive); real
 /// user `srun` steps are numbered below it (0, 1, 2, ...).
@@ -370,9 +372,11 @@ mod tests {
 
     #[test]
     fn test_step_special_ids() {
-        assert_eq!(STEP_BATCH, 0xFFFF_FFFE);
-        assert_eq!(STEP_EXTERN, 0xFFFF_FFFD);
-        assert_eq!(STEP_INTERACTIVE, 0xFFFF_FFFC);
+        // The exact Slurm sentinels from slurm.h: SLURM_BATCH_SCRIPT (0xfffffffb),
+        // SLURM_EXTERN_CONT (0xfffffffc), SLURM_INTERACTIVE_STEP (0xfffffffa).
+        assert_eq!(STEP_BATCH, 0xFFFF_FFFB);
+        assert_eq!(STEP_EXTERN, 0xFFFF_FFFC);
+        assert_eq!(STEP_INTERACTIVE, 0xFFFF_FFFA);
         // All special IDs should be distinct
         assert_ne!(STEP_BATCH, STEP_EXTERN);
         assert_ne!(STEP_BATCH, STEP_INTERACTIVE);

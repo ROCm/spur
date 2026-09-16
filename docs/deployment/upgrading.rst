@@ -402,6 +402,30 @@ An agent without them logs ``device filter not installed`` and runs the job with
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
 
+Reserved step IDs aligned to Slurm
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release changes the integer IDs of the reserved batch, extern, and interactive
+steps to Slurm's exact ``slurm.h`` sentinels (``SLURM_BATCH_SCRIPT``,
+``SLURM_EXTERN_CONT``, ``SLURM_INTERACTIVE_STEP``). These IDs are persisted in the Raft
+snapshot, embedded in each node's stepd runtime state (session directory names, launch
+descriptors, PMIx namespaces), and carried on the gRPC wire, so old and new builds
+disagree on which integer means which step.
+
+.. warning::
+
+   **This upgrade requires an empty cluster.** Drain every node and let all running jobs
+   finish, or cancel them, before swapping binaries, and upgrade every controller and
+   agent in the same window. A job in flight across the upgrade has its reserved step
+   recorded under the old ID: the new build no longer recognizes it as
+   batch/extern/interactive, so it reports the raw integer and its supervisor and cgroup
+   are not reaped correctly. Rolling back is not supported once a new controller has
+   written a snapshot carrying the new IDs.
+
+On a drained cluster the change is invisible: user-facing output already renders these
+steps as ``batch``/``extern``/``interactive`` rather than the integer, so no scripts or
+CLI output change.
+
 See Also
 --------
 
