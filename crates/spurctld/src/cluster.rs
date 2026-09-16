@@ -3725,9 +3725,7 @@ impl ClusterManager {
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
-            // A job whose every matching node is down can't be fixed by a future
-            // pass, so it must not reserve QOS/account grp-node quota it will
-            // never use — see `structural_unplaceable_reason`.
+            // An unplaceable job must not reserve grp-node quota it never uses.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 match structural_unplaceable_reason(job, &nodes, &reservations) {
                     Some(reason) => GateOutcome::Block(reason),
@@ -7190,14 +7188,8 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// `Some(reason)` only when every node matching the job's placement is down —
-/// no future scheduling pass fixes that without an operator bringing a node
-/// back. Deliberately narrower than `update_pending_reasons`'s full check: a
-/// job with too few *eligible* nodes (fewer real nodes registered than
-/// `num_nodes`, e.g. a partition still filling in) is left alone here — its
-/// candidacy depends on nodes that may still join, so it must keep holding its
-/// QOS/account charge like any other pending job. Only the down-node case is
-/// unconditionally permanent regardless of what else joins or finishes.
+/// `Some(reason)` only when every node matching the job's placement is down.
+/// Too-few-eligible is left alone: those nodes may still join.
 fn structural_unplaceable_reason(
     job: &Job,
     nodes: &HashMap<String, Node>,
@@ -18402,9 +18394,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_does_not_charge_for_a_job_pinned_to_a_down_node() {
-        // A job pinned (-w n1) to a down node can never place. Before the fix it
-        // still charged the QOS grp-node cap, permanently blocking a second job
-        // under the same QOS even with zero jobs actually running (SPUR-284).
+        // A job pinned to a down node must not charge the QOS grp-node cap and
+        // starve a second job in the same QOS that could actually run.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 128000);
@@ -18455,11 +18446,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_still_blocks_for_a_job_that_can_place_but_exceeds_cap() {
-        // Guard: the structural pre-check must not become a loophole that skips
-        // the real cap for a job that CAN place. Both nodes up but n1 has no
-        // spare capacity (registered with 0 cpus, matching the no-headroom
-        // pattern used above), so the new job genuinely needs n2 as a 2nd
-        // distinct node against a cap of 1.
+        // Guard: both nodes up, n1 has no spare capacity, so this must still
+        // block on the real cap instead of skipping it as unplaceable.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 0, 0);
