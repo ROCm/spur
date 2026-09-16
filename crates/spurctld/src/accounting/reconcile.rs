@@ -238,6 +238,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             submit_time: job.submit_time,
             start_time,
             reservation: spec.reservation.clone(),
+            idle_fill: job.idle_fill,
         },
     )
     .await
@@ -609,6 +610,7 @@ mod tests {
                     submit_time: job.submit_time,
                     start_time: job.start_time.unwrap(),
                     reservation: None,
+                    idle_fill: false,
                 },
             )
             .await?;

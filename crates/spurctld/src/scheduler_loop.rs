@@ -150,8 +150,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
-        let pending = cluster.pending_jobs_and_tag_reasons();
-        if pending.is_empty() {
+        let (mut pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
+        if pending.is_empty() && idle_fill_candidates.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
@@ -163,6 +163,34 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
+
+        // Append the borrow candidates below every in-quota job, strictly after the
+        // node set and the depth metric are derived from the in-quota list alone. A
+        // candidate's `--nodelist` would otherwise unpin a node held back by dispatch
+        // cooldown, and an in-quota job could then be placed on it (§5.3, D16).
+        //
+        // Tail position is real precedence: the pass walks the list in caller order
+        // and either places a job now, reserving its nodes on the timeline, or
+        // reserves the future slot it would need. A tail job is therefore offered
+        // exactly the capacity left after every in-quota job has taken what it can
+        // start on and reserved what it is waiting for — the definition of spare
+        // capacity, computed by the code that already owns the question (§5.1).
+        let borrow_ids: HashSet<spur_core::job::JobId> =
+            idle_fill_candidates.iter().map(|j| j.job_id).collect();
+        // The appended copies carry the stamp so the pass itself can tell a candidate
+        // from an in-quota job — that is how the future-slot reservation is suppressed
+        // (D15). These are clones; the stored job is stamped only if it actually
+        // starts, through the `borrowed` flag threaded into the dispatch below.
+        pending.extend(idle_fill_candidates.into_iter().map(|mut job| {
+            job.idle_fill = true;
+            job
+        }));
+        if pending.is_empty() {
+            cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
+            continue;
+        }
 
         if nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
@@ -218,9 +246,16 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
         if assignments.len() < pending.len() {
+            // An unplaced borrow candidate is deliberately absent from this list. It
+            // has no claim on the capacity it wanted, so it must not evict anyone via
+            // `try_preempt`; `update_pending_reasons` must not relabel it
+            // `NoSuitableNodes` when being over quota is the true reason; and it must
+            // not be exported to a federated peer, since forwarding a job that is over
+            // its local quota is a policy nobody has chosen (§5.4).
             let unscheduled: Vec<_> = pending
                 .iter()
                 .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+                .filter(|p| !borrow_ids.contains(&p.job_id))
                 .collect();
 
             if !unscheduled.is_empty() {
@@ -228,6 +263,35 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
+
+                // Reclaim runs before preemption: recovering capacity that was lent
+                // out is always preferable to evicting a job that holds a claim to
+                // it. A job whose shortfall reclaim closes never reaches
+                // `try_preempt` this cycle.
+                let sched_cfg = cluster.config().scheduler.clone();
+                if sched_cfg.idle_fill_enabled {
+                    let freed = reclaim_for_unplaced(
+                        &cluster,
+                        &unscheduled,
+                        &cluster_state,
+                        sched_cfg.idle_fill_exempt_secs,
+                    )
+                    .await;
+                    if !freed.is_empty() {
+                        // The cancel has been *delivered*, which is not the same as the
+                        // workload being gone: the agent then sends SIGTERM, waits its
+                        // grace, and only then SIGKILLs. Hold the freed nodes out for
+                        // that long so the reclaimer is not dispatched onto a node
+                        // whose previous occupant still holds GPU memory and its
+                        // cgroup (D3).
+                        const AGENT_KILL_GRACE: std::time::Duration =
+                            std::time::Duration::from_secs(5);
+                        for node in &freed {
+                            cluster.cool_down_node_for(node, AGENT_KILL_GRACE);
+                        }
+                        continue;
+                    }
+                }
 
                 try_preempt(
                     &cluster,
@@ -251,7 +315,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         let mut jobs_started_cycle = 0u64;
         for assignment in assignments {
-            if process_assignment(cluster.clone(), assignment).await {
+            // `Assignment` carries no tier information, but this loop appended the
+            // candidates, so results are tagged by job-ID membership rather than by
+            // changing the scheduler's signature (§5.2).
+            let borrowed = borrow_ids.contains(&assignment.job_id);
+            if process_assignment(cluster.clone(), assignment, borrowed).await {
                 jobs_started_cycle += 1;
             }
         }
@@ -278,6 +346,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 async fn process_assignment(
     cluster: Arc<ClusterManager>,
     assignment: spur_sched::traits::Assignment,
+    borrowed: bool,
 ) -> bool {
     let job = match cluster.get_job(assignment.job_id) {
         Some(j) => j,
@@ -475,6 +544,14 @@ async fn process_assignment(
             resources,
             assignment.per_node_alloc.clone(),
             true,
+            borrowed,
+        )
+    } else if borrowed {
+        cluster.start_borrowed_job(
+            job_id,
+            assignment.nodes.clone(),
+            resources,
+            assignment.per_node_alloc.clone(),
         )
     } else {
         cluster.start_job(
@@ -893,6 +970,218 @@ pub(crate) async fn try_preempt(
             break; // One preemption per cycle, re-evaluate next cycle
         }
     }
+}
+
+/// A borrowed run that reclaim is permitted to evict, and the nodes it holds.
+struct ReclaimableRun {
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    nodes: Vec<String>,
+}
+
+/// The minimum time a borrowed job runs before it may be reclaimed.
+///
+/// `preempt_exempt_time` is deliberately not reused: it resolves through the QOS,
+/// then the most protective matched partition, then a cluster fallback, and is
+/// unbounded — so an ordinary cluster-wide hour would make every borrowed job
+/// unreclaimable for an hour, leaving a job with a real claim waiting for capacity
+/// that was lent away. Worse, a user can raise their own window with
+/// `--partition=fast,protected`, since the maximum across matched partitions wins,
+/// and that needs no privilege (D10).
+///
+/// The window doubles per eviction. The anti-thrash hold elsewhere is five seconds
+/// at defaults — exactly the agent's SIGTERM-to-SIGKILL grace — so without this a
+/// job could be lent, evicted and re-lent every five seconds indefinitely,
+/// completing nothing while each round costs a Raft entry, an epilog, an accounting
+/// upsert and an agent RPC. Doubling turns unbounded churn into a converging series
+/// (D11).
+fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
+    const CAP_SECS: i64 = 3600;
+    (base_secs as i64)
+        .saturating_mul(1i64 << preempt_requeue_count.min(16))
+        .min(CAP_SECS)
+}
+
+/// Reclaim capacity lent to borrowed jobs, on behalf of in-quota jobs the pass could
+/// not place. Returns the nodes freed, which the caller holds out of the next cycle
+/// until the agents have confirmed the kill.
+///
+/// This is deliberately **not** part of `try_preempt`. Victim selection there never
+/// checks that an eviction helps: `preempt_overlaps_pending_nodes` returns true for
+/// any node the victim occupies that lies in any of the reclaimer's partitions, with
+/// no GPU-type, memory, feature or topology check, and nothing afterwards verifies
+/// the shortfall was closed. That is inert today only because the outer loop
+/// short-circuits on `preempt_mode = Off` and the victim must clear a hardcoded 2x
+/// priority gap. Reclaim consults neither, so reusing that selection would let a job
+/// that can never be placed — `--gres=gpu:8` where the largest node has 4 — requeue
+/// one borrowed job per cycle forever (D2, §8.1).
+///
+/// Instead the victim set must provably close the shortfall, or nothing is evicted.
+async fn reclaim_for_unplaced(
+    cluster: &Arc<ClusterManager>,
+    unplaced: &[&spur_core::job::Job],
+    cluster_state: &ClusterState<'_>,
+    exempt_secs: u32,
+) -> Vec<String> {
+    let now = Utc::now();
+    let running = cluster.get_jobs(&JobFilter {
+        states: &[spur_core::job::JobState::Running],
+        ..Default::default()
+    });
+
+    // Both sources of "borrowed" (§4.1): jobs stamped `idle_fill` because they
+    // exceeded their own quota, and jobs whose QOS is marked
+    // `idle_fill_preemptable` — the migration path for the burst pattern, which
+    // never exceeds a quota and so is never stamped.
+    let mut reclaimable: Vec<ReclaimableRun> = Vec::new();
+    for job in &running {
+        if job.allocated_nodes.is_empty() {
+            continue;
+        }
+        let borrowed = if job.idle_fill {
+            cluster.borrowed_run_still_over_quota(job)
+        } else {
+            cluster.resolve_qos(job).idle_fill_preemptable
+        };
+        if !borrowed {
+            continue;
+        }
+        let ran_for = job
+            .start_time
+            .map(|start| (now - start).num_seconds())
+            .unwrap_or(0);
+        if ran_for < idle_fill_exempt_window(exempt_secs, job.preempt_requeue_count) {
+            continue;
+        }
+        reclaimable.push(ReclaimableRun {
+            job_id: job.job_id,
+            run_attempt: job.run_attempt,
+            nodes: job.allocated_nodes.clone(),
+        });
+    }
+    if reclaimable.is_empty() {
+        return Vec::new();
+    }
+
+    // Which running jobs sit on each node, so a node is only counted as freed when
+    // *every* job on it is one this reclaim would evict.
+    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
+    for job in &running {
+        for node in &job.allocated_nodes {
+            occupants.entry(node.as_str()).or_default().push(job.job_id);
+        }
+    }
+    let reclaimable_ids: HashSet<spur_core::job::JobId> =
+        reclaimable.iter().map(|r| r.job_id).collect();
+
+    for reclaimer in unplaced {
+        let Some(victims) =
+            satisfiable_victim_set(reclaimer, &reclaimable_ids, &occupants, cluster_state, now)
+        else {
+            continue;
+        };
+
+        let mut freed = Vec::new();
+        for victim in reclaimable.iter().filter(|r| victims.contains(&r.job_id)) {
+            match cluster.preempt_job_with_provenance(
+                victim.job_id,
+                spur_core::partition::PreemptMode::Requeue,
+                Some(reclaimer.job_id),
+                None,
+            ) {
+                Ok(_) => {
+                    info!(
+                        reclaimed_job = victim.job_id,
+                        for_job = reclaimer.job_id,
+                        nodes = ?victim.nodes,
+                        "reclaimed a borrowed job for a job with a quota claim"
+                    );
+                    // Await the kill before the caller may reuse these nodes. The
+                    // requeue apply deallocates inside Raft and only then fires a
+                    // fire-and-forget cancel, while the agent does SIGTERM, waits five
+                    // seconds, then SIGKILL. At a one-second cycle the reclaimer would
+                    // otherwise be dispatched onto a node whose victim still holds GPU
+                    // memory and its cgroup — failing in exactly the case this feature
+                    // exists for (D3).
+                    cancel_job_on_nodes(
+                        cluster,
+                        victim.job_id,
+                        victim.run_attempt,
+                        &victim.nodes,
+                        0,
+                    )
+                    .await;
+                    freed.extend(victim.nodes.iter().cloned());
+                }
+                Err(e) => {
+                    warn!(job_id = victim.job_id, error = %e, "failed to reclaim borrowed job");
+                }
+            }
+        }
+        if !freed.is_empty() {
+            // One reclaim per cycle: the next pass re-derives everything from the
+            // committed state rather than reasoning about a half-applied plan.
+            return freed;
+        }
+    }
+    Vec::new()
+}
+
+/// The set of borrowed jobs whose eviction would let `reclaimer` actually run, or
+/// `None` when no such set exists.
+///
+/// Atomic by construction: a node counts as recovered only when every job on it is
+/// reclaimable, so the reclaimer either gets a full allocation or nothing is
+/// touched. A partial eviction destroys work without helping anyone, and an
+/// unplaceable job has no satisfiable set at all — which is what makes reclaim
+/// immune to the denial-of-service `try_preempt` would have allowed (§8.2).
+fn satisfiable_victim_set(
+    reclaimer: &spur_core::job::Job,
+    reclaimable_ids: &HashSet<spur_core::job::JobId>,
+    occupants: &HashMap<&str, Vec<spur_core::job::JobId>>,
+    cluster_state: &ClusterState<'_>,
+    now: DateTime<Utc>,
+) -> Option<HashSet<spur_core::job::JobId>> {
+    let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
+    let required = spur_sched::backfill::job_resource_request(reclaimer);
+    // Total rather than currently-free resources: an evacuated node is empty, so
+    // what matters is whether the whole node can host the job. Same suitability
+    // rules the scheduler applies, so reclaim cannot free a node placement would
+    // then refuse — including reservations and the k0s gate.
+    let suitable = |node: &spur_core::node::Node| {
+        placement.matches_for_reservation(node, cluster_state.reservations, now)
+            && node.total_resources.can_satisfy(&required)
+    };
+
+    let needed = reclaimer.spec.num_nodes as usize;
+    let mut have = 0usize;
+    let mut victims = HashSet::new();
+    let mut evacuable = Vec::new();
+
+    for node in cluster_state.nodes {
+        if !suitable(node) {
+            continue;
+        }
+        match occupants.get(node.name.as_str()) {
+            // Already empty and suitable, yet the pass still could not place the
+            // job — so these alone are never enough, but they count toward the total.
+            None => have += 1,
+            Some(on_node) if on_node.iter().all(|id| reclaimable_ids.contains(id)) => {
+                evacuable.push((node.name.as_str(), on_node));
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (_, on_node) in evacuable {
+        if have >= needed {
+            break;
+        }
+        have += 1;
+        victims.extend(on_node.iter().copied());
+    }
+
+    (have >= needed && !victims.is_empty()).then_some(victims)
 }
 
 /// True when `candidate` occupies a node the pending job could target.
@@ -3196,6 +3485,157 @@ mod tests {
     // agent over the network, so the eviction + cancel-RPC behavior it
     // drives is verified end-to-end rather than by calling evict_job
     // directly on an already-Running job.
+    mod idle_fill_reclaim_tests {
+        use super::*;
+
+        fn node(name: &str, cpus: u32) -> Node {
+            let mut n = Node::new(
+                name.into(),
+                ResourceSet {
+                    cpus,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+            );
+            n.state = spur_core::node::NodeState::Idle;
+            n
+        }
+
+        fn reclaimer(num_nodes: u32, cpus_per_task: u32) -> Job {
+            job_with_spec(JobSpec {
+                num_nodes,
+                num_tasks: num_nodes,
+                cpus_per_task,
+                time_limit: Some(chrono::Duration::minutes(10)),
+                ..Default::default()
+            })
+        }
+
+        fn state<'a>(
+            nodes: &'a [Node],
+            busy: &'a HashMap<String, DateTime<Utc>>,
+        ) -> ClusterState<'a> {
+            ClusterState {
+                nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+                busy_until: busy,
+            }
+        }
+
+        #[test]
+        fn an_unplaceable_job_evicts_nothing_however_long_it_waits() {
+            // The denial-of-service `try_preempt` would have allowed (D2): a job that
+            // can never be placed anywhere must have no satisfiable victim set, so it
+            // evicts nothing — not one borrowed job per cycle, forever.
+            let nodes = vec![node("n1", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+
+            // Wants 16 CPUs on one node; the only node has 4. No eviction can help.
+            let greedy = reclaimer(1, 16);
+            assert!(
+                satisfiable_victim_set(
+                    &greedy,
+                    &reclaimable,
+                    &occupants,
+                    &state(&nodes, &busy),
+                    Utc::now()
+                )
+                .is_none(),
+                "an unplaceable job must never find a victim set"
+            );
+
+            // Control: a job that fits does find one, so the refusal above is caused by
+            // unplaceability and not by the fixture being unsatisfiable for everyone.
+            let fits = reclaimer(1, 2);
+            assert_eq!(
+                satisfiable_victim_set(
+                    &fits,
+                    &reclaimable,
+                    &occupants,
+                    &state(&nodes, &busy),
+                    Utc::now()
+                ),
+                Some([7].into_iter().collect())
+            );
+        }
+
+        #[test]
+        fn a_victim_set_that_cannot_close_the_shortfall_evicts_nothing() {
+            // Atomicity: the reclaimer needs two nodes but only one can be evacuated,
+            // so nothing is touched. A partial eviction destroys work without helping.
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]); // borrowed, evacuable
+            occupants.insert("n2", vec![9]); // in-quota, not evacuable
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+
+            assert!(
+                satisfiable_victim_set(
+                    &reclaimer(2, 1),
+                    &reclaimable,
+                    &occupants,
+                    &state(&nodes, &busy),
+                    Utc::now()
+                )
+                .is_none(),
+                "one evacuable node cannot satisfy a two-node job, so evict nothing"
+            );
+
+            // Both evacuable: now the whole allocation is recoverable and both go.
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![8]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 8].into_iter().collect();
+            let victims = satisfiable_victim_set(
+                &reclaimer(2, 1),
+                &reclaimable,
+                &occupants,
+                &state(&nodes, &busy),
+                Utc::now(),
+            )
+            .expect("both nodes recoverable");
+            assert_eq!(victims, [7, 8].into_iter().collect());
+        }
+
+        #[test]
+        fn a_node_sharing_with_an_in_quota_job_is_never_counted_as_recovered() {
+            // Evicting the borrowed job would not empty the node, so it must not count
+            // toward closing the shortfall.
+            let nodes = vec![node("n1", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7, 9]); // 7 borrowed, 9 has a claim
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+
+            assert!(satisfiable_victim_set(
+                &reclaimer(1, 1),
+                &reclaimable,
+                &occupants,
+                &state(&nodes, &busy),
+                Utc::now()
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn the_exempt_window_doubles_per_eviction_and_is_capped() {
+            // A borrowed job evicted repeatedly is protected for longer each time, so
+            // lend/evict/re-lend converges instead of spinning every five seconds (D11).
+            assert_eq!(idle_fill_exempt_window(60, 0), 60);
+            assert_eq!(idle_fill_exempt_window(60, 1), 120);
+            assert_eq!(idle_fill_exempt_window(60, 4), 960);
+            // Capped, and an absurd count must not overflow into a panic.
+            assert_eq!(idle_fill_exempt_window(60, 20), 3600);
+            assert_eq!(idle_fill_exempt_window(u32::MAX, u32::MAX), 3600);
+        }
+    }
+
     mod dispatch_trigger_tests {
         use super::*;
         use spur_core::config::SlurmConfig;
@@ -4914,7 +5354,7 @@ mod tests {
             let mut spec = batch_spec("plain-batch", 1);
             spec.tasks_per_node = Some(2);
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(started, "a clean single-node batch dispatch must start");
             let job = cm.get_job(job_id).unwrap();
@@ -4931,7 +5371,7 @@ mod tests {
             // for an assignment computed against a snapshot that's since gone
             // stale (e.g. the job was deleted/expired between scheduling and
             // this call).
-            let started = process_assignment(cm.clone(), assignment(999, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(999, &["n1"]), false).await;
 
             assert!(!started);
         }
@@ -4946,7 +5386,7 @@ mod tests {
             register_node_at(&cm, "n1", bad_addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("plain-batch-unreachable", 1));
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -4972,7 +5412,7 @@ mod tests {
             assert!(spec.script.is_none());
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 !started,
@@ -4998,7 +5438,7 @@ mod tests {
             spec.script = Some("#!/bin/bash\necho hi\n".into());
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 started,
@@ -5029,7 +5469,7 @@ mod tests {
             let mut spec = batch_spec("plain-batch-fanout", 1);
             spec.tasks_per_node = Some(4);
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(started, "a clean single-node batch dispatch must start");
             assert_eq!(
@@ -5052,7 +5492,7 @@ mod tests {
             spec.tasks_per_node = Some(4);
             spec.script = Some("#!/bin/bash\necho hi\n".into());
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 started,
@@ -5082,7 +5522,7 @@ mod tests {
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 started,
@@ -5110,7 +5550,7 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
@@ -5137,7 +5577,8 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+            let started =
+                process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
@@ -5170,7 +5611,8 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+            let started =
+                process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await;
 
             assert!(!started);
             let job = cm.get_job(job_id).unwrap();
@@ -5216,7 +5658,7 @@ mod tests {
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
-            let started = process_assignment(cm.clone(), bad_assignment).await;
+            let started = process_assignment(cm.clone(), bad_assignment, false).await;
 
             assert!(
                 !started,
@@ -5249,7 +5691,7 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("unreleasable", 1));
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(!started, "a job no node released must not count as started");
             wait_for("n1 cancelled after refusing the release", || {
@@ -5290,7 +5732,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("superseded", 1));
             assert!(
-                process_assignment(cm.clone(), assignment(job_id, &["n1"])).await,
+                process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await,
                 "the job must reach Running first"
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
@@ -5341,7 +5783,7 @@ mod tests {
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -5372,7 +5814,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-slurmctld-batch", 1));
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -5410,7 +5852,7 @@ mod tests {
 
             let cm_task = cm.clone();
             let handle = tokio::spawn(async move {
-                process_assignment(cm_task, assignment(job_id, &["n1"])).await
+                process_assignment(cm_task, assignment(job_id, &["n1"]), false).await
             });
 
             // Simulate a concurrent scancel landing while the (delayed)

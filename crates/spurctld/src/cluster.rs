@@ -484,6 +484,50 @@ struct PendingJobClassification {
     jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
     bb_stage_candidates: Vec<JobId>,
+    /// Jobs refused solely by their QOS group node cap that may run on capacity
+    /// nobody with a claim wants. They are *not* in `jobs`: they keep reporting
+    /// their real reason and are appended below every in-quota job at placement
+    /// time (§5.1).
+    idle_fill_candidates: Vec<Job>,
+}
+
+/// Whether a borrowed run still sits outside its QOS group node quota.
+///
+/// Split from its caller so the rule is testable without standing up a cluster.
+/// `cap` of `None` or `0` means the dimension is unlimited, in which case there is
+/// no quota to be outside of and the run has a claim like any other.
+fn borrowed_run_over_quota(cap: Option<u64>, legitimate_nodes: u64, own_nodes: u64) -> bool {
+    match cap {
+        None | Some(0) => false,
+        Some(cap) => legitimate_nodes.saturating_add(own_nodes) > cap,
+    }
+}
+
+/// Whether a job refused by its group node cap may be lent idle capacity at all.
+/// Separate from the sole-blocker test, which asks about quota; these are the
+/// structural exclusions, each because re-running the gate concerned is either
+/// unsound or not a pure predicate (§9).
+fn idle_fill_collectible(job: &Job) -> bool {
+    // D5: a het component at the tail forces `HetGroupIncomplete` onto its
+    // in-quota siblings at the head, so the whole het job loses.
+    if job.het_job_id.is_some() || job.het_group.is_some() || job.spec.het_group.is_some() {
+        return false;
+    }
+    // D6: the burst-buffer gate is not a predicate — its success path drops the
+    // job and mutates staging state, so it cannot be re-run speculatively.
+    if extract_bb_requirement(&job.spec) > 0 {
+        return false;
+    }
+    // D7: the license gate's in-pass contention map is not threaded out here, so
+    // re-running it would let a candidate take a license an in-quota job just
+    // claimed this pass.
+    if !extract_license_requirements(&job.spec).is_empty() {
+        return false;
+    }
+    // D14: mandatory, not a preference. An unbounded borrowed job makes its node
+    // look busy effectively forever through `busy_until`, and legitimate jobs then
+    // reserve future slots years out on unrelated idle nodes.
+    job.spec.time_limit.is_some()
 }
 
 struct PendingJobCandidate {
@@ -1583,7 +1627,47 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<u32> {
-        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, false)
+    }
+
+    /// Whether a stamped running job is *still* outside its QOS group node quota.
+    ///
+    /// The stamp records what was true when the job started, and reclaim must not
+    /// trust it: raising the cap, or a sibling finishing, can leave a stamped job
+    /// comfortably inside the quota. Evicting it then would contradict the rule that
+    /// a job with a claim is never kicked out, so the question is re-asked live at
+    /// reclaim time (D13). The `idle_fill_preemptable` source needs no equivalent —
+    /// it is read from the QOS on every pass and so is never stale.
+    pub fn borrowed_run_still_over_quota(&self, job: &Job) -> bool {
+        let Some(qos_name) = job.spec.qos.as_deref() else {
+            return false;
+        };
+        let cap = self
+            .resolve_qos(job)
+            .limits
+            .grp_tres
+            .as_ref()
+            .map(|grp| grp.get(TresType::Node));
+        let jobs = self.jobs.read();
+        // Nodes held by jobs with a genuine claim, this job excluded by its stamp.
+        let legitimate = occupied_nodes(&jobs, |j| {
+            !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name)
+        })
+        .len() as u64;
+        borrowed_run_over_quota(cap, legitimate, job.allocated_nodes.len() as u64)
+    }
+
+    /// Start a job as *borrowed*: it exceeded its QOS group node cap and is running
+    /// on capacity nobody with a claim wanted. The stamp is what holds it outside
+    /// every quota aggregate and what makes it reclaimable.
+    pub fn start_borrowed_job(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<u32> {
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, true)
     }
 
     pub(crate) fn start_job_impl(
@@ -1593,6 +1677,7 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
+        idle_fill: bool,
     ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
@@ -1637,6 +1722,7 @@ impl ClusterManager {
             per_node_alloc: per_node_alloc.clone(),
             srun_step_dispatch,
             run_attempt,
+            idle_fill,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -1692,6 +1778,7 @@ impl ClusterManager {
                 submit_time: submit_time_for_notify,
                 start_time: Utc::now(),
                 reservation: spec_for_notify.reservation.clone(),
+                idle_fill,
             });
         }
 
@@ -3545,20 +3632,33 @@ impl ClusterManager {
         self.classify_pending_jobs().jobs
     }
 
-    /// Classify pending jobs once, apply pending-reason updates, advance burst-buffer
-    /// stage-in for selected candidates, and return the jobs eligible for scheduling.
+    /// The in-quota half of [`Self::pending_jobs_with_idle_fill_candidates`], for
+    /// tests that do not exercise borrowing.
+    #[cfg(test)]
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
+        self.pending_jobs_with_idle_fill_candidates().0
+    }
+
+    /// Classify pending jobs once, apply pending-reason updates, advance burst-buffer
+    /// stage-in for selected candidates, and return the jobs eligible for scheduling
+    /// alongside the over-quota jobs that may run on capacity nobody with a claim
+    /// wants. The two are kept separate because a borrow candidate is not schedulable
+    /// in its own right: the caller appends them below every in-quota job, and only
+    /// after deriving the node set and depth-limit metric from the in-quota list
+    /// alone (§5.3, D16).
+    pub fn pending_jobs_with_idle_fill_candidates(&self) -> (Vec<Job>, Vec<Job>) {
         let classification = self.classify_pending_jobs();
         let evaluated: Vec<JobId> = classification
             .jobs
             .iter()
             .map(|job| job.job_id)
+            .chain(classification.idle_fill_candidates.iter().map(|j| j.job_id))
             .chain(classification.reason_updates.iter().map(|(id, _)| *id))
             .collect();
         self.apply_pending_reason_updates(classification.reason_updates);
         self.advance_bb_staging_for(&classification.bb_stage_candidates);
         self.mark_scheduler_evaluated(&evaluated);
-        classification.jobs
+        (classification.jobs, classification.idle_fill_candidates)
     }
 
     /// Record that this cycle considered these jobs, for `LastSchedEval`. Keyed
@@ -3581,14 +3681,7 @@ impl ClusterManager {
     fn classify_pending_jobs(&self) -> PendingJobClassification {
         let jobs = self.jobs.read();
         let now = Utc::now();
-        let running_array_counts: HashMap<JobId, u32> = jobs
-            .values()
-            .filter(|job| job.state == JobState::Running)
-            .filter_map(|job| job.spec.array_job_id)
-            .fold(HashMap::new(), |mut counts, array_id| {
-                *counts.entry(array_id).or_insert(0) += 1;
-                counts
-            });
+        let running_array_counts = running_array_counts(&jobs);
         let mut candidates: Vec<PendingJobCandidate> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending)
@@ -3611,6 +3704,7 @@ impl ClusterManager {
             })
             .collect();
         let mut reason_updates = Vec::new();
+        let mut idle_fill_candidates = Vec::new();
 
         // Structural blockers retain their precedence before begin-time eligibility;
         // unlike consumables, they do not reserve capacity while the job waits.
@@ -3725,15 +3819,16 @@ impl ClusterManager {
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
+            let idle_fill_on = self.config.read().scheduler.idle_fill_enabled;
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
-                let account_charge = match account_block_with(
+                let admitted = match account_block_with(
                     job,
                     &self.association_cache,
                     &jobs,
                     &nodes,
                     &reserved,
                 ) {
-                    Ok(charge) => charge,
+                    Ok(admitted) => admitted,
                     Err(reason) => return GateOutcome::Block(reason),
                 };
                 let consumed_wall = job
@@ -3750,9 +3845,31 @@ impl ClusterManager {
                     consumed_wall,
                 ) {
                     Ok(charge) => charge,
-                    Err(reason) => return GateOutcome::Block(reason),
+                    Err(blocked) => {
+                        if idle_fill_on
+                            && blocked.grp_node_sole_blocker
+                            && admitted.admits_without_credit
+                            && idle_fill_collectible(job)
+                        {
+                            // The hint names nodes the account already occupies; a
+                            // borrowed job must land on spare capacity instead, and
+                            // `admits_without_credit` above is what makes dropping it
+                            // sound (D4).
+                            job.preferred_nodes.clear();
+                            // D8: charge the account in full and the QOS in every
+                            // dimension but Node, so later jobs in this pass see the
+                            // cpu/mem/gpu this candidate would consume. The Node
+                            // dimension is deliberately 0 — that is the one aggregate
+                            // a borrowed job is outside of (D1).
+                            reserved.reserve(job, 0, job.spec.num_nodes as u64);
+                            idle_fill_candidates.push(job.clone());
+                        }
+                        // Blocked either way: the job is over quota and that stays its
+                        // reported reason whether or not it gets lent a node (§5.4).
+                        return GateOutcome::Block(blocked.reason);
+                    }
                 };
-                reserved.reserve(job, qos_charge, account_charge);
+                reserved.reserve(job, qos_charge, admitted.charge);
                 GateOutcome::Keep
             });
         }
@@ -3835,6 +3952,7 @@ impl ClusterManager {
                 .collect(),
             reason_updates,
             bb_stage_candidates,
+            idle_fill_candidates,
         }
     }
 
@@ -6027,6 +6145,7 @@ impl ClusterManager {
                 per_node_alloc,
                 srun_step_dispatch,
                 run_attempt,
+                idle_fill,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
@@ -6036,6 +6155,7 @@ impl ClusterManager {
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
+                    job.idle_fill = *idle_fill;
                     job.launch_failure_detail = None;
                     // A new run supersedes any prior preemption provenance; clear so
                     // this run's accounting record does not inherit the previous one's.
@@ -7187,6 +7307,16 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
 /// grp-node cap so placement actually lands on one of them, and returns the
 /// node count actually charged against `grp_tres` so the caller can record it
 /// (rather than the job's raw `num_nodes`) in `reserved`.
+/// A QOS gate refusal. `reason` is what the job reports; `grp_node_sole_blocker`
+/// says the group node cap was the *only* limit in the way, which is what makes
+/// the job eligible to borrow idle capacity (§6.2). Every other QOS limit —
+/// other TRES dimensions, max jobs, max submit, group wall — still passing is
+/// what the flag asserts, so a job over two caps is never lent to.
+struct QosBlocked {
+    reason: spur_core::job::PendingReason,
+    grp_node_sole_blocker: bool,
+}
+
 fn qos_block_with(
     job: &mut Job,
     qos: &Qos,
@@ -7194,15 +7324,23 @@ fn qos_block_with(
     nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
-) -> Result<u64, spur_core::job::PendingReason> {
+) -> Result<u64, QosBlocked> {
     let Some(qos_name) = job.spec.qos.as_ref() else {
         return Ok(0);
     };
     let user = &job.spec.user;
+    // Idle-fill borrowed jobs (`idle_fill` stamped) are held outside every QOS
+    // quota aggregate: a borrowed job runs on capacity outside the quota, so it
+    // must not count toward the quota that gates its team's legitimate jobs —
+    // otherwise a legitimate sibling is blocked at this gate and dropped from
+    // the pending list before reclaim can ever see it (§7, D1). The exclusion
+    // keys on the stamp alone; a job reclaimable only via `idle_fill_preemptable`
+    // is inside its quota and keeps counting in full (§4.1).
     let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
+                && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
@@ -7213,16 +7351,18 @@ fn qos_block_with(
         .values()
         .filter(|j| {
             j.job_id < job.job_id
+                && !j.idle_fill
                 && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
     let mut user_running_tres = sum_running_tres(jobs, |j| {
-        j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
+        !j.idle_fill && j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
     });
-    let mut qos_running_tres =
-        sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
+    let mut qos_running_tres = sum_running_tres(jobs, |j| {
+        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
+    });
 
     let user_key = (user.clone(), qos_name.clone());
     running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
@@ -7234,11 +7374,12 @@ fn qos_block_with(
     }
 
     let already_claimed = reserved.qos_claimed_nodes.get(qos_name);
-    let qos_occupied: HashSet<String> =
-        occupied_nodes(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()))
-            .into_iter()
-            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-            .collect();
+    let qos_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
+        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
+    })
+    .into_iter()
+    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
+    .collect();
     let (grp_node_charge, reusable_nodes) = new_distinct_nodes_needed(job, &qos_occupied, nodes);
 
     match check_qos_limits_with_grp_node_charge(
@@ -7255,7 +7396,23 @@ fn qos_block_with(
             job.preferred_nodes.extend(reusable_nodes);
             Ok(grp_node_charge)
         }
-        QosCheckResult::Blocked(reason) => Err(reason),
+        // The sole-blocker test is answered here, not by the caller, because only
+        // here are the gate's own aggregates in scope — including this pass's
+        // `PassReservations` adjustments. Re-deriving them elsewhere would judge a
+        // different cluster state than the one that produced this refusal (§6.3).
+        QosCheckResult::Blocked(reason) => Err(QosBlocked {
+            reason,
+            grp_node_sole_blocker: spur_core::qos::grp_node_is_sole_blocker(
+                job,
+                qos,
+                running_count,
+                submitted_count,
+                &user_running_tres,
+                &qos_running_tres,
+                consumed_wall_minutes,
+                grp_node_charge,
+            ),
+        }),
     }
 }
 
@@ -7265,23 +7422,44 @@ fn qos_block_with(
 /// grp-node cap so placement actually lands on one of them, and returns the node
 /// count actually charged against `grp_tres` so the caller can record it (rather
 /// than the job's raw `num_nodes`) in `reserved`.
+/// A successful account-gate admission.
+struct AccountAdmitted {
+    /// grp-node count actually charged, which is less than the raw request when
+    /// the job packed onto nodes the account already occupies.
+    charge: u64,
+    /// Whether the job would still have been admitted with no packing credit at
+    /// all. Only idle-fill reads this (D4).
+    admits_without_credit: bool,
+}
+
 fn account_block_with(
     job: &mut Job,
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
     nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
-) -> Result<u64, spur_core::job::PendingReason> {
+) -> Result<AccountAdmitted, spur_core::job::PendingReason> {
     let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) else {
-        return Ok(0);
+        return Ok(AccountAdmitted {
+            charge: 0,
+            admits_without_credit: true,
+        });
     };
     let user = &job.spec.user;
     let limits = assoc_cache.limits(user, account);
 
+    // Idle-fill borrowed jobs (`idle_fill` stamped) sit outside every quota
+    // aggregate, the association's included. The account gate runs first and
+    // returns early, so a borrowed job counted here blocks its team's legitimate
+    // job before it ever reaches the QOS gate — dropping it from the pending
+    // list where reclaim can never see it (§7, D1). The exclusion keys on the
+    // stamp alone; a job reclaimable only via `idle_fill_preemptable` is inside
+    // its quota and keeps counting in full (§4.1).
     let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
+                && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
         })
@@ -7292,13 +7470,15 @@ fn account_block_with(
         .values()
         .filter(|j| {
             j.job_id < job.job_id
+                && !j.idle_fill
                 && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
         })
         .count() as u32;
-    let mut account_running_tres =
-        sum_running_tres(jobs, |j| j.spec.account.as_deref() == Some(account));
+    let mut account_running_tres = sum_running_tres(jobs, |j| {
+        !j.idle_fill && j.spec.account.as_deref() == Some(account)
+    });
 
     running_count += reserved
         .account_user_count
@@ -7310,11 +7490,12 @@ fn account_block_with(
     }
 
     let already_claimed = reserved.account_claimed_nodes.get(account);
-    let account_occupied: HashSet<String> =
-        occupied_nodes(jobs, |j| j.spec.account.as_deref() == Some(account))
-            .into_iter()
-            .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-            .collect();
+    let account_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
+        !j.idle_fill && j.spec.account.as_deref() == Some(account)
+    })
+    .into_iter()
+    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
+    .collect();
     let (grp_node_charge, reusable_nodes) =
         new_distinct_nodes_needed(job, &account_occupied, nodes);
 
@@ -7328,7 +7509,26 @@ fn account_block_with(
     ) {
         AccountCheckResult::Allowed => {
             job.preferred_nodes.extend(reusable_nodes);
-            Ok(grp_node_charge)
+            Ok(AccountAdmitted {
+                charge: grp_node_charge,
+                // Asked here, where the gate's own aggregates are in scope, for the
+                // same reason as the QOS sole-blocker test. A borrowed job's
+                // `preferred_nodes` hint gets cleared so it lands on spare capacity
+                // rather than packing onto a node the account already holds, and
+                // clearing it is only sound if admission never leaned on the credit
+                // (D4).
+                admits_without_credit: matches!(
+                    check_account_limits_with_grp_node_charge(
+                        job,
+                        &limits,
+                        running_count,
+                        submitted_count,
+                        &account_running_tres,
+                        job.spec.num_nodes as u64,
+                    ),
+                    AccountCheckResult::Allowed
+                ),
+            })
         }
         AccountCheckResult::Blocked(reason) => Err(reason),
     }
@@ -7494,6 +7694,21 @@ impl<'a> RunningTresAccumulator<'a> {
         );
         self.tres
     }
+}
+
+/// Running task count per array job, keyed on the array's job ID. Idle-fill
+/// borrowed jobs are excluded so a borrowed task never consumes an array's
+/// `array_max_concurrent` slot — counting it would block the array's own
+/// legitimate tasks at the concurrency gate, where reclaim cannot reach them
+/// (§7, D1).
+fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
+    jobs.values()
+        .filter(|job| job.state == JobState::Running && !job.idle_fill)
+        .filter_map(|job| job.spec.array_job_id)
+        .fold(HashMap::new(), |mut counts, array_id| {
+            *counts.entry(array_id).or_insert(0) += 1;
+            counts
+        })
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
@@ -9829,6 +10044,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], resources),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -9863,6 +10079,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -10917,6 +11134,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -10958,6 +11176,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11000,6 +11219,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11065,6 +11285,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -11126,6 +11347,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
@@ -11190,6 +11412,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         };
 
         cm.apply_operation(&WalOperation::JobSubmit {
@@ -11296,6 +11519,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11346,6 +11570,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -11385,6 +11610,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -11442,6 +11668,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -11478,6 +11705,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.node_complete(1, "n1", 0, 9, 0).unwrap();
@@ -11664,6 +11892,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -11699,6 +11928,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.node_complete(1, "n1", 42, 0, 0).unwrap();
@@ -11737,6 +11967,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 2,
+            idle_fill: false,
         });
 
         // Stale SIGKILL report from epoch 1 must be ignored.
@@ -11776,6 +12007,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11843,6 +12075,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -13492,6 +13725,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -13785,6 +14019,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -13872,6 +14107,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -24451,6 +24687,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         });
     }
 
@@ -24467,6 +24704,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: true,
             run_attempt: 0,
+            idle_fill: false,
         });
     }
 
@@ -25553,6 +25791,715 @@ mod tests {
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("premium"),
             "the resolved default QoS must be recorded on the job"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_fill_aggregate_tests {
+    use super::*;
+    use spur_core::accounting::{QosLimits, TresType};
+
+    fn team_qos(name: &str) -> Qos {
+        Qos {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn grp_node_qos(name: &str, node_cap: u64) -> Qos {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, node_cap);
+        Qos {
+            name: name.into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..team_qos(name)
+        }
+    }
+
+    fn running_in_qos(
+        job_id: JobId,
+        user: &str,
+        qos: &str,
+        nodes: &[&str],
+        idle_fill: bool,
+    ) -> Job {
+        let mut spec = JobSpec {
+            name: "j".into(),
+            user: user.into(),
+            qos: Some(qos.into()),
+            num_nodes: nodes.len().max(1) as u32,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.num_nodes = nodes.len().max(1) as u32;
+        let mut job = Job::new(job_id, spec);
+        job.state = JobState::Running;
+        job.idle_fill = idle_fill;
+        job.allocated_nodes = nodes.iter().map(|n| (*n).to_string()).collect();
+        job
+    }
+
+    fn candidate(job_id: JobId, user: &str, qos: &str, num_nodes: u32) -> Job {
+        let spec = JobSpec {
+            name: "cand".into(),
+            user: user.into(),
+            qos: Some(qos.into()),
+            num_nodes,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        Job::new(job_id, spec)
+    }
+
+    fn gate(job: &mut Job, qos: &Qos, jobs: &HashMap<JobId, Job>) -> Result<u64, PendingReason> {
+        qos_block_with(
+            job,
+            qos,
+            jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+            None,
+        )
+        .map_err(|blocked| blocked.reason)
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_its_qos_node_quota() {
+        let qos = grp_node_qos("team", 1);
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert!(
+            gate(&mut cand, &qos, &jobs).is_ok(),
+            "a borrowed sibling must not occupy the group node quota"
+        );
+
+        // Control: the identical sibling, unstamped, does block — proving the
+        // node exclusion is what admits the legitimate job.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QosGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_max_jobs_per_user() {
+        let qos = Qos {
+            limits: QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert!(gate(&mut cand, &qos, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QoSMaxJobsPerUser)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_max_submit_jobs() {
+        let qos = Qos {
+            limits: QosLimits {
+                max_submit_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert!(gate(&mut cand, &qos, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QosMaxSubmitJobPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_task_does_not_consume_array_concurrency() {
+        let mut jobs = HashMap::new();
+        let mut legit = running_in_qos(1, "alice", "team", &["n1"], false);
+        legit.spec.array_job_id = Some(100);
+        let mut borrowed = running_in_qos(2, "alice", "team", &["n2"], true);
+        borrowed.spec.array_job_id = Some(100);
+        jobs.insert(1, legit);
+        jobs.insert(2, borrowed);
+
+        let counts = running_array_counts(&jobs);
+        assert_eq!(
+            counts.get(&100).copied(),
+            Some(1),
+            "only the unstamped task counts toward array_max_concurrent"
+        );
+    }
+
+    #[test]
+    fn preemptable_only_job_still_counts_in_full() {
+        // A job that is reclaimable solely because its QOS is marked
+        // idle_fill_preemptable is inside its quota and unstamped, so it keeps
+        // counting — the exclusion keys on the stamp alone (§4.1).
+        let qos = Qos {
+            idle_fill_preemptable: true,
+            limits: QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("burst")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "burst", &["n1"], false));
+        let mut cand = candidate(2, "alice", "burst", 1);
+        assert_eq!(
+            gate(&mut cand, &qos, &jobs),
+            Err(PendingReason::QoSMaxJobsPerUser)
+        );
+    }
+
+    // --- Account/association gate (D1, §7): the gate that runs FIRST ---
+
+    fn running_in_account(
+        job_id: JobId,
+        user: &str,
+        account: &str,
+        nodes: &[&str],
+        idle_fill: bool,
+    ) -> Job {
+        let spec = JobSpec {
+            name: "j".into(),
+            user: user.into(),
+            account: Some(account.into()),
+            num_nodes: nodes.len().max(1) as u32,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let mut job = Job::new(job_id, spec);
+        job.state = JobState::Running;
+        job.idle_fill = idle_fill;
+        job.allocated_nodes = nodes.iter().map(|n| (*n).to_string()).collect();
+        job
+    }
+
+    fn candidate_in_account(job_id: JobId, user: &str, account: &str, num_nodes: u32) -> Job {
+        let spec = JobSpec {
+            name: "cand".into(),
+            user: user.into(),
+            account: Some(account.into()),
+            num_nodes,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        Job::new(job_id, spec)
+    }
+
+    fn assoc_with(user: &str, account: &str, limits: AccountLimits) -> AssociationCache {
+        let cache = AssociationCache::new();
+        cache.insert_limits(user, account, limits);
+        cache
+    }
+
+    fn node_cap(n: u64) -> AccountLimits {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, n);
+        AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        }
+    }
+
+    fn account_gate(
+        job: &mut Job,
+        assoc: &AssociationCache,
+        jobs: &HashMap<JobId, Job>,
+    ) -> Result<u64, PendingReason> {
+        account_block_with(
+            job,
+            assoc,
+            jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+        )
+        .map(|admitted| admitted.charge)
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_its_account_node_quota() {
+        let assoc = assoc_with("alice", "acct", node_cap(1));
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(
+            account_gate(&mut cand, &assoc, &jobs).is_ok(),
+            "a borrowed sibling must not occupy the association node quota"
+        );
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_assoc_max_running_jobs() {
+        let assoc = assoc_with(
+            "alice",
+            "acct",
+            AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(account_gate(&mut cand, &assoc, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocMaxJobsLimit)
+        );
+    }
+
+    #[test]
+    fn borrowed_job_does_not_consume_assoc_max_submit_jobs() {
+        let assoc = assoc_with(
+            "alice",
+            "acct",
+            AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert!(account_gate(&mut cand, &assoc, &jobs).is_ok());
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocMaxSubmitJobLimit)
+        );
+    }
+
+    #[test]
+    fn preemptable_only_job_still_counts_at_account_gate() {
+        // The account gate never reads the QOS flag; the stamp alone governs, so
+        // an unstamped job counts in full even if some other route would make it
+        // reclaimable (§4.1).
+        let assoc = assoc_with(
+            "alice",
+            "acct",
+            AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocMaxJobsLimit)
+        );
+    }
+
+    #[test]
+    fn legitimate_multi_node_job_admitted_while_borrowed_jobs_hold_account_nodes() {
+        // The D1 reproduction at the account gate: association cap node=6, three
+        // legitimate single-node jobs plus two borrowed ones (5 nodes occupied).
+        // A legitimate two-node job must be admitted — the borrowed pair must not
+        // push the account over its cap where the job is dropped before reclaim.
+        let assoc = assoc_with("alice", "acct", node_cap(6));
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["n1"], false));
+        jobs.insert(2, running_in_account(2, "alice", "acct", &["n2"], false));
+        jobs.insert(3, running_in_account(3, "alice", "acct", &["n3"], false));
+        jobs.insert(4, running_in_account(4, "alice", "acct", &["n4"], true));
+        jobs.insert(5, running_in_account(5, "alice", "acct", &["n5"], true));
+        let mut cand = candidate_in_account(6, "alice", "acct", 2);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Ok(2),
+            "3 legitimate + 2 new = 5 <= 6; the borrowed pair is outside the quota"
+        );
+
+        // Control: with the same five jobs all unstamped, 5 + 2 > 6 blocks the
+        // legitimate job — the exact permanently-unrecallable loan D1 describes.
+        let mut jobs = HashMap::new();
+        for id in 1..=5 {
+            jobs.insert(
+                id,
+                running_in_account(id, "alice", "acct", &[LEAF[id as usize]], false),
+            );
+        }
+        let mut cand = candidate_in_account(6, "alice", "acct", 2);
+        assert_eq!(
+            account_gate(&mut cand, &assoc, &jobs),
+            Err(PendingReason::AssocGrpNodeLimit)
+        );
+    }
+
+    const LEAF: [&str; 6] = ["n0", "n1", "n2", "n3", "n4", "n5"];
+
+    #[test]
+    fn packing_credit_survives_for_legitimate_nodes_but_not_borrowed_ones() {
+        // The grp-node charge credits packing onto a node the account already
+        // occupies. Excluding borrowed jobs from the occupied set must not break
+        // that credit for legitimate nodes — and must correctly withhold it for a
+        // node occupied only by a borrowed job, since from the legitimate-quota
+        // view that node is genuinely new.
+        let mut shared = Node::new(
+            "shared".into(),
+            ResourceSet {
+                cpus: 8,
+                ..Default::default()
+            },
+        );
+        shared.alloc_resources = ResourceAllocations::with_scalar(2, 0);
+        shared.state = NodeState::Mixed; // partially allocated, still schedulable
+        let mut nodes = HashMap::new();
+        nodes.insert("shared".to_string(), shared);
+
+        let assoc = assoc_with("alice", "acct", node_cap(4));
+
+        // Legitimate sibling on `shared`: the candidate packs onto it, charge 0.
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            1,
+            running_in_account(1, "alice", "acct", &["shared"], false),
+        );
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let charge = account_block_with(
+            &mut cand,
+            &assoc,
+            &jobs,
+            &nodes,
+            &PassReservations::default(),
+        )
+        .expect("within cap")
+        .charge;
+        assert_eq!(
+            charge, 0,
+            "packing onto a legitimate occupied node is credited"
+        );
+        assert!(cand.preferred_nodes.contains("shared"));
+
+        // Borrowed sibling on `shared`: the node is outside the account's
+        // occupied set, so the candidate is charged a full new node and gets no
+        // packing hint — consistent with the node being excluded from the aggregate.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_account(1, "alice", "acct", &["shared"], true));
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let charge = account_block_with(
+            &mut cand,
+            &assoc,
+            &jobs,
+            &nodes,
+            &PassReservations::default(),
+        )
+        .expect("within cap")
+        .charge;
+        assert_eq!(charge, 1, "a borrowed-only node grants no reuse credit");
+        assert!(!cand.preferred_nodes.contains("shared"));
+    }
+
+    fn bounded(mut job: Job) -> Job {
+        job.spec.time_limit = Some(chrono::Duration::minutes(30));
+        job
+    }
+
+    #[test]
+    fn a_stale_stamp_stops_being_reclaimable_once_the_run_fits_the_quota_again() {
+        // The stamp records what was true at start. Raising the cap, or a sibling
+        // finishing, can leave a stamped run comfortably inside quota, and evicting
+        // it then would break the rule that a job with a claim is never kicked out.
+        // Reclaim therefore re-asks rather than trusting the stamp (D13).
+
+        // One legitimate node held, this run holds one: over a cap of 1.
+        assert!(borrowed_run_over_quota(Some(1), 1, 1));
+        // Same run, cap raised to 2 — it now fits, so it must not be reclaimed.
+        assert!(!borrowed_run_over_quota(Some(2), 1, 1));
+        // Same cap of 1, but the legitimate sibling finished: it fits again.
+        assert!(!borrowed_run_over_quota(Some(1), 0, 1));
+        // Exactly at the cap counts as fitting, not as exceeding.
+        assert!(!borrowed_run_over_quota(Some(4), 2, 2));
+        assert!(borrowed_run_over_quota(Some(4), 2, 3));
+        // No cap, or an explicitly unlimited one, is never "over".
+        assert!(!borrowed_run_over_quota(None, 99, 99));
+        assert!(!borrowed_run_over_quota(Some(0), 99, 99));
+        // A pathological node count must saturate rather than wrap into "fits".
+        assert!(borrowed_run_over_quota(Some(1), u64::MAX, 1));
+    }
+
+    #[test]
+    fn one_users_borrowed_job_does_not_bind_another_users_per_user_limit() {
+        // Per-user limits are per *user*, so bob's headroom must be untouched by
+        // alice's job in either tier. With a single-user fixture this would pass
+        // vacuously, which is why it is stated across two users.
+        let qos = Qos {
+            limits: QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+
+        // Alice runs one legitimate job, which binds *her* limit.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut alice_again = candidate(2, "alice", "team", 1);
+        assert_eq!(
+            gate(&mut alice_again, &qos, &jobs),
+            Err(PendingReason::QoSMaxJobsPerUser),
+            "alice's own legitimate job binds alice's per-user limit"
+        );
+        // Bob is unaffected by it.
+        let mut bob = candidate(3, "bob", "team", 1);
+        assert!(
+            gate(&mut bob, &qos, &jobs).is_ok(),
+            "alice's job must not bind bob's per-user limit"
+        );
+
+        // Same again with alice's job borrowed: still no effect on bob, and now no
+        // effect on alice either, since a borrowed job is outside every aggregate.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut bob = candidate(3, "bob", "team", 1);
+        assert!(gate(&mut bob, &qos, &jobs).is_ok());
+        let mut alice_again = candidate(2, "alice", "team", 1);
+        assert!(gate(&mut alice_again, &qos, &jobs).is_ok());
+    }
+
+    #[test]
+    fn a_borrowed_job_frees_group_quota_for_a_different_users_legitimate_job() {
+        // The group node cap spans every user in the QOS, which is the whole point
+        // of the feature: alice borrows spare capacity, and bob — a different user
+        // in the same team, with a genuine claim — must still be admitted. If the
+        // exclusion were keyed on the submitting user rather than the stamp, this
+        // would fail while the single-user tests kept passing.
+        let qos = grp_node_qos("team", 1);
+
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let mut bob = candidate(2, "bob", "team", 1);
+        assert!(
+            gate(&mut bob, &qos, &jobs).is_ok(),
+            "alice's borrowed node must not consume the group quota bob has a claim on"
+        );
+
+        // Control: unstamped, alice's job does hold the group quota against bob.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut bob = candidate(2, "bob", "team", 1);
+        assert_eq!(
+            gate(&mut bob, &qos, &jobs),
+            Err(PendingReason::QosGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn a_second_users_job_is_borrow_eligible_when_the_group_cap_is_the_sole_blocker() {
+        // Eligibility is a property of the QOS aggregate, not of who submitted, so a
+        // job belonging to a user with no running jobs at all is still eligible when
+        // a *teammate* has exhausted the shared group cap.
+        let qos = grp_node_qos("team", 1);
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut bob = candidate(2, "bob", "team", 1);
+        let blocked = qos_block_with(
+            &mut bob,
+            &qos,
+            &jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+            None,
+        )
+        .expect_err("bob is over the shared group cap");
+        assert_eq!(blocked.reason, PendingReason::QosGrpNodeLimit);
+        assert!(
+            blocked.grp_node_sole_blocker,
+            "a teammate exhausting the shared cap still leaves bob borrow-eligible"
+        );
+    }
+
+    #[test]
+    fn grp_node_cap_alone_marks_the_refusal_borrow_eligible() {
+        // One node of a one-node cap is taken, so a second job breaches the node
+        // dimension and nothing else. That is exactly the case idle-fill lends to.
+        let qos = grp_node_qos("team", 1);
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        let blocked = qos_block_with(
+            &mut cand,
+            &qos,
+            &jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+            None,
+        )
+        .expect_err("over the node cap");
+        assert_eq!(blocked.reason, PendingReason::QosGrpNodeLimit);
+        assert!(
+            blocked.grp_node_sole_blocker,
+            "the node cap is the only limit breached, so the job may borrow"
+        );
+    }
+
+    #[test]
+    fn a_second_breached_dimension_leaves_the_refusal_not_borrow_eligible() {
+        // Node cap AND cpu cap both breached. Lending here would let the job
+        // escape a cap on a genuinely contended resource (§6.1).
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        grp.set(TresType::Cpu, 1);
+        let qos = Qos {
+            name: "team".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..team_qos("team")
+        };
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], false));
+        let mut cand = candidate(2, "alice", "team", 1);
+        let blocked = qos_block_with(
+            &mut cand,
+            &qos,
+            &jobs,
+            &HashMap::new(),
+            &PassReservations::default(),
+            None,
+        )
+        .expect_err("over both caps");
+        assert!(
+            !blocked.grp_node_sole_blocker,
+            "a job over a second dimension must never be lent idle capacity"
+        );
+    }
+
+    #[test]
+    fn idle_fill_collectible_refuses_the_four_structural_exclusions() {
+        // Baseline: a plain bounded job is collectible, so each rejection below is
+        // attributable to the one attribute it adds rather than to the baseline.
+        assert!(idle_fill_collectible(&bounded(candidate(
+            1, "alice", "team", 1
+        ))));
+
+        // D14: no effective time limit. Mandatory — an unbounded borrowed job makes
+        // its node look busy effectively forever.
+        assert!(
+            !idle_fill_collectible(&candidate(2, "alice", "team", 1)),
+            "a job with no time limit must never be lent to"
+        );
+
+        // D5: a het component at the tail would force HetGroupIncomplete onto its
+        // in-quota siblings at the head.
+        let mut het = bounded(candidate(3, "alice", "team", 1));
+        het.het_job_id = Some(1);
+        assert!(!idle_fill_collectible(&het));
+
+        // D6: the burst-buffer gate mutates staging state, so it is not a predicate
+        // that can be re-run speculatively.
+        let mut bb = bounded(candidate(4, "alice", "team", 1));
+        bb.spec.burst_buffer = Some("capacity=10GB".into());
+        assert!(!idle_fill_collectible(&bb));
+
+        // D7: the license gate's in-pass contention map is not threaded out here.
+        let mut lic = bounded(candidate(5, "alice", "team", 1));
+        lic.spec.gres = vec!["license:matlab:1".into()];
+        assert!(!idle_fill_collectible(&lic));
+    }
+
+    #[test]
+    fn account_admission_reports_whether_it_leaned_on_the_packing_credit() {
+        // Cap of exactly 1 node, already occupied by a legitimate sibling. The
+        // candidate is admitted only because it packs onto that node for a charge
+        // of 0 — so clearing its placement hint would break the admission (D4).
+        let assoc = assoc_with("alice", "acct", node_cap(1));
+        let mut shared = Node::new(
+            "shared".into(),
+            ResourceSet {
+                cpus: 8,
+                ..Default::default()
+            },
+        );
+        shared.alloc_resources = ResourceAllocations::with_scalar(2, 0);
+        shared.state = NodeState::Mixed;
+        let mut nodes = HashMap::new();
+        nodes.insert("shared".to_string(), shared);
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            1,
+            running_in_account(1, "alice", "acct", &["shared"], false),
+        );
+        let mut cand = candidate_in_account(2, "alice", "acct", 1);
+        let admitted = account_block_with(
+            &mut cand,
+            &assoc,
+            &jobs,
+            &nodes,
+            &PassReservations::default(),
+        )
+        .expect("credited admission");
+        assert_eq!(admitted.charge, 0, "packing credit applied");
+        assert!(
+            !admitted.admits_without_credit,
+            "admission depended on the credit, so this job must not be collected"
+        );
+
+        // A cap with room to spare admits the same job at full charge, so dropping
+        // the hint is safe.
+        let assoc = assoc_with("alice", "acct", node_cap(4));
+        let mut cand = candidate_in_account(3, "alice", "acct", 1);
+        let admitted = account_block_with(
+            &mut cand,
+            &assoc,
+            &jobs,
+            &nodes,
+            &PassReservations::default(),
+        )
+        .expect("within cap");
+        assert!(
+            admitted.admits_without_credit,
+            "the cap has room for a full-charge node, so the hint is droppable"
         );
     }
 }
