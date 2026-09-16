@@ -408,6 +408,7 @@ pub fn squeue_header(spec: char) -> &'static str {
         'k' => "COMMENT",
         'A' => "ARRAY_JOB_ID",
         'Y' => "SCHEDNODES",
+        'W' => "BORROWED",
         _ => "?",
     }
 }
