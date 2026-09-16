@@ -3725,6 +3725,15 @@ impl ClusterManager {
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
+            // A job whose every matching node is down can't be fixed by a future
+            // pass, so it must not reserve QOS/account grp-node quota it will
+            // never use — see `structural_unplaceable_reason`.
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
+                match structural_unplaceable_reason(job, &nodes, &reservations) {
+                    Some(reason) => GateOutcome::Block(reason),
+                    None => GateOutcome::Keep,
+                }
+            });
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 let account_charge = match account_block_with(
                     job,
@@ -7179,6 +7188,41 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
         }
     }
     None
+}
+
+/// `Some(reason)` only when every node matching the job's placement is down —
+/// no future scheduling pass fixes that without an operator bringing a node
+/// back. Deliberately narrower than `update_pending_reasons`'s full check: a
+/// job with too few *eligible* nodes (fewer real nodes registered than
+/// `num_nodes`, e.g. a partition still filling in) is left alone here — its
+/// candidacy depends on nodes that may still join, so it must keep holding its
+/// QOS/account charge like any other pending job. Only the down-node case is
+/// unconditionally permanent regardless of what else joins or finishes.
+fn structural_unplaceable_reason(
+    job: &Job,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Option<PendingReason> {
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let now = chrono::Utc::now();
+    let needed = (job.spec.num_nodes as usize).max(1);
+
+    let eligible: Vec<&Node> = nodes
+        .values()
+        .filter(|n| placement.eligible(n, reservations, now))
+        .collect();
+
+    if eligible.len() < needed || eligible.iter().any(|n| n.state.is_up()) {
+        return None;
+    }
+
+    Some(
+        if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+            PendingReason::ReqNodeNotAvail
+        } else {
+            PendingReason::NodeDown
+        },
+    )
 }
 
 /// `Err(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
@@ -18354,6 +18398,102 @@ mod tests {
         );
         let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
         assert!(!pending.contains(&new_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_for_a_job_pinned_to_a_down_node() {
+        // A job pinned (-w n1) to a down node can never place. Before the fix it
+        // still charged the QOS grp-node cap, permanently blocking a second job
+        // under the same QOS even with zero jobs actually running (SPUR-284).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("stuck-on-down-node");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 1;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        let mut placeable = basic_spec("should-still-run");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "job pinned to a down node must be tagged by real node state"
+        );
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            !pending.contains(&stuck_id),
+            "the unplaceable job must not be admitted"
+        );
+        assert!(
+            pending.contains(&placeable_id),
+            "an unplaceable job must not charge the QOS grp-node cap and starve a job that can actually run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_still_blocks_for_a_job_that_can_place_but_exceeds_cap() {
+        // Guard: the structural pre-check must not become a loophole that skips
+        // the real cap for a job that CAN place. Both nodes up but n1 has no
+        // spare capacity (registered with 0 cpus, matching the no-headroom
+        // pattern used above), so the new job genuinely needs n2 as a 2nd
+        // distinct node against a cap of 1.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 0, 0);
+        register_node(&cm, "n2", 8, 128000);
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            let mut running = make_running_job(101, &["n1"], 1);
+            running.spec.qos = Some("tight".into());
+            jobs.insert(101, running);
+        }
+
+        let mut newjob = basic_spec("wants-a-second-node");
+        newjob.qos = Some("tight".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(new_id).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit,
+            "cap already at 1/1 with no spare capacity to reuse must still block, even though n2 is up"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
