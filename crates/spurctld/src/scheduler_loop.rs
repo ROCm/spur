@@ -150,8 +150,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
-        let pending = cluster.pending_jobs_and_tag_reasons();
-        if pending.is_empty() {
+        let (mut pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
+        if pending.is_empty() && idle_fill_candidates.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
@@ -163,6 +163,34 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
+
+        // Append the borrow candidates below every in-quota job, strictly after the
+        // node set and the depth metric are derived from the in-quota list alone. A
+        // candidate's `--nodelist` would otherwise unpin a node held back by dispatch
+        // cooldown, and an in-quota job could then be placed on it (§5.3, D16).
+        //
+        // Tail position is real precedence: the pass walks the list in caller order
+        // and either places a job now, reserving its nodes on the timeline, or
+        // reserves the future slot it would need. A tail job is therefore offered
+        // exactly the capacity left after every in-quota job has taken what it can
+        // start on and reserved what it is waiting for — the definition of spare
+        // capacity, computed by the code that already owns the question (§5.1).
+        let borrow_ids: HashSet<spur_core::job::JobId> =
+            idle_fill_candidates.iter().map(|j| j.job_id).collect();
+        // The appended copies carry the stamp so the pass itself can tell a candidate
+        // from an in-quota job — that is how the future-slot reservation is suppressed
+        // (D15). These are clones; the stored job is stamped only if it actually
+        // starts, through the `borrowed` flag threaded into the dispatch below.
+        pending.extend(idle_fill_candidates.into_iter().map(|mut job| {
+            job.idle_fill = true;
+            job
+        }));
+        if pending.is_empty() {
+            cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
+            continue;
+        }
 
         if nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
@@ -218,9 +246,16 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
         if assignments.len() < pending.len() {
+            // An unplaced borrow candidate is deliberately absent from this list. It
+            // has no claim on the capacity it wanted, so it must not evict anyone via
+            // `try_preempt`; `update_pending_reasons` must not relabel it
+            // `NoSuitableNodes` when being over quota is the true reason; and it must
+            // not be exported to a federated peer, since forwarding a job that is over
+            // its local quota is a policy nobody has chosen (§5.4).
             let unscheduled: Vec<_> = pending
                 .iter()
                 .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+                .filter(|p| !borrow_ids.contains(&p.job_id))
                 .collect();
 
             if !unscheduled.is_empty() {
@@ -251,7 +286,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         let mut jobs_started_cycle = 0u64;
         for assignment in assignments {
-            if process_assignment(cluster.clone(), assignment).await {
+            // `Assignment` carries no tier information, but this loop appended the
+            // candidates, so results are tagged by job-ID membership rather than by
+            // changing the scheduler's signature (§5.2).
+            let borrowed = borrow_ids.contains(&assignment.job_id);
+            if process_assignment(cluster.clone(), assignment, borrowed).await {
                 jobs_started_cycle += 1;
             }
         }
@@ -278,6 +317,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 async fn process_assignment(
     cluster: Arc<ClusterManager>,
     assignment: spur_sched::traits::Assignment,
+    borrowed: bool,
 ) -> bool {
     let job = match cluster.get_job(assignment.job_id) {
         Some(j) => j,
@@ -475,6 +515,14 @@ async fn process_assignment(
             resources,
             assignment.per_node_alloc.clone(),
             true,
+            borrowed,
+        )
+    } else if borrowed {
+        cluster.start_borrowed_job(
+            job_id,
+            assignment.nodes.clone(),
+            resources,
+            assignment.per_node_alloc.clone(),
         )
     } else {
         cluster.start_job(
@@ -4914,7 +4962,7 @@ mod tests {
             let mut spec = batch_spec("plain-batch", 1);
             spec.tasks_per_node = Some(2);
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(started, "a clean single-node batch dispatch must start");
             let job = cm.get_job(job_id).unwrap();
@@ -4931,7 +4979,7 @@ mod tests {
             // for an assignment computed against a snapshot that's since gone
             // stale (e.g. the job was deleted/expired between scheduling and
             // this call).
-            let started = process_assignment(cm.clone(), assignment(999, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(999, &["n1"]), false).await;
 
             assert!(!started);
         }
@@ -4946,7 +4994,7 @@ mod tests {
             register_node_at(&cm, "n1", bad_addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("plain-batch-unreachable", 1));
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -4972,7 +5020,7 @@ mod tests {
             assert!(spec.script.is_none());
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 !started,
@@ -4998,7 +5046,7 @@ mod tests {
             spec.script = Some("#!/bin/bash\necho hi\n".into());
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 started,
@@ -5029,7 +5077,7 @@ mod tests {
             let mut spec = batch_spec("plain-batch-fanout", 1);
             spec.tasks_per_node = Some(4);
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(started, "a clean single-node batch dispatch must start");
             assert_eq!(
@@ -5052,7 +5100,7 @@ mod tests {
             spec.tasks_per_node = Some(4);
             spec.script = Some("#!/bin/bash\necho hi\n".into());
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 started,
@@ -5082,7 +5130,7 @@ mod tests {
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 started,
@@ -5110,7 +5158,7 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
@@ -5137,7 +5185,8 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+            let started =
+                process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
@@ -5170,7 +5219,8 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+            let started =
+                process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await;
 
             assert!(!started);
             let job = cm.get_job(job_id).unwrap();
@@ -5216,7 +5266,7 @@ mod tests {
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
-            let started = process_assignment(cm.clone(), bad_assignment).await;
+            let started = process_assignment(cm.clone(), bad_assignment, false).await;
 
             assert!(
                 !started,
@@ -5249,7 +5299,7 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("unreleasable", 1));
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(!started, "a job no node released must not count as started");
             wait_for("n1 cancelled after refusing the release", || {
@@ -5290,7 +5340,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("superseded", 1));
             assert!(
-                process_assignment(cm.clone(), assignment(job_id, &["n1"])).await,
+                process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await,
                 "the job must reach Running first"
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
@@ -5341,7 +5391,7 @@ mod tests {
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -5372,7 +5422,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-slurmctld-batch", 1));
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -5410,7 +5460,7 @@ mod tests {
 
             let cm_task = cm.clone();
             let handle = tokio::spawn(async move {
-                process_assignment(cm_task, assignment(job_id, &["n1"])).await
+                process_assignment(cm_task, assignment(job_id, &["n1"]), false).await
             });
 
             // Simulate a concurrent scancel landing while the (delayed)

@@ -1615,7 +1615,20 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<u32> {
-        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, false)
+    }
+
+    /// Start a job as *borrowed*: it exceeded its QOS group node cap and is running
+    /// on capacity nobody with a claim wanted. The stamp is what holds it outside
+    /// every quota aggregate and what makes it reclaimable.
+    pub fn start_borrowed_job(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<u32> {
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, true)
     }
 
     pub(crate) fn start_job_impl(
@@ -1625,6 +1638,7 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
+        idle_fill: bool,
     ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
@@ -1669,9 +1683,7 @@ impl ClusterManager {
             per_node_alloc: per_node_alloc.clone(),
             srun_step_dispatch,
             run_attempt,
-            // Nothing collects idle-fill candidates yet, so no dispatch is ever
-            // stamped; the flag is threaded through when placement lands.
-            idle_fill: false,
+            idle_fill,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -3583,17 +3595,27 @@ impl ClusterManager {
     /// Classify pending jobs once, apply pending-reason updates, advance burst-buffer
     /// stage-in for selected candidates, and return the jobs eligible for scheduling.
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
+        self.pending_jobs_with_idle_fill_candidates().0
+    }
+
+    /// As [`Self::pending_jobs_and_tag_reasons`], additionally returning the
+    /// over-quota jobs that may run on capacity nobody with a claim wants. They are
+    /// kept separate because they are not schedulable in their own right: the caller
+    /// appends them below every in-quota job, and only after deriving the node set
+    /// and depth-limit metric from the in-quota list alone (§5.3, D16).
+    pub fn pending_jobs_with_idle_fill_candidates(&self) -> (Vec<Job>, Vec<Job>) {
         let classification = self.classify_pending_jobs();
         let evaluated: Vec<JobId> = classification
             .jobs
             .iter()
             .map(|job| job.job_id)
+            .chain(classification.idle_fill_candidates.iter().map(|j| j.job_id))
             .chain(classification.reason_updates.iter().map(|(id, _)| *id))
             .collect();
         self.apply_pending_reason_updates(classification.reason_updates);
         self.advance_bb_staging_for(&classification.bb_stage_candidates);
         self.mark_scheduler_evaluated(&evaluated);
-        classification.jobs
+        (classification.jobs, classification.idle_fill_candidates)
     }
 
     /// Record that this cycle considered these jobs, for `LastSchedEval`. Keyed
