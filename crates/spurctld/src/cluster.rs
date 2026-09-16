@@ -7207,12 +7207,10 @@ fn structural_unplaceable_reason(
         .collect();
 
     // A k0s-claimed node would otherwise match: unlike a down node, it can
-    // free up on its own, so the block is k0s-flavored, not a dead end.
-    let blocked_by_k0s = || {
-        eligible
-            .iter()
-            .any(|n| n.is_k0s_reserved() && placement.matches_ignoring_k0s(n, reservations, now))
-    };
+    // free up on its own, so it must not be folded into a "will never place"
+    // verdict the way a truly dead node is.
+    let k0s_recoverable =
+        |n: &&Node| n.is_k0s_reserved() && placement.matches_ignoring_k0s(n, reservations, now);
 
     if placement.additive_listed_node_unavailable(
         eligible.iter().copied(),
@@ -7220,11 +7218,25 @@ fn structural_unplaceable_reason(
         now,
         &required,
     ) {
-        return Some(if blocked_by_k0s() {
-            PendingReason::K8sReserved
-        } else {
-            PendingReason::ReqNodeNotAvail
-        });
+        // Every listed node is independently mandatory, so this is only
+        // k0s-flavored when none of the *listed* nodes failed for some other,
+        // permanent reason (a coincidentally k0s-reserved but unlisted node
+        // elsewhere in `eligible` is irrelevant to this requirement).
+        let listed_blockers: Vec<&&Node> = eligible
+            .iter()
+            .filter(|n| {
+                placement.is_listed(&n.name)
+                    && n.total_resources.can_satisfy(&required)
+                    && !placement.matches_for_reservation(n, reservations, now)
+            })
+            .collect();
+        return Some(
+            if !listed_blockers.is_empty() && listed_blockers.iter().all(|n| k0s_recoverable(n)) {
+                PendingReason::K8sReserved
+            } else {
+                PendingReason::ReqNodeNotAvail
+            },
+        );
     }
 
     if eligible.len() < needed
@@ -7235,13 +7247,18 @@ fn structural_unplaceable_reason(
         return None;
     }
 
-    Some(if blocked_by_k0s() {
-        PendingReason::K8sReserved
-    } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
-        PendingReason::ReqNodeNotAvail
-    } else {
-        PendingReason::NodeDown
-    })
+    // General case: k0s-flavored only when enough of the blocked nodes would
+    // satisfy `needed` on their own once released — a stray down node
+    // elsewhere in `eligible` doesn't get to hide behind that classification.
+    Some(
+        if eligible.iter().filter(|n| k0s_recoverable(n)).count() >= needed {
+            PendingReason::K8sReserved
+        } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+            PendingReason::ReqNodeNotAvail
+        } else {
+            PendingReason::NodeDown
+        },
+    )
 }
 
 /// `Err(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
@@ -18724,6 +18741,51 @@ mod tests {
             cm.get_job(stuck_id).unwrap().pending_reason,
             PendingReason::K8sReserved,
             "every node being k0s-reserved is not the same as every node being down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_still_reports_req_node_not_avail_when_a_down_node_is_the_actual_blocker()
+    {
+        // -w n1 with --nodes=2 is additive; n1 (required) is down. n3 is
+        // merely k0s-reserved and isn't even listed, so it must not paper
+        // over n1 being genuinely, permanently unavailable.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        register_node(&cm, "n3", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+        if let Some(node) = cm.nodes.write().get_mut("n3") {
+            node.k0s_role = Some(K0sRole::Worker);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("pinned-to-down-plus-unrelated-k0s-node");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 2;
+        stuck.num_tasks = 2;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "n1 being down is a real, permanent block regardless of n3's unrelated k0s reservation"
         );
     }
 
