@@ -981,6 +981,21 @@ With this setup:
   ``reserved`` tier) will never have its jobs kicked out, regardless of how
   large a priority gap exists.
 
+.. note::
+
+   :doc:`idle-fill-scheduling` addresses the same waste — idle nodes while work
+   waits — but decides differently. This burst pattern is opt-in: the submitter
+   chooses ``--qos=burst``, and you maintain the allow-lists. Idle-fill is
+   automatic and derived from quota, considering any job whose only obstacle is its
+   QOS group node cap, with nothing for the user to opt into and no allow-list to
+   keep current.
+
+   The two coexist. A burst job runs inside its own quota, so idle-fill does not
+   stamp it and it keeps counting toward every limit as it does today. To move an
+   existing burst QOS onto idle-fill's reclaim path, mark it
+   ``idle_fill_preemptable``, which makes its jobs reclaimable even while inside
+   quota. That flag has no ``sacctmgr`` column yet, so it is not settable today.
+
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -493,7 +493,27 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        immediately eligible. Can be overridden per-partition (``preempt_exempt_time``
        in ``[[partitions]]``) and per-QOS (``preemptexempttime`` via
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
-       Mirrors Slurm's ``PreemptExemptTime``.
+       Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
+       which uses ``idle_fill_exempt_secs`` instead.
+   * - ``idle_fill_enabled``
+     - boolean
+     - ``false``
+     - Live
+     - Let a job that has exceeded its QOS group node quota run anyway, on nodes
+       no job with a quota claim wants. Such a run is *borrowed*: it consumes no
+       quota, and it is reclaimed when a job that does hold a claim needs the
+       capacity. Off by default; enabling it narrows a preemption guarantee, so
+       read :doc:`idle-fill-scheduling` before turning it on.
+   * - ``idle_fill_exempt_secs``
+     - integer
+     - ``60``
+     - Live
+     - Minimum number of seconds a borrowed job runs before it may be reclaimed,
+       and the only guard standing between a borrowed job and reclaim. The window
+       doubles on each successive eviction of the same job, capped at one hour, so
+       repeated lend-and-reclaim converges instead of churning. Deliberately
+       separate from ``preempt_exempt_time``, which is unbounded and which a user
+       can raise for their own job by submitting to several partitions.
 
 .. note::
 
@@ -1223,12 +1243,34 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        that node exclusively will have to wait until the paused job either
        finishes or is cancelled.
        ``"off"`` (default) — running jobs in this partition are never kicked
-       out. The scheduler will wait for a free slot instead of preempting.
+       out *by preemption*. The scheduler will wait for a free slot instead.
 
        A job's QOS can change what happens to *that specific job* when it is
        kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
        field is the on/off switch: preemption is only attempted at all when
        this is set to something other than ``"off"``.
+
+       .. important::
+
+          This setting governs **preemption**, and preemption arbitrates between
+          two jobs that both hold a claim on the capacity. It does not cover
+          :doc:`idle-fill-scheduling`, which is a different question: a borrowed
+          job holds no claim at all, having exceeded its QOS group node quota and
+          run only on capacity nobody with a claim wanted.
+
+          Reclaim therefore consults none of ``preempt_mode``, the priority gap,
+          the QOS allow list, or ``preempt_exempt_time``. With idle-fill enabled,
+          the guarantee narrows from "running jobs in this partition are never
+          kicked out" to **"jobs with a quota claim are never kicked out"**. The
+          only guard on a borrowed job is ``idle_fill_exempt_secs``.
+
+          A borrowed job is *defined* by being reclaimable, so shielding it would
+          not produce a safer job — it would produce capacity that was lent out
+          and can never be recovered, which is worse than never lending it. Two
+          things bound the change: ``idle_fill_enabled`` is off by default, so no
+          existing cluster behaves differently until an operator turns it on, and
+          for every job running inside its quota ``"off"`` still means exactly
+          what it says.
    * - ``preempt_exempt_time``
      - integer or null
      - ``null`` (inherit global)

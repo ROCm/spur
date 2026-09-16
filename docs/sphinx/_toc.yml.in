@@ -20,6 +20,7 @@ subtrees:
               - file: admin-guide/configuration
               - file: admin-guide/rbac
               - file: admin-guide/accounting
+              - file: admin-guide/idle-fill-scheduling
               - file: admin-guide/dme-integration
       - file: deployment/index
         subtrees:
