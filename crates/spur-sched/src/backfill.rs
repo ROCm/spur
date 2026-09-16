@@ -261,14 +261,7 @@ impl BackfillScheduler {
             node.total_resources.can_satisfy(&required)
         };
 
-        if placement.nodelist_is_additive()
-            && nodes.iter().any(|node| {
-                placement.is_listed(&node.name)
-                    && placement.eligible(node, reservations, now)
-                    && node.total_resources.can_satisfy(&required)
-                    && !suitable(node)
-            })
-        {
+        if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required) {
             return Vec::new();
         }
 

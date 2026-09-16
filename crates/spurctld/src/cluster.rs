@@ -4865,13 +4865,12 @@ impl ClusterManager {
                 .collect();
 
             let required = spur_sched::backfill::job_resource_request(job);
-            if placement.nodelist_is_additive()
-                && eligible.iter().any(|node| {
-                    placement.is_listed(&node.name)
-                        && node.total_resources.can_satisfy(&required)
-                        && !placement.matches_for_reservation(node, cluster_state.reservations, now)
-                })
-            {
+            if placement.additive_listed_node_unavailable(
+                eligible.iter().copied(),
+                cluster_state.reservations,
+                now,
+                &required,
+            ) {
                 job_entry.set_pending_reason(PendingReason::ReqNodeNotAvail);
                 continue;
             }
@@ -7188,13 +7187,15 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// `Some(reason)` only when every node matching the job's placement is down.
-/// Too-few-eligible is left alone: those nodes may still join.
+/// `Some(reason)` for a down required listed node or an all-down placement.
+/// Too-few-eligible is left alone in both cases: those nodes may still join.
 fn structural_unplaceable_reason(
     job: &Job,
     nodes: &HashMap<String, Node>,
     reservations: &[Reservation],
 ) -> Option<PendingReason> {
+    // Safe to use `new` (not `new_ignoring_preferred_nodes`): this gate runs
+    // before qos/account credit anything into `job.preferred_nodes`.
     let placement = spur_sched::node_match::NodePlacement::new(job);
     let now = chrono::Utc::now();
     let needed = (job.spec.num_nodes as usize).max(1);
@@ -7205,15 +7206,12 @@ fn structural_unplaceable_reason(
         .filter(|n| placement.eligible(n, reservations, now))
         .collect();
 
-    // Mirrors `find_suitable_nodes`: a required listed node that's down fails
-    // the whole additive-nodelist job regardless of other idle capacity.
-    if placement.nodelist_is_additive()
-        && eligible.iter().any(|n| {
-            placement.is_listed(&n.name)
-                && n.total_resources.can_satisfy(&required)
-                && !placement.matches_for_reservation(n, reservations, now)
-        })
-    {
+    if placement.additive_listed_node_unavailable(
+        eligible.iter().copied(),
+        reservations,
+        now,
+        &required,
+    ) {
         return Some(PendingReason::ReqNodeNotAvail);
     }
 
@@ -18477,17 +18475,29 @@ mod tests {
             ..Default::default()
         });
 
-        let mut running = make_running_job(101, &["n1"], 1);
-        running.spec.qos = Some("tight".into());
-        running.spec.nodelist = Some("n1".into());
-        cm.jobs.write().insert(101, running);
+        let mut spec = basic_spec("pinned-then-fails");
+        spec.qos = Some("tight".into());
+        spec.num_nodes = 1;
+        spec.nodelist = Some("n1".into());
+        let running_id = submit_and_wait(&cm, spec);
 
-        cm.requeue_job(101).unwrap();
+        let alloc = scalar_alloc(1, 1000);
+        cm.start_job(
+            running_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, running_id, JobState::Running);
+
+        cm.requeue_job(running_id).unwrap();
+        settle(&cm, running_id, JobState::Pending);
         if let Some(node) = cm.nodes.write().get_mut("n1") {
             node.state = NodeState::Down;
         }
         // Bypass the real backoff window: simulate it having already lapsed.
-        if let Some(job) = cm.jobs.write().get_mut(&101) {
+        if let Some(job) = cm.jobs.write().get_mut(&running_id) {
             job.spec.begin_time = None;
         }
 
@@ -18498,12 +18508,12 @@ mod tests {
 
         cm.refresh_pending_reasons();
         assert_eq!(
-            cm.get_job(101).unwrap().pending_reason,
+            cm.get_job(running_id).unwrap().pending_reason,
             PendingReason::ReqNodeNotAvail,
             "requeued job pinned to a now-down node must be tagged by real node state"
         );
         let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
-        assert!(!pending.contains(&101));
+        assert!(!pending.contains(&running_id));
         assert!(
             pending.contains(&placeable_id),
             "a requeued-but-unplaceable job must not keep charging the QOS cap after requeue"
@@ -18590,6 +18600,17 @@ mod tests {
         newjob.qos = Some("tight".into());
         newjob.num_nodes = 1;
         let new_id = submit_and_wait(&cm, newjob);
+
+        {
+            let job = cm.get_job(new_id).unwrap();
+            let nodes = cm.nodes.read();
+            let reservations = cm.get_reservations();
+            assert_eq!(
+                structural_unplaceable_reason(&job, &nodes, &reservations),
+                None,
+                "n2 is up and eligible, so the structural gate itself must not fire here"
+            );
+        }
 
         cm.refresh_pending_reasons();
         assert_eq!(
