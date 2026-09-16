@@ -207,6 +207,9 @@ impl SlurmAccounting for AccountingService {
                 submit_time,
                 start_time,
                 reservation: Some(req.reservation),
+                // The external accounting RPC carries no idle-fill notion; a run
+                // recorded through it is treated as an ordinary one.
+                idle_fill: false,
             },
         )
         .await

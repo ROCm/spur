@@ -165,6 +165,7 @@ ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS idle_fill BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -262,6 +263,11 @@ pub struct JobStartRecord {
     pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
     pub reservation: Option<String>,
+    /// True when this run was borrowed: the job exceeded its QOS group node cap and
+    /// ran on capacity nobody with a claim wanted. Reported by `sacct` so operators
+    /// can tell which runs were opportunistic, and read back when the run ends to
+    /// decide whether fairshare should be charged for it.
+    pub idle_fill: bool,
 }
 
 /// Record a job start in the database.
@@ -275,8 +281,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation, idle_fill)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13, $14)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -293,7 +299,15 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             exit_code = 0,
             exit_signal = 0,
             derived_exit_code = 0,
-            end_time = NULL
+            end_time = NULL,
+            idle_fill = EXCLUDED.idle_fill,
+            -- A requeued job starts again on the same row, so provenance from the
+            -- run that was evicted must be cleared or the job reads as
+            -- `COMPLETED, PreemptMode=Requeue` forever once it finally succeeds.
+            -- Reclaim makes this routine rather than rare (D12).
+            preempted_by = NULL,
+            preempt_mode = '',
+            preempt_qos = ''
         "#,
     )
     .bind(rec.job_id as i64)
@@ -309,13 +323,14 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.submit_time)
     .bind(rec.start_time)
     .bind(rec.reservation.as_deref().unwrap_or_default())
+    .bind(rec.idle_fill)
     .execute(&mut *conn)
     .await?;
 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -359,7 +374,7 @@ pub async fn record_job_end(
             preempted_by = $7,
             preempt_mode = $8,
             preempt_qos = $9
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, state, idle_fill
         "#,
     )
     .bind(job_id as i64)
@@ -434,6 +449,20 @@ async fn update_usage(
         // End arrived before start; usage will be computed when start lands.
         return Ok(());
     };
+    // A borrowed run that was reclaimed is not charged to fairshare. Charging it
+    // creates a self-reinforcing loop: the borrower is billed for a run it did not
+    // get to finish, its priority drops, and a lower priority makes it the preferred
+    // next victim — so the more capacity it loses, the more it loses (D9).
+    //
+    // Keyed on the stamp, so a burst-pattern victim (reclaimable only because its
+    // QOS is marked preemptable, while running inside its own quota) keeps today's
+    // treatment and is charged as before.
+    let state: String = row.get("state");
+    let idle_fill: bool = row.get("idle_fill");
+    if idle_fill && state == "PREEMPTED" {
+        return Ok(());
+    }
+
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
 
@@ -1568,6 +1597,7 @@ mod job_history_tests {
                 submit_time,
                 start_time,
                 reservation: Some(reservation.to_string()),
+                idle_fill: false,
             },
         )
         .await
@@ -1624,6 +1654,7 @@ mod job_history_tests {
                 submit_time: start_time,
                 start_time,
                 reservation: Some(String::new()),
+                idle_fill: false,
             },
         )
         .await?;

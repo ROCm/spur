@@ -1772,6 +1772,7 @@ impl ClusterManager {
                 submit_time: submit_time_for_notify,
                 start_time: Utc::now(),
                 reservation: spec_for_notify.reservation.clone(),
+                idle_fill,
             });
         }
 
