@@ -78,6 +78,12 @@ pub struct ClientResponse {
     pub reservation_created: bool,
     #[serde(default)]
     pub partition_created: bool,
+    #[serde(default)]
+    pub timeout_claimed: bool,
+    #[serde(default)]
+    pub properties_updated: bool,
+    #[serde(default)]
+    pub renewal: Option<Result<spur_core::job::RenewalReceipt, String>>,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

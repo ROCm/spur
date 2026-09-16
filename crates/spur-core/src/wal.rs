@@ -45,6 +45,10 @@ pub enum WalOperation {
         pending_reason_desc: Option<String>,
     },
     JobStart {
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        spec: Option<Box<JobSpec>>,
         job_id: JobId,
         nodes: Vec<String>,
         resources: ResourceAllocations,
@@ -62,6 +66,8 @@ pub enum WalOperation {
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+        #[serde(default)]
+        timeout_guard: Option<(u32, chrono::DateTime<chrono::Utc>)>,
     },
     JobNodeComplete {
         job_id: JobId,
@@ -77,6 +83,24 @@ pub enum WalOperation {
     JobTimeLimitSignaled {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        guard: Option<crate::job::TimeoutGuard>,
+    },
+    JobUpdateProperties {
+        job_id: JobId,
+        time_limit: Option<chrono::Duration>,
+        partition: Option<String>,
+        comment: Option<String>,
+        account: Option<String>,
+        qos: Option<String>,
+    },
+    JobRenew {
+        request: crate::job::RenewalRequest,
+        at: chrono::DateTime<chrono::Utc>,
+        expected_spec: Box<JobSpec>,
+        max_runway_seconds: u32,
+        qos: Box<crate::accounting::Qos>,
+        account_limits: crate::accounting::AccountLimits,
     },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
@@ -424,6 +448,8 @@ impl WalOperation {
         per_node_alloc: HashMap<String, ResourceAllocations>,
     ) -> Self {
         Self::JobStart {
+            at: None,
+            spec: None,
             job_id,
             nodes,
             resources,
@@ -1211,13 +1237,18 @@ mod suspend_wal_tests {
     #[test]
     fn job_time_limit_signaled_op_round_trips() {
         let at = chrono::Utc::now();
-        let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };
+        let op = WalOperation::JobTimeLimitSignaled {
+            job_id: 13,
+            at,
+            guard: None,
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobTimeLimitSignaled {
                 job_id,
                 at: at_back,
+                guard: _,
             } => {
                 assert_eq!(job_id, 13);
                 assert_eq!(at_back, at);

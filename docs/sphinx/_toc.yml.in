@@ -38,3 +38,4 @@ subtrees:
               - file: developer/building
               - file: developer/documentation
               - file: developer/contributing
+              - file: developer/renewable-qos-design

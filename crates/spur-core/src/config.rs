@@ -38,6 +38,9 @@ pub struct SlurmConfig {
     pub scheduler: SchedulerConfig,
 
     #[serde(default)]
+    pub renewal: RenewalConfig,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -124,6 +127,34 @@ pub struct SlurmConfig {
     /// pool and on an interval; a failure drains the node (spurd).
     #[serde(default)]
     pub health: HealthConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RenewalConfig {
+    /// Enable only after every controller can replay renewal WAL records.
+    #[serde(default)]
+    pub upgraded_controllers: bool,
+    #[serde(default)]
+    pub qos: HashMap<String, RenewalGrant>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenewalClass {
+    #[default]
+    Unqualified,
+    NonBurst,
+    Burst,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RenewalGrant {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub class: RenewalClass,
+    #[serde(default)]
+    pub max_runway_seconds: u32,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -2161,6 +2192,17 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Granting renewal to a burst QoS is a contradiction the controller would
+        // otherwise resolve silently at request time, long after the admin who
+        // wrote it has stopped looking.
+        for (name, grant) in &self.renewal.qos {
+            if grant.enabled && grant.class == RenewalClass::Burst {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("renewal.qos.{name}.class"),
+                    value: "burst (a burst QoS cannot be granted renewal)".into(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -3985,6 +4027,35 @@ cluster_name = "test"
 [controller]
 agent_keepalive_interval_secs = 0
 agent_keepalive_timeout_secs = 0
+"#;
+        assert!(SlurmConfig::load_from_str(ok).is_ok());
+    }
+
+    #[test]
+    fn renewal_config_rejects_a_grant_on_a_burst_qos() {
+        let toml = r#"
+cluster_name = "test"
+
+[renewal.qos.interactive]
+enabled = true
+class = "burst"
+max_runway_seconds = 86400
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("renewal.qos.interactive.class"),
+            "a burst QoS can never be renewed, so granting it must fail at load \
+             rather than silently at request time: {err}"
+        );
+
+        // The same grant on a non-burst classification is the supported case.
+        let ok = r#"
+cluster_name = "test"
+
+[renewal.qos.interactive]
+enabled = true
+class = "non_burst"
+max_runway_seconds = 86400
 "#;
         assert!(SlurmConfig::load_from_str(ok).is_ok());
     }

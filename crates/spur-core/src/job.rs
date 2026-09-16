@@ -835,12 +835,21 @@ pub struct Job {
     #[serde(default)]
     pub time_limit_signaled_at: Option<DateTime<Utc>>,
 
+    #[serde(default)]
+    pub deadline_revision: u64,
+    #[serde(default)]
+    pub renewal_ready: bool,
+    #[serde(default)]
+    pub renewal_receipts: Vec<RenewalReceipt>,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
     /// Total seconds spent suspended across all suspend/resume cycles.
     #[serde(default)]
     pub suspended_secs: i64,
+    #[serde(default)]
+    pub has_suspended: bool,
 
     /// Burst-buffer staging phase. `None` until the scheduler reserves BB
     /// capacity for this job; then `Staging` while stage-in runs and `Ready`
@@ -887,6 +896,30 @@ pub struct Job {
     pub last_sched_eval: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutGuard {
+    pub run_attempt: u32,
+    pub deadline_revision: u64,
+    pub deadline: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalRequest {
+    pub job_id: JobId,
+    pub user: String,
+    pub run_attempt: u32,
+    pub expected_revision: u64,
+    pub request_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalReceipt {
+    pub request: RenewalRequest,
+    pub previous_expiry: DateTime<Utc>,
+    pub deadline_revision: u64,
+}
+
 impl Job {
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
         let priority = if spec.hold {
@@ -928,8 +961,12 @@ impl Job {
             het_group: None,
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
+            deadline_revision: 0,
+            renewal_ready: false,
+            renewal_receipts: Vec::new(),
             suspended_at: None,
             suspended_secs: 0,
+            has_suspended: false,
             bb_stage_state: BbStageState::None,
             srun_step_dispatch: false,
             actual_stdout_path: None,

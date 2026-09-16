@@ -313,6 +313,9 @@ impl SlurmAccounting for AccountingService {
         let jobs = records
             .iter()
             .map(|r| JobInfo {
+                run_attempt: 0,
+                deadline_revision: 0,
+                allocation_expiry: None,
                 job_id: r.job_id,
                 name: r.name.clone(),
                 user: r.user_name.clone(),

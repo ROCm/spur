@@ -14697,6 +14697,7 @@ mod tests {
             suspend_job(spur_proto::proto::SuspendJobRequest) -> ();
             resume_job(spur_proto::proto::ResumeJobRequest) -> ();
             update_job(spur_proto::proto::UpdateJobRequest) -> ();
+            renew_job(spur_proto::proto::RenewJobRequest) -> spur_proto::proto::RenewJobResponse;
             requeue_job(spur_proto::proto::RequeueJobRequest) -> spur_proto::proto::RequeueJobResponse;
             get_nodes(spur_proto::proto::GetNodesRequest) -> spur_proto::proto::GetNodesResponse;
             get_node(spur_proto::proto::GetNodeRequest) -> spur_proto::proto::NodeInfo;

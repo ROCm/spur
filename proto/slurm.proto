@@ -295,6 +295,26 @@ message JobInfo {
   string sched_nodelist = 78;
 
   bool min_memory_is_per_cpu = 79;
+  uint32 run_attempt = 80;
+  uint64 deadline_revision = 81;
+  google.protobuf.Timestamp allocation_expiry = 82;
+}
+
+message RenewJobRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  uint64 expected_revision = 3;
+  string request_id = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message RenewJobResponse {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  string request_id = 3;
+  uint64 deadline_revision = 4;
+  google.protobuf.Timestamp previous_expiry = 5;
+  google.protobuf.Timestamp expires_at = 6;
 }
 
 message NodeInfo {
@@ -384,6 +404,7 @@ service SlurmController {
   rpc SuspendJob(SuspendJobRequest) returns (google.protobuf.Empty);
   rpc ResumeJob(ResumeJobRequest) returns (google.protobuf.Empty);
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
+  rpc RenewJob(RenewJobRequest) returns (RenewJobResponse);
   // Requeue a running/suspended or finished batch job back to PENDING,
   // keeping the same job_id and spec. `hold` parks it in a held state.
   rpc RequeueJob(RequeueJobRequest) returns (RequeueJobResponse);

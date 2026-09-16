@@ -379,6 +379,7 @@ pub struct ClusterManager {
     /// values live; sections captured once at startup (bound sockets, DB pool,
     /// scheduler loop interval) remain restart-only — see `reconfigure`.
     config: RwLock<Arc<SlurmConfig>>,
+    renewal_config_guard: parking_lot::Mutex<()>,
     /// Scheduler tick interval captured at startup. The scheduler loop's cadence
     /// is fixed once at boot (restart-only), so the preemption requeue hold —
     /// which is sized to that cadence — must read this pinned value, not the
@@ -542,6 +543,7 @@ impl ClusterManager {
 
         let cm = Self {
             config: RwLock::new(Arc::new(config)),
+            renewal_config_guard: parking_lot::Mutex::new(()),
             scheduler_interval_secs,
             config_path,
             jobs: RwLock::new(HashMap::new()),
@@ -1279,6 +1281,7 @@ impl ClusterManager {
         }
 
         let resp = self.propose(WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Deadline,
@@ -1318,6 +1321,7 @@ impl ClusterManager {
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
         // so the deallocation loop is a no-op.
         let resp = self.propose(WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Cancelled,
@@ -1631,6 +1635,12 @@ impl ClusterManager {
             JobState::Running,
         ))?;
         self.propose(WalOperation::JobStart {
+            at: Some(Utc::now()),
+            spec: self
+                .config()
+                .renewal
+                .upgraded_controllers
+                .then(|| Box::new(spec_for_notify.clone())),
             job_id,
             nodes: node_names.clone(),
             resources: resources.clone(),
@@ -1790,6 +1800,7 @@ impl ClusterManager {
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
         let resp = self.propose(WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code,
             state,
@@ -1805,9 +1816,45 @@ impl ClusterManager {
     /// completion path report `Timeout` instead of reading the terminating
     /// signal as an ordinary failure — a job that exits promptly on SIGTERM
     /// reports back long before the grace period is up.
+    #[cfg(test)]
     pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
-        self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
+        self.propose(WalOperation::JobTimeLimitSignaled {
+            job_id,
+            at,
+            guard: None,
+        })?;
         Ok(())
+    }
+
+    pub fn finish_time_limit(&self, job: &Job) -> anyhow::Result<bool> {
+        let Some(signaled_at) = job.time_limit_signaled_at else {
+            return Ok(false);
+        };
+        let response = self.propose(WalOperation::JobComplete {
+            job_id: job.job_id,
+            timeout_guard: Some((job.run_attempt, signaled_at)),
+            exit_code: -1,
+            state: JobState::Timeout,
+        })?;
+        let accepted = !response.jobs_finalized.is_empty();
+        self.run_all_finalized_side_effects(&response);
+        Ok(accepted)
+    }
+
+    pub fn claim_time_limit(&self, job: &Job, at: DateTime<Utc>) -> anyhow::Result<bool> {
+        let Some((start, limit)) = job.start_time.zip(job.spec.time_limit) else {
+            return Ok(false);
+        };
+        let response = self.propose(WalOperation::JobTimeLimitSignaled {
+            job_id: job.job_id,
+            at,
+            guard: Some(spur_core::job::TimeoutGuard {
+                run_attempt: job.run_attempt,
+                deadline_revision: job.deadline_revision,
+                deadline: job.effective_deadline(start, limit),
+            }),
+        })?;
+        Ok(response.timeout_claimed)
     }
 
     /// Preempt a running job per its partition's PreemptMode, without
@@ -2356,6 +2403,7 @@ impl ClusterManager {
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
         self.propose(WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Failed,
@@ -2860,6 +2908,7 @@ impl ClusterManager {
 
         if state == JobState::Running {
             self.propose(WalOperation::JobComplete {
+                timeout_guard: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Failed,
@@ -2942,6 +2991,110 @@ impl ClusterManager {
         Ok(())
     }
 
+    pub fn renew_job(
+        &self,
+        request: spur_core::job::RenewalRequest,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<spur_core::job::RenewalReceipt> {
+        let _config_guard = self.renewal_config_guard.lock();
+        let config = self.config();
+        if !config.renewal.upgraded_controllers {
+            anyhow::bail!("unsupported: renewable WAL requires upgraded controllers");
+        }
+        let job = self
+            .get_job(request.job_id)
+            .ok_or_else(|| anyhow::anyhow!("not_found: job"))?;
+        if job.spec.user != request.user {
+            anyhow::bail!("unauthorized: verified owner required");
+        }
+        if let Some(receipt) = job
+            .renewal_receipts
+            .iter()
+            .find(|r| r.request.user == request.user && r.request.request_id == request.request_id)
+        {
+            if receipt.request != request {
+                anyhow::bail!("conflict: request ID reused");
+            }
+            return Ok(receipt.clone());
+        }
+        let qos_name = job
+            .spec
+            .qos
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("ineligible: no QoS"))?;
+        let grant = config
+            .renewal
+            .qos
+            .get(qos_name)
+            .ok_or_else(|| anyhow::anyhow!("ineligible: no renewal grant for this QoS"))?;
+        // A burst classification is a permanent disqualification, not a missing
+        // grant: report it separately so the administrator does not "fix" it by
+        // adding the grant that is already there.
+        if grant.class == spur_core::config::RenewalClass::Burst {
+            anyhow::bail!("ineligible: QoS is classified burst");
+        }
+        if !grant.enabled
+            || grant.class != spur_core::config::RenewalClass::NonBurst
+            || grant.max_runway_seconds == 0
+        {
+            anyhow::bail!("ineligible: no non-burst renewal grant");
+        }
+        // Serialize publication through commit without holding cache reads: readers
+        // holding jobs must not block behind a refresh waiting on this proposal.
+        let (_qos_publication, qos_snapshot) = self.qos_cache.renewal_snapshot();
+        let qos = qos_snapshot
+            .qos
+            .get(qos_name)
+            .filter(|_| qos_snapshot.loaded)
+            .ok_or_else(|| anyhow::anyhow!("unavailable: QoS policy not loaded"))?;
+        let (_association_publication, associations) = self.association_cache.renewal_snapshot();
+        let account = job
+            .spec
+            .account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("ineligible: no account"))?;
+        let limits = associations
+            .renewal_limits(&request.user, account, qos_name)
+            .map_err(anyhow::Error::msg)?;
+        let mut candidate = job.spec.clone();
+        let start = job
+            .start_time
+            .ok_or_else(|| anyhow::anyhow!("not_running: no start"))?;
+        candidate.time_limit = Some(request.expires_at - start);
+        for cap in [qos.limits.max_wall_minutes, limits.max_wall_minutes]
+            .into_iter()
+            .flatten()
+        {
+            if request.expires_at - start > chrono::Duration::minutes(i64::from(cap)) {
+                anyhow::bail!("policy_limit: lifetime wall cap");
+            }
+        }
+        if let Some(reason) = spur_core::qos::check_qos_standalone_limits(&candidate, qos) {
+            anyhow::bail!("policy_limit: {reason:?}");
+        }
+        if let Some(reason) =
+            spur_core::account_limits::check_account_standalone_limits(&candidate, &limits)
+        {
+            anyhow::bail!("policy_limit: {reason:?}");
+        }
+        if qos.limits.grp_wall_minutes.is_some() {
+            // A cached consumption total cannot reserve future group wall atomically.
+            anyhow::bail!("ineligible: group-wall capped QoS is not renewable");
+        }
+        let response = self.propose(WalOperation::JobRenew {
+            request,
+            at: now,
+            expected_spec: Box::new(job.spec),
+            max_runway_seconds: grant.max_runway_seconds,
+            qos: Box::new(qos.clone()),
+            account_limits: limits,
+        })?;
+        response
+            .renewal
+            .ok_or_else(|| anyhow::anyhow!("unsupported: missing renewal receipt"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     /// Update job properties.
     #[allow(clippy::too_many_arguments)]
     pub fn update_job(
@@ -2959,6 +3112,16 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state.is_active()
+                && (time_limit.is_some()
+                    || partition.is_some()
+                    || account.is_some()
+                    || qos.is_some())
+            {
+                anyhow::bail!(
+                    "active job deadline and policy edits require the guarded renewal API"
+                );
+            }
             (job.spec.user.clone(), job.spec.account.clone())
         };
 
@@ -3025,6 +3188,18 @@ impl ClusterManager {
                 }
                 spec
             };
+            let caps = self.wall_caps(&candidate);
+            for cap in [caps.qos_minutes, caps.account_minutes]
+                .into_iter()
+                .flatten()
+            {
+                if candidate
+                    .time_limit
+                    .is_some_and(|limit| limit > chrono::Duration::minutes(i64::from(cap)))
+                {
+                    anyhow::bail!("job update exceeds lifetime wall limit");
+                }
+            }
             validate_user_account(&candidate, &self.association_cache, &config.accounting)?;
             self.validate_partition(&candidate, &partitions)?;
             validate_partition_time_limit(
@@ -3052,9 +3227,40 @@ impl ClusterManager {
             })?;
         }
 
-        // Non-WAL-tracked fields: update directly
+        if self.config().renewal.upgraded_controllers {
+            let response = self.propose(WalOperation::JobUpdateProperties {
+                job_id,
+                time_limit,
+                partition,
+                comment,
+                account,
+                qos,
+            })?;
+            if !response.properties_updated {
+                anyhow::bail!("job state changed during update");
+            }
+            return Ok(());
+        }
+
+        // Old controllers cannot replay property-update records during rollout.
         let mut jobs = self.jobs.write();
         if let Some(job) = jobs.get_mut(&job_id) {
+            if job.state.is_active()
+                && (time_limit.is_some()
+                    || partition.is_some()
+                    || account.is_some()
+                    || qos.is_some())
+            {
+                anyhow::bail!(
+                    "active job deadline and policy edits require the guarded renewal API"
+                );
+            }
+            if time_limit.is_some() {
+                job.deadline_revision = job
+                    .deadline_revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("deadline revision overflow"))?;
+            }
             if let Some(tl) = time_limit {
                 job.spec.time_limit = Some(tl);
             }
@@ -4083,6 +4289,7 @@ impl ClusterManager {
                 continue;
             }
             match self.propose(WalOperation::JobComplete {
+                timeout_guard: None,
                 job_id: id,
                 exit_code: -1,
                 state: JobState::Cancelled,
@@ -4284,6 +4491,7 @@ impl ClusterManager {
     /// their startup config. Per-field scope: docs/admin-guide/configuration.rst,
     /// "Applying configuration changes" section.
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
+        let _config_guard = self.renewal_config_guard.lock();
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
@@ -5973,6 +6181,8 @@ impl ClusterManager {
                     match job.apply_transition(JobState::Suspended) {
                         Ok(TransitionOutcome::Applied) => {
                             job.suspended_at = Some(*at);
+                            job.has_suspended = true;
+                            job.deadline_revision = job.deadline_revision.saturating_add(1);
                             if preempted_by.is_some() {
                                 job.preempted_by = *preempted_by;
                                 job.preempt_mode = Some("Suspend".to_string());
@@ -6027,6 +6237,8 @@ impl ClusterManager {
                 }
             }
             WalOperation::JobStart {
+                at,
+                spec,
                 job_id,
                 nodes: node_names,
                 resources,
@@ -6035,7 +6247,12 @@ impl ClusterManager {
                 run_attempt,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    job.start_time = Some(timestamp);
+                    job.start_time = Some(at.unwrap_or(timestamp));
+                    if let Some(spec) = spec {
+                        job.spec = (**spec).clone();
+                        job.deadline_revision = 0;
+                    }
+                    job.renewal_ready = at.is_some() && spec.is_some();
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
@@ -6187,20 +6404,254 @@ impl ClusterManager {
                     };
                 }
             }
-            WalOperation::JobTimeLimitSignaled { job_id, at } => {
+            WalOperation::JobUpdateProperties {
+                job_id,
+                time_limit,
+                partition,
+                comment,
+                account,
+                qos,
+            } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if job.state.is_active()
+                        && (time_limit.is_some()
+                            || partition.is_some()
+                            || account.is_some()
+                            || qos.is_some())
+                    {
+                        return response;
+                    }
+                    if let Some(limit) = time_limit {
+                        job.spec.time_limit = Some(*limit);
+                        job.deadline_revision = job.deadline_revision.saturating_add(1);
+                    }
+                    if let Some(value) = partition {
+                        job.spec.partition = Some(value.clone());
+                    }
+                    if let Some(value) = account {
+                        job.spec.account = Some(value.clone());
+                    }
+                    if let Some(value) = qos {
+                        job.spec.qos = Some(value.clone());
+                    }
+                    if let Some(value) = comment {
+                        job.spec.comment = Some(value.clone());
+                    }
+                    response.properties_updated = true;
+                }
+            }
+            WalOperation::JobRenew {
+                request,
+                at,
+                expected_spec,
+                max_runway_seconds,
+                qos,
+                account_limits,
+            } => {
+                response.renewal = Some((|| {
+                    let mut user_tres = TresRecord::new();
+                    let mut qos_tres = TresRecord::new();
+                    let mut account_tres = TresRecord::new();
+                    let expected_account = expected_spec.account.as_deref();
+                    for running in jobs
+                        .values()
+                        .filter(|j| j.job_id != request.job_id && j.state.is_active())
+                    {
+                        let tres = job_tres(running);
+                        if running.spec.qos == expected_spec.qos {
+                            qos_tres.add(&tres);
+                            if running.spec.user == request.user {
+                                user_tres.add(&tres);
+                            }
+                        }
+                        if running.spec.account.as_deref() == expected_account {
+                            account_tres.add(&tres);
+                        }
+                    }
+                    let job = jobs.get_mut(&request.job_id).ok_or("not_found: job")?;
+                    if job.spec.user != request.user {
+                        return Err("unauthorized: owner changed".into());
+                    }
+                    if let Some(receipt) = job.renewal_receipts.iter().find(|r| {
+                        r.request.user == request.user && r.request.request_id == request.request_id
+                    }) {
+                        return if receipt.request == *request {
+                            Ok(receipt.clone())
+                        } else {
+                            Err("conflict: request ID reused".into())
+                        };
+                    }
+                    if request.request_id.is_empty()
+                        || request.request_id.len() > 128
+                        || job.renewal_receipts.len() >= 4096
+                    {
+                        return Err("invalid: request ID or receipt capacity".into());
+                    }
+                    if !job.renewal_ready {
+                        return Err("ineligible: run predates renewable launch fencing".into());
+                    }
+                    if job.state != JobState::Running || job.run_attempt != request.run_attempt {
+                        return Err("not_running: run changed".into());
+                    }
+                    if job.deadline_revision != request.expected_revision {
+                        return Err("stale_revision: deadline changed".into());
+                    }
+                    if job.time_limit_signaled_at.is_some()
+                        || job.has_suspended
+                        || job.suspended_at.is_some()
+                        || job.suspended_secs != 0
+                    {
+                        return Err("ineligible: timeout or suspension".into());
+                    }
+                    if serde_json::to_value(&job.spec).ok()
+                        != serde_json::to_value(expected_spec).ok()
+                    {
+                        return Err("stale_revision: job specification changed".into());
+                    }
+                    let start = job.start_time.ok_or("not_running: start missing")?;
+                    let limit = job.spec.time_limit.ok_or("ineligible: unlimited job")?;
+                    let previous_expiry = start
+                        .checked_add_signed(limit)
+                        .ok_or("invalid: expiry overflow")?;
+                    if *at >= previous_expiry {
+                        return Err("expired: deadline elapsed".into());
+                    }
+                    if request.expires_at <= previous_expiry
+                        || request.expires_at - *at
+                            > chrono::Duration::seconds(i64::from(*max_runway_seconds))
+                    {
+                        return Err("policy_limit: expiry must increase within runway".into());
+                    }
+                    let partitions = self.partitions.read();
+                    self.validate_partition(&job.spec, &partitions)
+                        .map_err(|e| format!("policy_limit: {e}"))?;
+                    let partition = partitions
+                        .iter()
+                        .find(|p| Some(&p.name) == job.spec.partition.as_ref())
+                        .ok_or("ineligible: partition missing")?;
+                    if partition.max_time_minutes.is_some_and(|cap| {
+                        request.expires_at - start > chrono::Duration::minutes(i64::from(cap))
+                    }) {
+                        return Err("policy_limit: partition wall cap".into());
+                    }
+                    let reservations = self.reservations.read();
+                    for reservation in reservations.iter() {
+                        if job.spec.reservation.as_deref() == Some(reservation.name.as_str()) {
+                            if request.expires_at > reservation.end_time {
+                                return Err("reservation_conflict: reservation end".into());
+                            }
+                        } else if reservation.start_time < request.expires_at
+                            && reservation.end_time > *at
+                            && job
+                                .allocated_nodes
+                                .iter()
+                                .any(|n| reservation.covers_node(n))
+                        {
+                            return Err("reservation_conflict: protected nodes".into());
+                        }
+                    }
+                    for cap in [qos.limits.max_wall_minutes, account_limits.max_wall_minutes]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if request.expires_at - start > chrono::Duration::minutes(i64::from(cap)) {
+                            return Err("policy_limit: lifetime wall cap".into());
+                        }
+                    }
+                    if qos.limits.grp_wall_minutes.is_some() {
+                        return Err("ineligible: group-wall capped QoS".into());
+                    }
+                    let mut candidate = job.clone();
+                    candidate.spec.time_limit = Some(request.expires_at - start);
+                    let mut renewal_qos = (**qos).clone();
+                    renewal_qos.limits.max_jobs_per_user = None;
+                    renewal_qos.limits.max_submit_jobs_per_user = None;
+                    let mut renewal_account = account_limits.clone();
+                    renewal_account.max_running_jobs = None;
+                    renewal_account.max_submit_jobs = None;
+                    if !matches!(
+                        spur_core::qos::check_qos_limits(
+                            &candidate,
+                            &renewal_qos,
+                            0,
+                            0,
+                            &user_tres,
+                            &qos_tres,
+                            None
+                        ),
+                        spur_core::qos::QosCheckResult::Allowed
+                    ) || !matches!(
+                        spur_core::account_limits::check_account_limits(
+                            &candidate,
+                            &renewal_account,
+                            0,
+                            0,
+                            &account_tres
+                        ),
+                        spur_core::account_limits::AccountCheckResult::Allowed
+                    ) {
+                        return Err("policy_limit: current aggregate resource caps".into());
+                    }
+                    let revision = job
+                        .deadline_revision
+                        .checked_add(1)
+                        .ok_or("invalid: revision overflow")?;
+                    let receipt = spur_core::job::RenewalReceipt {
+                        request: request.clone(),
+                        previous_expiry,
+                        deadline_revision: revision,
+                    };
+                    job.spec.time_limit = Some(request.expires_at - start);
+                    job.deadline_revision = revision;
+                    job.renewal_receipts.push(receipt.clone());
+                    self.planned_reservations.write().clear();
+                    self.planned_job_starts.write().clear();
+                    self.scheduler_notify.notify_one();
+                    Ok(receipt)
+                })());
+            }
+            WalOperation::JobTimeLimitSignaled { job_id, at, guard } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     // A run that already ended keeps the verdict it finalized
                     // with: the watchdog raced the job's own exit and lost.
-                    if job.state.is_active() && job.time_limit_signaled_at.is_none() {
+                    let matches_guard = guard.as_ref().is_none_or(|guard| {
+                        job.state == JobState::Running
+                            && job.run_attempt == guard.run_attempt
+                            // Legacy starts used replica-local clocks; only fenced starts
+                            // have a canonical deadline that replicas can compare.
+                            && (!job.renewal_ready
+                                || (job.deadline_revision == guard.deadline_revision
+                                    && job
+                                        .start_time
+                                        .zip(job.spec.time_limit)
+                                        .map(|(start, limit)| job.effective_deadline(start, limit))
+                                        == Some(guard.deadline)))
+                            && *at >= guard.deadline
+                    });
+                    if job.state.is_active()
+                        && job.time_limit_signaled_at.is_none()
+                        && matches_guard
+                    {
                         job.time_limit_signaled_at = Some(*at);
+                        response.timeout_claimed = true;
                     }
                 }
             }
             WalOperation::JobComplete {
+                timeout_guard,
                 job_id,
                 exit_code,
                 state,
             } => {
+                if let Some((run_attempt, signaled_at)) = timeout_guard {
+                    if !jobs.get(job_id).is_some_and(|job| {
+                        job.run_attempt == *run_attempt
+                            && job.time_limit_signaled_at == Some(*signaled_at)
+                            && job.state == JobState::Running
+                    }) {
+                        return response;
+                    }
+                }
                 let freed_nodes;
                 let allocated_resources;
                 let already_deallocated;
@@ -8545,6 +8996,7 @@ mod tests {
             },
             accounting: Default::default(),
             scheduler: Default::default(),
+            renewal: Default::default(),
             auth: Default::default(),
             partitions: vec![spur_core::config::PartitionConfig {
                 name: "default".into(),
@@ -8588,6 +9040,453 @@ mod tests {
             mpi: Default::default(),
             health: Default::default(),
         }
+    }
+
+    fn renewal_fixture() -> (
+        TempDir,
+        ClusterManager,
+        Job,
+        spur_core::job::RenewalRequest,
+        DateTime<Utc>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.renewal.upgraded_controllers = true;
+        config.renewal.qos.insert(
+            "qualified".into(),
+            spur_core::config::RenewalGrant {
+                enabled: true,
+                class: spur_core::config::RenewalClass::NonBurst,
+                max_runway_seconds: 86400,
+            },
+        );
+        let cm = ClusterManager::new(config, dir.path()).unwrap();
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut job = Job::new(
+            1,
+            JobSpec {
+                user: "alice".into(),
+                account: Some("research".into()),
+                qos: Some("qualified".into()),
+                partition: Some("default".into()),
+                time_limit: Some(chrono::Duration::hours(2)),
+                ..Default::default()
+            },
+        );
+        job.start_time = Some(now - chrono::Duration::hours(1));
+        job.state = JobState::Running;
+        job.run_attempt = 1;
+        job.renewal_ready = true;
+        job.allocated_nodes = vec!["node1".into()];
+        cm.jobs.write().insert(1, job.clone());
+        let request = spur_core::job::RenewalRequest {
+            job_id: 1,
+            user: "alice".into(),
+            run_attempt: 1,
+            expected_revision: 0,
+            request_id: "renew-1".into(),
+            expires_at: now + chrono::Duration::hours(24),
+        };
+        (dir, cm, job, request, now)
+    }
+
+    fn renewal_op(
+        job: &Job,
+        request: spur_core::job::RenewalRequest,
+        at: DateTime<Utc>,
+    ) -> WalOperation {
+        WalOperation::JobRenew {
+            request,
+            at,
+            expected_spec: Box::new(job.spec.clone()),
+            max_runway_seconds: 86400,
+            qos: Box::default(),
+            account_limits: Default::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_policy_and_durable_api_receipt() {
+        let (dir, fixture, job, request, now) = renewal_fixture();
+        let cm = test_cluster_with_config(&dir, (*fixture.config()).clone()).await;
+        cm.jobs.write().insert(1, job);
+        assert!(cm
+            .renew_job(request.clone(), now)
+            .unwrap_err()
+            .to_string()
+            .starts_with("unavailable:"));
+        cm.qos_cache.insert(spur_core::accounting::Qos {
+            name: "qualified".into(),
+            ..Default::default()
+        });
+        cm.association_cache.insert_association("alice", "research");
+        let receipt = cm.renew_job(request.clone(), now).unwrap();
+        assert_eq!(receipt, cm.renew_job(request.clone(), now).unwrap());
+        assert_eq!(cm.get_job(1).unwrap().deadline_revision, 1);
+        let mut other = request;
+        other.user = "mallory".into();
+        assert!(cm
+            .renew_job(other, now)
+            .unwrap_err()
+            .to_string()
+            .starts_with("unauthorized:"));
+    }
+
+    #[test]
+    fn renewal_replay_after_pending_update_and_launch_is_identical() {
+        let (dir, leader, mut job, mut request, now) = renewal_fixture();
+        let follower = ClusterManager::new(test_config(), dir.path()).unwrap();
+        job.state = JobState::Pending;
+        job.start_time = None;
+        leader.jobs.write().insert(1, job.clone());
+        follower.jobs.write().insert(1, job.clone());
+        let update = WalOperation::JobUpdateProperties {
+            job_id: 1,
+            time_limit: Some(chrono::Duration::hours(3)),
+            partition: None,
+            comment: Some("replicated".into()),
+            account: None,
+            qos: None,
+        };
+        for cm in [&leader, &follower] {
+            assert!(cm.apply_operation(&update).properties_updated);
+        }
+        let spec = leader.get_job(1).unwrap().spec;
+        let launch = WalOperation::JobStart {
+            at: Some(now - chrono::Duration::hours(1)),
+            spec: Some(Box::new(spec)),
+            job_id: 1,
+            nodes: vec!["node1".into()],
+            resources: ResourceAllocations::with_scalar(1, 0),
+            per_node_alloc: HashMap::new(),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        };
+        for cm in [&leader, &follower] {
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            cm.apply_operation(&launch);
+        }
+        request.expected_revision = 0;
+        let op = renewal_op(&leader.get_job(1).unwrap(), request, now);
+        let wire = serde_json::to_vec(&op).unwrap();
+        let replay = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(
+            leader.apply_operation(&op).renewal,
+            follower.apply_operation(&replay).renewal
+        );
+        let a = leader.get_job(1).unwrap();
+        let b = follower.get_job(1).unwrap();
+        assert_eq!(a.start_time, b.start_time);
+        assert_eq!(a.spec.time_limit, b.spec.time_limit);
+        assert_eq!(a.deadline_revision, b.deadline_revision);
+        assert_eq!(a.renewal_receipts.len(), 1);
+    }
+
+    #[test]
+    fn renewal_publication_does_not_block_job_table_cache_readers() {
+        let (_dir, cm, before, request, now) = renewal_fixture();
+        cm.qos_cache.insert(Qos {
+            name: "qualified".into(),
+            ..Default::default()
+        });
+        cm.association_cache.insert_association("alice", "research");
+        let (qos_guard, _) = cm.qos_cache.renewal_snapshot();
+        let (association_guard, _) = cm.association_cache.renewal_snapshot();
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let qos_writer = scope.spawn(|| {
+                barrier.wait();
+                cm.qos_cache.reset();
+            });
+            let association_writer = scope.spawn(|| {
+                barrier.wait();
+                cm.association_cache.reset();
+            });
+            barrier.wait();
+            // assoc_mgr_info holds jobs while reading both caches, as real RPCs do.
+            let info = cm.assoc_mgr_info(None);
+            assert!(!info.qos_records.is_empty());
+            assert!(cm
+                .apply_operation(&renewal_op(&before, request, now))
+                .renewal
+                .unwrap()
+                .is_ok());
+            drop(association_guard);
+            drop(qos_guard);
+            qos_writer.join().unwrap();
+            association_writer.join().unwrap();
+        });
+        assert!(!cm.qos_cache.is_loaded());
+        assert!(!cm.association_cache.is_loaded());
+    }
+
+    #[test]
+    fn renewal_default_off_and_burst_are_refused() {
+        for class in [
+            spur_core::config::RenewalClass::Unqualified,
+            spur_core::config::RenewalClass::Burst,
+        ] {
+            let (_dir, cm, _, request, now) = renewal_fixture();
+            let mut config = (*cm.config()).clone();
+            config.renewal.qos.get_mut("qualified").unwrap().class = class;
+            *cm.config.write() = Arc::new(config);
+            assert!(cm
+                .renew_job(request, now)
+                .unwrap_err()
+                .to_string()
+                .starts_with("ineligible:"));
+        }
+        let (_dir, cm, _, request, now) = renewal_fixture();
+        let mut config = (*cm.config()).clone();
+        config.renewal = Default::default();
+        *cm.config.write() = Arc::new(config);
+        assert!(cm
+            .renew_job(request, now)
+            .unwrap_err()
+            .to_string()
+            .starts_with("unsupported:"));
+    }
+
+    #[test]
+    fn renewal_reservation_and_partition_conflicts_are_atomic() {
+        let (_dir, cm, before, request, now) = renewal_fixture();
+        cm.reservations.write().push(Reservation {
+            name: "maintenance".into(),
+            start_time: now + chrono::Duration::hours(2),
+            end_time: now + chrono::Duration::hours(3),
+            nodes: vec!["node1".into()],
+            accounts: vec![],
+            users: vec![],
+            flags: Default::default(),
+            owner: "admin".into(),
+        });
+        assert!(cm
+            .apply_operation(&renewal_op(&before, request.clone(), now))
+            .renewal
+            .unwrap()
+            .unwrap_err()
+            .starts_with("reservation_conflict:"));
+        cm.reservations.write().clear();
+        cm.partitions.write()[0].max_time_minutes = Some(25 * 60 - 1);
+        assert!(cm
+            .apply_operation(&renewal_op(&before, request.clone(), now))
+            .renewal
+            .unwrap()
+            .unwrap_err()
+            .starts_with("policy_limit:"));
+        cm.partitions.write()[0].max_time_minutes = Some(25 * 60);
+        assert!(cm
+            .apply_operation(&renewal_op(&before, request, now))
+            .renewal
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn renewal_legacy_active_update_cannot_bypass_fence() {
+        let (_dir, cm, before, _, _) = renewal_fixture();
+        assert!(cm
+            .update_job(
+                1,
+                Some(chrono::Duration::hours(48)),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err());
+        assert_eq!(
+            cm.get_job(1).unwrap().spec.time_limit,
+            before.spec.time_limit
+        );
+    }
+
+    #[test]
+    fn renewal_lifetime_wall_limit_is_exact() {
+        let (_dir, cm, _, request, now) = renewal_fixture();
+        cm.qos_cache.insert(spur_core::accounting::Qos {
+            name: "qualified".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(24 * 60),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        cm.association_cache.insert_association("alice", "research");
+        assert!(cm
+            .renew_job(request, now)
+            .unwrap_err()
+            .to_string()
+            .starts_with("policy_limit:"));
+    }
+
+    #[test]
+    fn renewal_preserves_allocation_and_replays_receipt() {
+        let (_dir, cm, before, request, now) = renewal_fixture();
+        let op = renewal_op(&before, request.clone(), now);
+        let receipt = cm.apply_operation(&op).renewal.unwrap().unwrap();
+        let after = cm.get_job(1).unwrap();
+        assert_eq!(after.run_attempt, before.run_attempt);
+        assert_eq!(after.start_time, before.start_time);
+        assert_eq!(after.allocated_nodes, before.allocated_nodes);
+        assert_eq!(
+            serde_json::to_value(&after.per_node_alloc).unwrap(),
+            serde_json::to_value(&before.per_node_alloc).unwrap()
+        );
+        assert_eq!(after.state, JobState::Running);
+        assert_eq!(after.spec.time_limit, Some(chrono::Duration::hours(25)));
+        assert_eq!(receipt, cm.apply_operation(&op).renewal.unwrap().unwrap());
+        let mut conflict = request;
+        conflict.expires_at += chrono::Duration::seconds(1);
+        assert!(cm
+            .apply_operation(&renewal_op(&before, conflict, now))
+            .renewal
+            .unwrap()
+            .is_err());
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored = ClusterManager::new(test_config(), _dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            restored.apply_operation(&op).renewal.unwrap().unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn renewal_and_timeout_claim_are_ordered_atomically() {
+        let (_dir, cm, before, request, now) = renewal_fixture();
+        let deadline = before.start_time.unwrap() + before.spec.time_limit.unwrap();
+        let claim = WalOperation::JobTimeLimitSignaled {
+            job_id: 1,
+            at: deadline,
+            guard: Some(spur_core::job::TimeoutGuard {
+                run_attempt: 1,
+                deadline_revision: 0,
+                deadline,
+            }),
+        };
+        assert!(cm
+            .apply_operation(&renewal_op(&before, request.clone(), now))
+            .renewal
+            .unwrap()
+            .is_ok());
+        assert!(!cm.apply_operation(&claim).timeout_claimed);
+        cm.jobs.write().insert(1, before.clone());
+        assert!(cm.apply_operation(&claim).timeout_claimed);
+        assert!(!cm.apply_operation(&claim).timeout_claimed);
+        assert!(cm
+            .apply_operation(&renewal_op(&before, request, now))
+            .renewal
+            .unwrap()
+            .is_err());
+    }
+
+    #[test]
+    fn renewal_refusals_leave_job_unchanged() {
+        for case in 0..7 {
+            let (_dir, cm, mut before, mut request, now) = renewal_fixture();
+            match case {
+                0 => request.expected_revision = 1,
+                1 => request.run_attempt = 2,
+                2 => before.state = JobState::Suspended,
+                3 => before.suspended_secs = 1,
+                4 => request.expires_at += chrono::Duration::seconds(1),
+                5 => before.renewal_ready = false,
+                _ => before.spec.time_limit = Some(chrono::Duration::minutes(30)),
+            }
+            cm.jobs.write().insert(1, before.clone());
+            assert!(cm
+                .apply_operation(&renewal_op(&before, request, now))
+                .renewal
+                .unwrap()
+                .is_err());
+            assert_eq!(
+                serde_json::to_value(cm.get_job(1).unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_timeout_replay_ignores_replica_local_start_clocks() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = test_cluster(&dir_a).await;
+        let b = test_cluster(&dir_b).await;
+        let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for (cm, offset) in [(&a, 0), (&b, 5)] {
+            register_node(cm, "node1", 8, 16000);
+            let mut spec = basic_spec("legacy-timeout");
+            spec.time_limit = Some(chrono::Duration::hours(1));
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(spec),
+            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            cm.apply_operation(&WalOperation::JobStart {
+                at: None,
+                spec: None,
+                job_id: 1,
+                nodes: vec!["node1".into()],
+                resources: scalar_alloc(4, 8000),
+                per_node_alloc: per_node_for(&["node1"], scalar_alloc(4, 8000)),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+            });
+            let mut jobs = cm.jobs.write();
+            let job = jobs.get_mut(&1).unwrap();
+            job.start_time =
+                Some(at - chrono::Duration::hours(1) + chrono::Duration::seconds(offset));
+            assert!(!job.renewal_ready);
+        }
+        let claim = WalOperation::JobTimeLimitSignaled {
+            job_id: 1,
+            at,
+            guard: Some(spur_core::job::TimeoutGuard {
+                run_attempt: 1,
+                deadline_revision: 0,
+                deadline: at,
+            }),
+        };
+        let finish = WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Timeout,
+            timeout_guard: Some((1, at)),
+        };
+        for cm in [&a, &b] {
+            assert!(cm.apply_operation(&claim).timeout_claimed);
+            assert_eq!(cm.get_job(1).unwrap().time_limit_signaled_at, Some(at));
+            assert_eq!(cm.apply_operation(&finish).jobs_finalized.len(), 1);
+            assert_eq!(cm.get_job(1).unwrap().state, JobState::Timeout);
+            let resources = cm.get_node("node1").unwrap().alloc_resources;
+            assert_eq!(resources.cpus, 0);
+            assert_eq!(resources.memory_mb, 0);
+        }
+    }
+
+    #[test]
+    fn stale_timeout_finish_cannot_end_replacement_run() {
+        let (_dir, cm, mut before, _, now) = renewal_fixture();
+        before.run_attempt = 2;
+        cm.jobs.write().insert(1, before);
+        let result = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            state: JobState::Timeout,
+            exit_code: -1,
+            timeout_guard: Some((1, now)),
+        });
+        assert!(result.jobs_finalized.is_empty());
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
     }
 
     async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
@@ -9907,6 +10806,8 @@ mod tests {
 
         let resources = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: resources.clone(),
@@ -9941,6 +10842,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
@@ -9950,6 +10853,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -9975,6 +10879,7 @@ mod tests {
             spec: Box::new(basic_spec("done")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10070,6 +10975,7 @@ mod tests {
                 spec: Box::new(basic_spec("done")),
             });
             cm.apply_operation(&WalOperation::JobComplete {
+                timeout_guard: None,
                 job_id: 1,
                 exit_code: 0,
                 state: JobState::Cancelled,
@@ -10124,6 +11030,7 @@ mod tests {
             spec: Box::new(basic_spec("fresh")),
         });
         cm2.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10158,6 +11065,7 @@ mod tests {
             spec: Box::new(basic_spec("done")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10203,6 +11111,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 100,
             exit_code: 0,
             state: JobState::Completed,
@@ -10226,6 +11135,7 @@ mod tests {
 
         // Once the child is gone, the target is evictable.
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 101,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10259,6 +11169,7 @@ mod tests {
             spec: Box::new(basic_spec("high")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: id2,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10522,6 +11433,7 @@ mod tests {
             preempt_qos: None,
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10995,6 +11907,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -11036,6 +11950,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -11078,6 +11994,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -11143,6 +12061,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -11204,6 +12124,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -11268,6 +12190,8 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         let start = || WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
@@ -11374,6 +12298,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
@@ -11424,6 +12350,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -11433,6 +12361,7 @@ mod tests {
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -11463,6 +12392,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -11472,6 +12403,7 @@ mod tests {
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -11485,6 +12417,7 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 0);
 
         let second = cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Cancelled,
@@ -11520,6 +12453,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -11556,6 +12491,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -11742,6 +12679,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -11777,6 +12716,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -11815,6 +12756,8 @@ mod tests {
         ));
         // Re-dispatched run: current epoch is 2.
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
@@ -11854,6 +12797,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -11921,6 +12866,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
@@ -13495,6 +14442,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Failed,
@@ -13570,6 +14518,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -13863,6 +14813,8 @@ mod tests {
 
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -13871,6 +14823,7 @@ mod tests {
             run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -13878,6 +14831,7 @@ mod tests {
 
         // Replaying the terminal complete: still Completed, resources still freed.
         let replayed = cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -13905,6 +14859,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Preempted,
@@ -13950,6 +14905,8 @@ mod tests {
         ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
@@ -14068,6 +15025,7 @@ mod tests {
     fn preempted_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
         let job_id = run_job_on(cm, name, node);
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -14111,6 +15069,7 @@ mod tests {
         let job_id = preempted_job_on(&cm, "replay-complete", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: 0,
             state: JobState::Completed,
@@ -16585,6 +17544,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -16601,6 +17561,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                timeout_guard: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -16635,6 +17596,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -16651,6 +17613,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                timeout_guard: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17042,6 +18005,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -17058,6 +18022,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                timeout_guard: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17092,6 +18057,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -22211,6 +23177,7 @@ mod tests {
         assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
 
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: id,
             exit_code: -1,
             state: JobState::Timeout,
@@ -23884,6 +24851,7 @@ mod tests {
             ));
         }
         cm.apply_operation(&WalOperation::JobComplete {
+            timeout_guard: None,
             job_id: id,
             exit_code,
             state,
@@ -24909,6 +25877,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
@@ -24925,6 +25895,8 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobStart {
+            at: None,
+            spec: None,
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),

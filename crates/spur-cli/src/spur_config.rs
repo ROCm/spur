@@ -13,6 +13,7 @@ pub fn load_spur_config() -> SlurmConfig {
             controller: Default::default(),
             accounting: Default::default(),
             scheduler: Default::default(),
+            renewal: Default::default(),
             auth: Default::default(),
             partitions: Vec::new(),
             nodes: Vec::new(),

@@ -11,8 +11,8 @@ use tracing::{info, warn};
 
 use spur_core::accounting::AccountLimits;
 
-#[derive(Default)]
-struct Snapshot {
+#[derive(Clone, Default)]
+pub(crate) struct Snapshot {
     default_qos: HashMap<(String, String), String>,
     default_account: HashMap<String, String>,
     memberships: HashSet<(String, String)>,
@@ -34,6 +34,7 @@ pub enum AccountMembership {
 /// refresh can never be observed half-applied.
 pub struct AssociationCache {
     snapshot: RwLock<Snapshot>,
+    publication: parking_lot::Mutex<()>,
 }
 
 /// Whether `qos` is usable given an association's allow-list and pinned
@@ -43,9 +44,41 @@ pub(crate) fn qos_permitted(allowed: &HashSet<String>, default: Option<&str>, qo
     (allowed.is_empty() && default.is_none()) || allowed.contains(qos) || default == Some(qos)
 }
 
+impl Snapshot {
+    pub(crate) fn renewal_limits(
+        &self,
+        user: &str,
+        account: &str,
+        qos: &str,
+    ) -> Result<AccountLimits, String> {
+        if !self.loaded {
+            return Err("unavailable: association cache not loaded".into());
+        }
+        let key = (user.to_owned(), account.to_owned());
+        let empty = HashSet::new();
+        if !self.memberships.contains(&key)
+            || !qos_permitted(
+                self.allowed_qos.get(&key).unwrap_or(&empty),
+                self.default_qos.get(&key).map(String::as_str),
+                qos,
+            )
+        {
+            return Err("unauthorized: association does not permit this QoS".into());
+        }
+        Ok(self.limits.get(&key).cloned().unwrap_or_default())
+    }
+}
+
 impl AssociationCache {
+    pub(crate) fn renewal_snapshot(&self) -> (parking_lot::MutexGuard<'_, ()>, Snapshot) {
+        let publication = self.publication.lock();
+        let snapshot = self.snapshot.read().clone();
+        (publication, snapshot)
+    }
+
     pub fn new() -> Self {
         Self {
+            publication: parking_lot::Mutex::new(()),
             snapshot: RwLock::new(Snapshot {
                 default_qos: HashMap::new(),
                 default_account: HashMap::new(),
@@ -206,6 +239,7 @@ impl AssociationCache {
         allowed_qos: HashMap<(String, String), HashSet<String>>,
         admin_level: HashMap<String, String>,
     ) {
+        let _publication = self.publication.lock();
         *self.snapshot.write() = Snapshot {
             default_qos,
             default_account,
@@ -221,12 +255,14 @@ impl AssociationCache {
     /// started controller sees it while its predecessor's queue is already durable.
     #[cfg(test)]
     pub(crate) fn reset(&self) {
+        let _publication = self.publication.lock();
         *self.snapshot.write() = Snapshot::default();
     }
 
     /// Test-only seam: populates the cache without a database.
     #[cfg(test)]
     pub(crate) fn insert_association(&self, user: &str, account: &str) {
+        let _publication = self.publication.lock();
         let mut snap = self.snapshot.write();
         snap.memberships
             .insert((user.to_owned(), account.to_owned()));
@@ -235,6 +271,7 @@ impl AssociationCache {
 
     #[cfg(test)]
     pub(crate) fn insert_admin_level(&self, user: &str, level: &str) {
+        let _publication = self.publication.lock();
         let mut snap = self.snapshot.write();
         snap.admin_level.insert(user.to_owned(), level.to_owned());
         snap.loaded = true;
@@ -242,6 +279,7 @@ impl AssociationCache {
 
     #[cfg(test)]
     pub(crate) fn insert_default_qos(&self, user: &str, account: &str, qos: &str) {
+        let _publication = self.publication.lock();
         let mut snap = self.snapshot.write();
         snap.memberships
             .insert((user.to_owned(), account.to_owned()));
@@ -252,6 +290,7 @@ impl AssociationCache {
 
     #[cfg(test)]
     pub(crate) fn insert_allowed_qos(&self, user: &str, account: &str, qos: &[&str]) {
+        let _publication = self.publication.lock();
         let mut snap = self.snapshot.write();
         snap.memberships
             .insert((user.to_owned(), account.to_owned()));
@@ -264,6 +303,7 @@ impl AssociationCache {
 
     #[cfg(test)]
     pub(crate) fn insert_default_account(&self, user: &str, account: &str) {
+        let _publication = self.publication.lock();
         let mut snap = self.snapshot.write();
         snap.memberships
             .insert((user.to_owned(), account.to_owned()));
@@ -274,6 +314,7 @@ impl AssociationCache {
 
     #[cfg(test)]
     pub(crate) fn insert_limits(&self, user: &str, account: &str, limits: AccountLimits) {
+        let _publication = self.publication.lock();
         let mut snap = self.snapshot.write();
         snap.memberships
             .insert((user.to_owned(), account.to_owned()));
@@ -284,6 +325,7 @@ impl AssociationCache {
 
     #[cfg(test)]
     pub(crate) fn set_loaded_without_associations(&self) {
+        let _publication = self.publication.lock();
         self.snapshot.write().loaded = true;
     }
 

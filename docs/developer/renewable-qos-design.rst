@@ -1,15 +1,85 @@
-Renewable QoS: draft design and implementation gates
-===================================================
+Renewable QoS: implementation and validation gates
+==================================================
 
 Status and scope
 ----------------
 
-**Design only: renewable allocations are not implemented by this change.**
-This document is a review milestone for `the renewable-allocation proposal
-<https://github.com/amdpilot-org/spur/issues/2>`_, not permission to resume jobs,
-change cluster policy, or promise uninterrupted runtime. No live-cluster
-validation has been performed. An existing successful ``UpdateJob`` response
-must not be advertised as a durable, policy-qualified renewal.
+The implementation adds the dedicated ``RenewJob`` RPC and
+``spur control renew`` command. It is disabled by default. No live-cluster
+validation has been performed; this change is not permission to resume jobs or
+change cluster policy. An ordinary successful ``UpdateJob`` response is not a
+renewal receipt. The historical analysis and acceptance checklist below remain
+useful review context; not every listed integration gate has been executed.
+
+Implemented interface
+~~~~~~~~~~~~~~~~~~~~~
+
+After upgrading **every controller**, explicitly acknowledge the WAL format
+upgrade and qualify a QoS in ``spur.conf``::
+
+    [renewal]
+    upgraded_controllers = true
+
+    [renewal.qos.qualified]
+    enabled = true
+    class = "non_burst"
+    max_runway_seconds = 86400
+
+``class`` defaults to ``unqualified``; ``burst`` refuses renewal even with
+``enabled = true``. Names do not confer eligibility. The administrator owns the
+classification: do not classify an existing burst policy as non-burst. Removing
+the grant prevents new renewals, not previously committed expiry extensions.
+Never enable the upgrade acknowledgement while an old controller can lead or
+replay new entries. Downgrading after new renewal entries is unsupported.
+
+Inspect ``spur show job JOB`` for ``RunAttempt``, ``DeadlineRevision`` and
+``AllocationExpiry``, then request an explicit absolute expiry::
+
+    spur control renew 42 --run-attempt 1 --revision 0 \
+        --request-id owner-chosen-unique-id --expires-at 2026-09-17T12:00:00Z
+
+Only an authenticated, verified owner may renew; no administrator ownership
+bypass or claimed-user fallback is accepted. The RPC has no mixed-edit fields.
+Old servers return UNIMPLEMENTED. The CLI checks the mandatory receipt's job,
+run, revision, request ID and expiry and never falls back to cancel/requeue.
+Identical retries return a historical receipt, including after the run ends;
+a conflicting reuse refuses. Receipts are retained with the job, bounded to
+4096 successful renewals per job; further requests refuse instead of evicting
+idempotency history. Refused requests do not consume receipt storage.
+
+Runway is not lifetime. An expiry 24 hours from now after one elapsed hour
+requires at least 25 hours of QoS, association and partition lifetime budget.
+Existing MaxWall/MaxTime are never silently raised or reinterpreted. Configure
+an appropriately qualified policy before requesting that runway. Group-wall
+capped QoS is conservatively ineligible because cached accounting cannot reserve
+future group wall atomically. Jobs with suspension history are ineligible.
+
+**Existing-running-allocation limitation:** only runs launched after enabling the
+upgrade gate carry a replicated canonical start time and job specification.
+Pre-upgrade running allocations refuse renewal; this implementation cannot extend
+an already-running legacy holder in place. It does not cancel/requeue that holder
+to manufacture eligibility. A separately reviewed replicated adoption mechanism
+would be needed for safe migration of such allocations.
+
+Acceptance changes only the time budget and deadline revision. Processes, run,
+node/device allocations, resource accounting and start time are not reset.
+Preemption, failure, cancellation, inactivity enforcement and maintenance still
+apply; a receipt is not a guarantee of runtime or node health. The controller is
+the allocation wall-time enforcer; no node lease-update RPC is required.
+
+The watchdog commits a run/deadline-guarded timeout claim and checks its actual
+apply result before sending SIGTERM. A stale or duplicate claim sends nothing.
+Once claimed, renewal refuses. Grace completion is guarded by run and claim
+before finalizing and sending SIGKILL. Legacy runs cannot renew and therefore use
+run fencing without comparing their historically replica-local deadlines; the
+leader's replicated timeout instant is shared by every replica. Qualified new
+runs additionally compare their canonical deadline and revision.
+
+QoS and association policy publication is serialized with renewal commit. Renewal
+holds publication guards, not cache read locks: ordinary readers that hold the
+job-table lock remain able to read caches while a refresh waits to publish. Legacy active-job deadline/account/QoS/
+partition edits are refused to prevent bypassing this fence; pending edits retain
+their ordinary path with lifetime-wall checks.
 
 The target is an owner-requested, in-place extension of an administrator-qualified,
 non-burst, running allocation. It must preserve job ID, run attempt, nodes,
@@ -107,7 +177,7 @@ Entitlement and policy
   boundaries rather than silently truncating seconds to minutes.
 
 Wire contract and retries
-~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Prefer an explicitly discriminated extension mode on ``UpdateJob``, preserving
 ordinary update behavior. It needs an absolute desired expiry, expected run
@@ -128,7 +198,7 @@ additive dedicated RPC rather than pretending an ignored field is supported.
 No client silently falls back to cancel/requeue or successor submission.
 
 Durability and timeout fencing prerequisite
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 #. Introduce a guarded timeout-claim operation carrying expected run attempt and
    expected deadline revision (or equivalent exact deadline identity). Apply it
@@ -157,7 +227,7 @@ Tests must call real state-machine and watchdog decision code, with deterministi
 ordering, rather than simulate a second implementation of the race.
 
 Enforcement, forecasts, and accounting
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The inspected wall-time watchdog is controller-side. Do not invent an agent
 lease-update requirement without first auditing every launch/executor/stepd,
@@ -212,11 +282,18 @@ Implementation acceptance gates (not executed)
 * Isolated integration gate, separately authorized: verify unchanged PIDs/cgroups/
   devices and actual termination timing. No live beam workload is a test fixture.
 
-Validation of this design change
--------------------------------
+Implementation validation and migration
+---------------------------------------
 
-No runtime code or tests are changed. ``cargo test --locked`` was attempted in the
-review environment and could not start: ``cargo: command not found`` (exit 127).
-No local Rust or protobuf toolchain installation was performed. This is not a passing test result. Rust tests, clippy, and runtime
-acceptance remain required for the implementation; this document alone does not
-satisfy the feature-delivery or beam-restart gate.
+Controller unit/regression tests exercise real Raft application, retry receipts,
+snapshot restoration, timeout ordering, policy refusal and preserved allocation
+identity. These do not establish unchanged real PIDs/cgroups or successful live
+termination timing. No live-cluster acceptance has been performed.
+
+**Compatibility change:** ordinary active-job deadline, account, QoS and partition
+updates now refuse rather than bypassing durable renewal authorization. Migrate
+qualified deadline extensions to ``RenewJob``/``spur control renew``. Other
+active-job policy edits require ending the allocation or an independently safe
+administrative workflow. This behavioral tightening requires a breaking-change
+release note; existing default and burst submission/scheduling policy is not
+automatically granted renewal eligibility.

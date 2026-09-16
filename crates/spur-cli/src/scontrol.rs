@@ -93,6 +93,19 @@ pub enum ScontrolCommand {
         /// Job ID
         job_id: u32,
     },
+    /// Extend a qualified running allocation in place; never requeue
+    Renew {
+        job_id: u32,
+        #[arg(long)]
+        run_attempt: u32,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        request_id: String,
+        /// Absolute RFC3339 expiry
+        #[arg(long)]
+        expires_at: String,
+    },
     /// Resume a suspended job (SIGCONT)
     Resume {
         /// Job ID
@@ -366,6 +379,45 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .await
                 .context("suspend failed")?;
             println!("job {} suspended", job_id);
+            Ok(())
+        }
+        ScontrolCommand::Renew {
+            job_id,
+            run_attempt,
+            revision,
+            request_id,
+            expires_at,
+        } => {
+            let expiry = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .context("expires-at must be an absolute RFC3339 timestamp")?;
+            let expires_at = prost_types::Timestamp {
+                seconds: expiry.timestamp(),
+                nanos: expiry.timestamp_subsec_nanos() as i32,
+            };
+            let channel = crate::authclient::connect(&args.controller).await?;
+            let mut client = spur_proto::controller_client(channel);
+            let receipt = client
+                .renew_job(spur_proto::proto::RenewJobRequest {
+                    job_id,
+                    run_attempt,
+                    expected_revision: revision,
+                    request_id: request_id.clone(),
+                    expires_at: Some(expires_at),
+                })
+                .await
+                .context("renewal refused; no cancel/requeue fallback was attempted")?
+                .into_inner();
+            if receipt.job_id != job_id
+                || receipt.run_attempt != run_attempt
+                || receipt.request_id != request_id
+                || receipt.deadline_revision
+                    != revision.checked_add(1).context("revision overflow")?
+                || receipt.expires_at != Some(expires_at)
+                || receipt.previous_expiry.is_none()
+            {
+                bail!("invalid renewal receipt; inspect the job before retrying");
+            }
+            println!("RenewalReceipt JobId={} RunAttempt={} DeadlineRevision={} RequestId={} ExpiresAt={} (historical receipt; not a runtime guarantee)", job_id, run_attempt, receipt.deadline_revision, request_id, expiry.to_rfc3339());
             Ok(())
         }
         ScontrolCommand::Resume { job_id } => {
@@ -1893,6 +1945,13 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     let mut out = String::new();
 
     let _ = writeln!(out, "JobId={} JobName={}", job.job_id, job.name);
+    let _ = writeln!(
+        out,
+        "   RunAttempt={} DeadlineRevision={} AllocationExpiry={}",
+        job.run_attempt,
+        job.deadline_revision,
+        format_ts(job.allocation_expiry.as_ref())
+    );
     if !job.comment.is_empty() {
         let _ = writeln!(out, "   Comment={}", job.comment);
     }

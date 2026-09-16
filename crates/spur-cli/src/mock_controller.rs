@@ -294,6 +294,7 @@ mock_controller_impl! {
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
+        renew_job(proto::RenewJobRequest) -> proto::RenewJobResponse;
         requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
