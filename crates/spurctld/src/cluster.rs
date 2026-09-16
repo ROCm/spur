@@ -7187,8 +7187,8 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// `Some(reason)` for a down required listed node or an all-down placement.
-/// Too-few-eligible is left alone in both cases: those nodes may still join.
+/// `Some(reason)` when no eligible node is one real placement would ever use.
+/// Too-few-eligible is left alone: those nodes may still join.
 fn structural_unplaceable_reason(
     job: &Job,
     nodes: &HashMap<String, Node>,
@@ -7215,7 +7215,11 @@ fn structural_unplaceable_reason(
         return Some(PendingReason::ReqNodeNotAvail);
     }
 
-    if eligible.len() < needed || eligible.iter().any(|n| n.state.is_up()) {
+    if eligible.len() < needed
+        || eligible
+            .iter()
+            .any(|n| placement.matches_for_reservation(n, reservations, now))
+    {
         return None;
     }
 
@@ -18617,6 +18621,55 @@ mod tests {
             cm.get_job(new_id).unwrap().pending_reason,
             PendingReason::QosGrpNodeLimit,
             "cap already at 1/1 with no spare capacity to reuse must still block, even though n2 is up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_when_the_only_up_node_is_k0s_reserved() {
+        // n1 is operationally Up but claimed by k0s: is_up() alone would miss
+        // this, but real placement excludes it just like a down node.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.k0s_role = Some(K0sRole::Worker);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("stuck-on-k0s-node");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 1;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        let mut placeable = basic_spec("should-still-run");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "a k0s-claimed node is not a real candidate even though it's operationally up"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&stuck_id));
+        assert!(
+            pending.contains(&placeable_id),
+            "a job stuck on a k0s-reserved node must not charge the QOS cap"
         );
     }
 
