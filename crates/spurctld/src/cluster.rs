@@ -7198,11 +7198,24 @@ fn structural_unplaceable_reason(
     let placement = spur_sched::node_match::NodePlacement::new(job);
     let now = chrono::Utc::now();
     let needed = (job.spec.num_nodes as usize).max(1);
+    let required = spur_sched::backfill::job_resource_request(job);
 
     let eligible: Vec<&Node> = nodes
         .values()
         .filter(|n| placement.eligible(n, reservations, now))
         .collect();
+
+    // Mirrors `find_suitable_nodes`: a required listed node that's down fails
+    // the whole additive-nodelist job regardless of other idle capacity.
+    if placement.nodelist_is_additive()
+        && eligible.iter().any(|n| {
+            placement.is_listed(&n.name)
+                && n.total_resources.can_satisfy(&required)
+                && !placement.matches_for_reservation(n, reservations, now)
+        })
+    {
+        return Some(PendingReason::ReqNodeNotAvail);
+    }
 
     if eligible.len() < needed || eligible.iter().any(|n| n.state.is_up()) {
         return None;
@@ -18494,6 +18507,55 @@ mod tests {
         assert!(
             pending.contains(&placeable_id),
             "a requeued-but-unplaceable job must not keep charging the QOS cap after requeue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_when_a_required_listed_node_is_down() {
+        // -w n1 with --nodes=2 is additive: n2 pads the count, but n1 is
+        // required and down, so the whole job fails despite n2 being idle.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("pinned-plus-flex");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 2;
+        stuck.num_tasks = 2;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        let mut placeable = basic_spec("should-still-run");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "a required listed node being down must block the job even though n2 is idle"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&stuck_id));
+        assert!(
+            pending.contains(&placeable_id),
+            "a job stuck on its required-but-down listed node must not charge the QOS cap"
         );
     }
 
