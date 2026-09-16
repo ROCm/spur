@@ -5025,6 +5025,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         min_memory_node_mb: min_memory_requested_mb(&job.spec),
         min_memory_is_per_cpu: job.spec.memory_per_node_mb.is_none()
             && job.spec.memory_per_cpu_mb.is_some(),
+        idle_fill: job.idle_fill,
         eligible_time: Some(datetime_to_proto(job.eligible_time())),
         accrue_time: Some(datetime_to_proto(job.accrue_time())),
         last_sched_eval: job.last_sched_eval.map(datetime_to_proto),

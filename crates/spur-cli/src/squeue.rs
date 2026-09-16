@@ -259,6 +259,9 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
                 job.req_gpus_detail.clone()
             }
         }
+        // Whether this run took borrowed capacity, and so may be reclaimed for a
+        // job that holds a quota claim on it.
+        'W' => if job.idle_fill { "yes" } else { "no" }.into(),
         _ => "?".into(),
     }
 }

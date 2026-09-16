@@ -298,6 +298,11 @@ message JobInfo {
   string sched_nodelist = 78;
 
   bool min_memory_is_per_cpu = 79;
+
+  // True when this run took borrowed capacity: the job exceeded its QOS group
+  // node quota and was placed on nodes nobody with a quota claim wanted, so it
+  // is reclaimable if such a job needs them.
+  bool idle_fill = 80;
 }
 
 message NodeInfo {

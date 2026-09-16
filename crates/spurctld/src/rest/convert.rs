@@ -8,6 +8,7 @@ use spur_core::partition::Partition;
 pub fn job_to_json(job: &Job) -> serde_json::Value {
     serde_json::json!({
         "job_id": job.job_id,
+        "idle_fill": job.idle_fill,
         "name": job.spec.name,
         "user_name": job.spec.user,
         "user_id": job.spec.uid,
