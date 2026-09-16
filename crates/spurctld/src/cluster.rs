@@ -7208,9 +7208,13 @@ fn structural_unplaceable_reason(
 
     // A k0s-claimed node would otherwise match: unlike a down node, it can
     // free up on its own, so it must not be folded into a "will never place"
-    // verdict the way a truly dead node is.
-    let k0s_recoverable =
-        |n: &&Node| n.is_k0s_reserved() && placement.matches_ignoring_k0s(n, reservations, now);
+    // verdict the way a truly dead node is. Capacity still has to hold —
+    // releasing a too-small node would never let the job place either.
+    let k0s_recoverable = |n: &&Node| {
+        n.is_k0s_reserved()
+            && placement.matches_ignoring_k0s(n, reservations, now)
+            && n.total_resources.can_satisfy(&required)
+    };
 
     if placement.additive_listed_node_unavailable(
         eligible.iter().copied(),
@@ -18741,6 +18745,33 @@ mod tests {
             cm.get_job(stuck_id).unwrap().pending_reason,
             PendingReason::K8sReserved,
             "every node being k0s-reserved is not the same as every node being down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_report_k8s_reserved_when_the_reserved_node_is_too_small() {
+        // The only node is k0s-reserved, but it could never fit this job's
+        // request even if k8s released it — releasing it changes nothing, so
+        // this must not be reported as the recoverable K8sReserved case.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 2, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.k0s_role = Some(K0sRole::Worker);
+        }
+
+        let mut stuck = basic_spec("too-big-for-the-k0s-node");
+        stuck.num_nodes = 1;
+        stuck.num_tasks = 1;
+        stuck.cpus_per_task = 8;
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::NodeDown,
+            "a k0s-reserved node too small for the request would never place even if released"
         );
     }
 
