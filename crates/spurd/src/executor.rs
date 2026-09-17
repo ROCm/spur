@@ -447,9 +447,8 @@ impl RunningJob {
     /// Managed jobs are spawned as their own process-group leader, so we signal
     /// the whole group (negative pid) to reach the batch shell and its children
     /// (e.g. an inner `sleep`), not just the tracked process.
-    /// For container (Forked) jobs, signals the entire process subtree
-    /// since the tracked PID is the intermediate parent and the actual
-    /// workload runs as a grandchild inside a PID namespace.
+    /// For container jobs, the workload is signalled while the shepherd stays
+    /// alive to reap it. SIGKILL also fences the shepherd as a fallback.
     pub fn kill_signal(&self, sig: Signal) -> anyhow::Result<()> {
         match self {
             RunningJob::Managed { child, .. } => {
@@ -459,11 +458,20 @@ impl RunningJob {
                 }
                 Ok(())
             }
-            RunningJob::Forked { pid, reaped, .. } => {
+            RunningJob::Forked {
+                pid,
+                workload_pid,
+                reaped,
+                ..
+            } => {
                 if *reaped {
                     return Ok(());
                 }
-                kill_process_tree(*pid, sig);
+                let target = workload_pid.unwrap_or(*pid);
+                kill_process_tree(target, sig);
+                if sig == Signal::SIGKILL && target != *pid {
+                    let _ = signal::kill(Pid::from_raw(*pid), sig);
+                }
                 Ok(())
             }
             RunningJob::AllocationOnly => Ok(()),
@@ -2620,6 +2628,69 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forked_sigterm_targets_workload_and_keeps_shepherd() {
+        let mut shepherd = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn shepherd");
+        let mut workload = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn workload");
+        let job = RunningJob::Forked {
+            pid: shepherd.id() as i32,
+            workload_pid: Some(workload.id() as i32),
+            _pidfd: None,
+            reaped: false,
+        };
+
+        job.kill_signal(Signal::SIGTERM)
+            .expect("signal container workload");
+
+        let workload_status = workload.wait().expect("reap workload");
+        assert!(
+            !workload_status.success(),
+            "SIGTERM must reach the workload"
+        );
+        assert!(
+            shepherd.try_wait().expect("inspect shepherd").is_none(),
+            "the shepherd must remain alive to reap the workload"
+        );
+        shepherd.kill().expect("kill shepherd");
+        shepherd.wait().expect("reap shepherd");
+    }
+
+    #[test]
+    fn forked_sigkill_fences_workload_and_shepherd() {
+        let mut shepherd = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn shepherd");
+        let mut workload = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn workload");
+        let job = RunningJob::Forked {
+            pid: shepherd.id() as i32,
+            workload_pid: Some(workload.id() as i32),
+            _pidfd: None,
+            reaped: false,
+        };
+
+        job.kill_signal(Signal::SIGKILL)
+            .expect("force-kill container");
+
+        assert!(
+            !workload.wait().expect("reap workload").success(),
+            "SIGKILL must reach the workload"
+        );
+        assert!(
+            !shepherd.wait().expect("reap shepherd").success(),
+            "SIGKILL must also fence the shepherd"
+        );
+    }
 
     #[test]
     fn purging_one_step_leaves_its_siblings_output() {

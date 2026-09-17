@@ -1754,6 +1754,7 @@ fn next_step_epoch() -> u64 {
 #[derive(Debug, Default)]
 struct ActiveStep {
     cancel_requested: bool,
+    /// Container workload PID 1, or the host process for non-container steps.
     pid: Option<u32>,
     epoch: u64,
     /// Spool files the step's stdout/stderr are redirected to, so
@@ -2546,6 +2547,10 @@ fn container_parent_ready(
     Ok(workload_pid)
 }
 
+fn container_signal_pid(shepherd_pid: nix::unistd::Pid, workload_pid: Option<i32>) -> u32 {
+    workload_pid.unwrap_or(shepherd_pid.as_raw()) as u32
+}
+
 /// Reap a directly-forked child and map its wait status to a shell-style exit
 /// code (128 + signal when killed). Used by the PTY bridge to await a container
 /// step that was forked raw (no `tokio::process::Child` to `wait()` on).
@@ -2638,24 +2643,22 @@ async fn run_containerized_step(
             // The spool-file fds belong to the child now; close our copies.
             drop(step_files);
 
-            container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
+            let workload_pid = container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
 
             // Register PID for cancellation.
-            let raw_pid = child_pid.as_raw() as u32;
+            let signal_pid = container_signal_pid(child_pid, workload_pid);
             let cancel_now = {
                 let mut steps = active_steps.lock().await;
                 if let Some(step) = steps.get_mut(&step_key) {
-                    step.pid = Some(raw_pid);
+                    step.pid = Some(signal_pid);
                     step.cancel_requested
                 } else {
                     false
                 }
             };
             if cancel_now {
-                // SIGKILL the whole subtree: the workload is a grandchild that
-                // is PID 1 of its namespace and would ignore SIGTERM from here.
                 crate::executor::kill_process_tree(
-                    child_pid.as_raw(),
+                    signal_pid as i32,
                     nix::sys::signal::Signal::SIGKILL,
                 );
                 let _ = nix::sys::wait::waitpid(child_pid, None);
@@ -7940,7 +7943,7 @@ impl AgentService {
                 drop(ready_w);
                 drop(slave);
 
-                container_parent_ready(
+                let workload_pid = container_parent_ready(
                     child_pid,
                     ready_r,
                     self.cgroup.required,
@@ -7956,13 +7959,14 @@ impl AgentService {
 
                 let raw_pid = child_pid.as_raw();
                 rootfs_guard.pid = Some(raw_pid);
+                let signal_pid = container_signal_pid(child_pid, workload_pid);
 
                 // Register so scancel and the allocation-cancel path can signal it.
                 self.active_steps.lock().await.insert(
                     (job_id, step_id),
                     ActiveStep {
                         epoch: next_step_epoch(),
-                        pid: Some(raw_pid as u32),
+                        pid: Some(signal_pid),
                         ..Default::default()
                     },
                 );
@@ -8220,6 +8224,13 @@ mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
     use tonic::Request;
+
+    #[test]
+    fn container_cancellation_targets_workload_pid() {
+        let shepherd = nix::unistd::Pid::from_raw(1200);
+        assert_eq!(container_signal_pid(shepherd, Some(1201)), 1201);
+        assert_eq!(container_signal_pid(shepherd, None), 1200);
+    }
 
     #[test]
     fn spawn_stepd_process_reports_a_live_setsid_grandchild() {
