@@ -286,6 +286,30 @@ to a name, or a node whose reason predates provenance tracking, renders as
 ``Reason=<text> [<user>@<timestamp>]`` when a set-time is recorded, and the REST
 node object carries ``reason_uid`` and ``reason_time`` fields.
 
+Not every reason comes from an admin. A node still reporting ``idle`` or ``mix``
+may nonetheless be skipped by the scheduler, and says so in the same field
+(``Reason=`` in ``scontrol show node``, ``%E`` in ``sinfo``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 42 58
+
+   * - Reason
+     - Meaning
+   * - ``reconciling with the controller``
+     - The agent has just registered and declared what it holds; the node takes
+       no new work until the controller has compared that against its own
+       records. Usually immediate, but a controller still replaying its own log
+       waits for that first, and the whole pass is capped at a minute.
+   * - ``dispatch cooldown after a failed launch (<n>s remaining)``
+     - A launch failed on this node, so the scheduler skips it for
+       ``controller.dispatch_reject_cooldown_secs`` instead of re-picking it
+       every cycle. It returns to service on its own when the countdown ends;
+       the launch failure itself is reported on the affected job.
+
+A reason an admin set with ``scontrol update`` takes precedence over both: a
+drained node reports the drain, not the transient skip.
+
 Node states are shown as short abbreviations: ``idle`` (free), ``alloc`` (fully
 allocated), ``mix`` (partly allocated), ``down``, ``drain`` (offline, not
 accepting jobs), ``drng`` (draining), ``err`` (error), ``unk``
@@ -872,12 +896,27 @@ silently skipped.
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, and ``QOS=``. Node updates need ``NodeName=`` and
-accept ``State=`` and ``Reason=``.
+accept ``State=``, ``Reason=``, and ``Reconcile=``.
 
 .. code-block:: bash
 
    scontrol update JobId=1024 TimeLimit=2:00:00 Priority=100
    scontrol update NodeName=node01 State=drain Reason="maintenance"
+   scontrol update NodeName=node01 Reconcile=yes
+
+``Reconcile=yes`` asks the node for a fresh account of what it believes it is
+running and compares that against the controller's own record, resolving any
+difference. It changes nothing else about the node, so it is safe to run at any
+time. The controller already does this when a node registers, when a new
+controller takes over, and once an hour; this is the way to ask for it
+immediately — for instance after an incident, when you want to confirm a node
+is not still holding resources for a job that has finished.
+
+A node reports a reason of ``reconciling with the controller`` while that
+comparison is in progress. It accepts no new work until it completes. That is
+usually immediate; a controller that is still replaying its own log waits up to
+ten seconds for that before comparing anything, and the pass as a whole is
+capped at a minute.
 
 See Also
 --------

@@ -502,6 +502,7 @@ impl SlurmAgent for VirtualAgent {
             Ok(_) => {
                 info!(job_id, pod = %pod_name, namespace = %ns, target = %req.target_node, "K8s Pod created");
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     ..Default::default()
@@ -510,6 +511,7 @@ impl SlurmAgent for VirtualAgent {
             Err(kube::Error::Api(e)) if e.code == 409 => {
                 info!(job_id, pod = %pod_name, namespace = %ns, target = %req.target_node, "K8s Pod already exists, treating as success");
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     ..Default::default()
@@ -518,6 +520,7 @@ impl SlurmAgent for VirtualAgent {
             Err(e) => {
                 error!(job_id, error = %e, "failed to create K8s Pod");
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: false,
                     error: e.to_string(),
                     ..Default::default()
@@ -549,6 +552,30 @@ impl SlurmAgent for VirtualAgent {
         _request: Request<spur_proto::proto::AgentStartJobRequest>,
     ) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
+    }
+
+    /// A virtual node keeps no local ledger; its pods are the only state.
+    async fn request_node_ledger(
+        &self,
+        _request: Request<spur_proto::proto::RequestNodeLedgerRequest>,
+    ) -> Result<Response<spur_proto::proto::RequestNodeLedgerResponse>, Status> {
+        Ok(Response::new(
+            spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+        ))
+    }
+
+    /// A virtual node has no local ledger to fence: its pods are the only state,
+    /// and cancel deletes them outright.
+    async fn fence_run(
+        &self,
+        request: Request<spur_proto::proto::FenceRunRequest>,
+    ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(spur_proto::proto::FenceRunResponse {
+            success: true,
+            error: String::new(),
+            reject_before_unix_ms: req.reject_before_unix_ms,
+        }))
     }
 
     async fn cancel_job(

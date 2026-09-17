@@ -830,6 +830,10 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    /// `process_start_ticks` is measured from boot, and the spool outlives a
+    /// reboot, so identity is only comparable within the boot that recorded it.
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 impl StepdDescriptor {
@@ -866,6 +870,7 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            boot_id: crate::admission::current_boot_id(),
         }
     }
 }
@@ -975,6 +980,25 @@ fn prune_finalized_session(
         sweep_finalized_session(session_dir, obligations, step_id)?,
         SweptSession::Pruned
     ))
+}
+
+/// Write `name` into `dir` so a reader sees either the previous record or the
+/// whole new one: a torn record on the recovery path reads as corruption.
+pub fn publish_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary_path = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temporary = options.open(&temporary_path)?;
+    temporary.write_all(contents)?;
+    temporary.sync_all()?;
+    drop(temporary);
+    fs::rename(&temporary_path, dir.join(name))?;
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Session records carry the job's environment, so they are owner-only.
@@ -2268,28 +2292,13 @@ impl StepdStore {
             descriptor.run_attempt,
             descriptor.step_id,
         )?;
-        let temporary_path =
-            session_dir.join(format!("{DESCRIPTOR_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = serde_json::to_vec(descriptor).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("serialize runtime descriptor: {error}"),
             )
         })?;
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut temporary = options.open(&temporary_path)?;
-        temporary.write_all(&contents)?;
-        temporary.sync_all()?;
-        drop(temporary);
-        fs::rename(&temporary_path, descriptor_path)?;
-        fs::File::open(session_dir)?.sync_all()
+        publish_private(&session_dir, DESCRIPTOR_FILE, &contents)
     }
 
     /// Every session directory: runtime/<job>.<attempt>.<step>. The notification
@@ -2589,6 +2598,17 @@ impl StepdStore {
             .unwrap_or(false))
     }
 
+    /// The session a supervisor published for one step of one run, as it is on
+    /// disk. `NotFound` means no session was ever published for that step.
+    pub(crate) fn published_session(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<StepdDescriptor> {
+        self.load_descriptor(&self.session_dir(job_id, run_attempt, step_id))
+    }
+
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
         let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = fs::read(&descriptor_path)?;
@@ -2648,7 +2668,7 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn verify_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn verify_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(path)?;
@@ -2685,25 +2705,73 @@ pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
 /// as gone, and so does a zombie: it has already released everything and only
 /// waits to be reaped.
 pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
+    matches!(process_liveness(pid, start_ticks), Ok(StepdLiveness::Live))
+}
+
+/// The same reading, keeping "could not tell" apart from "gone" for callers
+/// that may not treat an unreadable `/proc` as a death.
+pub(crate) fn process_liveness(pid: u32, start_ticks: u64) -> io::Result<StepdLiveness> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let Some((_, fields)) = stat.rsplit_once(") ") else {
-        return false;
+        return Ok(StepdLiveness::Stale);
     };
     let mut fields = fields.split_ascii_whitespace();
     if fields.next() == Some("Z") {
-        return false;
+        return Ok(StepdLiveness::Stale);
     }
-    matches!(fields.nth(18).and_then(|t| t.parse::<u64>().ok()), Some(ticks) if ticks == start_ticks)
+    match fields.nth(18).and_then(|t| t.parse::<u64>().ok()) {
+        Some(ticks) if ticks == start_ticks => Ok(StepdLiveness::Live),
+        _ => Ok(StepdLiveness::Stale),
+    }
 }
 
-pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
-    match process_start_ticks(descriptor.pid) {
-        Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
+/// Whether a recorded `(pid, start_ticks, boot_id)` still names the process it
+/// was recorded for. `Err` is undetermined, which no caller may read as a death.
+pub(crate) fn supervisor_liveness(
+    recorded: &crate::admission::SupervisorRef,
+) -> io::Result<StepdLiveness> {
+    // `process_start_ticks` counts from boot and the spool survives one, so a
+    // pid and tick match across boots is a collision, not the same process.
+    if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
+        == crate::admission::BootScope::Different
+    {
+        return Ok(StepdLiveness::Stale);
+    }
+    match process_start_ticks(recorded.pid) {
+        Ok(start_ticks) if start_ticks == recorded.start_ticks => Ok(StepdLiveness::Live),
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+    supervisor_liveness(&crate::admission::SupervisorRef {
+        pid: descriptor.pid,
+        start_ticks: descriptor.process_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    })
+}
+
+/// Undetermined counts as executing; an unrecorded workload (`0`) holds nothing
+/// up. Unlike a supervisor, a zombie counts as gone -- it holds none of the slice.
+pub(crate) fn workload_may_be_live(descriptor: &StepdDescriptor) -> bool {
+    if descriptor.workload_pid == 0 {
+        return false;
+    }
+    let recorded = crate::admission::SupervisorRef {
+        pid: descriptor.workload_pid,
+        start_ticks: descriptor.workload_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    };
+    if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
+        == crate::admission::BootScope::Different
+    {
+        return false;
+    }
+    match process_liveness(descriptor.workload_pid, descriptor.workload_start_ticks) {
+        Ok(liveness) => liveness == StepdLiveness::Live,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
     }
 }
 
@@ -2910,6 +2978,37 @@ mod launch_spec_compat {
         assert!(!spec.allocation_only);
         assert!(!spec.pmix_multi_task);
         assert_eq!(spec.run_attempt, 0);
+    }
+
+    /// Frozen at the shipped shape. Never regenerate it: a field added without
+    /// a default must fail here, not on an upgraded node mid-recovery.
+    const FROZEN_DESCRIPTOR_JSON: &str = r##"{
+        "format_version": 1,
+        "job_id": 42,
+        "run_attempt": 3,
+        "pid": 991,
+        "process_start_ticks": 7788,
+        "socket_path": "/var/spool/spur/runtime/42.3.4294967294/runtime.sock",
+        "cgroup_path": "/sys/fs/cgroup/spur/job_42"
+    }"##;
+
+    #[test]
+    fn a_descriptor_from_an_older_build_still_loads() {
+        let descriptor: crate::stepd::StepdDescriptor =
+            serde_json::from_str(FROZEN_DESCRIPTOR_JSON)
+                .expect("an older descriptor.json must still load");
+
+        assert_eq!(descriptor.job_id, 42);
+        assert_eq!(descriptor.run_attempt, 3);
+        assert_eq!(descriptor.pid, 991);
+        assert_eq!(descriptor.step_id, spur_core::step::default_step_id());
+        assert!(descriptor.owner.is_empty());
+        assert_eq!(descriptor.workload_pid, 0);
+        assert!(descriptor.container_rootfs_mode.is_none());
+        assert!(
+            descriptor.boot_id.is_none(),
+            "an older descriptor predates the boot scope and must read as unknown"
+        );
     }
 }
 

@@ -1385,6 +1385,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     let mut node_name: Option<String> = None;
     let mut node_state: Option<String> = None;
     let mut node_reason: Option<String> = None;
+    let mut node_reconcile = false;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1399,6 +1400,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
                 "nodename" | "node" => node_name = Some(value.into()),
                 "state" => node_state = Some(value.into()),
                 "reason" => node_reason = Some(value.into()),
+                "reconcile" => node_reconcile = parse_yes_no(value),
                 other => eprintln!("scontrol: unknown update key '{}'", other),
             }
         }
@@ -1416,7 +1418,15 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         let names = resolve_node_names(&mut client, &node_pattern).await?;
         let mut failed: Vec<String> = Vec::new();
         for name in &names {
-            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
+            if let Err(e) = update_node(
+                &mut client,
+                name,
+                proto_state,
+                node_reason.clone(),
+                node_reconcile,
+            )
+            .await
+            {
                 eprintln!("error: {name}: {e}");
                 failed.push(name.clone());
             }
@@ -1492,6 +1502,15 @@ pub(crate) async fn resolve_node_names(
         return Ok(names);
     }
     spur_core::hostlist::expand(pattern).context("invalid node name pattern")
+}
+
+/// Slurm accepts several spellings for a boolean `Key=Value`; anything else
+/// reads as "no" so a typo cannot silently trigger an action.
+fn parse_yes_no(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "yes" | "y" | "true" | "1"
+    )
 }
 
 /// Parse a Slurm node state name into its proto representation.
@@ -1622,9 +1641,11 @@ async fn update_node(
     name: &str,
     state: Option<i32>,
     reason: Option<String>,
+    reconcile: bool,
 ) -> Result<()> {
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
+            reconcile,
             name: name.to_string(),
             state,
             reason,
@@ -2485,6 +2506,17 @@ mod tests {
         node.state = spur_proto::proto::NodeState::NodeAllocated as i32;
         node.planned_job_id = 42;
         assert_eq!(node_state_display(&node), "ALLOCATED");
+    }
+
+    #[test]
+    fn reconcile_only_fires_on_an_affirmative_value() {
+        for yes in ["yes", "Yes", "Y", "true", "TRUE", "1"] {
+            assert!(parse_yes_no(yes), "{yes} must ask for a reconcile");
+        }
+        // A typo must not silently trigger an audit that gates the node.
+        for no in ["no", "false", "0", "", "ys", "reconcile"] {
+            assert!(!parse_yes_no(no), "{no} must not");
+        }
     }
 
     #[test]

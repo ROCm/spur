@@ -30,6 +30,7 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 hostname = "0.4.2"
 openraft = { workspace = true }
 axum = { workspace = true }

@@ -24,6 +24,8 @@ pub enum WalOperation {
     JobSubmit {
         job_id: JobId,
         spec: Box<JobSpec>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobStateChange {
         job_id: JobId,
@@ -57,17 +59,25 @@ pub enum WalOperation {
         /// Run epoch for this dispatch (0 for pre-upgrade entries).
         #[serde(default)]
         run_attempt: u32,
+        /// Stamped on the leader so a replay dates the run from the dispatch
+        /// rather than from its own clock. `None` in pre-upgrade entries.
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobComplete {
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobNodeComplete {
         job_id: JobId,
         node_name: String,
         exit_code: i32,
         signal: i32,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// The time-limit watchdog signalled a running job for exhausting its wall
     /// clock. Durable so the grace period survives a leadership change and so
@@ -84,6 +94,8 @@ pub enum WalOperation {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Record a job step at creation so `run_step` survives controller restart.
     JobStepCreate {
@@ -133,6 +145,9 @@ pub enum WalOperation {
         /// QOS of the preempting job (`None` for plain priority-based preemption).
         #[serde(default)]
         preempt_qos: Option<String>,
+        /// When the preempted run ended, distinct from `begin_time`'s future hold.
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Preempt a running job with cancel. The job transitions Running →
     /// Preempted → Cancelled: Preempted is reported to accounting so the
@@ -148,6 +163,8 @@ pub enum WalOperation {
         /// QOS of the preempting job (`None` for plain priority-based preemption).
         #[serde(default)]
         preempt_qos: Option<String>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
     /// Pending with the same spec in one atomic step. A running/suspended job is
@@ -161,6 +178,9 @@ pub enum WalOperation {
         hold: bool,
         #[serde(default)]
         begin_time: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the superseded run ended, distinct from `begin_time`'s future hold.
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobSuspend {
         job_id: JobId,
@@ -188,6 +208,8 @@ pub enum WalOperation {
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Record why a requeued job is back in Pending (survives controller restart).
     JobLaunchFailureDetail {
@@ -225,6 +247,12 @@ pub enum WalOperation {
         #[serde(default)]
         source: NodeSource,
     },
+    /// Hold a node out of scheduling until its asserted state has been diffed
+    /// against Raft, or release it. An old log has no such entries.
+    NodeReconcilePending {
+        name: String,
+        pending: bool,
+    },
     NodeStateChange {
         name: String,
         old_state: NodeState,
@@ -236,6 +264,10 @@ pub enum WalOperation {
         reason_uid: Option<u32>,
         #[serde(default)]
         reason_time: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the change was made. Dates the eviction of any job the node was
+        /// running, which `reason_time` does not (it is only set for some changes).
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     NodeLabelsUpdate {
         name: String,
@@ -247,6 +279,8 @@ pub enum WalOperation {
     NodeRemove {
         name: String,
         reason: Option<String>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
 
     // Admission token operations
@@ -416,6 +450,101 @@ impl WalOperation {
         }
     }
 
+    /// The leader's stamp for operations dating something a user reads back.
+    /// Replays must date from here, not their own clock. `None` pre-upgrade.
+    pub fn occurred_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::JobSubmit { at, .. }
+            | Self::JobStart { at, .. }
+            | Self::JobComplete { at, .. }
+            | Self::JobNodeComplete { at, .. }
+            | Self::JobStepComplete { at, .. }
+            | Self::JobPreemptRequeue { at, .. }
+            | Self::JobPreemptCancel { at, .. }
+            | Self::JobUserRequeue { at, .. }
+            | Self::JobEvict { at, .. }
+            | Self::NodeStateChange { at, .. }
+            | Self::NodeRemove { at, .. } => *at,
+            Self::JobSuspend { at, .. }
+            | Self::JobResume { at, .. }
+            | Self::JobTimeLimitSignaled { at, .. } => Some(*at),
+            // Exhaustive on purpose: a new variant that dates something a user
+            // reads back must be a compile error here, not a silent `None`.
+            Self::JobStateChange { .. }
+            | Self::JobStepCreate { .. }
+            | Self::JobPriorityChange { .. }
+            | Self::JobDispatchBackoff { .. }
+            | Self::JobLaunchFailureDetail { .. }
+            | Self::NodeRegister { .. }
+            | Self::NodeUpdate { .. }
+            | Self::NodeReconcilePending { .. }
+            | Self::NodeLabelsUpdate { .. }
+            | Self::TokenCreate { .. }
+            | Self::TokenRevoke { .. }
+            | Self::PartitionCreate { .. }
+            | Self::PartitionUpdate { .. }
+            | Self::PartitionDelete { .. }
+            | Self::ReservationCreate { .. }
+            | Self::ReservationUpdate { .. }
+            | Self::ReservationDelete { .. }
+            | Self::NodeK0sAssign { .. }
+            | Self::K0sSetPhase { .. }
+            | Self::NodeK0sClear { .. }
+            | Self::NodeK0sSetError { .. }
+            | Self::K0sMemberNodesAdd { .. }
+            | Self::K0sMemberNodesRemove { .. }
+            | Self::EvictTerminalJobs { .. } => None,
+        }
+    }
+
+    /// Stamp on the proposing leader so replicas and replays read one instant.
+    /// An entry that already carries one keeps it.
+    pub fn stamp_occurred_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        let slot = match self {
+            Self::JobSubmit { at, .. }
+            | Self::JobStart { at, .. }
+            | Self::JobComplete { at, .. }
+            | Self::JobNodeComplete { at, .. }
+            | Self::JobStepComplete { at, .. }
+            | Self::JobPreemptRequeue { at, .. }
+            | Self::JobPreemptCancel { at, .. }
+            | Self::JobUserRequeue { at, .. }
+            | Self::JobEvict { at, .. }
+            | Self::NodeStateChange { at, .. }
+            | Self::NodeRemove { at, .. } => at,
+            // Exhaustive for the same reason as `occurred_at`: these carry no
+            // stamp, and a new one that does must not silently go unstamped.
+            Self::JobSuspend { .. }
+            | Self::JobResume { .. }
+            | Self::JobTimeLimitSignaled { .. }
+            | Self::JobStateChange { .. }
+            | Self::JobStepCreate { .. }
+            | Self::JobPriorityChange { .. }
+            | Self::JobDispatchBackoff { .. }
+            | Self::JobLaunchFailureDetail { .. }
+            | Self::NodeRegister { .. }
+            | Self::NodeUpdate { .. }
+            | Self::NodeReconcilePending { .. }
+            | Self::NodeLabelsUpdate { .. }
+            | Self::TokenCreate { .. }
+            | Self::TokenRevoke { .. }
+            | Self::PartitionCreate { .. }
+            | Self::PartitionUpdate { .. }
+            | Self::PartitionDelete { .. }
+            | Self::ReservationCreate { .. }
+            | Self::ReservationUpdate { .. }
+            | Self::ReservationDelete { .. }
+            | Self::NodeK0sAssign { .. }
+            | Self::K0sSetPhase { .. }
+            | Self::NodeK0sClear { .. }
+            | Self::NodeK0sSetError { .. }
+            | Self::K0sMemberNodesAdd { .. }
+            | Self::K0sMemberNodesRemove { .. }
+            | Self::EvictTerminalJobs { .. } => return,
+        };
+        slot.get_or_insert(now);
+    }
+
     /// Record node allocation at job start (batch/sbatch and K8s srun fallback).
     pub fn job_start(
         job_id: JobId,
@@ -430,6 +559,7 @@ impl WalOperation {
             per_node_alloc,
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         }
     }
 }
@@ -757,8 +887,12 @@ mod tests {
         let op: WalOperation = serde_json::from_str(JOB_SUBMIT_V0_5_1).expect(
             "v0.5.1 JobSubmit must deserialize; a new JobSpec field needs #[serde(default)]",
         );
+        assert!(
+            op.occurred_at().is_none(),
+            "a pre-upgrade entry carries no submit instant"
+        );
         match op {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit { job_id, spec, .. } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(spec.name, "fixture");
                 assert_eq!(spec.work_dir, "/home/alice");
@@ -775,6 +909,7 @@ mod tests {
         use crate::job::JobSpec;
 
         let op = WalOperation::JobSubmit {
+            at: None,
             job_id: 99,
             spec: Box::new(JobSpec {
                 name: "mpi-job".into(),
@@ -786,7 +921,7 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit { job_id, spec, .. } => {
                 assert_eq!(job_id, 99);
                 assert_eq!(spec.mpi.as_deref(), Some("pmix"));
             }
@@ -797,6 +932,7 @@ mod tests {
     #[test]
     fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n0".into(),
             exit_code: 0,
@@ -811,6 +947,7 @@ mod tests {
                 node_name,
                 exit_code,
                 signal,
+                ..
             } => {
                 assert_eq!(job_id, 1);
                 assert_eq!(node_name, "n0");
@@ -829,13 +966,14 @@ mod deregistration_wal_tests {
     #[test]
     fn node_remove_round_trips() {
         let op = WalOperation::NodeRemove {
+            at: None,
             name: "gpu01".into(),
             reason: Some("decommission".into()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 assert_eq!(name, "gpu01");
                 assert_eq!(reason.as_deref(), Some("decommission"));
             }
@@ -998,13 +1136,14 @@ mod deregistration_wal_tests {
     #[test]
     fn node_remove_none_reason_round_trips() {
         let op = WalOperation::NodeRemove {
+            at: None,
             name: "n0".into(),
             reason: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 assert_eq!(name, "n0");
                 assert!(reason.is_none());
             }
@@ -1027,6 +1166,78 @@ mod deregistration_wal_tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    #[test]
+    fn job_start_frozen_payload_still_deserializes() {
+        const START: &str = r#"{"JobStart":{"job_id":7,"nodes":["n1"],"resources":{"cpus":2,"memory_mb":1000,"devices":{}}}}"#;
+        let op: WalOperation = serde_json::from_str(START)
+            .expect("frozen JobStart must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::JobStart { job_id, at, .. } => {
+                assert_eq!(job_id, 7);
+                assert!(at.is_none(), "a pre-upgrade entry carries no start instant");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen on-wire shapes. Never regenerate: a failure here means the new
+    // field needs a default, not a new fixture.
+    #[test]
+    fn frozen_pre_stamp_payloads_still_deserialize_undated() {
+        const FROZEN: &[&str] = &[
+            r#"{"JobComplete":{"job_id":7,"exit_code":0,"state":"COMPLETED"}}"#,
+            r#"{"JobNodeComplete":{"job_id":7,"node_name":"n1","exit_code":0,"signal":0}}"#,
+            r#"{"JobStepComplete":{"job_id":7,"step_id":1,"exit_code":0}}"#,
+            r#"{"JobPreemptRequeue":{"job_id":7,"begin_time":"2026-01-01T00:00:00Z"}}"#,
+            r#"{"JobPreemptCancel":{"job_id":7}}"#,
+            r#"{"JobUserRequeue":{"job_id":7}}"#,
+            r#"{"JobEvict":{"job_id":7}}"#,
+            r#"{"NodeRemove":{"name":"n1","reason":null}}"#,
+            r#"{"NodeStateChange":{"name":"n1","old_state":"IDLE","new_state":"DOWN","reason":null}}"#,
+        ];
+        for frozen in FROZEN {
+            let op: WalOperation = serde_json::from_str(frozen).unwrap_or_else(|error| {
+                panic!("frozen entry must deserialize ({frozen}): {error}")
+            });
+            assert!(
+                op.occurred_at().is_none(),
+                "a pre-upgrade entry carries no instant: {frozen}"
+            );
+        }
+    }
+
+    #[test]
+    fn stamping_dates_an_entry_once_and_replay_reads_it_back() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let mut op = WalOperation::JobComplete {
+            job_id: 7,
+            exit_code: 0,
+            state: JobState::Completed,
+            at: None,
+        };
+        op.stamp_occurred_at(at);
+        assert_eq!(op.occurred_at(), Some(at));
+
+        let later = at + chrono::Duration::hours(3);
+        op.stamp_occurred_at(later);
+        assert_eq!(
+            op.occurred_at(),
+            Some(at),
+            "an entry that already carries an instant keeps it"
+        );
+
+        let round_tripped: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(
+            round_tripped.occurred_at(),
+            Some(at),
+            "the instant must survive the log verbatim"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1036,6 +1247,7 @@ mod suspend_wal_tests {
     #[test]
     fn preempt_cancel_op_round_trips() {
         let op = WalOperation::JobPreemptCancel {
+            at: None,
             job_id: 7,
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
@@ -1047,6 +1259,7 @@ mod suspend_wal_tests {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
@@ -1063,6 +1276,7 @@ mod suspend_wal_tests {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
@@ -1076,6 +1290,7 @@ mod suspend_wal_tests {
     fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {
+            at: None,
             job_id: 42,
             begin_time,
             preempted_by: Some(7),
@@ -1089,6 +1304,7 @@ mod suspend_wal_tests {
                 begin_time: b,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
@@ -1119,6 +1335,7 @@ mod suspend_wal_tests {
         let begin = chrono::Utc::now();
         for (hold, begin_time) in [(false, Some(begin)), (true, None), (false, None)] {
             let op = WalOperation::JobUserRequeue {
+                at: None,
                 job_id: 42,
                 hold,
                 begin_time,
@@ -1130,6 +1347,7 @@ mod suspend_wal_tests {
                     job_id,
                     hold: got_hold,
                     begin_time: got_begin,
+                    ..
                 } => {
                     assert_eq!(job_id, 42);
                     assert_eq!(got_hold, hold);
@@ -1151,6 +1369,7 @@ mod suspend_wal_tests {
                 job_id,
                 hold,
                 begin_time,
+                ..
             } => {
                 assert_eq!(job_id, 7);
                 assert!(!hold);
@@ -1235,13 +1454,14 @@ mod evict_wal_tests {
     #[test]
     fn job_evict_op_round_trips() {
         let op = WalOperation::JobEvict {
+            at: None,
             job_id: 9,
             detail: Some("PMIx prepare failed".into()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobEvict { job_id, detail } => {
+            WalOperation::JobEvict { job_id, detail, .. } => {
                 assert_eq!(job_id, 9);
                 assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
             }

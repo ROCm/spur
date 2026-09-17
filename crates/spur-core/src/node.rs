@@ -376,6 +376,10 @@ pub struct Node {
     /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
     #[serde(default)]
     pub k0s_last_error: Option<String>,
+    /// The agent asserted state the controller has not yet diffed against Raft.
+    /// Not a `NodeState`, which the WAL and the proto both serialize.
+    #[serde(default)]
+    pub reconcile_pending: bool,
 }
 
 fn default_weight() -> u32 {
@@ -419,6 +423,7 @@ impl Node {
             k0s_mesh_ip: None,
             k0s_pod_cidr: None,
             k0s_last_error: None,
+            reconcile_pending: false,
         }
     }
 
@@ -441,9 +446,10 @@ impl Node {
         !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
     }
 
-    /// Whether this node can accept new work.
+    /// Whether this node can accept new work. A node whose evidence the
+    /// controller has not reconciled may already hold work it has not declared.
     pub fn is_schedulable(&self) -> bool {
-        self.state.is_available()
+        self.state.is_available() && !self.reconcile_pending
     }
 
     /// Routable comm address (NodeAddr), when registered.
@@ -476,6 +482,37 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_awaiting_reconcile_takes_no_work() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.state = NodeState::Idle;
+        assert!(node.is_schedulable());
+
+        // It may already hold work it has not declared; dispatching into that
+        // window double-books it.
+        node.reconcile_pending = true;
+        assert!(!node.is_schedulable());
+
+        node.reconcile_pending = false;
+        assert!(node.is_schedulable());
+    }
+
+    #[test]
+    fn an_old_node_record_replays_ungated() {
+        // A pre-upgrade snapshot has no such field; defaulting it to gated would
+        // stall every node in the cluster on upgrade.
+        let mut seed = Node::new("n1".into(), ResourceSet::default());
+        seed.state = NodeState::Idle;
+        let mut value = serde_json::to_value(seed).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("reconcile_pending");
+        let node: Node = serde_json::from_value(value).expect("an older record must still load");
+        assert!(!node.reconcile_pending);
+        assert!(node.is_schedulable());
+    }
 
     #[test]
     fn is_k0s_reserved_tracks_role_assignment() {

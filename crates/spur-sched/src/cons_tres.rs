@@ -28,6 +28,8 @@ pub enum AllocError {
     /// A core being replayed does not exist on this node (the node's CPU count
     /// shrank since the allocation was made), or another job still holds it.
     CpusUnavailable,
+    /// The request would take the node past its total memory.
+    MemoryUnavailable,
 }
 
 /// Per-node resource allocation state.
@@ -171,6 +173,31 @@ impl NodeAllocation {
                 return Err(AllocError::Superseded);
             }
         }
+        // Feasibility is judged against what this job would free, so a refusal
+        // never drops the reservation it was about to supersede.
+        let reclaimable = self
+            .owners
+            .get(&job_id)
+            .map(|owned| owned.result.clone())
+            .unwrap_or_else(|| AllocationResult {
+                cpu_ids: Vec::new(),
+                gpu_ids: Vec::new(),
+                memory_mb: 0,
+            });
+        let free_cpus =
+            self.allocated_cpus.iter().filter(|a| !**a).count() + reclaimable.cpu_ids.len();
+        if free_cpus < cpus as usize {
+            return Err(AllocError::CpusUnavailable);
+        }
+        if self.total_memory_mb > 0
+            && self
+                .allocated_memory_mb
+                .saturating_sub(reclaimable.memory_mb)
+                .saturating_add(memory_mb)
+                > self.total_memory_mb
+        {
+            return Err(AllocError::MemoryUnavailable);
+        }
         self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
@@ -186,14 +213,30 @@ impl NodeAllocation {
             gpu_indices.push(idx);
         }
 
-        let mut cpu_ids = Vec::new();
-        for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
-            if !*allocated && cpu_ids.len() < cpus as usize {
-                *allocated = true;
-                cpu_ids.push(i as u32);
-            }
+        // Chosen before anything is marked, so a shortfall refuses instead of
+        // serving a short list the caller reads as a full allocation.
+        let cpu_ids: Vec<u32> = self
+            .allocated_cpus
+            .iter()
+            .enumerate()
+            .filter(|(_, allocated)| !**allocated)
+            .map(|(i, _)| i as u32)
+            .take(cpus as usize)
+            .collect();
+        if cpu_ids.len() < cpus as usize {
+            return Err(AllocError::CpusUnavailable);
+        }
+        // A node that could not read its own memory reports 0. Unknown is not
+        // zero: enforcing a ceiling there refuses every job on the node.
+        if self.total_memory_mb > 0
+            && self.allocated_memory_mb.saturating_add(memory_mb) > self.total_memory_mb
+        {
+            return Err(AllocError::MemoryUnavailable);
         }
 
+        for &id in &cpu_ids {
+            self.allocated_cpus[id as usize] = true;
+        }
         self.allocated_memory_mb += memory_mb;
         for &idx in &gpu_indices {
             self.gpu_allocated[idx] = true;
@@ -354,17 +397,18 @@ impl NodeAllocation {
     /// Release owned allocations whose job is neither live nor launching within
     /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
     /// or a dropped launch instead of stranding the node until spurd restart.
-    pub fn reconcile(
-        &mut self,
+    /// Claims with nothing tracked behind them. A query, not a reclaim: a
+    /// missing entry is not evidence that the job's work finished.
+    pub fn unbacked_claims(
+        &self,
         live: &HashSet<u32>,
         now: Instant,
         launching_ttl: Duration,
-    ) -> Vec<u32> {
-        let orphaned: Vec<u32> = self
+    ) -> Vec<(u32, u32)> {
+        let mut unbacked: Vec<(u32, u32)> = self
             .owners
-            .keys()
-            .copied()
-            .filter(|id| {
+            .iter()
+            .filter(|(id, _)| {
                 if live.contains(id) {
                     return false;
                 }
@@ -375,11 +419,19 @@ impl NodeAllocation {
                     None => true,
                 }
             })
+            .map(|(id, owned)| (*id, owned.run_attempt))
             .collect();
-        for &id in &orphaned {
-            self.release_job(id);
-        }
-        orphaned
+        unbacked.sort_unstable();
+        unbacked
+    }
+
+    /// Every run this node still charges resources to, including launches in
+    /// flight: anything the ledger must keep a record for until it is released.
+    pub fn charged_runs(&self) -> HashSet<(u32, u32)> {
+        self.owners
+            .iter()
+            .map(|(job_id, owned)| (*job_id, owned.run_attempt))
+            .collect()
     }
 }
 
@@ -642,18 +694,110 @@ mod tests {
 
         let live: HashSet<u32> = [1].into_iter().collect();
         let ttl = Duration::from_secs(120);
-        let mut reclaimed = node.reconcile(&live, Instant::now(), ttl);
-        reclaimed.sort();
-        assert_eq!(reclaimed, vec![2], "only the orphan (job 2) is reclaimed");
+        assert_eq!(
+            node.unbacked_claims(&live, Instant::now(), ttl),
+            vec![(2, 1)],
+            "only the untracked job is reported"
+        );
+        // Reporting is not reclaiming: the claim is still held afterwards.
+        assert_eq!(node.free_gpus(None), 1);
 
-        assert!(!node.release_job(2), "job 2 already reconciled");
+        assert!(node.release_job(2));
         assert!(node.release_job(1));
         assert!(node.release_job(3));
         assert_eq!(node.free_gpus(None), 4);
     }
 
     #[test]
-    fn test_reconcile_reclaims_launching_past_ttl() {
+    fn a_runs_own_steps_never_conflict_with_each_other() {
+        // The claim points at the run, not at one step, so a run's steps share
+        // its devices. A conflict here would cancel an entitled job.
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        node.allocate_for_job(7, 1, 2, 1_000, &[0]).unwrap();
+        node.commit_job(7, 1);
+
+        assert_eq!(
+            node.conflicting_owners(&[0]),
+            vec![7],
+            "the run itself holds it"
+        );
+        // Re-allocating for the same run succeeds rather than conflicting.
+        assert!(node.allocate_for_job(7, 1, 2, 1_000, &[0]).is_ok());
+        // A different job is a genuine conflict.
+        node.commit_job(7, 1);
+        assert_eq!(
+            node.allocate_for_job(8, 1, 2, 1_000, &[0]),
+            Err(AllocError::GpusUnavailable)
+        );
+    }
+
+    #[test]
+    fn allocate_refuses_a_cpu_shortfall_instead_of_under_serving() {
+        // It used to fill what it could and return Ok with a short list, which
+        // both callers read as a full allocation.
+        let mut node = make_node(4, 64_000, 0, "");
+        node.allocate_for_job(1, 1, 3, 1_000, &[]).unwrap();
+
+        assert_eq!(
+            node.allocate_for_job(2, 1, 3, 1_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(node.free_cpus(), 1, "the refusal must not consume cores");
+        assert!(node.allocate_for_job(2, 1, 1, 1_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn allocate_refuses_to_take_the_node_past_its_memory() {
+        let mut node = make_node(8, 10_000, 0, "");
+        node.allocate_for_job(1, 1, 1, 6_000, &[]).unwrap();
+
+        assert_eq!(
+            node.allocate_for_job(2, 1, 1, 5_000, &[]),
+            Err(AllocError::MemoryUnavailable)
+        );
+        assert_eq!(
+            node.allocated_memory_mb, 6_000,
+            "the refusal must not commit"
+        );
+        assert!(node.allocate_for_job(2, 1, 1, 4_000, &[]).is_ok());
+        assert_eq!(node.allocated_memory_mb, 10_000);
+    }
+
+    #[test]
+    fn a_node_that_never_read_its_memory_is_not_treated_as_having_none() {
+        // A node reports 0 when /proc/meminfo is unreadable. Enforcing a ceiling
+        // against that refuses every job the node is asked to run.
+        let mut node = make_node(8, 0, 0, "");
+        assert!(node.allocate_for_job(1, 1, 1, 4_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_refused_reallocation_does_not_drop_the_owner_it_would_supersede() {
+        let mut node = make_node(4, 10_000, 0, "");
+        node.allocate_for_job(1, 1, 2, 4_000, &[]).unwrap();
+        node.commit_job(1, 1);
+        node.allocate_for_job(2, 1, 2, 4_000, &[]).unwrap();
+        node.commit_job(2, 1);
+
+        // Job 1 re-allocating beyond what it could free must refuse without
+        // having already released what it holds.
+        assert_eq!(
+            node.allocate_for_job(1, 2, 4, 4_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(
+            node.free_cpus(),
+            0,
+            "the refusal must not have released job 1"
+        );
+        assert_eq!(node.allocated_memory_mb, 8_000);
+
+        // It may still grow into exactly what it can free.
+        assert!(node.allocate_for_job(1, 2, 2, 6_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_unbacked_claims_reports_launching_past_ttl_without_freeing_it() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
         // A launch reserved but never committed must be reclaimed past the TTL.
         node.allocate_for_job(1, 1, 4, 8_000, &[0]).unwrap();
@@ -661,12 +805,16 @@ mod tests {
         let live: HashSet<u32> = HashSet::new();
         let ttl = Duration::from_secs(120);
 
-        assert!(node.reconcile(&live, Instant::now(), ttl).is_empty());
+        assert!(node.unbacked_claims(&live, Instant::now(), ttl).is_empty());
         assert_eq!(node.free_gpus(None), 3, "still reserved within TTL");
 
         let future = Instant::now() + Duration::from_secs(121);
-        assert_eq!(node.reconcile(&live, future, ttl), vec![1]);
-        assert_eq!(node.free_gpus(None), 4, "reclaimed after TTL");
+        assert_eq!(node.unbacked_claims(&live, future, ttl), vec![(1, 1)]);
+        assert_eq!(
+            node.free_gpus(None),
+            3,
+            "a timeout alone must not free a claim the agent cannot account for"
+        );
     }
 
     #[test]
@@ -678,21 +826,18 @@ mod tests {
             "commit of a live reservation returns true"
         );
 
-        // A launch whose reservation reconcile reclaimed before commit: the
-        // owner is gone, so commit must report false and stay a no-op. Keep
-        // job 1 in the live set so only the past-TTL launch (job 2) is reclaimed.
+        // A reservation explicitly released before commit: the owner is gone,
+        // so commit must report false and stay a no-op.
         node.allocate_for_job(2, 1, 4, 8_000, &[1]).unwrap();
-        let live: HashSet<u32> = [1].into_iter().collect();
-        let past = Instant::now() + Duration::from_secs(121);
-        node.reconcile(&live, past, Duration::from_secs(120));
+        node.release_job(2);
         assert!(
             !node.commit_job(2, 1),
-            "commit of a reclaimed reservation returns false"
+            "commit of a released reservation returns false"
         );
         assert_eq!(
             node.free_gpus(None),
             1,
-            "reclaimed GPU stays free after the no-op commit"
+            "the released GPU stays free after the no-op commit"
         );
     }
 
@@ -752,7 +897,7 @@ mod tests {
         assert!(!node.commit_job(7, 1), "a superseded attempt cannot commit");
 
         assert!(
-            node.reconcile(&HashSet::new(), Instant::now(), Duration::from_secs(120))
+            node.unbacked_claims(&HashSet::new(), Instant::now(), Duration::from_secs(120))
                 .is_empty(),
             "a stale commit must not strip the launching marker sparing attempt 2"
         );
@@ -838,7 +983,11 @@ mod tests {
         assert_eq!(node.conflicting_owners(&[0]), vec![4]);
         let live: HashSet<u32> = HashSet::new();
         let ttl = Duration::from_secs(600);
-        assert_eq!(node.reconcile(&live, Instant::now(), ttl), vec![4]);
+        assert_eq!(
+            node.unbacked_claims(&live, Instant::now(), ttl),
+            vec![(4, 1)]
+        );
+        node.release_job(4);
         assert_eq!(node.free_cpus(), 8);
 
         // A job still mid-launch when the agent restarted: adoption must clear

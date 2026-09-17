@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -426,6 +426,9 @@ pub struct ClusterManager {
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
     raft: RwLock<Option<SpurRaft>>,
+    /// Latch for `state_machine_ready`: a leader commits continuously, so an
+    /// instantaneous check would flap back off once replay had finished.
+    state_machine_ready: AtomicBool,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
@@ -454,6 +457,9 @@ pub struct ClusterManager {
     /// from the durable job store / node reasons instead, so they survive
     /// failover.
     health_last_check: parking_lot::Mutex<HashMap<(usize, String), std::time::Instant>>,
+    /// Launches this controller has on the wire, so a ledger cut taken while one
+    /// was in flight is not read as the node having let that job go.
+    dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -478,6 +484,25 @@ fn health_job_target_node(name: &str) -> Option<&str> {
     name.strip_prefix(HEALTH_JOB_PREFIX)
         .and_then(|rest| rest.split_once('.'))
         .map(|(_, node)| node)
+}
+
+/// Summed count per `(gres, device_id)`, dropping zeroes. `subtract` prunes an
+/// emptied gres key while `add` creates it unconditionally, so presence differs.
+fn device_counts(alloc: &ResourceAllocations) -> HashMap<(&str, u32), u64> {
+    let mut counts: HashMap<(&str, u32), u64> = HashMap::new();
+    for (gres, devices) in &alloc.devices {
+        for dev in devices {
+            *counts.entry((gres.as_str(), dev.device_id)).or_default() += dev.count;
+        }
+    }
+    counts.retain(|_, count| *count > 0);
+    counts
+}
+
+/// Device order is not drift: the accumulator's per-gres `Vec` follows the
+/// add/subtract sequence while the derivation's follows job id.
+fn allocations_equivalent(a: &ResourceAllocations, b: &ResourceAllocations) -> bool {
+    a.cpus == b.cpus && a.memory_mb == b.memory_mb && device_counts(a) == device_counts(b)
 }
 
 struct PendingJobClassification {
@@ -561,6 +586,7 @@ impl ClusterManager {
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
+            state_machine_ready: AtomicBool::new(false),
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
@@ -573,6 +599,7 @@ impl ClusterManager {
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
+            dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -609,15 +636,15 @@ impl ClusterManager {
             .insert(name.to_string(), until);
     }
 
-    /// How long a node's dispatch cooldown still has to run, for tests that need to tell the
-    /// reject cooldown apart from the longer dispatch-deadline one.
-    #[cfg(test)]
+    /// Remaining dispatch cooldown. An expired entry reads as `None`, so a read
+    /// path cannot report a node as skipped once the scheduler will take it.
     pub fn dispatch_cooldown_remaining(&self, name: &str) -> Option<std::time::Duration> {
         let now = std::time::Instant::now();
         self.node_dispatch_cooldowns
             .read()
             .get(name)
-            .map(|&until| until.saturating_duration_since(now))
+            .filter(|&&until| until > now)
+            .map(|&until| until - now)
     }
 
     /// Names still within their dispatch cooldown, pruning any that have expired.
@@ -784,6 +811,7 @@ impl ClusterManager {
             }
 
             self.propose(WalOperation::JobSubmit {
+                at: None,
                 job_id: task_id,
                 spec: Box::new(task_spec),
             })
@@ -1279,6 +1307,7 @@ impl ClusterManager {
         }
 
         let resp = self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Deadline,
@@ -1318,6 +1347,7 @@ impl ClusterManager {
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
         // so the deallocation loop is a no-op.
         let resp = self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Cancelled,
@@ -1456,6 +1486,7 @@ impl ClusterManager {
         };
 
         let resp = self.propose(WalOperation::JobUserRequeue {
+            at: None,
             job_id,
             hold,
             begin_time,
@@ -1576,6 +1607,48 @@ impl ClusterManager {
     /// Start a job on specific nodes.
     /// Transition a pending job to Running and record its allocation. Returns
     /// the run epoch assigned to this dispatch (threaded into the launch RPC).
+    /// Record a placement in Raft before dispatching against it, so a leader
+    /// change mid-dispatch finds the slice charged rather than free.
+    pub fn reserve_placement(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<u32> {
+        for name in &node_names {
+            if !per_node_alloc.contains_key(name) {
+                anyhow::bail!("job {job_id}: per_node_alloc missing entry for node '{name}'");
+            }
+        }
+        let run_attempt = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
+            }
+            job.run_attempt.saturating_add(1)
+        };
+        // `JobStart`'s apply has no state guard, so it charges the slice while
+        // the job is still Pending; the transition follows once it is confirmed.
+        self.propose(WalOperation::JobStart {
+            job_id,
+            nodes: node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            run_attempt,
+            at: Some(Utc::now()),
+        })?;
+        Ok(run_attempt)
+    }
+
+    /// Reserve and activate together, for callers with nothing to dispatch in
+    /// between. Not the scheduler: the launch is what separates the two.
+    #[cfg(test)]
     pub fn start_job(
         &self,
         job_id: JobId,
@@ -1586,6 +1659,7 @@ impl ClusterManager {
         self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_job_impl(
         &self,
         job_id: JobId,
@@ -1594,51 +1668,86 @@ impl ClusterManager {
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
     ) -> anyhow::Result<u32> {
-        for name in &node_names {
-            if !per_node_alloc.contains_key(name) {
-                anyhow::bail!(
-                    "job {}: per_node_alloc missing entry for node '{}'",
-                    job_id,
-                    name
-                );
-            }
-        }
+        let run_attempt = self.reserve_placement(
+            job_id,
+            node_names.clone(),
+            resources.clone(),
+            per_node_alloc.clone(),
+            srun_step_dispatch,
+        )?;
+        self.activate_job(
+            job_id,
+            run_attempt,
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+        )
+    }
 
-        // Validate job exists and can transition
-        let old_state;
-        let spec_for_notify;
-        let submit_time_for_notify;
-        let run_attempt;
-        {
+    /// Give up a reservation whose dispatch never confirmed, freeing the slice
+    /// it charged. A no-op on a job that never reserved one.
+    pub fn abort_placement(&self, job_id: JobId) -> anyhow::Result<()> {
+        let Some(job) = self.get_job(job_id) else {
+            return Ok(());
+        };
+        let begin_time = self.launch_backoff_until(&job);
+        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        Ok(())
+    }
+
+    /// Make a reserved job Running, once every node has confirmed its launch.
+    /// The placement is already in the log, so this is the transition only.
+    pub fn activate_job(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<u32> {
+        let (old_state, spec_for_notify, submit_time_for_notify) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
-                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            old_state = job.state;
-            spec_for_notify = job.spec.clone();
-            submit_time_for_notify = job.submit_time;
-            // Next run epoch (first dispatch = 1), threaded to the agents.
-            run_attempt = job.run_attempt.saturating_add(1);
+                .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
-        }
-
-        // propose() handles: state transition, resource allocation, license subtraction
+            (job.state, job.spec.clone(), job.submit_time)
+        };
         self.propose(WalOperation::job_state_change(
             job_id,
             old_state,
             JobState::Running,
         ))?;
-        self.propose(WalOperation::JobStart {
+        self.finish_job_start(
             job_id,
-            nodes: node_names.clone(),
-            resources: resources.clone(),
-            per_node_alloc: per_node_alloc.clone(),
-            srun_step_dispatch,
             run_attempt,
-        })?;
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            spec_for_notify,
+            submit_time_for_notify,
+        )
+    }
 
+    /// The bookkeeping a started run needs once its transition is committed:
+    /// the batch step, the notification, and the accounting record.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_job_start(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        spec_for_notify: JobSpec,
+        submit_time_for_notify: DateTime<Utc>,
+    ) -> anyhow::Result<u32> {
         let node_count = node_names.len().max(1) as u32;
         let per_node = node_names
             .first()
@@ -1732,6 +1841,7 @@ impl ClusterManager {
 
         let resp = self
             .propose(WalOperation::JobNodeComplete {
+                at: None,
                 job_id,
                 node_name: node_name.to_string(),
                 exit_code,
@@ -1790,6 +1900,7 @@ impl ClusterManager {
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
         let resp = self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code,
             state,
@@ -1861,6 +1972,7 @@ impl ClusterManager {
             }
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
+                    at: None,
                     job_id,
                     preempted_by,
                     preempt_qos,
@@ -1891,6 +2003,7 @@ impl ClusterManager {
                     .and_then(|j| j.spec.begin_time)
                     .map_or(hold, |user_begin| user_begin.max(hold));
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
+                    at: None,
                     job_id,
                     begin_time,
                     preempted_by,
@@ -2100,6 +2213,7 @@ impl ClusterManager {
         // Trusted internal submit: bypass the user-facing validation pipeline
         // (auth, account/QOS, submit limits) that does not apply to a system job.
         self.propose(WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(spec),
         })?;
@@ -2356,6 +2470,7 @@ impl ClusterManager {
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
         self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Failed,
@@ -2474,7 +2589,11 @@ impl ClusterManager {
                 return Ok(());
             }
         }
-        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
+        let resp = self.propose(WalOperation::JobEvict {
+            job_id,
+            detail,
+            at: None,
+        })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(())
     }
@@ -2860,6 +2979,7 @@ impl ClusterManager {
 
         if state == JobState::Running {
             self.propose(WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Failed,
@@ -3128,6 +3248,7 @@ impl ClusterManager {
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
 
         self.propose(WalOperation::NodeStateChange {
+            at: None,
             name: name.to_string(),
             old_state,
             new_state: effective_state,
@@ -3351,6 +3472,7 @@ impl ClusterManager {
                         None => (Some("Not responding".into()), Some(0), Some(Utc::now())),
                     };
                     match self.propose(WalOperation::NodeStateChange {
+                        at: None,
                         name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
@@ -3386,6 +3508,7 @@ impl ClusterManager {
                     };
                     info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
+                        at: None,
                         name,
                         old_state,
                         new_state: recovered_state,
@@ -3440,6 +3563,7 @@ impl ClusterManager {
         };
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
         self.propose(WalOperation::NodeStateChange {
+            at: None,
             name: name.to_string(),
             old_state,
             new_state: target_state,
@@ -3487,6 +3611,7 @@ impl ClusterManager {
         }
 
         let resp = self.propose(WalOperation::NodeRemove {
+            at: None,
             name: name.to_string(),
             reason,
         })?;
@@ -3517,6 +3642,7 @@ impl ClusterManager {
         exit_code: i32,
     ) -> anyhow::Result<()> {
         self.propose(WalOperation::JobStepComplete {
+            at: None,
             job_id,
             step_id,
             exit_code,
@@ -4083,6 +4209,7 @@ impl ClusterManager {
                 continue;
             }
             match self.propose(WalOperation::JobComplete {
+                at: None,
                 job_id: id,
                 exit_code: -1,
                 state: JobState::Cancelled,
@@ -5038,6 +5165,29 @@ impl ClusterManager {
         *self.raft.write() = Some(raft);
     }
 
+    /// Whether this controller has applied its whole log, waiting up to `wait_for`.
+    /// Until then an absence in cluster state is no evidence; unknown reads false.
+    pub async fn state_machine_ready(&self, wait_for: std::time::Duration) -> bool {
+        if self.state_machine_ready.load(Ordering::Relaxed) {
+            return true;
+        }
+        let Some(raft) = self.raft.read().clone() else {
+            return false;
+        };
+        let caught_up = raft
+            .wait(Some(wait_for))
+            .metrics(
+                crate::raft::state_machine_caught_up,
+                "state machine applied its log",
+            )
+            .await
+            .is_ok();
+        if caught_up {
+            self.state_machine_ready.store(true, Ordering::Relaxed);
+        }
+        caught_up
+    }
+
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
         *self.accounting.write() = Some(notifier);
     }
@@ -5462,7 +5612,10 @@ impl ClusterManager {
     }
 
     #[allow(clippy::result_large_err)]
-    fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
+    fn propose(&self, mut op: WalOperation) -> anyhow::Result<ClientResponse> {
+        // Stamped at the one chokepoint into the log rather than at each call
+        // site, so no operation can reach it undated and be re-dated on replay.
+        op.stamp_occurred_at(Utc::now());
         let raft = self
             .raft
             .read()
@@ -5485,9 +5638,9 @@ impl ClusterManager {
         already_deallocated: &[String],
         job_id: JobId,
     ) {
-        let Some(total) = allocated_resources else {
+        if allocated_resources.is_none() {
             return;
-        };
+        }
         let node_count = freed_nodes.len().max(1) as u32;
         for name in freed_nodes {
             if already_deallocated.iter().any(|n| n == name) {
@@ -5496,22 +5649,155 @@ impl ClusterManager {
             let Some(node) = nodes.get_mut(name) else {
                 continue;
             };
-            let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
-                warn!(job_id, node = %name, "per_node_alloc missing at deallocation, using scalar fallback");
-                ResourceAllocations::with_scalar(
-                    total.cpus / node_count,
-                    total.memory_mb / node_count as u64,
-                )
-            });
+            let Some(slice) = Self::job_node_slice(
+                per_node_alloc,
+                allocated_resources,
+                name,
+                node_count,
+                job_id,
+                "deallocate",
+            ) else {
+                continue;
+            };
             node.alloc_resources.subtract(&slice);
-            node.update_state_from_alloc();
-            if node.state == NodeState::Draining
-                && node.alloc_resources.cpus == 0
-                && !node.alloc_resources.has_devices()
-            {
-                node.state = NodeState::Drain;
+            Self::refresh_node_state_for_alloc(node);
+        }
+    }
+
+    /// A job's slice of one node: the recorded value, or an even split of the job
+    /// total when no per-node entry exists. `None` means nothing to charge or free.
+    fn job_node_slice(
+        per_node_alloc: &HashMap<String, ResourceAllocations>,
+        allocated_resources: Option<&ResourceAllocations>,
+        node_name: &str,
+        node_count: u32,
+        job_id: JobId,
+        phase: &'static str,
+    ) -> Option<ResourceAllocations> {
+        if let Some(slice) = per_node_alloc.get(node_name) {
+            return Some(slice.clone());
+        }
+        let total = allocated_resources?;
+        warn!(job_id, node = %node_name, phase, "per_node_alloc missing, using scalar fallback");
+        Some(ResourceAllocations::with_scalar(
+            total.cpus / node_count,
+            total.memory_mb / node_count as u64,
+        ))
+    }
+
+    /// Refresh node state after its allocation changed. `update_state_from_alloc`
+    /// leaves hold states alone, so a fully-released Draining node completes here.
+    fn refresh_node_state_for_alloc(node: &mut Node) {
+        node.update_state_from_alloc();
+        if node.state == NodeState::Draining
+            && node.alloc_resources.cpus == 0
+            && !node.alloc_resources.has_devices()
+        {
+            node.state = NodeState::Drain;
+        }
+    }
+
+    /// Rebuild the node allocation cache from the job records that own the slices,
+    /// for `only` or for every node. The WAL apply sites maintain it in between.
+    fn derive_node_allocations(
+        jobs: &HashMap<JobId, Job>,
+        nodes: &mut HashMap<String, Node>,
+        only: Option<&str>,
+    ) {
+        let wanted = |name: &str| only.is_none_or(|n| n == name);
+        let mut derived: HashMap<String, ResourceAllocations> = HashMap::new();
+        // Sorted so the derived value is the same on every replica.
+        let mut job_ids: Vec<JobId> = jobs.keys().copied().collect();
+        job_ids.sort_unstable();
+        for job_id in job_ids {
+            let Some(job) = jobs.get(&job_id) else {
+                continue;
+            };
+            let node_count = job.allocated_nodes.len().max(1) as u32;
+            for name in &job.allocated_nodes {
+                // `is_held_on` carries the liveness clause: JobComplete and
+                // eviction clear node_completions but leave allocated_nodes set.
+                if !job.is_held_on(name) || !wanted(name) || !nodes.contains_key(name) {
+                    continue;
+                }
+                let Some(slice) = Self::job_node_slice(
+                    &job.per_node_alloc,
+                    job.allocated_resources.as_ref(),
+                    name,
+                    node_count,
+                    job_id,
+                    "derive",
+                ) else {
+                    continue;
+                };
+                match derived.get_mut(name) {
+                    Some(acc) => acc.add(&slice),
+                    None => {
+                        derived.insert(name.clone(), slice);
+                    }
+                }
             }
         }
+
+        for (name, node) in nodes.iter_mut().filter(|(n, _)| wanted(n)) {
+            let next = derived.remove(name).unwrap_or_default();
+            if allocations_equivalent(&node.alloc_resources, &next) {
+                continue;
+            }
+            warn!(
+                node = %name,
+                was = ?node.alloc_resources,
+                now = ?next,
+                "node allocation totals drifted from job records, correcting"
+            );
+            node.alloc_resources = next;
+            Self::refresh_node_state_for_alloc(node);
+        }
+    }
+
+    /// Hold a node out of scheduling, or release it. Proposed rather than set
+    /// locally so a follower promoted mid-reconcile does not schedule onto it.
+    pub fn set_reconcile_pending(&self, name: &str, pending: bool) {
+        if let Err(error) = self.propose(WalOperation::NodeReconcilePending {
+            name: name.to_string(),
+            pending,
+        }) {
+            warn!(node = %name, %error, "could not record the reconcile gate");
+        }
+    }
+
+    /// The launches this controller currently has on the wire.
+    pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
+        &self.dispatch_tracker
+    }
+
+    /// Every non-finalized job Raft places on this node, with its attempt.
+    pub fn jobs_allocated_on_node(&self, node: &str) -> HashMap<JobId, u32> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| job.is_held_on(node))
+            .map(|job| (job.job_id, job.run_attempt))
+            .collect()
+    }
+
+    /// Every job on this node whose launch an agent confirmed, with its attempt.
+    /// Narrower than [`Self::jobs_allocated_on_node`]: no in-flight dispatches.
+    pub fn jobs_confirmed_on_node(&self, node: &str) -> HashMap<JobId, u32> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| job.is_confirmed_on(node))
+            .map(|job| (job.job_id, job.run_attempt))
+            .collect()
+    }
+
+    /// Rebuild the node allocation cache from job records. Called where state has
+    /// just been built from durable records and before it drives placement.
+    pub fn recompute_node_allocations(&self) {
+        let jobs = self.jobs.read();
+        let mut nodes = self.nodes.write();
+        Self::derive_node_allocations(&jobs, &mut nodes, None);
     }
 
     /// Clear a job's run-state fields so it's schedulable again after requeue.
@@ -5637,16 +5923,21 @@ impl ClusterManager {
 
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
-    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+    pub(crate) fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
         let mut next_id = self.next_job_id.load(Ordering::Relaxed);
-        let timestamp = Utc::now();
+        // The leader's instant, so a replay dates the operation from when it
+        // happened. Only entries written before the field existed fall back.
+        let timestamp = op.occurred_at().unwrap_or_else(Utc::now);
 
         match op {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit { job_id, spec, .. } => {
                 let mut job = Job::new(*job_id, (**spec).clone());
+                // Job::new dates the submission from the local clock, which on a
+                // replay is the replay instant rather than the real submission.
+                job.submit_time = timestamp;
                 if let Some(het_group) = spec.het_group {
                     job.het_group = Some(het_group);
                     if het_group > 0 {
@@ -5713,15 +6004,30 @@ impl ClusterManager {
                 if job.state != JobState::Pending {
                     return ClientResponse::default();
                 }
+                // Free what the reservation charged before the requeue wipes
+                // the fields that say where it went.
+                let freed_nodes = job.allocated_nodes.clone();
+                let allocated_resources = job.allocated_resources.clone();
+                let per_node_map = job.per_node_alloc.clone();
+                let already: Vec<String> = job.node_completions.keys().cloned().collect();
                 Self::reset_job_for_requeue(job);
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
+                Self::deallocate_job_slices(
+                    &mut nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &already,
+                    *job_id,
+                );
             }
             WalOperation::JobPreemptRequeue {
                 job_id,
                 begin_time,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
@@ -5799,6 +6105,7 @@ impl ClusterManager {
                 job_id,
                 hold,
                 begin_time,
+                ..
             } => {
                 // A live job is finalized once (routed through Requeued so
                 // accounting/steps see a finished run) then re-pended; an
@@ -5890,6 +6197,7 @@ impl ClusterManager {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -5924,30 +6232,24 @@ impl ClusterManager {
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
                 }
-                if let Some(ref total) = allocated_resources {
+                if allocated_resources.is_some() {
                     let node_count = freed_nodes.len().max(1) as u32;
                     for name in &freed_nodes {
-                        if let Some(node) = nodes.get_mut(name) {
-                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
-                                warn!(
-                                    job_id = *job_id,
-                                    node = %name,
-                                    "per_node_alloc missing at preempt-cancel deallocation, using scalar fallback"
-                                );
-                                ResourceAllocations::with_scalar(
-                                    total.cpus / node_count,
-                                    total.memory_mb / node_count as u64,
-                                )
-                            });
-                            node.alloc_resources.subtract(&slice);
-                            node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && !node.alloc_resources.has_devices()
-                            {
-                                node.state = NodeState::Drain;
-                            }
-                        }
+                        let Some(node) = nodes.get_mut(name) else {
+                            continue;
+                        };
+                        let Some(slice) = Self::job_node_slice(
+                            &per_node_map,
+                            allocated_resources.as_ref(),
+                            name,
+                            node_count,
+                            *job_id,
+                            "preempt-cancel",
+                        ) else {
+                            continue;
+                        };
+                        node.alloc_resources.subtract(&slice);
+                        Self::refresh_node_state_for_alloc(node);
                     }
                 }
                 drop(jobs);
@@ -6007,7 +6309,7 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id, detail } => {
+            WalOperation::JobEvict { job_id, detail, .. } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -6033,9 +6335,17 @@ impl ClusterManager {
                 per_node_alloc,
                 srun_step_dispatch,
                 run_attempt,
+                at,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    job.start_time = Some(timestamp);
+                    // A requeue clears `start_time`, so keeping an existing one
+                    // only pins a run a pre-upgrade entry is being replayed for.
+                    match at {
+                        Some(at) => job.start_time = Some(*at),
+                        None => {
+                            job.start_time.get_or_insert(timestamp);
+                        }
+                    }
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
@@ -6055,17 +6365,21 @@ impl ClusterManager {
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
-                    if let Some(node) = nodes.get_mut(name) {
-                        let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
-                            warn!(job_id = *job_id, node = %name, "per_node_alloc missing at allocation, using scalar fallback");
-                            ResourceAllocations::with_scalar(
-                                resources.cpus / node_count,
-                                resources.memory_mb / node_count as u64,
-                            )
-                        });
-                        node.alloc_resources.add(&slice);
-                        node.update_state_from_alloc();
-                    }
+                    let Some(node) = nodes.get_mut(name) else {
+                        continue;
+                    };
+                    let Some(slice) = Self::job_node_slice(
+                        per_node_alloc,
+                        Some(resources),
+                        name,
+                        node_count,
+                        *job_id,
+                        "allocate",
+                    ) else {
+                        continue;
+                    };
+                    node.alloc_resources.add(&slice);
+                    node.update_state_from_alloc();
                 }
                 // Licenses are not mutated here: usage is derived on demand from
                 // running jobs (see available_licenses()), so the config total is
@@ -6076,6 +6390,7 @@ impl ClusterManager {
                 node_name,
                 exit_code,
                 signal,
+                ..
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -6096,25 +6411,19 @@ impl ClusterManager {
                         },
                     );
 
-                    if let Some(ref total) = job.allocated_resources {
-                        if !already_reported {
-                            let node_count = job.allocated_nodes.len().max(1) as u32;
-                            if let Some(node) = nodes.get_mut(node_name) {
-                                let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
-                                    warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
-                                    ResourceAllocations::with_scalar(
-                                        total.cpus / node_count,
-                                        total.memory_mb / node_count as u64,
-                                    )
-                                });
+                    if job.allocated_resources.is_some() && !already_reported {
+                        let node_count = job.allocated_nodes.len().max(1) as u32;
+                        if let Some(node) = nodes.get_mut(node_name) {
+                            if let Some(slice) = Self::job_node_slice(
+                                &job.per_node_alloc,
+                                job.allocated_resources.as_ref(),
+                                node_name,
+                                node_count,
+                                *job_id,
+                                "node-complete",
+                            ) {
                                 node.alloc_resources.subtract(&slice);
-                                node.update_state_from_alloc();
-                                if node.state == NodeState::Draining
-                                    && node.alloc_resources.cpus == 0
-                                    && !node.alloc_resources.has_devices()
-                                {
-                                    node.state = NodeState::Drain;
-                                }
+                                Self::refresh_node_state_for_alloc(node);
                             }
                         }
                     }
@@ -6200,6 +6509,7 @@ impl ClusterManager {
                 job_id,
                 exit_code,
                 state,
+                ..
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -6268,6 +6578,7 @@ impl ClusterManager {
                 job_id,
                 step_id,
                 exit_code,
+                ..
             } => {
                 // Keyed on job state, not step state: the eviction sweep
                 // (complete_evicted_steps) runs leader-only, so steps can diverge.
@@ -6345,6 +6656,11 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::NodeReconcilePending { name, pending } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.reconcile_pending = *pending;
+                }
+            }
             WalOperation::NodeRegister {
                 name,
                 hostname,
@@ -6400,6 +6716,9 @@ impl ClusterManager {
 
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
+                // A fresh Node starts at zero, so this is the one apply that can
+                // silently discard a charge rather than adjust one.
+                Self::derive_node_allocations(&jobs, &mut nodes, Some(name));
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse::default();
             }
@@ -6481,7 +6800,7 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
@@ -6950,6 +7269,9 @@ impl StateMachineApply for ClusterManager {
         }
         self.k0s_role_counts
             .recompute_from(nodes.values().map(|n| n.k0s_role));
+        // The snapshot carries the cache, the job records carry the truth: drift
+        // written by a previous leader is corrected rather than inherited.
+        Self::derive_node_allocations(&jobs, &mut nodes, None);
 
         *self.reservations.write() = snap.reservations;
 
@@ -8612,6 +8934,67 @@ mod tests {
         cm
     }
 
+    /// A raft needing two voters while only one runs, so it holds an entry it can
+    /// never apply. Returned already observed behind, so callers can wait zero.
+    async fn raft_that_cannot_apply(dir: &TempDir) -> crate::raft::RaftHandle {
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle =
+            crate::raft::start_raft(1, &["[::1]:0".into(), "[::1]:1".into()], dir.path(), cm)
+                .await
+                .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(
+                |m| !crate::raft::state_machine_caught_up(m),
+                "an entry it cannot apply",
+            )
+            .await
+            .expect("a raft without a quorum must hold an unapplied entry");
+        handle
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_with_no_raft_handle_is_not_ready() {
+        let dir = TempDir::new().unwrap();
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+
+        assert!(
+            !cm.state_machine_ready(std::time::Duration::ZERO).await,
+            "readiness it cannot determine must not license a destructive action"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_behind_its_own_log_is_not_ready() {
+        let dir = TempDir::new().unwrap();
+        let raft_dir = TempDir::new().unwrap();
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
+
+        assert!(!cm.state_machine_ready(std::time::Duration::ZERO).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readiness_latches_once_the_controller_has_caught_up() {
+        // A leader commits continuously, so an unlatched check would report the
+        // controller untrustworthy again the moment it accepted new work.
+        let dir = TempDir::new().unwrap();
+        let raft_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(
+            cm.state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
+
+        assert!(
+            cm.state_machine_ready(std::time::Duration::ZERO).await,
+            "the same raft reads as not ready when it is the first one seen"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interactive_reap_candidates_reaps_only_idle_allocations() {
         let dir = TempDir::new().unwrap();
@@ -9359,6 +9742,7 @@ mod tests {
 
         let spec = basic_spec("test-job");
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(spec.clone()),
         });
@@ -9875,12 +10259,94 @@ mod tests {
         assert_eq!(job_id, 500);
     }
 
+    /// A committed log as the leader wrote it, stamped far enough in the past
+    /// that a replay clock could not coincide with it.
+    fn finished_job_log() -> (DateTime<Utc>, DateTime<Utc>, Vec<WalOperation>) {
+        let submitted = DateTime::parse_from_rfc3339("2026-03-04T18:45:52Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let started = submitted + chrono::Duration::seconds(46);
+        let ended = started + chrono::Duration::seconds(300);
+
+        let mut log = vec![
+            WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("finished")),
+                at: Some(submitted),
+            },
+            WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["n1".into()],
+                resources: ResourceAllocations {
+                    cpus: 1,
+                    memory_mb: 1000,
+                    devices: HashMap::new(),
+                },
+                per_node_alloc: HashMap::new(),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                at: Some(started),
+            },
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running),
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Completed,
+                at: Some(ended),
+            },
+        ];
+        // Re-proposing must not re-date an entry that already carries an instant.
+        for op in &mut log {
+            op.stamp_occurred_at(Utc::now());
+        }
+        (submitted, ended, log)
+    }
+
+    /// Dating a replayed entry from the replay clock inflates a finished job's
+    /// run time by the restart interval, and over-bills it in accounting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_finished_job_keeps_the_times_the_run_actually_had() {
+        let (submitted, ended, log) = finished_job_log();
+
+        let first_dir = TempDir::new().unwrap();
+        let first = test_cluster(&first_dir).await;
+        register_node(&first, "n1", 8, 16000);
+        for op in &log {
+            first.apply_operation(op);
+        }
+        let before = first.get_job(1).expect("the job survives its own apply");
+
+        let replay_dir = TempDir::new().unwrap();
+        let replayed = test_cluster(&replay_dir).await;
+        register_node(&replayed, "n1", 8, 16000);
+        for op in &log {
+            replayed.apply_operation(op);
+        }
+        let after = replayed.get_job(1).expect("the job survives replay");
+
+        assert_eq!(
+            after.submit_time, submitted,
+            "SubmitTime must not be re-dated"
+        );
+        assert_eq!(after.end_time, Some(ended), "EndTime must not be re-dated");
+        assert_eq!(after.submit_time, before.submit_time);
+        assert_eq!(after.end_time, before.end_time);
+        assert_eq!(after.start_time, before.start_time);
+        assert_eq!(
+            after.run_time().map(|d| d.num_seconds()),
+            Some(300),
+            "RunTime is derived from start and end, so a re-dated end corrupts it"
+        );
+        assert_eq!(after.run_time(), before.run_time());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_job_state_change() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -9901,6 +10367,7 @@ mod tests {
 
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -9913,6 +10380,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], resources),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let job = cm.get_job(1).unwrap();
@@ -9925,12 +10393,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_running_job_keeps_the_start_it_was_dispatched_with() {
+        // A replay runs this same apply path; dating the run from it shortens every
+        // RunTime spanning a restart, which with accounting on is what gets billed.
+        let dispatched_at = Utc::now() - chrono::Duration::seconds(45);
+        let resources = scalar_alloc(4, 8000);
+        let log = [
+            WalOperation::JobSubmit {
+                at: None,
+                job_id: 1,
+                spec: Box::new(basic_spec("j")),
+            },
+            WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["node1".into()],
+                resources: resources.clone(),
+                per_node_alloc: per_node_for(&["node1"], resources),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                at: Some(dispatched_at),
+            },
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running),
+        ];
+
+        let dir = TempDir::new().unwrap();
+        let replayed = test_cluster(&dir).await;
+        register_node(&replayed, "node1", 8, 16000);
+        for op in &log {
+            replayed.apply_operation(op);
+        }
+
+        let job = replayed.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(
+            job.start_time,
+            Some(dispatched_at),
+            "the replay must not move a started run's clock forward"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_pre_upgrade_start_leaves_a_running_job_where_it_was() {
+        // Entries written before the instant was recorded still replay on the
+        // first restart after an upgrade, with only the prior apply to go on.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node1", 8, 16000);
+        let resources = scalar_alloc(4, 8000);
+        let legacy = WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["node1".into()],
+            resources: resources.clone(),
+            per_node_alloc: per_node_for(&["node1"], resources),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            at: None,
+        };
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("j")),
+        });
+        cm.apply_operation(&legacy);
+        let first = cm.get_job(1).unwrap().start_time;
+
+        cm.apply_operation(&legacy);
+
+        assert_eq!(cm.get_job(1).unwrap().start_time, first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_job_complete_deallocates_resources() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -9947,9 +10486,11 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -9971,10 +10512,12 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -9984,6 +10527,7 @@ mod tests {
             "job 1 is terminal"
         );
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(basic_spec("running")),
         });
@@ -9993,12 +10537,14 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 3,
             spec: Box::new(basic_spec("pending")),
         });
         // A job stranded in Preempted (a rare requeue-strand): finalized with an
         // end_time, so it must be reapable even though it isn't is_terminal().
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 4,
             spec: Box::new(basic_spec("preempted")),
         });
@@ -10066,10 +10612,12 @@ mod tests {
 
         for cm in [&cm_a, &cm_b] {
             cm.apply_operation(&WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(basic_spec("done")),
             });
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id: 1,
                 exit_code: 0,
                 state: JobState::Cancelled,
@@ -10096,6 +10644,7 @@ mod tests {
         let dir_c = TempDir::new().unwrap();
         let cm_c = test_cluster(&dir_c).await;
         cm_c.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeued")),
         });
@@ -10120,10 +10669,12 @@ mod tests {
         cfg2.controller.terminal_job_retention_secs = 86_400;
         let cm2 = test_cluster_with_config(&dir2, cfg2).await;
         cm2.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("fresh")),
         });
         cm2.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10154,10 +10705,12 @@ mod tests {
         let cm = test_cluster_with_config(&dir, cfg).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10194,6 +10747,7 @@ mod tests {
 
         // Target runs, completes, and ages out of the window.
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 100,
             spec: Box::new(basic_spec("target")),
         });
@@ -10203,6 +10757,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 100,
             exit_code: 0,
             state: JobState::Completed,
@@ -10214,6 +10769,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:100".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 101,
             spec: Box::new(child),
         });
@@ -10226,6 +10782,7 @@ mod tests {
 
         // Once the child is gone, the target is evictable.
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 101,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10251,14 +10808,17 @@ mod tests {
         let id1 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
         let id2 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: id1,
             spec: Box::new(basic_spec("survivor")),
         });
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: id2,
             spec: Box::new(basic_spec("high")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: id2,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10289,6 +10849,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("s")),
         });
@@ -10458,6 +11019,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("acc")),
         });
@@ -10505,6 +11067,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("cancel-susp")),
         });
@@ -10522,6 +11085,7 @@ mod tests {
             preempt_qos: None,
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10611,6 +11175,7 @@ mod tests {
 
         register_node(&cm, "n1", 4, 8000);
         cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Drain,
@@ -10631,6 +11196,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -10985,6 +11551,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("single-completing")),
         });
@@ -11001,9 +11568,11 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "worker1".into(),
             exit_code: 0,
@@ -11026,6 +11595,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("oom")),
         });
@@ -11042,9 +11612,11 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "worker1".into(),
             exit_code: 0,
@@ -11068,6 +11640,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("multi-completing")),
         });
@@ -11084,9 +11657,11 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11099,6 +11674,7 @@ mod tests {
         assert!(cm.get_node("n2").unwrap().alloc_resources.cpus > 0);
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
@@ -11107,6 +11683,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n3".into(),
             exit_code: 42,
@@ -11134,6 +11711,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("steps")),
         });
@@ -11149,17 +11727,20 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
         // the running max live; ExitCode is unaffected (it is the batch exit).
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 7,
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 1,
             exit_code: 3,
@@ -11167,6 +11748,7 @@ mod tests {
         // 3 < 7, running max stays 7.
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 2,
             exit_code: 2,
@@ -11175,6 +11757,7 @@ mod tests {
 
         // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 2,
@@ -11195,6 +11778,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("late-step")),
         });
@@ -11210,6 +11794,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
@@ -11228,11 +11813,13 @@ mod tests {
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 3,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11244,6 +11831,7 @@ mod tests {
             .expect("step survives job completion until eviction");
 
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 9,
@@ -11274,9 +11862,11 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         };
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeued")),
         });
@@ -11287,11 +11877,13 @@ mod tests {
         ));
         cm.apply_operation(&start());
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 5,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11301,6 +11893,7 @@ mod tests {
         assert_eq!((job.derived_exit_code, job.exit_signal), (5, 9));
 
         cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id: 1,
             hold: false,
             begin_time: None,
@@ -11336,6 +11929,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("batch-only")),
         });
@@ -11346,6 +11940,7 @@ mod tests {
         ));
 
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: STEP_BATCH,
             exit_code: 9,
@@ -11364,6 +11959,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("finalize-response")),
         });
@@ -11380,9 +11976,11 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11392,6 +11990,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         let r2 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
@@ -11414,6 +12013,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("job-complete-response")),
         });
@@ -11430,9 +12030,11 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -11453,6 +12055,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("double-complete")),
         });
@@ -11469,9 +12072,11 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -11485,6 +12090,7 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 0);
 
         let second = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Cancelled,
@@ -11510,6 +12116,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("penultimate")),
         });
@@ -11526,8 +12133,10 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11547,6 +12156,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("signal-job")),
         });
@@ -11562,6 +12172,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.node_complete(1, "n1", 0, 9, 0).unwrap();
@@ -11733,6 +12344,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("rpc-signal-job")),
         });
@@ -11748,6 +12360,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -11768,6 +12381,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("exit-job")),
         });
@@ -11783,6 +12397,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.node_complete(1, "n1", 42, 0, 0).unwrap();
@@ -11805,6 +12420,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("stale-job")),
         });
@@ -11821,6 +12437,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 2,
+            at: Some(chrono::Utc::now()),
         });
 
         // Stale SIGKILL report from epoch 1 must be ignored.
@@ -11844,6 +12461,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("cancel-while-cg")),
         });
@@ -11860,9 +12478,11 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11891,6 +12511,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
@@ -11911,6 +12532,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("nc-after-cancel")),
         });
@@ -11927,8 +12549,10 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -12557,6 +13181,7 @@ mod tests {
         // a completed job is never accounted twice.
         let live = run_job_on(&cm, "finalize-live", "worker1");
         let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id: live,
             hold: false,
             begin_time: None,
@@ -12568,6 +13193,7 @@ mod tests {
         cm.complete_job(done, 0, JobState::Completed).unwrap();
         settle(&cm, done, JobState::Completed);
         let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id: done,
             hold: false,
             begin_time: None,
@@ -12902,6 +13528,7 @@ mod tests {
         let job_id = run_job_on(&cm, "replay", "worker1");
 
         cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id,
             hold: false,
             begin_time: None,
@@ -12912,6 +13539,7 @@ mod tests {
         // Re-applying the same entry (follower catch-up / replay) is a NoOp:
         // the job is already Pending, so the counter must not double-bump.
         cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id,
             hold: false,
             begin_time: None,
@@ -13486,6 +14114,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("backoff-replay")),
         });
@@ -13495,6 +14124,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Failed,
@@ -13560,6 +14190,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("preempt-cancel-replay")),
         });
@@ -13576,11 +14207,13 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
         // Apply with explicit provenance to verify field propagation.
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            at: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -13602,6 +14235,7 @@ mod tests {
 
         // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            at: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -13844,6 +14478,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("replay")),
         });
@@ -13869,8 +14504,10 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -13878,6 +14515,7 @@ mod tests {
 
         // Replaying the terminal complete: still Completed, resources still freed.
         let replayed = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -13896,6 +14534,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeue-replay")),
         });
@@ -13905,6 +14544,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Preempted,
@@ -13940,6 +14580,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("preempt-replay")),
         });
@@ -13956,6 +14597,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -13963,6 +14605,7 @@ mod tests {
         // Apply without provenance fields — simulates a WAL entry written by an
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            at: None,
             job_id: 1,
             begin_time,
             preempted_by: None,
@@ -13985,6 +14628,7 @@ mod tests {
 
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            at: None,
             job_id: 1,
             begin_time,
             preempted_by: None,
@@ -14068,6 +14712,7 @@ mod tests {
     fn preempted_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
         let job_id = run_job_on(cm, name, node);
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -14088,6 +14733,7 @@ mod tests {
         let job_id = preempted_job_on(&cm, "late-nodecomplete", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id,
             node_name: "worker1".into(),
             exit_code: 0,
@@ -14111,6 +14757,7 @@ mod tests {
         let job_id = preempted_job_on(&cm, "replay-complete", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: 0,
             state: JobState::Completed,
@@ -14574,6 +15221,7 @@ mod tests {
         spec.num_tasks = 2;
         let job_id = 1;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(spec),
         });
@@ -14618,6 +15266,7 @@ mod tests {
         under_nodes.num_nodes = 1; // below min_nodes=2
         let n_id = 999;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: n_id,
             spec: Box::new(under_nodes),
         });
@@ -16585,6 +17234,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -16601,6 +17251,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -16635,6 +17286,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -16651,6 +17303,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17042,6 +17695,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -17058,6 +17712,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17092,6 +17747,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -19977,6 +20633,7 @@ mod tests {
 
         // Parent running -> child's afterok dependency is Waiting (not satisfied).
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -19990,6 +20647,7 @@ mod tests {
         child.dependency = vec!["afterok:1".into()];
         child.reservation = Some("does-not-exist".into());
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -21248,6 +21906,702 @@ mod tests {
         assert_eq!(snap.nodes_by_role[0], (K0sRole::Controller, 1));
     }
 
+    /// Deterministic xorshift64* so a failing run reproduces from its seed alone.
+    struct DiffRng(u64);
+
+    impl DiffRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    fn gpu_slice(cpus: u32, memory_mb: u64, device_ids: &[u32]) -> ResourceAllocations {
+        let mut alloc = ResourceAllocations::with_scalar(cpus, memory_mb);
+        if !device_ids.is_empty() {
+            alloc.devices.insert(
+                "gpu".to_string(),
+                device_ids
+                    .iter()
+                    .map(|id| spur_core::resource::AllocatedDevice::injectable(*id))
+                    .collect(),
+            );
+        }
+        alloc
+    }
+
+    /// Drive a generated cluster through the real WAL apply path, then assert the
+    /// derivation reaches the totals the four incremental sites accumulated.
+    fn run_allocation_differential(
+        seed: u64,
+    ) -> (ClusterManager, Vec<(String, ResourceAllocations)>) {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut rng = DiffRng(seed);
+        let (mut partials, mut fallbacks) = (0u32, 0u32);
+
+        let node_names: Vec<String> = (0..6).map(|i| format!("n{i}")).collect();
+        for name in &node_names {
+            cm.apply_operation(&WalOperation::NodeRegister {
+                name: name.clone(),
+                hostname: name.clone(),
+                resources: ResourceSet {
+                    cpus: 32,
+                    memory_mb: 64000,
+                    ..Default::default()
+                },
+                address: "127.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                source: spur_core::node::NodeSource::NativeHost,
+            });
+        }
+
+        for job_id in 1..=60u32 {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                at: None,
+                job_id,
+                spec: Box::new(basic_spec(&format!("j{job_id}"))),
+            });
+
+            // One in six never starts, so Pending jobs with no slice are covered.
+            if rng.below(6) == 0 {
+                continue;
+            }
+
+            let width = 1 + rng.below(3) as usize;
+            let first = rng.below(node_names.len() as u64) as usize;
+            let mut targets: Vec<String> = (0..width)
+                .map(|k| node_names[(first + k) % node_names.len()].clone())
+                .collect();
+            targets.dedup();
+
+            let cpus = 1 + rng.below(4) as u32;
+            let mem = 1000 * (1 + rng.below(4));
+            // One in five carries no per-node record, so both paths take the
+            // even-split fallback and must agree on the divisor.
+            let per_node: HashMap<String, ResourceAllocations> = if rng.below(5) == 0 {
+                fallbacks += 1;
+                HashMap::new()
+            } else {
+                targets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, n)| {
+                        let devices: Vec<u32> = match rng.below(3) {
+                            0 => Vec::new(),
+                            1 => vec![(idx as u32) % 4],
+                            _ => vec![(idx as u32) % 4, ((idx as u32) + 1) % 4],
+                        };
+                        (n.clone(), gpu_slice(cpus, mem, &devices))
+                    })
+                    .collect()
+            };
+            let total = gpu_slice(
+                cpus * targets.len() as u32,
+                mem * targets.len() as u64,
+                &[0],
+            );
+
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+                begin_time: None,
+                pending_reason_desc: None,
+            });
+            cm.apply_operation(&WalOperation::JobStart {
+                job_id,
+                nodes: targets.clone(),
+                resources: total,
+                per_node_alloc: per_node,
+                srun_step_dispatch: false,
+                run_attempt: 0,
+                at: Some(chrono::Utc::now()),
+            });
+
+            match rng.below(7) {
+                // Still running: the slice must stay charged.
+                0 => {}
+                1 => {
+                    cm.apply_operation(&WalOperation::JobStateChange {
+                        job_id,
+                        old_state: JobState::Running,
+                        new_state: JobState::Suspended,
+                        pending_reason: None,
+                        pending_priority: None,
+                        begin_time: None,
+                        pending_reason_desc: None,
+                    });
+                }
+                // A single-node job would finalize here, duplicating branch 3.
+                2 if targets.len() > 1 => {
+                    cm.apply_operation(&WalOperation::JobNodeComplete {
+                        at: None,
+                        job_id,
+                        node_name: targets[0].clone(),
+                        exit_code: 0,
+                        signal: 0,
+                    });
+                    partials += 1;
+                    assert!(
+                        !cm.get_job(job_id).unwrap().state.is_finalized(),
+                        "branch 2 must leave the job live with a partial completion"
+                    );
+                }
+                3 => {
+                    for name in &targets {
+                        cm.apply_operation(&WalOperation::JobNodeComplete {
+                            at: None,
+                            job_id,
+                            node_name: name.clone(),
+                            exit_code: 0,
+                            signal: 0,
+                        });
+                    }
+                }
+                4 => {
+                    cm.apply_operation(&WalOperation::JobComplete {
+                        at: None,
+                        job_id,
+                        exit_code: 0,
+                        state: JobState::Completed,
+                    });
+                }
+                5 => {
+                    cm.apply_operation(&WalOperation::JobPreemptCancel {
+                        at: None,
+                        job_id,
+                        preempted_by: None,
+                        preempt_qos: None,
+                    });
+                }
+                _ => {
+                    cm.apply_operation(&WalOperation::JobPreemptRequeue {
+                        at: None,
+                        job_id,
+                        begin_time: Utc::now(),
+                        preempted_by: None,
+                        preempt_qos: None,
+                    });
+                }
+            }
+        }
+
+        assert!(
+            partials > 0 && fallbacks > 0,
+            "seed {seed:#x}: partial completions ({partials}) and even-split              fallbacks ({fallbacks}) must both be exercised"
+        );
+
+        let accumulated: Vec<(String, ResourceAllocations)> = {
+            let nodes = cm.nodes.read();
+            let mut v: Vec<_> = nodes
+                .values()
+                .map(|n| (n.name.clone(), n.alloc_resources.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        (cm, accumulated)
+    }
+
+    #[test]
+    fn derived_allocations_match_the_accumulator() {
+        for seed in [0x5eed_1234_u64, 0xfeed_face, 0x0bad_c0de, 1, u64::MAX] {
+            let (cm, accumulated) = run_allocation_differential(seed);
+            assert!(
+                accumulated.iter().any(|(_, a)| a.cpus > 0),
+                "seed {seed:#x} generated no live allocation to compare"
+            );
+
+            cm.recompute_node_allocations();
+
+            let nodes = cm.nodes.read();
+            for (name, before) in &accumulated {
+                let after = &nodes.get(name).unwrap().alloc_resources;
+                assert!(
+                    allocations_equivalent(before, after),
+                    "seed {seed:#x} node {name}: accumulator {before:?} != derived {after:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reserved_placement_is_charged_before_the_job_runs() {
+        // The window this closes: a leader change between placing a job and
+        // launching it used to find the slice free and place a second job here.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+            )
+            .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "a reservation is not a start"
+        );
+
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+        )
+        .expect("activate");
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_up_a_reservation_frees_what_it_charged() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+        )
+        .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        cm.abort_placement(id).expect("abort");
+        wait_for("freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "the job goes back to the queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_up_a_placement_that_never_charged_is_harmless() {
+        // A pre-upgrade backoff entry carries no allocation, and replaying one
+        // must not free anything.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+
+        cm.abort_placement(id).expect("abort");
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcile_gate_is_independent_of_the_registration_decision() {
+        // An agent restarting on an unchanged node takes the Skip path, which
+        // proposes nothing -- and that is exactly the case the gate exists for.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(
+            !cm.get_node("n1").unwrap().is_schedulable(),
+            "a node mid-reconcile must not be dispatched to"
+        );
+
+        cm.set_reconcile_pending("n1", false);
+        wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jobs_allocated_on_node_reports_what_the_agent_must_account_for() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        let slice = scalar_alloc(2, 1000);
+        for (job_id, finish) in [(1u32, false), (2, true)] {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                at: None,
+                job_id,
+                spec: Box::new(basic_spec("j")),
+            });
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+                begin_time: None,
+                pending_reason_desc: None,
+            });
+            cm.apply_operation(&WalOperation::JobStart {
+                job_id,
+                nodes: vec!["n1".into()],
+                resources: slice.clone(),
+                per_node_alloc: per_node_for(&["n1"], slice.clone()),
+                srun_step_dispatch: false,
+                run_attempt: 3,
+                at: Some(chrono::Utc::now()),
+            });
+            if finish {
+                cm.apply_operation(&WalOperation::JobComplete {
+                    at: None,
+                    job_id,
+                    exit_code: 0,
+                    state: JobState::Completed,
+                });
+            }
+        }
+
+        let placed = cm.jobs_allocated_on_node("n1");
+        assert_eq!(placed.get(&1), Some(&3), "a live job must be accounted for");
+        assert!(
+            !placed.contains_key(&2),
+            "a finished job is not something the agent still owes"
+        );
+        assert!(cm.jobs_allocated_on_node("other").is_empty());
+    }
+
+    #[test]
+    fn allocations_equivalent_compares_device_content_not_layout() {
+        let a = gpu_slice(4, 8000, &[3, 1]);
+        let b = gpu_slice(4, 8000, &[1, 3]);
+        assert!(allocations_equivalent(&a, &b), "order alone is not drift");
+
+        assert!(!allocations_equivalent(&a, &gpu_slice(4, 8000, &[1, 2])));
+        assert!(!allocations_equivalent(&a, &gpu_slice(5, 8000, &[3, 1])));
+        assert!(!allocations_equivalent(&a, &gpu_slice(4, 9000, &[3, 1])));
+
+        // `subtract` prunes an emptied gres key, `add` creates it unconditionally,
+        // so an empty Vec must compare equal to an absent key.
+        let mut empty_key = scalar_alloc(2, 1000);
+        empty_key.devices.insert("gpu".into(), Vec::new());
+        assert!(allocations_equivalent(&empty_key, &scalar_alloc(2, 1000)));
+
+        // Two entries for one id must not read as equivalent to two distinct ids.
+        let mut duplicated = scalar_alloc(2, 1000);
+        duplicated.devices.insert(
+            "gpu".into(),
+            vec![
+                spur_core::resource::AllocatedDevice::injectable(1),
+                spur_core::resource::AllocatedDevice::injectable(1),
+            ],
+        );
+        assert!(!allocations_equivalent(
+            &duplicated,
+            &gpu_slice(2, 1000, &[1, 2])
+        ));
+    }
+
+    #[test]
+    fn derivation_does_not_charge_finalized_jobs() {
+        // JobComplete leaves allocated_nodes set with node_completions cleared, so
+        // a derivation without the liveness clause recharges every finished job.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = scalar_alloc(4, 8000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            at: Some(chrono::Utc::now()),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert!(
+            !job.allocated_nodes.is_empty() && job.node_completions.is_empty(),
+            "the record shape this clause exists for must still hold"
+        );
+
+        cm.recompute_node_allocations();
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[test]
+    fn derivation_corrects_a_drifted_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("live")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = gpu_slice(4, 8000, &[2]);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            at: Some(chrono::Utc::now()),
+        });
+
+        // Drift the cache the way a lost subtract or a double add would, then
+        // snapshot it: the job record still says 4 CPUs and GPU 2.
+        cm.nodes.write().get_mut("n1").unwrap().alloc_resources = scalar_alloc(7, 15000);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = ClusterManager::new(test_config(), dst.path()).unwrap();
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        let node = cm2.get_node("n1").unwrap();
+        assert_eq!(
+            node.alloc_resources.cpus, 4,
+            "restore must not inherit drift"
+        );
+        assert_eq!(node.alloc_resources.memory_mb, 8000);
+        assert_eq!(
+            node.alloc_resources.device_ids("gpu"),
+            vec![2],
+            "a derivation that drops gres must not pass"
+        );
+    }
+
+    #[test]
+    fn registering_a_node_recharges_it_from_live_job_records() {
+        // NodeRegister replaces the Node wholesale, so a fresh one starts at zero
+        // while a live job record still claims the slice.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let register = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        };
+        cm.apply_operation(&register);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("live")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = scalar_alloc(4, 8000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            at: Some(chrono::Utc::now()),
+        });
+
+        cm.apply_operation(&register);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "re-registration must not drop a live job's charge"
+        );
+    }
+
+    #[test]
+    fn registering_a_node_leaves_other_nodes_alone() {
+        // The rebuild on this path is scoped to the registering node: a wholesale
+        // one would restate unrelated nodes on an unrelated event.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let resources = ResourceSet {
+            cpus: 8,
+            memory_mb: 16000,
+            ..Default::default()
+        };
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: resources.clone(),
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        {
+            let mut nodes = cm.nodes.write();
+            let n1 = nodes.get_mut("n1").unwrap();
+            n1.alloc_resources = scalar_alloc(4, 8000);
+            n1.state = NodeState::Draining;
+        }
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n2".into(),
+            hostname: "n2".into(),
+            resources,
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+
+        let n1 = cm.get_node("n1").unwrap();
+        assert_eq!(n1.alloc_resources.cpus, 4);
+        assert_eq!(n1.state, NodeState::Draining);
+    }
+
+    #[test]
+    fn derivation_completes_a_drain_the_cache_left_hanging() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        {
+            let mut nodes = cm.nodes.write();
+            let node = nodes.get_mut("n1").unwrap();
+            node.alloc_resources = scalar_alloc(4, 8000);
+            node.state = NodeState::Draining;
+        }
+
+        cm.recompute_node_allocations();
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(
+            node.state,
+            NodeState::Drain,
+            "a drain whose last charge was phantom must complete, not hang"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_pre_partition_snapshot_keeps_config_baseline() {
         // An old snapshot predating partition support has no `partitions` field
@@ -22211,6 +23565,7 @@ mod tests {
         assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
 
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: id,
             exit_code: -1,
             state: JobState::Timeout,
@@ -22405,6 +23760,7 @@ mod tests {
         );
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: job_a,
             node_name: "n1".into(),
             exit_code: 0,
@@ -23868,6 +25224,7 @@ mod tests {
         spec.array_job_id = Some(parent);
         spec.array_task_id = Some(task);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: id,
             spec: Box::new(spec),
         });
@@ -23884,6 +25241,7 @@ mod tests {
             ));
         }
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: id,
             exit_code,
             state,
@@ -23897,6 +25255,7 @@ mod tests {
 
         // Parent scalar job that fails.
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -23906,6 +25265,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -23923,6 +25283,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -23931,6 +25292,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -23953,6 +25315,7 @@ mod tests {
 
         // Parent still running; child waits, not cancelled.
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -23965,6 +25328,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -23994,6 +25358,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:10".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(child),
         });
@@ -24018,6 +25383,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:10".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(child),
         });
@@ -24060,6 +25426,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("scalar")),
         });
@@ -24915,6 +26282,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
     }
 
@@ -24931,6 +26299,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: true,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
     }
 
@@ -24945,6 +26314,7 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
             name: "n1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -24974,6 +26344,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,
@@ -24995,6 +26366,7 @@ mod tests {
         assert!(cm.get_node("n1").is_some());
 
         cm.apply_operation(&WalOperation::NodeRemove {
+            at: None,
             name: "n1".into(),
             reason: Some("decommission".into()),
         });
@@ -25011,6 +26383,7 @@ mod tests {
         start_job_on(&cm, id, "n1");
 
         let resp = cm.apply_operation(&WalOperation::NodeRemove {
+            at: None,
             name: "n1".into(),
             reason: None,
         });
@@ -25136,6 +26509,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: id,
             node_name: "n1".into(),
             exit_code: 0,
