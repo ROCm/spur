@@ -45,6 +45,16 @@ pub enum WalOperation {
         pending_reason_desc: Option<String>,
     },
     JobStart {
+        /// Older entries restore the entire captured spec, including its comment.
+        #[serde(default)]
+        preserve_comment: bool,
+        /// Canonicalizes legacy comments unless a replicated edit followed capture.
+        #[serde(default)]
+        captured_comment_revision: Option<u64>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        spec: Option<Box<JobSpec>>,
         job_id: JobId,
         nodes: Vec<String>,
         resources: ResourceAllocations,
@@ -62,6 +72,8 @@ pub enum WalOperation {
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+        #[serde(default)]
+        timeout_guard: Option<(u32, chrono::DateTime<chrono::Utc>)>,
     },
     JobNodeComplete {
         job_id: JobId,
@@ -77,6 +89,24 @@ pub enum WalOperation {
     JobTimeLimitSignaled {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        guard: Option<crate::job::TimeoutGuard>,
+    },
+    JobUpdateProperties {
+        job_id: JobId,
+        time_limit: Option<chrono::Duration>,
+        partition: Option<String>,
+        comment: Option<String>,
+        account: Option<String>,
+        qos: Option<String>,
+    },
+    JobRenew {
+        request: crate::job::RenewalRequest,
+        at: chrono::DateTime<chrono::Utc>,
+        expected_spec: Box<JobSpec>,
+        max_runway_seconds: u32,
+        qos: Box<crate::accounting::Qos>,
+        account_limits: crate::accounting::AccountLimits,
     },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
@@ -164,6 +194,8 @@ pub enum WalOperation {
     },
     JobSuspend {
         job_id: JobId,
+        #[serde(default)]
+        fence_deadline: bool,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
         at: chrono::DateTime<chrono::Utc>,
         /// Preemption provenance — set when suspension is triggered by preemption,
@@ -286,9 +318,14 @@ pub enum WalOperation {
     },
 
     ReservationCreate {
+        /// Historical entries were validated before proposal, not during replay.
+        #[serde(default)]
+        validate_overlap: bool,
         reservation: Reservation,
     },
     ReservationUpdate {
+        #[serde(default)]
+        validate_overlap: bool,
         name: String,
         duration_minutes: u32,
         add_nodes: Vec<String>,
@@ -424,6 +461,10 @@ impl WalOperation {
         per_node_alloc: HashMap<String, ResourceAllocations>,
     ) -> Self {
         Self::JobStart {
+            preserve_comment: false,
+            captured_comment_revision: None,
+            at: None,
+            spec: None,
             job_id,
             nodes,
             resources,
@@ -437,6 +478,25 @@ impl WalOperation {
 #[cfg(test)]
 mod job_state_change_wal_tests {
     use super::*;
+
+    #[test]
+    fn reservation_update_marker_defaults_for_historical_entries() {
+        let wire = serde_json::json!({
+            "ReservationUpdate": {
+                "name": "reserved", "duration_minutes": 60,
+                "add_nodes": [], "remove_nodes": [],
+                "add_users": [], "remove_users": [],
+                "add_accounts": [], "remove_accounts": []
+            }
+        });
+        assert!(matches!(
+            serde_json::from_value::<WalOperation>(wire).unwrap(),
+            WalOperation::ReservationUpdate {
+                validate_overlap: false,
+                ..
+            }
+        ));
+    }
 
     /// A reason's variant name is its wire form in the Raft log, and a controller
     /// on an older binary cannot read a name it does not know. Freeze the newest
@@ -706,6 +766,7 @@ mod reservation_wal_tests {
     fn reservation_create_round_trips() {
         let now = Utc::now();
         let op = WalOperation::ReservationCreate {
+            validate_overlap: false,
             reservation: Reservation {
                 name: "r1".into(),
                 start_time: now,
@@ -723,7 +784,7 @@ mod reservation_wal_tests {
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::ReservationCreate { reservation } => {
+            WalOperation::ReservationCreate { reservation, .. } => {
                 assert_eq!(reservation.name, "r1");
                 assert!(reservation.flags.maint);
             }
@@ -1165,6 +1226,7 @@ mod suspend_wal_tests {
         let at = chrono::Utc::now();
         for op in [
             WalOperation::JobSuspend {
+                fence_deadline: false,
                 job_id: 7,
                 at,
                 preempted_by: None,
@@ -1177,11 +1239,13 @@ mod suspend_wal_tests {
             match (op, back) {
                 (
                     WalOperation::JobSuspend {
+                        fence_deadline: false,
                         job_id: a,
                         at: at_a,
                         ..
                     },
                     WalOperation::JobSuspend {
+                        fence_deadline: false,
                         job_id: b,
                         at: at_b,
                         ..
@@ -1211,13 +1275,18 @@ mod suspend_wal_tests {
     #[test]
     fn job_time_limit_signaled_op_round_trips() {
         let at = chrono::Utc::now();
-        let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };
+        let op = WalOperation::JobTimeLimitSignaled {
+            job_id: 13,
+            at,
+            guard: None,
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobTimeLimitSignaled {
                 job_id,
                 at: at_back,
+                guard: _,
             } => {
                 assert_eq!(job_id, 13);
                 assert_eq!(at_back, at);

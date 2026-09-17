@@ -2064,12 +2064,9 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
 
                 // Record before signalling: if the job exits on the SIGTERM, its
                 // completion must find the run already marked as timed out.
-                if let Err(e) = cluster.signal_time_limit(job.job_id, now) {
-                    warn!(job_id = job.job_id, error = %e, "failed to record time limit expiry");
-                    continue;
+                if let Err(e) = claim_and_signal_time_limit(&cluster, job, now).await {
+                    warn!(job_id = job.job_id, error = %e, "failed to claim time limit expiry");
                 }
-
-                send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
                 continue;
             };
 
@@ -2082,15 +2079,35 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 "grace period expired — force-killing job"
             );
 
-            if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
-            {
-                warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
-                continue;
+            match cluster.finish_time_limit(job) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(job_id = job.job_id, error = %e, "failed to finish time limit claim");
+                    continue;
+                }
             }
 
             send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
         }
     }
+}
+
+async fn claim_and_signal_time_limit(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<Vec<tokio::task::JoinHandle<()>>>> {
+    if !cluster.claim_time_limit(job, now)? {
+        return Ok(None);
+    }
+    Ok(Some(spawn_cancel_to_nodes(
+        cluster,
+        job.job_id,
+        job.run_attempt,
+        &job.allocated_nodes,
+        15,
+    )))
 }
 
 /// Reap interactive allocations (salloc/srun) whose client stopped sending
@@ -2409,9 +2426,26 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
-    }
+    drop(spawn_cancel_to_nodes(
+        cluster,
+        job_id,
+        run_attempt,
+        node_names,
+        signal,
+    ));
+}
+
+fn spawn_cancel_to_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+    signal: i32,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    cancel_agent_addrs(cluster, job_id, node_names)
+        .into_iter()
+        .map(|addr| tokio::spawn(cancel_one_agent(addr, job_id, run_attempt, signal)))
+        .collect()
 }
 
 /// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
@@ -3630,6 +3664,7 @@ mod tests {
                 },
                 accounting: Default::default(),
                 scheduler: Default::default(),
+                renewal: Default::default(),
                 auth: Default::default(),
                 partitions: vec![spur_core::config::PartitionConfig {
                     name: "default".into(),
@@ -3848,6 +3883,74 @@ mod tests {
                 1,
                 "n1 must have been cancelled before confirm_dispatch_on_nodes returned"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn renewal_stale_watchdog_claim_sends_no_agent_signal() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.renewal.upgraded_controllers = true;
+            let cm = test_cluster_with_config(&dir, config).await;
+            let (addr, cancels) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    user: "testuser".into(),
+                    partition: Some("default".into()),
+                    time_limit: Some(chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            );
+            cm.start_job(
+                job_id,
+                vec!["n1".into()],
+                ResourceAllocations::with_scalar(1, 0),
+                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(1, 0))]),
+            )
+            .unwrap();
+            let before = cm.get_job(job_id).unwrap();
+            let start = before.start_time.unwrap();
+            use crate::raft::StateMachineApply;
+            let result = cm.apply_operation(&spur_core::wal::WalOperation::JobRenew {
+                request: spur_core::job::RenewalRequest {
+                    job_id,
+                    user: "testuser".into(),
+                    run_attempt: before.run_attempt,
+                    expected_revision: 0,
+                    request_id: "watchdog-race".into(),
+                    expires_at: start + chrono::Duration::hours(2),
+                },
+                at: start + chrono::Duration::minutes(30),
+                expected_spec: Box::new(before.spec.clone()),
+                max_runway_seconds: 86400,
+                qos: Box::default(),
+                account_limits: Default::default(),
+            });
+            assert!(result.renewal.unwrap().is_ok());
+            let dispatched =
+                claim_and_signal_time_limit(&cm, &before, start + chrono::Duration::hours(1))
+                    .await
+                    .unwrap();
+            let claimed = dispatched.is_some();
+            for task in dispatched.into_iter().flatten() {
+                task.await.unwrap();
+            }
+            assert_eq!(cancels.load(Ordering::SeqCst), 0);
+            assert!(!claimed);
+            let renewed = cm.get_job(job_id).unwrap();
+            assert_eq!(renewed.state, spur_core::job::JobState::Running);
+
+            let dispatched =
+                claim_and_signal_time_limit(&cm, &renewed, start + chrono::Duration::hours(2))
+                    .await
+                    .unwrap()
+                    .expect("the renewed deadline must claim timeout");
+            assert_eq!(dispatched.len(), 1);
+            for task in dispatched {
+                task.await.unwrap();
+            }
+            assert_eq!(cancels.load(Ordering::SeqCst), 1);
         }
 
         // Force-finish must cancel the job on the unreported node before freeing

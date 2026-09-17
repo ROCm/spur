@@ -632,6 +632,7 @@ mod tests {
         suspend_job(pb::SuspendJobRequest) -> ();
         resume_job(pb::ResumeJobRequest) -> ();
         update_job(pb::UpdateJobRequest) -> ();
+        renew_job(pb::RenewJobRequest) -> pb::RenewJobResponse;
         requeue_job(pb::RequeueJobRequest) -> pb::RequeueJobResponse;
         get_node(pb::GetNodeRequest) -> pb::NodeInfo;
         update_node(pb::UpdateNodeRequest) -> ();

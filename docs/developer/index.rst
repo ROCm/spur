@@ -9,3 +9,6 @@ Spur is a Rust workspace (Cargo) that builds four binaries — ``spurctld``,
 - :doc:`documentation` — build and preview these docs locally.
 - :doc:`contributing` — commit and pull-request conventions, license headers, and
   the pre-commit hook.
+- :doc:`renewable-qos-design` — the guarded renewal contract, its timeout fencing
+  prerequisites, and the validation gates. Disabled by default; see
+  :doc:`../admin-guide/configuration` for the ``[renewal]`` keys.

@@ -559,6 +559,110 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    that must not be starved by anything wall-time can't bound, use
    preemption (``preempt_type``, above) instead.
 
+``[renewal]``
+-------------
+
+Lets the verified owner of a running allocation extend its expiry in place with
+``spur control renew``. It never requeues the job, and never restarts a process.
+Disabled by default. The contract and its limitations are described in
+:doc:`../developer/renewable-qos-design`.
+
+**Reload: Live.**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 12 12 52
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``upgraded_controllers``
+     - bool
+     - ``false``
+     - Acknowledges that every controller in the cluster can replay renewal WAL
+       records. Renewal is refused until this is set. Never enable it while an
+       older controller can still lead or replay. This also enables new
+       ``JobUpdateProperties`` WAL records for ordinary edits, even without grants
+       or successful renewals. Downgrading after new-format entries is unsupported;
+       disabling the gate does not undo persisted entries.
+
+Each QoS that may be renewed needs its own ``[renewal.qos.<name>]`` grant. A QoS
+with no grant is never renewable.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 12 18 46
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``enabled``
+     - bool
+     - ``false``
+     - Grants renewal to this QoS. Revoking it stops new renewals; expiry
+       extensions already committed are unaffected.
+   * - ``class``
+     - string
+     - ``"unqualified"``
+     - Administrator's classification: ``non_burst``, ``burst``, or
+       ``unqualified``. Only ``non_burst`` is renewable. A QoS name containing
+       "burst" confers nothing either way — you are asserting the policy's real
+       nature, so do not classify an existing burst policy as ``non_burst``.
+       Combining ``class = "burst"`` with ``enabled = true`` is a contradiction
+       and fails to load.
+   * - ``max_runway_seconds``
+     - integer
+     - ``0``
+     - Furthest forward, from now, that a single request may push the expiry.
+       ``0`` renews nothing, so a grant is inert until you set this.
+
+.. code-block:: toml
+
+   [renewal]
+   upgraded_controllers = true
+
+   [renewal.qos.long_training]
+   enabled = true
+   class = "non_burst"
+   max_runway_seconds = 86400
+
+Expiry eligibility and runway use leader decision time, sampled after publication
+lock waits and policy preparation, immediately before Raft proposal. Arrival before
+expiry does not preserve eligibility during a wait. Replicas apply the same recorded
+time; commit and receipt delivery may be later than the previous expiry. Identical
+retries return the historical receipt rather than making a new expiry decision.
+
+Runway is not lifetime. ``max_runway_seconds`` bounds each individual extension;
+the resulting expiry is still checked against QoS, association and partition
+wall limits, which are never raised or reinterpreted. A job one hour in asking
+for 24 hours of runway needs 25 hours of lifetime budget. Jobs that have been
+suspended, jobs under a group-wall-capped QoS, and allocations launched before
+``upgraded_controllers`` was enabled cannot be renewed. New renewals also refuse
+while any other active legacy allocation remains, regardless of its reported QoS
+or account: legacy attribution can differ across replicas and cannot safely feed
+aggregate policy checks. Existing historical receipts remain retrievable while
+the upgrade gate remains enabled.
+
+For comma-separated partition requests, renewal uses the tightest finite MaxTime
+among the requested partitions because the selected launch partition is not
+persisted. This does not change submission's alternative-partition semantics.
+Reservation access is rechecked for the current user/account; an authorized named
+reservation still caps the extension at its end. Group node caps count distinct
+occupied nodes, while CPU, memory and GPU usage stay additive.
+
+Once ``upgraded_controllers`` is enabled, reservation create/update also validates
+current occupancy at Raft apply. Active legacy allocations conservatively retain
+their nodes for this check regardless of their estimated expiry, because their
+start clocks were not replicated. IgnoreJobs and same-reservation update exemptions
+remain unchanged. With the upgrade acknowledgement disabled, reservation writes
+retain historical pre-proposal validation for mixed-version compatibility.
+
+The renewal request ID must contain 1–128 UTF-8 bytes, not characters. Invalid
+IDs are rejected before entering Raft; identical retries retain their original
+receipt and do not consume additional receipt capacity.
+
 ``[auth]``
 ----------
 

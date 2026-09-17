@@ -1517,6 +1517,67 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn renew_job(
+        &self,
+        request: Request<RenewJobRequest>,
+    ) -> Result<Response<RenewJobResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let mut client = self
+                .leader_proxy
+                .get_leader_client()
+                .await
+                .map_err(|_| status)?;
+            return client.renew_job(Self::forward_request(request)).await;
+        }
+        let user = Self::verified_identity(&request)
+            .ok_or_else(|| Status::unauthenticated("renewal requires verified identity"))?
+            .user
+            .clone();
+        let req = request.into_inner();
+        let expiry = req
+            .expires_at
+            .ok_or_else(|| Status::invalid_argument("expires_at required"))?;
+        if !(0..1_000_000_000).contains(&expiry.nanos) {
+            return Err(Status::invalid_argument("invalid timestamp nanos"));
+        }
+        let expires_at = chrono::DateTime::from_timestamp(expiry.seconds, expiry.nanos as u32)
+            .ok_or_else(|| Status::invalid_argument("invalid expiry"))?;
+        let receipt = self
+            .cluster
+            .renew_job(spur_core::job::RenewalRequest {
+                job_id: req.job_id,
+                user,
+                run_attempt: req.run_attempt,
+                expected_revision: req.expected_revision,
+                request_id: req.request_id,
+                expires_at,
+            })
+            .map_err(|e| {
+                let message = e.to_string();
+                if message.starts_with("unauthorized:") {
+                    Status::permission_denied(message)
+                } else if message.starts_with("unsupported:") {
+                    Status::unimplemented(message)
+                } else if message.starts_with("unavailable:") {
+                    Status::unavailable(message)
+                } else if message.starts_with("not_found:") {
+                    Status::not_found(message)
+                } else if message.starts_with("invalid:") {
+                    Status::invalid_argument(message)
+                } else {
+                    Status::failed_precondition(message)
+                }
+            })?;
+        Ok(Response::new(RenewJobResponse {
+            job_id: receipt.request.job_id,
+            run_attempt: receipt.request.run_attempt,
+            request_id: receipt.request.request_id,
+            deadline_revision: receipt.deadline_revision,
+            previous_expiry: Some(datetime_to_proto(receipt.previous_expiry)),
+            expires_at: Some(datetime_to_proto(receipt.request.expires_at)),
+        }))
+    }
+
     async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
             let proxy = &self.leader_proxy;
@@ -4784,6 +4845,12 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         account: job.spec.account.clone().unwrap_or_default(),
         state: job.state.to_proto_i32(),
         state_reason: job.state_reason(),
+        run_attempt: job.run_attempt,
+        deadline_revision: job.deadline_revision,
+        allocation_expiry: job
+            .start_time
+            .zip(job.spec.time_limit)
+            .map(|(start, limit)| datetime_to_proto(job.effective_deadline(start, limit))),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
         end_time: job.end_time.map(datetime_to_proto),
@@ -9023,6 +9090,22 @@ mod tests {
             .await
             .expect_err("claiming root without a credential must not bypass ownership");
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_requires_verified_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let err = svc
+            .renew_job(Request::new(RenewJobRequest {
+                job_id,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated);
+        assert_eq!(svc.cluster.get_job(job_id).unwrap().deadline_revision, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
