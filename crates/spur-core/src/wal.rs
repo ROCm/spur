@@ -17,6 +17,11 @@ fn default_port() -> u16 {
     6818
 }
 
+/// The only eviction an entry from before the reason field could carry.
+fn evicted_after_launch_failure() -> PendingReason {
+    PendingReason::JobLaunchFailure
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
@@ -131,14 +136,8 @@ pub enum WalOperation {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
     },
-    /// Preempt a running job and requeue it in one atomic step: free its node
-    /// allocation, end the prior run for accounting (as PREEMPTED), return it to
-    /// Pending, and hold it ineligible until `begin_time` so the scheduler can't
-    /// re-dispatch it into its own in-flight kill. A single committed entry
-    /// leaves the job Pending-with-hold and nodes freed, so a leadership change
-    /// or restart mid-sequence cannot strand it in PREEMPTED. `begin_time` is
-    /// the leader-computed absolute instant (already max'd against any user
-    /// `--begin`); followers apply it verbatim and re-apply is a NoOp.
+    /// End a running job's run as PREEMPTED and return it to Pending, held until
+    /// the leader-computed `begin_time`. Deferred while an epilog owes a slice.
     JobPreemptRequeue {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
@@ -212,6 +211,10 @@ pub enum WalOperation {
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
+        /// Why the run is coming off its nodes. Decides whether the requeue takes
+        /// the launch backoff, so a run that did launch must not claim one.
+        #[serde(default = "evicted_after_launch_failure")]
+        reason: PendingReason,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -1583,13 +1586,20 @@ mod evict_wal_tests {
             at: None,
             job_id: 9,
             detail: Some("PMIx prepare failed".into()),
+            reason: PendingReason::JobLaunchFailure,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobEvict { job_id, detail, .. } => {
+            WalOperation::JobEvict {
+                job_id,
+                detail,
+                reason,
+                ..
+            } => {
                 assert_eq!(job_id, 9);
                 assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
+                assert_eq!(reason, PendingReason::JobLaunchFailure);
             }
             _ => panic!("wrong variant"),
         }
@@ -1607,6 +1617,40 @@ mod evict_wal_tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // Frozen on-wire shape. Never regenerate: an entry from before the reason
+    // field must keep reading as the only eviction that controller could write.
+    #[test]
+    fn job_evict_without_a_reason_reads_as_a_launch_failure() {
+        const FROZEN: &str = r#"{"JobEvict":{"job_id":7,"detail":"boom"}}"#;
+        let op: WalOperation =
+            serde_json::from_str(FROZEN).expect("a pre-reason entry must still deserialize");
+        let WalOperation::JobEvict { reason, detail, .. } = op else {
+            panic!("wrong variant");
+        };
+        assert_eq!(detail.as_deref(), Some("boom"));
+        assert_eq!(
+            reason,
+            PendingReason::JobLaunchFailure,
+            "an older controller only ever evicted a failed launch"
+        );
+    }
+
+    #[test]
+    fn job_evict_carries_a_node_fault_reason_distinctly() {
+        let op = WalOperation::JobEvict {
+            at: None,
+            job_id: 4,
+            detail: Some("node n1 no longer holds this job".into()),
+            reason: PendingReason::NodeDown,
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).expect("serialize")).expect("parse");
+        let WalOperation::JobEvict { reason, .. } = back else {
+            panic!("wrong variant");
+        };
+        assert_eq!(reason, PendingReason::NodeDown);
     }
 
     #[test]

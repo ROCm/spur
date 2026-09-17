@@ -1661,6 +1661,7 @@ async fn update_node(
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
             reconcile,
+            caller: crate::interactive::current_user().unwrap_or_else(|_| "unknown".into()),
             name: name.to_string(),
             state,
             reason,

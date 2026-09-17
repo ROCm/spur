@@ -910,6 +910,45 @@ impl AdmissionStore {
         Ok(true)
     }
 
+    /// Settle a run the controller has answered, sparing a hook the record still
+    /// has in flight: only the teardown that owns one may call it lost.
+    pub fn mark_acknowledged_run_cleaned(&self, run_key: RunKey) -> io::Result<bool> {
+        let mut run = match self.load_run(run_key) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if run.state == RunState::Cleaned {
+            return Ok(true);
+        }
+        if run.cleanup.epilog.is_in_flight() {
+            return Ok(false);
+        }
+        run.state = RunState::Cleaned;
+        self.admit_run(&run)?;
+        Ok(true)
+    }
+
+    /// Record a hook the run has heard nothing about yet, deciding and writing
+    /// under one read so an outcome that landed meanwhile is never overwritten.
+    pub fn record_epilog_if_unstarted(
+        &self,
+        run_key: RunKey,
+        state: HookState,
+    ) -> io::Result<bool> {
+        let mut run = match self.load_run(run_key) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if run.cleanup.epilog != HookState::NotStarted {
+            return Ok(false);
+        }
+        run.cleanup.epilog = state;
+        self.admit_run(&run)?;
+        Ok(true)
+    }
+
     /// One run and everything admitted under it, plus what could not be read: a
     /// damaged participant file otherwise reads as a run that never had one.
     pub fn load_admitted(

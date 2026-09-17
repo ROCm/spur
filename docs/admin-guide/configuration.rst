@@ -788,7 +788,10 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
 
        ``"cancel"`` — the running job is stopped and removed from the queue.
        ``"requeue"`` — the running job is stopped and put back in the queue;
-       it will start again automatically once a node is free.
+       it will start again automatically once a node is free. Where ``epilog``
+       is configured the job shows as ``PREEMPTED`` and keeps its node slice
+       until every node has finished that hook, then returns to ``PENDING``;
+       the higher-priority job starts once that slice is actually free.
        ``"suspend"`` — the running job is paused (not stopped). It keeps its
        node allocation and continues automatically once the higher-priority job
        finishes. Because the node stays occupied, any other job that also needs

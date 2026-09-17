@@ -221,6 +221,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.drive_bb_stage_in();
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
+        cluster.requeue_stranded_preempted_jobs();
         cluster.evict_expired_terminal_jobs();
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
@@ -616,9 +617,12 @@ async fn process_assignment(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) =
-            cluster.evict_job_attempt(job_id, Some(prospective_run_attempt), Some(detail))
-        {
+        if let Err(e) = cluster.evict_job_attempt(
+            job_id,
+            Some(prospective_run_attempt),
+            Some(detail),
+            spur_core::job::PendingReason::JobLaunchFailure,
+        ) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -852,6 +856,7 @@ pub(crate) async fn try_preempt(
     use spur_core::reservation::job_runs_in_active_reservation;
 
     let now = chrono::Utc::now();
+    cluster.discharge_preempt_debt();
     let reservations = cluster.get_reservations();
     let cluster_nodes = cluster.get_nodes();
 
@@ -894,6 +899,11 @@ pub(crate) async fn try_preempt(
         .collect();
 
     for pending in unscheduled {
+        // A victim taken last cycle can still be handing its slice back through
+        // an epilog; taking a second one now kills a job for nothing.
+        if cluster.owed_a_preempted_slice(pending.job_id) {
+            continue;
+        }
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
@@ -983,6 +993,7 @@ pub(crate) async fn try_preempt(
                     continue;
                 }
             }
+            cluster.record_preempt_debt(pending.job_id, candidate.job_id);
             break; // One preemption per cycle, re-evaluate next cycle
         }
     }
@@ -6006,8 +6017,13 @@ mod tests {
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
 
-            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
-                .expect("a stale eviction must be a no-op, not an error");
+            cm.evict_job_attempt(
+                job_id,
+                Some(current.wrapping_sub(1)),
+                Some("stale".into()),
+                spur_core::job::PendingReason::JobLaunchFailure,
+            )
+            .expect("a stale eviction must be a no-op, not an error");
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(
@@ -6203,6 +6219,111 @@ mod tests {
                  1 gpu/resource allocation mismatch)",
                 "operators need the specific failure category, not a generic count"
             );
+        }
+
+        fn register_epilog_node_without_comm_addr(cm: &ClusterManager, name: &str) {
+            use spur_core::wal::WalOperation;
+
+            cm.apply_operation(&WalOperation::NodeRegister {
+                runs_job_epilog: true,
+                name: name.into(),
+                hostname: name.into(),
+                resources: ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                address: String::new(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                source: NodeSource::NativeHost,
+            });
+            let n = name.to_string();
+            wait_for(&format!("epilog node '{n}' registered"), || {
+                cm.get_node(&n).is_some()
+            });
+        }
+
+        /// Run `passes` preemption cycles for one high-priority pending job against
+        /// two low-priority runs on an epilog node; returns how many were taken.
+        async fn victims_taken_over(
+            cm: &Arc<ClusterManager>,
+            mode: spur_core::partition::PreemptMode,
+            passes: usize,
+        ) -> usize {
+            use spur_core::job::JobState;
+
+            register_epilog_node_without_comm_addr(cm, "n1");
+            let spec = |name: &str, priority: u32| JobSpec {
+                name: name.into(),
+                user: "u".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                partition: Some("default".into()),
+                priority: Some(priority),
+                ..Default::default()
+            };
+            let slice = ResourceAllocations::with_scalar(1, 0);
+            let victims: Vec<_> = ["a", "b"]
+                .iter()
+                .map(|name| {
+                    let id = submit_and_wait(cm, spec(name, 1));
+                    cm.start_job(
+                        id,
+                        vec!["n1".into()],
+                        slice.clone(),
+                        HashMap::from([("n1".to_string(), slice.clone())]),
+                    )
+                    .unwrap();
+                    settle(cm, id, JobState::Running);
+                    id
+                })
+                .collect();
+
+            let waiting = JobSpec {
+                nodelist: Some("n1".into()),
+                ..spec("waiting", 10_000)
+            };
+            let waiting_id = submit_and_wait(cm, waiting);
+            let waiting = cm.get_job(waiting_id).expect("the pending job");
+            let parts = vec![partition_with_mode("default", mode)];
+            let sched = sched_config_default();
+
+            for _ in 0..passes {
+                try_preempt(cm, &parts, &[&waiting], &sched).await;
+            }
+            victims
+                .iter()
+                .filter(|id| cm.get_job(**id).is_some_and(|j| j.state.is_finalized()))
+                .count()
+        }
+
+        // A victim still charged to its epilog does not fit the pending job yet,
+        // and next cycle it is no longer a candidate: so a fresh job dies instead.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_pending_job_takes_one_requeue_victim_while_it_hands_its_slice_back() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let taken =
+                victims_taken_over(&cm, spur_core::partition::PreemptMode::Requeue, 3).await;
+            assert_eq!(
+                taken, 1,
+                "one pending job is owed one victim, not one a cycle"
+            );
+        }
+
+        // Cancel holds the victim's slice through its epilog exactly as requeue
+        // does, but leaves it Cancelled — so state is the wrong thing to watch.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_pending_job_takes_one_cancel_victim_while_it_hands_its_slice_back() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let taken = victims_taken_over(&cm, spur_core::partition::PreemptMode::Cancel, 3).await;
+            assert_eq!(taken, 1, "a cancelled victim is still giving up its cores");
         }
     }
 

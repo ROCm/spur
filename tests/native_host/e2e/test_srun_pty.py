@@ -91,6 +91,23 @@ class TestSrunPtyStep:
             assert code == 0, out
             assert out.count("--input is not supported for a job step") == 1, out
 
+    def test_pty_step_runs_under_its_own_supervisor(self, cluster):
+        # The shell used to be a direct child of spurd, so nothing could reach
+        # it. It now has a session of its own beside the allocation's.
+        runtime = f"{cluster.state_dir}/runtime"
+        code, out = cluster.salloc_run(
+            f"srun --pty bash -c 'echo SESSIONS=$(ls {runtime} "
+            '| grep -c "^$SPUR_JOB_ID[.]")\'\n'
+        )
+        assert code == 0, out
+        counts = [
+            int(line.split("=", 1)[1].strip())
+            for line in out.splitlines()
+            if line.startswith("SESSIONS=")
+        ]
+        assert counts, out
+        assert counts[0] >= 2, f"a pty step must add a supervisor: {out}"
+
     def test_pty_step_runs_srun_epilog(self, cluster):
         epilog = cluster.write_file(
             "pty-epilog.sh", "#!/bin/bash\ntouch /tmp/spur-pty-epilog-marker\n"

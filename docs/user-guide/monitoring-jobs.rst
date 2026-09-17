@@ -286,9 +286,9 @@ to a name, or a node whose reason predates provenance tracking, renders as
 ``Reason=<text> [<user>@<timestamp>]`` when a set-time is recorded, and the REST
 node object carries ``reason_uid`` and ``reason_time`` fields.
 
-Not every reason comes from an admin. A node still reporting ``idle`` or ``mix``
-may nonetheless be skipped by the scheduler, and says so in the same field
-(``Reason=`` in ``scontrol show node``, ``%E`` in ``sinfo``):
+Not every reason comes from an admin. The controller sets reasons of its own in
+the same field (``Reason=`` in ``scontrol show node``, ``%E`` in ``sinfo``) when
+it is holding a node back:
 
 .. list-table::
    :header-rows: 1
@@ -303,16 +303,18 @@ may nonetheless be skipped by the scheduler, and says so in the same field
        waits for that first, and the whole pass is capped at a minute.
    * - ``holding claims the controller has no record of: <ids>``
      - The node is holding resources for runs the controller cannot place, and
-       could not resolve them itself. The node keeps working; the named runs are
-       what an operator should look at. It clears itself once the node reports
-       them or they are otherwise settled.
+       could not resolve them itself. The node is drained — it reports ``drain``,
+       or ``drng`` until the work it is still running finishes — because the held
+       cores refuse every launch aimed at them. The named runs are what an
+       operator should look at. The drain lifts itself once a complete ledger
+       from the node shows no such claim left.
    * - ``dispatch cooldown after a failed launch (<n>s remaining)``
      - A launch failed on this node, so the scheduler skips it for
        ``controller.dispatch_reject_cooldown_secs`` instead of re-picking it
        every cycle. It returns to service on its own when the countdown ends;
        the launch failure itself is reported on the affected job.
 
-A reason an admin set with ``scontrol update`` takes precedence over both: a
+A reason an admin set with ``scontrol update`` takes precedence over all three: a
 drained node reports the drain, not the transient skip.
 
 Node states are shown as short abbreviations: ``idle`` (free), ``alloc`` (fully
@@ -965,19 +967,41 @@ about it:
   The node keeps a veto it alone can exercise: while a cleanup hook is still
   running under the job, it declines and the next reconcile asks again;
 - neither — the node cannot account for the claim and the controller has no
-  record of it, so nothing may end it and nothing proves it is over. It is left
-  alone and named in the node's reason as ``holding claims the controller has
-  no record of``, followed by the job ids. Only an operator can clear the
-  underlying condition.
+  record of it, so nothing may end it and nothing proves it is over. The claim
+  is left alone, but the node is drained and named in its reason as ``holding
+  claims the controller has no record of``, followed by the job ids. Only an
+  operator can clear the underlying condition.
+
+The drain is what keeps the cluster from grinding against the node: the held
+cores are ones the controller counts as free, so left in service the node is
+picked every scheduling cycle and refuses every launch aimed at them. A node
+still running other work reports ``drng`` until that work finishes, then
+``drain``.
+
+Both the drain and the reason are lifted by the first reconcile that finds no
+claim left, and lifting them takes the same evidence as settling a job: a
+complete ledger from the node's current agent. A node that cannot enumerate its
+own records stays drained. Where the node had also gone ``down`` in the
+meantime, the reconcile releases the hold but leaves the state alone — the
+heartbeat decides when that node is fit again, not the reconcile. Resuming the
+node by hand does not help while the claim is still there: the next reconcile
+drains it again.
+
+Both the drained nodes and the job ids show up in the usual places:
+
+.. code-block:: bash
+
+   sinfo -R
+   scontrol show node node01
 
 The reason is written only where the controller has no other reason to
-overwrite, and is cleared only once a reconcile that could see every claim finds
-none left. A node carrying any other reason — an operator's, or one the
-controller set for something else such as a missed heartbeat — keeps it, and the
-drift is reported in the controller log instead. Naming needs an
+overwrite, and the drain only where the node is not already held by someone
+else. A node carrying any other reason — an operator's, or one the controller
+set for something else such as a missed heartbeat — keeps it untouched, and the
+drift is reported in the controller log instead. Both naming and lifting need an
 attested reconcile: under the default ``open`` node admission a ledger that
-arrives with a registration cannot license it, so on those clusters the reason
-is written by a reconcile the controller initiated. See
+arrives with a registration cannot license either, so on those clusters both are
+done by a reconcile the controller initiated. See
 :doc:`/admin-guide/configuration` for how ``admission.mode`` decides that.
 
 The controller already reconciles a node on its own:
@@ -1002,11 +1026,39 @@ named is evidence whether or not the rest of the account is complete. So a node
 with a damaged spool is not uniformly left alone: expect cancellations from it,
 but no settlements.
 
+The other direction is a job the controller records on the node that the node
+did not list. A complete ledger that omits it is evidence the node let it go, so
+the run is settled as ``NODE_FAIL`` — the same state a job reaches when the node
+under it goes ``DOWN``, and for the same reason: it did not report an exit
+status, it stopped being there. A job submitted with ``--requeue`` therefore
+goes back to the queue and is retried, up to ``[controller] max_batch_requeue``
+attempts, after which it is held with a reason of ``JobHoldMaxRequeue``. The
+retry is immediate. The growing hold capped by ``[controller]
+max_launch_backoff_secs`` is for a job that never started; this one ran, so it
+is re-dispatched on the next cycle with no ``BeginTime`` in its future.
+
+A multi-node job is settled whole: the ranks on the node that lost it are gone,
+so it cannot finish on the peers either. The controller kills it on every peer
+still running it and releases their slices; a node that had already reported, or
+that still owes a cleanup hook, keeps its slice until that hook answers. Where
+the run had already finished and the node owed only its epilog, the record is
+settled by releasing that slice rather than by ending the job again. The job's
+reason names the node it was lost from:
+
+.. code-block:: text
+
+   Reason=NodeDown (node node01 no longer holds this job)
+
 Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see
 :doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
 
-Asking for one by hand requires admin rights, because it can end running work:
+Asking for one by hand requires a cluster admin, because it can end running
+work. Where authentication is configured the verified identity decides it. Where
+it is not, the admin check falls back to the username the client sends, which is
+an operator-error guard and not a security boundary — on such a cluster anyone
+who can reach the controller can claim any name. An omitted username is refused
+rather than trusted:
 
 .. code-block:: bash
 

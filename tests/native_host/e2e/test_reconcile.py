@@ -4,6 +4,8 @@
 """The controller reconciles what a node is holding against its own log, on an
 operator's word."""
 
+import pytest
+
 from cluster import job_state, wait_until
 from test_admission_ledger import (
     read_run_record,
@@ -24,6 +26,11 @@ def reconcile(cluster, node_name: str, extra_env: dict[str, str] | None = None):
         ["scontrol", "update", f"NodeName={node_name}", "Reconcile=yes"],
         extra_env=extra_env,
     )
+
+
+def start_authenticated(cluster):
+    cluster.start(config_overrides={"auth": {"plugin": "jwt", "jwt_key": JWT_KEY}})
+    return cluster
 
 
 def mint_token(cluster, user: str, admin: bool = False) -> str:
@@ -75,11 +82,33 @@ class TestOperatorReconcile:
         for job_id in job_ids:
             cluster.scancel(str(job_id))
 
-    def test_only_an_admin_may_ask_a_node_to_reconcile(self, unstarted_cluster):
-        cluster = unstarted_cluster
-        cluster.start(
-            config_overrides={"auth": {"plugin": "jwt", "jwt_key": JWT_KEY}}
+    # The authz bar must hold on a cluster that authenticates nobody, without
+    # locking its operators out — see the root case in the tests above.
+    def test_a_non_admin_is_refused_on_a_cluster_with_no_authentication(self, cluster):
+        submit_user = cluster.nodes[0].user
+        if submit_user == "root":
+            pytest.skip("need a non-root SSH user to test non-admin rejection")
+        probe = cluster.cli_as_user("root", ["scontrol", "show", "config"])
+        if "sudo" in probe.lower() and (
+            "password" in probe.lower() or "not allowed" in probe.lower()
+        ):
+            pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
+
+        node = cluster.node_names[0]
+        before = ledger_pulls(cluster)
+        out = cluster.cli_as_user(
+            submit_user,
+            ["scontrol", "update", f"NodeName={node}", "Reconcile=yes"],
         )
+        assert "requires cluster admin" in out.lower(), (
+            f"a non-admin reconcile must be denied even with auth off: {out}"
+        )
+        assert ledger_pulls(cluster) == before, (
+            "a refused reconcile must not reach the node"
+        )
+
+    def test_only_an_admin_may_ask_a_node_to_reconcile(self, unstarted_cluster):
+        cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
 
         before_pulls = ledger_pulls(cluster)

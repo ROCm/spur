@@ -90,6 +90,10 @@ pub struct StepdLaunchSpec {
     /// Absent unless this launch hosts a PMIx server; see [`StepdPmix`].
     #[serde(default)]
     pub pmix: Option<StepdPmix>,
+    /// Present when this launch's stdio is a terminal. The supervisor opens it
+    /// and keeps custody, so the terminal outlives whichever agent asked for it.
+    #[serde(default)]
+    pub pty: Option<crate::pty::WindowSize>,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -219,6 +223,10 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 mpi: config.mpi.clone(),
             },
             pmix: None,
+            pty: match config.io_mode {
+                crate::executor::LaunchIo::Pty(winsize) => Some(winsize.unwrap_or_default()),
+                crate::executor::LaunchIo::File => None,
+            },
         })
     }
 }
@@ -255,7 +263,14 @@ impl StepdLaunchSpec {
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
-            io_mode: crate::executor::LaunchIo::File,
+            io_mode: match self.pty {
+                // A zeroed size means the client never said; forcing 0x0 on the
+                // terminal would be worse than leaving the kernel default.
+                Some(winsize) => crate::executor::LaunchIo::Pty(
+                    (winsize != crate::pty::WindowSize::default()).then_some(winsize),
+                ),
+                None => crate::executor::LaunchIo::File,
+            },
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
@@ -1432,13 +1447,24 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
-/// Holds each open terminal's pty master for this job. Keyed per shell, since a
-/// job can have several at once, and retained after a hand-back so the terminal
-/// still outlives however many agents come and go.
-async fn serve_pty_custody(listener: UnixListener) {
+/// Every open terminal this session holds, keyed by the shell's pid. A hand-back
+/// retains custody, so the terminal outlives however many agents come and go.
+pub type PtyCustody = Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>>;
+
+/// Take custody of a terminal this supervisor opened for its own launch, so the
+/// master outlives the launch and the agent can claim it under the shell's pid.
+async fn hold_launched_pty(held: &PtyCustody, workload_pid: u32, master: std::os::fd::OwnedFd) {
+    if workload_pid == 0 {
+        tracing::warn!("a terminal was opened for a launch with no process; releasing it");
+        return;
+    }
+    held.lock().await.insert(workload_pid, master);
+}
+
+/// Serves the custody socket against a map the launch path can also write, so a
+/// terminal the supervisor opened itself needs no round trip to be held.
+async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
     use std::os::fd::AsRawFd;
-    let held: std::sync::Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>> =
-        std::sync::Arc::new(Mutex::new(HashMap::new()));
     while let Ok((stream, _)) = listener.accept().await {
         let held = held.clone();
         tokio::spawn(async move {
@@ -1907,12 +1933,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // created it, so the terminal survives a restart and can be picked back up.
     let custody_path = session_dir.join(PTY_CUSTODY_SOCKET_NAME);
     let _ = std::fs::remove_file(&custody_path);
-    if let Ok(custody) = UnixListener::bind(&custody_path) {
+    let custody: PtyCustody = Arc::new(Mutex::new(HashMap::new()));
+    if let Ok(listener) = UnixListener::bind(&custody_path) {
         let _ = std::fs::set_permissions(
             &custody_path,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         );
-        tokio::spawn(serve_pty_custody(custody));
+        tokio::spawn(serve_pty_custody(listener, custody.clone()));
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let stderr_path = launch_spec.stderr_path.clone();
@@ -1974,14 +2001,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None, None)
+    let (job, launched_cgroup, launched_output, launched_master) = if launch_spec.allocation_only {
+        (RunningJob::AllocationOnly, None, None, None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => (
                 result.job,
                 result.cgroup_path,
                 Some((result.stdout_path, result.stderr_path)),
+                result.pty_master,
             ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
@@ -1993,6 +2021,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let workload_pid = job.pid().unwrap_or(0);
+    // Custody before anything can observe the launch: dropping the master would
+    // hang the terminal up under the shell that just got its slave.
+    if let Some(master) = launched_master {
+        hold_launched_pty(&custody, workload_pid, master).await;
+    }
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
         descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);
@@ -2933,6 +2966,76 @@ mod pty_custody_tests {
         assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT]), None);
         assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT, 1, 2]), None);
     }
+
+    /// Serves a custody socket over `held` the way the supervisor's own launch
+    /// path does, so the reclaim under test crosses the real socket.
+    async fn serve_custody_over(
+        dir: &std::path::Path,
+        held: super::PtyCustody,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(dir.join(super::PTY_CUSTODY_SOCKET_NAME))
+            .expect("bind custody socket");
+        tokio::spawn(super::serve_pty_custody(listener, held))
+    }
+
+    // Multi-thread: a reclaim blocks in recvmsg, so the server it waits on needs
+    // a worker of its own. In production that server is a separate process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_master_the_supervisor_launched_is_handed_back_still_usable() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let held: super::PtyCustody =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let server = serve_custody_over(dir.path(), held.clone()).await;
+
+        let (master, slave) =
+            crate::pty::openpty_with_winsize(None).expect("openpty for the custody test");
+        super::hold_launched_pty(&held, 4242, master).await;
+
+        let reclaimed = super::reclaim_pty_master(dir.path(), 4242)
+            .await
+            .expect("reclaim must not error")
+            .expect("the launched master must be in custody");
+
+        let mut writer = std::fs::File::from(reclaimed);
+        writer.write_all(b"ping\n").expect("write to the terminal");
+        writer.flush().expect("flush the terminal");
+
+        let mut reader = std::fs::File::from(slave);
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).expect("read on the slave");
+        assert_eq!(&buf, b"ping\n");
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reclaim_for_a_terminal_nobody_launched_is_absent_not_a_hang() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let held: super::PtyCustody =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let server = serve_custody_over(dir.path(), held).await;
+
+        let reclaimed = super::reclaim_pty_master(dir.path(), 4242)
+            .await
+            .expect("reclaim must not error");
+        assert!(reclaimed.is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_for_a_launch_with_no_process_is_not_left_held() {
+        let held: super::PtyCustody =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let (master, _slave) =
+            crate::pty::openpty_with_winsize(None).expect("openpty for the custody test");
+
+        super::hold_launched_pty(&held, 0, master).await;
+
+        assert!(held.lock().await.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2998,6 +3101,18 @@ mod launch_spec_compat {
 
         assert!(spec.array_job_id.is_none());
         assert!(spec.array_task_id.is_none());
+    }
+
+    #[test]
+    fn an_older_launch_spec_opens_no_terminal_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.pty.is_none());
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::File
+        );
     }
 
     /// Captured from the build that first shipped `pmix` in launch.json, before
@@ -3219,6 +3334,7 @@ mod tests {
             allocation_only: false,
             pmix_multi_task: false,
             pmix: None,
+            pty: None,
         }
     }
 
@@ -3472,6 +3588,7 @@ mod tests {
             "pmix_multi_task",
             "array_job_id",
             "array_task_id",
+            "pty",
         ] {
             fields.remove(field);
         }
@@ -3497,6 +3614,64 @@ mod tests {
         assert!(restored.array_task_id.is_none());
         assert!(!restored.allocation_only);
         assert!(!restored.pmix_multi_task);
+        assert!(restored.pty.is_none());
+        assert_eq!(
+            restored.into_launch_config().io_mode,
+            crate::executor::LaunchIo::File
+        );
+    }
+
+    #[test]
+    fn a_pty_launch_spec_survives_the_agent_to_supervisor_boundary() {
+        let mut spec = launch_spec();
+        spec.pty = Some(crate::pty::WindowSize {
+            rows: 40,
+            cols: 120,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
+                .expect("decode launch spec");
+
+        let io_mode = restored.into_launch_config().io_mode;
+        assert!(io_mode.is_pty(), "a pty spec must launch on a terminal");
+        let crate::executor::LaunchIo::Pty(Some(winsize)) = io_mode else {
+            panic!("the window size the client asked for must reach the launch");
+        };
+        assert_eq!((winsize.rows, winsize.cols), (40, 120));
+    }
+
+    #[test]
+    fn a_pty_launch_with_no_stated_size_leaves_the_kernel_default() {
+        let mut spec = launch_spec();
+        spec.pty = Some(crate::pty::WindowSize::default());
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty(None)
+        );
+    }
+
+    #[test]
+    fn a_pty_io_mode_round_trips_back_out_of_the_launch_spec() {
+        let mut config = launch_spec().into_launch_config();
+        config.io_mode = crate::executor::LaunchIo::Pty(Some(crate::pty::WindowSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        }));
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty(Some(crate::pty::WindowSize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            }))
+        );
     }
 
     #[test]

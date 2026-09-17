@@ -12,10 +12,17 @@ use nix::pty::openpty;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 
+/// Travels in a supervised launch's spec: only the client knows the size, and
+/// the supervisor is the one that opens the terminal on its behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct WindowSize {
+    #[serde(default)]
     pub rows: u16,
+    #[serde(default)]
     pub cols: u16,
+    #[serde(default)]
     pub xpixel: u16,
+    #[serde(default)]
     pub ypixel: u16,
 }
 

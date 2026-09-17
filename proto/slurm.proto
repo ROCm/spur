@@ -672,6 +672,7 @@ message UpdateNodeRequest {
   // Ask the node for a fresh ledger and reconcile it against Raft. An audit,
   // not a mutation: nothing else about the node is changed by it.
   bool reconcile = 6;
+  string caller = 7;   // For authorization of `reconcile` (cluster admin required).
 }
 
 message DrainNodeRequest {
