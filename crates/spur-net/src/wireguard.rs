@@ -108,6 +108,18 @@ struct PeerBuilder {
     extra: Vec<String>,
 }
 
+/// wg-quick accumulates repeated `Address`/`AllowedIPs` lines rather than overwriting, so a second
+/// occurrence must extend the value; the comma-joined form is the equivalent single line.
+fn append_csv(slot: &mut Option<String>, value: String) {
+    match slot {
+        Some(existing) => {
+            existing.push_str(", ");
+            existing.push_str(&value);
+        }
+        None => *slot = Some(value),
+    }
+}
+
 impl PeerBuilder {
     fn build(self) -> Option<WgPeer> {
         Some(WgPeer {
@@ -155,14 +167,14 @@ impl WgConfig {
             if in_interface {
                 match key.to_ascii_lowercase().as_str() {
                     "privatekey" => private_key = Some(value),
-                    "address" => address = Some(value),
+                    "address" => append_csv(&mut address, value),
                     "listenport" => listen_port = value.parse().ok(),
                     _ => extra.push(line.to_string()),
                 }
             } else if let Some(peer) = current_peer.as_mut() {
                 match key.to_ascii_lowercase().as_str() {
                     "publickey" => peer.public_key = Some(value),
-                    "allowedips" => peer.allowed_ips = Some(value),
+                    "allowedips" => append_csv(&mut peer.allowed_ips, value),
                     "endpoint" => peer.endpoint = Some(value),
                     "persistentkeepalive" => peer.persistent_keepalive = value.parse().ok(),
                     _ => peer.extra.push(line.to_string()),
@@ -668,6 +680,27 @@ mod tests {
         assert_eq!(config.private_key, "key=");
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].public_key, "peerA=");
+    }
+
+    /// wg-quick accumulates repeated `Address`/`AllowedIPs`, so a dual-stack interface and a peer
+    /// with split cryptokey routes must survive the read-modify-write a rewrite performs.
+    #[test]
+    fn parse_accumulates_repeated_address_and_allowed_ips() {
+        let ini = "[Interface]\n\
+                   PrivateKey = key=\n\
+                   Address = 10.44.0.1/16\n\
+                   Address = fd00::1/64\n\n\
+                   [Peer]\n\
+                   PublicKey = peerA=\n\
+                   AllowedIPs = 10.44.0.2/32\n\
+                   AllowedIPs = 10.42.1.0/24\n";
+        let config = WgConfig::parse(ini).unwrap();
+        assert_eq!(config.address, "10.44.0.1/16, fd00::1/64");
+        assert_eq!(config.peers[0].allowed_ips, "10.44.0.2/32, 10.42.1.0/24");
+
+        let reparsed = WgConfig::parse(&config.to_ini()).unwrap();
+        assert_eq!(reparsed.address, config.address);
+        assert_eq!(reparsed.peers[0].allowed_ips, config.peers[0].allowed_ips);
     }
 
     #[test]
