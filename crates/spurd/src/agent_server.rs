@@ -14737,6 +14737,10 @@ mod tests {
             cluster_kubeconfig(spur_proto::proto::ClusterKubeconfigRequest) -> spur_proto::proto::ClusterKubeconfigResponse;
             cluster_add_nodes(spur_proto::proto::ClusterAddNodesRequest) -> spur_proto::proto::ClusterAddNodesResponse;
             cluster_remove_nodes(spur_proto::proto::ClusterRemoveNodesRequest) -> spur_proto::proto::ClusterRemoveNodesResponse;
+            raft_add_learner(spur_proto::proto::RaftAddLearnerRequest) -> ();
+            raft_promote_voter(spur_proto::proto::RaftPromoteVoterRequest) -> ();
+            raft_remove_voter(spur_proto::proto::RaftRemoveVoterRequest) -> ();
+            raft_membership(spur_proto::proto::RaftMembershipRequest) -> spur_proto::proto::RaftMembershipResponse;
 
     }
 
