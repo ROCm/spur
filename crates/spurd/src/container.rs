@@ -1115,10 +1115,18 @@ fn assume_container_root() -> anyhow::Result<()> {
 /// rootfs setup. Host root is unmapped in the userns, so inodes it creates on a
 /// userns-owned mount (the `/dev` tmpfs, device targets, symlinks) are rejected.
 /// `setfsuid`/`setfsgid` keep `CAP_SYS_ADMIN` for mounts and leave the real uid
-/// intact for later pivot_root.
-fn assume_container_root_fsids() {
+/// intact for later pivot_root. Must run before any inode is created under the
+/// rootfs (i.e. before `mount_filesystems`).
+fn assume_container_root_fsids() -> anyhow::Result<()> {
     nix::unistd::setfsgid(nix::unistd::Gid::from_raw(0));
     nix::unistd::setfsuid(nix::unistd::Uid::from_raw(0));
+    // setfsuid cannot report failure; it returns the prior fsuid. A second call
+    // reports the now-current value. If it is not the mapped root, the change
+    // silently no-op'd (no CAP_SETUID) and /dev would come up empty — fail loud.
+    if nix::unistd::setfsuid(nix::unistd::Uid::from_raw(0)).as_raw() != 0 {
+        bail!("setfsuid(0) did not take effect in userns (missing CAP_SETUID?)");
+    }
+    Ok(())
 }
 
 fn merge_supplementary_gids(mut gids: Vec<u32>, extra: &[u32]) -> Vec<u32> {
@@ -1332,7 +1340,7 @@ pub fn container_init(
     let workload_pid = fork_into_pid_namespace()?;
 
     if mode == UserNamespaceMode::SubmitterAsRoot {
-        assume_container_root_fsids();
+        assume_container_root_fsids()?;
     }
 
     mount_filesystems(rootfs)?;

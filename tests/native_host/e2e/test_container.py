@@ -440,6 +440,10 @@ _REMAP_PROBE = (
     "echo UID=$(id -u); "
     "if echo hi > /root/remap-test 2>/dev/null; then echo ROOT_WRITE=ok; "
     "else echo ROOT_WRITE=fail; fi; "
+    # Device nodes must be populated under remap (regression: /dev came up empty
+    # because the rootfs was set up with an unmapped fsuid).
+    "if [ -c /dev/null ] && echo x > /dev/null 2>&1 "
+    "&& head -c1 /dev/urandom > /dev/null 2>&1; then echo DEV=ok; else echo DEV=fail; fi; "
     "echo REMAP_PROBE_OK"
 )
 
@@ -498,6 +502,9 @@ class TestContainerRemapRootSrun:
         assert vals.get("ROOT_WRITE") == "ok", (
             f"container-root must be able to write root-owned /root:\n{out}"
         )
+        assert vals.get("DEV") == "ok", (
+            f"remap container must have working device nodes (/dev/null, /dev/urandom):\n{out}"
+        )
 
     def test_remap_never_becomes_host_root(self, remap_cluster):
         # A file created inside the remapped container on a bind-mounted host dir
@@ -550,4 +557,7 @@ class TestContainerRemapRootSbatch:
         assert vals.get("UID") == "0", f"batch container must be uid 0 inside:\n{content}"
         assert vals.get("ROOT_WRITE") == "ok", (
             f"container-root must be able to write root-owned /root:\n{content}"
+        )
+        assert vals.get("DEV") == "ok", (
+            f"remap container must have working device nodes (/dev/null, /dev/urandom):\n{content}"
         )
