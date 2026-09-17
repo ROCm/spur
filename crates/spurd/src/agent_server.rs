@@ -3844,13 +3844,12 @@ struct StepRootfsGuard {
 impl Drop for StepRootfsGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.pid {
-            // Kill the container child (SIGKILL — it may be PID 1 in its
-            // namespace and ignore SIGTERM) and reap it so the process is
-            // fully gone before we unmount/remove the rootfs it lives in.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            // `pid` is the shepherd, whose child is PID 1 of the container's
+            // namespace. SIGKILL to the shepherd alone leaves PID 1 alive, so
+            // walk the tree to kill the workload first (tearing the namespace
+            // down), then reap the shepherd before we unmount/remove the rootfs
+            // the workload is pivoted into.
+            crate::executor::kill_process_tree(pid, nix::sys::signal::Signal::SIGKILL);
             let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
         }
         crate::container::cleanup_rootfs(&self.base, &self.mode);
@@ -4985,18 +4984,35 @@ impl SlurmAgent for AgentService {
         } else {
             nix::sys::signal::Signal::SIGTERM as i32
         };
-        let pid = {
+        let (pid, epoch) = {
             let mut steps = self.active_steps.lock().await;
             match steps.get_mut(&step_key) {
                 Some(step) => {
                     step.cancel_requested = true;
-                    step.pid
+                    (step.pid, step.epoch)
                 }
-                None => None,
+                None => (None, 0),
             }
         };
         if let Some(pid) = pid {
             signal_step_tree(pid, signal);
+            // A container-init step ignores a graceful signal (PID 1 discards
+            // SIGTERM/SIGINT unless it installed a handler), so escalate to
+            // SIGKILL after a short grace period. Compare epochs so a step that
+            // reused this (job, step) key with a recycled pid is never signalled.
+            if signal != nix::sys::signal::Signal::SIGKILL as i32 {
+                let active_steps = self.active_steps.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    let still = {
+                        let steps = active_steps.lock().await;
+                        steps.get(&step_key).map(|s| s.epoch) == Some(epoch)
+                    };
+                    if still {
+                        signal_step_tree(pid, nix::sys::signal::Signal::SIGKILL as i32);
+                    }
+                });
+            }
         }
         Ok(Response::new(()))
     }

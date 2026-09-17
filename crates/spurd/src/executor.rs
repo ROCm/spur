@@ -2629,8 +2629,15 @@ mod cgroup_files_tests {
 mod tests {
     use super::*;
 
+    // The Forked arm must direct a graceful signal at the workload, never the
+    // shepherd. The two are unrelated processes here, so the workload receiving
+    // the signal while the shepherd stays alive proves target selection lands on
+    // `workload_pid`, not the shepherd's subtree. A real container workload is
+    // PID 1 of its namespace and *ignores* SIGTERM; that init semantics (and the
+    // SIGKILL escalation that follows) is exercised by the bare-metal E2E, not
+    // reproducible in an unprivileged unit test.
     #[test]
-    fn forked_sigterm_targets_workload_and_keeps_shepherd() {
+    fn forked_graceful_signal_targets_workload_not_shepherd() {
         let mut shepherd = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -2652,7 +2659,7 @@ mod tests {
         let workload_status = workload.wait().expect("reap workload");
         assert!(
             !workload_status.success(),
-            "SIGTERM must reach the workload"
+            "the graceful signal must land on the workload's tree"
         );
         assert!(
             shepherd.try_wait().expect("inspect shepherd").is_none(),
