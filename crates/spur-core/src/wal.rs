@@ -48,6 +48,9 @@ pub enum WalOperation {
         /// Older entries restore the entire captured spec, including its comment.
         #[serde(default)]
         preserve_comment: bool,
+        /// Canonicalizes legacy comments unless a replicated edit followed capture.
+        #[serde(default)]
+        captured_comment_revision: Option<u64>,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
@@ -191,6 +194,8 @@ pub enum WalOperation {
     },
     JobSuspend {
         job_id: JobId,
+        #[serde(default)]
+        fence_deadline: bool,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
         at: chrono::DateTime<chrono::Utc>,
         /// Preemption provenance — set when suspension is triggered by preemption,
@@ -457,6 +462,7 @@ impl WalOperation {
     ) -> Self {
         Self::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id,
@@ -483,10 +489,14 @@ mod job_state_change_wal_tests {
                 "add_accounts": [], "remove_accounts": []
             }
         });
-        assert!(matches!(serde_json::from_value::<WalOperation>(wire).unwrap(),
-            WalOperation::ReservationUpdate { validate_overlap: false, .. }));
+        assert!(matches!(
+            serde_json::from_value::<WalOperation>(wire).unwrap(),
+            WalOperation::ReservationUpdate {
+                validate_overlap: false,
+                ..
+            }
+        ));
     }
-
 
     /// A reason's variant name is its wire form in the Raft log, and a controller
     /// on an older binary cannot read a name it does not know. Freeze the newest
@@ -1216,6 +1226,7 @@ mod suspend_wal_tests {
         let at = chrono::Utc::now();
         for op in [
             WalOperation::JobSuspend {
+                fence_deadline: false,
                 job_id: 7,
                 at,
                 preempted_by: None,
@@ -1228,11 +1239,13 @@ mod suspend_wal_tests {
             match (op, back) {
                 (
                     WalOperation::JobSuspend {
+                        fence_deadline: false,
                         job_id: a,
                         at: at_a,
                         ..
                     },
                     WalOperation::JobSuspend {
+                        fence_deadline: false,
                         job_id: b,
                         at: at_b,
                         ..

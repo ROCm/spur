@@ -30,7 +30,10 @@ upgrade and qualify a QoS in ``spur.conf``::
 classification: do not classify an existing burst policy as non-burst. Removing
 the grant prevents new renewals, not previously committed expiry extensions.
 Never enable the upgrade acknowledgement while an old controller can lead or
-replay new entries. Downgrading after new renewal entries is unsupported.
+replay new entries. The gate also enables new ``JobUpdateProperties`` WAL records
+for ordinary property edits, even with no QoS grant or successful renewal.
+Downgrading after any such new-format entries is unsupported; disabling the gate
+does not make persisted entries readable by old controllers.
 
 Inspect ``spur show job JOB`` for ``RunAttempt``, ``DeadlineRevision`` and
 ``AllocationExpiry``, then request an explicit absolute expiry::
@@ -42,12 +45,21 @@ Only an authenticated, verified owner may renew; no administrator ownership
 bypass or claimed-user fallback is accepted. The RPC has no mixed-edit fields.
 Old servers return UNIMPLEMENTED. The CLI checks the mandatory receipt's job,
 run, revision, request ID and expiry and never falls back to cancel/requeue.
-Identical retries return a historical receipt, including after the run ends;
+While the upgrade gate remains enabled, identical retries return a historical
+receipt, including after the run ends;
 a conflicting reuse refuses. Receipts are retained with the job, bounded to
 4096 successful renewals per job; further requests refuse instead of evicting
 idempotency history. Refused requests do not consume receipt storage. Request IDs
 must contain 1–128 UTF-8 bytes (not characters); invalid IDs are rejected before
 Raft submission.
+
+New requests must be unexpired at **leader decision time**, sampled after acquiring
+publication guards and preparing policy, immediately before proposing the renewal.
+Arrival before expiry does not reserve eligibility while a request waits. Raft
+apply uses that replicated timestamp, never a replica-local clock; commit and
+receipt delivery may occur after the prior expiry. A timeout claim ordered first
+still refuses renewal. Identical retries return historical receipts without a new
+expiry decision.
 
 Runway is not lifetime. An expiry 24 hours from now after one elapsed hour
 requires at least 25 hours of QoS, association and partition lifetime budget.
@@ -62,15 +74,20 @@ persisted, so extending an unchanged allocation cannot safely choose a more
 permissive alternative. Submission still treats the list as alternatives.
 Group node usage counts distinct occupied nodes, including the renewal candidate's
 actual placement; CPU, memory and GPU usage remain additive. A named reservation
-exempts its own nodes only while its user/account access still permits the owner,
-and still caps renewal at its end.
+must still exist and permit the owner's current user/account, and caps renewal at
+its end even if its nodes have moved away from the allocation. Other reservations
+retain the normal protected-node overlap checks.
 
 **Existing-running-allocation limitation:** only runs launched after enabling the
 upgrade gate carry a replicated canonical start time and job specification.
 Pre-upgrade running allocations refuse renewal; this implementation cannot extend
 an already-running legacy holder in place. It does not cancel/requeue that holder
 to manufacture eligibility. A separately reviewed replicated adoption mechanism
-would be needed for safe migration of such allocations.
+would be needed for safe migration of such allocations. New renewals also refuse
+while **any other active legacy allocation** remains: its QoS/account/specification
+may differ across replicas, so aggregate policy cannot be checked deterministically.
+This refusal is independent of that legacy allocation's reported QoS/account.
+Historical receipts remain replayable.
 
 Acceptance changes only the time budget and deadline revision. Processes, run,
 node/device allocations, resource accounting and start time are not reset.
@@ -85,7 +102,10 @@ before finalizing and sending SIGKILL. Every guarded claim checks run attempt an
 deadline revision, including legacy runs. Only the absolute-deadline comparison
 is skipped for legacy replica-local start clocks; the leader's replicated timeout
 instant is shared by every replica. Historical unguarded WAL claims retain their
-original replay behavior.
+original replay behavior. Timeout guards and suspension revision fences are emitted
+only with the upgrade gate enabled; mixed-version operation retains historical
+unguarded timeout semantics. Historical suspension entries do not increment the
+revision, so old snapshot restoration and old-log replay agree.
 
 QoS and association policy publication is serialized with renewal commit. Renewal
 holds publication guards, not cache read locks: ordinary readers that hold the
@@ -101,7 +121,8 @@ the historical pre-proposal validation behavior so old and new replicas agree.
 During apply validation, active legacy allocations conservatively occupy their
 nodes regardless of replica-local estimated expiry, until they stop being active.
 The existing IgnoreJobs and same-reservation update exemptions still apply. New launches capture policy after the Running transition and
-preserve comments committed before launch apply.
+canonicalize legacy leader-local comments while preserving replicated comment
+edits committed after capture, using a defaulted comment revision.
 Legacy active-job deadline/account/QoS/partition edits are refused to prevent bypassing this fence; pending edits retain
 their ordinary path with lifetime-wall checks.
 
@@ -111,8 +132,11 @@ devices, processes, cgroups, and inputs; it must not requeue, run lifecycle hook
 or restart a process. Automatic hourly renewal is a client policy, not part of
 the initial controller implementation.
 
-Source baseline and concrete blockers
--------------------------------------
+Historical source baseline and blockers
+---------------------------------------
+
+This section describes the pre-implementation baseline, not current behavior.
+The implemented contract above supersedes the historical proposal below.
 
 References below are relative to the repository at
 ``467d5215373795bbb4e29a0c090a96f341682817``; line numbers describe that baseline.
@@ -164,8 +188,12 @@ Adding WAL persistence only to the extension does not fix this ordering. An
 extension must not be delivered until timeout ownership is fenced in the same
 state machine.
 
-Proposed minimum safe contract
-------------------------------
+Historical proposal: minimum safe contract
+------------------------------------------
+
+Retained as design rationale, not configuration or API instructions. In particular,
+the implementation chose a dedicated ``RenewJob`` RPC rather than extending
+``UpdateJob`` and now has concrete policy configuration and suspension fencing.
 
 Entitlement and policy
 ~~~~~~~~~~~~~~~~~~~~~~

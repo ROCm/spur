@@ -871,13 +871,36 @@ silently skipped.
 
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
-``Account=``, ``Comment=``, and ``QOS=``. Node updates need ``NodeName=`` and
-accept ``State=`` and ``Reason=``.
+``Account=``, ``Comment=``, and ``QOS=``. Changes to ``TimeLimit=``,
+``Partition=``, ``Account=``, and ``QOS=`` are refused for active allocations,
+including when renewal is disabled. Set these before the job starts; ordinary
+updates are not an alternative to renewal authorization. Node updates need
+``NodeName=`` and accept ``State=`` and ``Reason=``.
 
 .. code-block:: bash
 
+   # Change the budget of a pending job.
    scontrol update JobId=1024 TimeLimit=2:00:00 Priority=100
    scontrol update NodeName=node01 State=drain Reason="maintenance"
+
+**Extend a qualified running allocation** with ``spur control renew``. This
+requires a verified owner identity, an administrator-enabled non-burst QoS grant,
+and an allocation launched after the controller upgrade gate was enabled.
+Pre-upgrade running allocations cannot be renewed in place.
+
+Inspect ``spur show job JOB`` for ``RunAttempt``, ``DeadlineRevision``, and
+``AllocationExpiry``, then supply the observed run/revision, a unique request ID,
+and the desired absolute expiry::
+
+   spur control renew 1024 --run-attempt 1 --revision 0 \
+       --request-id owner-unique-request --expires-at 2026-09-17T12:00:00Z
+
+The command requires a renewal receipt and never falls back to cancel/requeue.
+For a retry, reuse exactly the same request: a historical receipt does not prove
+that the allocation still runs. Renewal preserves the allocation, but remains
+subject to lifetime wall limits, reservation boundaries, and timeout eligibility
+at leader decision time. See :doc:`/admin-guide/configuration` for the
+``[renewal]`` policy and :doc:`/developer/renewable-qos-design` for the contract.
 
 See Also
 --------

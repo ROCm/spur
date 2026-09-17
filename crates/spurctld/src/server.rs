@@ -1544,17 +1544,14 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::invalid_argument("invalid expiry"))?;
         let receipt = self
             .cluster
-            .renew_job(
-                spur_core::job::RenewalRequest {
-                    job_id: req.job_id,
-                    user,
-                    run_attempt: req.run_attempt,
-                    expected_revision: req.expected_revision,
-                    request_id: req.request_id,
-                    expires_at,
-                },
-                Utc::now(),
-            )
+            .renew_job(spur_core::job::RenewalRequest {
+                job_id: req.job_id,
+                user,
+                run_attempt: req.run_attempt,
+                expected_revision: req.expected_revision,
+                request_id: req.request_id,
+                expires_at,
+            })
             .map_err(|e| {
                 let message = e.to_string();
                 if message.starts_with("unauthorized:") {

@@ -2097,12 +2097,17 @@ async fn claim_and_signal_time_limit(
     cluster: &Arc<ClusterManager>,
     job: &spur_core::job::Job,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<Vec<tokio::task::JoinHandle<()>>>> {
     if !cluster.claim_time_limit(job, now)? {
-        return Ok(false);
+        return Ok(None);
     }
-    send_cancel_to_agents(cluster, job, 15).await;
-    Ok(true)
+    Ok(Some(spawn_cancel_to_nodes(
+        cluster,
+        job.job_id,
+        job.run_attempt,
+        &job.allocated_nodes,
+        15,
+    )))
 }
 
 /// Reap interactive allocations (salloc/srun) whose client stopped sending
@@ -2421,9 +2426,26 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
-    }
+    drop(spawn_cancel_to_nodes(
+        cluster,
+        job_id,
+        run_attempt,
+        node_names,
+        signal,
+    ));
+}
+
+fn spawn_cancel_to_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+    signal: i32,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    cancel_agent_addrs(cluster, job_id, node_names)
+        .into_iter()
+        .map(|addr| tokio::spawn(cancel_one_agent(addr, job_id, run_attempt, signal)))
+        .collect()
 }
 
 /// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
@@ -3906,16 +3928,29 @@ mod tests {
                 account_limits: Default::default(),
             });
             assert!(result.renewal.unwrap().is_ok());
-            assert!(
-                !claim_and_signal_time_limit(&cm, &before, start + chrono::Duration::hours(1))
+            let dispatched =
+                claim_and_signal_time_limit(&cm, &before, start + chrono::Duration::hours(1))
+                    .await
+                    .unwrap();
+            let claimed = dispatched.is_some();
+            for task in dispatched.into_iter().flatten() {
+                task.await.unwrap();
+            }
+            assert_eq!(cancels.load(Ordering::SeqCst), 0);
+            assert!(!claimed);
+            let renewed = cm.get_job(job_id).unwrap();
+            assert_eq!(renewed.state, spur_core::job::JobState::Running);
+
+            let dispatched =
+                claim_and_signal_time_limit(&cm, &renewed, start + chrono::Duration::hours(2))
                     .await
                     .unwrap()
-            );
-            assert_eq!(cancels.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                cm.get_job(job_id).unwrap().state,
-                spur_core::job::JobState::Running
-            );
+                    .expect("the renewed deadline must claim timeout");
+            assert_eq!(dispatched.len(), 1);
+            for task in dispatched {
+                task.await.unwrap();
+            }
+            assert_eq!(cancels.load(Ordering::SeqCst), 1);
         }
 
         // Force-finish must cancel the job on the unreported node before freeing

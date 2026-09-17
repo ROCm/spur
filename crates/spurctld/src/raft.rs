@@ -1043,15 +1043,20 @@ mod tests {
 
     #[test]
     fn legacy_client_response_defaults_reservation_validation() {
-        let response: ClientResponse = serde_json::from_str(r#"{"reservation_created":true}"#).unwrap();
+        let response: ClientResponse =
+            serde_json::from_str(r#"{"reservation_created":true}"#).unwrap();
         assert!(response.reservation_created);
         assert!(response.reservation_validation.is_none());
         let response = ClientResponse {
             reservation_validation: Some(Err("busy nodes".into())),
             ..Default::default()
         };
-        let replay: ClientResponse = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
-        assert_eq!(replay.reservation_validation, response.reservation_validation);
+        let replay: ClientResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(
+            replay.reservation_validation,
+            response.reservation_validation
+        );
     }
 
     struct NoopApplier;

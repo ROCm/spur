@@ -256,6 +256,16 @@ Follow this order for any cluster upgrade:
 
 .. warning::
 
+   Enable ``[renewal].upgraded_controllers`` only after **every controller** has
+   been upgraded. This is a WAL-format acknowledgement, not just a renewal grant:
+   ordinary property edits then emit new ``JobUpdateProperties`` records even if
+   no renewal succeeds or no QoS is eligible. Old controllers cannot replay those
+   records. Disabling the gate afterwards does not undo persisted entries or make
+   downgrade safe. See :doc:`../admin-guide/configuration` for renewal policy and
+   the limitation on allocations launched before enabling the gate.
+
+.. warning::
+
    **Upgrading to the release that introduces** ``spurstepd`` **requires an empty
    cluster.** Drain every node and let all running jobs finish, or cancel them,
    before swapping binaries. Sessions written by the previous build are not

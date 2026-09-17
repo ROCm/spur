@@ -582,8 +582,10 @@ Disabled by default. The contract and its limitations are described in
      - ``false``
      - Acknowledges that every controller in the cluster can replay renewal WAL
        records. Renewal is refused until this is set. Never enable it while an
-       older controller can still lead or replay; downgrading afterwards is
-       unsupported.
+       older controller can still lead or replay. This also enables new
+       ``JobUpdateProperties`` WAL records for ordinary edits, even without grants
+       or successful renewals. Downgrading after new-format entries is unsupported;
+       disabling the gate does not undo persisted entries.
 
 Each QoS that may be renewed needs its own ``[renewal.qos.<name>]`` grant. A QoS
 with no grant is never renewable.
@@ -626,12 +628,22 @@ with no grant is never renewable.
    class = "non_burst"
    max_runway_seconds = 86400
 
+Expiry eligibility and runway use leader decision time, sampled after publication
+lock waits and policy preparation, immediately before Raft proposal. Arrival before
+expiry does not preserve eligibility during a wait. Replicas apply the same recorded
+time; commit and receipt delivery may be later than the previous expiry. Identical
+retries return the historical receipt rather than making a new expiry decision.
+
 Runway is not lifetime. ``max_runway_seconds`` bounds each individual extension;
 the resulting expiry is still checked against QoS, association and partition
 wall limits, which are never raised or reinterpreted. A job one hour in asking
 for 24 hours of runway needs 25 hours of lifetime budget. Jobs that have been
 suspended, jobs under a group-wall-capped QoS, and allocations launched before
-``upgraded_controllers`` was enabled cannot be renewed.
+``upgraded_controllers`` was enabled cannot be renewed. New renewals also refuse
+while any other active legacy allocation remains, regardless of its reported QoS
+or account: legacy attribution can differ across replicas and cannot safely feed
+aggregate policy checks. Existing historical receipts remain retrievable while
+the upgrade gate remains enabled.
 
 For comma-separated partition requests, renewal uses the tightest finite MaxTime
 among the requested partitions because the selected launch partition is not

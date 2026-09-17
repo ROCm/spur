@@ -57,9 +57,9 @@ pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
 // Publication can wait on a Raft commit; free the runtime worker before taking
 // any guard so contending writers cannot starve that commit's async tasks.
 pub(crate) fn with_publication_blocking<R>(f: impl FnOnce() -> R) -> R {
-    if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-    }) {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
         tokio::task::block_in_place(f)
     } else {
         f()
@@ -1559,6 +1559,7 @@ impl ClusterManager {
             Self::check_job_owner(user, &job.spec.user, "suspend")?;
         }
         self.propose(WalOperation::JobSuspend {
+            fence_deadline: self.config().renewal.upgraded_controllers,
             job_id,
             at: chrono::Utc::now(),
             preempted_by: None,
@@ -1644,12 +1645,13 @@ impl ClusterManager {
             old_state,
             JobState::Running,
         ))?;
-        let spec_for_notify = self
+        let captured_job = self
             .get_job(job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} disappeared during start", job_id))?
-            .spec;
+            .ok_or_else(|| anyhow::anyhow!("job {} disappeared during start", job_id))?;
+        let spec_for_notify = captured_job.spec;
         self.propose(WalOperation::JobStart {
             preserve_comment: true,
+            captured_comment_revision: Some(captured_job.comment_revision),
             at: Some(Utc::now()),
             spec: self
                 .config()
@@ -1847,7 +1849,11 @@ impl ClusterManager {
         };
         let response = self.propose(WalOperation::JobComplete {
             job_id: job.job_id,
-            timeout_guard: Some((job.run_attempt, signaled_at)),
+            timeout_guard: self
+                .config()
+                .renewal
+                .upgraded_controllers
+                .then_some((job.run_attempt, signaled_at)),
             exit_code: -1,
             state: JobState::Timeout,
         })?;
@@ -1863,11 +1869,13 @@ impl ClusterManager {
         let response = self.propose(WalOperation::JobTimeLimitSignaled {
             job_id: job.job_id,
             at,
-            guard: Some(spur_core::job::TimeoutGuard {
-                run_attempt: job.run_attempt,
-                deadline_revision: job.deadline_revision,
-                deadline: job.effective_deadline(start, limit),
-            }),
+            guard: self.config().renewal.upgraded_controllers.then_some(
+                spur_core::job::TimeoutGuard {
+                    run_attempt: job.run_attempt,
+                    deadline_revision: job.deadline_revision,
+                    deadline: job.effective_deadline(start, limit),
+                },
+            ),
         })?;
         Ok(response.timeout_claimed)
     }
@@ -1912,6 +1920,7 @@ impl ClusterManager {
                 // replication and leader failover. The job state was already
                 // validated at the top of preempt_job — no re-check needed.
                 let resp = self.propose(WalOperation::JobSuspend {
+                    fence_deadline: self.config().renewal.upgraded_controllers,
                     job_id,
                     at: chrono::Utc::now(),
                     preempted_by,
@@ -3009,19 +3018,28 @@ impl ClusterManager {
     pub fn renew_job(
         &self,
         request: spur_core::job::RenewalRequest,
-        now: DateTime<Utc>,
+    ) -> anyhow::Result<spur_core::job::RenewalReceipt> {
+        self.renew_job_with_clock(request, Utc::now)
+    }
+
+    fn renew_job_with_clock(
+        &self,
+        request: spur_core::job::RenewalRequest,
+        clock: impl FnOnce() -> DateTime<Utc>,
     ) -> anyhow::Result<spur_core::job::RenewalReceipt> {
         if request.request_id.is_empty() || request.request_id.len() > 128 {
             anyhow::bail!("invalid: request ID must contain 1 to 128 bytes");
         }
-        with_publication_blocking(|| self.renew_job_guarded(request, now))
+        with_publication_blocking(|| self.renew_job_guarded(request, clock, || {}))
     }
 
     fn renew_job_guarded(
         &self,
         request: spur_core::job::RenewalRequest,
-        now: DateTime<Utc>,
+        clock: impl FnOnce() -> DateTime<Utc>,
+        before_publication: impl FnOnce(),
     ) -> anyhow::Result<spur_core::job::RenewalReceipt> {
+        before_publication();
         let _config_guard = self.renewal_config_guard.lock();
         let config = self.config();
         if !config.renewal.upgraded_controllers {
@@ -3107,12 +3125,17 @@ impl ClusterManager {
             // A cached consumption total cannot reserve future group wall atomically.
             anyhow::bail!("ineligible: group-wall capped QoS is not renewable");
         }
+        let expected_spec = Box::new(job.spec);
+        let qos = Box::new(qos.clone());
+        // Eligibility uses leader decision time, not arrival time before lock waits.
+        // Replicas must use this same timestamp even if commit occurs after expiry.
+        let at = clock();
         let response = self.propose(WalOperation::JobRenew {
             request,
-            at: now,
-            expected_spec: Box::new(job.spec),
+            at,
+            expected_spec,
             max_runway_seconds: grant.max_runway_seconds,
-            qos: Box::new(qos.clone()),
+            qos,
             account_limits: limits,
         })?;
         response
@@ -3280,12 +3303,6 @@ impl ClusterManager {
                 anyhow::bail!(
                     "active job deadline and policy edits require the guarded renewal API"
                 );
-            }
-            if time_limit.is_some() {
-                job.deadline_revision = job
-                    .deadline_revision
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("deadline revision overflow"))?;
             }
             if let Some(tl) = time_limit {
                 job.spec.time_limit = Some(tl);
@@ -4953,23 +4970,26 @@ impl ClusterManager {
         }
         // Legacy start clocks differ across replicas, so apply cannot infer that
         // their nodes will be free by a reservation's start.
-        let legacy_overlap = conservative_legacy.then(|| {
-            jobs.values()
-                .filter(|job| {
-                    job.state.is_active()
-                        && !job.renewal_ready
-                        && !(except_name.is_some() && job.spec.reservation.as_deref() == except_name)
-                })
-                .filter_map(|job| {
-                    job.allocated_nodes.iter()
-                        .find(|node| res.nodes.contains(node))
-                        .map(|node| (job.job_id, node.clone()))
-                })
-                .min()
-        }).flatten();
-        if let Some((job_id, node)) = legacy_overlap.or_else(|| {
-            running_jobs_overlap_start(jobs, &res.nodes, res.start_time, except_name)
-        })
+        let legacy_overlap = conservative_legacy
+            .then(|| {
+                jobs.values()
+                    .filter(|job| {
+                        job.state.is_active()
+                            && !job.renewal_ready
+                            && !(except_name.is_some()
+                                && job.spec.reservation.as_deref() == except_name)
+                    })
+                    .filter_map(|job| {
+                        job.allocated_nodes
+                            .iter()
+                            .find(|node| res.nodes.contains(node))
+                            .map(|node| (job.job_id, node.clone()))
+                    })
+                    .min()
+            })
+            .flatten();
+        if let Some((job_id, node)) = legacy_overlap
+            .or_else(|| running_jobs_overlap_start(jobs, &res.nodes, res.start_time, except_name))
         {
             anyhow::bail!(
                 "requested nodes are busy (job {} on {} until after reservation start)",
@@ -4985,7 +5005,11 @@ impl ClusterManager {
         res: &Reservation,
         except_name: Option<&str>,
     ) -> anyhow::Result<()> {
-        Self::validate_reservation_storage_overlap_locked(&self.reservations.read(), res, except_name)
+        Self::validate_reservation_storage_overlap_locked(
+            &self.reservations.read(),
+            res,
+            except_name,
+        )
     }
 
     fn validate_reservation_storage_overlap_locked(
@@ -6246,6 +6270,7 @@ impl ClusterManager {
                 };
             }
             WalOperation::JobSuspend {
+                fence_deadline,
                 job_id,
                 at,
                 preempted_by,
@@ -6256,7 +6281,9 @@ impl ClusterManager {
                         Ok(TransitionOutcome::Applied) => {
                             job.suspended_at = Some(*at);
                             job.has_suspended = true;
-                            job.deadline_revision = job.deadline_revision.saturating_add(1);
+                            if *fence_deadline {
+                                job.deadline_revision = job.deadline_revision.saturating_add(1);
+                            }
                             if preempted_by.is_some() {
                                 job.preempted_by = *preempted_by;
                                 job.preempt_mode = Some("Suspend".to_string());
@@ -6312,6 +6339,7 @@ impl ClusterManager {
             }
             WalOperation::JobStart {
                 preserve_comment,
+                captured_comment_revision,
                 at,
                 spec,
                 job_id,
@@ -6326,7 +6354,10 @@ impl ClusterManager {
                     if let Some(spec) = spec {
                         let comment = job.spec.comment.clone();
                         job.spec = (**spec).clone();
-                        if *preserve_comment {
+                        if captured_comment_revision
+                            .map(|revision| job.comment_revision > revision)
+                            .unwrap_or(*preserve_comment)
+                        {
                             job.spec.comment = comment;
                         }
                         job.deadline_revision = 0;
@@ -6515,6 +6546,7 @@ impl ClusterManager {
                     }
                     if let Some(value) = comment {
                         job.spec.comment = Some(value.clone());
+                        job.comment_revision = job.comment_revision.saturating_add(1);
                     }
                     response.properties_updated = true;
                 }
@@ -6528,6 +6560,11 @@ impl ClusterManager {
                 account_limits,
             } => {
                 response.renewal = Some((|| {
+                    // Legacy peer policy can differ across replicas after gate-off edits.
+                    // Do not classify or charge that policy until all active runs are canonical.
+                    let has_legacy_peer = jobs.values().any(|job| {
+                        job.job_id != request.job_id && job.state.is_active() && !job.renewal_ready
+                    });
                     let mut user_tres = RunningTresAccumulator::default();
                     let mut qos_tres = RunningTresAccumulator::default();
                     let mut account_tres = RunningTresAccumulator::default();
@@ -6564,6 +6601,12 @@ impl ClusterManager {
                         } else {
                             Err("conflict: request ID reused".into())
                         };
+                    }
+                    if has_legacy_peer {
+                        return Err(
+                            "ineligible: active legacy allocations prevent canonical accounting"
+                                .into(),
+                        );
                     }
                     if request.request_id.is_empty()
                         || request.request_id.len() > 128
@@ -6623,14 +6666,23 @@ impl ClusterManager {
                         return Err("policy_limit: partition wall cap".into());
                     }
                     let reservations = self.reservations.read();
+                    if let Some(name) = job.spec.reservation.as_deref() {
+                        let reservation = reservations
+                            .iter()
+                            .find(|reservation| reservation.name == name)
+                            .ok_or("reservation_conflict: named reservation missing")?;
+                        if !reservation.allows_user(&job.spec.user, job.spec.account.as_deref()) {
+                            return Err("reservation_conflict: reservation access revoked".into());
+                        }
+                        if request.expires_at > reservation.end_time {
+                            return Err("reservation_conflict: reservation end".into());
+                        }
+                    }
                     for reservation in reservations.iter() {
-                        if job.spec.reservation.as_deref() == Some(reservation.name.as_str())
-                            && reservation.allows_user(&job.spec.user, job.spec.account.as_deref())
-                        {
-                            if request.expires_at > reservation.end_time {
-                                return Err("reservation_conflict: reservation end".into());
-                            }
-                        } else if reservation.start_time < request.expires_at
+                        if job.spec.reservation.as_deref() == Some(reservation.name.as_str()) {
+                            continue;
+                        }
+                        if reservation.start_time < request.expires_at
                             && reservation.end_time > *at
                             && job
                                 .allocated_nodes
@@ -9267,13 +9319,25 @@ mod tests {
         for id in [String::new(), "x".repeat(129), "é".repeat(65)] {
             let (_dir, cm, _, mut request, now) = renewal_fixture();
             request.request_id = id;
-            assert!(cm.renew_job(request, now).unwrap_err().to_string().starts_with("invalid:"));
+            assert!(cm
+                .renew_job_with_clock(request, || now)
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid:"));
         }
         for id in ["x".repeat(128), "é".repeat(64)] {
             let (_dir, cm, job, mut request, now) = renewal_fixture();
             request.request_id = id;
-            assert!(cm.renew_job(request.clone(), now).unwrap_err().to_string().starts_with("unavailable:"));
-            assert!(cm.apply_operation(&renewal_op(&job, request, now)).renewal.unwrap().is_ok());
+            assert!(cm
+                .renew_job_with_clock(request.clone(), || now)
+                .unwrap_err()
+                .to_string()
+                .starts_with("unavailable:"));
+            assert!(cm
+                .apply_operation(&renewal_op(&job, request, now))
+                .renewal
+                .unwrap()
+                .is_ok());
         }
     }
 
@@ -9282,7 +9346,10 @@ mod tests {
         let (dir, fixture, job, request, now) = renewal_fixture();
         let cm = test_cluster_with_config(&dir, (*fixture.config()).clone()).await;
         cm.jobs.write().insert(1, job);
-        cm.qos_cache.insert(Qos { name: "qualified".into(), ..Default::default() });
+        cm.qos_cache.insert(Qos {
+            name: "qualified".into(),
+            ..Default::default()
+        });
         cm.association_cache.insert_association("alice", "research");
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -9302,7 +9369,7 @@ mod tests {
             let entered = entered_tx.clone();
             tasks.push(tokio::spawn(async move {
                 entered.send(()).unwrap();
-                cm.renew_job(request, now).unwrap()
+                cm.renew_job_with_clock(request, || now).unwrap()
             }));
         }
         entered_rx.recv().await.unwrap();
@@ -9331,7 +9398,13 @@ mod tests {
             cm.partitions.write().push(other);
             job.spec.partition = Some(names.into());
             cm.jobs.write().insert(1, job.clone());
-            assert_eq!(cm.apply_operation(&renewal_op(&job, request, now)).renewal.unwrap().is_ok(), allowed);
+            assert_eq!(
+                cm.apply_operation(&renewal_op(&job, request, now))
+                    .renewal
+                    .unwrap()
+                    .is_ok(),
+                allowed
+            );
         }
     }
 
@@ -9363,11 +9436,75 @@ mod tests {
             job.spec.reservation = Some(reservation.name.clone());
             cm.jobs.write().insert(1, job.clone());
             cm.reservations.write().push(reservation);
-            assert_eq!(cm.apply_operation(&renewal_op(&job, request.clone(), now)).renewal.unwrap().is_ok(), allowed);
+            assert_eq!(
+                cm.apply_operation(&renewal_op(&job, request.clone(), now))
+                    .renewal
+                    .unwrap()
+                    .is_ok(),
+                allowed
+            );
             if allowed {
                 cm.jobs.write().insert(1, job.clone());
-                cm.reservations.write()[0].end_time = request.expires_at - chrono::Duration::seconds(1);
-                assert!(cm.apply_operation(&renewal_op(&job, request, now)).renewal.unwrap().is_err());
+                cm.reservations.write()[0].end_time =
+                    request.expires_at - chrono::Duration::seconds(1);
+                assert!(cm
+                    .apply_operation(&renewal_op(&job, request, now))
+                    .renewal
+                    .unwrap()
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn renewal_named_reservation_checks_survive_node_moves() {
+        for (revoke, missing, short_end, allowed) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+        ] {
+            let (_dir, cm, mut job, request, now) = renewal_fixture();
+            let mut reservation = renewal_reservation(now);
+            reservation.users = vec!["alice".into()];
+            if short_end {
+                reservation.end_time = request.expires_at - chrono::Duration::seconds(1);
+            }
+            job.spec.reservation = Some(reservation.name.clone());
+            cm.jobs.write().insert(1, job.clone());
+            cm.reservations.write().push(reservation);
+            let update = WalOperation::ReservationUpdate {
+                validate_overlap: true,
+                name: "reserved".into(),
+                duration_minutes: 0,
+                add_nodes: vec!["node2".into()],
+                remove_nodes: vec!["node1".into()],
+                add_users: if revoke { vec!["bob".into()] } else { vec![] },
+                remove_users: if revoke { vec!["alice".into()] } else { vec![] },
+                add_accounts: vec![],
+                remove_accounts: vec![],
+            };
+            assert!(cm
+                .apply_operation(&update)
+                .reservation_validation
+                .unwrap()
+                .is_ok());
+            if missing {
+                cm.reservations.write().clear();
+            }
+            let before = serde_json::to_value(cm.get_job(1).unwrap()).unwrap();
+            assert_eq!(
+                cm.apply_operation(&renewal_op(&job, request, now))
+                    .renewal
+                    .unwrap()
+                    .is_ok(),
+                allowed
+            );
+            if !allowed {
+                assert_eq!(
+                    serde_json::to_value(cm.get_job(1).unwrap()).unwrap(),
+                    before
+                );
             }
         }
     }
@@ -9388,20 +9525,33 @@ mod tests {
                         duration_minutes: 0,
                         add_nodes: vec!["node1".into()],
                         remove_nodes: vec!["node2".into()],
-                        add_users: vec![], remove_users: vec![],
-                        add_accounts: vec![], remove_accounts: vec![],
+                        add_users: vec![],
+                        remove_users: vec![],
+                        add_accounts: vec![],
+                        remove_accounts: vec![],
                     }
                 } else {
-                    WalOperation::ReservationCreate { reservation, validate_overlap: true }
+                    WalOperation::ReservationCreate {
+                        reservation,
+                        validate_overlap: true,
+                    }
                 };
                 let before = serde_json::to_value(cm.get_reservations()).unwrap();
                 let renew = renewal_op(&job, request, now);
                 if renewal_first {
                     assert!(cm.apply_operation(&renew).renewal.unwrap().is_ok());
-                    assert!(cm.apply_operation(&mutation).reservation_validation.unwrap().is_err());
+                    assert!(cm
+                        .apply_operation(&mutation)
+                        .reservation_validation
+                        .unwrap()
+                        .is_err());
                     assert_eq!(serde_json::to_value(cm.get_reservations()).unwrap(), before);
                 } else {
-                    assert!(cm.apply_operation(&mutation).reservation_validation.unwrap().is_ok());
+                    assert!(cm
+                        .apply_operation(&mutation)
+                        .reservation_validation
+                        .unwrap()
+                        .is_ok());
                     assert!(cm.apply_operation(&renew).renewal.unwrap().is_err());
                     assert_eq!(cm.get_job(1).unwrap().deadline_revision, 0);
                 }
@@ -9411,14 +9561,29 @@ mod tests {
 
     #[test]
     fn reservation_validation_markers_preserve_legacy_replay_and_flags() {
-        for (validate_overlap, ignore_jobs, accepted) in [(false, false, true), (true, false, false), (true, true, true)] {
+        for (validate_overlap, ignore_jobs, accepted) in [
+            (false, false, true),
+            (true, false, false),
+            (true, true, true),
+        ] {
             let (_dir, cm, job, request, now) = renewal_fixture();
-            assert!(cm.apply_operation(&renewal_op(&job, request, now)).renewal.unwrap().is_ok());
+            assert!(cm
+                .apply_operation(&renewal_op(&job, request, now))
+                .renewal
+                .unwrap()
+                .is_ok());
             let mut reservation = renewal_reservation(now);
             reservation.flags.ignore_jobs = ignore_jobs;
-            let mut wire = serde_json::to_value(WalOperation::ReservationCreate { reservation, validate_overlap }).unwrap();
+            let mut wire = serde_json::to_value(WalOperation::ReservationCreate {
+                reservation,
+                validate_overlap,
+            })
+            .unwrap();
             if !validate_overlap {
-                wire["ReservationCreate"].as_object_mut().unwrap().remove("validate_overlap");
+                wire["ReservationCreate"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("validate_overlap");
             }
             let op = serde_json::from_value(wire).unwrap();
             assert_eq!(cm.apply_operation(&op).reservation_created, accepted);
@@ -9430,9 +9595,14 @@ mod tests {
             let mut candidate = original;
             candidate.name = "second".into();
             candidate.flags.overlap = overlap;
-            assert_eq!(cm.apply_operation(&WalOperation::ReservationCreate {
-                reservation: candidate, validate_overlap: true,
-            }).reservation_created, overlap);
+            assert_eq!(
+                cm.apply_operation(&WalOperation::ReservationCreate {
+                    reservation: candidate,
+                    validate_overlap: true,
+                })
+                .reservation_created,
+                overlap
+            );
         }
     }
 
@@ -9463,11 +9633,16 @@ mod tests {
                             duration_minutes: 0,
                             add_nodes: vec!["node1".into()],
                             remove_nodes: vec!["node2".into()],
-                            add_users: vec![], remove_users: vec![],
-                            add_accounts: vec![], remove_accounts: vec![],
+                            add_users: vec![],
+                            remove_users: vec![],
+                            add_accounts: vec![],
+                            remove_accounts: vec![],
                         }
                     } else {
-                        WalOperation::ReservationCreate { reservation, validate_overlap: true }
+                        WalOperation::ReservationCreate {
+                            reservation,
+                            validate_overlap: true,
+                        }
                     };
                     outcomes.push(cm.apply_operation(&op).reservation_validation);
                     states.push(serde_json::to_value(cm.get_reservations()).unwrap());
@@ -9491,22 +9666,43 @@ mod tests {
             job.renewal_ready = false;
             cm.jobs.write().insert(1, job);
             let reservation = renewal_reservation(now);
-            assert_eq!(cm.create_reservation(reservation.clone()).is_ok(), !upgraded);
+            assert_eq!(
+                cm.create_reservation(reservation.clone()).is_ok(),
+                !upgraded
+            );
             cm.reservations.write().clear();
             let mut original = reservation;
             original.nodes = vec!["node2".into()];
             cm.reservations.write().push(original);
-            assert_eq!(cm.update_reservation(
-                "reserved", 0, &["node1".into()], &["node2".into()], &[], &[], &[], &[],
-            ).is_ok(), !upgraded);
-            assert_eq!(cm.get_reservations()[0].nodes, vec![if upgraded { "node2" } else { "node1" }.to_owned()]);
+            assert_eq!(
+                cm.update_reservation(
+                    "reserved",
+                    0,
+                    &["node1".into()],
+                    &["node2".into()],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .is_ok(),
+                !upgraded
+            );
+            assert_eq!(
+                cm.get_reservations()[0].nodes,
+                vec![if upgraded { "node2" } else { "node1" }.to_owned()]
+            );
         }
     }
 
     #[test]
     fn historical_reservation_update_replays_without_new_overlap_validation() {
         let (_dir, cm, job, request, now) = renewal_fixture();
-        assert!(cm.apply_operation(&renewal_op(&job, request, now)).renewal.unwrap().is_ok());
+        assert!(cm
+            .apply_operation(&renewal_op(&job, request, now))
+            .renewal
+            .unwrap()
+            .is_ok());
         let mut reservation = renewal_reservation(now);
         reservation.nodes = vec!["node2".into()];
         cm.reservations.write().push(reservation);
@@ -9517,7 +9713,8 @@ mod tests {
                 "add_users": [], "remove_users": [],
                 "add_accounts": [], "remove_accounts": []
             }
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(cm.apply_operation(&op).reservation_validation.is_none());
         assert_eq!(cm.get_reservations()[0].nodes, vec!["node1".to_owned()]);
     }
@@ -9547,12 +9744,356 @@ mod tests {
                     cm.jobs.write().insert(id, other);
                 }
                 let mut op = renewal_op(&job, request, now);
-                if let WalOperation::JobRenew { qos, account_limits, .. } = &mut op {
+                if let WalOperation::JobRenew {
+                    qos,
+                    account_limits,
+                    ..
+                } = &mut op
+                {
                     let cap = Some(TresRecord::parse(limit).unwrap());
-                    if account_cap { account_limits.grp_tres = cap; } else { qos.limits.grp_tres = cap; }
+                    if account_cap {
+                        account_limits.grp_tres = cap;
+                    } else {
+                        qos.limits.grp_tres = cap;
+                    }
                 }
-                assert_eq!(cm.apply_operation(&op).renewal.unwrap().is_ok(), allowed, "{nodes:?} {limit} account={account_cap}");
+                assert_eq!(
+                    cm.apply_operation(&op).renewal.unwrap().is_ok(),
+                    allowed,
+                    "{nodes:?} {limit} account={account_cap}"
+                );
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_off_pending_update_launch_and_timeout_replay() {
+        struct ReplicatingApplier {
+            leader: Arc<ClusterManager>,
+            follower: Arc<ClusterManager>,
+        }
+        impl StateMachineApply for ReplicatingApplier {
+            fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+                let response = self.leader.apply_operation(op);
+                let replay = serde_json::from_slice(&serde_json::to_vec(op).unwrap()).unwrap();
+                let follower_response = self.follower.apply_operation(&replay);
+                assert_eq!(response.timeout_claimed, follower_response.timeout_claimed);
+                assert_eq!(
+                    response.jobs_finalized.len(),
+                    follower_response.jobs_finalized.len()
+                );
+                response
+            }
+
+            fn snapshot_state(&self) -> anyhow::Result<Vec<u8>> {
+                self.leader.snapshot_state()
+            }
+
+            fn restore_from_snapshot(&self, data: &[u8]) -> anyhow::Result<()> {
+                self.leader.restore_from_snapshot(data)?;
+                self.follower.restore_from_snapshot(data)
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let follower_dir = TempDir::new().unwrap();
+        let leader = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let follower = Arc::new(ClusterManager::new(test_config(), follower_dir.path()).unwrap());
+        let job = Job::new(
+            1,
+            JobSpec {
+                user: "alice".into(),
+                partition: Some("default".into()),
+                time_limit: Some(chrono::Duration::hours(1)),
+                requeue: false,
+                ..Default::default()
+            },
+        );
+        for cm in [&leader, &follower] {
+            cm.jobs.write().insert(1, job.clone());
+        }
+        let handle = crate::raft::start_raft(
+            1,
+            &["[::1]:0".into()],
+            dir.path(),
+            Arc::new(ReplicatingApplier {
+                leader: Arc::clone(&leader),
+                follower: Arc::clone(&follower),
+            }),
+        )
+        .await
+        .unwrap();
+        handle
+            .raft
+            .wait(None)
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        leader.set_raft(handle.raft);
+        leader
+            .update_job(
+                1,
+                Some(chrono::Duration::hours(2)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        leader
+            .start_job_impl(
+                1,
+                vec![],
+                ResourceAllocations::default(),
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+        let running = leader.get_job(1).unwrap();
+        assert!(!running.renewal_ready);
+        assert_eq!(
+            running.deadline_revision,
+            follower.get_job(1).unwrap().deadline_revision
+        );
+        // Gate-off property edits intentionally remain local; timeout fencing must not.
+        assert_ne!(
+            running.spec.time_limit,
+            follower.get_job(1).unwrap().spec.time_limit
+        );
+        let deadline = running.start_time.unwrap() + running.spec.time_limit.unwrap();
+        assert!(leader.claim_time_limit(&running, deadline).unwrap());
+        assert!(!leader.claim_time_limit(&running, deadline).unwrap());
+        for cm in [&leader, &follower] {
+            assert_eq!(
+                cm.get_job(1).unwrap().time_limit_signaled_at,
+                Some(deadline)
+            );
+        }
+        let claimed = leader.get_job(1).unwrap();
+        assert!(leader.finish_time_limit(&claimed).unwrap());
+        assert!(!leader.finish_time_limit(&claimed).unwrap());
+        for cm in [&leader, &follower] {
+            assert_eq!(cm.get_job(1).unwrap().state, JobState::Timeout);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_uses_decision_clock_after_publication_wait() {
+        let (dir, fixture, job, request, now) = renewal_fixture();
+        let cm = test_cluster_with_config(&dir, (*fixture.config()).clone()).await;
+        cm.jobs.write().insert(1, job.clone());
+        cm.qos_cache.insert(Qos {
+            name: "qualified".into(),
+            ..Default::default()
+        });
+        cm.association_cache.insert_association("alice", "research");
+        let clock = Arc::new(parking_lot::Mutex::new(now));
+        let guard = cm.renewal_config_guard.lock();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let worker_cm = Arc::clone(&cm);
+        let worker_clock = Arc::clone(&clock);
+        let runtime = tokio::runtime::Handle::current();
+        let worker = std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            with_publication_blocking(|| {
+                worker_cm.renew_job_guarded(
+                    request,
+                    || {
+                        assert!(worker_cm.renewal_config_guard.try_lock().is_none());
+                        *worker_clock.lock()
+                    },
+                    || {
+                        assert_eq!(*worker_clock.lock(), now);
+                        queued_tx.send(()).unwrap();
+                        released_rx.recv().unwrap();
+                    },
+                )
+            })
+        });
+        queued_rx.recv().unwrap();
+        *clock.lock() = job.start_time.unwrap() + job.spec.time_limit.unwrap();
+        drop(guard);
+        released_tx.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().starts_with("expired:"), "{error}");
+        assert_eq!(
+            serde_json::to_value(cm.get_job(1).unwrap()).unwrap(),
+            serde_json::to_value(job).unwrap()
+        );
+    }
+
+    #[test]
+    fn renewal_legacy_peer_policy_divergence_refuses_identically() {
+        let (_dir, cm, job, request, now) = renewal_fixture();
+        let mut outcomes = Vec::new();
+        for qos in ["qualified", "different"] {
+            let mut peer = job.clone();
+            peer.job_id = 2;
+            peer.renewal_ready = false;
+            peer.spec.qos = Some(qos.into());
+            peer.spec.account = Some(qos.into());
+            cm.jobs.write().insert(2, peer);
+            outcomes.push(
+                cm.apply_operation(&renewal_op(&job, request.clone(), now))
+                    .renewal,
+            );
+            assert_eq!(cm.get_job(1).unwrap().deadline_revision, 0);
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert!(outcomes[0]
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .contains("legacy"));
+        cm.jobs.write().remove(&2);
+        let op = renewal_op(&job, request, now);
+        let receipt = cm.apply_operation(&op).renewal.unwrap().unwrap();
+        let mut peer = job;
+        peer.job_id = 2;
+        peer.renewal_ready = false;
+        cm.jobs.write().insert(2, peer);
+        assert_eq!(cm.apply_operation(&op).renewal.unwrap().unwrap(), receipt);
+    }
+
+    #[test]
+    fn renewal_launch_canonicalizes_legacy_comments_and_preserves_new_edits() {
+        for intervening in [false, true] {
+            let (dir, leader, mut job, mut request, now) = renewal_fixture();
+            let follower_dir = TempDir::new().unwrap();
+            let follower = ClusterManager::new(test_config(), follower_dir.path()).unwrap();
+            job.state = JobState::Pending;
+            job.start_time = None;
+            job.run_attempt = 0;
+            job.renewal_ready = false;
+            for cm in [&leader, &follower] {
+                cm.jobs.write().insert(1, job.clone());
+            }
+            let mut config = (*leader.config()).clone();
+            config.renewal.upgraded_controllers = false;
+            *leader.config.write() = Arc::new(config.clone());
+            leader
+                .update_job(1, None, None, None, Some("legacy local".into()), None, None)
+                .unwrap();
+            config.renewal.upgraded_controllers = true;
+            *leader.config.write() = Arc::new(config);
+            let captured = leader.get_job(1).unwrap();
+            let launch = WalOperation::JobStart {
+                preserve_comment: true,
+                captured_comment_revision: Some(captured.comment_revision),
+                at: Some(now - chrono::Duration::hours(1)),
+                spec: Some(Box::new(captured.spec)),
+                job_id: 1,
+                nodes: vec![],
+                resources: ResourceAllocations::default(),
+                per_node_alloc: HashMap::new(),
+                srun_step_dispatch: true,
+                run_attempt: 1,
+            };
+            for cm in [&leader, &follower] {
+                cm.apply_operation(&WalOperation::job_state_change(
+                    1,
+                    JobState::Pending,
+                    JobState::Running,
+                ));
+                if intervening {
+                    cm.apply_operation(&WalOperation::JobUpdateProperties {
+                        job_id: 1,
+                        time_limit: None,
+                        partition: None,
+                        comment: Some("replicated later".into()),
+                        account: None,
+                        qos: None,
+                    });
+                }
+                cm.apply_operation(&launch);
+                assert_eq!(
+                    cm.get_job(1).unwrap().spec.comment.as_deref(),
+                    Some(if intervening {
+                        "replicated later"
+                    } else {
+                        "legacy local"
+                    })
+                );
+            }
+            request.expected_revision = 0;
+            let op = renewal_op(&leader.get_job(1).unwrap(), request, now);
+            let accepted = leader.apply_operation(&op).renewal;
+            assert!(accepted.as_ref().unwrap().is_ok());
+            assert_eq!(accepted, follower.apply_operation(&op).renewal);
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn renewal_historical_suspend_snapshot_and_replay_keep_revision_zero() {
+        let (_dir, cm, mut job, _, now) = renewal_fixture();
+        job.renewal_ready = false;
+        cm.jobs.write().insert(1, job);
+        let op: WalOperation = serde_json::from_value(serde_json::json!({
+            "JobSuspend": { "job_id": 1, "at": now }
+        }))
+        .unwrap();
+        cm.apply_operation(&op);
+        cm.apply_operation(&WalOperation::JobResume { job_id: 1, at: now });
+        let mut old_snapshot_job = serde_json::to_value(cm.get_job(1).unwrap()).unwrap();
+        old_snapshot_job
+            .as_object_mut()
+            .unwrap()
+            .remove("deadline_revision");
+        old_snapshot_job
+            .as_object_mut()
+            .unwrap()
+            .remove("comment_revision");
+        let restored: Job = serde_json::from_value(old_snapshot_job).unwrap();
+        assert_eq!(
+            restored.deadline_revision,
+            cm.get_job(1).unwrap().deadline_revision
+        );
+        assert_eq!(restored.deadline_revision, 0);
+        cm.apply_operation(&WalOperation::JobSuspend {
+            fence_deadline: true,
+            job_id: 1,
+            at: now,
+            preempted_by: None,
+            preempt_qos: None,
+        });
+        cm.apply_operation(&WalOperation::JobResume { job_id: 1, at: now });
+        for (revision, accepted) in [(0, false), (1, true)] {
+            assert_eq!(
+                cm.apply_operation(&WalOperation::JobTimeLimitSignaled {
+                    job_id: 1,
+                    at: now,
+                    guard: Some(spur_core::job::TimeoutGuard {
+                        run_attempt: 1,
+                        deadline_revision: revision,
+                        deadline: now
+                    }),
+                })
+                .timeout_claimed,
+                accepted
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_timeout_guards_are_gated_for_mixed_version_replay() {
+        for upgraded in [false, true] {
+            let (dir, fixture, job, _, now) = renewal_fixture();
+            let mut config = (*fixture.config()).clone();
+            config.renewal.upgraded_controllers = upgraded;
+            let cm = test_cluster_with_config(&dir, config).await;
+            cm.jobs.write().insert(1, job.clone());
+            cm.suspend_job(1, "alice").unwrap();
+            let at = job.start_time.unwrap() + job.spec.time_limit.unwrap();
+            assert_eq!(cm.claim_time_limit(&job, at).unwrap(), !upgraded);
+            let mut claimed = job;
+            claimed.time_limit_signaled_at = Some(now);
+            cm.jobs.write().insert(1, claimed.clone());
+            cm.suspend_job(1, "alice").unwrap();
+            assert_eq!(cm.finish_time_limit(&claimed).unwrap(), !upgraded);
         }
     }
 
@@ -9563,12 +10104,19 @@ mod tests {
         job.deadline_revision = 1;
         cm.jobs.write().insert(1, job);
         for (revision, accepted) in [(0, false), (1, true)] {
-            assert_eq!(cm.apply_operation(&WalOperation::JobTimeLimitSignaled {
-                job_id: 1, at: now,
-                guard: Some(spur_core::job::TimeoutGuard {
-                    run_attempt: 1, deadline_revision: revision, deadline: now,
-                }),
-            }).timeout_claimed, accepted);
+            assert_eq!(
+                cm.apply_operation(&WalOperation::JobTimeLimitSignaled {
+                    job_id: 1,
+                    at: now,
+                    guard: Some(spur_core::job::TimeoutGuard {
+                        run_attempt: 1,
+                        deadline_revision: revision,
+                        deadline: now,
+                    }),
+                })
+                .timeout_claimed,
+                accepted
+            );
         }
     }
 
@@ -9577,7 +10125,13 @@ mod tests {
         struct UpdatingApplier(Arc<ClusterManager>);
         impl StateMachineApply for UpdatingApplier {
             fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
-                if matches!(op, WalOperation::JobStateChange { new_state: JobState::Running, .. }) {
+                if matches!(
+                    op,
+                    WalOperation::JobStateChange {
+                        new_state: JobState::Running,
+                        ..
+                    }
+                ) {
                     self.0.apply_operation(&WalOperation::JobUpdateProperties {
                         job_id: 1,
                         time_limit: Some(chrono::Duration::hours(3)),
@@ -9615,11 +10169,28 @@ mod tests {
         let cm = Arc::new(fixture);
         cm.jobs.write().insert(1, job);
         let handle = crate::raft::start_raft(
-            1, &["[::1]:0".into()], dir.path(), Arc::new(UpdatingApplier(Arc::clone(&cm))),
-        ).await.unwrap();
-        handle.raft.wait(None).metrics(|m| m.current_leader == Some(1), "leader elected").await.unwrap();
+            1,
+            &["[::1]:0".into()],
+            dir.path(),
+            Arc::new(UpdatingApplier(Arc::clone(&cm))),
+        )
+        .await
+        .unwrap();
+        handle
+            .raft
+            .wait(None)
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
         cm.set_raft(handle.raft);
-        cm.start_job_impl(1, vec![], ResourceAllocations::default(), HashMap::new(), true).unwrap();
+        cm.start_job_impl(
+            1,
+            vec![],
+            ResourceAllocations::default(),
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
         let started = cm.get_job(1).unwrap();
         assert_eq!(started.spec.time_limit, Some(chrono::Duration::hours(3)));
         assert_eq!(started.spec.account.as_deref(), Some("updated-account"));
@@ -9637,15 +10208,33 @@ mod tests {
             job.spec.comment = Some("committed later".into());
             cm.jobs.write().insert(1, job);
             let mut wire = serde_json::to_value(WalOperation::JobStart {
-                preserve_comment, at: Some(now), spec: Some(Box::new(captured)),
-                job_id: 1, nodes: vec![], resources: ResourceAllocations::default(),
-                per_node_alloc: HashMap::new(), srun_step_dispatch: false, run_attempt: 1,
-            }).unwrap();
+                preserve_comment,
+                captured_comment_revision: None,
+                at: Some(now),
+                spec: Some(Box::new(captured)),
+                job_id: 1,
+                nodes: vec![],
+                resources: ResourceAllocations::default(),
+                per_node_alloc: HashMap::new(),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+            })
+            .unwrap();
             if !preserve_comment {
-                wire["JobStart"].as_object_mut().unwrap().remove("preserve_comment");
+                wire["JobStart"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("preserve_comment");
             }
             cm.apply_operation(&serde_json::from_value(wire).unwrap());
-            assert_eq!(cm.get_job(1).unwrap().spec.comment.as_deref(), Some(if preserve_comment { "committed later" } else { "captured" }));
+            assert_eq!(
+                cm.get_job(1).unwrap().spec.comment.as_deref(),
+                Some(if preserve_comment {
+                    "committed later"
+                } else {
+                    "captured"
+                })
+            );
         }
     }
 
@@ -9672,8 +10261,12 @@ mod tests {
             let contender = tokio::spawn(async move {
                 entered_tx.send(()).unwrap();
                 match target {
-                    0 => { assert!(cm.renew_job(request, now).is_err()); }
-                    1 => { assert!(cm.reconfigure().is_err()); }
+                    0 => {
+                        assert!(cm.renew_job_with_clock(request, || now).is_err());
+                    }
+                    1 => {
+                        assert!(cm.reconfigure().is_err());
+                    }
                     2 => cm.qos_cache.reset(),
                     _ => cm.association_cache.reset(),
                 }
@@ -9694,7 +10287,7 @@ mod tests {
         let cm = test_cluster_with_config(&dir, (*fixture.config()).clone()).await;
         cm.jobs.write().insert(1, job);
         assert!(cm
-            .renew_job(request.clone(), now)
+            .renew_job_with_clock(request.clone(), || now)
             .unwrap_err()
             .to_string()
             .starts_with("unavailable:"));
@@ -9703,13 +10296,19 @@ mod tests {
             ..Default::default()
         });
         cm.association_cache.insert_association("alice", "research");
-        let receipt = cm.renew_job(request.clone(), now).unwrap();
-        assert_eq!(receipt, cm.renew_job(request.clone(), now).unwrap());
+        let receipt = cm.renew_job_with_clock(request.clone(), || now).unwrap();
+        assert_eq!(
+            receipt,
+            cm.renew_job_with_clock(request.clone(), || {
+                panic!("historical retries must not sample a new decision time")
+            })
+            .unwrap()
+        );
         assert_eq!(cm.get_job(1).unwrap().deadline_revision, 1);
         let mut other = request;
         other.user = "mallory".into();
         assert!(cm
-            .renew_job(other, now)
+            .renew_job_with_clock(other, || now)
             .unwrap_err()
             .to_string()
             .starts_with("unauthorized:"));
@@ -9737,6 +10336,7 @@ mod tests {
         let spec = leader.get_job(1).unwrap().spec;
         let launch = WalOperation::JobStart {
             preserve_comment: true,
+            captured_comment_revision: None,
             at: Some(now - chrono::Duration::hours(1)),
             spec: Some(Box::new(spec)),
             job_id: 1,
@@ -9752,14 +10352,17 @@ mod tests {
                 JobState::Pending,
                 JobState::Running,
             ));
-            assert!(cm.apply_operation(&WalOperation::JobUpdateProperties {
-                job_id: 1,
-                time_limit: None,
-                partition: None,
-                comment: Some("after running".into()),
-                account: None,
-                qos: None,
-            }).properties_updated);
+            assert!(
+                cm.apply_operation(&WalOperation::JobUpdateProperties {
+                    job_id: 1,
+                    time_limit: None,
+                    partition: None,
+                    comment: Some("after running".into()),
+                    account: None,
+                    qos: None,
+                })
+                .properties_updated
+            );
             cm.apply_operation(&launch);
             let started = cm.get_job(1).unwrap();
             assert_eq!(started.spec.time_limit, Some(chrono::Duration::hours(3)));
@@ -9789,10 +10392,10 @@ mod tests {
             ..Default::default()
         });
         cm.association_cache.insert_association("alice", "research");
-        let (qos_guard, _) = cm.qos_cache.renewal_snapshot();
-        let (association_guard, _) = cm.association_cache.renewal_snapshot();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
+            let (qos_guard, _) = cm.qos_cache.renewal_snapshot();
+            let (association_guard, _) = cm.association_cache.renewal_snapshot();
             let qos_writer = scope.spawn(|| {
                 barrier.wait();
                 cm.qos_cache.reset();
@@ -9830,7 +10433,7 @@ mod tests {
             config.renewal.qos.get_mut("qualified").unwrap().class = class;
             *cm.config.write() = Arc::new(config);
             assert!(cm
-                .renew_job(request, now)
+                .renew_job_with_clock(request, || now)
                 .unwrap_err()
                 .to_string()
                 .starts_with("ineligible:"));
@@ -9840,7 +10443,7 @@ mod tests {
         config.renewal = Default::default();
         *cm.config.write() = Arc::new(config);
         assert!(cm
-            .renew_job(request, now)
+            .renew_job_with_clock(request, || now)
             .unwrap_err()
             .to_string()
             .starts_with("unsupported:"));
@@ -9914,7 +10517,7 @@ mod tests {
         });
         cm.association_cache.insert_association("alice", "research");
         assert!(cm
-            .renew_job(request, now)
+            .renew_job_with_clock(request, || now)
             .unwrap_err()
             .to_string()
             .starts_with("policy_limit:"));
@@ -9922,13 +10525,22 @@ mod tests {
 
     #[test]
     fn renewal_preserves_allocation_and_replays_receipt() {
-        let (_dir, cm, before, request, now) = renewal_fixture();
+        let (_dir, cm, mut before, request, now) = renewal_fixture();
+        let mut allocation = ResourceAllocations::with_scalar(4, 8192);
+        allocation.devices.insert(
+            "gpu".into(),
+            vec![spur_core::resource::AllocatedDevice::injectable(3)],
+        );
+        before.allocated_resources = Some(allocation.clone());
+        before.per_node_alloc.insert("node1".into(), allocation);
+        cm.jobs.write().insert(1, before.clone());
         let op = renewal_op(&before, request.clone(), now);
         let receipt = cm.apply_operation(&op).renewal.unwrap().unwrap();
         let after = cm.get_job(1).unwrap();
         assert_eq!(after.run_attempt, before.run_attempt);
         assert_eq!(after.start_time, before.start_time);
         assert_eq!(after.allocated_nodes, before.allocated_nodes);
+        assert_eq!(after.allocated_resources, before.allocated_resources);
         assert_eq!(
             serde_json::to_value(&after.per_node_alloc).unwrap(),
             serde_json::to_value(&before.per_node_alloc).unwrap()
@@ -10029,6 +10641,7 @@ mod tests {
             ));
             cm.apply_operation(&WalOperation::JobStart {
                 preserve_comment: false,
+                captured_comment_revision: None,
                 at: None,
                 spec: None,
                 job_id: 1,
@@ -11403,6 +12016,7 @@ mod tests {
         let resources = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -11440,6 +12054,7 @@ mod tests {
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -11808,6 +12423,7 @@ mod tests {
         ));
         let t0 = chrono::Utc::now();
         cm.apply_operation(&WalOperation::JobSuspend {
+            fence_deadline: false,
             job_id: 1,
             at: t0,
             preempted_by: None,
@@ -11978,6 +12594,7 @@ mod tests {
         let t0 = chrono::Utc::now();
         // Cycle 1: 10s suspended.
         cm.apply_operation(&WalOperation::JobSuspend {
+            fence_deadline: false,
             job_id: 1,
             at: t0,
             preempted_by: None,
@@ -11990,6 +12607,7 @@ mod tests {
         // Cycle 2: 15s suspended.
         let t1 = t0 + chrono::Duration::seconds(40);
         cm.apply_operation(&WalOperation::JobSuspend {
+            fence_deadline: false,
             job_id: 1,
             at: t1,
             preempted_by: None,
@@ -12025,6 +12643,7 @@ mod tests {
         // Suspended 30s ago, then cancelled now (JobComplete stamps Utc::now()).
         let since = chrono::Utc::now() - chrono::Duration::seconds(30);
         cm.apply_operation(&WalOperation::JobSuspend {
+            fence_deadline: false,
             job_id: 1,
             at: since,
             preempted_by: None,
@@ -12506,6 +13125,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12550,6 +13170,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12595,6 +13216,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12663,6 +13285,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12727,6 +13350,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12794,6 +13418,7 @@ mod tests {
 
         let start = || WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12903,6 +13528,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12956,6 +13582,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -12999,6 +13626,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13061,6 +13689,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13100,6 +13729,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13289,6 +13919,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13327,6 +13958,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13368,6 +14000,7 @@ mod tests {
         // Re-dispatched run: current epoch is 2.
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13410,6 +14043,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -13480,6 +14114,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -15133,6 +15768,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -15429,6 +16065,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -15522,6 +16159,7 @@ mod tests {
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: 1,
@@ -26503,6 +27141,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: id,
@@ -26522,6 +27161,7 @@ mod tests {
         ));
         cm.apply_operation(&WalOperation::JobStart {
             preserve_comment: false,
+            captured_comment_revision: None,
             at: None,
             spec: None,
             job_id: id,

@@ -837,6 +837,9 @@ pub struct Job {
 
     #[serde(default)]
     pub deadline_revision: u64,
+    /// Distinguishes replicated comment edits from legacy leader-local edits.
+    #[serde(default)]
+    pub comment_revision: u64,
     #[serde(default)]
     pub renewal_ready: bool,
     #[serde(default)]
@@ -962,6 +965,7 @@ impl Job {
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
             deadline_revision: 0,
+            comment_revision: 0,
             renewal_ready: false,
             renewal_receipts: Vec::new(),
             suspended_at: None,
