@@ -284,18 +284,25 @@ pub fn readiness_message(workload_pid: Option<i32>) -> String {
 /// Parse a [`readiness_message`]. Empty or non-`OK` is a failure, so the owner
 /// fails closed on a truncated write or a crashed child.
 pub fn parse_readiness(buf: &[u8]) -> Result<Option<i32>, String> {
-    if buf.len() < 2 || &buf[..2] != b"OK" {
+    if buf == b"OK" {
+        return Ok(None);
+    }
+    let Some(pid_bytes) = buf.strip_prefix(b"OK ") else {
         return Err(if buf.is_empty() {
             "container init failed (no status)".to_string()
         } else {
             String::from_utf8_lossy(buf).to_string()
         });
+    };
+    if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
+        return Err(String::from_utf8_lossy(buf).to_string());
     }
-    let pid = std::str::from_utf8(&buf[2..])
+    let pid = std::str::from_utf8(pid_bytes)
         .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|p| *p > 0);
-    Ok(pid)
+        .and_then(|pid| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| String::from_utf8_lossy(buf).to_string())?;
+    Ok(Some(pid))
 }
 
 /// How the rootfs was set up — determines cleanup strategy.
@@ -1352,7 +1359,23 @@ mod tests {
 
     #[test]
     fn readiness_rejects_non_positive_pid() {
-        assert_eq!(parse_readiness(b"OK 0"), Ok(None));
+        assert!(parse_readiness(b"OK 0").is_err());
+    }
+
+    #[test]
+    fn readiness_rejects_malformed_success_messages() {
+        for message in [
+            b"O".as_slice(),
+            b"OK ".as_slice(),
+            b"OKAY".as_slice(),
+            b"OK 12 extra".as_slice(),
+            b"OK 12\n".as_slice(),
+            b"OK -1".as_slice(),
+            b"OK 2147483648".as_slice(),
+            b"OK \xff".as_slice(),
+        ] {
+            assert!(parse_readiness(message).is_err(), "{message:?}");
+        }
     }
 
     // --- Mount parsing ---
