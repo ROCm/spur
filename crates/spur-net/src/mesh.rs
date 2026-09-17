@@ -143,6 +143,24 @@ pub fn apply_mesh(
     Ok(peers.len())
 }
 
+/// The persist half of [`apply_mesh_durable`], split out so it is testable without the `wg` binary
+/// the live half shells out to. Caller holds the config lock.
+fn persist_mesh_peers(
+    config_path: &std::path::Path,
+    peers: &[wireguard::WgPeer],
+) -> anyhow::Result<()> {
+    let mut config = wireguard::WgConfig::read_from(config_path).with_context(|| {
+        format!(
+            "no WireGuard config at {} — run `spur net init` or `spur net join` first",
+            config_path.display()
+        )
+    })?;
+    for peer in peers {
+        config.upsert_peer(peer.clone());
+    }
+    config.write_to(config_path)
+}
+
 /// Like [`apply_mesh`], but also persists every applied peer into the config at `config_path` (one
 /// read-modify-write covering all peers), so a manual `spur net mesh` pass survives an interface
 /// reload — unlike the k0s reconcile loop, there is no daemon re-pushing it every tick.
@@ -155,16 +173,7 @@ pub fn apply_mesh_durable(
 ) -> anyhow::Result<usize> {
     let peers = mesh_peers_for(self_mesh_ip, members);
     wireguard::with_config_lock(config_path, || {
-        let mut config = wireguard::WgConfig::read_from(config_path).with_context(|| {
-            format!(
-                "no WireGuard config at {} — run `spur net init` or `spur net join` first",
-                config_path.display()
-            )
-        })?;
-        for peer in &peers {
-            config.upsert_peer(peer.clone());
-        }
-        config.write_to(config_path)?;
+        persist_mesh_peers(config_path, &peers)?;
         for peer in &peers {
             wireguard::add_peer(interface, peer)?;
         }
@@ -359,11 +368,10 @@ mod tests {
         assert_eq!(prune, vec!["pk-truly-departed"]);
     }
 
-    /// `apply_mesh_durable` persists every computed peer to the config file before touching the
-    /// live interface, so the file reflects the full mesh even if the (untestable-without-`wg`)
-    /// live half then fails. Only additive: an unrelated pre-existing peer in the file survives.
+    /// The persist half of `apply_mesh_durable` writes every computed peer to the config, and is
+    /// additive: an unrelated pre-existing peer in the file survives.
     #[test]
-    fn apply_mesh_durable_persists_all_peers_before_live_apply() {
+    fn persist_mesh_peers_writes_every_peer_and_keeps_unrelated_ones() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("spur0.conf");
         wireguard::WgConfig {
@@ -387,9 +395,7 @@ mod tests {
             node("10.44.0.2", None), // self
             node("10.44.0.3", Some("10.42.2.0/24")),
         ];
-        // The live half needs the `wg` binary and errors in this environment; only the
-        // persistence half (which runs first) is under test here.
-        let _ = apply_mesh_durable("spur0", "10.44.0.2", &members, false, &config_path);
+        persist_mesh_peers(&config_path, &mesh_peers_for("10.44.0.2", &members)).unwrap();
 
         let persisted = wireguard::WgConfig::read_from(&config_path).unwrap();
         assert!(
