@@ -104,7 +104,9 @@ the default ``/etc/wireguard``.
 
 Rewriting the file preserves directives Spur does not manage itself — ``PostUp``,
 ``MTU``, ``Table``, per-peer ``PresharedKey`` and so on are carried through
-unchanged. Comments and blank lines are not preserved.
+unchanged. Comments and blank lines are not preserved. Repeated ``Address`` or
+``AllowedIPs`` lines keep every value but are rewritten as the equivalent single
+comma-separated line, which ``wg`` and ``wg-quick`` treat identically.
 
 Under a SPUR-managed k0s cluster, the peers in a k0s-meshed node's persisted
 config are also protected from the k0s reconcile loop's prune pass (see below):

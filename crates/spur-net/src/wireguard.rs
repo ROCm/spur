@@ -134,7 +134,8 @@ impl PeerBuilder {
 
 impl WgConfig {
     /// Parse a wg-quick compatible config file. Directives this type does not model are kept in
-    /// `extra` and re-emitted by [`Self::to_ini`]; comments and blank lines are not preserved.
+    /// `extra` and re-emitted by [`Self::to_ini`]; comments and blank lines are not preserved, and
+    /// repeated `Address`/`AllowedIPs` are merged into one comma-joined value.
     pub fn parse(content: &str) -> anyhow::Result<Self> {
         let mut private_key = None;
         let mut address = None;
@@ -698,9 +699,18 @@ mod tests {
         assert_eq!(config.address, "10.44.0.1/16, fd00::1/64");
         assert_eq!(config.peers[0].allowed_ips, "10.44.0.2/32, 10.42.1.0/24");
 
-        let reparsed = WgConfig::parse(&config.to_ini()).unwrap();
+        let mut reparsed = WgConfig::parse(&config.to_ini()).unwrap();
         assert_eq!(reparsed.address, config.address);
         assert_eq!(reparsed.peers[0].allowed_ips, config.peers[0].allowed_ips);
+
+        // A later add-peer replaces the merged value rather than extending it, so repeated calls
+        // converge instead of growing the list.
+        reparsed.upsert_peer(WgPeer {
+            public_key: "peerA=".into(),
+            allowed_ips: "10.44.0.2/32".into(),
+            ..Default::default()
+        });
+        assert_eq!(reparsed.peers[0].allowed_ips, "10.44.0.2/32");
     }
 
     #[test]
