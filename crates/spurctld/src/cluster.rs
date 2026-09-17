@@ -4797,7 +4797,7 @@ impl ClusterManager {
             .terminal_job_retention_secs
             .max(crate::accounting::RECONCILE_INTERVAL_SECS);
         let before = Utc::now() - chrono::Duration::seconds(retention as i64);
-        let job_ids = Self::expired_terminal_job_ids(&self.jobs.read(), before);
+        let job_ids = Self::expired_terminal_job_ids(&self.jobs.read(), &self.nodes.read(), before);
         if job_ids.is_empty() {
             return;
         }
@@ -4806,10 +4806,40 @@ impl ClusterManager {
         }
     }
 
+    /// Whether a finished job's epilog hold still protects anything. A node that
+    /// is gone or unheard from runs no hook this could be shielding, and a node
+    /// that returns re-presents the claim through the normal reconcile path.
+    fn epilog_gate_still_binds(job: &Job, nodes: &HashMap<String, Node>) -> bool {
+        job.epilog_gated_nodes
+            .iter()
+            .any(|name| nodes.get(name).is_some_and(|n| n.state != NodeState::Down))
+    }
+
+    /// Hand back what a collected job's gates were holding. Nothing else will:
+    /// the totals are derived from the jobs map this record is leaving.
+    fn release_gates_of_collected_job(job: &Job, nodes: &mut HashMap<String, Node>) {
+        let node_count = job.allocated_nodes.len().max(1) as u32;
+        for name in &job.epilog_gated_nodes {
+            let slice = Self::job_node_slice(
+                &job.per_node_alloc,
+                job.allocated_resources.as_ref(),
+                name,
+                node_count,
+                job.job_id,
+                "collect-gated",
+            );
+            if let (Some(slice), Some(node)) = (slice, nodes.get_mut(name)) {
+                node.alloc_resources.subtract(&slice);
+                Self::refresh_node_state_for_alloc(node);
+            }
+        }
+    }
+
     /// Which finished jobs may be collected. Separate from the propose so the
     /// rule can be read against the apply's, which must refuse the same ids.
     fn expired_terminal_job_ids(
         jobs: &HashMap<JobId, Job>,
+        nodes: &HashMap<String, Node>,
         before: chrono::DateTime<Utc>,
     ) -> Vec<JobId> {
         // Spare a target still referenced by a live job's dependency: dropping it
@@ -4829,7 +4859,7 @@ impl ClusterManager {
                 j.state.is_finalized()
                     // Mirrors the apply's refusal to collect a job still holding a
                     // slice: without it every pass re-proposes the same no-op.
-                    && j.epilog_gated_nodes.is_empty()
+                    && !Self::epilog_gate_still_binds(j, nodes)
                     && j.end_time.is_some_and(|t| t < before)
                     && !referenced.contains(id)
                     && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
@@ -5887,16 +5917,6 @@ impl ClusterManager {
         Self::runs_on_node(&self.jobs.read(), |job| job.is_held_on(node))
     }
 
-    /// Nodes still charged for a finished run while that run's epilog completes.
-    pub fn epilog_held_nodes(&self) -> HashSet<String> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|job| job.state.is_finalized())
-            .flat_map(|job| job.epilog_gated_nodes.iter().cloned())
-            .collect()
-    }
-
     /// Every run on this node whose launch an agent confirmed.
     /// Narrower than [`Self::jobs_allocated_on_node`]: no in-flight dispatches.
     pub fn jobs_confirmed_on_node(&self, node: &str) -> HashSet<RunKey> {
@@ -6951,8 +6971,8 @@ impl ClusterManager {
                     node.admin_locked = *admin_locked;
                 }
                 if *new_state == NodeState::Down {
-                    // Down means unheard from, which is no evidence the hook ended,
-                    // so a gate stands here until the node reports or is removed.
+                    // Down is no evidence the hook ended, so the gate stands and the
+                    // slice stays charged; only collection later stops honouring it.
                     Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
                 }
             }
@@ -7320,12 +7340,19 @@ impl ClusterManager {
                     .iter()
                     .filter(|id| {
                         jobs.get(id).is_some_and(|j| {
-                            j.state.is_finalized() && j.epilog_gated_nodes.is_empty()
+                            j.state.is_finalized() && !Self::epilog_gate_still_binds(j, &nodes)
                         })
                     })
                     .copied()
                     .collect();
                 if !evicted.is_empty() {
+                    // The charge is derived by summing the jobs map, so dropping a
+                    // record that still holds one strands it until a leader change.
+                    for id in &evicted {
+                        if let Some(job) = jobs.get(id) {
+                            Self::release_gates_of_collected_job(job, &mut nodes);
+                        }
+                    }
                     jobs.retain(|id, _| !evicted.contains(id));
                     self.steps
                         .write()
@@ -22698,6 +22725,15 @@ mod tests {
         cm.get_node(node).expect("node").alloc_resources.cpus
     }
 
+    fn epilog_held_nodes(cm: &ClusterManager) -> HashSet<String> {
+        cm.jobs
+            .read()
+            .values()
+            .filter(|job| job.state.is_finalized())
+            .flat_map(|job| job.epilog_gated_nodes.iter().cloned())
+            .collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requeueing_a_cancelled_run_returns_the_slice_its_gate_was_holding() {
         let dir = TempDir::new().unwrap();
@@ -22802,7 +22838,7 @@ mod tests {
             0,
             "a node with no epilog has nothing to wait for; holding it would be a leak"
         );
-        assert!(cm.epilog_held_nodes().is_empty());
+        assert!(epilog_held_nodes(&cm).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22895,7 +22931,7 @@ mod tests {
         register_epilog_node(&cm, "n1", true);
         start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
         cancel(&cm, 1);
-        assert!(!cm.epilog_held_nodes().is_empty());
+        assert!(!epilog_held_nodes(&cm).is_empty());
 
         cm.apply_operation(&WalOperation::NodeRemove {
             name: "n1".into(),
@@ -22903,7 +22939,7 @@ mod tests {
             at: None,
         });
         assert!(
-            cm.epilog_held_nodes().is_empty(),
+            epilog_held_nodes(&cm).is_empty(),
             "deregistration is the operator's escape from a hold nothing else ends"
         );
     }
@@ -23046,7 +23082,8 @@ mod tests {
         cancel(&cm, 2);
 
         let horizon = chrono::Utc::now() + chrono::Duration::seconds(1);
-        let selected = ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), horizon);
+        let selected =
+            ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), &cm.nodes.read(), horizon);
         assert_eq!(
             selected,
             vec![2],
@@ -23054,8 +23091,57 @@ mod tests {
         );
 
         report_node_done(&cm, 1, "n1");
-        let selected = ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), horizon);
+        let selected =
+            ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), &cm.nodes.read(), horizon);
         assert!(selected.contains(&1), "released, so collectable");
+    }
+
+    // A gate the node can never answer outlives the job forever, and every
+    // snapshot carries it: the jobs map is the growth surface, not the slice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gate_held_only_by_a_down_node_stops_blocking_collection() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cancel(&cm, 1);
+
+        let horizon = chrono::Utc::now() + chrono::Duration::seconds(1);
+        assert!(
+            ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), &cm.nodes.read(), horizon)
+                .is_empty(),
+            "a live node may still be running the hook"
+        );
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("not responding".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+
+        let selected =
+            ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), &cm.nodes.read(), horizon);
+        assert!(
+            selected.contains(&1),
+            "nothing on an unreachable node is running this hook, and a node that \
+             comes back re-presents the claim for reconciliation to answer"
+        );
+        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: selected });
+        assert!(
+            cm.get_job(1).is_none(),
+            "the apply must not refuse what the pass was right to select"
+        );
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            0,
+            "the totals are summed from the jobs map, so a record that leaves \
+             holding a charge strands it until the next leadership gain"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23077,7 +23163,7 @@ mod tests {
             reason_time: None,
         });
         assert!(
-            cm.epilog_held_nodes().contains("n1"),
+            epilog_held_nodes(&cm).contains("n1"),
             "unheard from is not evidence the hook returned"
         );
         cm.recompute_node_allocations();

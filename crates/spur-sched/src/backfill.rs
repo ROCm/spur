@@ -948,6 +948,45 @@ mod tests {
     }
 
     #[test]
+    fn a_fully_charged_node_absent_from_busy_until_is_not_placed_on() {
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut nodes = make_nodes(1);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+
+        let mut sched = BackfillScheduler::new(100);
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+        assert!(
+            sched.schedule(&[make_job(1, 1, 64)], &cluster).is_empty(),
+            "every core is charged, so there is nothing here to place on"
+        );
+
+        // Naming `now` as the horizon reserves a zero-width interval, which
+        // `accumulated_at` skips — the charge vanishes and the node reads free.
+        let mut sched = BackfillScheduler::new(100);
+        let now_horizon = std::collections::HashMap::from([(nodes[0].name.clone(), Utc::now())]);
+        let cluster = ClusterState {
+            busy_until: &now_horizon,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+        assert!(
+            !sched.schedule(&[make_job(2, 1, 64)], &cluster).is_empty(),
+            "if this ever stops double-booking, the guard above is free to relax"
+        );
+    }
+
+    #[test]
     fn unplaced_job_asking_for_more_nodes_than_exist_reports_too_few_candidates() {
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2);

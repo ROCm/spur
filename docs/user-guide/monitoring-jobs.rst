@@ -1006,9 +1006,11 @@ Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see
 :doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
 
-Asking for one by hand requires admin rights, because it can end running work::
+Asking for one by hand requires admin rights, because it can end running work:
 
-    scontrol update NodeName=node01 Reconcile=yes
+.. code-block:: bash
+
+   scontrol update NodeName=node01 Reconcile=yes
 
 The command returns once the pass is done. It reports nothing about what the pass
 found — read the controller log, or the node's reason, for that.

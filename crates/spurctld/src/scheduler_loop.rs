@@ -752,21 +752,9 @@ fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime
         states: &[spur_core::job::JobState::Running],
         ..Default::default()
     });
-    let mut busy_until = busy_until_from_running_jobs(&running);
-    add_epilog_held_nodes(&mut busy_until, &cluster.epilog_held_nodes(), Utc::now());
-    busy_until
-}
-
-/// A node holding a finished run's slice for its epilog has no running job to be
-/// derived from, and would otherwise fall to the flat unlimited placeholder.
-fn add_epilog_held_nodes(
-    busy_until: &mut HashMap<String, DateTime<Utc>>,
-    held: &HashSet<String>,
-    now: DateTime<Utc>,
-) {
-    for node in held {
-        busy_until.entry(node.clone()).or_insert(now);
-    }
+    // An epilog-held node is deliberately absent: it has no running job to derive
+    // an end from, so backfill's own placeholder is the only honest horizon.
+    busy_until_from_running_jobs(&running)
 }
 
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
@@ -1553,6 +1541,22 @@ enum RegisterError {
     TimedOut(Duration),
 }
 
+impl RegisterError {
+    /// Whether the refusal says the node is already holding these resources. The
+    /// reply has no room to name the holder, so the code is all there is to read.
+    fn is_a_held_refusal(&self) -> bool {
+        let Self::Failed(error) = self else {
+            return false;
+        };
+        error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::AlreadyExists | tonic::Code::ResourceExhausted
+            )
+        })
+    }
+}
+
 impl std::fmt::Display for RegisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1706,6 +1710,15 @@ async fn register_allocation_on_nodes(
                     error = %e,
                     "allocation registration on agent failed"
                 );
+                // The node holds something Raft cannot explain: look before sending
+                // it anything else. Paced, as on the launch path.
+                if e.is_a_held_refusal() && cluster.claim_ledger_pull_slot(&node_name) {
+                    let cluster = cluster.clone();
+                    let node = node_name.clone();
+                    tokio::spawn(async move {
+                        pull_node_ledger(&cluster, &node, "allocation refused").await;
+                    });
+                }
                 // Mirrors the launch fan-out: an unreachable node is cooled briefly, one that
                 // burned a deadline is held for it, so neither is re-picked on the next tick.
                 match e {
@@ -2604,6 +2617,9 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     // Opened before the cut is asked for, so any launch the cut could have
     // missed is one this watch has seen.
     let dispatched = cluster.dispatch_tracker().watch(node);
+    // Logged here rather than at each trigger: the controller is otherwise silent
+    // about every pull but one, which reads as a reconciler that never runs.
+    info!(node = %node, reason, "pulling this node's ledger");
     let pulled = tokio::time::timeout(
         CANCEL_RPC_TIMEOUT,
         client.request_node_ledger(RequestNodeLedgerRequest {
@@ -2614,7 +2630,7 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     match pulled {
         Ok(Ok(response)) => {
             if let Some(ledger) = response.into_inner().ledger {
-                crate::server::reconcile_node_ledger(
+                let outcome = crate::server::reconcile_node_ledger(
                     cluster,
                     node,
                     ledger,
@@ -2622,6 +2638,15 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
                     crate::server::CutProvenance::Pulled,
                 )
                 .await;
+                info!(
+                    node = %node,
+                    reason,
+                    cancelled = outcome.cancelled.len(),
+                    settled = outcome.settled.len(),
+                    released = outcome.released.len(),
+                    unresolved = outcome.unresolved.len(),
+                    "reconciled this node's ledger"
+                );
             }
         }
         // An agent that predates the pull keeps its pre-upgrade behaviour.
@@ -3090,35 +3115,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_node_held_for_an_epilog_is_free_now_not_at_the_unlimited_placeholder() {
-        let now = Utc::now();
-        let mut busy_until = busy_until_from_running_jobs(&[running_job_on("node001", now, 60)]);
-
-        add_epilog_held_nodes(
-            &mut busy_until,
-            &HashSet::from(["node002".to_string()]),
-            now,
-        );
-        assert_eq!(
-            busy_until.get("node002"),
-            Some(&now),
-            "without an entry backfill would inflate every start behind this node"
-        );
+    // Built the way the RPC path builds it: `?` on a tonic call, so the Status
+    // survives inside the anyhow error rather than being flattened to a string.
+    fn refused_with(status: tonic::Status) -> RegisterError {
+        fn as_the_rpc_path_does(status: tonic::Status) -> anyhow::Result<()> {
+            Err(status)?;
+            Ok(())
+        }
+        RegisterError::Failed(as_the_rpc_path_does(status).unwrap_err())
     }
 
     #[test]
-    fn an_epilog_hold_never_shortens_a_running_job_on_the_same_node() {
-        let now = Utc::now();
-        let mut busy_until = busy_until_from_running_jobs(&[running_job_on("node001", now, 60)]);
-        let running_end = busy_until["node001"];
-
-        add_epilog_held_nodes(
-            &mut busy_until,
-            &HashSet::from(["node001".to_string()]),
-            now,
+    fn an_allocation_refused_by_a_node_already_holding_it_asks_for_a_reconcile() {
+        assert!(
+            refused_with(tonic::Status::already_exists("job 7 already registered"))
+                .is_a_held_refusal()
         );
-        assert_eq!(busy_until["node001"], running_end);
+        assert!(
+            refused_with(tonic::Status::resource_exhausted("cpus unavailable")).is_a_held_refusal()
+        );
+
+        assert!(
+            !refused_with(tonic::Status::unavailable("connection refused")).is_a_held_refusal(),
+            "an unreachable node has told us nothing about what it holds"
+        );
+        assert!(
+            !RegisterError::TimedOut(Duration::from_secs(5)).is_a_held_refusal(),
+            "a node that answered nothing has not refused"
+        );
     }
 
     #[test]
@@ -3835,6 +3859,11 @@ mod tests {
                 if !self.register_delay.is_zero() {
                     tokio::time::sleep(self.register_delay).await;
                 }
+                if self.reject_resources {
+                    return Err(tonic::Status::resource_exhausted(
+                        "controller-allocated cpus unavailable on this node",
+                    ));
+                }
                 Ok(tonic::Response::new(Default::default()))
             }
 
@@ -4055,6 +4084,33 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             counter.load(Ordering::SeqCst)
+        }
+
+        /// Refuses both launches and allocation registrations, and counts pulls.
+        async fn spawn_mock_agent_refusing_allocations() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger_pulls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_resources: true,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                ledger_pulls: ledger_pulls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger_pulls)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted.
@@ -5728,6 +5784,30 @@ mod tests {
                 job.srun_step_dispatch,
                 "the pure interactive path must record itself as step-dispatch, \
                  not the batch-script fallback"
+            );
+        }
+
+        // The batch launch path names its holder in the reply; this one has only
+        // the status code, so the code is what has to reach the reconciler.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_allocation_a_node_refuses_for_want_of_resources_pulls_its_ledger() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, pulls) = spawn_mock_agent_refusing_allocations().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-alloc-refused", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(!started, "the node refused, so nothing started here");
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a node refusing for want of resources it should have is drift, and \
+                 only the node's own ledger can say what it is holding"
             );
         }
 

@@ -62,6 +62,9 @@ pub struct NodeReporter {
     /// Whether the last cut could see everything. Only the transition is worth
     /// saying: the condition needs an operator, and it does not clear itself.
     inventory_was_complete: AtomicBool,
+    /// Whether the last heartbeat asked for a reconcile, so the one that finds
+    /// nothing left to reconcile still asks — see `judge_cut`.
+    asked_for_reconcile: AtomicBool,
     /// Declared at registration so the controller knows a run's slice outlives
     /// its tasks here. Static config: there is no agent-side reconfigure.
     runs_job_epilog: bool,
@@ -98,6 +101,7 @@ impl NodeReporter {
             admissions: std::sync::OnceLock::new(),
             agent_session_id: uuid::Uuid::new_v4().to_string(),
             inventory_was_complete: AtomicBool::new(true),
+            asked_for_reconcile: AtomicBool::new(false),
             runs_job_epilog,
         }
     }
@@ -159,7 +163,19 @@ impl NodeReporter {
                 );
             }
         }
-        cut.wants_reconcile()
+        let wants = cut.wants_reconcile();
+        // Keep asking after the holds clear, until a pull actually lands: the
+        // controller retires the reason it wrote on this node only from a cut.
+        if wants {
+            self.asked_for_reconcile.store(true, Ordering::Relaxed);
+        }
+        wants || self.asked_for_reconcile.load(Ordering::Relaxed)
+    }
+
+    /// The controller has taken a cut, so whatever this node was asking it to
+    /// look at has now been looked at.
+    pub(crate) fn note_ledger_pulled(&self) {
+        self.asked_for_reconcile.store(false, Ordering::Relaxed);
     }
 
     /// Identifies this agent process. A cut whose session a later registration
@@ -599,6 +615,60 @@ mod tests {
     use spur_devices::cdi::cache::CdiCache;
     use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use spur_devices::{DeviceRegistry, GresCache, GresEntry};
+
+    fn a_reporter() -> NodeReporter {
+        NodeReporter::new(
+            "test-node".into(),
+            "127.0.0.1:6817".into(),
+            ResourceSet::default(),
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            Arc::new(Mutex::new(HashMap::<u32, u8>::new())),
+            false,
+        )
+    }
+
+    fn a_cut(conflict_hold: bool) -> crate::admission::LedgerCut {
+        crate::admission::LedgerCut {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![crate::admission::LedgerCutEntry {
+                job_id: 42,
+                run_attempt: 1,
+                allocation: Default::default(),
+                disposition: spur_core::job::LedgerDisposition::Unresolved,
+                conflict_hold,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_node_keeps_asking_after_its_holds_clear_until_a_pull_lands() {
+        let reporter = a_reporter();
+
+        assert!(reporter.judge_cut(&a_cut(true)));
+        // The controller paces pulls, so the heartbeat that first reports "nothing
+        // left" can be refused; asking until a cut is taken cannot be.
+        assert!(
+            reporter.judge_cut(&a_cut(false)),
+            "the reason the controller wrote on this node is retired only by a pull"
+        );
+        assert!(reporter.judge_cut(&a_cut(false)), "and the next one too");
+
+        reporter.note_ledger_pulled();
+        assert!(
+            !reporter.judge_cut(&a_cut(false)),
+            "the cut was taken, so there is nothing left to ask for"
+        );
+    }
 
     #[test]
     fn test_gpus_from_registry_link_type() {

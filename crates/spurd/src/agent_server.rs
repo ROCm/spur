@@ -5435,6 +5435,7 @@ impl SlurmAgent for AgentService {
             complete = cut.inventory_complete,
             "answered a ledger pull"
         );
+        self.reporter.note_ledger_pulled();
         Ok(Response::new(RequestNodeLedgerResponse {
             ledger: Some(crate::reporter::ledger_to_proto(cut)),
         }))
@@ -17760,6 +17761,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
             false,
         ));
@@ -18186,6 +18188,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
             false,
         ));
@@ -18253,6 +18256,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
             false,
         ));
@@ -18900,6 +18904,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
             false,
         ))
