@@ -8,13 +8,15 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use tracing::{debug, error, info, warn};
 
+use spur_core::job::LAUNCH_LIFETIME_MS;
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    RegisterJobAllocationRequest, SubmitJobRequest,
+    AgentCancelJobRequest, AgentSuspendJobRequest, FenceRunRequest, JobSpec as ProtoJobSpec,
+    LaunchJobRequest, RegisterJobAllocationRequest, RequestNodeLedgerRequest, SettleRunRequest,
+    SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -40,6 +42,61 @@ fn node_comm_socket(node: &Node) -> Option<String> {
 fn node_comm_http_url(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
     Some(spur_net::format_comm_http_url(host, node.port))
+}
+
+/// Milliseconds since the epoch, saturating rather than panicking on a clock
+/// set before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// Identifies what a launch asks the node to run, so an exact repeat stays
+/// idempotent and a different command under the same identity is refused.
+fn command_digest(params: &AgentDispatchParams<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let spec = params.spec;
+    let mut hasher = Sha256::new();
+    hasher.update(params.job_id.to_le_bytes());
+    hasher.update(params.run_attempt.to_le_bytes());
+    hasher.update(params.task_offset.to_le_bytes());
+    hasher.update(spec.script.as_deref().unwrap_or_default().as_bytes());
+    for arg in spec.argv.iter().chain(spec.script_args.iter()) {
+        hasher.update([0u8]);
+        hasher.update(arg.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// True on the tick a leadership term begins, so per-term setup runs once rather
+/// than on every tick or on a follower. Advances `was_leader` to the new value.
+fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
+    let entering = is_leader && !*was_leader;
+    *was_leader = is_leader;
+    entering
+}
+
+/// Drop everything a former leader may no longer speak for. Kept whole so state
+/// that only one term can vouch for is not left behind in one place and not another.
+pub(crate) fn relinquish_leadership(
+    cluster: &Arc<ClusterManager>,
+    scheduler: &mut BackfillScheduler,
+) {
+    cluster.set_planned_reservations(HashMap::new());
+    cluster.set_planned_job_starts(HashMap::new());
+    // Registrations during another term went to that leader, so what is recorded
+    // here may already name a lifetime that has been replaced.
+    cluster.agent_sessions().clear();
+    scheduler.clear_outcomes();
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -111,6 +168,10 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
+    let mut was_leader = false;
+    // `None` until the first sweep of a term, so a new leader does not inherit
+    // the previous one's schedule.
+    let mut last_ledger_sweep: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -121,13 +182,33 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             _ = interval.tick() => {}
         }
 
-        if !raft.is_leader() {
-            // A former leader must not keep serving planned-reservation info
-            // from before it lost leadership.
-            cluster.set_planned_reservations(HashMap::new());
-            cluster.set_planned_job_starts(HashMap::new());
-            scheduler.clear_outcomes();
+        let is_leader = raft.is_leader();
+        let entering_term = entering_leadership(&mut was_leader, is_leader);
+
+        if !is_leader {
+            relinquish_leadership(&cluster, &mut scheduler);
             continue;
+        }
+
+        // A promoted follower's totals were maintained across an unknown replay
+        // history; rebuild from the job records before this term's placements.
+        if entering_term {
+            cluster.recompute_node_allocations();
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "leadership gain").await;
+            });
+        }
+
+        // Routine sweep: drift nothing reported is only found by looking.
+        if !entering_term
+            && last_ledger_sweep.is_none_or(|last| last.elapsed() >= LEDGER_SWEEP_INTERVAL)
+        {
+            last_ledger_sweep = Some(Instant::now());
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "routine sweep").await;
+            });
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -140,6 +221,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.drive_bb_stage_in();
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
+        cluster.requeue_stranded_preempted_jobs();
         cluster.evict_expired_terminal_jobs();
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
@@ -440,6 +522,20 @@ async fn process_assignment(
     };
 
     let dispatched = dispatch_spec.is_some();
+
+    // Reserved first: a leader change in the window that follows then finds the
+    // slice charged, so a new leader cannot place a second job on these cores.
+    if let Err(e) = cluster.reserve_placement(
+        job_id,
+        assignment.nodes.clone(),
+        resources.clone(),
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+    ) {
+        debug!(job_id, error = %e, "could not reserve the placement");
+        return false;
+    }
+
     if let Some(dspec) = dispatch_spec {
         // The run epoch start_job_impl is about to persist for this
         // dispatch. Safe to read ahead of that call: this iteration is
@@ -460,7 +556,10 @@ async fn process_assignment(
         )
         .await
         {
-            DispatchConfirmOutcome::Aborted => return false,
+            DispatchConfirmOutcome::Aborted => {
+                abort_placement(&cluster, job_id);
+                return false;
+            }
             DispatchConfirmOutcome::Confirmed => {}
         }
     }
@@ -468,23 +567,16 @@ async fn process_assignment(
     // Transition job to Running. Reached only once every assigned node
     // has confirmed (LaunchJob for batch dispatch above, or
     // RegisterJobAllocation for the pure interactive case above that).
-    let start_result = if srun_step_dispatch {
-        cluster.start_job_impl(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-            true,
-        )
-    } else {
-        cluster.start_job(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-        )
-    };
+    let start_result = cluster.activate_job(
+        job_id,
+        prospective_run_attempt,
+        assignment.nodes.clone(),
+        resources,
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+    );
     if let Err(e) = start_result {
+        abort_placement(&cluster, job_id);
         // Confirmation above already registered the allocation or
         // launched real processes on dispatch_nodes; stop them so a
         // start_job failure here (e.g. the job was cancelled out from
@@ -525,9 +617,12 @@ async fn process_assignment(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) =
-            cluster.evict_job_attempt(job_id, Some(prospective_run_attempt), Some(detail))
-        {
+        if let Err(e) = cluster.evict_job_attempt(
+            job_id,
+            Some(prospective_run_attempt),
+            Some(detail),
+            spur_core::job::PendingReason::JobLaunchFailure,
+        ) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -661,6 +756,8 @@ fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime
         states: &[spur_core::job::JobState::Running],
         ..Default::default()
     });
+    // An epilog-held node is deliberately absent: it has no running job to derive
+    // an end from, so backfill's own placeholder is the only honest horizon.
     busy_until_from_running_jobs(&running)
 }
 
@@ -759,6 +856,7 @@ pub(crate) async fn try_preempt(
     use spur_core::reservation::job_runs_in_active_reservation;
 
     let now = chrono::Utc::now();
+    cluster.discharge_preempt_debt();
     let reservations = cluster.get_reservations();
     let cluster_nodes = cluster.get_nodes();
 
@@ -801,6 +899,11 @@ pub(crate) async fn try_preempt(
         .collect();
 
     for pending in unscheduled {
+        // A victim taken last cycle can still be handing its slice back through
+        // an epilog; taking a second one now kills a job for nothing.
+        if cluster.owed_a_preempted_slice(pending.job_id) {
+            continue;
+        }
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
@@ -890,6 +993,7 @@ pub(crate) async fn try_preempt(
                     continue;
                 }
             }
+            cluster.record_preempt_debt(pending.job_id, candidate.job_id);
             break; // One preemption per cycle, re-evaluate next cycle
         }
     }
@@ -1136,6 +1240,18 @@ enum DispatchError {
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
+    /// The node refuses this attempt because the controller already stopped it.
+    /// Retrying the same attempt cannot succeed; the controller's view is stale.
+    Fenced(String),
+    /// The launch aged out in flight. The controller's own latency, so a fresh
+    /// dispatch is the whole fix.
+    Expired(String),
+    /// Same identity, different command. Something is wrong on one side or the
+    /// other; retrying blindly would run the wrong thing.
+    ConflictingDigest(String),
+    /// The node holds something the controller cannot account for. Retrying
+    /// here is pointless until the two have been reconciled.
+    NeedsReconcile(String),
     Other(anyhow::Error),
 }
 
@@ -1149,6 +1265,10 @@ impl DispatchError {
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
+            Self::Fenced(_) => "run already stopped",
+            Self::Expired(_) => "launch expired in flight",
+            Self::ConflictingDigest(_) => "conflicting command for one identity",
+            Self::NeedsReconcile(_) => "node holds unaccounted resources",
             Self::Other(_) => "dispatch error",
         }
     }
@@ -1166,6 +1286,10 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::Fenced(reason)
+            | Self::Expired(reason)
+            | Self::ConflictingDigest(reason)
+            | Self::NeedsReconcile(reason) => write!(f, "agent refused job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1322,6 +1446,7 @@ async fn dispatch_to_agent(
         submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
+    let issued_at = now_unix_ms();
     let response = client
         .launch_job(LaunchJobRequest {
             job_id: params.job_id,
@@ -1337,6 +1462,9 @@ async fn dispatch_to_agent(
             pmix_plan,
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
+            issued_at_unix_ms: issued_at,
+            expires_at_unix_ms: issued_at.saturating_add(LAUNCH_LIFETIME_MS),
+            command_digest: command_digest(params),
         })
         .await
         .map_err(|s| match s.code() {
@@ -1351,15 +1479,25 @@ async fn dispatch_to_agent(
     if !inner.success {
         // An agent predating the classification sends UNSPECIFIED, which falls
         // through to the generic requeue this has always done.
-        return Err(
-            if inner.failure_kind
-                == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32
-            {
-                DispatchError::PrologFailed(inner.error)
-            } else {
+        use spur_proto::proto::LaunchFailureKind as Kind;
+        // A named reason lets the controller act in this round trip. An older
+        // agent sends UNSPECIFIED and falls through to the generic requeue.
+        return Err(match Kind::try_from(inner.failure_kind) {
+            Ok(Kind::LaunchFailureProlog) => DispatchError::PrologFailed(inner.error),
+            Ok(Kind::LaunchFailureFenced) => DispatchError::Fenced(inner.error),
+            Ok(Kind::LaunchFailureExpired) => DispatchError::Expired(inner.error),
+            Ok(Kind::LaunchFailureConflictingDigest) => {
+                DispatchError::ConflictingDigest(inner.error)
+            }
+            // Runtime state with no record behind it, or a claim the controller
+            // does not know about: both need a full look at the node.
+            Ok(Kind::LaunchFailureLocalOverlap | Kind::LaunchFailureResidualState) => {
+                DispatchError::NeedsReconcile(inner.error)
+            }
+            Ok(Kind::LaunchFailureTargetMismatch) | Ok(Kind::LaunchFailureUnspecified) | Err(_) => {
                 DispatchError::AgentRejected(inner.error)
-            },
-        );
+            }
+        });
     }
     info!(
         job_id = params.job_id,
@@ -1412,6 +1550,22 @@ pub(crate) enum AllocationRegisterOutcome {
 enum RegisterError {
     Failed(anyhow::Error),
     TimedOut(Duration),
+}
+
+impl RegisterError {
+    /// Whether the refusal says the node is already holding these resources. The
+    /// reply has no room to name the holder, so the code is all there is to read.
+    fn is_a_held_refusal(&self) -> bool {
+        let Self::Failed(error) = self else {
+            return false;
+        };
+        error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::AlreadyExists | tonic::Code::ResourceExhausted
+            )
+        })
+    }
 }
 
 impl std::fmt::Display for RegisterError {
@@ -1537,7 +1691,11 @@ async fn register_allocation_on_nodes(
             work_dir: spec.work_dir.clone(),
             run_attempt,
         };
+        // Same reason as the launch fan-out: this claim is one the node takes
+        // partway through the call, not one a cut can be asked about.
+        let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
         set.spawn(async move {
+            let _in_flight = in_flight;
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
@@ -1563,6 +1721,15 @@ async fn register_allocation_on_nodes(
                     error = %e,
                     "allocation registration on agent failed"
                 );
+                // The node holds something Raft cannot explain: look before sending
+                // it anything else. Paced, as on the launch path.
+                if e.is_a_held_refusal() && cluster.claim_ledger_pull_slot(&node_name) {
+                    let cluster = cluster.clone();
+                    let node = node_name.clone();
+                    tokio::spawn(async move {
+                        pull_node_ledger(&cluster, &node, "allocation refused").await;
+                    });
+                }
                 // Mirrors the launch fan-out: an unreachable node is cooled briefly, one that
                 // burned a deadline is held for it, so neither is re-picked on the next tick.
                 match e {
@@ -1849,7 +2016,11 @@ async fn confirm_dispatch_on_nodes(
         let allocated_nodelist = allocated_nodelist.clone();
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
+        // Held for the whole call: a cut taken before this lands is silent about
+        // the job for reasons that have nothing to do with the node dropping it.
+        let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
         set.spawn(async move {
+            let _in_flight = in_flight;
             let params = AgentDispatchParams {
                 job_id,
                 spec: &spec,
@@ -1904,7 +2075,27 @@ async fn confirm_dispatch_on_nodes(
                     // Held for the deadline it actually burned: while assignments are processed
                     // serially, re-picking this node stalls every job behind it, not just this one.
                     DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
-                    DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
+                    // The node holds something Raft cannot explain: look before
+                    // sending it anything else.
+                    DispatchError::NeedsReconcile(_) => {
+                        cluster.cool_down_node(&node_name);
+                        // Paced: a node that refuses every dispatch would
+                        // otherwise earn a pull per refusal.
+                        if cluster.claim_ledger_pull_slot(&node_name) {
+                            let cluster = cluster.clone();
+                            let node = node_name.clone();
+                            tokio::spawn(async move {
+                                pull_node_ledger(&cluster, &node, "dispatch refused").await;
+                            });
+                        }
+                    }
+                    // Retrying this attempt cannot succeed, and a fresh dispatch
+                    // costs nothing; neither says anything about the node.
+                    DispatchError::Fenced(_)
+                    | DispatchError::Expired(_)
+                    | DispatchError::ConflictingDigest(_)
+                    | DispatchError::AgentRejected(_)
+                    | DispatchError::Other(_) => {}
                 }
             }
             Err(e) => {
@@ -2399,9 +2590,8 @@ pub async fn send_cancel_to_agents(
 /// isn't at the mercy of `job.allocated_nodes` having been mutated in the
 /// meantime (e.g. cleared by a requeue-on-eviction side effect).
 ///
-/// Fire-and-forget: each node's cancel runs on its own task and this returns
-/// immediately. Use `cancel_job_on_nodes` when the cancel must be delivered
-/// before subsequent work (e.g. a requeue that could re-dispatch the job).
+/// The fence is awaited; each node's cancel then runs on its own task. Use
+/// `cancel_job_on_nodes` when the cancel itself must land before later work.
 pub async fn send_cancel_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -2409,8 +2599,201 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+    }
+}
+
+/// Give up a reservation whose dispatch never confirmed. Every non-activating
+/// exit goes through this, or the slice stays charged to a requeued job.
+fn abort_placement(cluster: &Arc<ClusterManager>, job_id: spur_core::job::JobId) {
+    if let Err(error) = cluster.abort_placement(job_id) {
+        warn!(job_id, %error, "could not give up a reservation; it stays charged");
+    }
+}
+
+/// How often the controller sweeps the cluster for drift nothing reported.
+const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Pull a fresh cut of one node's ledger and reconcile it. The heartbeat
+/// carries no inventory, so this is how a controller-side event gets one.
+pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason: &str) {
+    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+        return;
+    };
+    let Ok(mut client) = crate::agent_client::connect(addr).await else {
+        return;
+    };
+    // Opened before the cut is asked for, so any launch the cut could have
+    // missed is one this watch has seen.
+    let dispatched = cluster.dispatch_tracker().watch(node);
+    // Logged here rather than at each trigger: the controller is otherwise silent
+    // about every pull but one, which reads as a reconciler that never runs.
+    info!(node = %node, reason, "pulling this node's ledger");
+    let pulled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.request_node_ledger(RequestNodeLedgerRequest {
+            reason: reason.to_string(),
+        }),
+    )
+    .await;
+    match pulled {
+        Ok(Ok(response)) => {
+            if let Some(ledger) = response.into_inner().ledger {
+                let outcome = crate::server::reconcile_node_ledger(
+                    cluster,
+                    node,
+                    ledger,
+                    &dispatched,
+                    crate::server::CutProvenance::Pulled,
+                )
+                .await;
+                info!(
+                    node = %node,
+                    reason,
+                    cancelled = outcome.cancelled.len(),
+                    settled = outcome.settled.len(),
+                    released = outcome.released.len(),
+                    unresolved = outcome.unresolved.len(),
+                    "reconciled this node's ledger"
+                );
+            }
+        }
+        // An agent that predates the pull keeps its pre-upgrade behaviour.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
+        Ok(Err(status)) => warn!(node = %node, %status, "ledger pull refused"),
+        Err(_) => warn!(node = %node, "ledger pull timed out"),
+    }
+}
+
+/// Pull every node's ledger. Used where the controller has reason to distrust
+/// its own view rather than any one node's: a leader took over, or the sweep.
+pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) {
+    let nodes: Vec<String> = cluster.get_nodes().into_iter().map(|n| n.name).collect();
+    let mut set = tokio::task::JoinSet::new();
+    for node in nodes {
+        let cluster = cluster.clone();
+        let reason = reason.to_string();
+        set.spawn(async move { pull_node_ledger(&cluster, &node, &reason).await });
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Refuse any launch for this run issued before now. Sent before the cancel,
+/// which alone races an in-flight launch and loses.
+async fn fence_run_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+) {
+    // Attempt 0 is the "whichever is tracked" wildcard the cancel below accepts.
+    // A cutoff has no run to live on without an attempt, so there is none to set.
+    if run_attempt == 0 {
+        return;
+    }
+    let cutoff = now_unix_ms();
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(fence_one_agent(agent_addr, job_id, run_attempt, cutoff));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+async fn fence_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    reject_before_unix_ms: u64,
+) {
+    let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+        Ok(client) => client,
+        // An unreachable node runs nothing the controller can see; its
+        // registration reconcile covers it when it returns.
+        Err(error) => {
+            debug!(job_id, agent = %agent_addr, %error, "could not reach an agent to fence a run");
+            return;
+        }
+    };
+    let fenced = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.fence_run(FenceRunRequest {
+            job_id,
+            run_attempt,
+            reject_before_unix_ms,
+        }),
+    )
+    .await;
+    match fenced {
+        Ok(Ok(_)) => {}
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, agent = %agent_addr, "agent predates run fencing")
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, agent = %agent_addr, %status, "agent refused a run fence")
+        }
+        Err(_) => warn!(job_id, agent = %agent_addr, "timed out fencing a run"),
+    }
+}
+
+/// One node's agent connection, opened on first use and reused for the rest of
+/// that node's pass: a handshake and a minted credential per claim is a tax.
+pub type AgentLink = Option<
+    spur_proto::proto::slurm_agent_client::SlurmAgentClient<crate::agent_client::AgentChannel>,
+>;
+
+/// Tell a node the controller is not accounting for a run it still holds, which
+/// is the acknowledgement that run's slice is waiting on. Whether it went back.
+pub async fn settle_run_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    run: spur_core::job::RunKey,
+    link: &mut AgentLink,
+) -> bool {
+    let job_id = run.job_id();
+    // A settle names one run's slice; the wildcard key names no slice to free.
+    let Some(run_attempt) = run.attempt() else {
+        return false;
+    };
+    if link.is_none() {
+        let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+            return false;
+        };
+        match crate::agent_client::connect(addr).await {
+            Ok(client) => *link = Some(client),
+            Err(_) => {
+                debug!(job_id, node = %node, "could not reach an agent to settle a run");
+                return false;
+            }
+        }
+    }
+    let Some(client) = link.as_mut() else {
+        return false;
+    };
+    let settled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.settle_run(SettleRunRequest {
+            job_id,
+            run_attempt,
+        }),
+    )
+    .await;
+    match settled {
+        Ok(Ok(response)) => response.into_inner().released,
+        // An agent that predates the settle keeps holding; the next pass retries.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, node = %node, "agent predates run settlement");
+            false
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, node = %node, %status, "agent refused a run settlement");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node = %node, "timed out settling a run");
+            false
+        }
     }
 }
 
@@ -2425,6 +2808,7 @@ pub async fn cancel_job_on_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
@@ -2669,6 +3053,42 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    #[test]
+    fn every_refusal_maps_to_one_controller_action() {
+        // Each kind exists because the controller does something different with
+        // it; two collapsing into one silently loses that distinction.
+        let categories: Vec<&str> = vec![
+            DispatchError::PrologFailed(String::new()).category(),
+            DispatchError::Fenced(String::new()).category(),
+            DispatchError::Expired(String::new()).category(),
+            DispatchError::ConflictingDigest(String::new()).category(),
+            DispatchError::NeedsReconcile(String::new()).category(),
+            DispatchError::ResourcesUnavailable.category(),
+            DispatchError::AgentRejected(String::new()).category(),
+        ];
+        let unique: std::collections::HashSet<&str> = categories.iter().copied().collect();
+        assert_eq!(unique.len(), categories.len(), "got: {categories:?}");
+    }
+
+    #[test]
+    fn leadership_edge_fires_once_per_term() {
+        let mut was_leader = false;
+        assert!(!entering_leadership(&mut was_leader, false));
+        assert!(
+            entering_leadership(&mut was_leader, true),
+            "a promoted follower must rebuild derived state before placing"
+        );
+        assert!(
+            !entering_leadership(&mut was_leader, true),
+            "a steady-state tick must not rescan every job"
+        );
+        assert!(!entering_leadership(&mut was_leader, false));
+        assert!(
+            entering_leadership(&mut was_leader, true),
+            "re-promotion after a lost term must rebuild again"
+        );
+    }
+
     fn job_with_spec(mut spec: JobSpec) -> Job {
         spec.cpus_per_task = spec.cpus_per_task.max(1);
         spec.num_tasks = spec.num_tasks.max(1);
@@ -2703,6 +3123,36 @@ mod tests {
         assert!(
             (got - expected).num_seconds().abs() < 2,
             "expected the later job's end time to win, got {got}, expected ~{expected}"
+        );
+    }
+
+    // Built the way the RPC path builds it: `?` on a tonic call, so the Status
+    // survives inside the anyhow error rather than being flattened to a string.
+    fn refused_with(status: tonic::Status) -> RegisterError {
+        fn as_the_rpc_path_does(status: tonic::Status) -> anyhow::Result<()> {
+            Err(status)?;
+            Ok(())
+        }
+        RegisterError::Failed(as_the_rpc_path_does(status).unwrap_err())
+    }
+
+    #[test]
+    fn an_allocation_refused_by_a_node_already_holding_it_asks_for_a_reconcile() {
+        assert!(
+            refused_with(tonic::Status::already_exists("job 7 already registered"))
+                .is_a_held_refusal()
+        );
+        assert!(
+            refused_with(tonic::Status::resource_exhausted("cpus unavailable")).is_a_held_refusal()
+        );
+
+        assert!(
+            !refused_with(tonic::Status::unavailable("connection refused")).is_a_held_refusal(),
+            "an unreachable node has told us nothing about what it holds"
+        );
+        assert!(
+            !RegisterError::TimedOut(Duration::from_secs(5)).is_a_held_refusal(),
+            "a node that answered nothing has not refused"
         );
     }
 
@@ -3228,10 +3678,47 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            /// Ledger pulls this node has served, so a test can assert both
+            /// that a refusal triggers one and that repeats do not storm.
+            ledger_pulls: Arc<AtomicU32>,
         }
 
         #[tonic::async_trait]
         impl spur_proto::proto::slurm_agent_server::SlurmAgent for MockAgent {
+            async fn request_node_ledger(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+            {
+                self.ledger_pulls.fetch_add(1, Ordering::SeqCst);
+                Ok(tonic::Response::new(
+                    spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+                ))
+            }
+
+            async fn fence_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms: 0,
+                }))
+            }
+
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }))
+            }
+
             type StreamJobOutputStream =
                 tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
             type InteractiveSessionStream =
@@ -3270,6 +3757,7 @@ mod tests {
                 }
                 if let Some(kind) = self.reject_launch_as {
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
+                        conflict: None,
                         success: false,
                         error: "prolog failed: prolog_slurmd script exited with exit status: 1"
                             .into(),
@@ -3285,6 +3773,7 @@ mod tests {
                 }
                 let path = format!("/spool/off{}/spur.out", req.task_offset);
                 Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     stdout_path: path.clone(),
@@ -3380,6 +3869,11 @@ mod tests {
             > {
                 if !self.register_delay.is_zero() {
                     tokio::time::sleep(self.register_delay).await;
+                }
+                if self.reject_resources {
+                    return Err(tonic::Status::resource_exhausted(
+                        "controller-allocated cpus unavailable on this node",
+                    ));
                 }
                 Ok(tonic::Response::new(Default::default()))
             }
@@ -3547,6 +4041,7 @@ mod tests {
                 reject_resources: false,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
+                ledger_pulls: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3557,6 +4052,76 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls, release_pmix_calls, fanout_calls)
+        }
+
+        /// Mock agent that refuses with `reject_launch_as` and counts the ledger
+        /// pulls that refusal earns it.
+        async fn spawn_mock_agent_counting_pulls(
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger_pulls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_resources: false,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                ledger_pulls: ledger_pulls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger_pulls)
+        }
+
+        /// The pull is spawned onto its own task, so an assertion on the count
+        /// has a real async wait behind it rather than a guess.
+        async fn pulls_reaching(counter: &Arc<AtomicU32>, wanted: u32) -> u32 {
+            for _ in 0..200 {
+                let seen = counter.load(Ordering::SeqCst);
+                if seen >= wanted {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            counter.load(Ordering::SeqCst)
+        }
+
+        /// Refuses both launches and allocation registrations, and counts pulls.
+        async fn spawn_mock_agent_refusing_allocations() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger_pulls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_resources: true,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                ledger_pulls: ledger_pulls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger_pulls)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted.
@@ -3572,6 +4137,7 @@ mod tests {
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
                 reject_start: false,
+                ledger_pulls: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3599,6 +4165,7 @@ mod tests {
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
                 reject_start: true,
+                ledger_pulls: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3726,6 +4293,7 @@ mod tests {
                 NodeSource::NativeHost,
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -3735,10 +4303,10 @@ mod tests {
         }
 
         fn register_node_without_comm_addr(cm: &ClusterManager, name: &str) {
-            use crate::raft::StateMachineApply;
             use spur_core::wal::WalOperation;
 
             cm.apply_operation(&WalOperation::NodeRegister {
+                runs_job_epilog: false,
                 name: name.into(),
                 hostname: name.into(),
                 resources: ResourceSet {
@@ -4486,6 +5054,135 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_says_it_holds_the_resources_gets_looked_at() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("overlap", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a named overlap is the whole reason the reconcile pull exists"
+            );
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert!(
+                job.state_reason()
+                    .contains("node holds unaccounted resources"),
+                "got {:?}",
+                job.state_reason()
+            );
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "drift is for the controller to resolve, not grounds to drain"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn residual_state_is_looked_at_the_same_way_an_overlap_is() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureResidualState,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("residual", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a node that cannot say what it holds is the case a pull answers"
+            );
+        }
+
+        // A launch the node rejects on its own terms says nothing about what it
+        // holds, so pulling its ledger would be pure cost.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_misaddressed_launch_does_not_earn_a_ledger_pull() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureTargetMismatch,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("misaddressed", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            // The unclaimed slot settles it with no waiting: a pull stamps the
+            // slot before it spawns, so an untaken slot means none was started.
+            assert!(
+                cm.claim_ledger_pull_slot("n1"),
+                "a misaddressed launch must not have claimed the node's pull slot"
+            );
+            assert_eq!(pulls.load(Ordering::SeqCst), 0);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert!(
+                job.state_reason().contains("agent rejected launch"),
+                "got {:?}",
+                job.state_reason()
+            );
+        }
+
+        // A node stuck refusing must not earn a pull per dispatch: the pacing is
+        // the only thing between a standing conflict and a pull storm.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_keeps_refusing_is_pulled_once_not_once_per_refusal() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            // The requeue backoff would otherwise end the run before the second
+            // refusal; the pacing, not the backoff, is what is under test.
+            config.controller.max_batch_requeue = 10;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("standing-conflict", 1));
+            for _ in 0..4 {
+                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            }
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "every refusal inside the cooldown must reuse the first pull"
+            );
+            // The slot is what every trigger consults, so a node-asked pull
+            // arriving now is held off by the refusal's, not counted beside it.
+            assert!(
+                !cm.claim_ledger_pull_slot("n1"),
+                "the first refusal must still hold the node's only pull slot"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn an_unclassified_rejection_backs_off_without_draining_the_node() {
             use spur_core::job::{JobState, PendingReason};
 
@@ -4879,6 +5576,7 @@ mod tests {
                 },
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -5100,6 +5798,30 @@ mod tests {
             );
         }
 
+        // The batch launch path names its holder in the reply; this one has only
+        // the status code, so the code is what has to reach the reconciler.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_allocation_a_node_refuses_for_want_of_resources_pulls_its_ledger() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, pulls) = spawn_mock_agent_refusing_allocations().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-alloc-refused", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(!started, "the node refused, so nothing started here");
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a node refusing for want of resources it should have is drift, and \
+                 only the node's own ledger can say what it is holding"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn process_assignment_requeues_when_all_srun_allocation_registrations_fail() {
             use spur_core::job::JobState;
@@ -5194,8 +5916,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn process_assignment_cancels_dispatched_nodes_when_start_job_fails_after_confirmation(
-        ) {
+        async fn an_inconsistent_assignment_is_refused_before_anything_is_launched() {
             use spur_core::job::JobState;
 
             let dir = TempDir::new().unwrap();
@@ -5207,15 +5928,8 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("start-job-inconsistent", 2));
 
-            // A malformed assignment: confirm_dispatch_on_nodes tolerates a
-            // missing per_node_alloc entry (falls back to a default
-            // allocation), but start_job validates every assigned node has
-            // one and rejects the whole call otherwise. This is what a
-            // scheduler/assignment bug producing inconsistent data — or the
-            // job being touched by another path between assignment and this
-            // call — looks like from here: both nodes already launched real
-            // work by the time start_job is rejected, so both must be torn
-            // back down rather than left running under a job stuck Pending.
+            // The reservation validates the per-node data, and it now runs
+            // before the dispatch, so nothing is ever launched.
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
@@ -5223,20 +5937,25 @@ mod tests {
 
             assert!(
                 !started,
-                "start_job's own validation must still block on inconsistent per-node data"
+                "inconsistent per-node data must block the dispatch"
             );
             assert_eq!(
                 cm.get_job(job_id).unwrap().state,
                 JobState::Pending,
-                "a start_job failure must not leave the job Running with no confirmed nodes"
+                "a refused placement must leave the job queued"
             );
-            wait_for(
-                "n1 cancelled after start_job rejected the assignment",
-                || cancel1.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                (
+                    cancel1.load(Ordering::SeqCst),
+                    cancel2.load(Ordering::SeqCst)
+                ),
+                (0, 0),
+                "nothing was launched, so there is nothing to tear down"
             );
-            wait_for(
-                "n2 cancelled after start_job rejected the assignment",
-                || cancel2.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                cm.get_node("n1").unwrap().alloc_resources.cpus,
+                0,
+                "a refused placement charges nothing"
             );
         }
 
@@ -5298,8 +6017,13 @@ mod tests {
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
 
-            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
-                .expect("a stale eviction must be a no-op, not an error");
+            cm.evict_job_attempt(
+                job_id,
+                Some(current.wrapping_sub(1)),
+                Some("stale".into()),
+                spur_core::job::PendingReason::JobLaunchFailure,
+            )
+            .expect("a stale eviction must be a no-op, not an error");
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(
@@ -5495,6 +6219,111 @@ mod tests {
                  1 gpu/resource allocation mismatch)",
                 "operators need the specific failure category, not a generic count"
             );
+        }
+
+        fn register_epilog_node_without_comm_addr(cm: &ClusterManager, name: &str) {
+            use spur_core::wal::WalOperation;
+
+            cm.apply_operation(&WalOperation::NodeRegister {
+                runs_job_epilog: true,
+                name: name.into(),
+                hostname: name.into(),
+                resources: ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                address: String::new(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                source: NodeSource::NativeHost,
+            });
+            let n = name.to_string();
+            wait_for(&format!("epilog node '{n}' registered"), || {
+                cm.get_node(&n).is_some()
+            });
+        }
+
+        /// Run `passes` preemption cycles for one high-priority pending job against
+        /// two low-priority runs on an epilog node; returns how many were taken.
+        async fn victims_taken_over(
+            cm: &Arc<ClusterManager>,
+            mode: spur_core::partition::PreemptMode,
+            passes: usize,
+        ) -> usize {
+            use spur_core::job::JobState;
+
+            register_epilog_node_without_comm_addr(cm, "n1");
+            let spec = |name: &str, priority: u32| JobSpec {
+                name: name.into(),
+                user: "u".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                partition: Some("default".into()),
+                priority: Some(priority),
+                ..Default::default()
+            };
+            let slice = ResourceAllocations::with_scalar(1, 0);
+            let victims: Vec<_> = ["a", "b"]
+                .iter()
+                .map(|name| {
+                    let id = submit_and_wait(cm, spec(name, 1));
+                    cm.start_job(
+                        id,
+                        vec!["n1".into()],
+                        slice.clone(),
+                        HashMap::from([("n1".to_string(), slice.clone())]),
+                    )
+                    .unwrap();
+                    settle(cm, id, JobState::Running);
+                    id
+                })
+                .collect();
+
+            let waiting = JobSpec {
+                nodelist: Some("n1".into()),
+                ..spec("waiting", 10_000)
+            };
+            let waiting_id = submit_and_wait(cm, waiting);
+            let waiting = cm.get_job(waiting_id).expect("the pending job");
+            let parts = vec![partition_with_mode("default", mode)];
+            let sched = sched_config_default();
+
+            for _ in 0..passes {
+                try_preempt(cm, &parts, &[&waiting], &sched).await;
+            }
+            victims
+                .iter()
+                .filter(|id| cm.get_job(**id).is_some_and(|j| j.state.is_finalized()))
+                .count()
+        }
+
+        // A victim still charged to its epilog does not fit the pending job yet,
+        // and next cycle it is no longer a candidate: so a fresh job dies instead.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_pending_job_takes_one_requeue_victim_while_it_hands_its_slice_back() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let taken =
+                victims_taken_over(&cm, spur_core::partition::PreemptMode::Requeue, 3).await;
+            assert_eq!(
+                taken, 1,
+                "one pending job is owed one victim, not one a cycle"
+            );
+        }
+
+        // Cancel holds the victim's slice through its epilog exactly as requeue
+        // does, but leaves it Cancelled — so state is the wrong thing to watch.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_pending_job_takes_one_cancel_victim_while_it_hands_its_slice_back() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let taken = victims_taken_over(&cm, spur_core::partition::PreemptMode::Cancel, 3).await;
+            assert_eq!(taken, 1, "a cancelled victim is still giving up its cores");
         }
     }
 

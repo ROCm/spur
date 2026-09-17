@@ -68,6 +68,8 @@ async fn sync_taint_state(
     };
 
     let req = UpdateNodeRequest {
+        caller: String::new(),
+        reconcile: false,
         name: name.into(),
         state: Some(state),
         reason,
@@ -127,6 +129,10 @@ pub async fn run(
                     info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
+                        // A virtual node keeps no local ledger of its own, and
+                        // runs no epilog for the controller to wait on.
+                        ledger: None,
+                        runs_job_epilog: false,
                         hostname: name.clone(),
                         resources: Some(resources),
                         version: "spur-k8s-operator".into(),
@@ -170,6 +176,8 @@ pub async fn run(
                 hb.untrack(&name).await;
 
                 let req = UpdateNodeRequest {
+                    caller: String::new(),
+                    reconcile: false,
                     name: name.clone(),
                     state: Some(NodeState::NodeDown as i32),
                     reason: Some("K8s node removed".into()),

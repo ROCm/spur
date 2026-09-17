@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
+use spur_core::node::{Node, NodeState};
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
     batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
@@ -277,6 +278,33 @@ pub(crate) fn resolve_startup_jwt_key(
         );
     }
     Ok("spur-default-key".to_string())
+}
+
+/// How long a node may stay gated for one reconcile. A node held past this is
+/// worse than one reconciled imperfectly: it is silently out of the cluster.
+const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a reconcile waits for this controller to replay its own log. Well under
+/// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
+const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Releases a node's reconcile gate however the reconcile ends, including a
+/// panic: a gate that only clears on success removes the node permanently.
+struct ReconcileGate {
+    cluster: Arc<ClusterManager>,
+    node: String,
+}
+
+impl ReconcileGate {
+    fn new(cluster: Arc<ClusterManager>, node: String) -> Self {
+        Self { cluster, node }
+    }
+}
+
+impl Drop for ReconcileGate {
+    fn drop(&mut self) {
+        self.cluster.set_reconcile_pending(&self.node, false);
+    }
 }
 
 impl ControllerService {
@@ -819,12 +847,561 @@ impl ControllerService {
         }
     }
 
+    /// Admin bar for an operation that can end running work, on a cluster that may authenticate
+    /// nobody. A verified identity settles it; failing that the client's own word does, which is
+    /// an operator-error guard and not a boundary — the same trade `is_k0s_admin` documents.
+    #[allow(clippy::result_large_err)]
+    fn require_admin_by_assertion<T>(
+        &self,
+        request: &Request<T>,
+        asserted: &str,
+        op: &str,
+    ) -> Result<(), Status> {
+        let allowed = match Self::verified_identity(request) {
+            Some(identity) => self.caller_is_admin(Some(identity)),
+            // Empty is refused rather than waved through: the field is client-supplied, so
+            // treating "unset" as admin would make the check bypassable by omitting it.
+            None => {
+                !asserted.is_empty() && is_k0s_admin(self.cluster.association_cache(), asserted)
+            }
+        };
+        if allowed {
+            return Ok(());
+        }
+        Err(Status::permission_denied(format!(
+            "{op} requires cluster admin"
+        )))
+    }
+
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
     /// or a caller with no verified identity. The latter keeps the pre-auth behaviour — `disabled`,
     /// or `permissive` with no credential, trusts the client — so restricting it would break no-auth
     /// deployments. `required` never reaches here without an identity, so real users are still bound.
     fn caller_is_privileged(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
         identity.is_none() || self.caller_is_admin(identity)
+    }
+}
+
+/// What one reconcile pass resolved. Settling is reported separately from
+/// cancelling because the apply layer drops a completion it considers stale.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconcileOutcome {
+    /// Direction A: claims the node held that Raft did not record.
+    pub cancelled: Vec<u32>,
+    /// Direction B: records the node stopped holding, that the apply accepted.
+    pub settled: Vec<u32>,
+    /// Direction A: finished runs Raft did not record, answered by releasing the
+    /// slice the agent was holding out for an acknowledgement to free.
+    pub released: Vec<u32>,
+    /// Direction A: claims neither side can account for. Nothing may end them and
+    /// nothing proves them over, so they are surfaced rather than acted on.
+    pub unresolved: Vec<u32>,
+}
+
+/// How the controller came by a cut. Under open admission neither one attests
+/// the node: a caller that can register may repoint the address a pull dials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutProvenance {
+    Pulled,
+    Registered,
+}
+
+/// Diff an agent's asserted ledger against Raft and resolve the differences.
+/// `dispatched` must predate the cut: it names launches that could postdate it.
+pub(crate) async fn reconcile_node_ledger(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: spur_proto::proto::NodeLedger,
+    dispatched: &crate::dispatch_tracker::DispatchWatch,
+    provenance: CutProvenance,
+) -> ReconcileOutcome {
+    reconcile_node_ledger_after(
+        cluster,
+        node,
+        ledger,
+        dispatched,
+        provenance,
+        cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT),
+    )
+    .await
+}
+
+/// What a cut licenses, established once for every direction. Built whole so a
+/// safety condition cannot be wired into one direction and forgotten in another.
+struct ReconcileLicense<'a> {
+    /// What the node asserts it is holding, keyed by the run, not the job: a
+    /// leaked attempt beside a recorded one is invisible to a job-keyed diff.
+    held: std::collections::HashMap<spur_core::job::RunKey, &'a spur_proto::proto::LedgerEntry>,
+    /// Whether something missing from `held` is evidence that the node let it
+    /// go. A cut the agent could not complete says nothing about what is absent.
+    absence_is_evidence: bool,
+    /// How the controller came by this cut, which is what decides whether it may
+    /// license an act or only be read for drift.
+    provenance: CutProvenance,
+    /// The agent lifetime that took the cut, so a direction acting over several
+    /// awaits can tell whether it is still the one this node is running.
+    session: &'a str,
+}
+
+impl ReconcileLicense<'_> {
+    /// Why the licence no longer holds. Re-checked between acts, since a premise
+    /// that lapsed mid-pass cannot undo what has already been done under it.
+    fn lapsed(&self, cluster: &ClusterManager, node: &str) -> Option<&'static str> {
+        if !cluster.is_raft_leader() {
+            return Some("no longer the leader");
+        }
+        if !cluster.agent_sessions().vouches_for(node, self.session) {
+            return Some("a later registration replaced the lifetime that took this cut");
+        }
+        None
+    }
+
+    /// Whether the controller can attest whoever produced this cut. Read per act
+    /// rather than fixed at the open: a mode revoked mid-pass licenses no more.
+    fn teardown_is_licensed(&self, cluster: &ClusterManager) -> bool {
+        match self.provenance {
+            CutProvenance::Pulled => true,
+            // Open admission lets any reachable host assert any hostname, so the
+            // cut names a node the controller has no way to place the caller at.
+            CutProvenance::Registered => matches!(
+                cluster.config().admission.mode,
+                spur_core::config::AdmissionMode::Token
+            ),
+        }
+    }
+}
+
+/// `None` when nothing may be acted on: a half-replayed log, or a cut whose
+/// lifetime a later registration replaced -- both settled before any sampling.
+async fn open_reconcile_license<'a>(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: &'a spur_proto::proto::NodeLedger,
+    provenance: CutProvenance,
+    replayed: impl std::future::Future<Output = bool>,
+) -> Option<ReconcileLicense<'a>> {
+    if !replayed.await {
+        warn!(
+            node = %node,
+            "controller has not replayed its own log; leaving this node's claims alone"
+        );
+        return None;
+    }
+    // Read after the wait, so a re-registration that landed while this pass was
+    // blocked is still seen to overtake the cut.
+    if !cluster
+        .agent_sessions()
+        .vouches_for(node, &ledger.agent_session_id)
+    {
+        warn!(
+            node = %node,
+            agent_session_id = %ledger.agent_session_id,
+            "a later registration replaced the agent lifetime that took this cut; discarding it"
+        );
+        return None;
+    }
+    let mut held = std::collections::HashMap::new();
+    let mut every_entry_named_a_run = true;
+    for entry in &ledger.entries {
+        match spur_core::job::RunKey::new(entry.job_id, entry.run_attempt) {
+            Some(run) => {
+                held.insert(run, entry);
+            }
+            // Nothing can be keyed on attempt 0, and a cut carrying one cannot
+            // be read as a complete account of what the node holds either.
+            None => {
+                warn!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    "agent reported a claim under run attempt 0; it names no run to act on"
+                );
+                every_entry_named_a_run = false;
+            }
+        }
+    }
+    Some(ReconcileLicense {
+        held,
+        absence_is_evidence: ledger.inventory_complete && every_entry_named_a_run,
+        provenance,
+        session: &ledger.agent_session_id,
+    })
+}
+
+/// Direction A: the node asserts a claim Raft has no record of. Reasons from a
+/// presence, which an incomplete cut does not weaken. Every such claim gets an
+/// answer -- ended, released, or named as one only an operator can clear.
+/// False when a claim went unanswered, leaving `outcome.unresolved` a part of
+/// this node's account rather than the whole of it.
+async fn answer_unrecorded_claims(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    license: &ReconcileLicense<'_>,
+    outcome: &mut ReconcileOutcome,
+) -> bool {
+    let recorded = cluster.jobs_allocated_on_node(node);
+    let mut answered_every_claim = true;
+    let mut link: crate::scheduler_loop::AgentLink = None;
+    for (run, entry) in license
+        .held
+        .iter()
+        .filter(|(run, _)| !recorded.contains(run))
+    {
+        // Both answers leave Raft behind -- a kill cannot be taken back and a
+        // release hands cores away -- so the premises are retaken before each.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's claims alone");
+            answered_every_claim = false;
+            break;
+        }
+        // Reported either way: an operator sees the drift even where the caller
+        // proved too little for the controller to act on it.
+        if !license.teardown_is_licensed(cluster) {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "unattested registration cannot license answering a claim; leaving it alone"
+            );
+            answered_every_claim = false;
+            continue;
+        }
+        let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
+        // Teardown is done and Raft has no record of the run, so the completion
+        // this claim is waiting on is one only this side can still give it.
+        if disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
+            // Said of the answer, never of the intent: an agent that declines --
+            // because a hook is still on the cores -- leaves the claim standing.
+            if crate::scheduler_loop::settle_run_on_node(cluster, node, *run, &mut link).await {
+                info!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    run_attempt = entry.run_attempt,
+                    "agent held a finished run the controller has no record of; released it"
+                );
+                outcome.released.push(entry.job_id);
+                continue;
+            }
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "agent would not release a finished run the controller has no record of"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        }
+        // "Cannot tell" is never "dead". Nothing here licenses ending the claim
+        // and nothing proves it is over, so it is named rather than acted on.
+        if disposition.is_some_and(spur_core::job::LedgerDisposition::already_accounted_for) {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                disposition = %entry.disposition,
+                "agent holds a claim it cannot resolve and the controller has no record of"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        }
+        warn!(
+            node = %node,
+            job_id = entry.job_id,
+            run_attempt = entry.run_attempt,
+            "agent holds a claim the controller has no record of; cancelling it"
+        );
+        crate::scheduler_loop::cancel_job_on_nodes(
+            cluster,
+            run.job_id(),
+            run.attempt().unwrap_or_default(),
+            std::slice::from_ref(&node.to_string()),
+            9,
+        )
+        .await;
+        outcome.cancelled.push(run.job_id());
+    }
+    answered_every_claim
+}
+
+/// As [`reconcile_node_ledger`], readiness taken unresolved so no part of the
+/// record can be read before it settles.
+async fn reconcile_node_ledger_after(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: spur_proto::proto::NodeLedger,
+    dispatched: &crate::dispatch_tracker::DispatchWatch,
+    provenance: CutProvenance,
+    replayed: impl std::future::Future<Output = bool>,
+) -> ReconcileOutcome {
+    let Some(license) = open_reconcile_license(cluster, node, &ledger, provenance, replayed).await
+    else {
+        return ReconcileOutcome::default();
+    };
+    let mut outcome = ReconcileOutcome::default();
+    let answered_every_claim =
+        answer_unrecorded_claims(cluster, node, &license, &mut outcome).await;
+
+    // Direction B: Raft records a run the agent did not report. Reasons from an
+    // absence, so it needs a complete cut and a run no launch of ours raced.
+    let raced_the_cut = dispatched.observed();
+    for run in cluster.jobs_confirmed_on_node(node) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        // Every settle below awaits a round trip, so the premises this pass
+        // opened on are at least that stale and have to be taken again.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's records alone");
+            break;
+        }
+        if license.held.contains_key(&run) {
+            continue;
+        }
+        if raced_the_cut.contains(&job_id) {
+            warn!(
+                node = %node,
+                job_id,
+                "this cut could not have seen the launch we were dispatching; leaving it alone"
+            );
+            continue;
+        }
+        if !license.absence_is_evidence {
+            warn!(
+                node = %node,
+                job_id,
+                "agent could not enumerate its state; leaving this job's record alone"
+            );
+            continue;
+        }
+        warn!(
+            node = %node,
+            job_id, run_attempt, "node no longer holds a job the controller placed on it"
+        );
+        // Reported either way: an operator sees the drift even where the caller
+        // proved too little for the controller to act on it.
+        if !license.teardown_is_licensed(cluster) {
+            warn!(
+                node = %node,
+                job_id,
+                "unattested registration cannot license settling a job; leaving its record alone"
+            );
+            continue;
+        }
+        if settle_vanished_run(cluster, node, job_id, run_attempt).await {
+            outcome.settled.push(job_id);
+        }
+    }
+
+    // Direction C: both agree the run exists but the slices differ. Correcting
+    // means rewriting the record the controller derives its totals from.
+    for entry in &ledger.entries {
+        if entry.conflict_hold {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                disposition = %entry.disposition,
+                "agent is holding evidence it cannot resolve on its own"
+            );
+        }
+    }
+
+    // A pass that answered only some of this node's claims knows a subset, and a
+    // subset may neither clear the reason nor rewrite it to a shorter list.
+    if answered_every_claim {
+        name_unresolved_claims_on_node(cluster, node, &license, &outcome);
+    }
+    outcome
+}
+
+/// End a run the node stopped holding, reporting whether the record took it.
+/// A refusal leaves the job placed here, which is not a settlement.
+async fn settle_vanished_run(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    if only_the_epilog_is_owed(cluster, job_id, node) {
+        return release_the_owed_epilog(cluster, node, job_id, run_attempt);
+    }
+    // The job ends on every node it spans, so the ranks still running on its
+    // peers have to be told before the record stops accounting for them.
+    let peers = peers_still_holding(cluster, job_id, node);
+    if !peers.is_empty() {
+        crate::scheduler_loop::cancel_job_on_nodes(cluster, job_id, run_attempt, &peers, 9).await;
+    }
+    // A run the node dropped reported no exit, so it is an eviction and not a
+    // failure: only that reading is eligible for the node-fault retry.
+    let detail = format!("node {node} no longer holds this job");
+    match cluster.evict_job_attempt(
+        job_id,
+        Some(run_attempt),
+        Some(detail),
+        spur_core::job::PendingReason::NodeDown,
+    ) {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(node = %node, job_id, "the eviction was not applied; this job stays recorded on the node");
+            false
+        }
+        Err(error) => {
+            warn!(node = %node, job_id, ?error, "could not settle a job the node no longer holds");
+            false
+        }
+    }
+}
+
+/// Whether the run is over and only the hook this node owes keeps its slice
+/// charged. Such a record has no eviction left to take, just a debt to discharge.
+fn only_the_epilog_is_owed(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    node: &str,
+) -> bool {
+    cluster
+        .get_job(job_id)
+        .is_some_and(|job| job.state.is_finalized() && job.is_epilog_gated_on(node))
+}
+
+/// The other nodes this run is still charged to, which a whole-job settle ends
+/// the work on.
+fn peers_still_holding(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    node: &str,
+) -> Vec<String> {
+    let Some(job) = cluster.get_job(job_id) else {
+        return Vec::new();
+    };
+    job.allocated_nodes
+        .iter()
+        .filter(|peer| peer.as_str() != node && job.is_held_on(peer))
+        .cloned()
+        .collect()
+}
+
+/// Answer the epilog a finalized run is still gated on here. Only the completion
+/// path ends that debt; an eviction has nothing left to evict.
+fn release_the_owed_epilog(
+    cluster: &ClusterManager,
+    node: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
+        Ok(crate::cluster::NodeCompleteResult::EpilogReleased) => true,
+        Ok(result) => {
+            warn!(node = %node, job_id, ?result, "the report was not applied; this job stays recorded on the node");
+            false
+        }
+        Err(error) => {
+            warn!(node = %node, job_id, ?error, "could not release an epilog the node no longer owes");
+            false
+        }
+    }
+}
+
+/// Marks the reason this pass owns, so a later pass can tell its own stale text
+/// from an operator's and clear only the former.
+const UNRESOLVED_CLAIM_REASON: &str = "holding claims the controller has no record of";
+
+/// Hold a node whose claims nobody can account for out of service: left
+/// schedulable it is picked every cycle and refuses every launch, indefinitely.
+fn name_unresolved_claims_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    license: &ReconcileLicense<'_>,
+    outcome: &ReconcileOutcome,
+) {
+    // Both directions took awaits, so the premises this pass opened on are at
+    // least that stale, and putting a node in or out of service is an act.
+    if let Some(reason) = license.lapsed(cluster, node) {
+        warn!(node = %node, reason, "leaving this node's reason alone");
+        return;
+    }
+    let Some(current) = cluster.get_node(node) else {
+        return;
+    };
+    // Power management owns this node's state and is not a fault to report over.
+    if current.state == NodeState::Suspended {
+        return;
+    }
+    let existing = current.state_reason.as_deref().unwrap_or_default();
+    // Authorship, not state: the hold below is itself an admin hold, so without
+    // this the pass would be locked out of lifting the one it placed.
+    let mine = existing.starts_with(UNRESOLVED_CLAIM_REASON);
+    // A reason set anywhere else is somebody's, and its attribution goes with
+    // it; an admin hold with no text at all is theirs on the same grounds.
+    if !mine && (current.admin_locked || !existing.is_empty()) {
+        return;
+    }
+    // The ids come out of a map, so an unsorted list rewrites the same fact in a
+    // different order every pass and proposes a state change through Raft for it.
+    let mut claims = outcome.unresolved.clone();
+    claims.sort_unstable();
+    claims.dedup();
+    let wanted = match claims.as_slice() {
+        [] => String::new(),
+        claims => format!(
+            "{UNRESOLVED_CLAIM_REASON}: {}",
+            claims
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    };
+    if wanted.is_empty() {
+        release_unresolved_claim_hold(cluster, &current, mine, license);
+        return;
+    }
+    let target = claim_hold_state(&current);
+    if current.state == target && existing == wanted {
+        return;
+    }
+    // uid 0 so `sinfo -R` names the controller rather than an unknown user.
+    if let Err(error) = cluster.update_node_state(node, target, Some(wanted), Some(0)) {
+        warn!(node = %node, ?error, "could not hold the node for an unresolved claim");
+    }
+}
+
+/// Where a held node's state goes. A node another subsystem already took out of
+/// service keeps that state, so only the reason and the hold move.
+fn claim_hold_state(node: &Node) -> NodeState {
+    match node.state {
+        NodeState::Down | NodeState::Error => node.state,
+        _ if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() => {
+            NodeState::Draining
+        }
+        _ => NodeState::Drain,
+    }
+}
+
+/// Put a node back in service once its claims are answered. Lifting a hold is an
+/// inference from absence, so it needs the premises a settle needs, and the tag.
+fn release_unresolved_claim_hold(
+    cluster: &Arc<ClusterManager>,
+    current: &Node,
+    mine: bool,
+    license: &ReconcileLicense<'_>,
+) {
+    if !mine || !license.absence_is_evidence || !license.teardown_is_licensed(cluster) {
+        return;
+    }
+    if let Err(error) = cluster.release_controller_hold(&current.name) {
+        warn!(node = %current.name, ?error, "could not return the node to service");
+    }
+}
+
+impl ControllerService {
+    /// On its own task: the heartbeat must not wait on an RPC back to the node,
+    /// and the node's alternative is the routine sweep, an hour away.
+    fn pull_ledger_for_asking_node(&self, node: String) {
+        if !self.cluster.claim_ledger_pull_slot(&node) {
+            return;
+        }
+        info!(node = %node, "node asked to be reconciled; pulling its ledger");
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::pull_node_ledger(&cluster, &node, "node asked").await;
+        });
     }
 
     /// Stricter form of [`Self::require_admin`] for reservations: the admin bar, or the
@@ -1680,6 +2257,7 @@ impl SlurmController for ControllerService {
         let reservations = self.cluster.get_reservations();
         annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
         annotate_nodes_with_planned_reservations(&mut proto_nodes, &self.cluster);
+        annotate_nodes_with_dispatch_cooldown(&mut proto_nodes, &self.cluster);
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
@@ -1718,6 +2296,7 @@ impl SlurmController for ControllerService {
             std::slice::from_mut(&mut proto_node),
             &self.cluster,
         );
+        annotate_nodes_with_dispatch_cooldown(std::slice::from_mut(&mut proto_node), &self.cluster);
         Ok(Response::new(proto_node))
     }
 
@@ -1742,7 +2321,17 @@ impl SlurmController for ControllerService {
         self.require_admin(&request, "update node")?;
 
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        // Held to a stricter bar than the rest of this RPC: a reconcile can end running
+        // work, where State= and Reason= only change what is allowed to start next.
+        if request.get_ref().reconcile {
+            let asserted = request.get_ref().caller.clone();
+            self.require_admin_by_assertion(&request, &asserted, "reconciling a node")?;
+        }
         let req = request.into_inner();
+        if req.reconcile {
+            crate::scheduler_loop::pull_node_ledger(&self.cluster, &req.name, "operator audit")
+                .await;
+        }
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
                 .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
@@ -2103,6 +2692,17 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
+        // A node the controller has never seen has no record to carry the
+        // gate yet, so a first registration sets it below instead.
+        let ledger = req.ledger.clone();
+        // The agent took this cut before it called, so the watch can only cover
+        // launches still on the wire now -- the best this direction allows.
+        let dispatched = self.cluster.dispatch_tracker().watch(&req.hostname);
+        let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
+        if known_before {
+            self.cluster.set_reconcile_pending(&req.hostname, true);
+        }
+
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
             .register_node(
@@ -2117,8 +2717,51 @@ impl SlurmController for ControllerService {
                 source,
                 req.labels,
                 caller_privileged,
+                req.runs_job_epilog,
             )
             .map_err(register_node_rpc_status)?;
+
+        // A first registration builds the node record from scratch, which is
+        // also the earliest moment the gate has anything to be recorded on.
+        if ledger.is_some() && !known_before {
+            self.cluster.set_reconcile_pending(&req.hostname, true);
+        }
+
+        // Recorded only once the registration has been accepted, and before the
+        // reconcile below: a rejected one must disown no other lifetime.
+        self.cluster.agent_sessions().observe_registration(
+            &req.hostname,
+            ledger
+                .as_ref()
+                .map(|l| l.agent_session_id.as_str())
+                .unwrap_or_default(),
+        );
+
+        if let Some(ledger) = ledger {
+            let node = req.hostname.clone();
+            let cluster = self.cluster.clone();
+            let cluster_for_reconcile = self.cluster.clone();
+            // On its own task: tonic drops a handler future when the client
+            // disconnects, and a gate left set removes the node for good.
+            tokio::spawn(async move {
+                let _gate = ReconcileGate::new(cluster, node.clone());
+                if tokio::time::timeout(
+                    RECONCILE_BUDGET,
+                    reconcile_node_ledger(
+                        &cluster_for_reconcile,
+                        &node,
+                        ledger,
+                        &dispatched,
+                        CutProvenance::Registered,
+                    ),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(node = %node, "reconcile did not finish within its budget");
+                }
+            });
+        }
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -2226,6 +2869,14 @@ impl SlurmController for ControllerService {
                 }
                 Ok(Response::new(()))
             }
+            Some(Ok(NodeCompleteResult::EpilogReleased)) => {
+                info!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    "epilog reported for a finished run; the node's slice is free"
+                );
+                Ok(Response::new(()))
+            }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
@@ -2240,6 +2891,26 @@ impl SlurmController for ControllerService {
                     node = %req.reporting_node,
                     run_attempt = req.run_attempt,
                     "ignoring completion report from superseded run"
+                );
+                Ok(Response::new(()))
+            }
+            // Not gated on the id watermark: a controller that lost its state
+            // restarts its counter, putting genuinely old ids above it.
+            Some(Err(NodeCompleteError::JobNotFound { job_id })) => {
+                warn!(
+                    job_id,
+                    node = %req.reporting_node,
+                    "completion for a job the controller has no record of; accepting it"
+                );
+                Ok(Response::new(()))
+            }
+            // No retry can put the node back on a job it was taken off, so
+            // refusing the report would hold its slice for good.
+            Some(Err(NodeCompleteError::NodeNotAllocated { job_id, node })) => {
+                warn!(
+                    job_id,
+                    %node,
+                    "completion from a node this job is no longer placed on; accepting it"
                 );
                 Ok(Response::new(()))
             }
@@ -2293,6 +2964,9 @@ impl SlurmController for ControllerService {
             self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
+            }
+            if req.needs_reconcile {
+                self.pull_ledger_for_asking_node(req.hostname.clone());
             }
             Ok(Response::new(HeartbeatResponse {}))
         } else {
@@ -5081,7 +5755,13 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     NodeInfo {
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
-        state_reason: node.state_reason.clone().unwrap_or_default(),
+        // A gated node is idle but refuses work; without a reason an operator
+        // sees only a node that will not take jobs.
+        state_reason: match (&node.state_reason, node.reconcile_pending) {
+            (Some(reason), _) => reason.clone(),
+            (None, true) => "reconciling with the controller".into(),
+            (None, false) => String::new(),
+        },
         partitions: node.partitions.clone(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
         alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
@@ -5294,6 +5974,22 @@ fn apply_planned_reservations(
         };
         job.planned_start_time = Some(datetime_to_proto(*start));
         job.sched_nodelist = spur_core::hostlist::compress(nodes);
+    }
+}
+
+/// A node the scheduler is skipping otherwise reports Idle/Mixed with no
+/// reason. A durable reason wins: a drain outranks a transient skip.
+fn annotate_nodes_with_dispatch_cooldown(nodes: &mut [NodeInfo], cluster: &ClusterManager) {
+    for node_info in nodes.iter_mut() {
+        if !node_info.state_reason.is_empty() {
+            continue;
+        }
+        let Some(remaining) = cluster.dispatch_cooldown_remaining(&node_info.name) else {
+            continue;
+        };
+        let secs = (remaining.as_millis() as u64).div_ceil(1000);
+        node_info.state_reason =
+            format!("dispatch cooldown after a failed launch ({secs}s remaining)");
     }
 }
 
@@ -5819,6 +6515,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_takes_the_admin_bar_with_or_without_authentication() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let req = |id: Option<spur_core::auth::Identity>| {
+            let mut r = Request::new(());
+            if let Some(id) = id {
+                r.extensions_mut().insert(id);
+            }
+            r
+        };
+        let allowed = |id, asserted| {
+            svc.require_admin_by_assertion(&req(id), asserted, "reconciling a node")
+                .is_ok()
+        };
+
+        // A verified identity settles it, and the assertion beside it is ignored.
+        assert!(allowed(Some(viewer("root", true)), ""));
+        assert!(!allowed(Some(viewer("bob", false)), "root"));
+
+        // With nobody authenticated the client's own word is all there is. This is
+        // the case that must keep working: a no-auth cluster still has operators.
+        assert!(
+            allowed(None, "root"),
+            "refusing here would leave a no-auth cluster unable to reconcile at all"
+        );
+        assert!(!allowed(None, "bob"));
+        assert!(
+            !allowed(None, ""),
+            "an omitted caller must not be admin, or the check is bypassable by omission"
+        );
+
+        assert!(
+            svc.require_admin(&req(None), "update node").is_ok(),
+            "the ordinary node update must keep accepting an unnamed caller"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_job_scopes_by_identity_under_default_redacted_policy() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
@@ -5981,6 +6716,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(spec),
             },
@@ -6015,6 +6751,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(JobSpec {
                     name: "alice-job".into(),
@@ -6107,6 +6844,7 @@ mod tests {
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
 
         let submit = |job_id: u32, name: &str| WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(JobSpec {
                 name: name.into(),
@@ -6215,6 +6953,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(JobSpec {
                 name: "evicted".into(),
@@ -6268,6 +7007,7 @@ mod tests {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
                 &WalOperation::JobSubmit {
+                    at: None,
                     job_id: task_id,
                     spec: Box::new(JobSpec {
                         name: "array-task".into(),
@@ -6310,6 +7050,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 40,
             spec: Box::new(JobSpec {
                 name: "moved".into(),
@@ -6371,6 +7112,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 50,
                 spec: Box::new(JobSpec {
                     name: "launching".into(),
@@ -6410,6 +7152,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 60,
                 spec: Box::new(JobSpec {
                     name: "starting".into(),
@@ -6457,6 +7200,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 77,
             spec: Box::new(JobSpec {
                 name: "interactive".into(),
@@ -6591,6 +7335,2389 @@ mod tests {
         .unwrap()
     }
 
+    /// A node holding one running job, as Raft records it.
+    async fn service_with_a_job_on_a_node(
+        dir: &tempfile::TempDir,
+    ) -> (ControllerService, Arc<ClusterManager>) {
+        let svc = test_service(dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+        (svc, cluster)
+    }
+
+    /// The same fixture with nothing behind it: no raft, so the controller reads
+    /// as a follower, which is what the leader-only paths have to answer for.
+    fn cluster_with_a_job_on_a_node_but_no_raft(dir: &tempfile::TempDir) -> Arc<ClusterManager> {
+        let cluster = Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        seed_a_job_on_a_node(&cluster);
+        cluster
+    }
+
+    /// A port this process bound and let go. The agent port would make a test
+    /// that turns on nothing answering depend on what else the machine runs.
+    fn a_port_nothing_listens_on() -> u16 {
+        let bound = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = bound.local_addr().expect("ephemeral address").port();
+        drop(bound);
+        port
+    }
+
+    fn seed_a_job_on_a_node(cluster: &Arc<ClusterManager>) {
+        seed_a_job_on_a_node_with(cluster, a_one_node_spec());
+    }
+
+    fn a_one_node_spec() -> spur_core::job::JobSpec {
+        spur_core::job::JobSpec {
+            name: "j".into(),
+            user: "testuser".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        }
+    }
+
+    fn register_a_node(cluster: &Arc<ClusterManager>, name: &str) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+            runs_job_epilog: false,
+            name: name.into(),
+            hostname: name.into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on(),
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: std::collections::HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+    }
+
+    fn seed_a_job_on_a_node_with(cluster: &Arc<ClusterManager>, spec: spur_core::job::JobSpec) {
+        register_a_node(cluster, "n1");
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(spec),
+        });
+        place_job_7_on_n1(cluster, 1);
+    }
+
+    /// Put job 7 back on `n1` under `run_attempt`, the way a fresh dispatch of
+    /// an already-submitted job would.
+    fn place_job_7_on_n1(cluster: &Arc<ClusterManager>, run_attempt: u32) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+            job_id: 7,
+            old_state: spur_core::job::JobState::Pending,
+            new_state: spur_core::job::JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
+            srun_step_dispatch: false,
+            run_attempt,
+            at: Some(chrono::Utc::now()),
+        });
+    }
+
+    /// Charge a slice to "n1" for a job that is still Pending: the window
+    /// `reserve_placement` opens, before any node has confirmed the launch.
+    fn reserve_pending_job_on_n1(cluster: &Arc<ClusterManager>, job_id: u32) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id,
+            spec: Box::new(spur_core::job::JobSpec {
+                name: "reserved".into(),
+                user: "testuser".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            at: Some(chrono::Utc::now()),
+        });
+        assert_eq!(
+            cluster.get_job(job_id).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+            "the reservation must not have activated the job"
+        );
+    }
+
+    fn declare_epilog_on_n1(cluster: &Arc<ClusterManager>) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeUpdate {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on(),
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+            reconcile_pending: None,
+            runs_job_epilog: Some(true),
+        });
+    }
+
+    fn ledger(complete: bool, entries: Vec<(u32, u32)>) -> spur_proto::proto::NodeLedger {
+        spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: complete,
+            entries: entries
+                .into_iter()
+                .map(|(job_id, run_attempt)| spur_proto::proto::LedgerEntry {
+                    job_id,
+                    run_attempt,
+                    cpu_ids: vec![0, 1],
+                    memory_mb: 1000,
+                    gpu_devices: Vec::new(),
+                    disposition: String::new(),
+                    conflict_hold: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// The same cut, with each entry carrying the disposition the agent would
+    /// have stamped on it.
+    fn ledger_disposed(
+        complete: bool,
+        entries: Vec<(u32, u32, spur_core::job::LedgerDisposition)>,
+    ) -> spur_proto::proto::NodeLedger {
+        let mut cut = ledger(
+            complete,
+            entries
+                .iter()
+                .map(|(job_id, run_attempt, _)| (*job_id, *run_attempt))
+                .collect(),
+        );
+        for (proto, (_, _, disposition)) in cut.entries.iter_mut().zip(&entries) {
+            proto.disposition = disposition.as_str().to_string();
+        }
+        cut
+    }
+
+    /// A reconcile of a node this controller is not dispatching to.
+    fn no_launch_in_flight(
+        cluster: &Arc<ClusterManager>,
+        node: &str,
+    ) -> crate::dispatch_tracker::DispatchWatch {
+        cluster.dispatch_tracker().watch(node)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_ledger_never_removes_a_job_the_controller_placed() {
+        // Inverting this frees live allocations across the cluster whenever an
+        // agent cannot read its own spool.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(false, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "an absence in a partial ledger proves nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caught_up_controller_cancels_a_claim_it_has_no_record_of() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await,
+            "this test is only meaningful against a controller that has replayed its log"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![99],
+            "job 7 is recorded here; job 99 is a claim Raft never placed"
+        );
+    }
+
+    // Open admission lets any host that can reach the port assert any hostname,
+    // so a registration under it is not proof of what that node is holding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_registration_cancels_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert_eq!(
+            svc.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open,
+            "fixture assumption: default admission mode is Open"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "a caller the controller cannot place must not kill work"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_registration_settles_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "an empty cut from an unplaceable caller is not proof the node let go"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "the job must still be recorded on the node"
+        );
+    }
+
+    // Degrade, do not deadlock: proving the join token restores the destructive
+    // half, so the gate costs an attested deployment nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attested_registration_still_cancels_an_unrecorded_claim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+    }
+
+    // A revoked licence has to stop the pass it opened. Reconfigure swaps the
+    // whole config, so admission can reopen while a reconcile is still killing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_path = dir.path().join("spur.conf");
+        let conf = |mode| format!("cluster_name = \"test\"\n[admission]\nmode = \"{mode}\"\n");
+        std::fs::write(&conf_path, conf("token")).unwrap();
+
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cluster = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft);
+
+        let (agent, release, mut fences) = spawn_gated_probe_agent_watching_fences().await;
+        seed_a_job_on_a_node(&cluster);
+        cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                agent.port(),
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                true,
+                false,
+            )
+            .expect("point the node at its probe agent");
+
+        let cut = ledger(true, vec![(98, 1), (99, 1)]);
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+        let reconcile = {
+            let cluster = cluster.clone();
+            tokio::spawn(async move {
+                reconcile_node_ledger(&cluster, "n1", cut, &dispatched, CutProvenance::Registered)
+                    .await
+            })
+        };
+
+        // The pass is provably mid-flight: one kill is held on the agent.
+        let first = fences.recv().await.expect("a fence reaches the agent");
+        std::fs::write(&conf_path, conf("open")).unwrap();
+        cluster.reconfigure().expect("reopen admission");
+        release.notify_one();
+        release.notify_one();
+        let outcome = reconcile.await.expect("reconcile");
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![first],
+            "a mode that no longer attests the caller licenses no further kill"
+        );
+    }
+
+    // The only production caller that hands reconciliation a registration's own
+    // cut. Pinned through the handler: the provenance is set there, not by a test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registered_cut_settles_nothing_under_open_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (addr, _release) = spawn_gated_probe_agent().await;
+        seed_a_job_on_a_node(&svc.cluster);
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            ledger: Some(ledger(true, Vec::new())),
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("register");
+
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            holds_job(&svc.cluster.jobs_allocated_on_node("n1"), 7),
+            "an empty cut from a caller open admission cannot place must not end a run"
+        );
+    }
+
+    // The attested half of the same wiring, and the settle this suite otherwise
+    // only ever proves by cancelling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registered_cut_settles_a_job_the_node_let_go_under_token_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let (addr, _release) = spawn_gated_probe_agent().await;
+        seed_a_job_on_a_node(&svc.cluster);
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            ledger: Some(ledger(true, Vec::new())),
+            join_token,
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("register");
+
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            !holds_job(&svc.cluster.jobs_allocated_on_node("n1"), 7),
+            "a caller that proved admission may settle what its complete cut omits"
+        );
+    }
+
+    // Cancelling awaits a round trip per claim, so a registration can land mid-pass
+    // -- and settling under the cut it replaced is as destructive as cancelling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registration_landing_mid_pass_stops_settling_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+        let (agent, release, mut fences) = spawn_gated_probe_agent_watching_fences().await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+        cluster
+            .agent_sessions()
+            .observe_registration("n1", "session-a");
+
+        // Two unrecorded claims to cancel and, by omission, job 7 to settle.
+        let cut = ledger(true, vec![(98, 1), (99, 1)]);
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+        let reconcile = {
+            let cluster = cluster.clone();
+            tokio::spawn(async move {
+                reconcile_node_ledger(&cluster, "n1", cut, &dispatched, CutProvenance::Registered)
+                    .await
+            })
+        };
+
+        // The pass is provably mid-flight: one fence is held on the agent.
+        fences.recv().await.expect("a fence reaches the agent");
+        cluster
+            .agent_sessions()
+            .observe_registration("n1", "session-b");
+        release.notify_one();
+        release.notify_one();
+        let outcome = reconcile.await.expect("reconcile");
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "a cut a later registration replaced is not evidence the node let go"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "the job must still be recorded on the node"
+        );
+    }
+
+    // A leaked claim the node can name is capacity lost until someone looks. The
+    // routine sweep is an hour away, so the heartbeat has to be what brings it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_asking_to_be_reconciled_is_pulled_on_its_heartbeat() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (agent, mut pulls) = spawn_probe_agent_watching_pulls().await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            needs_reconcile: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("heartbeat");
+
+        assert_eq!(
+            pulls.recv().await.as_deref(),
+            Some("node asked"),
+            "a node that says it is holding something unexplained must be looked at"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_reads_the_record_its_replay_wait_produced() {
+        // The wait is only protective if the record is read after it. Sampled
+        // first, the wait makes the pre-replay reading certain instead of rare.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 8));
+
+        let replaying = Arc::new(tokio::sync::Notify::new());
+        let replayed = Arc::new(tokio::sync::Notify::new());
+        let readiness = {
+            let (replaying, replayed) = (replaying.clone(), replayed.clone());
+            async move {
+                replaying.notify_one();
+                replayed.notified().await;
+                true
+            }
+        };
+        let replay = async {
+            replaying.notified().await;
+            reserve_pending_job_on_n1(&cluster, 8);
+            replayed.notify_one();
+        };
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+
+        let (outcome, ()) = tokio::join!(
+            super::reconcile_node_ledger_after(
+                &cluster,
+                "n1",
+                ledger(true, vec![(7, 1), (8, 1)]),
+                &dispatched,
+                CutProvenance::Pulled,
+                readiness,
+            ),
+            replay,
+        );
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "both claims are in the log this reconcile waited for"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+            "cancelling would kill a job the replay had already placed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_cannot_vouch_for_its_own_record_cancels_nothing() {
+        // A restart replays its log behind the gRPC server coming up, so a claim
+        // placed since the last snapshot reads as one the controller never made.
+        use crate::cluster::ClusterManager;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+            runs_job_epilog: false,
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on(),
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: std::collections::HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        assert!(!cluster.state_machine_ready(std::time::Duration::ZERO).await);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert!(
+            outcome.cancelled.is_empty(),
+            "the controller's own absence is not evidence until it has replayed its log"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_complete_ledger_settles_a_job_the_node_no_longer_holds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(
+            outcome.settled,
+            vec![7],
+            "a complete ledger that omits a confirmed run is evidence the node let it go"
+        );
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    /// A complete cut naming nothing, which is the whole of Direction B's case.
+    async fn take_a_cut_that_holds_nothing(cluster: &Arc<ClusterManager>) -> ReconcileOutcome {
+        reconcile_node_ledger(
+            cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direction_b_settles_a_vanished_job_as_node_fail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+
+        let job = cluster.get_job(7).expect("job 7 stays on record");
+        assert_eq!(
+            job.state,
+            spur_core::job::JobState::NodeFail,
+            "a run the node stopped holding never reported an exit status to fail on"
+        );
+        assert_eq!(job.exit_code, Some(-1));
+    }
+
+    // Nothing else in the record says where the job went, so without this an
+    // operator sees a node-fault eviction naming no node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_job_says_which_node_let_it_go() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(
+            cluster
+                .get_job(7)
+                .expect("job 7 stays on record")
+                .state_reason(),
+            "NodeDown (node n1 no longer holds this job)",
+            "this is the reason the documentation quotes"
+        );
+    }
+
+    // The launch backoff exists for a job that never started. This one ran, so
+    // charging it the backoff defers a retry that has nothing to wait for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_job_retries_at_once_instead_of_serving_a_launch_backoff() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node_with(
+            &cluster,
+            spur_core::job::JobSpec {
+                requeue: true,
+                ..a_one_node_spec()
+            },
+        );
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+
+        let job = cluster.get_job(7).expect("job 7 stays on record");
+        assert_eq!(job.state, spur_core::job::JobState::Pending);
+        assert_eq!(
+            job.spec.begin_time, None,
+            "a run that launched did not fail to launch"
+        );
+    }
+
+    // The completion path is the only one that answers an epilog debt: an
+    // eviction skips a finalized record and leaves the slice charged for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_job_still_owing_an_epilog_has_its_slice_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        declare_epilog_on_n1(&cluster);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(a_one_node_spec()),
+        });
+        place_job_7_on_n1(&cluster, 1);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobComplete {
+            at: None,
+            job_id: 7,
+            exit_code: 0,
+            state: spur_core::job::JobState::Completed,
+        });
+        assert_eq!(
+            cpus_charged_to(&cluster, "n1"),
+            2,
+            "the epilog gate is what still holds this slice"
+        );
+
+        let outcome = take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(outcome.settled, vec![7]);
+        assert_eq!(
+            cpus_charged_to(&cluster, "n1"),
+            0,
+            "a node that dropped the run will never report the hook that frees it"
+        );
+    }
+
+    // A parked preemption is a finished run with a hook still owed. Reading it
+    // as unfinished settles the whole job and SIGKILLs peers mid-hook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_run_parked_mid_preemption_has_its_slice_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        declare_epilog_on_n1(&cluster);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(a_one_node_spec()),
+        });
+        place_job_7_on_n1(&cluster, 1);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobPreemptRequeue {
+            at: None,
+            job_id: 7,
+            begin_time: chrono::Utc::now(),
+            preempted_by: Some(99),
+            preempt_qos: None,
+        });
+        assert_eq!(
+            cluster.get_job(7).expect("job 7").state,
+            spur_core::job::JobState::Preempted
+        );
+        assert_eq!(cpus_charged_to(&cluster, "n1"), 2);
+
+        let outcome = take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(outcome.settled, vec![7]);
+        assert_eq!(cpus_charged_to(&cluster, "n1"), 0);
+        assert_eq!(
+            cluster.get_job(7).expect("job 7").state,
+            spur_core::job::JobState::Pending,
+            "releasing the last hook is what completes the requeue"
+        );
+    }
+
+    fn config_capping_requeues_at(max: u32) -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\nmax_batch_requeue = {max}\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n"
+        ))
+        .unwrap()
+    }
+
+    // The label is cosmetic; this is the cost. Only a node-fault reading feeds
+    // the auto-requeue, so anything else drops the job on the floor in silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vanished_job_stays_eligible_for_retry() {
+        use spur_core::job::{JobState, PendingReason};
+
+        const CAP: u32 = 2;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, config_capping_requeues_at(CAP)).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node_with(
+            &cluster,
+            spur_core::job::JobSpec {
+                requeue: true,
+                ..a_one_node_spec()
+            },
+        );
+
+        for attempt in 1..=CAP {
+            take_a_cut_that_holds_nothing(&cluster).await;
+            let job = cluster.get_job(7).expect("job 7 stays on record");
+            assert_eq!(
+                job.state,
+                JobState::Pending,
+                "the job has to go back in line"
+            );
+            assert_eq!(job.requeue_count, attempt);
+            place_job_7_on_n1(&cluster, attempt + 1);
+        }
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+        let job = cluster.get_job(7).expect("job 7 stays on record");
+        assert_eq!(
+            job.requeue_count, CAP,
+            "the cap has to stop the retries rather than let them run on"
+        );
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+    }
+
+    /// Job 7 across three nodes, with `nB` already done and a second job holding
+    /// a slice there: whatever frees `nB` twice takes that second job's slice.
+    fn seed_a_three_node_job(cluster: &Arc<ClusterManager>) {
+        for name in ["nA", "nB", "nC"] {
+            register_a_node(cluster, name);
+        }
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        for (job_id, nodes) in [(7u32, vec!["nA", "nB", "nC"]), (8, vec!["nB"])] {
+            cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+                at: None,
+                job_id,
+                spec: Box::new(spur_core::job::JobSpec {
+                    num_nodes: nodes.len() as u32,
+                    ..a_one_node_spec()
+                }),
+            });
+            cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+                job_id,
+                old_state: spur_core::job::JobState::Pending,
+                new_state: spur_core::job::JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+                begin_time: None,
+                pending_reason_desc: None,
+            });
+            let total = spur_core::resource::ResourceAllocations::with_scalar(
+                2 * nodes.len() as u32,
+                1000 * nodes.len() as u64,
+            );
+            cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+                job_id,
+                nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+                resources: total,
+                per_node_alloc: nodes
+                    .iter()
+                    .map(|n| ((*n).to_string(), slice.clone()))
+                    .collect(),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                at: Some(chrono::Utc::now()),
+            });
+        }
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobNodeComplete {
+            job_id: 7,
+            node_name: "nB".into(),
+            exit_code: 0,
+            signal: 0,
+            run_attempt: 1,
+            at: None,
+        });
+    }
+
+    fn cpus_charged_to(cluster: &Arc<ClusterManager>, node: &str) -> u32 {
+        cluster
+            .get_node(node)
+            .expect("the node is registered")
+            .alloc_resources
+            .cpus
+    }
+
+    // A kill aimed at a node that already reported would land on whatever took
+    // its place, since the slice it names went back to the free pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_peers_still_running_the_job_are_told_to_end_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_a_three_node_job(&svc.cluster);
+
+        assert_eq!(
+            super::peers_still_holding(&svc.cluster, 7, "nA"),
+            vec!["nC".to_string()],
+            "nB reported already; only nC is still running this job"
+        );
+    }
+
+    // Letting the job run on its peers would hang: the lost node's ranks are
+    // gone, so the all-nodes-reported condition can never come true again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_node_losing_a_job_evicts_the_whole_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_three_node_job(&cluster);
+        assert_eq!(cpus_charged_to(&cluster, "nB"), 2, "job 8's slice is left");
+
+        reconcile_node_ledger(
+            &cluster,
+            "nA",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "nA"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            cluster.get_job(7).map(|job| job.state),
+            Some(spur_core::job::JobState::NodeFail)
+        );
+        assert_eq!(cpus_charged_to(&cluster, "nA"), 0);
+        assert_eq!(
+            cpus_charged_to(&cluster, "nC"),
+            0,
+            "a peer's slice is freed too"
+        );
+        assert_eq!(
+            cpus_charged_to(&cluster, "nB"),
+            2,
+            "nB was freed as it reported; freeing it again eats job 8's slice"
+        );
+    }
+
+    /// Register `n1` as a fresh agent lifetime, the way a restarted agent does.
+    /// The cut asserts nothing, so the reconcile it spawns cannot race the caller.
+    async fn register_lifetime(svc: &ControllerService, session: &str) {
+        let mut cut = ledger(false, Vec::new());
+        cut.agent_session_id = session.into();
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on().into(),
+            ledger: Some(cut),
+            ..Default::default()
+        }))
+        .await
+        .expect("an agent must be able to register");
+    }
+
+    fn ledger_from(session: &str, entries: Vec<(u32, u32)>) -> spur_proto::proto::NodeLedger {
+        let mut cut = ledger(true, entries);
+        cut.agent_session_id = session.into();
+        cut
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_from_a_lifetime_that_has_re_registered_is_discarded() {
+        // A rolling upgrade restarts an agent under every outstanding pull. The
+        // reply names a node that no longer exists, in both directions at once.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-b").await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-a", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::default(),
+            "a cut the agent's current lifetime did not take proves nothing either way"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "an absence in a superseded cut must not settle a live run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_from_the_lifetime_that_registered_is_acted_on() {
+        // The same cut the previous test discards, differing only in the lifetime
+        // it names: the gate must turn on staleness and nothing else.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-b").await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-b", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+        assert_eq!(outcome.settled, vec![7]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_has_seen_no_registration_still_reconciles() {
+        // A restarted controller keeps its nodes from the snapshot, so they never
+        // re-register. Treating that silence as doubt would strand every leak.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-a", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+        assert_eq!(outcome.settled, vec![7]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_registration_disowns_the_lifetime_it_replaces() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+        register_lifetime(&svc, "session-b").await;
+
+        assert!(
+            !cluster.agent_sessions().vouches_for("n1", "session-a"),
+            "a re-registration must disown the lifetime it replaces"
+        );
+        assert!(
+            cluster.agent_sessions().vouches_for("n1", "session-b"),
+            "the cut that establishes a lifetime cannot be stale against it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lifetime_recorded_in_a_term_that_ended_no_longer_gates_a_cut() {
+        // Registrations during another term went to that leader. Keeping this
+        // term's record would discard every later cut, with nothing to clear it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
+        crate::scheduler_loop::relinquish_leadership(&cluster, &mut scheduler);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-b", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![99],
+            "a leaked claim must not be stranded by a lifetime no term can vouch for"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lifetime_replaced_mid_pass_stops_the_cancelling() {
+        // Direction A kills over many awaits, so the licence it opened under can
+        // go stale between one claim and the next.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let cut = ledger_from("session-a", vec![(99, 1), (100, 1)]);
+        let license =
+            super::open_reconcile_license(&cluster, "n1", &cut, CutProvenance::Pulled, async {
+                true
+            })
+            .await
+            .expect("the only lifetime seen so far licenses its own cut");
+
+        register_lifetime(&svc, "session-b").await;
+
+        let mut outcome = ReconcileOutcome::default();
+        super::answer_unrecorded_claims(&cluster, "n1", &license, &mut outcome).await;
+        assert!(
+            outcome.cancelled.is_empty(),
+            "a lifetime that has been replaced must not have the rest of its cut acted on"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_reads_the_lifetime_its_replay_wait_produced() {
+        // Sampled before the wait, a registration landing while the pass is
+        // blocked cannot overtake the cut it replaces.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let replaying = Arc::new(tokio::sync::Notify::new());
+        let replayed = Arc::new(tokio::sync::Notify::new());
+        let readiness = {
+            let (replaying, replayed) = (replaying.clone(), replayed.clone());
+            async move {
+                replaying.notify_one();
+                replayed.notified().await;
+                true
+            }
+        };
+        let register = async {
+            replaying.notified().await;
+            register_lifetime(&svc, "session-b").await;
+            replayed.notify_one();
+        };
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+
+        let (outcome, ()) = tokio::join!(
+            super::reconcile_node_ledger_after(
+                &cluster,
+                "n1",
+                ledger_from("session-a", vec![(99, 1)]),
+                &dispatched,
+                CutProvenance::Pulled,
+                readiness,
+            ),
+            register,
+        );
+
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::default(),
+            "the registration that landed during the wait had already replaced this cut"
+        );
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_removed_from_the_cluster_takes_its_lifetime_with_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+        assert!(!cluster.agent_sessions().vouches_for("n1", "session-b"));
+
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: None,
+            at: None,
+        });
+
+        assert!(
+            cluster.agent_sessions().vouches_for("n1", "session-b"),
+            "a name that rejoins must not be judged against the cluster it left"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_registration_disowns_no_lifetime() {
+        // A registration that never took effect runs no reconcile of its own, so
+        // letting it supersede the live lifetime would discard cuts and replace none.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+
+        let mut cut = ledger(false, Vec::new());
+        cut.agent_session_id = "session-b".into();
+        let mut rejected = Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on().into(),
+            labels: [("pool".to_string(), "stolen".to_string())].into(),
+            ledger: Some(cut),
+            ..Default::default()
+        });
+        rejected.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(rejected)
+            .await
+            .expect_err("a non-admin caller must not be able to relabel an existing node");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        assert!(
+            cluster.agent_sessions().vouches_for("n1", "session-a"),
+            "the lifetime still running must keep speaking for this node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_complete_ledger_does_not_settle_a_job_still_being_dispatched() {
+        // The cut can predate the launch, so its silence about a reservation is
+        // not the agent letting go -- it is the agent not having been told yet.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        reserve_pending_job_on_n1(&cluster, 8);
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 8));
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "an unconfirmed launch is not something the cut can disown"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 8),
+            "the reservation must stay charged to the node"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+            "settling would finalize a job that never ran"
+        );
+    }
+
+    // The gate is written at placement, while the job is still Pending. Reading it
+    // as a confirmed launch lets the cut disown a reservation about to be launched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_epilog_declaration_does_not_make_a_reservation_disownable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        declare_epilog_on_n1(&cluster);
+        reserve_pending_job_on_n1(&cluster, 8);
+        assert!(
+            cluster
+                .get_job(8)
+                .is_some_and(|j| j.is_epilog_gated_on("n1")),
+            "the placement must have recorded the gate for this to be the real case"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "an unconfirmed launch is not something the cut can disown"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 8),
+            "subtracting here undercharges the node the job is about to launch on"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_taken_while_a_launch_was_on_the_wire_settles_nothing() {
+        // Only the cut's position relative to the launch separates this from a node
+        // that genuinely let go, and the cut's own contents cannot say which it is.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let dispatched = cluster.dispatch_tracker().watch("n1");
+        let on_the_wire = Arc::new(tokio::sync::Notify::new());
+        let cut_taken = Arc::new(tokio::sync::Notify::new());
+
+        let launch = tokio::spawn({
+            let cluster = cluster.clone();
+            let on_the_wire = on_the_wire.clone();
+            let cut_taken = cut_taken.clone();
+            async move {
+                let in_flight = cluster.dispatch_tracker().begin("n1", 8);
+                on_the_wire.notify_one();
+                cut_taken.notified().await;
+                reserve_pending_job_on_n1(&cluster, 8);
+                cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+                    job_id: 8,
+                    old_state: spur_core::job::JobState::Pending,
+                    new_state: spur_core::job::JobState::Running,
+                    pending_reason: None,
+                    pending_priority: None,
+                    begin_time: None,
+                    pending_reason_desc: None,
+                });
+                drop(in_flight);
+            }
+        });
+
+        on_the_wire.notified().await;
+        let cut = ledger(true, vec![(7, 1)]);
+        cut_taken.notify_one();
+        launch.await.unwrap();
+
+        let outcome =
+            reconcile_node_ledger(&cluster, "n1", cut, &dispatched, CutProvenance::Pulled).await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "the cut was taken before the launch landed, so it cannot disown it"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Running),
+            "the agent ran this job to completion; failing it loses the real exit code"
+        );
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 8));
+    }
+
+    // The post-requeue shape: a redispatch reuses the job id, so the leaked
+    // claim and the recorded one differ only in the attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leaked_attempt_beside_a_recorded_one_is_still_cancelled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (7, 2)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![7],
+            "attempt 2 of job 7 is a claim Raft never placed, whatever attempt 1 is"
+        );
+    }
+
+    // A run leaves the controller's record the moment its completion commits,
+    // yet stays in the cut until its slice goes back. That gap is not a leak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_the_agent_has_already_accounted_for_is_not_killed() {
+        for disposition in [
+            spur_core::job::LedgerDisposition::OverButCharged,
+            spur_core::job::LedgerDisposition::Unresolved,
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+            assert!(
+                cluster
+                    .state_machine_ready(std::time::Duration::from_secs(5))
+                    .await
+            );
+
+            let outcome = reconcile_node_ledger(
+                &cluster,
+                "n1",
+                ledger_disposed(true, vec![(7, 2, disposition)]),
+                &no_launch_in_flight(&cluster, "n1"),
+                CutProvenance::Pulled,
+            )
+            .await;
+
+            assert_eq!(
+                outcome.cancelled,
+                Vec::<u32>::new(),
+                "{} owes its slice back, not a signal to a payload that has ended",
+                disposition.as_str()
+            );
+        }
+    }
+
+    /// Re-point a seeded node at a probe agent, so an act the controller aims at
+    /// the node has somewhere real to land.
+    fn point_node_at(cluster: &Arc<ClusterManager>, node: &str, addr: std::net::SocketAddr) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeUpdate {
+            runs_job_epilog: None,
+            name: node.into(),
+            hostname: node.into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: addr.ip().to_string(),
+            port: addr.port(),
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+            reconcile_pending: None,
+        });
+    }
+
+    // The strand: teardown is done, the completion never landed, and the claim
+    // is waiting on an acknowledgement only this side can still give it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_claim_the_controller_has_no_record_of_is_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        let (tx, mut settles) = tokio::sync::mpsc::unbounded_channel();
+        let addr = spawn_probe_agent_full(false, None, None, None, Some(tx)).await;
+        point_node_at(&cluster, "n1", addr);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(99, 3, spur_core::job::LedgerDisposition::OverButCharged)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            settles.try_recv(),
+            Ok((99, 3)),
+            "the claim is answered at the agent holding it, not merely counted here"
+        );
+        assert_eq!(outcome.released, vec![99]);
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "nothing is left running to signal"
+        );
+    }
+
+    // "Cannot tell" is not "over": an unresolvable claim gets a name, not an act.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_the_agent_cannot_resolve_is_named_rather_than_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        let (tx, mut settles) = tokio::sync::mpsc::unbounded_channel();
+        let addr = spawn_probe_agent_full(false, None, None, None, Some(tx)).await;
+        point_node_at(&cluster, "n1", addr);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(99, 3, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert!(
+            settles.try_recv().is_err(),
+            "nothing proves this run is over, so no acknowledgement may be issued for it"
+        );
+        assert_eq!(outcome.released, Vec::<u32>::new());
+        assert_eq!(outcome.cancelled, Vec::<u32>::new());
+        assert_eq!(outcome.unresolved, vec![99]);
+        assert!(
+            node_reason(&svc, "n1").await.contains("99"),
+            "a node holding cores the controller counts as free must say so"
+        );
+    }
+
+    // Left standing, the reason outlives the claim and sends an operator after
+    // capacity that came back on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolved_claim_takes_its_reason_off_the_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        let addr = spawn_probe_agent_full(false, None, None, None, None).await;
+        point_node_at(&cluster, "n1", addr);
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(99, 3, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert!(!node_reason(&svc, "n1").await.is_empty());
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert!(
+            node_reason(&svc, "n1").await.is_empty(),
+            "the claim is gone, so the reason pointing at it must be too"
+        );
+    }
+
+    // An operator's own reason is the one they will act on; a reconcile that
+    // overwrote it would hide a drain behind a transient claim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_held_node_keeps_its_own_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        let addr = spawn_probe_agent_full(false, None, None, None, None).await;
+        point_node_at(&cluster, "n1", addr);
+        cluster
+            .update_node_state(
+                "n1",
+                spur_core::node::NodeState::Drain,
+                Some("hardware swap".into()),
+                None,
+            )
+            .expect("drain");
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(99, 3, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(node_reason(&svc, "n1").await, "hardware swap");
+    }
+
+    // Direction A cancels outside Raft, so this check is the only thing between
+    // a deposed leader and the work still running on its former nodes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_is_not_the_leader_cancels_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = cluster_with_a_job_on_a_node_but_no_raft(&dir);
+        assert!(!cluster.is_raft_leader(), "the fixture has no leadership");
+
+        let outcome = super::reconcile_node_ledger_after(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (7, 2)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+            async { true },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "attempt 2 is unrecorded here too, but this controller no longer speaks for the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_under_attempt_zero_is_reported_not_killed() {
+        // Attempt 0 names no run, so the cancel it would drive is an unfenced
+        // wildcard against whatever the node happens to be running.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 0)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "a claim that names no run must not drive a wildcard kill"
+        );
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "a cut carrying an unnameable claim is not a complete account either"
+        );
+    }
+
+    // Both directions read the same record, so the readiness wait has to hold
+    // both of them: settling on a half-replayed log finalizes live work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_has_not_replayed_settles_nothing_either() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+
+        let outcome = super::reconcile_node_ledger_after(
+            &cluster,
+            "n1",
+            ledger(true, vec![(99, 1)]),
+            &dispatched,
+            CutProvenance::Pulled,
+            async { false },
+        )
+        .await;
+
+        assert_eq!(outcome, super::ReconcileOutcome::default());
+        assert_eq!(
+            cluster.get_job(7).map(|j| j.state),
+            Some(spur_core::job::JobState::Running),
+            "job 7 is absent from this cut, but nothing about this reconcile may act on that"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_for_a_job_still_being_dispatched_is_not_cancelled() {
+        // Direction A needs no dispatch-window guard of its own: a reservation is
+        // a record, so the claim the agent just took is one the controller made.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        reserve_pending_job_on_n1(&cluster, 8);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (8, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            super::ReconcileOutcome::default(),
+            "both jobs are placed here; neither direction has anything to resolve"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ledger_that_reports_the_job_leaves_it_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pulled_ledger_reconciles_the_same_way_a_registration_does() {
+        // The pull exists so a controller-side event -- a failover, an audit, a
+        // refused dispatch -- can reach evidence no agent pushed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pulling_from_an_unreachable_node_changes_nothing() {
+        // The node is not reporting, which is not evidence about what it holds.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        crate::scheduler_loop::pull_node_ledger(&cluster, "n1", "test").await;
+
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "a failed pull must not be read as an empty ledger"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pulling_from_a_node_that_does_not_exist_is_a_no_op() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        crate::scheduler_loop::pull_node_ledger(&cluster, "nowhere", "test").await;
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gated_node_says_why_it_is_refusing_work() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        cluster.set_reconcile_pending("n1", true);
+        for _ in 0..200 {
+            if cluster.get_node("n1").unwrap().reconcile_pending {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let info = node_to_proto(&cluster.get_node("n1").unwrap());
+        assert!(
+            !info.state_reason.is_empty(),
+            "an idle node that silently refuses work is the outcome this rules out"
+        );
+    }
+
+    /// Whether any run of `job_id` is placed here. The reconciler compares on
+    /// the pair; these cases only care that the job is accounted for at all.
+    fn holds_job(placed: &std::collections::HashSet<spur_core::job::RunKey>, job_id: u32) -> bool {
+        placed.iter().any(|run| run.job_id() == job_id)
+    }
+
+    async fn await_reconcile_gate(svc: &ControllerService, name: &str, expected: bool) {
+        for _ in 0..600 {
+            if svc
+                .cluster
+                .get_node(name)
+                .is_some_and(|node| node.reconcile_pending == expected)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("node {name} never reached reconcile_pending={expected}");
+    }
+
+    fn registration(hostname: &str, addr: std::net::SocketAddr) -> RegisterAgentRequest {
+        RegisterAgentRequest {
+            hostname: hostname.into(),
+            address: addr.ip().to_string(),
+            port: u32::from(addr.port()),
+            ..Default::default()
+        }
+    }
+
+    /// Token admission, so the cut licenses the cancel that holds the reconcile
+    /// open on the gated agent; under open admission nothing would block.
+    async fn register_with_a_blocking_cut(
+        svc: &ControllerService,
+        addr: std::net::SocketAddr,
+    ) -> Result<tonic::Response<RegisterAgentResponse>, Status> {
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            // A claim the controller has no record of, so the reconcile has to
+            // cancel it -- and the cancel fences through the agent held open.
+            ledger: Some(ledger(true, vec![(99, 1)])),
+            join_token,
+            ..registration("n1", addr)
+        }))
+        .await
+    }
+
+    // The gate's live window is milliseconds wide, far too narrow to catch by
+    // sampling, so its contract is pinned here instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registering_with_a_ledger_holds_the_node_out_until_the_reconcile_finishes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let (addr, release) = spawn_gated_probe_agent().await;
+
+        register_with_a_blocking_cut(&svc, addr)
+            .await
+            .expect("register");
+
+        await_reconcile_gate(&svc, "n1", true).await;
+        assert!(
+            !svc.cluster.get_node("n1").expect("node").is_schedulable(),
+            "a node whose evidence is undiffed may already hold work it has not declared"
+        );
+        assert!(
+            !node_reason(&svc, "n1").await.is_empty(),
+            "an operator must be able to see why the node is taking nothing"
+        );
+
+        release.notify_one();
+
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            svc.cluster.get_node("n1").expect("node").is_schedulable(),
+            "the gate must open again once the reconcile is done"
+        );
+        assert!(node_reason(&svc, "n1").await.is_empty());
+    }
+
+    // The agent-restart case: the node is already in the cluster, so the gate
+    // has to land before the registration makes it available again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_re_registering_node_is_gated_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let (addr, release) = spawn_gated_probe_agent().await;
+
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            join_token,
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("first registration");
+        await_registered_node(&svc, "n1").await;
+
+        register_with_a_blocking_cut(&svc, addr)
+            .await
+            .expect("re-registration");
+
+        await_reconcile_gate(&svc, "n1", true).await;
+        release.notify_one();
+        await_reconcile_gate(&svc, "n1", false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registering_without_a_ledger_never_gates_the_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (addr, _release) = spawn_gated_probe_agent().await;
+
+        svc.register_agent(Request::new(registration("n1", addr)))
+            .await
+            .expect("register");
+        await_registered_node(&svc, "n1").await;
+
+        let node = svc.cluster.get_node("n1").expect("node");
+        assert!(
+            !node.reconcile_pending,
+            "an agent that asserts no evidence must not be held out of the cluster"
+        );
+        assert!(node.is_schedulable());
+        assert!(node_reason(&svc, "n1").await.is_empty());
+    }
+
+    async fn node_reason(svc: &ControllerService, name: &str) -> String {
+        svc.get_node(Request::new(GetNodeRequest { name: name.into() }))
+            .await
+            .expect("get_node")
+            .into_inner()
+            .state_reason
+    }
+
+    async fn await_node_reason(svc: &ControllerService, name: &str, expected: &str) {
+        for _ in 0..600 {
+            if node_reason(svc, name).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "node {name} reason never became {expected:?}; it is {:?}",
+            node_reason(svc, name).await
+        );
+    }
+
+    fn set_node_reason(cluster: &Arc<ClusterManager>, node: &str, reason: &str) {
+        let state = cluster.get_node(node).expect("node").state;
+        cluster
+            .update_node_state(node, state, Some(reason.to_string()), None)
+            .expect("set a reason on the node");
+    }
+
+    fn unresolved_reason(claims: &str) -> String {
+        format!("{}: {claims}", super::UNRESOLVED_CLAIM_REASON)
+    }
+
+    // An unlicensed pass answers no claim, so its empty account of the node is
+    // not evidence that the claims went away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unlicensed_pass_leaves_an_already_named_claim_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        set_node_reason(&cluster, "n1", &unresolved_reason("9"));
+        await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
+
+        // Open admission cannot place the caller at the node a registration names,
+        // so nothing in this cut licenses acting on -- or clearing -- anything.
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            node_reason(&svc, "n1").await,
+            unresolved_reason("9"),
+            "the claim is still held; only a pass that could see it may clear it"
+        );
+    }
+
+    // The ids come out of a map. An unsorted list rewrites the same fact in a
+    // different order each pass, proposing a state change through Raft every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_same_unresolved_claims_are_named_the_same_way_every_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        for _ in 0..8 {
+            reconcile_node_ledger(
+                &cluster,
+                "n1",
+                ledger_disposed(
+                    true,
+                    vec![
+                        (9, 1, spur_core::job::LedgerDisposition::Unresolved),
+                        (8, 1, spur_core::job::LedgerDisposition::Unresolved),
+                    ],
+                ),
+                &no_launch_in_flight(&cluster, "n1"),
+                CutProvenance::Pulled,
+            )
+            .await;
+            await_node_reason(&svc, "n1", &unresolved_reason("8,9")).await;
+        }
+    }
+
+    // Only this pass's own text is its to move. A reason set anywhere else carries
+    // somebody's attribution, and rewriting it destroys that with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reason_this_pass_did_not_write_is_left_standing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        set_node_reason(&cluster, "n1", "cable replacement");
+        await_node_reason(&svc, "n1", "cable replacement").await;
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            node_reason(&svc, "n1").await,
+            "cable replacement",
+            "the drift belongs in the log, not over the top of somebody else's reason"
+        );
+    }
+
+    // A settle the agent does not answer -- unreachable, or too old to know the
+    // call -- releases nothing, so the claim is still there to be accounted for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settle_that_released_nothing_leaves_the_claim_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(9, 1, spur_core::job::LedgerDisposition::OverButCharged)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.released,
+            Vec::<u32>::new(),
+            "nothing came back, so nothing may be counted as released"
+        );
+        assert_eq!(outcome.unresolved, vec![9]);
+        await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
+    }
+
+    /// A pass that finds job 9 held on `node` with nothing able to account for it,
+    /// beside the runs in `holding` that both sides agree on.
+    async fn reconcile_an_unresolvable_claim(
+        cluster: &Arc<ClusterManager>,
+        node: &str,
+        holding: Vec<(u32, u32)>,
+    ) {
+        let mut entries: Vec<_> = holding
+            .into_iter()
+            .map(|(job_id, run)| (job_id, run, spur_core::job::LedgerDisposition::Held))
+            .collect();
+        entries.push((9, 1, spur_core::job::LedgerDisposition::Unresolved));
+        let outcome = reconcile_node_ledger(
+            cluster,
+            node,
+            ledger_disposed(true, entries),
+            &no_launch_in_flight(cluster, node),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(outcome.unresolved, vec![9], "the claim must go unanswered");
+    }
+
+    /// A pass that finds the node holding nothing the controller cannot place.
+    /// `holding` names the runs both sides agree on, which such a pass leaves be.
+    async fn reconcile_a_clean_ledger(
+        cluster: &Arc<ClusterManager>,
+        node: &str,
+        holding: Vec<(u32, u32)>,
+    ) {
+        let outcome = reconcile_node_ledger(
+            cluster,
+            node,
+            ledger(true, holding),
+            &no_launch_in_flight(cluster, node),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(outcome.unresolved, Vec::<u32>::new());
+    }
+
+    // Left schedulable, a node holding cores the record counts as free is picked
+    // every cycle and every launch onto them is refused, for as long as it holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolvable_claim_takes_the_node_out_of_the_scheduler() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(cluster.get_node("n1").expect("node").is_schedulable());
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
+
+        let held = cluster.get_node("n1").expect("node");
+        assert_eq!(
+            held.state_reason.as_deref(),
+            Some(unresolved_reason("9").as_str())
+        );
+        assert_eq!(held.state, NodeState::Drain);
+        assert_eq!(held.reason_uid, Some(0), "`sinfo -R` must name the setter");
+        assert!(
+            !held.is_schedulable(),
+            "the scheduler must stop picking a node whose cores are spoken for"
+        );
+
+        // The hold is an admin hold, so only a pass that knows it wrote this one
+        // can take it off again.
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let back = cluster.get_node("n1").expect("node");
+        assert_eq!(back.state, NodeState::Idle);
+        assert!(back.is_schedulable());
+        assert!(!back.admin_locked, "the node must not stay locked out");
+        assert_eq!(back.state_reason, None);
+    }
+
+    /// The fields a release would move, so a test can say "nothing moved".
+    fn node_hold(cluster: &Arc<ClusterManager>, name: &str) -> (NodeState, Option<String>, bool) {
+        let node = cluster.get_node(name).expect("node");
+        (node.state, node.state_reason, node.admin_locked)
+    }
+
+    // The release derives its target from allocation alone, so on a node out of
+    // service for something it did not write it would silently declare it fit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_that_finds_nothing_releases_no_node_it_never_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeStateChange {
+            at: None,
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Unknown,
+            reason: None,
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+        let before = node_hold(&cluster, "n1");
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        assert_eq!(
+            node_hold(&cluster, "n1"),
+            before,
+            "a node nobody held has nothing to release"
+        );
+    }
+
+    // Lifting the hold is an inference from absence, so a cut the agent could not
+    // finish is no more evidence for it than it is for settling a vanished run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_cut_cannot_lift_the_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
+        let held = node_hold(&cluster, "n1");
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(false, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            node_hold(&cluster, "n1"),
+            held,
+            "an agent that cannot read its own spool has not shown the claim gone"
+        );
+    }
+
+    // Under open admission any reachable host can assert any hostname, so a cut
+    // arriving with a registration cannot license putting a node back in service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_cut_cannot_lift_the_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open
+        );
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
+        let held = node_hold(&cluster, "n1");
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            node_hold(&cluster, "n1"),
+            held,
+            "the controller cannot place the caller at the node this cut names"
+        );
+    }
+
+    // A node released while it is still running work is not idle, and reporting
+    // it so would let the scheduler count cores another job already has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_released_while_it_still_holds_work_comes_back_as_mixed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        assert_eq!(
+            cluster.get_node("n1").expect("node").state,
+            NodeState::Draining
+        );
+
+        reconcile_a_clean_ledger(&cluster, "n1", vec![(7, 1)]).await;
+
+        let back = cluster.get_node("n1").expect("node");
+        assert_eq!(back.state, NodeState::Mixed);
+        assert!(back.is_schedulable());
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    // A reason on a node nobody drained is still somebody's: the pass has to read
+    // the text, not the hold, to tell that it is not looking at its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reason_on_an_unheld_node_is_not_this_pass_to_clear() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        set_node_reason(&cluster, "n1", "awaiting a firmware flash");
+        assert!(!cluster.get_node("n1").expect("node").admin_locked);
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let node = cluster.get_node("n1").expect("node");
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("awaiting a firmware flash")
+        );
+    }
+
+    // Re-proposing an unchanged fact restamps its set-time, so the hold would
+    // read as brand new every pass and `sinfo -R` would never age it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holding_the_same_claim_again_does_not_restamp_the_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        let first = cluster.get_node("n1").expect("node");
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        let second = cluster.get_node("n1").expect("node");
+
+        assert_eq!(first.state, NodeState::Draining);
+        assert_eq!(second.state, first.state);
+        assert_eq!(second.reason_time, first.reason_time, "nothing changed");
+    }
+
+    // An operator's drain carries their attribution; a reconcile that rewrote or
+    // cleared it would destroy that along with the reason to keep the node out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_drain_outlives_a_pass_that_finds_an_unresolvable_claim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        cluster
+            .drain_node("n1", Some("cable replacement".into()), Some(1234))
+            .expect("operator drain");
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        reconcile_a_clean_ledger(&cluster, "n1", vec![(7, 1)]).await;
+
+        let node = cluster.get_node("n1").expect("node");
+        assert_eq!(node.state_reason.as_deref(), Some("cable replacement"));
+        assert_eq!(node.state, NodeState::Draining);
+        assert!(node.admin_locked);
+        assert_eq!(node.reason_uid, Some(1234), "the attribution stands too");
+    }
+
+    // Draining is not exempt from the heartbeat timeout, so a held node that goes
+    // quiet lands in Down still locked, where nothing in the health path recovers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_node_that_stopped_heartbeating_still_comes_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        assert_eq!(
+            cluster.get_node("n1").expect("node").state,
+            NodeState::Draining
+        );
+
+        cluster.check_node_health(0, crate::cluster::MarkDownPolicy::Allowed);
+        let down = cluster.get_node("n1").expect("node");
+        assert_eq!(down.state, NodeState::Down, "the hazard this test pins");
+        assert!(down.admin_locked);
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let unlocked = cluster.get_node("n1").expect("node");
+        assert!(!unlocked.admin_locked, "a locked Down node never recovers");
+        assert_eq!(unlocked.state_reason, None);
+        assert_eq!(
+            unlocked.state,
+            NodeState::Down,
+            "liveness is the health pass's call, not this one's"
+        );
+
+        cluster.update_heartbeat("n1", 0, 0);
+        cluster.check_node_health(90, crate::cluster::MarkDownPolicy::Allowed);
+        assert!(cluster.get_node("n1").expect("node").is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_on_dispatch_cooldown_says_why_it_is_being_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(node_reason(&svc, "n1").await.is_empty());
+
+        cluster.cool_down_node("n1");
+
+        assert!(
+            node_reason(&svc, "n1").await.contains("cooldown"),
+            "a node the scheduler is skipping must not report an empty reason"
+        );
+        let listed = svc
+            .get_nodes(Request::new(GetNodesRequest::default()))
+            .await
+            .expect("get_nodes")
+            .into_inner()
+            .nodes;
+        assert!(
+            listed
+                .iter()
+                .any(|n| n.name == "n1" && n.state_reason.contains("cooldown")),
+            "sinfo reads the same field and must see the same reason"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_reason_outranks_a_dispatch_cooldown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        cluster
+            .drain_node("n1", Some("operator maintenance".into()), Some(0))
+            .expect("drain");
+
+        cluster.cool_down_node("n1");
+
+        assert_eq!(
+            node_reason(&svc, "n1").await,
+            "operator maintenance",
+            "a transient skip must not overwrite the durable reason an operator set"
+        );
+    }
+
     async fn test_service(dir: &tempfile::TempDir) -> ControllerService {
         test_service_with(dir, step_test_config()).await
     }
@@ -6642,6 +9769,74 @@ mod tests {
         assert_eq!(resp.cluster_name, "test");
     }
 
+    /// A NotFound here never reaches an acknowledgement, so the reporting node
+    /// holds that job's cpu slice forever and the node quietly loses capacity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_for_a_forgotten_job_is_accepted_above_the_id_watermark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        // What a wiped state dir looks like: the counter restarted, so an id
+        // this cluster really did issue now sits at or above the watermark.
+        assert!(5 >= svc.cluster.peek_next_job_id());
+
+        let reported = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id: 5,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n1".into(),
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(
+            reported.is_ok(),
+            "a job the controller has no record of is never coming back: {:?}",
+            reported.err()
+        );
+    }
+
+    /// A requeue takes a job off its nodes without bumping its attempt, so the
+    /// node reports against a job it is no longer listed on -- forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_from_a_node_the_job_left_is_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobUserRequeue {
+            job_id: 7,
+            hold: false,
+            begin_time: None,
+            at: None,
+        });
+        assert!(
+            !cluster
+                .get_job(7)
+                .expect("job 7")
+                .allocated_nodes
+                .iter()
+                .any(|n| n == "n1"),
+            "fixture assumption: the requeue takes the job off its node"
+        );
+
+        let reported = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id: 7,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n1".into(),
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(
+            reported.is_ok(),
+            "refusing this report holds n1's slice for good: {:?}",
+            reported.err()
+        );
+    }
+
     /// A service with a configured node-identity signing key, for stepd
     /// recovery tests — `test_service` deliberately leaves this unset.
     async fn test_service_with_node_identity(dir: &tempfile::TempDir) -> ControllerService {
@@ -6670,10 +9865,66 @@ mod tests {
 
     struct ProbeAgent {
         active: bool,
+        /// Holds `fence_run` until the test releases it, so a test can keep a
+        /// reconcile open rather than race the window in which it runs.
+        fence_gate: Option<Arc<tokio::sync::Notify>>,
+        /// Reports each ledger pull's reason, so a test can await the pull it
+        /// expects instead of guessing how long the controller takes to make it.
+        ledger_pulls: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        /// Reports each fence's job as it arrives and before `fence_gate` holds
+        /// it, so a test can act while a reconcile is provably mid-pass.
+        fence_arrivals: Option<tokio::sync::mpsc::UnboundedSender<u32>>,
+        /// Reports each run the controller asked this node to settle, so a test
+        /// asserts the answer reached the agent rather than that a vec was filled.
+        settle_arrivals: Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>,
     }
 
     #[tonic::async_trait]
     impl spur_proto::proto::slurm_agent_server::SlurmAgent for ProbeAgent {
+        async fn request_node_ledger(
+            &self,
+            request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+        {
+            if let Some(pulls) = &self.ledger_pulls {
+                let _ = pulls.send(request.into_inner().reason);
+            }
+            Ok(tonic::Response::new(
+                spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+            ))
+        }
+
+        async fn fence_run(
+            &self,
+            request: Request<spur_proto::proto::FenceRunRequest>,
+        ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+            if let Some(arrivals) = &self.fence_arrivals {
+                let _ = arrivals.send(request.into_inner().job_id);
+            }
+            if let Some(gate) = &self.fence_gate {
+                gate.notified().await;
+            }
+            Ok(Response::new(spur_proto::proto::FenceRunResponse {
+                success: true,
+                error: String::new(),
+                reject_before_unix_ms: 0,
+            }))
+        }
+
+        async fn settle_run(
+            &self,
+            request: Request<spur_proto::proto::SettleRunRequest>,
+        ) -> Result<Response<spur_proto::proto::SettleRunResponse>, Status> {
+            let req = request.into_inner();
+            if let Some(arrivals) = &self.settle_arrivals {
+                let _ = arrivals.send((req.job_id, req.run_attempt));
+            }
+            Ok(Response::new(spur_proto::proto::SettleRunResponse {
+                released: true,
+                error: String::new(),
+            }))
+        }
+
         type StreamJobOutputStream =
             tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
         type InteractiveSessionStream =
@@ -6825,10 +10076,66 @@ mod tests {
 
     /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
     async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_with(active, None).await
+    }
+
+    /// A probe agent whose `FenceRun` blocks until the returned handle is
+    /// notified, which holds any reconcile that cancels a claim through it.
+    async fn spawn_gated_probe_agent() -> (std::net::SocketAddr, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let addr = spawn_probe_agent_with(false, Some(gate.clone())).await;
+        (addr, gate)
+    }
+
+    /// A gated agent that also says when a fence reached it, so a test can act at
+    /// a point the reconcile has provably started and not yet finished.
+    async fn spawn_gated_probe_agent_watching_fences() -> (
+        std::net::SocketAddr,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::mpsc::UnboundedReceiver<u32>,
+    ) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let addr = spawn_probe_agent_full(false, Some(gate.clone()), None, Some(tx), None).await;
+        (addr, gate, rx)
+    }
+
+    /// A probe agent that reports every ledger pull the controller makes to it.
+    async fn spawn_probe_agent_watching_pulls() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            spawn_probe_agent_full(false, None, Some(tx), None, None).await,
+            rx,
+        )
+    }
+
+    async fn spawn_probe_agent_with(
+        active: bool,
+        fence_gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> std::net::SocketAddr {
+        spawn_probe_agent_full(active, fence_gate, None, None, None).await
+    }
+
+    async fn spawn_probe_agent_full(
+        active: bool,
+        fence_gate: Option<Arc<tokio::sync::Notify>>,
+        ledger_pulls: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        fence_arrivals: Option<tokio::sync::mpsc::UnboundedSender<u32>>,
+        settle_arrivals: Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>>,
+    ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active };
+        let agent = ProbeAgent {
+            active,
+            fence_gate,
+            ledger_pulls,
+            fence_arrivals,
+            settle_arrivals,
+        };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
@@ -6959,7 +10266,7 @@ mod tests {
     async fn a_keyed_token_cluster_rejects_an_untokened_or_forged_heartbeat() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_token_admission(&dir).await;
-        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        point_node_at_probe_agent(&svc, "n1", a_port_nothing_listens_on()).await;
 
         let error = svc
             .heartbeat(Request::new(HeartbeatRequest {
@@ -7035,7 +10342,7 @@ mod tests {
     async fn a_keyed_token_cluster_rejects_an_untokened_deregistration() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_token_admission(&dir).await;
-        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        point_node_at_probe_agent(&svc, "n1", a_port_nothing_listens_on()).await;
 
         let error = svc
             .deregister_agent(Request::new(spur_proto::proto::DeregisterAgentRequest {
@@ -7062,7 +10369,7 @@ mod tests {
             svc.node_identity_key_configured,
             "fixture assumption: a key is configured but admission stays open"
         );
-        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        point_node_at_probe_agent(&svc, "n1", a_port_nothing_listens_on()).await;
 
         svc.heartbeat(Request::new(HeartbeatRequest {
             hostname: "n1".into(),
@@ -7366,6 +10673,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("update recovery probe address");
     }
@@ -7389,6 +10697,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point the node at its probe agent");
         for _ in 0..200 {
@@ -7673,6 +10982,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point n1 at its live probe agent");
 
@@ -7693,6 +11003,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("register the untouched peer");
         for name in ["n1", "n2"] {
@@ -8014,6 +11325,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -8176,6 +11488,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -8345,6 +11658,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -8749,6 +12063,7 @@ mod tests {
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
         }
@@ -8855,6 +12170,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -9161,6 +12477,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -9245,6 +12562,7 @@ mod tests {
                     NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
             svc.cluster
@@ -9380,6 +12698,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         svc.cluster
@@ -9414,6 +12733,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
     }
@@ -10771,6 +14091,7 @@ mod tests {
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
         }

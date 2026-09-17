@@ -90,6 +90,10 @@ pub struct StepdLaunchSpec {
     /// Absent unless this launch hosts a PMIx server; see [`StepdPmix`].
     #[serde(default)]
     pub pmix: Option<StepdPmix>,
+    /// Present when this launch's stdio is a terminal. The supervisor opens it
+    /// and keeps custody, so the terminal outlives whichever agent asked for it.
+    #[serde(default)]
+    pub pty: Option<crate::pty::WindowSize>,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -219,6 +223,10 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 mpi: config.mpi.clone(),
             },
             pmix: None,
+            pty: match config.io_mode {
+                crate::executor::LaunchIo::Pty(winsize) => Some(winsize.unwrap_or_default()),
+                crate::executor::LaunchIo::File => None,
+            },
         })
     }
 }
@@ -255,7 +263,14 @@ impl StepdLaunchSpec {
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
-            io_mode: crate::executor::LaunchIo::File,
+            io_mode: match self.pty {
+                // A zeroed size means the client never said; forcing 0x0 on the
+                // terminal would be worse than leaving the kernel default.
+                Some(winsize) => crate::executor::LaunchIo::Pty(
+                    (winsize != crate::pty::WindowSize::default()).then_some(winsize),
+                ),
+                None => crate::executor::LaunchIo::File,
+            },
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
@@ -525,6 +540,11 @@ pub struct StepdObligationLog {
 impl StepdObligationLog {
     fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn append(&self, obligation: &StepdObligation) -> io::Result<()> {
@@ -830,6 +850,10 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    /// `process_start_ticks` is measured from boot, and the spool outlives a
+    /// reboot, so identity is only comparable within the boot that recorded it.
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 impl StepdDescriptor {
@@ -866,6 +890,7 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            boot_id: crate::admission::current_boot_id(),
         }
     }
 }
@@ -975,6 +1000,25 @@ fn prune_finalized_session(
         sweep_finalized_session(session_dir, obligations, step_id)?,
         SweptSession::Pruned
     ))
+}
+
+/// Write `name` into `dir` so a reader sees either the previous record or the
+/// whole new one: a torn record on the recovery path reads as corruption.
+pub fn publish_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary_path = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temporary = options.open(&temporary_path)?;
+    temporary.write_all(contents)?;
+    temporary.sync_all()?;
+    drop(temporary);
+    fs::rename(&temporary_path, dir.join(name))?;
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Session records carry the job's environment, so they are owner-only.
@@ -1403,13 +1447,24 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
-/// Holds each open terminal's pty master for this job. Keyed per shell, since a
-/// job can have several at once, and retained after a hand-back so the terminal
-/// still outlives however many agents come and go.
-async fn serve_pty_custody(listener: UnixListener) {
+/// Every open terminal this session holds, keyed by the shell's pid. A hand-back
+/// retains custody, so the terminal outlives however many agents come and go.
+pub type PtyCustody = Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>>;
+
+/// Take custody of a terminal this supervisor opened for its own launch, so the
+/// master outlives the launch and the agent can claim it under the shell's pid.
+async fn hold_launched_pty(held: &PtyCustody, workload_pid: u32, master: std::os::fd::OwnedFd) {
+    if workload_pid == 0 {
+        tracing::warn!("a terminal was opened for a launch with no process; releasing it");
+        return;
+    }
+    held.lock().await.insert(workload_pid, master);
+}
+
+/// Serves the custody socket against a map the launch path can also write, so a
+/// terminal the supervisor opened itself needs no round trip to be held.
+async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
     use std::os::fd::AsRawFd;
-    let held: std::sync::Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>> =
-        std::sync::Arc::new(Mutex::new(HashMap::new()));
     while let Ok((stream, _)) = listener.accept().await {
         let held = held.clone();
         tokio::spawn(async move {
@@ -1878,12 +1933,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // created it, so the terminal survives a restart and can be picked back up.
     let custody_path = session_dir.join(PTY_CUSTODY_SOCKET_NAME);
     let _ = std::fs::remove_file(&custody_path);
-    if let Ok(custody) = UnixListener::bind(&custody_path) {
+    let custody: PtyCustody = Arc::new(Mutex::new(HashMap::new()));
+    if let Ok(listener) = UnixListener::bind(&custody_path) {
         let _ = std::fs::set_permissions(
             &custody_path,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         );
-        tokio::spawn(serve_pty_custody(custody));
+        tokio::spawn(serve_pty_custody(listener, custody.clone()));
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let stderr_path = launch_spec.stderr_path.clone();
@@ -1945,14 +2001,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None, None)
+    let (job, launched_cgroup, launched_output, launched_master) = if launch_spec.allocation_only {
+        (RunningJob::AllocationOnly, None, None, None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => (
                 result.job,
                 result.cgroup_path,
                 Some((result.stdout_path, result.stderr_path)),
+                result.pty_master,
             ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
@@ -1964,6 +2021,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let workload_pid = job.pid().unwrap_or(0);
+    // Custody before anything can observe the launch: dropping the master would
+    // hang the terminal up under the shell that just got its slave.
+    if let Some(master) = launched_master {
+        hold_launched_pty(&custody, workload_pid, master).await;
+    }
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
         descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);
@@ -2268,28 +2330,13 @@ impl StepdStore {
             descriptor.run_attempt,
             descriptor.step_id,
         )?;
-        let temporary_path =
-            session_dir.join(format!("{DESCRIPTOR_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = serde_json::to_vec(descriptor).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("serialize runtime descriptor: {error}"),
             )
         })?;
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut temporary = options.open(&temporary_path)?;
-        temporary.write_all(&contents)?;
-        temporary.sync_all()?;
-        drop(temporary);
-        fs::rename(&temporary_path, descriptor_path)?;
-        fs::File::open(session_dir)?.sync_all()
+        publish_private(&session_dir, DESCRIPTOR_FILE, &contents)
     }
 
     /// Every session directory: runtime/<job>.<attempt>.<step>. The notification
@@ -2577,52 +2624,91 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<bool> {
+        Ok(self
+            .epilog_result(job_id, run_attempt, step_id)?
+            .unwrap_or(false))
+    }
+
+    /// How the supervisor's own ledger says its epilog ended, or `None` while it
+    /// has not said. Written by the hook's owner, so no teardown here loses it.
+    pub(crate) fn epilog_result(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<bool>> {
         let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
         Ok(obligations
             .iter()
             .rev()
             .find_map(|obligation| match obligation {
-                StepdObligation::EpilogCompleted { failed } => Some(*failed),
-                StepdObligation::ExitObserved { .. } => Some(false),
+                StepdObligation::EpilogCompleted { failed } => Some(Some(*failed)),
+                // An exit newer than the last result belongs to a session that
+                // has not reached its hook, so the older result does not answer it.
+                StepdObligation::ExitObserved { .. } => Some(None),
                 _ => None,
             })
-            .unwrap_or(false))
+            .flatten())
+    }
+
+    /// Every session this store holds for one run, whatever step it belongs to:
+    /// a run's payload is whatever any of its participants is still running.
+    pub(crate) fn published_sessions_for_run(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> io::Result<Vec<io::Result<StepdDescriptor>>> {
+        let prefix = format!("{job_id}.{run_attempt}.");
+        Ok(self
+            .session_dirs()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .map(|path| self.load_descriptor(&path))
+            .collect())
     }
 
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
-        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
-        let contents = fs::read(&descriptor_path)?;
-        let descriptor: StepdDescriptor = serde_json::from_slice(&contents).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid {}: {e}", descriptor_path.display()),
-            )
-        })?;
-        // A range, not equality: a descriptor this build still understands must
-        // survive a version bump, because rejecting one reaps its job's cgroup.
-        if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported runtime descriptor version {}",
-                    descriptor.format_version
-                ),
-            ));
-        }
-        if session_dir
-            != self.session_dir(
-                descriptor.job_id,
-                descriptor.run_attempt,
-                descriptor.step_id,
-            )
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime descriptor identity does not match its directory",
-            ));
-        }
-        Ok(descriptor)
+        load_descriptor_at(session_dir)
     }
+}
+
+/// Read the descriptor a session directory holds. Free-standing because the
+/// freshest copy is found from a descriptor's own path, not from a store handle.
+pub(crate) fn load_descriptor_at(session_dir: &Path) -> io::Result<StepdDescriptor> {
+    let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
+    let contents = fs::read(&descriptor_path)?;
+    let descriptor: StepdDescriptor = serde_json::from_slice(&contents).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {}: {e}", descriptor_path.display()),
+        )
+    })?;
+    // A range, not equality: a descriptor this build still understands must
+    // survive a version bump, because rejecting one reaps its job's cgroup.
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported runtime descriptor version {}",
+                descriptor.format_version
+            ),
+        ));
+    }
+    let named = format!(
+        "{}.{}.{}",
+        descriptor.job_id, descriptor.run_attempt, descriptor.step_id
+    );
+    if session_dir.file_name().and_then(|name| name.to_str()) != Some(named.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime descriptor identity does not match its directory",
+        ));
+    }
+    Ok(descriptor)
 }
 
 #[cfg(unix)]
@@ -2648,7 +2734,7 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn verify_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn verify_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(path)?;
@@ -2685,25 +2771,153 @@ pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
 /// as gone, and so does a zombie: it has already released everything and only
 /// waits to be reaped.
 pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
+    matches!(process_liveness(pid, start_ticks), Ok(StepdLiveness::Live))
+}
+
+/// The same reading, keeping "could not tell" apart from "gone" for callers
+/// that may not treat an unreadable `/proc` as a death.
+pub(crate) fn process_liveness(pid: u32, start_ticks: u64) -> io::Result<StepdLiveness> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let Some((_, fields)) = stat.rsplit_once(") ") else {
-        return false;
+        return Ok(StepdLiveness::Stale);
     };
     let mut fields = fields.split_ascii_whitespace();
     if fields.next() == Some("Z") {
-        return false;
+        return Ok(StepdLiveness::Stale);
     }
-    matches!(fields.nth(18).and_then(|t| t.parse::<u64>().ok()), Some(ticks) if ticks == start_ticks)
+    match fields.nth(18).and_then(|t| t.parse::<u64>().ok()) {
+        Some(ticks) if ticks == start_ticks => Ok(StepdLiveness::Live),
+        _ => Ok(StepdLiveness::Stale),
+    }
 }
 
-pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
-    match process_start_ticks(descriptor.pid) {
-        Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
+/// Whether a recorded `(pid, start_ticks, boot_id)` still names the process it
+/// was recorded for. `Err` is undetermined, which no caller may read as a death.
+pub(crate) fn supervisor_liveness(
+    recorded: &crate::admission::SupervisorRef,
+) -> io::Result<StepdLiveness> {
+    // `process_start_ticks` counts from boot and the spool survives one, so a
+    // pid and tick match across boots is a collision, not the same process.
+    if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
+        == crate::admission::BootScope::Different
+    {
+        return Ok(StepdLiveness::Stale);
+    }
+    match process_start_ticks(recorded.pid) {
+        Ok(start_ticks) if start_ticks == recorded.start_ticks => Ok(StepdLiveness::Live),
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
+    }
+}
+
+/// What a published descriptor says about a session's workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadLiveness {
+    /// The recorded `(pid, start_ticks)` still names a running process.
+    Live,
+    Gone,
+    /// Neither the descriptor nor the process behind it could be read, so
+    /// nothing is proven. Never read as gone, and never as licence to kill.
+    Unknown,
+}
+
+/// The one verdict on whether a session's workload is still running: the
+/// completion gate and the teardown fence must not disagree about one process.
+pub(crate) fn workload_liveness(published: &io::Result<StepdDescriptor>) -> WorkloadLiveness {
+    match published {
+        Ok(descriptor) => workload_process_liveness(descriptor),
+        // No session on disk: nothing published a workload, so there is none.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+/// The freshest copy of a session: what the supervisor last published, since the
+/// agent wrote its own before the launch returned and it names no workload.
+pub(crate) fn freshest_session(descriptor: &StepdDescriptor) -> io::Result<StepdDescriptor> {
+    let published = match descriptor.socket_path.parent() {
+        Some(session_dir) => load_descriptor_at(session_dir),
+        None => return Ok(descriptor.clone()),
+    };
+    match published {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(descriptor.clone()),
+        other => other,
+    }
+}
+
+pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+    supervisor_liveness(&crate::admission::SupervisorRef {
+        pid: descriptor.pid,
+        start_ticks: descriptor.process_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    })
+}
+
+/// An unrecorded workload (`0`) holds nothing up. Unlike a supervisor, a zombie
+/// counts as gone -- it holds none of the slice.
+pub(crate) fn workload_process_liveness(descriptor: &StepdDescriptor) -> WorkloadLiveness {
+    if descriptor.workload_pid == 0 {
+        return WorkloadLiveness::Gone;
+    }
+    let recorded = crate::admission::SupervisorRef {
+        pid: descriptor.workload_pid,
+        start_ticks: descriptor.workload_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    };
+    if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
+        == crate::admission::BootScope::Different
+    {
+        return WorkloadLiveness::Gone;
+    }
+    workload_liveness_of_reading(process_liveness(
+        descriptor.workload_pid,
+        descriptor.workload_start_ticks,
+    ))
+}
+
+/// A `/proc` read that failed for anything but absence proves nothing: the pid
+/// may be anyone's, so it holds the slice without ever licensing a kill.
+pub(crate) fn workload_liveness_of_reading(reading: io::Result<StepdLiveness>) -> WorkloadLiveness {
+    match reading {
+        Ok(StepdLiveness::Live) => WorkloadLiveness::Live,
+        Ok(_) => WorkloadLiveness::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod workload_liveness_tests {
+    use super::{workload_liveness_of_reading, StepdLiveness, WorkloadLiveness};
+    use std::io;
+
+    #[test]
+    fn an_unreadable_process_is_undetermined_rather_than_live_or_gone() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                workload_liveness_of_reading(Err(io::Error::from(kind))),
+                WorkloadLiveness::Unknown,
+                "an undetermined {kind:?} read must not pass as proof of either state"
+            );
+        }
+        assert_eq!(
+            workload_liveness_of_reading(Err(io::Error::from(io::ErrorKind::NotFound))),
+            WorkloadLiveness::Gone,
+            "an absent process is the one positive proof of death"
+        );
+        assert_eq!(
+            workload_liveness_of_reading(Ok(StepdLiveness::Live)),
+            WorkloadLiveness::Live
+        );
+        assert_eq!(
+            workload_liveness_of_reading(Ok(StepdLiveness::Stale)),
+            WorkloadLiveness::Gone
+        );
     }
 }
 
@@ -2751,6 +2965,76 @@ mod pty_custody_tests {
         assert_eq!(parse_custody_payload(&[]), None);
         assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT]), None);
         assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT, 1, 2]), None);
+    }
+
+    /// Serves a custody socket over `held` the way the supervisor's own launch
+    /// path does, so the reclaim under test crosses the real socket.
+    async fn serve_custody_over(
+        dir: &std::path::Path,
+        held: super::PtyCustody,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(dir.join(super::PTY_CUSTODY_SOCKET_NAME))
+            .expect("bind custody socket");
+        tokio::spawn(super::serve_pty_custody(listener, held))
+    }
+
+    // Multi-thread: a reclaim blocks in recvmsg, so the server it waits on needs
+    // a worker of its own. In production that server is a separate process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_master_the_supervisor_launched_is_handed_back_still_usable() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let held: super::PtyCustody =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let server = serve_custody_over(dir.path(), held.clone()).await;
+
+        let (master, slave) =
+            crate::pty::openpty_with_winsize(None).expect("openpty for the custody test");
+        super::hold_launched_pty(&held, 4242, master).await;
+
+        let reclaimed = super::reclaim_pty_master(dir.path(), 4242)
+            .await
+            .expect("reclaim must not error")
+            .expect("the launched master must be in custody");
+
+        let mut writer = std::fs::File::from(reclaimed);
+        writer.write_all(b"ping\n").expect("write to the terminal");
+        writer.flush().expect("flush the terminal");
+
+        let mut reader = std::fs::File::from(slave);
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).expect("read on the slave");
+        assert_eq!(&buf, b"ping\n");
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reclaim_for_a_terminal_nobody_launched_is_absent_not_a_hang() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let held: super::PtyCustody =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let server = serve_custody_over(dir.path(), held).await;
+
+        let reclaimed = super::reclaim_pty_master(dir.path(), 4242)
+            .await
+            .expect("reclaim must not error");
+        assert!(reclaimed.is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_for_a_launch_with_no_process_is_not_left_held() {
+        let held: super::PtyCustody =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let (master, _slave) =
+            crate::pty::openpty_with_winsize(None).expect("openpty for the custody test");
+
+        super::hold_launched_pty(&held, 0, master).await;
+
+        assert!(held.lock().await.is_empty());
     }
 }
 
@@ -2817,6 +3101,18 @@ mod launch_spec_compat {
 
         assert!(spec.array_job_id.is_none());
         assert!(spec.array_task_id.is_none());
+    }
+
+    #[test]
+    fn an_older_launch_spec_opens_no_terminal_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.pty.is_none());
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::File
+        );
     }
 
     /// Captured from the build that first shipped `pmix` in launch.json, before
@@ -2910,6 +3206,37 @@ mod launch_spec_compat {
         assert!(!spec.allocation_only);
         assert!(!spec.pmix_multi_task);
         assert_eq!(spec.run_attempt, 0);
+    }
+
+    /// Frozen at the shipped shape. Never regenerate it: a field added without
+    /// a default must fail here, not on an upgraded node mid-recovery.
+    const FROZEN_DESCRIPTOR_JSON: &str = r##"{
+        "format_version": 1,
+        "job_id": 42,
+        "run_attempt": 3,
+        "pid": 991,
+        "process_start_ticks": 7788,
+        "socket_path": "/var/spool/spur/runtime/42.3.4294967294/runtime.sock",
+        "cgroup_path": "/sys/fs/cgroup/spur/job_42"
+    }"##;
+
+    #[test]
+    fn a_descriptor_from_an_older_build_still_loads() {
+        let descriptor: crate::stepd::StepdDescriptor =
+            serde_json::from_str(FROZEN_DESCRIPTOR_JSON)
+                .expect("an older descriptor.json must still load");
+
+        assert_eq!(descriptor.job_id, 42);
+        assert_eq!(descriptor.run_attempt, 3);
+        assert_eq!(descriptor.pid, 991);
+        assert_eq!(descriptor.step_id, spur_core::step::default_step_id());
+        assert!(descriptor.owner.is_empty());
+        assert_eq!(descriptor.workload_pid, 0);
+        assert!(descriptor.container_rootfs_mode.is_none());
+        assert!(
+            descriptor.boot_id.is_none(),
+            "an older descriptor predates the boot scope and must read as unknown"
+        );
     }
 }
 
@@ -3007,6 +3334,7 @@ mod tests {
             allocation_only: false,
             pmix_multi_task: false,
             pmix: None,
+            pty: None,
         }
     }
 
@@ -3260,6 +3588,7 @@ mod tests {
             "pmix_multi_task",
             "array_job_id",
             "array_task_id",
+            "pty",
         ] {
             fields.remove(field);
         }
@@ -3285,6 +3614,64 @@ mod tests {
         assert!(restored.array_task_id.is_none());
         assert!(!restored.allocation_only);
         assert!(!restored.pmix_multi_task);
+        assert!(restored.pty.is_none());
+        assert_eq!(
+            restored.into_launch_config().io_mode,
+            crate::executor::LaunchIo::File
+        );
+    }
+
+    #[test]
+    fn a_pty_launch_spec_survives_the_agent_to_supervisor_boundary() {
+        let mut spec = launch_spec();
+        spec.pty = Some(crate::pty::WindowSize {
+            rows: 40,
+            cols: 120,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
+                .expect("decode launch spec");
+
+        let io_mode = restored.into_launch_config().io_mode;
+        assert!(io_mode.is_pty(), "a pty spec must launch on a terminal");
+        let crate::executor::LaunchIo::Pty(Some(winsize)) = io_mode else {
+            panic!("the window size the client asked for must reach the launch");
+        };
+        assert_eq!((winsize.rows, winsize.cols), (40, 120));
+    }
+
+    #[test]
+    fn a_pty_launch_with_no_stated_size_leaves_the_kernel_default() {
+        let mut spec = launch_spec();
+        spec.pty = Some(crate::pty::WindowSize::default());
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty(None)
+        );
+    }
+
+    #[test]
+    fn a_pty_io_mode_round_trips_back_out_of_the_launch_spec() {
+        let mut config = launch_spec().into_launch_config();
+        config.io_mode = crate::executor::LaunchIo::Pty(Some(crate::pty::WindowSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        }));
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty(Some(crate::pty::WindowSize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            }))
+        );
     }
 
     #[test]
@@ -4541,6 +4928,50 @@ mod tests {
         )
         .expect("write corrupt log");
         assert!(log.read().is_err());
+    }
+
+    // The release gate has to tell "the hook has not finished" from "it finished
+    // and passed"; a boolean reads both as false and would open on the first.
+    #[test]
+    fn an_epilog_reads_as_unanswered_until_its_supervisor_records_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        store
+            .prepare_session_dir(9, 2, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(9, 2, spur_core::step::STEP_BATCH);
+        assert_eq!(
+            store
+                .epilog_result(9, 2, spur_core::step::STEP_BATCH)
+                .expect("epilog result"),
+            None,
+            "a session that has recorded nothing owes an answer"
+        );
+
+        obligations
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("append exit");
+        assert_eq!(
+            store
+                .epilog_result(9, 2, spur_core::step::STEP_BATCH)
+                .expect("epilog result"),
+            None,
+            "an observed exit is the hook starting, not the hook ending"
+        );
+
+        obligations
+            .append(&StepdObligation::EpilogCompleted { failed: true })
+            .expect("append epilog");
+        assert_eq!(
+            store
+                .epilog_result(9, 2, spur_core::step::STEP_BATCH)
+                .expect("epilog result"),
+            Some(true),
+            "and the supervisor's own word is the answer"
+        );
     }
 
     #[test]

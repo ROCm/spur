@@ -4,24 +4,25 @@
 //! gRPC server implementing the SlurmAgent service.
 //! Receives job launch/cancel requests from spurctld.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
-use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
+use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation, ReleaseWarrant};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
+use spur_core::job::RunKey;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
@@ -42,6 +43,27 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
     if allocated_device_ids.is_empty() {
         spur_core::task_launch::gpu_deny_visibility(env);
     }
+}
+
+type TerminalExit = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
+
+/// A shell running under its own supervisor, from the agent's side: the master
+/// it bridges, the pid its signals target, and where its exit status arrives.
+struct SupervisedTerminal {
+    master: std::os::fd::OwnedFd,
+    pid: i32,
+    exit: TerminalExit,
+}
+
+/// What a terminal inherits from the job it opens into. Copied out under one
+/// lock so the launch below never holds the running-job table.
+struct TerminalJobFacts {
+    run_attempt: u32,
+    cpus: u32,
+    memory_mb: u64,
+    gpu_devices: Vec<u32>,
+    partition: String,
+    nodelist: String,
 }
 
 struct StepdLaunchOptions {
@@ -184,8 +206,7 @@ async fn launch_stepd(
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
-    launch_spec.allocation_only =
-        options.allocation_only || config.io_mode == executor::LaunchIo::Pty;
+    launch_spec.allocation_only = options.allocation_only;
     launch_spec.step_id = options.step_id;
     launch_spec.container_rootfs_mode = options.container_rootfs_mode;
     launch_spec.hooks = options.hooks;
@@ -346,18 +367,29 @@ async fn runtime_teardown_confirmed(
 /// workload it left behind — it is a separate process the signal never reached.
 /// Escalate to the recorded workload and answer for that instead.
 async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> bool {
-    // Allocations hold no workload, and a descriptor written before this was
-    // recorded cannot be improved on here.
-    if descriptor.workload_pid == 0 {
-        return true;
+    // The agent's own copy was written before the launch returned, so it names
+    // no workload at all; only what the supervisor republished does.
+    let freshest = crate::stepd::freshest_session(descriptor);
+    match crate::stepd::workload_liveness(&freshest) {
+        crate::stepd::WorkloadLiveness::Gone => return true,
+        // Holding is all an undetermined reading licenses; a root SIGKILL on a
+        // pid whose identity it never confirmed is not.
+        crate::stepd::WorkloadLiveness::Unknown => {
+            warn!(
+                job_id = descriptor.job_id,
+                step_id = descriptor.step_id,
+                "could not prove this workload is gone, nor that its pid is still its own; it \
+                 stays held"
+            );
+            return false;
+        }
+        crate::stepd::WorkloadLiveness::Live => {}
     }
+    let Ok(session) = freshest else { return false };
     let alive =
-        || crate::stepd::process_is_live(descriptor.workload_pid, descriptor.workload_start_ticks);
-    if !alive() {
-        return true;
-    }
+        || crate::stepd::process_is_live(session.workload_pid, session.workload_start_ticks);
     crate::executor::kill_process_tree(
-        descriptor.workload_pid as i32,
+        session.workload_pid as i32,
         nix::sys::signal::Signal::SIGKILL,
     );
     for _ in 0..WORKLOAD_DEATH_POLLS {
@@ -369,7 +401,7 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
     warn!(
         job_id = descriptor.job_id,
         step_id = descriptor.step_id,
-        pid = descriptor.workload_pid,
+        pid = session.workload_pid,
         "workload outlived its supervisor and did not die on SIGKILL"
     );
     false
@@ -379,6 +411,21 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
 fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
     crate::executor::cleanup_cgroup(cgroup_path);
     !cgroup_path.exists()
+}
+
+/// The run a loose `(job, attempt)` pair names. Attempt 0 names no run, so a
+/// caller that cannot name one is told rather than left keying on a phantom.
+fn named_run(job_id: u32, run_attempt: u32) -> Option<RunKey> {
+    let key = RunKey::new(job_id, run_attempt);
+    if key.is_none() {
+        warn!(job_id, "a command named run attempt 0, which is no run");
+    }
+    key
+}
+
+#[cfg(test)]
+fn key(job_id: u32, run_attempt: u32) -> RunKey {
+    RunKey::new(job_id, run_attempt).expect("attempts start at 1")
 }
 
 /// Supervisors are per (job, step): a job may hold several at once.
@@ -470,6 +517,14 @@ fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
         .collect()
 }
 
+/// What one admitted run's evidence said at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedRunOutcome {
+    pub job_id: u32,
+    pub run_attempt: u32,
+    pub disposition: crate::admission::RunDisposition,
+}
+
 /// Every supervisor a job currently holds. Job-level operations (signal,
 /// cancel, teardown) act on all of its steps, not just the batch one.
 fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDescriptor> {
@@ -484,6 +539,12 @@ fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDe
 /// process in the tree, so a supervised teardown must serve its grace period first.
 fn cgroup_to_reap_on_cancel(doomed_attempt: Option<u32>, supervised: bool) -> Option<u32> {
     doomed_attempt.filter(|_| !supervised)
+}
+
+/// PMIx namespaces are keyed by job, not by attempt, so tearing one down on
+/// behalf of a doomed attempt would strand a sibling still running under it.
+fn pmix_teardown_is_due(doomed_attempt: Option<u32>, tracked_attempt: Option<u32>) -> bool {
+    tracked_attempt.is_none_or(|tracked| doomed_attempt == Some(tracked))
 }
 
 /// The job's supervisors for one epoch. Attempt 0 means "whichever attempt this
@@ -544,8 +605,31 @@ async fn fence_displaced_stepd(
         .is_some_and(|current| stepd_is_current(current, &displaced))
     {
         sessions.remove(&(job_id, step_id));
+        discard_superseded_session(&displaced, run_attempt);
     }
     Ok(())
+}
+
+/// Drop a superseded attempt's session directory. The agent stopped this
+/// supervisor itself, so nothing will ever finalize the session.
+fn discard_superseded_session(displaced: &crate::stepd::StepdDescriptor, claiming_attempt: u32) {
+    // A relaunch of the same attempt reuses this very directory.
+    if displaced.run_attempt >= claiming_attempt {
+        return;
+    }
+    let Some(session_dir) = displaced.socket_path.parent() else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_dir_all(session_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                job_id = displaced.job_id,
+                run_attempt = displaced.run_attempt,
+                %error,
+                "failed to discard a superseded runtime session"
+            );
+        }
+    }
 }
 
 fn displaced_runtime_attempt(
@@ -756,6 +840,8 @@ async fn teardown_completed_job(
     running: &RunningJobs,
     allocation: &Arc<Mutex<NodeAllocation>>,
     mpi_host: &MpiPluginHost,
+    admissions: &crate::admission::AdmissionStore,
+    epilog: crate::admission::EpilogOwed,
 ) {
     let job_id = completed.job_id;
     // Held across the check below and every release under it, so a re-dispatch either
@@ -785,7 +871,16 @@ async fn teardown_completed_job(
         job_id,
         completed.run_attempt,
     ));
-    allocation.lock().await.release_job(job_id);
+    // The slice is NOT freed here. Cleanup finishing is not the controller
+    // having committed the completion, and only that frees it.
+    let _ = allocation;
+    // Marked, not removed: the record is the evidence a later reconcile reads,
+    // and the sweep collects it once nothing is still owed.
+    if let Some(run) = named_run(job_id, completed.run_attempt) {
+        if let Err(error) = admissions.mark_run_cleaned(run, epilog) {
+            warn!(job_id, %error, "failed to settle the admission record after teardown");
+        }
+    }
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
 
@@ -927,6 +1022,7 @@ pub struct CompletionListenerContext {
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
     stepds_store: crate::stepd::StepdStore,
+    admissions: crate::admission::AdmissionStore,
     controller_addr: String,
     hostname: String,
 }
@@ -995,9 +1091,9 @@ async fn release_stepd_tracking(
         other.job_id == descriptor.job_id && other.run_attempt == descriptor.run_attempt
     });
 
-    // Hold `running` across the allocation release too — matching the
-    // lock order commit_job uses — so a redispatch racing this can't have
-    // its brand-new allocation torn down by this stale, job_id-keyed release.
+    // Tracking stops, but the slice is not freed: until the controller commits
+    // a completion, this node is the only thing that knows the work stopped.
+    let _ = allocation;
     let removed_tracked = was_last_step && {
         let mut jobs = running.lock().await;
         if jobs
@@ -1005,7 +1101,6 @@ async fn release_stepd_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
-            allocation.lock().await.release_job(descriptor.job_id);
             true
         } else {
             false
@@ -1172,21 +1267,42 @@ async fn settle_recovered_stepd(
     })
 }
 
+/// What the recovery monitor needs to settle an adopted supervisor.
+pub(crate) struct RecoveryContext {
+    pub running: RunningJobs,
+    pub allocation: Arc<Mutex<NodeAllocation>>,
+    pub stepds: Arc<Mutex<StepdMap>>,
+    pub completions: crate::step_completion::StepCompletions,
+    pub store: crate::stepd::StepdStore,
+    pub admissions: crate::admission::AdmissionStore,
+    pub controller_addr: String,
+}
+
 pub(crate) fn monitor_recovered_stepds(
-    running: RunningJobs,
-    allocation: Arc<Mutex<NodeAllocation>>,
-    stepds: Arc<Mutex<StepdMap>>,
-    completions: crate::step_completion::StepCompletions,
+    context: RecoveryContext,
     descriptors: Vec<crate::stepd::StepdDescriptor>,
-    store: crate::stepd::StepdStore,
-    controller_addr: String,
 ) {
+    let RecoveryContext {
+        running,
+        allocation,
+        stepds,
+        completions,
+        store,
+        admissions,
+        controller_addr,
+    } = context;
     tokio::spawn(async move {
         let mut pending: StepdMap = descriptors
             .into_iter()
             .map(|descriptor| (stepd_key(&descriptor), descriptor))
             .collect();
         let mut completed = HashMap::new();
+        // Attempt count and first-failure instant per outstanding report. The
+        // durable driver is the record; this only paces and surfaces the retry.
+        let mut attempts: HashMap<(u32, spur_core::step::StepId), (u32, std::time::Instant)> =
+            HashMap::new();
+        let mut hooking_since: HashMap<(u32, spur_core::step::StepId), std::time::Instant> =
+            HashMap::new();
         let hostname = hostname::get()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|_| "localhost".into());
@@ -1223,10 +1339,12 @@ pub(crate) fn monitor_recovered_stepds(
                             false
                         }
                     };
-                let exit = if inactive {
-                    match durable_runtime_exit(&store, descriptor) {
-                        Ok(exit) => exit,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                let progress = if inactive {
+                    match recovered_session_progress(&store, descriptor) {
+                        Ok(progress) => progress,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            RecoveredSession::Unfinished
+                        }
                         Err(error) => {
                             warn!(
                                 job_id,
@@ -1234,40 +1352,56 @@ pub(crate) fn monitor_recovered_stepds(
                                 %error,
                                 "failed to read durable recovered runtime completion"
                             );
-                            None
+                            RecoveredSession::Unfinished
                         }
                     }
                 } else {
-                    None
+                    RecoveredSession::Unfinished
                 };
-                if let Some((exit_code, signal)) = exit {
-                    match settle_recovered_stepd(
-                        &running,
-                        &allocation,
-                        &stepds,
-                        &completions,
-                        &store,
-                        descriptor,
-                        exit_code,
-                        signal,
-                    )
-                    .await
-                    {
-                        Some(completion) => newly_completed.push((*key, completion)),
-                        None => released.push(*key),
+                match progress {
+                    RecoveredSession::Ended { exit_code, signal } => {
+                        match settle_recovered_stepd(
+                            &running,
+                            &allocation,
+                            &stepds,
+                            &completions,
+                            &store,
+                            descriptor,
+                            exit_code,
+                            signal,
+                        )
+                        .await
+                        {
+                            Some(completion) => newly_completed.push((*key, completion)),
+                            None => released.push(*key),
+                        }
                     }
-                } else if !tracked {
-                    released.push(*key);
+                    // Held pending rather than released: the report is what frees
+                    // the slice, and the hook is still standing on it.
+                    RecoveredSession::Hooking => {
+                        if epilog_hold_is_worth_saying(&mut hooking_since, *key) {
+                            warn!(
+                                job_id,
+                                run_attempt = descriptor.run_attempt,
+                                step_id = descriptor.step_id,
+                                "an epilog is still running; holding this run's completion report"
+                            );
+                        }
+                    }
+                    RecoveredSession::Unfinished if !tracked => released.push(*key),
+                    RecoveredSession::Unfinished => {}
                 }
             }
             for key in released {
                 pending.remove(&key);
+                hooking_since.remove(&key);
             }
             for (key, completion) in newly_completed {
                 completed.insert(key, completion);
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
+                let key = (completion.job_id, completion.step_id);
                 if report_completion(
                     &controller_addr,
                     CompletionReport {
@@ -1280,9 +1414,11 @@ pub(crate) fn monitor_recovered_stepds(
                             reason: "epilog script failed".into(),
                         }),
                         step_id: Some(completion.step_id),
+                        payload: PayloadEvidence::Supervised(&store),
                     },
                 )
                 .await
+                .settled()
                 {
                     if let Err(error) = store.acknowledge_completion(completion) {
                         warn!(
@@ -1292,13 +1428,50 @@ pub(crate) fn monitor_recovered_stepds(
                             "failed to acknowledge recovered runtime completion"
                         );
                     } else {
-                        acknowledged.push((completion.job_id, completion.step_id));
+                        // Only now may the slice go: the controller has it.
+                        if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                            record_run_epilog(
+                                &admissions,
+                                run,
+                                completion.step_id,
+                                epilog_outcome(completion.epilog_failed),
+                            );
+                            settle_acknowledged_completion(
+                                &allocation,
+                                &admissions,
+                                run,
+                                completion.step_id,
+                            )
+                            .await;
+                        }
+                        acknowledged.push(key);
+                        attempts.remove(&key);
                     }
+                } else {
+                    // Nothing ends the obligation but an acknowledgement: this
+                    // report is the only thing that will ever free the slice.
+                    let attempt = attempts
+                        .entry(key)
+                        .or_insert((0u32, std::time::Instant::now()));
+                    attempt.0 = attempt.0.saturating_add(1);
+                    if attempt.1.elapsed() >= COMPLETION_STUCK_AFTER {
+                        error!(
+                            job_id = completion.job_id,
+                            run_attempt = completion.run_attempt,
+                            attempts = attempt.0,
+                            held_for_secs = attempt.1.elapsed().as_secs(),
+                            "a completion report the controller will not accept is holding this \
+                             job's resources"
+                        );
+                        attempt.1 = std::time::Instant::now();
+                    }
+                    tokio::time::sleep(completion_backoff(attempt.0, completion.job_id)).await;
                 }
             }
             for key in acknowledged {
                 completed.remove(&key);
                 pending.remove(&key);
+                hooking_since.remove(&key);
             }
         }
     });
@@ -1369,6 +1542,7 @@ async fn fence_dead_stepd(
         allocation,
         stepds,
         stepds_store: store,
+        admissions,
         controller_addr,
         hostname,
     } = context;
@@ -1397,6 +1571,21 @@ async fn fence_dead_stepd(
         .flatten();
     let (exit_code, signal) =
         recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
+    // Strictly above both the synthetic exit below, which would read as a hook
+    // not reached, and the teardown that retires the ledger holding this answer.
+    let recorded_epilog = match store.epilog_result(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    ) {
+        Ok(Some(failed)) => epilog_outcome(failed),
+        Ok(None) => crate::admission::HookState::Unknown,
+        Err(error) => {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                "could not read how a dead stepd's epilog ended");
+            crate::admission::HookState::Unknown
+        }
+    };
     if recorded_exit.is_none() {
         if let Some(reason) = store.recorded_failure(
             descriptor.job_id,
@@ -1413,14 +1602,13 @@ async fn fence_dead_stepd(
                 "failed to record synthetic exit for a dead stepd");
         }
     }
-    // The crashed supervisor was the cgroup's only owner, so its job process
-    // can outlive it as an orphan — reap it before releasing this node's ledger.
-    // No unit is left to retry stopping, so an unconfirmed cgroup still proceeds.
-    if !runtime_cgroup_reaped(&effective_cgroup_path(&descriptor)) {
+    // A crashed supervisor's job can outlive it. Teardown's confirmation falls
+    // back to the recorded workload; a cgroup-only reap would do nothing here.
+    if !runtime_teardown_confirmed(&descriptor, &Ok(())).await {
         warn!(
             job_id = descriptor.job_id,
             run_attempt = descriptor.run_attempt,
-            "could not confirm the crashed stepd's cgroup is empty; releasing tracking anyway"
+            "could not confirm a crashed stepd's workload is gone; its slice stays held"
         );
     }
     // The supervisor cannot be recovered, but its death still has to reach the
@@ -1435,9 +1623,11 @@ async fn fence_dead_stepd(
             reporting_node: hostname,
             drain: None,
             step_id: Some(descriptor.step_id),
+            payload: PayloadEvidence::Supervised(store),
         },
     )
-    .await;
+    .await
+    .settled();
     if reported {
         if let Err(error) =
             obligations.append(&crate::stepd::StepdObligation::CompletionAcknowledged)
@@ -1454,6 +1644,12 @@ async fn fence_dead_stepd(
     }
 
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    if reported {
+        if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
+            record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
+            settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id).await;
+        }
+    }
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
@@ -1588,9 +1784,11 @@ async fn handle_completion_notification(
                         reason: "epilog script failed".into(),
                     }),
                     step_id: Some(step_id),
+                    payload: PayloadEvidence::Supervised(&context.stepds_store),
                 },
             )
-            .await;
+            .await
+            .settled();
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -1599,6 +1797,18 @@ async fn handle_completion_notification(
                 "runtime completion",
             )
             .await;
+            // Recorded whatever the controller said: the record must describe
+            // the hook that ran, not the delivery of the report about it.
+            let admissions = context.admissions.clone();
+            if let Some(run) = named_run(job_id, run_attempt) {
+                record_run_epilog(&admissions, run, step_id, epilog_outcome(epilog_failed));
+                // The acknowledgement, and only it, unlocks the slice. Without
+                // this the exit path holds and nothing ever frees it again.
+                if reported {
+                    settle_acknowledged_completion(&context.allocation, &admissions, run, step_id)
+                        .await;
+                }
+            }
             // A user step's exit ends the RPC that launched it, not the job, so
             // the controller report above was a no-op and this is the delivery.
             context
@@ -1640,12 +1850,46 @@ fn durable_runtime_exit(
     )
 }
 
+/// How far a recovered supervisor's own ledger says its session has got. The
+/// exit is recorded before the epilog runs, so an exit alone is not the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredSession {
+    Unfinished,
+    /// Exited, with the hook that follows it yet to say how it ended.
+    Hooking,
+    Ended {
+        exit_code: i32,
+        signal: i32,
+    },
+}
+
+fn recovered_session_progress(
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<RecoveredSession> {
+    let Some((exit_code, signal)) = durable_runtime_exit(store, descriptor)? else {
+        return Ok(RecoveredSession::Unfinished);
+    };
+    // Only the hook's own record proves it ended: a hook can outlive the process
+    // that started it, so nothing about the supervisor answers for it.
+    match store.epilog_result(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    )? {
+        Some(_) => Ok(RecoveredSession::Ended { exit_code, signal }),
+        None => Ok(RecoveredSession::Hooking),
+    }
+}
+
 /// One runtime session: a step of one attempt of one job. Two sessions of the
 /// same attempt are distinct, so dedup keyed on the job alone over-matches.
 pub type SessionIdentity = (u32, u32, spur_core::step::StepId);
 
 pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+    allocation: &Arc<Mutex<NodeAllocation>>,
     controller_addr: &str,
     reporting_node: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
@@ -1663,11 +1907,25 @@ pub async fn replay_unacknowledged_stepd_completions(
                     reason: "epilog script failed".into(),
                 }),
                 step_id: Some(completion.step_id),
+                payload: PayloadEvidence::Supervised(store),
             },
         )
         .await
+        .settled()
         {
             store.acknowledge_completion(&completion)?;
+            if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                record_run_epilog(
+                    admissions,
+                    run,
+                    completion.step_id,
+                    epilog_outcome(completion.epilog_failed),
+                );
+                // A late delivery frees the slice here, like every other settled
+                // report: leaving it to a later sweep frees it with nothing said.
+                settle_acknowledged_completion(allocation, admissions, run, completion.step_id)
+                    .await;
+            }
             reconciled.push((
                 completion.job_id,
                 completion.run_attempt,
@@ -1675,19 +1933,175 @@ pub async fn replay_unacknowledged_stepd_completions(
             ));
         }
     }
+    // After the sessions above, which carry the real exit status: a run only
+    // reaches the pass below once nothing is left that could report one.
+    report_runs_nothing_can_speak_for(
+        store,
+        admissions,
+        allocation,
+        controller_addr,
+        reporting_node,
+    )
+    .await;
     Ok(reconciled)
+}
+
+/// What a run's recorded supervisors can be *proven* to be. "No evidence" is its
+/// own answer, so silence can never be spent as proof of death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Every recorded supervisor read as stale, and there was one to read.
+    Gone,
+    Live,
+    /// Nothing was recorded, or a read could not be completed.
+    CannotTell,
+}
+
+/// Whether the reads prove anything. No reads at all proves nothing, and neither
+/// does one that could not be completed.
+fn liveness_of(reads: &[std::io::Result<crate::stepd::StepdLiveness>]) -> Liveness {
+    if reads
+        .iter()
+        .any(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Live)))
+    {
+        return Liveness::Live;
+    }
+    if !reads.is_empty()
+        && reads
+            .iter()
+            .all(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Stale)))
+    {
+        return Liveness::Gone;
+    }
+    Liveness::CannotTell
+}
+
+fn recorded_supervisor_liveness(admitted: &crate::admission::AdmittedRun) -> Liveness {
+    let reads: Vec<std::io::Result<crate::stepd::StepdLiveness>> = admitted
+        .recorded_supervisors()
+        .map(crate::stepd::supervisor_liveness)
+        .collect();
+    for (supervisor, read) in admitted.recorded_supervisors().zip(reads.iter()) {
+        if let Err(error) = read {
+            warn!(
+                job_id = admitted.run.job_id,
+                run_attempt = admitted.run.run_attempt,
+                pid = supervisor.pid,
+                %error,
+                "could not tell whether a supervisor is alive; holding its slice"
+            );
+        }
+    }
+    liveness_of(&reads)
+}
+
+/// Whether some participant left an exit behind. One exists only on disk, so a
+/// session still holding it is what will report this run, with the real status.
+fn an_exit_is_still_on_disk(
+    store: &crate::stepd::StepdStore,
+    admitted: &crate::admission::AdmittedRun,
+) -> bool {
+    admitted.participants.iter().any(|participant| {
+        !matches!(
+            store.observed_exit(
+                admitted.run.job_id,
+                admitted.run.run_attempt,
+                participant.step_id,
+            ),
+            Ok(None)
+        )
+    })
+}
+
+/// Runs no session is left to speak for; without this nothing ever asks, and the
+/// record charges the node's cores for good.
+fn runs_nothing_can_speak_for(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+) -> Vec<crate::admission::AdmittedRun> {
+    let Ok(loaded) = admissions.load_all() else {
+        return Vec::new();
+    };
+    loaded
+        .runs
+        .into_iter()
+        .filter(|admitted| {
+            !admitted.run.controller_ack.is_given()
+                && admitted.owes_a_report()
+                && recorded_supervisor_liveness(admitted) == Liveness::Gone
+                && !an_exit_is_still_on_disk(store, admitted)
+        })
+        .collect()
+}
+
+/// Report the loss of a run nothing is left to speak for, so its slice is freed
+/// on the controller's acknowledgement like every other completion.
+async fn report_runs_nothing_can_speak_for(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    controller_addr: &str,
+    reporting_node: &str,
+) {
+    for admitted in runs_nothing_can_speak_for(store, admissions) {
+        let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
+        let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
+            continue;
+        };
+        let acknowledged = report_completion(
+            controller_addr,
+            CompletionReport {
+                job_id,
+                exit_code: 0,
+                signal: nix::sys::signal::Signal::SIGKILL as i32,
+                run_attempt,
+                reporting_node,
+                drain: None,
+                step_id: Some(step_id),
+                payload: PayloadEvidence::Supervised(store),
+            },
+        )
+        .await
+        .settled();
+        if !acknowledged {
+            debug!(
+                job_id,
+                run_attempt, "a lost run's completion is not acknowledged yet; holding its slice"
+            );
+            continue;
+        }
+        settle_acknowledged_completion(allocation, admissions, run, step_id).await;
+        // The run's completion is committed, so no sibling's report will ever be
+        // answered, and one left owed keeps the record forever.
+        if let Err(error) = admissions.discharge_owed_reports(run) {
+            warn!(job_id, run_attempt, %error, "failed to discharge a lost run's owed reports");
+        }
+        warn!(
+            job_id,
+            run_attempt,
+            "no supervisor was left for this run; reported its loss and freed its slice"
+        );
+    }
 }
 
 pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
+    admissions: crate::admission::AdmissionStore,
+    allocation: Arc<Mutex<NodeAllocation>>,
     controller_addr: String,
     reporting_node: String,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match replay_unacknowledged_stepd_completions(&store, &controller_addr, &reporting_node)
-                .await
+            match replay_unacknowledged_stepd_completions(
+                &store,
+                &admissions,
+                &allocation,
+                &controller_addr,
+                &reporting_node,
+            )
+            .await
             {
                 Ok(reconciled) if !reconciled.is_empty() => {
                     tracing::info!(
@@ -2223,6 +2637,120 @@ fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
     )
 }
 
+/// The environment an interactive shell starts from: the job's own, never
+/// spurd's, plus the identity a login shell expects to find.
+fn terminal_environment(
+    entry: &crate::job_entry::JobEntry,
+    job_id: u32,
+) -> HashMap<String, String> {
+    let mut environment = HashMap::from([("TERM".to_string(), "xterm-256color".to_string())]);
+    environment.extend(AgentService::session_environ(entry));
+    environment.extend(entry.env_vars(job_id));
+    if entry.uid > 0 {
+        if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
+            .ok()
+            .flatten()
+        {
+            environment.insert("HOME".into(), user.dir.to_string_lossy().into_owned());
+            environment.insert("USER".into(), user.name.clone());
+            environment.insert("LOGNAME".into(), user.name);
+            environment.insert("SHELL".into(), user.shell.to_string_lossy().into_owned());
+        }
+    }
+    environment
+}
+
+/// Only a supervisor confirmed dead may be launched over. An unreadable one
+/// counts as alive: fencing it would SIGTERM a shell that is still serving.
+fn confirmed_gone(liveness: std::io::Result<crate::stepd::StepdLiveness>) -> bool {
+    matches!(liveness, Ok(crate::stepd::StepdLiveness::Stale))
+}
+
+fn terminal_supervisor_is_gone(descriptor: &crate::stepd::StepdDescriptor) -> bool {
+    confirmed_gone(crate::stepd::stepd_liveness(descriptor))
+}
+
+struct TerminalIdentity {
+    job_id: u32,
+    step_id: u32,
+    node: String,
+}
+
+/// The step id stays the client's user step, which is what puts the shell in a
+/// cgroup leaf under the job rather than on the job node itself.
+fn terminal_launch_config(
+    entry: &crate::job_entry::JobEntry,
+    identity: TerminalIdentity,
+    argv: &[String],
+    winsize: Option<crate::pty::WindowSize>,
+    job: TerminalJobFacts,
+    memlock: spur_core::config::MemlockLimit,
+    cgroup: CgroupConfig,
+) -> Result<executor::JobLaunchConfig, Status> {
+    let TerminalIdentity {
+        job_id,
+        step_id,
+        node,
+    } = identity;
+    let environment = terminal_environment(entry, job_id);
+    let script = supervised_step_script(entry, entry.uid, entry.gid, &session_shell(entry, argv))?;
+    Ok(executor::JobLaunchConfig {
+        job_id,
+        step_id,
+        run_attempt: job.run_attempt,
+        script,
+        work_dir: match entry.work_dir.is_empty() {
+            true => "/tmp".to_string(),
+            false => entry.work_dir.clone(),
+        },
+        name: format!("{job_id}.{step_id}"),
+        user: environment.get("USER").cloned().unwrap_or_default(),
+        node,
+        array_job_id: None,
+        array_task_id: None,
+        environment,
+        // The terminal is the session's only output; nothing is spooled.
+        stdout_path: String::new(),
+        stderr_path: String::new(),
+        stdin_path: String::new(),
+        open_mode: None,
+        cpus: job.cpus,
+        memory_mb: job.memory_mb,
+        gpu_devices: job.gpu_devices,
+        cpu_ids: Vec::new(),
+        uid: entry.uid,
+        gid: entry.gid,
+        container: None,
+        prolog_script: None,
+        partition: job.partition,
+        nodelist: job.nodelist,
+        mpi: String::new(),
+        host_device_plan: None,
+        memlock,
+        cgroup,
+        io_mode: executor::LaunchIo::Pty(winsize),
+        pmix_multi_task: false,
+        joins_parent_namespaces: entry.has_namespaces() && entry.pid > 0,
+        allocation_holder: false,
+    })
+}
+
+/// What an interactive session runs when the client named nothing. A job in its
+/// own mount namespace is probed through /proc, not on the host filesystem.
+fn session_shell(entry: &crate::job_entry::JobEntry, argv: &[String]) -> Vec<String> {
+    if !argv.is_empty() {
+        return argv.to_vec();
+    }
+    let bash = match entry.pid > 0 && entry.has_mount_namespace {
+        true => format!("/proc/{}/root/bin/bash", entry.pid),
+        false => "/bin/bash".to_string(),
+    };
+    match std::path::Path::new(&bash).exists() {
+        true => vec!["/bin/bash".to_string()],
+        false => vec!["/bin/sh".to_string()],
+    }
+}
+
 /// The script a supervised step runs. A step joining a running job enters its
 /// namespaces from inside the script, so the supervisor itself stays outside
 /// them and survives independently of the job it is running work for.
@@ -2717,6 +3245,48 @@ pub struct AgentService {
 }
 
 impl AgentService {
+    /// Whether this launch must be refused. A run with no record has no cutoff
+    /// and no admitted digest, so only its own deadline can refuse it.
+    fn check_launch_fences(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        launch_step: spur_core::step::StepId,
+        fences: &crate::admission::LaunchFences,
+    ) -> Option<crate::admission::LaunchRefusal> {
+        let admissions = self.admissions();
+        let run = named_run(job_id, run_attempt)?;
+        let recorded = admissions.load_run(run).ok();
+        // Only a live run can be asked to run a second command. A settled one's
+        // digest would refuse a fresh job that merely reuses its identity.
+        let digest = recorded
+            .as_ref()
+            .filter(|run| !run.is_over())
+            .and_then(|_| {
+                admissions
+                    .participants(run)
+                    .ok()
+                    .and_then(|(participants, _)| {
+                        participants
+                            .into_iter()
+                            .find(|p| p.step_id == launch_step && !p.command_digest.is_empty())
+                            .map(|p| p.command_digest)
+                    })
+            });
+        fences.check(
+            crate::admission::now_unix_ms(),
+            recorded.map(|r| r.reject_before_unix_ms).unwrap_or(0),
+            digest.as_deref(),
+        )
+    }
+
+    /// The entitlement ledger, keyed to the node this agent serves.
+    pub(crate) fn admissions(&self) -> crate::admission::AdmissionStore {
+        crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
+    }
+}
+
+impl AgentService {
     /// Construct with default k0s settings (pinned version, `/usr/local/bin/k0s`). Test-only; the
     /// binary uses `with_cluster_config` to honor the operator's `[cluster]` settings.
     #[cfg(test)]
@@ -2844,6 +3414,17 @@ impl AgentService {
         }
     }
 
+    /// Give this node an epilog hook, so a test reaches the teardown ordering a
+    /// cluster with one has: the record is marked cleaned before the hook runs.
+    #[cfg(test)]
+    fn with_epilog_hook(mut self, script: &str) -> Self {
+        self.hooks = Arc::new(HooksConfig {
+            epilog: Some(script.into()),
+            ..HooksConfig::default()
+        });
+        self
+    }
+
     /// Pretend spurd is (or is not) root, so a test can drive the uid-0 refusal through a real RPC
     /// on an unprivileged runner. Production always uses the value read at construction.
     #[cfg(test)]
@@ -2888,6 +3469,206 @@ impl AgentService {
                 descriptor.cgroup_path = std::path::PathBuf::new();
             }
             sessions.insert(stepd_key(&descriptor), descriptor);
+        }
+    }
+
+    /// Rebuild the claim index from the admission records, which are exact and
+    /// complete before any supervisor exists. Nothing here releases anything.
+    pub async fn replay_admitted_allocations(
+        &self,
+        descriptors: &[crate::stepd::StepdDescriptor],
+    ) -> Vec<AdoptedRunOutcome> {
+        let admissions = self.admissions();
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        let boot_id = crate::admission::current_boot_id();
+        // Before the read below, so the rebuilt ledger sees the settled values.
+        // Gated on the owner: an adopted supervisor outlives this restart.
+        match admissions.settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart) {
+            Ok(settled) if settled > 0 => {
+                warn!(
+                    runs = settled,
+                    "settled epilogs whose owner did not survive"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "could not settle the epilogs of a previous agent"),
+        }
+        let loaded = match admissions.load_all() {
+            Ok(loaded) => loaded,
+            // An empty index reads as a free node while the jobs are still on
+            // it, so fall back to what the descriptors can still account for.
+            Err(error) => {
+                error!(%error, "could not read the admission ledger; falling back to descriptors");
+                self.replay_adopted_allocations(descriptors).await;
+                return Vec::new();
+            }
+        };
+
+        let mut outcomes = Vec::new();
+        for rejected in &loaded.rejected {
+            let (job_id, run_attempt) =
+                crate::admission::parse_run_dir_name(&rejected.path).unwrap_or_default();
+            // Its slice is unknown, so nothing is restored for it. The node is
+            // short until the controller reconciles, which is the safe side.
+            warn!(
+                job_id,
+                run_attempt,
+                path = %rejected.path.display(),
+                reason = %rejected.reason,
+                "unreadable admission record; its claim needs reconciliation"
+            );
+            outcomes.push(AdoptedRunOutcome {
+                job_id,
+                run_attempt,
+                disposition: crate::admission::RunDisposition::Corrupt,
+            });
+        }
+
+        // A record whose supervisor is proven gone must not take a contested core
+        // from one still running: the loser of that race goes unprotected.
+        let mut ordered: Vec<&crate::admission::AdmittedRun> = loaded.runs.iter().collect();
+        ordered.sort_by_key(|admitted| recorded_supervisor_liveness(admitted) == Liveness::Gone);
+
+        let mut allocation = self.allocation.lock().await;
+        for admitted in ordered {
+            let run = &admitted.run;
+            let evidence =
+                self.gather_run_evidence(admitted, descriptors, &store, boot_id.as_deref());
+            let disposition = crate::admission::classify_run(&evidence);
+
+            // Every disposition holds, but a slice already handed back does not:
+            // re-charging one takes a core from whatever the node gave it to.
+            if run.slice_released {
+                tracing::debug!(
+                    job_id = run.job_id,
+                    run_attempt = run.run_attempt,
+                    ?disposition,
+                    "an admitted run's slice was already released; not re-charging it"
+                );
+            } else {
+                // The recorded slice is exact, so this does not under-count the
+                // way a descriptor rebuild does.
+                match allocation.restore_for_job(
+                    run.job_id,
+                    run.run_attempt,
+                    &run.allocation.cpu_ids,
+                    run.allocation.memory_mb,
+                    &run.allocation.gpu_devices,
+                ) {
+                    Ok(_) => info!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        cpus = run.allocation.cpu_ids.len(),
+                        gpus = run.allocation.gpu_devices.len(),
+                        ?disposition,
+                        "restored an admitted run's claim"
+                    ),
+                    // Superseded means a newer attempt already holds the slice,
+                    // which is the expected outcome, not a loss.
+                    Err(spur_sched::cons_tres::AllocError::Superseded) => tracing::debug!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        "a newer attempt already holds this run's slice"
+                    ),
+                    Err(error) => error!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        ?error,
+                        "could not restore an admitted run's claim; the slice is unprotected"
+                    ),
+                }
+            }
+            outcomes.push(AdoptedRunOutcome {
+                job_id: run.job_id,
+                run_attempt: run.run_attempt,
+                disposition,
+            });
+        }
+        drop(allocation);
+
+        // A session with no record predates this ledger. Falling back keeps an
+        // in-place upgrade over a live node lossless.
+        let unrecorded: Vec<crate::stepd::StepdDescriptor> = descriptors
+            .iter()
+            .filter(|d| {
+                !loaded
+                    .runs
+                    .iter()
+                    .any(|r| r.run.job_id == d.job_id && r.run.run_attempt == d.run_attempt)
+            })
+            .cloned()
+            .collect();
+        if !unrecorded.is_empty() {
+            info!(
+                sessions = unrecorded.len(),
+                "replaying sessions that predate the admission ledger"
+            );
+            self.replay_adopted_allocations(&unrecorded).await;
+        }
+        outcomes
+    }
+
+    fn gather_run_evidence(
+        &self,
+        admitted: &crate::admission::AdmittedRun,
+        descriptors: &[crate::stepd::StepdDescriptor],
+        store: &crate::stepd::StepdStore,
+        boot_id: Option<&str>,
+    ) -> crate::admission::RunEvidence {
+        let run = &admitted.run;
+        let mine: Vec<&crate::stepd::StepdDescriptor> = descriptors
+            .iter()
+            .filter(|d| d.job_id == run.job_id && d.run_attempt == run.run_attempt)
+            .collect();
+        let boot_scope_of_supervisor = admitted
+            .participants
+            .iter()
+            .filter_map(|p| p.supervisor.as_ref())
+            .map(|s| s.boot_scope(boot_id))
+            .chain(mine.iter().map(|d| {
+                crate::admission::SupervisorRef {
+                    pid: d.pid,
+                    start_ticks: d.process_start_ticks,
+                    boot_id: d.boot_id.clone(),
+                }
+                .boot_scope(boot_id)
+            }))
+            // A single definite reboot settles the run; otherwise an unknown
+            // must not be promoted into a change.
+            .reduce(|a, b| match (a, b) {
+                (crate::admission::BootScope::Different, _)
+                | (_, crate::admission::BootScope::Different) => {
+                    crate::admission::BootScope::Different
+                }
+                (crate::admission::BootScope::Same, _) | (_, crate::admission::BootScope::Same) => {
+                    crate::admission::BootScope::Same
+                }
+                _ => crate::admission::BootScope::Unknown,
+            });
+        // From the record's participants, not the live set: an exit only exists
+        // once the supervisor is gone, so a live descriptor never carries one.
+        let recorded_exit = admitted.participants.iter().find_map(|p| {
+            store
+                .observed_exit(run.job_id, run.run_attempt, p.step_id)
+                .ok()
+                .flatten()
+        });
+        // Re-checked rather than trusted from the caller's bucket: reporting a
+        // dead supervisor as running holds a phantom indefinitely.
+        let live = mine.iter().any(|d| {
+            matches!(
+                crate::stepd::stepd_liveness(d),
+                Ok(crate::stepd::StepdLiveness::Live)
+            )
+        });
+        crate::admission::RunEvidence {
+            supervisor_matches_a_live_process: live,
+            boot_scope_of_supervisor,
+            recorded_exit,
+            never_spawned: !live
+                && mine.is_empty()
+                && admitted.participants.iter().all(|p| p.supervisor.is_none()),
+            residual_or_corrupt: false,
         }
     }
 
@@ -2984,13 +3765,16 @@ impl AgentService {
 
     pub fn monitor_recovered_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         monitor_recovered_stepds(
-            self.running.clone(),
-            self.allocation.clone(),
-            self.stepds.clone(),
-            self.step_completions.clone(),
+            RecoveryContext {
+                running: self.running.clone(),
+                allocation: self.allocation.clone(),
+                stepds: self.stepds.clone(),
+                completions: self.step_completions.clone(),
+                store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                admissions: self.admissions(),
+                controller_addr: self.reporter.controller_addr.clone(),
+            },
             descriptors.to_vec(),
-            crate::stepd::StepdStore::new(&self.stepd_state_dir),
-            self.reporter.controller_addr.clone(),
         );
     }
 
@@ -3002,6 +3786,11 @@ impl AgentService {
     /// this process exiting.
     pub fn stepds_handle(&self) -> Arc<Mutex<StepdMap>> {
         self.stepds.clone()
+    }
+
+    /// A handle to this node's ledger of charged slices.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
     }
 
     /// The job's own process, asked of its supervisor over the control socket —
@@ -3140,6 +3929,249 @@ impl AgentService {
         }
     }
 
+    /// Take up this step's terminal, opening one only if the step has none.
+    /// A reattach must find the shell already running, not start a second one.
+    async fn attach_terminal(
+        &self,
+        entry: &crate::job_entry::JobEntry,
+        init: &InitSession,
+        argv: &[String],
+        winsize: Option<crate::pty::WindowSize>,
+    ) -> Result<SupervisedTerminal, Status> {
+        let held = stepds_for_job(&*self.stepds.lock().await, init.job_id)
+            .into_iter()
+            .find(|descriptor| descriptor.step_id == init.step_id);
+        // Only a supervisor that is confirmed gone may be launched over: fencing
+        // a live one would SIGTERM the shell whose terminal was asked for.
+        if let Some(descriptor) = held.filter(|descriptor| !terminal_supervisor_is_gone(descriptor))
+        {
+            return self.resume_terminal(&descriptor).await;
+        }
+        self.launch_supervised_terminal(entry, init.job_id, init.step_id, argv, winsize)
+            .await
+    }
+
+    /// Take over a terminal whose supervisor is still running. Refused rather
+    /// than shared: two bridges on one master interleave the user's keystrokes.
+    async fn resume_terminal(
+        &self,
+        descriptor: &crate::stepd::StepdDescriptor,
+    ) -> Result<SupervisedTerminal, Status> {
+        let (job_id, step_id) = (descriptor.job_id, descriptor.step_id);
+        let waiter = self
+            .step_completions
+            .reregister(job_id, descriptor.run_attempt, step_id)
+            .await
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "job {job_id} step {step_id} already has a client attached"
+                ))
+            })?;
+        match self.claim_terminal(descriptor, waiter).await {
+            Some(terminal) => {
+                info!(
+                    job_id,
+                    step_id,
+                    child_pid = terminal.pid,
+                    "resumed a supervised terminal"
+                );
+                Ok(terminal)
+            }
+            None => {
+                // Ours to clear: reregister refused to hand one out while another
+                // client's was parked, so this waiter can only be the one above.
+                self.step_completions
+                    .deregister(job_id, descriptor.run_attempt, step_id)
+                    .await;
+                Err(Status::unavailable(format!(
+                    "job {job_id} step {step_id} is running but its terminal could not be read"
+                )))
+            }
+        }
+    }
+
+    /// The shell becomes a child of a process that outlives the agent, and
+    /// `scancel` reaches it through the stepd map like every other step.
+    async fn launch_supervised_terminal(
+        &self,
+        entry: &crate::job_entry::JobEntry,
+        job_id: u32,
+        step_id: u32,
+        argv: &[String],
+        winsize: Option<crate::pty::WindowSize>,
+    ) -> Result<SupervisedTerminal, Status> {
+        let tracked = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&job_id).ok_or_else(|| {
+                Status::failed_precondition(format!("job {job_id} is not running on this node"))
+            })?;
+            TerminalJobFacts {
+                run_attempt: tracked.run_attempt,
+                cpus: tracked.cpus,
+                memory_mb: tracked.memory_mb,
+                gpu_devices: tracked.gpu_devices.clone(),
+                partition: tracked.partition.clone(),
+                nodelist: tracked.nodelist.clone(),
+            }
+        };
+        let run_attempt = tracked.run_attempt;
+
+        let config = terminal_launch_config(
+            entry,
+            TerminalIdentity {
+                job_id,
+                step_id,
+                node: self.reporter.hostname.clone(),
+            },
+            argv,
+            winsize,
+            tracked,
+            self.limits.memlock,
+            self.cgroup.clone(),
+        )?;
+
+        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "could not fence a displaced terminal supervisor: {error}"
+                ))
+            })?;
+
+        // Registered before the spawn: a shell that exits immediately would
+        // otherwise deliver its status to nobody.
+        let waiter = self
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
+
+        let descriptor = match launch_stepd(
+            &config,
+            run_attempt,
+            &self.reporter.controller_addr,
+            &self.reporter.hostname,
+            &self.stepd_state_dir,
+            StepdLaunchOptions {
+                step_id,
+                allocation_only: false,
+                container_rootfs_mode: None,
+                hooks: (*self.hooks).clone(),
+                plugstack_path: self.plugstack_path.clone(),
+                pmix: None,
+            },
+        )
+        .await
+        {
+            Ok((_, descriptor)) => descriptor,
+            Err(error) => {
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
+                return Err(Status::internal(format!(
+                    "terminal supervisor failed to start: {error}"
+                )));
+            }
+        };
+
+        if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            discard_stepd_session(&descriptor).await;
+            return Err(Status::aborted(
+                "terminal supervisor superseded before it could be tracked",
+            ));
+        }
+
+        if let Err(error) =
+            crate::stepd::start_job(&descriptor, uuid::Uuid::new_v4().to_string()).await
+        {
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            self.abandon_terminal_supervisor(&descriptor, "terminal could not be released")
+                .await;
+            return Err(Status::internal(format!(
+                "failed to release the terminal: {error}"
+            )));
+        }
+
+        match self.claim_terminal(&descriptor, waiter).await {
+            Some(terminal) => Ok(terminal),
+            None => {
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
+                self.abandon_terminal_supervisor(&descriptor, "terminal never became reachable")
+                    .await;
+                Err(Status::internal(
+                    "the terminal supervisor never handed back a terminal",
+                ))
+            }
+        }
+    }
+
+    /// Discard a supervisor whose terminal this agent could not take up. The
+    /// shell may already be running, and stopping the supervisor alone would
+    /// leave it on init still holding the step's cgroup.
+    async fn abandon_terminal_supervisor(
+        &self,
+        descriptor: &crate::stepd::StepdDescriptor,
+        reason: &'static str,
+    ) {
+        discard_stepd_session(descriptor).await;
+        release_stepd_tracking(
+            &self.running,
+            &self.allocation,
+            &self.stepds,
+            descriptor,
+            reason,
+        )
+        .await;
+    }
+
+    /// Take up a terminal a supervisor is holding: its shell's pid names the
+    /// master in custody, and its exit arrives on the step-completion channel.
+    async fn claim_terminal(
+        &self,
+        descriptor: &crate::stepd::StepdDescriptor,
+        waiter: tokio::sync::oneshot::Receiver<crate::step_completion::StepOutcome>,
+    ) -> Option<SupervisedTerminal> {
+        let pid = supervised_step_workload_pid(descriptor).await?;
+        let session_dir = descriptor.socket_path.parent()?;
+        let master = match crate::stepd::reclaim_pty_master(session_dir, pid).await {
+            Ok(master) => master?,
+            Err(error) => {
+                warn!(
+                    job_id = descriptor.job_id,
+                    step_id = descriptor.step_id,
+                    %error,
+                    "could not take up the supervised terminal"
+                );
+                return None;
+            }
+        };
+        // AsyncFd in the bridge polls this fd; a blocking master would stall the
+        // whole reactor on the first read that has nothing behind it.
+        if let Err(error) = nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        ) {
+            warn!(job_id = descriptor.job_id, %error, "could not set the terminal non-blocking");
+            return None;
+        }
+        Some(SupervisedTerminal {
+            master,
+            pid: pid as i32,
+            exit: Box::pin(async move {
+                match waiter.await {
+                    Ok(outcome) => spur_core::process::shell_exit_code(&step_exit_status(outcome)),
+                    Err(_) => 128,
+                }
+            }),
+        })
+    }
+
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
         StepdRecoveryCleanup {
             running: self.running.clone(),
@@ -3155,6 +4187,7 @@ impl AgentService {
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
             stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+            admissions: self.admissions(),
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
         }
@@ -3168,7 +4201,11 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let admissions = self.admissions();
+        let stepd_store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        let epilog = epilog_owed(&hooks);
         tokio::spawn(async move {
+            let mut epilog_held_since: HashMap<RunKey, std::time::Instant> = HashMap::new();
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
@@ -3225,16 +4262,44 @@ impl AgentService {
                 drop(jobs);
 
                 for c in &completed {
-                    teardown_completed_job(c, &lifecycle, &running, &allocation, &mpi_host).await;
+                    teardown_completed_job(
+                        c,
+                        &lifecycle,
+                        &running,
+                        &allocation,
+                        &mpi_host,
+                        &admissions,
+                        epilog,
+                    )
+                    .await;
                 }
 
-                // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `running` is re-taken before `allocation`,
+                // Report allocations with no tracked, non-launching job. `running` is re-taken before `allocation`,
                 // the order commit_job uses, so the live set the reclaim reads
                 // can't race a committing launch.
                 {
                     let jobs = running.lock().await;
-                    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+                    let unbacked = {
+                        let alloc = allocation.lock().await;
+                        alloc.unbacked_claims(
+                            &jobs.keys().copied().collect(),
+                            std::time::Instant::now(),
+                            LAUNCHING_TTL,
+                        )
+                    };
+                    drop(jobs);
+                    // Strictly before the two sweeps below, which read the record
+                    // this writes to decide whether a hook still holds the cores.
+                    resolve_supervised_epilogs(&stepd_store, &admissions, &mut epilog_held_since)
+                        .await;
+                    // Record-driven, so a report path that records an
+                    // acknowledgement without releasing cannot strand a slice.
+                    settle_cancelled_runs(&lifecycle, &allocation, &admissions).await;
+                    release_due_allocations(&allocation, &admissions).await;
+                    flag_unbacked_allocations(&unbacked, &admissions).await;
+                    // Strictly after the releases above: collecting a record
+                    // before its slice is freed destroys the instruction to free it.
+                    collect_settled_admissions(&allocation, &admissions).await;
                 }
 
                 let local_hostname = hostname::get()
@@ -3262,7 +4327,18 @@ impl AgentService {
                             cpus: c.cpus,
                             memory_mb: c.memory_mb,
                         };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
+                        // Marked before the hook: an agent that dies inside one
+                        // leaves a `Running` that reloads as unknowable.
+                        let hooked = named_run(c.job_id, c.run_attempt);
+                        if let Some(run) = hooked {
+                            let _ =
+                                admissions.record_epilog(run, crate::admission::HookState::Running);
+                        }
+                        let outcome = spur_core::hooks::run_hook(epilog_script, &ctx).await;
+                        if let Some(run) = hooked {
+                            let _ = admissions.record_epilog(run, epilog_outcome(outcome.is_err()));
+                        }
+                        if let Err(e) = outcome {
                             error!(
                                 job_id = c.job_id,
                                 error = %e,
@@ -3296,7 +4372,7 @@ impl AgentService {
                     let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
                         reason: reason.clone(),
                     });
-                    report_completion(
+                    let acknowledged = report_completion(
                         &controller_addr,
                         CompletionReport {
                             job_id: c.job_id,
@@ -3307,9 +4383,30 @@ impl AgentService {
                             drain: drain.as_ref(),
                             // Unsupervised path: the report speaks for the job.
                             step_id: None,
+                            payload: PayloadEvidence::Reaped,
                         },
                     )
-                    .await;
+                    .await
+                    .settled();
+                    if !acknowledged {
+                        // Held, not freed: nothing but this node knows the work
+                        // stopped until the controller commits the completion.
+                        warn!(
+                            job_id = c.job_id,
+                            run_attempt = c.run_attempt,
+                            "completion unacknowledged; holding this run's resources"
+                        );
+                        continue;
+                    }
+                    if let Some(run) = named_run(c.job_id, c.run_attempt) {
+                        settle_acknowledged_completion(
+                            &allocation,
+                            &admissions,
+                            run,
+                            spur_core::step::STEP_BATCH,
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -3320,26 +4417,535 @@ pub(crate) struct DrainRequest {
     pub(crate) reason: String,
 }
 
-/// Reclaim a launch reservation that never commits within this bound. Sized
-/// above a typical image pull + fork so a normal launch is spared; one stalled
-/// past this bound is reclaimed.
+/// How long a reservation may sit mid-launch before the sweep reports it,
+/// sized above a typical image pull and fork.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Reclaim allocations whose job is no longer tracked and is not mid-launch,
-/// using the running set as ground truth. Callers hold the `running` lock
-/// across building `running` and this call so the live set is a consistent
-/// snapshot (see the monitor loop). Returns nothing; logs what it reclaimed.
-fn reconcile_orphaned_allocations(
-    running: &HashMap<u32, TrackedJob>,
-    allocation: &mut NodeAllocation,
+/// Flag claims the agent has no tracked job for. It does **not** free them:
+/// forgetting a job is not evidence its work finished, and no timeout makes it so.
+async fn flag_unbacked_allocations(
+    unbacked: &[(u32, u32)],
+    admissions: &crate::admission::AdmissionStore,
 ) {
-    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
-    let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
-    if !reclaimed.is_empty() {
+    for &(job_id, run_attempt) in unbacked {
+        let Some(run) = named_run(job_id, run_attempt) else {
+            continue;
+        };
+        let store = admissions.clone();
+        let taken = tokio::task::spawn_blocking(move || {
+            store.take_conflict_hold(run, "held with no tracked job on this agent")
+        })
+        .await;
+        match taken {
+            // On the transition only: a claim held for the controller to
+            // resolve would otherwise warn on every tick, forever.
+            Ok(Ok(crate::admission::HoldOutcome::Taken)) => warn!(
+                job_id,
+                run_attempt, "holding a claim with no tracked job; it needs reconciliation"
+            ),
+            Ok(Ok(crate::admission::HoldOutcome::AlreadyHeld)) => {}
+            Ok(Ok(crate::admission::HoldOutcome::AlreadyReleased)) => debug!(
+                job_id,
+                run_attempt, "a claim released since the sweep read it needs no hold"
+            ),
+            Ok(Ok(crate::admission::HoldOutcome::NoRecord)) => tracing::debug!(
+                job_id,
+                run_attempt,
+                "holding a claim with neither a tracked job nor a record"
+            ),
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a conflict hold")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "conflict-hold task failed"),
+        }
+    }
+}
+
+/// Settle runs the controller cancelled, once their teardown has finished. A
+/// completion for a run it has forgotten is never acknowledged, so nothing frees it.
+async fn settle_cancelled_runs(
+    lifecycle: &crate::job_lifecycle::JobLifecycle,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    for admitted in loaded.runs {
+        let run = &admitted.run;
+        if !run.cancelled_by_controller
+            || run.state != crate::admission::RunState::Cleaned
+            || run.controller_ack.is_given()
+        {
+            continue;
+        }
+        let (job_id, run_attempt) = (run.job_id, run.run_attempt);
+        let Some(run_key) = run.key() else { continue };
+        // Held across the settle and the release under it, as the RPC that does
+        // the same thing does: a re-dispatch of this id must not straddle them.
+        let _lifecycle = lifecycle.acquire(job_id).await;
+        // Settled and freed together, not on the next tick: settling makes the
+        // record collectable and the sweep may take it before another pass reads it.
+        match settle_and_release_run(allocation, admissions, run_key).await {
+            Ok(SettleRunOutcome::NotQuiescent) => {
+                debug!(
+                    job_id,
+                    run_attempt, "a hook is still running under a cancelled run"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => warn!(job_id, run_attempt, %error, "failed to settle a cancelled run"),
+        }
+    }
+}
+
+/// Free every run the records say is due. Record-driven and idempotent, so a
+/// report that acknowledges without releasing cannot strand a slice.
+async fn release_due_allocations(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    for admitted in loaded.runs {
+        let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
+            continue;
+        };
+        release_acknowledged_allocation(allocation, admissions, run, step_id).await;
+    }
+}
+
+/// Collect records nothing is owed on, sparing every run the allocator still
+/// charges: its record is the only thing that can still order that release.
+async fn collect_settled_admissions(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    // A charge no attempt names still spares its own job's records — widened into
+    // the set — rather than stopping the sweep for every other job on the node.
+    let (charged, unnameable) = allocation.lock().await.charged_runs();
+    for job_id in unnameable {
         warn!(
-            ?reclaimed,
-            "reconciled orphaned resource allocations with no tracked job"
+            job_id,
+            "this node charges a reservation that names no run; keeping its records"
         );
+    }
+    let store = admissions.clone();
+    let swept = tokio::task::spawn_blocking(move || {
+        store.sweep(
+            crate::admission::now_unix_ms(),
+            crate::admission::DEFAULT_RETENTION_SECS * 1000,
+            &charged,
+        )
+    })
+    .await;
+    match swept {
+        Ok(Ok(0)) => {}
+        Ok(Ok(swept)) => info!(swept, "swept settled admission records"),
+        Ok(Err(error)) => warn!(%error, "failed to sweep admission records"),
+        Err(error) => warn!(%error, "admission sweep task failed"),
+    }
+}
+
+/// A refusal the controller can resolve by looking at this node. Carried in a
+/// response, not a transport error, which has nowhere to say any of this.
+#[derive(Debug)]
+pub(crate) struct HeldRefusal {
+    message: String,
+    conflict: Option<LaunchConflict>,
+}
+
+impl HeldRefusal {
+    /// The node can say which job holds the resources, so the controller can
+    /// look that job up and decide which of the two is stale.
+    fn named(job_id: u32, run_attempt: u32, held: &AllocationResult) -> Self {
+        Self {
+            message: format!("allocated resources are held on this node by job {job_id}"),
+            conflict: Some(LaunchConflict {
+                job_id,
+                run_attempt,
+                cpu_ids: held.cpu_ids.clone(),
+                gpu_devices: held.gpu_ids.clone(),
+            }),
+        }
+    }
+
+    /// The node is holding something it cannot attribute to a job: only a full
+    /// ledger pull can tell the controller what.
+    fn unattributed(detail: &str) -> Self {
+        Self {
+            message: detail.to_string(),
+            conflict: None,
+        }
+    }
+
+    /// Derived from the conflict rather than stored beside it: an overlap the
+    /// controller is told to look up must always carry the job to look up.
+    pub(crate) fn kind(&self) -> LaunchFailureKind {
+        match self.conflict {
+            Some(_) => LaunchFailureKind::LaunchFailureLocalOverlap,
+            None => LaunchFailureKind::LaunchFailureResidualState,
+        }
+    }
+
+    pub(crate) fn into_response(self) -> LaunchJobResponse {
+        let failure_kind = self.kind() as i32;
+        LaunchJobResponse {
+            success: false,
+            error: self.message,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            failure_kind,
+            conflict: self.conflict,
+        }
+    }
+}
+
+/// Describe what the node holds, or say it cannot. Both are answers the
+/// controller can act on; only the first names a job for it to adjudicate.
+fn held_refusal(alloc: &NodeAllocation, holder: Option<u32>, detail: &str) -> HeldRefusal {
+    match holder.and_then(|job_id| alloc.claim_of(job_id).map(|claim| (job_id, claim))) {
+        Some((job_id, (run_attempt, held))) => HeldRefusal::named(job_id, run_attempt, &held),
+        None => HeldRefusal::unattributed(detail),
+    }
+}
+
+/// A committed owner the node is not tracking as live that holds cores: the
+/// claim behind a shortfall. One holding none of them explains nothing.
+fn unexplained_cpu_holder(alloc: &NodeAllocation, live: &HashSet<u32>) -> Option<u32> {
+    alloc.committed_owners().into_iter().find(|owner| {
+        !live.contains(owner)
+            && alloc
+                .claim_of(*owner)
+                .is_some_and(|(_, held)| !held.cpu_ids.is_empty())
+    })
+}
+
+/// Why a launch could not reserve its slice: something this node is holding,
+/// which the controller resolves by looking, or an error only it can act on.
+#[derive(Debug)]
+pub(crate) enum LaunchRejection {
+    Held(HeldRefusal),
+    Failed(Status),
+}
+
+impl From<Status> for LaunchRejection {
+    fn from(status: Status) -> Self {
+        Self::Failed(status)
+    }
+}
+
+/// What became of a release the record was asked to license.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    Freed,
+    AlreadyFree,
+    /// The record licenses nothing yet, so the slice stays charged.
+    NotDue,
+}
+
+/// Free a run's slice, now that the controller has committed its completion.
+/// This is the only path that frees one: an exit alone never does.
+async fn release_acknowledged_allocation(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+) -> ReleaseOutcome {
+    let warrant = match admissions.release_is_due(run, step_id) {
+        Ok(Some(warrant)) => warrant,
+        Ok(None) => return ReleaseOutcome::NotDue,
+        Err(error) => {
+            warn!(%run, %error, "could not tell whether a release is due; holding");
+            return ReleaseOutcome::NotDue;
+        }
+    };
+    // Recorded on the release line below: the decision a slice rests on is the
+    // whole of the rule that only a committed acknowledgement may free one.
+    let ground = warrant.ground();
+    let released = allocation.lock().await.release_job(warrant);
+    // The cut is driven off this, so a slice given back without it recorded
+    // stays advertised as a claim the node no longer holds.
+    if let Err(error) = admissions.record_slice_released(run) {
+        warn!(%run, %error, "failed to record a released slice");
+    }
+    if !released {
+        // The audit reads the line below as the release; without this one, a
+        // slice freed elsewhere is indistinguishable from a leak.
+        debug!(%run, %ground, "a run's slice was already free at its acknowledgement");
+        return ReleaseOutcome::AlreadyFree;
+    }
+    info!(%run, %ground, "released a run's slice on its acknowledgement");
+    ReleaseOutcome::Freed
+}
+
+/// What came of taking the controller's word that it is not accounting for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleRunOutcome {
+    Released,
+    AlreadyFree,
+    NoRecord,
+    NotQuiescent,
+    /// The record settled but the release gate still licensed nothing, so this
+    /// agent freed no slice and must not be counted as having freed one.
+    Declined,
+}
+
+/// Settle a run the controller has no record of and hand its slice back, in that
+/// order: cores freed ahead of the record are cores a restart cannot re-charge.
+async fn settle_and_release_run(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+) -> std::io::Result<SettleRunOutcome> {
+    let store = admissions.clone();
+    let permit = tokio::task::spawn_blocking(move || store.settle_permit(run))
+        .await
+        .map_err(|error| std::io::Error::other(format!("settle permit task failed: {error}")))??;
+    let step_id = match permit {
+        crate::admission::SettlePermit::Due(step_id) => step_id,
+        crate::admission::SettlePermit::NoRecord => return Ok(SettleRunOutcome::NoRecord),
+        crate::admission::SettlePermit::NotQuiescent => return Ok(SettleRunOutcome::NotQuiescent),
+    };
+    let store = admissions.clone();
+    let settled = tokio::task::spawn_blocking(move || store.settle_acknowledged_run(run))
+        .await
+        .map_err(|error| std::io::Error::other(format!("settle task failed: {error}")))??;
+    if !settled {
+        return Ok(SettleRunOutcome::NoRecord);
+    }
+    Ok(
+        match release_acknowledged_allocation(allocation, admissions, run, step_id).await {
+            ReleaseOutcome::Freed => SettleRunOutcome::Released,
+            ReleaseOutcome::AlreadyFree => SettleRunOutcome::AlreadyFree,
+            ReleaseOutcome::NotDue => SettleRunOutcome::Declined,
+        },
+    )
+}
+
+/// Settle a run the controller has taken the completion of, and free its slice.
+/// The one path from an acknowledgement to a released core, so none goes unsaid.
+pub(crate) async fn settle_acknowledged_completion(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+) -> bool {
+    let _ = admissions.record_controller_ack(run, 1);
+    let _ = admissions.record_report_acknowledged(run, step_id);
+    // Settling a hook still in flight is the teardown's to do, never an
+    // acknowledgement's: the controller cannot see whose hook is still running.
+    let _ = admissions.mark_acknowledged_run_cleaned(run);
+    release_acknowledged_allocation(allocation, admissions, run, step_id).await
+        == ReleaseOutcome::Freed
+}
+
+/// What a run's record still owes once teardown finishes. Teardown runs ahead of
+/// the hook, so a configured epilog is a debt the mark has to carry.
+pub(crate) fn epilog_owed(hooks: &HooksConfig) -> crate::admission::EpilogOwed {
+    match hooks.epilog {
+        Some(_) => crate::admission::EpilogOwed::Yes,
+        None => crate::admission::EpilogOwed::No,
+    }
+}
+
+/// What this node declares at registration. One reading of the hook config, so
+/// the controller's gate and the agent's own debt cannot disagree.
+pub fn runs_job_epilog(hooks: &HooksConfig) -> bool {
+    epilog_owed(hooks) == crate::admission::EpilogOwed::Yes
+}
+
+/// The step whose supervisor runs this run's epilog. A numbered step never runs
+/// one, so only the step owning the job's lifetime can answer for it.
+fn hook_owner_step(admitted: &crate::admission::AdmittedRun) -> Option<spur_core::step::StepId> {
+    admitted
+        .participants
+        .iter()
+        .find(|participant| {
+            participant.supervisor.is_some() && !spur_core::step::is_user_step(participant.step_id)
+        })
+        .map(|participant| participant.step_id)
+}
+
+/// Whether nothing that could still run this run's epilog survived the restart.
+/// A run that named no supervisor had the previous agent's own hook.
+fn hook_owner_did_not_survive_restart(admitted: &crate::admission::AdmittedRun) -> bool {
+    if admitted.recorded_supervisors().next().is_none() {
+        return true;
+    }
+    matches!(recorded_supervisor_liveness(admitted), Liveness::Gone)
+}
+
+/// What a run still owes once the agent stops tracking it. Only proof that
+/// nothing can run the hook cancels the debt; anything less holds the slice.
+fn supervised_epilog_owed(
+    admitted: &crate::admission::AdmittedRun,
+    hooks: &HooksConfig,
+) -> crate::admission::EpilogOwed {
+    if hooks.epilog.is_none() {
+        return crate::admission::EpilogOwed::No;
+    }
+    match recorded_supervisor_liveness(admitted) {
+        Liveness::Gone => crate::admission::EpilogOwed::No,
+        Liveness::Live | Liveness::CannotTell => crate::admission::EpilogOwed::Yes,
+    }
+}
+
+/// What a cancelled run's teardown still owes. A record that cannot be read in
+/// full never says no hook is owed; the owner-loss sweep ends that hold instead.
+fn cancelled_epilog_owed(
+    admissions: &crate::admission::AdmissionStore,
+    hooks: &HooksConfig,
+    run: RunKey,
+) -> crate::admission::EpilogOwed {
+    // Nothing can owe a hook this node does not run.
+    if hooks.epilog.is_none() {
+        return crate::admission::EpilogOwed::No;
+    }
+    let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+    match admissions.load_admitted(run) {
+        Ok((admitted, rejected)) if rejected.is_empty() => supervised_epilog_owed(&admitted, hooks),
+        Ok(_) => crate::admission::EpilogOwed::Yes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::admission::EpilogOwed::No
+        }
+        Err(error) => {
+            warn!(job_id, run_attempt, %error,
+                "could not read a cancelled run's participants; holding its slice");
+            crate::admission::EpilogOwed::Yes
+        }
+    }
+}
+
+/// Carry the hook a cancelled run's teardown still owes into the record the gate
+/// reads. A run whose hook has already spoken keeps its answer.
+fn hold_cancelled_run_for_epilog(
+    admissions: &crate::admission::AdmissionStore,
+    hooks: &HooksConfig,
+    run: RunKey,
+) -> std::io::Result<()> {
+    if cancelled_epilog_owed(admissions, hooks, run) == crate::admission::EpilogOwed::No {
+        return Ok(());
+    }
+    admissions.record_epilog_if_unstarted(run, crate::admission::HookState::Pending)?;
+    Ok(())
+}
+
+/// Record how a run's epilog ended, from the step that owns the hook. A numbered
+/// step reports `epilog_failed: false` for a hook it never ran.
+fn record_run_epilog(
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+    state: crate::admission::HookState,
+) {
+    if spur_core::step::is_user_step(step_id) {
+        return;
+    }
+    let _ = admissions.record_epilog(run, state);
+}
+
+/// How long a hook may hold a slice before it is called out by name. An epilog
+/// standing on the cores is correct, but an unbounded one must not be silent.
+const EPILOG_HOLD_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Whether this hold has gone on long enough to say so, restarting its clock when
+/// it has. A hook has no deadline, so the only thing that can be periodic is this.
+fn epilog_hold_is_worth_saying<K: std::hash::Hash + Eq>(
+    held_since: &mut HashMap<K, std::time::Instant>,
+    held: K,
+) -> bool {
+    let since = held_since
+        .entry(held)
+        .or_insert_with(std::time::Instant::now);
+    if since.elapsed() < EPILOG_HOLD_STUCK_AFTER {
+        return false;
+    }
+    *since = std::time::Instant::now();
+    true
+}
+
+/// Mirror each in-flight epilog's outcome from the supervisor's own ledger into
+/// the record the gate reads. The hook's owner writes it, so a cancel cannot.
+async fn resolve_supervised_epilogs(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+    held_since: &mut HashMap<RunKey, std::time::Instant>,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    let mut still_held = HashSet::new();
+    for admitted in loaded.runs {
+        if !admitted.run.cleanup.epilog.is_in_flight() {
+            continue;
+        }
+        let Some(run) = admitted.run.key() else {
+            continue;
+        };
+        let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
+        // No owner was ever named, so no ledger can answer for the hook. The
+        // hold ends at the restart that proves the owner did not survive.
+        let Some(step_id) = hook_owner_step(&admitted) else {
+            still_held.insert(run);
+            if epilog_hold_is_worth_saying(held_since, run) {
+                warn!(
+                    job_id,
+                    run_attempt, "an epilog with no recorded owner is holding this run's slice"
+                );
+            }
+            continue;
+        };
+        let state = match store.epilog_result(job_id, run_attempt, step_id) {
+            Ok(Some(failed)) => epilog_outcome(failed),
+            // Nothing the ledger can be read as; only proof the owner is gone
+            // may settle it, never the wait itself.
+            Ok(None) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
+                warn!(
+                    job_id,
+                    run_attempt, "settling an epilog whose supervisor is gone"
+                );
+                crate::admission::HookState::Unknown
+            }
+            Ok(None) => {
+                still_held.insert(run);
+                if epilog_hold_is_worth_saying(held_since, run) {
+                    warn!(
+                        job_id,
+                        run_attempt, "an epilog is still holding this run's slice"
+                    );
+                }
+                continue;
+            }
+            // A ledger that cannot be read is never proof the hook ended, but a
+            // hold it takes must still end when nothing is left to end it.
+            Err(error) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
+                warn!(job_id, run_attempt, %error,
+                    "settling an unreadable epilog whose supervisor is gone");
+                crate::admission::HookState::Unknown
+            }
+            Err(error) => {
+                still_held.insert(run);
+                if epilog_hold_is_worth_saying(held_since, run) {
+                    warn!(job_id, run_attempt, %error, "could not read an epilog's outcome; holding");
+                }
+                continue;
+            }
+        };
+        if let Err(error) = admissions.record_epilog(run, state) {
+            warn!(job_id, run_attempt, %error, "failed to record an epilog's outcome");
+        }
+    }
+    held_since.retain(|run, _| still_held.contains(run));
+}
+
+/// How a run's epilog ended, as the record spells it.
+pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
+    if failed {
+        crate::admission::HookState::Failed
+    } else {
+        crate::admission::HookState::Succeeded
     }
 }
 
@@ -3348,23 +4954,41 @@ fn reconcile_orphaned_allocations(
 /// Disarmed once the job is committed to the running set.
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
-    job_id: u32,
-    run_attempt: u32,
+    admissions: crate::admission::AdmissionStore,
+    run: RunKey,
     armed: bool,
+    spawned: bool,
 }
 
 impl LaunchReservationGuard {
-    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32, run_attempt: u32) -> Self {
+    fn new(
+        allocation: Arc<Mutex<NodeAllocation>>,
+        admissions: crate::admission::AdmissionStore,
+        run: RunKey,
+    ) -> Self {
         Self {
             allocation,
-            job_id,
-            run_attempt,
+            admissions,
+            run,
             armed: true,
+            spawned: false,
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// Past this point something is running, so an aborted launch must keep the
+    /// record: a live process with no ledger entry reads as free capacity.
+    fn mark_spawned(&mut self) {
+        self.spawned = true;
+    }
+
+    /// The workload was killed and reaped before the launch returned, so the
+    /// record describes nothing again and must not outlive the call.
+    fn mark_reaped(&mut self) {
+        self.spawned = false;
     }
 }
 
@@ -3373,17 +4997,31 @@ impl Drop for LaunchReservationGuard {
         if !self.armed {
             return;
         }
-        let job_id = self.job_id;
-        let run_attempt = self.run_attempt;
-        // Generation-checked: a redispatch may have already superseded this
-        // reservation, and releasing it here must not free the new one.
+        let run = self.run;
+        // Something is running against this reservation, so the record and the
+        // slice both still describe it. Only the controller can end it now.
+        if self.spawned {
+            warn!(%run, "an aborted launch left a payload running; its slice stays held");
+            return;
+        }
+        // Not forgetfulness: this is the process that made the reservation,
+        // aborting before anything was spawned against it.
+        if let Err(error) = self.admissions.remove_run(run) {
+            warn!(%run, %error, "failed to drop the admission record of an aborted launch");
+        }
         if let Ok(mut alloc) = self.allocation.try_lock() {
-            alloc.release_job_if(job_id, run_attempt);
+            alloc.release_job(ReleaseWarrant::never_spawned(run));
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
             handle.spawn(async move {
-                allocation.lock().await.release_job_if(job_id, run_attempt);
+                allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::never_spawned(run));
             });
+        } else {
+            // Nothing sweeps this now, so it has to be visible.
+            warn!(%run, "could not release an aborted launch's reservation; it stays held");
         }
     }
 }
@@ -3392,6 +5030,24 @@ use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The completion report is now the only thing that frees a slice, so the
+/// obligation to deliver it is unbounded in attempts and bounded only in rate.
+const COMPLETION_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a report may go unacknowledged before it is called out. A run that
+/// holds its slice forever is correct but must not be silent.
+const COMPLETION_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Next backoff, capped. Jittered so a controller coming back does not meet
+/// every node's retry at the same instant.
+fn completion_backoff(attempt: u32, job_id: u32) -> std::time::Duration {
+    let base = CONTROLLER_RPC_RETRY_GAP
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(COMPLETION_RETRY_CAP);
+    let jitter = std::time::Duration::from_millis(u64::from(job_id % 1000));
+    (base + jitter).min(COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1))
+}
 
 /// A single failed attempt at a controller RPC.
 enum ControllerRpcError {
@@ -3463,6 +5119,30 @@ mod controller_rpc_tests {
     fn transient_errors_are_retryable() {
         assert!(controller_rpc_retryable(&Status::unavailable("x")));
         assert!(controller_rpc_retryable(&Status::internal("x")));
+    }
+
+    /// Only the controller's own "no such job" settles a run. Everything else,
+    /// including a rejection no retry can fix, leaves the slice held.
+    #[test]
+    fn only_a_definite_no_such_job_settles_a_completion() {
+        use super::CompletionOutcome;
+        assert!(
+            CompletionOutcome::for_error(&ControllerRpcError::Rpc(Status::not_found(
+                "job 5 not found"
+            )))
+            .settled()
+        );
+        for status in [
+            Status::invalid_argument("node n1 is not allocated to job 5"),
+            Status::unavailable("not the Raft leader"),
+            Status::internal("raft propose failed"),
+        ] {
+            let outcome = CompletionOutcome::for_error(&ControllerRpcError::Rpc(status.clone()));
+            assert!(
+                !outcome.settled(),
+                "{status:?} is not the controller saying it has no record"
+            );
+        }
     }
 
     /// Drive the retry loop with one scripted outcome per attempt, reporting how
@@ -3623,7 +5303,7 @@ struct LaunchPlan {
 }
 
 /// Decide how to enter a job and run `command`, shared by `exec_in_job` and
-/// `spawn_pty_in_job`.
+/// the script a supervised step runs.
 ///
 /// When the job has live namespaces, enter them with `nsenter` and drop
 /// privilege inside via `setpriv` (see [`build_nsenter_argv`]); the child hook
@@ -3909,9 +5589,94 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
+    pub payload: PayloadEvidence<'a>,
 }
 
-pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
+/// Carried on every report, so a path reporting a run over cannot be written
+/// without answering for the processes it says have stopped.
+pub(crate) enum PayloadEvidence<'a> {
+    /// The agent spawned and reaped the payload itself, so none of it is left.
+    Reaped,
+    /// A `spurstepd` session owns the payload; its published identity decides.
+    Supervised(&'a crate::stepd::StepdStore),
+}
+
+/// Read from the recorded `(pid, start_ticks)` identity, not cgroup population:
+/// available where cgroups are not, and names only the process the report ends.
+fn payload_still_executing(report: &CompletionReport<'_>) -> bool {
+    let PayloadEvidence::Supervised(store) = report.payload else {
+        return false;
+    };
+    // Every participant, not the reporting step alone: this report ends the
+    // whole run, and a sibling's payload is as much of it as the owner's.
+    let sessions = match store.published_sessions_for_run(report.job_id, report.run_attempt) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            warn!(
+                job_id = report.job_id,
+                run_attempt = report.run_attempt,
+                %error,
+                "could not enumerate a run's sessions; withholding its completion report"
+            );
+            return true;
+        }
+    };
+    for published in &sessions {
+        let live = crate::stepd::workload_liveness(published);
+        if live == crate::stepd::WorkloadLiveness::Gone {
+            continue;
+        }
+        warn!(
+            job_id = report.job_id,
+            run_attempt = report.run_attempt,
+            step_id = published.as_ref().map(|s| s.step_id).unwrap_or_default(),
+            ?live,
+            "this run's payload is still executing; withholding its completion report"
+        );
+        return true;
+    }
+    false
+}
+
+/// What the controller said when handed one node's account of a finished run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    /// The controller committed the completion.
+    Acknowledged,
+    /// The controller answered that it has no record of the run.
+    NoSuchRun,
+    /// Nothing that settles the run; the report is still owed.
+    Undelivered,
+}
+
+impl CompletionOutcome {
+    /// A definite "no such job" is the controller's own word that it is not
+    /// accounting for the run; anything else leaves the report owed.
+    fn for_error(error: &ControllerRpcError) -> Self {
+        match error {
+            ControllerRpcError::Rpc(status) if status.code() == tonic::Code::NotFound => {
+                Self::NoSuchRun
+            }
+            _ => Self::Undelivered,
+        }
+    }
+
+    /// Whether the controller has settled this run, so its slice may go. A run
+    /// the controller has no record of will never be acknowledged by anything.
+    pub(crate) fn settled(self) -> bool {
+        matches!(self, Self::Acknowledged | Self::NoSuchRun)
+    }
+}
+
+pub(crate) async fn report_completion(
+    controller_addr: &str,
+    report: CompletionReport<'_>,
+) -> CompletionOutcome {
+    // Before the RPC, not after: an acknowledgement frees the slice, and a
+    // payload still on the cores makes this report a lie the controller acts on.
+    if payload_still_executing(&report) {
+        return CompletionOutcome::Undelivered;
+    }
     let CompletionReport {
         job_id,
         exit_code,
@@ -3920,6 +5685,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         reporting_node,
         drain,
         step_id,
+        payload: _,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
@@ -3966,31 +5732,35 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
     })
     .await;
 
-    let acknowledged = result.is_ok();
-    match result {
-        Ok(_) => {
-            info!(
-                job_id,
-                exit_code,
-                controller = %controller_addr,
-                "reported completion to controller"
-            );
-        }
-        Err(e) if e.retryable() => error!(
+    let Err(error) = result else {
+        info!(
             job_id,
             exit_code,
-            attempts = CONTROLLER_RPC_ATTEMPTS,
-            error = %e,
-            "gave up reporting completion to controller"
-        ),
-        Err(e) => error!(
+            controller = %controller_addr,
+            "reported completion to controller"
+        );
+        return CompletionOutcome::Acknowledged;
+    };
+
+    let outcome = CompletionOutcome::for_error(&error);
+    if outcome == CompletionOutcome::NoSuchRun {
+        warn!(
             job_id,
             exit_code,
-            error = %e,
-            "ReportJobStatus failed with non-retryable error"
-        ),
+            controller = %controller_addr,
+            "controller has no record of this run; no acknowledgement will ever come for it"
+        );
+        return outcome;
     }
-    acknowledged
+    // Deliberately not called non-retryable: every caller replays or holds
+    // until the controller takes it, whatever the code says about one attempt.
+    error!(
+        job_id,
+        exit_code,
+        error = %error,
+        "controller did not accept this completion; the report stays owed"
+    );
+    outcome
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -4073,6 +5843,125 @@ impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
     type InteractiveSessionStream = ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    async fn request_node_ledger(
+        &self,
+        request: Request<RequestNodeLedgerRequest>,
+    ) -> Result<Response<RequestNodeLedgerResponse>, Status> {
+        Self::require_controller(&request)?;
+        let reason = request.into_inner().reason;
+        let admissions = self.admissions();
+        let session = self.reporter.agent_session_id().to_string();
+        let cut = tokio::task::spawn_blocking(move || admissions.ledger_cut(&session))
+            .await
+            .map_err(|error| Status::internal(format!("ledger task failed: {error}")))?;
+        info!(
+            %reason,
+            entries = cut.entries.len(),
+            complete = cut.inventory_complete,
+            "answered a ledger pull"
+        );
+        self.reporter.note_ledger_pulled();
+        Ok(Response::new(RequestNodeLedgerResponse {
+            ledger: Some(crate::reporter::ledger_to_proto(cut)),
+        }))
+    }
+
+    async fn fence_run(
+        &self,
+        request: Request<FenceRunRequest>,
+    ) -> Result<Response<FenceRunResponse>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let admissions = self.admissions();
+        let (job_id, run_attempt, cutoff) =
+            (req.job_id, req.run_attempt, req.reject_before_unix_ms);
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to fence"))?;
+        let fenced = tokio::task::spawn_blocking(move || admissions.fence_run(run, cutoff))
+            .await
+            .map_err(|error| Status::internal(format!("fence task failed: {error}")))?;
+        match fenced {
+            Ok(reject_before_unix_ms) => {
+                info!(
+                    job_id,
+                    run_attempt, reject_before_unix_ms, "fenced a run against in-flight launches"
+                );
+                Ok(Response::new(FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms,
+                }))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not persist the fence for job {job_id}: {error}"
+            ))),
+        }
+    }
+
+    async fn settle_run(
+        &self,
+        request: Request<SettleRunRequest>,
+    ) -> Result<Response<SettleRunResponse>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let (job_id, run_attempt) = (req.job_id, req.run_attempt);
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to settle"))?;
+        // Held across the running check and the release under it, as teardown does,
+        // so a re-dispatch either lands before this or finds nothing taken from it.
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        // Declining costs a slice until the next reconcile; releasing one a
+        // payload is still on hands its cores to a second job.
+        if self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt)
+        {
+            warn!(
+                job_id,
+                run_attempt, "declining to settle a run this agent is still running"
+            );
+            return Ok(Response::new(SettleRunResponse {
+                released: false,
+                error: "this agent is still running the run".into(),
+            }));
+        }
+        let outcome = settle_and_release_run(&self.allocation, &self.admissions(), run)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "could not settle run {job_id}.{run_attempt}: {error}"
+                ))
+            })?;
+        let declined = match outcome {
+            SettleRunOutcome::Released => {
+                info!(
+                    job_id,
+                    run_attempt,
+                    "controller answered a claim it has no record of; released the slice"
+                );
+                return Ok(Response::new(SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }));
+            }
+            SettleRunOutcome::AlreadyFree => "the slice was already free",
+            SettleRunOutcome::NoRecord => "this agent has no record of the run",
+            SettleRunOutcome::NotQuiescent => "the run is still being torn down",
+            SettleRunOutcome::Declined => "this agent's release gate licensed nothing",
+        };
+        warn!(
+            job_id,
+            run_attempt, declined, "declining to report a slice as released"
+        );
+        Ok(Response::new(SettleRunResponse {
+            released: false,
+            error: declined.into(),
+        }))
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -4083,11 +5972,55 @@ impl SlurmAgent for AgentService {
         // A launch names the node the controller scheduled it onto. If it does not name this host it
         // was aimed at the wrong agent — refuse rather than run another node's allocation here.
         if !req.target_node.is_empty() && !self.agent_owns_node(&req.target_node) {
-            return Err(Status::failed_precondition(format!(
-                "launch targeted node '{}' but this agent serves '{}'",
-                req.target_node, self.reporter.hostname
-            )));
+            return Ok(Response::new(LaunchJobResponse {
+                success: false,
+                error: format!(
+                    "launch targeted node '{}' but this agent serves '{}'",
+                    req.target_node, self.reporter.hostname
+                ),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: LaunchFailureKind::LaunchFailureTargetMismatch as i32,
+                conflict: None,
+            }));
         }
+        // Before anything is reserved or spawned. These refuse a stale command
+        // from the controller; they authenticate nobody.
+        let fences = crate::admission::LaunchFences {
+            issued_at_unix_ms: req.issued_at_unix_ms,
+            expires_at_unix_ms: req.expires_at_unix_ms,
+            command_digest: req.command_digest.clone(),
+        };
+        let launch_step = launch_step_id(req.spec.as_ref().map(|spec| spec.pty).unwrap_or(false));
+        if let Some(refusal) =
+            self.check_launch_fences(job_id, req.run_attempt, launch_step, &fences)
+        {
+            warn!(
+                job_id,
+                run_attempt = req.run_attempt,
+                ?refusal,
+                "refusing a launch"
+            );
+            return Ok(Response::new(LaunchJobResponse {
+                conflict: None,
+                success: false,
+                error: format!("launch refused: {refusal:?}"),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: match refusal {
+                    crate::admission::LaunchRefusal::Fenced => {
+                        LaunchFailureKind::LaunchFailureFenced as i32
+                    }
+                    crate::admission::LaunchRefusal::Expired => {
+                        LaunchFailureKind::LaunchFailureExpired as i32
+                    }
+                    crate::admission::LaunchRefusal::ConflictingDigest => {
+                        LaunchFailureKind::LaunchFailureConflictingDigest as i32
+                    }
+                },
+            }));
+        }
+
         let peer_nodes = req.peer_nodes;
         let task_offset = req.task_offset;
         // Per-task array identity is controller-assigned on the launch request,
@@ -4095,10 +6028,13 @@ impl SlurmAgent for AgentService {
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
         let run_attempt = req.run_attempt;
+        let run_key = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to launch"))?;
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // A pty launch stays on the legacy path: its terminal is the agent's to own.
+        // Only the batch fallback reaches here with a pty; supervising it would put
+        // the script's terminal in custody, where a reclaim hands it to any client.
         let stepd_enabled = !spec.pty;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
@@ -4156,6 +6092,7 @@ impl SlurmAgent for AgentService {
                     "stepd already tracked for this attempt; treating retried launch as success"
                 );
                 return Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     stdout_path: paths.0,
@@ -4443,7 +6380,7 @@ impl SlurmAgent for AgentService {
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
 
-        let (alloc_result, allocated_device_ids) = self
+        let reserved = self
             .allocate_local_resources(
                 job_id,
                 run_attempt,
@@ -4452,12 +6389,60 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
             )
-            .await?;
+            .await;
+        let (alloc_result, allocated_device_ids) = match reserved {
+            Ok(reserved) => reserved,
+            // A transport error has nowhere to carry the holder, so the
+            // controller's reconcile never fires on one.
+            Err(LaunchRejection::Held(refusal)) => {
+                return Ok(Response::new(refusal.into_response()))
+            }
+            Err(LaunchRejection::Failed(status)) => return Err(status),
+        };
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
+        let admissions = self.admissions();
         let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
+            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), run_key);
+
+        // Durable before anything is spawned against it: a crash before this
+        // leaves neither a record nor a process, a crash after leaves both.
+        let mut run_record = crate::admission::RunAdmission::new(
+            job_id,
+            run_attempt,
+            &self.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: alloc_result.cpu_ids.clone(),
+                memory_mb: alloc_result.memory_mb,
+                gpu_devices: allocated_device_ids.clone(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run_record.lifecycle_owner_step = Some(launch_step);
+        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+            error!(job_id, run_attempt, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {job_id}: {error}"
+            )));
+        }
+        let mut participant_record = crate::admission::ParticipantAdmission::new(
+            job_id,
+            run_attempt,
+            launch_step,
+            &self.reporter.hostname,
+            run_record.allocation.clone(),
+        );
+        participant_record.final_report.required = true;
+        participant_record.command_digest = req.command_digest.clone();
+        participant_record.issued_at_unix_ms = req.issued_at_unix_ms;
+        participant_record.expires_at_unix_ms = req.expires_at_unix_ms;
+        if let Err(error) = admissions.admit_participant_async(participant_record).await {
+            error!(job_id, run_attempt, %error, "failed to persist the participant admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {job_id}: {error}"
+            )));
+        }
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -4500,6 +6485,7 @@ impl SlurmAgent for AgentService {
                 let err_msg = format!("prolog failed: {e:#}");
                 error!(job_id, error = %err_msg, "prolog hook failed before launch");
                 return Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
@@ -4582,7 +6568,7 @@ impl SlurmAgent for AgentService {
             memlock: self.limits.memlock,
             cgroup: self.cgroup.clone(),
             io_mode: if spec.pty {
-                executor::LaunchIo::Pty
+                executor::LaunchIo::Pty(None)
             } else {
                 executor::LaunchIo::File
             },
@@ -4625,6 +6611,22 @@ impl SlurmAgent for AgentService {
         match launch_result {
             Ok((mut result, runtime_descriptor)) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
+                reservation_guard.mark_spawned();
+                if let Some(ref descriptor) = runtime_descriptor {
+                    if let Err(error) = admissions.record_supervisor(
+                        run_key,
+                        launch_step,
+                        crate::admission::SupervisorRef {
+                            pid: descriptor.pid,
+                            start_ticks: descriptor.process_start_ticks,
+                            boot_id: descriptor.boot_id.clone(),
+                        },
+                    ) {
+                        error!(job_id, run_attempt, %error,
+                            "failed to record the supervisor identity; this run's slice is \
+                             held until the agent restarts");
+                    }
+                }
 
                 // Claim the stepd slot before committing anything
                 // else. A concurrent LaunchJob for the same job (a retry
@@ -4647,7 +6649,9 @@ impl SlurmAgent for AgentService {
                         discard_stepd_session(&descriptor).await;
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
+                        reservation_guard.mark_reaped();
                         return Ok(Response::new(LaunchJobResponse {
+                            conflict: None,
                             success: false,
                             error: "stepd superseded by a newer attempt".into(),
                             stdout_path: String::new(),
@@ -4663,7 +6667,9 @@ impl SlurmAgent for AgentService {
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
                 let committed = self.allocation.lock().await.commit_job(job_id, run_attempt);
-                reservation_guard.disarm();
+                if committed {
+                    reservation_guard.disarm();
+                }
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
                 // the TTL). Don't track a job with no backing allocation — kill,
@@ -4672,6 +6678,7 @@ impl SlurmAgent for AgentService {
                 // job never enters `running`), then fail the launch.
                 if !committed {
                     drop(jobs);
+                    reservation_guard.mark_reaped();
                     warn!(
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
@@ -4709,6 +6716,7 @@ impl SlurmAgent for AgentService {
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {
+                        conflict: None,
                         success: false,
                         error: "reservation reclaimed during launch".into(),
                         stdout_path: String::new(),
@@ -4769,6 +6777,7 @@ impl SlurmAgent for AgentService {
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     stdout_path,
@@ -4797,6 +6806,7 @@ impl SlurmAgent for AgentService {
                 }
 
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
@@ -4875,7 +6885,6 @@ impl SlurmAgent for AgentService {
                 // the controller holding a job whose workload never starts.
                 warn!(job_id, run_attempt = req.run_attempt, %error,
                     "failed to release the supervised job");
-                let _ = stop_stepd_process(descriptor).await;
                 release_stepd_tracking(
                     &self.running,
                     &self.allocation,
@@ -4884,6 +6893,7 @@ impl SlurmAgent for AgentService {
                     "supervised job could not be released",
                 )
                 .await;
+                discard_stepd_session(descriptor).await;
                 return Err(Status::internal(format!(
                     "failed to release the supervised job: {error}"
                 )));
@@ -4907,23 +6917,14 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id, req.run_attempt).await;
         }
 
-        // The signal paths only act on a running job; release a still-launching
-        // reservation so a cancel-during-eviction doesn't strand it until the
-        // TTL. Hold the running lock across the release (matching launch_job's
-        // commit order) so this can't free a job that just became running, and
-        // generation-check the release itself so a redispatch that already
-        // reserved a newer attempt survives a cancel for the old one.
-        let jobs = self.running.lock().await;
-        let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
-        if !jobs.contains_key(&job_id) {
-            let mut alloc = self.allocation.lock().await;
-            if req.run_attempt == 0 {
-                alloc.release_job(job_id);
-            } else {
-                alloc.release_job_if(job_id, req.run_attempt);
-            }
-        }
-        drop(jobs);
+        // Excludes the launch of this id, which holds this same guard across its own
+        // commit. Must stay below the signal paths above: they reach drop_tracked_job.
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        let tracked_attempt = {
+            let jobs = self.running.lock().await;
+            jobs.get(&job_id).map(|tracked| tracked.run_attempt)
+        };
+        let nothing_tracked = tracked_attempt.is_none();
 
         // An allocation ends here rather than through the completion teardown,
         // so this is where its cgroup node has to go: the steps inside only
@@ -4937,7 +6938,12 @@ impl SlurmAgent for AgentService {
             _ => None,
         };
         let doomed_attempt = match req.run_attempt {
-            0 => tracked_attempt.or(supervised_attempt),
+            // A reservation whose launch never reached the tracking map is named
+            // only by the claim index, and an unnamed release cannot be gated.
+            0 => match tracked_attempt.or(supervised_attempt) {
+                named @ Some(_) => named,
+                None => self.charged_attempt(job_id).await,
+            },
             named => Some(named),
         };
         let supervised = !stepds_for_job(&*self.stepds.lock().await, job_id).is_empty();
@@ -4947,8 +6953,27 @@ impl SlurmAgent for AgentService {
             ));
         }
 
-        if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
+        if !pmix_teardown_is_due(doomed_attempt, tracked_attempt) {
+            info!(
+                job_id,
+                doomed_attempt,
+                tracked_attempt,
+                "leaving PMIx alone; this job's namespaces belong to a live attempt"
+            );
+        } else if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
+        }
+
+        // Nothing tracked means the record is all that is left of the claim and
+        // its slice just went back; a tracked one is still tearing down.
+        if let Some(attempt) = doomed_attempt {
+            if let Some(run) = named_run(job_id, attempt) {
+                if nothing_tracked {
+                    self.settle_cancelled_run(run).await;
+                } else {
+                    self.mark_controller_cancelled(run).await;
+                }
+            }
         }
 
         Ok(Response::new(()))
@@ -5172,6 +7197,9 @@ impl SlurmAgent for AgentService {
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
+        let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
+            Status::invalid_argument("run attempt 0 names no run to hold an allocation")
+        })?;
         let mut jobs = self.running.lock().await;
         if jobs.contains_key(&req.job_id) {
             return Err(Status::already_exists(format!(
@@ -5204,13 +7232,56 @@ impl SlurmAgent for AgentService {
                     AllocError::CpusUnavailable => {
                         Status::resource_exhausted("allocated cores unavailable on this node")
                     }
+                    AllocError::MemoryUnavailable => {
+                        Status::resource_exhausted("allocated memory unavailable on this node")
+                    }
                 })?;
             result
         };
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
+        let admissions = self.admissions();
         let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), req.job_id, req.run_attempt);
+            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), alloc_run);
+
+        // An srun allocation holds a slice with no launch of its own, so it
+        // needs the same record: the claim outlives whatever steps join it.
+        let mut run_record = crate::admission::RunAdmission::new(
+            req.job_id,
+            req.run_attempt,
+            &self.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: alloc_result.cpu_ids.clone(),
+                memory_mb: alloc_result.memory_mb,
+                gpu_devices: controller_gpu_ids.clone(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
+        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+            error!(job_id = req.job_id, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {}: {error}",
+                req.job_id
+            )));
+        }
+        // The allocation's own participant. Without it the run has no step that
+        // can own a hook, and its teardown reads as owing nothing.
+        let mut participant_record = crate::admission::ParticipantAdmission::new(
+            req.job_id,
+            req.run_attempt,
+            spur_core::step::STEP_EXTERN,
+            &self.reporter.hostname,
+            run_record.allocation.clone(),
+        );
+        participant_record.final_report.required = true;
+        if let Err(error) = admissions.admit_participant_async(participant_record).await {
+            error!(job_id = req.job_id, %error, "failed to persist the participant admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {}: {error}",
+                req.job_id
+            )));
+        }
 
         // This allocation launches nothing, so its cgroup has to be created
         // here or the first step arriving has none to join.
@@ -5323,6 +7394,26 @@ impl SlurmAgent for AgentService {
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
 
+            // A supervisor is live against this reservation now, so an abandoned
+            // launch must leave the slice held rather than hand it back.
+            reservation_guard.mark_spawned();
+
+            // Names who answers for this run's hooks. Unrecorded, no ledger can
+            // answer for them, so the gate holds until a restart settles it.
+            if let Err(error) = admissions.record_supervisor(
+                alloc_run,
+                spur_core::step::STEP_EXTERN,
+                crate::admission::SupervisorRef {
+                    pid: descriptor.pid,
+                    start_ticks: descriptor.process_start_ticks,
+                    boot_id: descriptor.boot_id.clone(),
+                },
+            ) {
+                error!(job_id = req.job_id, %error,
+                    "failed to record the supervisor identity; this allocation's slice is \
+                     held until the agent restarts");
+            }
+
             // The allocation's cgroup is created here, not by the supervisor, so
             // record it or a stale session leaves its steps unreaped.
             if let Some(path) = cgroup_path.as_ref() {
@@ -5343,10 +7434,7 @@ impl SlurmAgent for AgentService {
                     run_attempt = req.run_attempt,
                     "stepd superseded by a newer attempt before it could be tracked; aborting"
                 );
-                if let Err(error) = stop_stepd_process(&descriptor).await {
-                    warn!(job_id = req.job_id, %error, "failed to stop superseded stepd");
-                }
-                cleanup_stepd_files(&descriptor);
+                discard_stepd_session(&descriptor).await;
                 return Err(Status::failed_precondition(format!(
                     "job {} was superseded by a newer attempt on this node",
                     req.job_id
@@ -5367,9 +7455,7 @@ impl SlurmAgent for AgentService {
                     .await
                     .remove(&(req.job_id, spur_core::step::STEP_EXTERN));
                 if let Some(descriptor) = removed {
-                    if let Err(error) = stop_stepd_process(&descriptor).await {
-                        warn!(job_id = req.job_id, %error, "failed to stop redundant stepd");
-                    }
+                    discard_stepd_session(&descriptor).await;
                 }
             }
             return Err(Status::already_exists(format!(
@@ -5398,8 +7484,8 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // Matches the epoch the allocation table was keyed with; 0 from an
-                // older controller keeps the previous stale-report-disabled behavior.
+                // Matches the epoch the allocation table was keyed with, which
+                // the attempt-0 refusal above has already made a real one.
                 run_attempt: req.run_attempt,
                 cgroup_path,
             },
@@ -6522,6 +8608,15 @@ impl SlurmAgent for AgentService {
             }
         };
 
+        // A reserved id names the job's own supervisor, which this would then
+        // fence and replace with a shell.
+        if !spur_core::step::is_user_step(init.step_id) {
+            return Err(Status::invalid_argument(format!(
+                "step {} is reserved and cannot host a session",
+                init.step_id
+            )));
+        }
+
         self.check_job_access(init.job_id, identity.as_ref(), &init.user, "attach to")
             .await?;
 
@@ -6540,8 +8635,8 @@ impl SlurmAgent for AgentService {
         let interactive = !init.non_interactive;
 
         // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
-        // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
-        // inside spawn_pty_in_job, which is a static helper with no access to the agent config.
+        // interactive PTY into a root job must obey allow_root_jobs too. Checked here because
+        // nothing further down the supervised launch can read the agent's config.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             entry.uid,
             self.allow_root_jobs,
@@ -6624,18 +8719,14 @@ impl SlurmAgent for AgentService {
             );
         }
 
-        // The supervisor that outlives this agent, so a terminal it is holding
-        // can be found again after a restart.
-        let custody_dir = stepds_for_job(&*self.stepds.lock().await, init.job_id)
+        // Left by an agent that predates supervised terminals: its shell has no
+        // supervisor of its own, so the job's holds the master on its behalf.
+        let legacy_custody_dir = stepds_for_job(&*self.stepds.lock().await, init.job_id)
             .into_iter()
             .find(|descriptor| !spur_core::step::is_user_step(descriptor.step_id))
             .and_then(|descriptor| descriptor.socket_path.parent().map(|dir| dir.to_path_buf()));
-
-        // Resume rather than open a new one: a terminal held for a job this
-        // agent is not already bridging was orphaned when its agent went away,
-        // and its user wants it back.
         let already_bridging = self.live_ptys.lock().await.contains(&init.job_id);
-        let reclaimed = match custody_dir.as_deref() {
+        let legacy = match legacy_custody_dir.as_deref() {
             Some(dir) if !already_bridging => match crate::stepd::reclaim_orphaned_pty(dir).await {
                 Ok(found) => found,
                 Err(error) => {
@@ -6643,76 +8734,56 @@ impl SlurmAgent for AgentService {
                     None
                 }
             },
-            _ => {
-                if custody_dir.is_none() {
-                    warn!(
-                        job_id = init.job_id,
-                        "no supervisor to hold this terminal; it will not survive a restart"
-                    );
-                }
-                None
-            }
+            _ => None,
         };
 
-        type ExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
-        let (master_fd, wait_exit, child_pid): (std::os::fd::OwnedFd, ExitFuture, i32) =
-            match reclaimed {
-                Some((session_id, master)) => {
-                    let pid = session_id as i32;
-                    info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
-                    (master, Box::pin(wait_for_reparented_exit(pid)), pid)
+        // Only a terminal actually taken from the job's custody is released back
+        // to it; a supervised one is its own supervisor's to hold.
+        let mut release_to_legacy_custody = false;
+        let terminal = match legacy {
+            Some((session_id, master)) => {
+                let pid = session_id as i32;
+                release_to_legacy_custody = true;
+                info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
+                SupervisedTerminal {
+                    master,
+                    pid,
+                    exit: Box::pin(wait_for_reparented_exit(pid)),
                 }
-                None => {
-                    let (master, mut child, pid) = Self::spawn_pty_in_job(
-                        &entry,
-                        &argv,
-                        init.job_id,
-                        winsize.as_ref(),
-                        self.cgroup.required,
-                    )?;
-                    // Deposited with the supervisor, which outlives this agent:
-                    // without a second holder the master closes when the agent
-                    // does and the terminal hangs up under the user.
-                    if let Some(dir) = custody_dir.as_deref() {
-                        if let Err(error) = crate::stepd::deposit_pty_master(
-                            dir,
-                            pid as u32,
-                            std::os::fd::AsFd::as_fd(&master),
-                        )
-                        .await
-                        {
-                            warn!(job_id = init.job_id, pid, %error, "pty master custody failed");
-                        }
-                    }
+            }
+            None => self
+                .attach_terminal(&entry, &init, &argv, winsize)
+                .await
+                .inspect(|terminal| {
                     info!(
                         job_id = init.job_id,
-                        child_pid = pid,
+                        step_id = init.step_id,
+                        child_pid = terminal.pid,
                         overlap = init.overlap,
                         "interactive session started"
-                    );
-                    let exit = async move {
-                        child
-                            .wait()
-                            .await
-                            .ok()
-                            .and_then(|s| s.code())
-                            .unwrap_or(128)
-                    };
-                    (master, Box::pin(exit), pid)
-                }
-            };
+                    )
+                })?,
+        };
 
         self.live_ptys.lock().await.insert(init.job_id);
         let live_ptys = self.live_ptys.clone();
         let job_id = init.job_id;
-        let bridge =
-            Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx);
+        let child_pid = terminal.pid;
+        let bridge = Self::run_pty_bridge(
+            terminal.master,
+            terminal.exit,
+            child_pid,
+            interactive,
+            inbound,
+            tx,
+        );
         tokio::spawn(async move {
             bridge.await;
             live_ptys.lock().await.remove(&job_id);
-            // The terminal is gone; stop holding its descriptor or it leaks for
-            // as long as the job runs.
-            if let Some(dir) = custody_dir.as_deref() {
+            if let Some(dir) = legacy_custody_dir
+                .as_deref()
+                .filter(|_| release_to_legacy_custody)
+            {
                 if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
                     warn!(job_id, child_pid, %error, "failed to release a closed terminal");
                 }
@@ -6959,7 +9030,10 @@ impl AgentService {
     /// attempt between the caller's peek and this call, and that entry must
     /// survive.
     async fn drop_tracked_job(&self, job_id: u32, run_attempt: u32) {
-        // The cgroup removal and the release below both key off the id, so a launch
+        // Both admission paths refuse attempt 0, so nothing production tracks
+        // widens here; the equality check below is what scopes the settle.
+        let run = RunKey::new(job_id, run_attempt).unwrap_or(RunKey::any_attempt(job_id));
+        // The cgroup removal and the settle below both key off the id, so a launch
         // reusing it must not interleave with them.
         let _lifecycle = self.lifecycle.acquire(job_id).await;
         // Scoped so the guard is gone before `cgroup` is dropped below: removing
@@ -6971,7 +9045,6 @@ impl AgentService {
                 .is_some_and(|current| current.run_attempt == run_attempt)
             {
                 let (tracked, cgroup) = remove_tracked_job(&mut jobs, job_id);
-                self.allocation.lock().await.release_job(job_id);
                 (tracked.is_some(), cgroup)
             } else {
                 (false, executor::CgroupGuard::new(None))
@@ -6980,6 +9053,11 @@ impl AgentService {
         drop(cgroup);
         if !removed {
             return;
+        }
+        // Tracking is gone, but the slice is the record's to hand back: a hook
+        // still running under this run is still standing on the cores.
+        if run.attempt().is_some() {
+            self.settle_cancelled_run(run).await;
         }
         let stale_sessions = {
             let mut sessions = self.stepds.lock().await;
@@ -7002,6 +9080,81 @@ impl AgentService {
         }
     }
 
+    /// Settle a cancelled run, as an acknowledged completion settles one. What
+    /// teardown still owes is recorded first, so the gate below can refuse.
+    async fn settle_cancelled_run(&self, run: RunKey) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        let admissions = self.admissions();
+        let hooks = self.hooks.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            let epilog = cancelled_epilog_owed(&admissions, &hooks, run);
+            admissions.mark_controller_cancelled(run)?;
+            admissions.mark_run_cleaned(run, epilog)
+        })
+        .await;
+        match recorded {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a cancelled run's teardown")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "cancel-record task failed"),
+        }
+        match settle_and_release_run(&self.allocation, &self.admissions(), run).await {
+            Ok(SettleRunOutcome::NotQuiescent) => info!(
+                job_id,
+                run_attempt, "holding a cancelled run's slice until its epilog ends"
+            ),
+            // Absent under the lifecycle guard, which excludes the launch that
+            // would write it: no record then means no payload and no hook.
+            Ok(SettleRunOutcome::NoRecord) => {
+                if self
+                    .allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::never_spawned(run))
+                {
+                    info!(
+                        job_id,
+                        run_attempt, "released a reservation nothing was spawned against"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(job_id, run_attempt, %error, "failed to settle a cancelled run's record")
+            }
+        }
+    }
+
+    /// The attempt this node's claim index still charges for `job_id`. The only
+    /// name a reservation whose launch never reached the tracking map still has.
+    async fn charged_attempt(&self, job_id: u32) -> Option<u32> {
+        self.allocation.lock().await.charged_attempt(job_id)
+    }
+
+    /// Note the controller's cancel on a run still being torn down, and the hook
+    /// its teardown owes: settling here frees the slice under processes still exiting.
+    async fn mark_controller_cancelled(&self, run: RunKey) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        let admissions = self.admissions();
+        let hooks = self.hooks.clone();
+        let marked = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+            if !admissions.mark_controller_cancelled(run)? {
+                return Ok(false);
+            }
+            hold_cancelled_run_for_epilog(&admissions, &hooks, run)?;
+            Ok(true)
+        })
+        .await;
+        match marked {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a run's cancellation")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "cancel-record task failed"),
+        }
+    }
+
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
     /// `cpus`/`memory_mb` are the resolved grant, so the core IDs match it.
     async fn allocate_local_resources(
@@ -7012,7 +9165,17 @@ impl AgentService {
         allocated: Option<&ResourceAllocations>,
         cpus: u32,
         memory_mb: u64,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u32>), LaunchRejection> {
+        // A zero request reserves an empty cpuset on a node with nothing free,
+        // which confirms as an allocation mismatch instead of refusing here.
+        if cpus == 0 {
+            warn!(job_id, "rejecting launch: it would reserve no cpu at all");
+            return Err(Status::resource_exhausted(
+                "a launch must reserve at least one cpu on this node",
+            )
+            .into());
+        }
+
         let controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -7025,7 +9188,8 @@ impl AgentService {
                 "job requests {} GPUs (type: {}) but controller sent no device IDs",
                 gres_gpu_count,
                 gres_gpu_type.as_deref().unwrap_or("any"),
-            )));
+            ))
+            .into());
         }
 
         // Hold running across the reclaim (running-then-allocation, as in commit)
@@ -7035,88 +9199,81 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        let result = match alloc.allocate_for_job(
-            job_id,
-            run_attempt,
-            cpus,
-            memory_mb,
-            &controller_gpu_ids,
-        ) {
-            Ok(result) => result,
-            Err(AllocError::GpusUnavailable) => {
-                // A conflicting owner absent from the live set is stale (the
-                // controller only re-launches after freeing it); reclaim and retry.
-                let stale: Vec<u32> = alloc
-                    .conflicting_owners(&controller_gpu_ids)
-                    .into_iter()
-                    .filter(|owner| !live.contains(owner))
-                    .collect();
-                if !stale.is_empty() {
+        let result =
+            match alloc.allocate_for_job(job_id, run_attempt, cpus, memory_mb, &controller_gpu_ids)
+            {
+                Ok(result) => result,
+                Err(AllocError::GpusUnavailable) => {
+                    // An owner absent from the live set is unaccounted for, not
+                    // finished. Displacing it puts two jobs on one GPU.
+                    let conflicting = alloc.conflicting_owners(&controller_gpu_ids);
+                    let unaccounted: Vec<u32> = conflicting
+                        .iter()
+                        .copied()
+                        .filter(|owner| !live.contains(owner))
+                        .collect();
                     warn!(
                         job_id,
-                        reclaimed = ?stale,
                         requested = ?controller_gpu_ids,
-                        "reclaiming stale GPU owners no longer running, then retrying dispatch"
+                        ?unaccounted,
+                        already_allocated = ?alloc.allocated_gpu_ids(),
+                        "refusing dispatch: the allocated GPUs are held on this node"
                     );
-                    for owner in &stale {
-                        alloc.release_job(*owner);
-                    }
+                    // The unaccounted owner first: a live one holding the same
+                    // device is the controller's own doing, not the drift.
+                    let holder = unaccounted.first().or(conflicting.first()).copied();
+                    return Err(LaunchRejection::Held(held_refusal(
+                        &alloc,
+                        holder,
+                        "allocated resources unavailable on this node",
+                    )));
                 }
-                match alloc.allocate_for_job(
-                    job_id,
-                    run_attempt,
-                    cpus,
-                    memory_mb,
-                    &controller_gpu_ids,
-                ) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(
-                            job_id,
-                            requested = ?controller_gpu_ids,
-                            already_allocated = ?alloc.allocated_gpu_ids(),
-                            "rejecting dispatch: controller-allocated GPUs already in use in the \
-                             local allocation table by a still-running or launching job"
-                        );
-                        return Err(Status::resource_exhausted(
-                            "controller-allocated GPUs unavailable on this node",
-                        ));
-                    }
+                Err(AllocError::DuplicateJob) => {
+                    // A launch is already in flight for this job id (reserved, not
+                    // yet committed or released). This is a concurrent duplicate,
+                    // not resource exhaustion.
+                    warn!(
+                        job_id,
+                        "rejecting duplicate launch: a launch is already in flight for this job"
+                    );
+                    return Err(Status::already_exists(format!(
+                        "job {job_id} already has a launch in flight on this node"
+                    ))
+                    .into());
                 }
-            }
-            Err(AllocError::DuplicateJob) => {
-                // A launch is already in flight for this job id (reserved, not
-                // yet committed or released). This is a concurrent duplicate,
-                // not resource exhaustion.
-                warn!(
-                    job_id,
-                    "rejecting duplicate launch: a launch is already in flight for this job"
-                );
-                return Err(Status::already_exists(format!(
-                    "job {job_id} already has a launch in flight on this node"
-                )));
-            }
-            Err(AllocError::Superseded) => {
-                // A newer attempt already reserved/committed this job id; this
-                // is a late or duplicate LaunchJob for an older attempt.
-                warn!(
+                Err(AllocError::Superseded) => {
+                    // A newer attempt already reserved/committed this job id; this
+                    // is a late or duplicate LaunchJob for an older attempt.
+                    warn!(
                     job_id,
                     run_attempt,
                     "rejecting launch: superseded by a newer attempt already tracked on this node"
                 );
-                return Err(Status::failed_precondition(format!(
-                    "job {job_id} was superseded by a newer attempt on this node"
-                )));
-            }
-            // Only a replay of recorded cores can raise this; dispatch derives
-            // its own, so reaching here means the ledger disagrees with the node.
-            Err(AllocError::CpusUnavailable) => {
-                warn!(job_id, "rejecting launch: allocated cores unavailable");
-                return Err(Status::resource_exhausted(
-                    "allocated cores unavailable on this node",
-                ));
-            }
-        };
+                    return Err(Status::failed_precondition(format!(
+                        "job {job_id} was superseded by a newer attempt on this node"
+                    ))
+                    .into());
+                }
+                // Reachable on dispatch now that a shortfall refuses rather than
+                // serving a short list the caller reads as a full allocation.
+                Err(AllocError::CpusUnavailable) => {
+                    warn!(job_id, "rejecting launch: allocated cores unavailable");
+                    let holder = unexplained_cpu_holder(&alloc, &live);
+                    return Err(LaunchRejection::Held(held_refusal(
+                        &alloc,
+                        holder,
+                        "allocated cores unavailable on this node",
+                    )));
+                }
+                // Unattributed whatever the node holds: a conflict carries cores
+                // and devices, and neither can say whose memory is in the way.
+                Err(AllocError::MemoryUnavailable) => {
+                    warn!(job_id, "rejecting launch: no room for the requested memory");
+                    return Err(LaunchRejection::Held(HeldRefusal::unattributed(
+                        "allocated memory unavailable on this node",
+                    )));
+                }
+            };
 
         let gpu_ids = controller_gpu_ids;
         Ok((result, gpu_ids))
@@ -7130,7 +9287,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u32>), LaunchRejection> {
         let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
         self.allocate_local_resources(job_id, 1, spec, allocated, cpus, memory_mb)
             .await
@@ -7967,107 +10124,6 @@ impl AgentService {
         }
     }
 
-    fn spawn_pty_in_job(
-        entry: &crate::job_entry::JobEntry,
-        argv: &[String],
-        job_id: u32,
-        winsize: Option<&crate::pty::WindowSize>,
-        cgroup_required: bool,
-    ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
-        use std::os::fd::AsRawFd;
-        use std::process::Stdio;
-
-        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
-            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
-
-        let shell = if argv.is_empty() {
-            let bash_exists = if entry.pid > 0 && entry.has_mount_namespace {
-                std::path::Path::new(&format!("/proc/{}/root/bin/bash", entry.pid)).exists()
-            } else {
-                std::path::Path::new("/bin/bash").exists()
-            };
-            if bash_exists {
-                vec!["/bin/bash".to_string()]
-            } else {
-                vec!["/bin/sh".to_string()]
-            }
-        } else {
-            argv.to_vec()
-        };
-
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
-
-        let plan = build_launch_plan(entry, priv_drop.as_ref(), &shell);
-        let containment = ChildContainment::for_plan(&plan, entry, priv_drop, cgroup_required);
-        let launch_cmd = plan.program;
-        let launch_args = plan.args;
-
-        let mut cmd = tokio::process::Command::new(&launch_cmd);
-        let work_dir = if entry.work_dir.is_empty() {
-            "/tmp"
-        } else {
-            &entry.work_dir
-        };
-        cmd.args(&launch_args)
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        // Start from an empty environment so spurd's own environment (which may
-        // hold daemon secrets) never leaks into the session; then apply the job's
-        // own environment.
-        cmd.env_clear();
-        cmd.env("TERM", "xterm-256color");
-        for (k, v) in Self::session_environ(entry) {
-            cmd.env(k, v);
-        }
-        for (k, v) in entry.env_vars(job_id) {
-            cmd.env(k, v);
-        }
-        if entry.uid > 0 {
-            if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
-                .ok()
-                .flatten()
-            {
-                cmd.env("HOME", user.dir.to_string_lossy().as_ref());
-                cmd.env("USER", &user.name);
-                cmd.env("LOGNAME", &user.name);
-                cmd.env("SHELL", user.shell.to_string_lossy().as_ref());
-            }
-        }
-
-        let raw = crate::executor::JobIoRaw::Pty {
-            master: master.as_raw_fd(),
-            slave: slave.as_raw_fd(),
-        };
-        // Hooks run in registration order, so the child wires its PTY, then
-        // joins the job's cgroup, then drops privilege.
-        unsafe {
-            cmd.pre_exec(move || raw.wire());
-        }
-        containment.register(&mut cmd);
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| Status::internal(format!("spawn PTY shell: {e}")))?;
-        let child_pid = child
-            .id()
-            .ok_or_else(|| Status::internal("spawned PTY child exited before pid could be read"))?
-            as i32;
-
-        drop(slave);
-
-        // Set non-blocking so AsyncFd reads/writes are correct.
-        nix::fcntl::fcntl(
-            &master,
-            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
-
-        Ok((master, child, child_pid))
-    }
-
     /// Read environment variables from a running process via /proc.
     fn read_proc_environ(pid: u32) -> Vec<(String, String)> {
         const MAX_ENVIRON: usize = 1 << 20; // 1 MiB
@@ -8214,6 +10270,7 @@ impl AgentService {
 mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
+    use std::collections::HashSet;
     use tonic::Request;
 
     #[test]
@@ -8382,6 +10439,85 @@ mod tests {
         assert!(retained.exists());
     }
 
+    // Nothing else reaches an interactive shell: it has no `active_steps` entry,
+    // and `cancel_active_steps_for_job` skips supervised steps by design.
+    #[tokio::test]
+    async fn a_cancel_reaches_a_terminal_tracked_the_way_its_launch_tracks_it() {
+        let terminal_step = 7;
+        let sessions: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        for step_id in [spur_core::step::STEP_BATCH, terminal_step] {
+            claim_stepd_slot(
+                &sessions,
+                crate::stepd::StepdDescriptor::new(
+                    42,
+                    3,
+                    step_id,
+                    0,
+                    0,
+                    std::path::PathBuf::from("/tmp/runtime.sock"),
+                    std::path::PathBuf::new(),
+                ),
+            )
+            .await
+            .expect("a terminal must claim its slot");
+        }
+
+        let reached: Vec<u32> = stepds_for_attempt(&*sessions.lock().await, 42, 3)
+            .into_iter()
+            .map(|descriptor| descriptor.step_id)
+            .collect();
+        assert!(
+            reached.contains(&terminal_step),
+            "a cancel must reach the terminal: {reached:?}"
+        );
+        assert!(stepds_for_attempt(&*sessions.lock().await, 42, 4).is_empty());
+    }
+
+    // A second client must be refused rather than handed the same master: two
+    // bridges on one terminal interleave the user's keystrokes.
+    #[tokio::test]
+    async fn a_second_client_cannot_take_over_a_terminal_that_still_has_one() {
+        let completions = crate::step_completion::StepCompletions::new();
+        let first = completions
+            .reregister(42, 3, 7)
+            .await
+            .expect("the first client takes the terminal");
+
+        assert!(
+            completions.reregister(42, 3, 7).await.is_none(),
+            "a second client must not displace the first"
+        );
+
+        drop(first);
+        assert!(
+            completions.reregister(42, 3, 7).await.is_some(),
+            "the terminal is free again once its client is gone"
+        );
+    }
+
+    // An unreadable supervisor is not a dead one. Treating it as dead makes the
+    // fresh launch fence it, killing the shell the client asked to resume.
+    #[test]
+    fn only_a_supervisor_confirmed_dead_is_launched_over() {
+        assert!(confirmed_gone(Ok(crate::stepd::StepdLiveness::Stale)));
+        assert!(!confirmed_gone(Ok(crate::stepd::StepdLiveness::Live)));
+        assert!(!confirmed_gone(Err(std::io::Error::other("unreadable"))));
+    }
+
+    #[test]
+    fn a_live_supervisor_reads_as_live_through_the_descriptor() {
+        let live = crate::stepd::StepdDescriptor::new(
+            42,
+            3,
+            7,
+            std::process::id(),
+            crate::stepd::process_start_ticks(std::process::id()).unwrap_or(0),
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert!(!terminal_supervisor_is_gone(&live));
+    }
+
     #[test]
     fn runtime_displacement_requires_a_strictly_newer_attempt() {
         let displaced = crate::stepd::StepdDescriptor::new(
@@ -8541,6 +10677,69 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
+    }
+
+    /// A superseded attempt can never finalize, so without this reap a
+    /// relaunching job leaves one directory per attempt behind.
+    #[tokio::test]
+    async fn fence_displaced_stepd_reaps_a_superseded_attempts_session_dir() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        let cgroup = TestCgroup::new(&cgroup_root);
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(42, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        std::fs::write(session_dir.join("launch.json"), b"{}").expect("seed session contents");
+
+        let displaced = crate::stepd::StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            session_dir.join("runtime.sock"),
+            cgroup.path().to_path_buf(),
+        );
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&displaced), displaced.clone());
+
+        fence_displaced_stepd(&sessions, 42, spur_core::step::STEP_BATCH, 2)
+            .await
+            .expect("fencing a dead supervisor succeeds");
+
+        assert!(
+            !session_dir.exists(),
+            "attempt 1's session directory must not outlive the attempt that displaced it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_of_the_same_attempt_keeps_the_session_dir_it_reuses() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(42, 3, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let displaced = crate::stepd::StepdDescriptor::new(
+            42,
+            3,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            session_dir.join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        discard_superseded_session(&displaced, 3);
+
+        assert!(
+            session_dir.exists(),
+            "the incoming attempt writes into this very directory"
+        );
     }
 
     // A successful unit stop must NOT substitute for cgroup confirmation: the
@@ -8922,7 +11121,9 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
-        assert_eq!(allocation.lock().await.allocated_memory_mb, 0);
+        // The exit stops the tracking; only an acknowledged completion frees
+        // the slice, because until then nothing but this node knows it stopped.
+        assert_eq!(allocation.lock().await.allocated_memory_mb, 128);
         assert!(!store
             .session_dir(42, 7, spur_core::step::STEP_BATCH)
             .exists());
@@ -8987,8 +11188,8 @@ mod tests {
         assert!(!running.lock().await.contains_key(&42));
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
-            0,
-            "the last step out releases the allocation"
+            128,
+            "even the last step out only stops tracking; the slice waits on the controller"
         );
     }
 
@@ -9101,8 +11302,8 @@ mod tests {
 
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
-            0,
-            "a session left by an older attempt has no claim on this one"
+            128,
+            "a session left by an older attempt cannot free the current one's slice"
         );
     }
 
@@ -9295,6 +11496,203 @@ mod tests {
         descriptor
     }
 
+    /// The same session, naming a real running process as its workload.
+    fn fenced_session_holding(
+        store: &crate::stepd::StepdStore,
+        workload_pid: u32,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut descriptor = fenced_session(store);
+        descriptor.workload_pid = workload_pid;
+        descriptor.workload_start_ticks =
+            crate::stepd::process_start_ticks(workload_pid).expect("workload start ticks");
+        store.publish(&descriptor).expect("publish descriptor");
+        descriptor
+    }
+
+    // Reaping only the cgroup leaves the workload running wherever cgroups are
+    // unavailable, which is every job on a node that cannot use them.
+    #[tokio::test]
+    async fn fencing_a_dead_stepd_reaps_the_workload_it_left_behind() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let descriptor = fenced_session_holding(&store, child.id());
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        fence_dead_stepd(&context, descriptor.clone()).await;
+
+        assert!(
+            !crate::stepd::process_is_live(
+                descriptor.workload_pid,
+                descriptor.workload_start_ticks
+            ),
+            "the fenced workload must actually be dead, not merely reported so"
+        );
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "with the workload gone the run's completion must reach the controller"
+        );
+        let _ = child.wait();
+    }
+
+    // The agent's tracked copy is written before the launch returns, so it names
+    // no workload. Answering from it declares a live payload dead.
+    #[tokio::test]
+    async fn fencing_reads_the_workload_the_supervisor_published_not_the_stale_copy() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let published = fenced_session_holding(&store, child.id());
+        let mut stale = published.clone();
+        stale.workload_pid = 0;
+        stale.workload_start_ticks = 0;
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&stale), stale.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        fence_dead_stepd(&context, stale).await;
+
+        assert!(
+            !crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks),
+            "the fence must kill the workload the supervisor published, not the one it was handed"
+        );
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "with the workload gone the run's completion must reach the controller"
+        );
+        let _ = child.wait();
+    }
+
+    // A run-ending report discharges every sibling's obligation, so the owner
+    // step's own evidence is not enough to license it.
+    #[tokio::test]
+    async fn a_sibling_step_still_running_withholds_the_runs_completion() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let owner = fenced_session(&store);
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+
+        let sibling_step = 0;
+        let mut sibling = crate::stepd::StepdDescriptor::new(
+            owner.job_id,
+            owner.run_attempt,
+            sibling_step,
+            owner.pid,
+            owner.process_start_ticks,
+            store
+                .session_dir(owner.job_id, owner.run_attempt, sibling_step)
+                .join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        sibling.workload_pid = child.id();
+        sibling.workload_start_ticks =
+            crate::stepd::process_start_ticks(child.id()).expect("workload start ticks");
+        store
+            .publish(&sibling)
+            .expect("publish the sibling session");
+
+        assert!(
+            payload_still_executing(&CompletionReport {
+                job_id: owner.job_id,
+                exit_code: 0,
+                signal: 0,
+                run_attempt: owner.run_attempt,
+                reporting_node: "test-node",
+                drain: None,
+                step_id: Some(owner.step_id),
+                payload: PayloadEvidence::Supervised(&store),
+            }),
+            "the owner step is done, but the run's payload is not"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // The gate that keeps a slice from being freed under a running payload. It
+    // is the report that must not go: an acknowledgement is what frees cores.
+    #[tokio::test]
+    async fn a_run_whose_payload_is_still_executing_reports_nothing() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let descriptor = fenced_session_holding(&store, child.id());
+
+        let outcome = report_completion(
+            &controller_addr,
+            CompletionReport {
+                job_id: descriptor.job_id,
+                exit_code: 0,
+                signal: 0,
+                run_attempt: descriptor.run_attempt,
+                reporting_node: "test-node",
+                drain: None,
+                step_id: Some(descriptor.step_id),
+                payload: PayloadEvidence::Supervised(&store),
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, CompletionOutcome::Undelivered);
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            0,
+            "a report the controller would acknowledge is a slice freed under a live payload"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     async fn fence_against_controller(controller_addr: String, store: &crate::stepd::StepdStore) {
         let descriptor = fenced_session(store);
         let running = new_running_jobs();
@@ -9346,6 +11744,611 @@ mod tests {
             0,
             "an acknowledged report leaves nothing for the replay loop"
         );
+    }
+
+    /// Fence a run that really holds two of this node's four cores, so the
+    /// assertion is about the slice and not only about the report.
+    async fn fence_a_slice_holding_run(
+        controller_addr: String,
+        store: &crate::stepd::StepdStore,
+        admissions: &crate::admission::AdmissionStore,
+    ) -> Arc<Mutex<NodeAllocation>> {
+        let descriptor = fenced_session(store);
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 4,
+                memory_mb: 8_000,
+                ..Default::default()
+            },
+        )));
+        let reserved = allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 7, 2, 1_000, &[])
+            .expect("reserve the run's cores");
+        allocation.lock().await.commit_job(42, 7);
+
+        let mut run = crate::admission::RunAdmission::new(
+            42,
+            7,
+            "test-node",
+            crate::admission::AdmittedResources {
+                cpu_ids: reserved.cpu_ids.clone(),
+                memory_mb: reserved.memory_mb,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit the run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+            "test-node",
+            run.allocation.clone(),
+        );
+        participant.final_report.required = true;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &new_running_jobs(),
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            store,
+        );
+        context.controller_addr = controller_addr;
+        context.admissions = admissions.clone();
+        fence_dead_stepd(&context, descriptor).await;
+        allocation
+    }
+
+    /// This process's pid with the wrong start time, so the liveness check reads
+    /// it as gone without depending on any other pid.
+    fn a_gone_supervisor() -> crate::admission::SupervisorRef {
+        let pid = std::process::id();
+        crate::admission::SupervisorRef {
+            pid,
+            start_ticks: crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            boot_id: crate::admission::current_boot_id(),
+        }
+    }
+
+    fn a_live_supervisor() -> crate::admission::SupervisorRef {
+        let pid = std::process::id();
+        crate::admission::SupervisorRef {
+            pid,
+            start_ticks: crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            boot_id: crate::admission::current_boot_id(),
+        }
+    }
+
+    /// A run holding the named cores, whose step owes a report and whose
+    /// supervisor is whatever the caller wants it to be.
+    fn admit_a_supervised_run(
+        admissions: &crate::admission::AdmissionStore,
+        node: &str,
+        job_id: u32,
+        cpu_ids: Vec<u32>,
+        supervisor: Option<crate::admission::SupervisorRef>,
+    ) {
+        let mut run = crate::admission::RunAdmission::new(
+            job_id,
+            1,
+            node,
+            crate::admission::AdmittedResources {
+                cpu_ids,
+                memory_mb: 1_000,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit the run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            node,
+            run.allocation.clone(),
+        );
+        participant.final_report.required = true;
+        participant.lifecycle = crate::admission::ParticipantLifecycle::Running;
+        participant.supervisor = supervisor;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+    }
+
+    fn four_core_node() -> Arc<Mutex<NodeAllocation>> {
+        Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 4,
+                memory_mb: 8_000,
+                ..Default::default()
+            },
+        )))
+    }
+
+    // A supervisor that died without reporting left nothing to report, so the
+    // agent never asked and the record charged cores across every restart.
+    #[tokio::test]
+    async fn a_run_nothing_can_speak_for_is_reported_and_its_slice_freed() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "the loss has to be reported before anything is concluded"
+        );
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "the slice goes back on the acknowledgement, as on every other path"
+        );
+        assert!(
+            admissions.ledger_cut("session-a").entries.is_empty(),
+            "and the cut stops advertising a claim the node no longer holds"
+        );
+        assert_eq!(
+            admissions
+                .sweep(crate::admission::now_unix_ms(), 1, &HashSet::new())
+                .expect("sweep"),
+            1,
+            "nothing is owed any more, so the record is collectable"
+        );
+    }
+
+    // Three of these covering the same cores took a four-core node to nothing
+    // usable, and a restart made it worse rather than better.
+    #[tokio::test]
+    async fn a_restart_holding_records_nothing_can_speak_for_recovers_the_pool() {
+        let (controller_addr, _reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        for job_id in [30_866, 30_867, 30_868] {
+            admit_a_supervised_run(
+                &admissions,
+                "test-node",
+                job_id,
+                vec![0, 1, 2, 3],
+                Some(a_gone_supervisor()),
+            );
+            let _ = allocation
+                .lock()
+                .await
+                .restore_for_job(job_id, 1, &[0, 1, 2, 3], 1_000, &[]);
+        }
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            0,
+            "the restart charges every record, which is what wedged the node"
+        );
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "every one of them is reported and acknowledged, so the pool comes back"
+        );
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(99, 1, 4, 1_000, &[])
+            .expect("the node must be able to take work again");
+    }
+
+    // The failure that matters most: a report would have the controller free
+    // the cores of a job that is still running on them.
+    #[tokio::test]
+    async fn a_run_whose_supervisor_is_alive_is_never_reported_lost() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_live_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert!(reports.lock().expect("completion reports").is_empty());
+        assert_eq!(allocation.lock().await.free_cpus(), 2);
+    }
+
+    // A run still mid-launch has recorded no supervisor at all, and a missing
+    // one is not a dead one.
+    #[tokio::test]
+    async fn a_run_with_no_recorded_supervisor_is_never_reported_lost() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(&admissions, "test-node", 42, vec![0, 1], None);
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert!(reports.lock().expect("completion reports").is_empty());
+        assert_eq!(allocation.lock().await.free_cpus(), 2);
+    }
+
+    /// The session a supervisor leaves behind, naming `workload` as the process
+    /// it launched. The supervisor itself is recorded as one already gone.
+    fn publish_session_for_workload(
+        store: &crate::stepd::StepdStore,
+        job_id: u32,
+        workload: &crate::admission::SupervisorRef,
+    ) {
+        let gone = a_gone_supervisor();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            gone.pid,
+            gone.start_ticks,
+            store
+                .session_dir(job_id, 1, spur_core::step::STEP_BATCH)
+                .join("stepd.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.workload_pid = workload.pid;
+        descriptor.workload_start_ticks = workload.start_ticks;
+        descriptor.boot_id = workload.boot_id.clone();
+        store.publish(&descriptor).expect("publish the session");
+    }
+
+    // A supervisor killed outright leaves its payload running. Reporting that
+    // run over frees cores the old work is still executing on.
+    #[tokio::test]
+    async fn a_run_whose_processes_outlived_its_supervisor_is_not_reported_lost() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+        publish_session_for_workload(&store, 42, &a_live_supervisor());
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert!(
+            reports.lock().expect("completion reports").is_empty(),
+            "the payload is still on these cores, so nothing may report the run over"
+        );
+        assert_eq!(allocation.lock().await.free_cpus(), 2);
+    }
+
+    // The same run once its payload is gone: the report it owes must still go.
+    #[tokio::test]
+    async fn a_lost_run_is_reported_once_its_payload_is_gone() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+        publish_session_for_workload(&store, 42, &a_gone_supervisor());
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "a run nothing is left to speak for still owes the controller a report"
+        );
+        assert_eq!(allocation.lock().await.free_cpus(), 4);
+    }
+
+    // The session carries the real exit status; a synthetic loss reported over
+    // it would record the wrong outcome for the job.
+    #[tokio::test]
+    async fn a_run_whose_session_still_holds_an_exit_is_left_to_that_session() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        let gone = a_gone_supervisor();
+        store
+            .publish(&crate::stepd::StepdDescriptor::new(
+                42,
+                1,
+                spur_core::step::STEP_BATCH,
+                gone.pid,
+                gone.start_ticks,
+                store
+                    .session_dir(42, 1, spur_core::step::STEP_BATCH)
+                    .join("runtime.sock"),
+                std::path::PathBuf::new(),
+            ))
+            .expect("publish the session the supervisor left behind");
+        store
+            .obligations(42, 1, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: 0,
+            })
+            .expect("record the exit the supervisor left behind");
+
+        report_runs_nothing_can_speak_for(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await;
+        assert!(
+            reports.lock().expect("completion reports").is_empty(),
+            "an exit left on disk belongs to the session that recorded it"
+        );
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        let sent = reports.lock().expect("completion reports").clone();
+        assert_eq!(sent.len(), 1, "the session reports it, and only once");
+        assert_eq!(
+            sent[0].exit_code, 3,
+            "the recorded status, not a synthetic loss"
+        );
+    }
+
+    #[test]
+    fn a_liveness_read_that_could_not_complete_never_proves_a_supervisor_gone() {
+        use crate::stepd::StepdLiveness;
+        assert_eq!(liveness_of(&[Ok(StepdLiveness::Stale)]), Liveness::Gone);
+        assert_eq!(
+            liveness_of(&[]),
+            Liveness::CannotTell,
+            "nothing read proves nothing"
+        );
+        assert_eq!(
+            liveness_of(&[Ok(StepdLiveness::Stale), Ok(StepdLiveness::Live)]),
+            Liveness::Live
+        );
+        assert_eq!(
+            liveness_of(&[
+                Ok(StepdLiveness::Stale),
+                Err(std::io::Error::other("proc unreadable")),
+            ]),
+            Liveness::CannotTell,
+            "an unreadable process is not a gone one"
+        );
+    }
+
+    /// A controller that lost its state answers NotFound forever. Treating that
+    /// as unfinished business held the cores of a job nothing would ever ack.
+    #[tokio::test]
+    async fn a_completion_the_controller_has_no_record_of_frees_the_slice() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+
+        let allocation = fence_a_slice_holding_run(controller_addr, &store, &admissions).await;
+
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "the death still has to be reported before anything is concluded"
+        );
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "a run the controller has no record of must not hold cores forever"
+        );
+        assert_eq!(
+            pending_replays(&store),
+            0,
+            "replaying a report to a controller that has no record of it is futile"
+        );
+    }
+
+    // A supervisor that ran its hook before dying still said how it ended. Taken
+    // as unknowable, that answer never reaches the record the gate reads.
+    #[tokio::test]
+    async fn fencing_keeps_the_epilog_outcome_the_dead_supervisor_recorded() {
+        let (controller_addr, _reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        store
+            .prepare_session_dir(42, 7, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(42, 7, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 9,
+            })
+            .expect("record the observed exit");
+        obligations
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
+            .expect("record the failed epilog");
+
+        let allocation = fence_a_slice_holding_run(controller_addr, &store, &admissions).await;
+
+        assert_eq!(
+            admissions
+                .load_run(key(42, 7))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Failed,
+            "the ledger's own word on the hook must survive the fence"
+        );
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "a hook that has answered holds nothing, so the cores still go back"
+        );
+    }
+
+    /// The other half of the invariant: only the controller's own definite "no
+    /// such job" settles a run. Silence must leave the slice exactly as it was.
+    #[tokio::test]
+    async fn an_unanswered_completion_still_holds_the_slice() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+
+        let allocation =
+            fence_a_slice_holding_run("http://127.0.0.1:1".into(), &store, &admissions).await;
+
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            2,
+            "an unreachable controller is not evidence that it stopped tracking the run"
+        );
+        assert_eq!(pending_replays(&store), 1);
     }
 
     #[tokio::test]
@@ -9513,6 +12516,10 @@ mod tests {
             .insert(stepd_key(&descriptor), descriptor);
         let state_dir = tempfile::tempdir().expect("state dir");
         let context = CompletionListenerContext {
+            admissions: crate::admission::AdmissionStore::new(
+                std::env::temp_dir().join(format!("spur-test-adm-{}", uuid::Uuid::new_v4())),
+                "test-node",
+            ),
             running: running.clone(),
             step_completions: completions.clone(),
             allocation,
@@ -10462,6 +13469,15 @@ mod tests {
         assert!(!running.lock().await.contains_key(&42));
     }
 
+    /// A namespaced job whose pid cannot exist, so `/proc/<pid>/...` probes and
+    /// `/proc/<pid>/environ` reads resolve the same way on every host.
+    fn dead_pid_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
+        crate::job_entry::JobEntry {
+            pid: i32::MAX,
+            ..nsenter_job_entry(uid, gid)
+        }
+    }
+
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
             pid: 1234,
@@ -10473,6 +13489,142 @@ mod tests {
             work_dir: "/home/user".into(),
             cgroup_path: None,
         }
+    }
+
+    fn terminal_job_facts() -> TerminalJobFacts {
+        TerminalJobFacts {
+            run_attempt: 3,
+            cpus: 4,
+            memory_mb: 2048,
+            gpu_devices: vec![1],
+            partition: "batch".into(),
+            nodelist: "node-a".into(),
+        }
+    }
+
+    fn terminal_config(
+        entry: &crate::job_entry::JobEntry,
+        step_id: u32,
+        winsize: Option<crate::pty::WindowSize>,
+    ) -> executor::JobLaunchConfig {
+        terminal_launch_config(
+            entry,
+            TerminalIdentity {
+                job_id: 42,
+                step_id,
+                node: "node-a".into(),
+            },
+            &["/bin/bash".to_string()],
+            winsize,
+            terminal_job_facts(),
+            spur_core::config::MemlockLimit::Unlimited,
+            CgroupConfig::default(),
+        )
+        .expect("a terminal launch config")
+    }
+
+    // An interactive shell is a supervised launch on a terminal, so the size
+    // the client asked for has to survive into the launch config.
+    #[test]
+    fn a_terminal_launches_on_a_pty_sized_the_way_the_client_asked() {
+        let winsize = crate::pty::WindowSize {
+            rows: 50,
+            cols: 200,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, Some(winsize));
+
+        assert_eq!(config.io_mode, executor::LaunchIo::Pty(Some(winsize)));
+    }
+
+    // A reserved step id sends setup_cgroup down the job-creation branch, where
+    // it would claim the job node the allocation already owns.
+    #[test]
+    fn a_terminal_lands_in_a_cgroup_leaf_below_the_job() {
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+        let job = executor::reapable_cgroup_path(
+            config.job_id,
+            config.run_attempt,
+            spur_core::step::STEP_BATCH,
+        );
+        let leaf =
+            executor::reapable_cgroup_path(config.job_id, config.run_attempt, config.step_id);
+
+        assert_ne!(leaf, job, "a terminal must not claim the job's own node");
+        assert_eq!(
+            leaf.parent(),
+            Some(job.as_path()),
+            "a terminal's cgroup must sit under the job's"
+        );
+        assert_eq!(config.run_attempt, terminal_job_facts().run_attempt);
+    }
+
+    #[test]
+    fn a_terminal_into_a_namespaced_job_enters_it_rather_than_unsharing_again() {
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+
+        assert!(config.joins_parent_namespaces);
+        assert!(
+            config.script.contains("nsenter"),
+            "the terminal must enter the job: {}",
+            config.script
+        );
+    }
+
+    #[test]
+    fn a_terminal_on_a_plain_job_runs_the_shell_without_nsenter() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/home/user".into(),
+            cgroup_path: None,
+        };
+        let config = terminal_config(&entry, 7, None);
+
+        assert!(!config.joins_parent_namespaces);
+        assert!(!config.script.contains("nsenter"), "{}", config.script);
+        assert!(config.script.contains("/bin/bash"), "{}", config.script);
+    }
+
+    // spurd's own environment may hold daemon secrets, so a session starts from
+    // the job's and nothing else.
+    #[test]
+    fn a_terminal_carries_the_jobs_environment_and_a_term() {
+        let config = terminal_config(&dead_pid_job_entry(1000, 1000), 7, None);
+
+        assert_eq!(
+            config.environment.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            config.environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            config.environment.get("SLURM_JOB_ID").map(String::as_str),
+            Some("42")
+        );
+    }
+
+    // An empty argv is the bare `srun --pty`; the shell is resolved inside the
+    // job's mount namespace, not against the host's filesystem.
+    #[test]
+    fn a_session_with_no_command_resolves_a_shell() {
+        let entry = dead_pid_job_entry(1000, 1000);
+        assert_eq!(
+            session_shell(&entry, &[]),
+            vec!["/bin/sh".to_string()],
+            "a namespace whose /proc root cannot be read falls back to sh"
+        );
+        assert_eq!(
+            session_shell(&entry, &["id".to_string()]),
+            vec!["id".to_string()]
+        );
     }
 
     #[test]
@@ -10509,7 +13661,7 @@ mod tests {
 
     #[test]
     fn build_nsenter_argv_pty_shell_wraps_with_setpriv_init_groups() {
-        // spawn_pty_in_job passes the resolved shell as the command.
+        // An interactive session passes the resolved shell as the command.
         let entry = nsenter_job_entry(1000, 1000);
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
         let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
@@ -10617,111 +13769,6 @@ mod tests {
         assert_eq!(plan.program, "echo");
         assert_eq!(plan.args, vec!["hi".to_string()]);
         assert!(plan.apply_priv_in_child);
-    }
-
-    #[tokio::test]
-    async fn spawn_pty_in_job_direct_spawn_runs_command() {
-        // Drives the real spawn_pty_in_job handler (not just the pure planner)
-        // on the direct-spawn path: no namespaces, uid 0 so no privilege drop.
-        // This exercises the build_launch_plan call site inside the handler.
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: None,
-        };
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
-                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
-        assert!(pid > 0);
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-    }
-
-    // The device filter lives on the job cgroup, so a child that fails to join it runs
-    // unfiltered. Under `required` that must abort before exec, not exec and warn.
-    #[tokio::test]
-    async fn a_required_join_that_cannot_land_aborts_the_attach() {
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            // A path with no cgroup.procs: the pre-exec open fails, so the join cannot land.
-            cgroup_path: Some("/nonexistent/spur-required/job_1".into()),
-        };
-
-        let err = AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, true)
-            .expect_err("a required join that cannot land must fail the spawn");
-        assert_eq!(err.code(), tonic::Code::Internal);
-    }
-
-    // The same unjoinable cgroup without `required` is the degraded non-root-agent path:
-    // it must still run rather than refuse the user their shell.
-    #[tokio::test]
-    async fn a_best_effort_join_failure_still_runs_the_command() {
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: Some("/nonexistent/spur-besteffort/job_1".into()),
-        };
-
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, false)
-                .expect("a best-effort join failure must still spawn the command");
-        assert!(pid > 0);
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-    }
-
-    // An attach that keeps spurd's cgroup reaches every device on the node,
-    // including ones the job was never allocated.
-    #[tokio::test]
-    async fn a_pty_attach_joins_the_job_cgroup() {
-        // A plain file stands in for `cgroup.procs`: the child opens and writes
-        // it exactly as it would the kernel's, so no root and no cgroupfs.
-        let cgroup = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("cgroup.procs");
-
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: Some(cgroup.path().to_path_buf()),
-        };
-
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
-                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-
-        let joined =
-            std::fs::read_to_string(cgroup.path().join("cgroup.procs")).expect("read cgroup.procs");
-        assert_eq!(
-            joined.trim(),
-            pid.to_string(),
-            "the attached PTY child must join the job's cgroup"
-        );
     }
 
     #[test]
@@ -10885,6 +13932,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            false,
         ))
     }
 
@@ -10914,6 +13962,7 @@ mod tests {
 
         let err = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 4242,
                 spec: Some(JobSpec {
                     // uid 0 is the default, but state it so the test's subject is unmissable.
@@ -10957,6 +14006,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 4243,
                 spec: Some(JobSpec {
                     uid: 0,
@@ -10996,6 +14046,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 7,
                 spec: Some(JobSpec {
                     name: "prolog-fail".into(),
@@ -11041,6 +14092,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 8,
                 spec: Some(JobSpec {
                     name: "prolog-missing".into(),
@@ -11991,6 +15043,123 @@ mod tests {
         assert_eq!(response.into_inner().exit_code, 0);
     }
 
+    fn append_obligation(
+        store: &crate::stepd::StepdStore,
+        descriptor: &crate::stepd::StepdDescriptor,
+        obligation: &crate::stepd::StepdObligation,
+    ) {
+        store
+            .obligations(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+            .append(obligation)
+            .expect("append the session's obligation");
+    }
+
+    fn record_epilog_completed(
+        store: &crate::stepd::StepdStore,
+        descriptor: &crate::stepd::StepdDescriptor,
+        failed: bool,
+    ) {
+        append_obligation(
+            store,
+            descriptor,
+            &crate::stepd::StepdObligation::EpilogCompleted { failed },
+        );
+    }
+
+    /// The batch step, the one whose supervisor actually runs the node epilog.
+    fn recovered_batch_session(
+        store: &crate::stepd::StepdStore,
+        exit: Option<i32>,
+    ) -> crate::stepd::StepdDescriptor {
+        publish_session(store, spur_core::step::STEP_BATCH, exit)
+    }
+
+    #[test]
+    fn a_recovered_session_with_no_recorded_exit_is_unfinished() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, None);
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Unfinished,
+            "a session that recorded no exit has not reached its hook"
+        );
+    }
+
+    #[test]
+    fn a_recovered_session_is_not_reportable_while_its_epilog_runs() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(0));
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Hooking,
+            "the exit is recorded before the hook runs, so an exit alone must not be reported"
+        );
+    }
+
+    #[test]
+    fn a_recovered_session_reports_once_its_epilog_has_ended() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(4));
+        record_epilog_completed(&store, &descriptor, false);
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Ended {
+                exit_code: 4,
+                signal: 0
+            },
+            "a hook that has said how it ended is no longer on the cores"
+        );
+    }
+
+    #[test]
+    fn a_recovered_session_reports_an_epilog_that_failed() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(0));
+        record_epilog_completed(&store, &descriptor, true);
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Ended {
+                exit_code: 0,
+                signal: 0
+            },
+            "a failed hook has returned; holding its report would strand the run"
+        );
+    }
+
+    #[test]
+    fn an_epilog_recorded_before_a_newer_exit_does_not_report_that_exit() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(0));
+        record_epilog_completed(&store, &descriptor, false);
+        append_obligation(
+            &store,
+            &descriptor,
+            &crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            },
+        );
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Hooking,
+            "an older hook result cannot speak for an exit recorded after it"
+        );
+    }
+
     #[tokio::test]
     async fn await_step_reports_the_exit_a_stale_session_recorded() {
         let state_dir = tempfile::tempdir().expect("state dir");
@@ -12263,7 +15432,6 @@ mod tests {
         );
     }
 
-    // The exec counterpart of the PTY required-join test: `spur exec` must refuse to
     // run outside the job's device filter when `[cgroup] required` and the join fails.
     #[tokio::test]
     async fn a_required_join_that_cannot_land_aborts_the_exec() {
@@ -12578,8 +15746,16 @@ mod tests {
             );
             let flag = Arc::clone(&torn_down);
             async move {
-                teardown_completed_job(&completed, &lifecycle, &running, &allocation, &mpi_host)
-                    .await;
+                teardown_completed_job(
+                    &completed,
+                    &lifecycle,
+                    &running,
+                    &allocation,
+                    &mpi_host,
+                    &svc.admissions(),
+                    crate::admission::EpilogOwed::No,
+                )
+                .await;
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
@@ -12616,6 +15792,7 @@ mod tests {
         );
 
         let mut req = Request::new(RegisterJobAllocationRequest {
+            run_attempt: 1,
             job_id: 49,
             uid: 1234,
             gid: 1234,
@@ -12636,6 +15813,144 @@ mod tests {
         );
     }
 
+    /// Driven through the real RPC: a refusal over resources this node already holds has to reach
+    /// the controller as an answer it can classify, since a transport error carries no kind at all.
+    #[tokio::test]
+    async fn a_launch_refused_over_a_held_slice_answers_with_the_holder() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Job 99 holds the whole node and is not tracked as live: exactly the
+        // claim the controller's own view has lost.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(99, 3, 4, 0, &[])
+                .expect("fill the 4-cpu test node");
+            alloc.commit_job(99, 3);
+        }
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
+                job_id: 7,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 2,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("the refusal is an answer, not a transport failure")
+            .into_inner();
+
+        assert!(!refused.success);
+        assert_eq!(
+            refused.failure_kind,
+            LaunchFailureKind::LaunchFailureLocalOverlap as i32,
+            "a transport error reaches the controller with no kind, so no reconcile fires"
+        );
+        let conflict = refused
+            .conflict
+            .expect("the node knows which job holds the slice");
+        assert_eq!((conflict.job_id, conflict.run_attempt), (99, 3));
+        assert_eq!(conflict.cpu_ids, vec![0, 1, 2, 3]);
+    }
+
+    /// An unaccounted claim is only worth naming if it explains the shortfall. One holding no core
+    /// does not explain a core shortfall, and naming it would send the controller after the wrong job.
+    #[tokio::test]
+    async fn a_core_shortfall_names_only_a_holder_that_holds_cores() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.insert_test_job(99, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            // Unaccounted, but holds memory only: the lowest id, so the naive
+            // scan would reach it first.
+            alloc.allocate_for_job(50, 1, 0, 1_000, &[]).expect("held");
+            alloc.commit_job(50, 1);
+            // The cores are all held by a job the node is tracking as live.
+            alloc.allocate_for_job(99, 1, 4, 0, &[]).expect("held");
+            alloc.commit_job(99, 1);
+        }
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let refusal = held(
+            svc.allocate_local_for_test(7, &spec, None)
+                .await
+                .expect_err("every core is held"),
+        );
+
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState,
+            "job 50 holds no core, so it cannot be the claim behind a core shortfall"
+        );
+        assert!(refusal.conflict.is_none());
+    }
+
+    /// A conflict carries cores and devices, so it can never say whose memory is in the way. The
+    /// node says that plainly rather than naming a job whose claim does not explain the shortfall.
+    #[tokio::test]
+    async fn a_memory_shortfall_refuses_without_naming_a_holder() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // An unaccounted owner is present and still must not be named: it holds
+        // one core, which says nothing about the memory that fell short.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(99, 1, 1, 8_000, &[])
+                .expect("the 8192MB test node has room for this");
+            alloc.commit_job(99, 1);
+        }
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let allocated = ResourceAllocations {
+            cpus: 1,
+            memory_mb: 4096,
+            ..Default::default()
+        };
+        let refusal = held(
+            svc.allocate_local_for_test(7, &spec, Some(&allocated))
+                .await
+                .expect_err("the node has no room for another 4096MB"),
+        );
+
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState
+        );
+        assert!(refusal.conflict.is_none());
+    }
+
     /// A launch aimed at another node's name must be refused: the agent only runs allocations
     /// scheduled onto its own host.
     #[tokio::test]
@@ -12647,8 +15962,9 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
 
-        let err = svc
+        let refused = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 7,
                 target_node: "some-other-node".into(),
                 spec: Some(JobSpec {
@@ -12664,8 +15980,17 @@ mod tests {
                 ..Default::default()
             }))
             .await
-            .expect_err("a launch targeting another node must be refused");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            .expect("the refusal is an answer, not a transport failure")
+            .into_inner();
+        assert!(!refused.success);
+        assert_eq!(
+            refused.failure_kind,
+            LaunchFailureKind::LaunchFailureTargetMismatch as i32
+        );
+        assert!(
+            refused.conflict.is_none(),
+            "a misaddressed launch says nothing about what this node holds"
+        );
     }
 
     #[tokio::test]
@@ -12972,6 +16297,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            run_attempt: 1,
             job_id: 77,
             cpus: 1,
             ..Default::default()
@@ -13445,6 +16771,45 @@ mod tests {
         assert_eq!(result.cpu_ids, vec![0, 1, 2, 3]);
     }
 
+    // An empty cpuset reserves nothing, so it is admitted on a full node and
+    // only fails later, at dispatch confirmation, as a resource mismatch.
+    #[tokio::test]
+    async fn a_launch_that_would_reserve_no_cpu_is_refused_not_admitted() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let spec = JobSpec::default();
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(1, 1, 4, 0, &[])
+            .expect("fill the 4-cpu test node");
+
+        let refused = svc
+            .allocate_local_resources(7, 1, &spec, None, 0, 0)
+            .await
+            .expect_err("a launch reserving nothing must be refused");
+
+        // A bad ask, not a claim this node is holding: nothing for the
+        // controller to reconcile, so it stays a transport error.
+        let LaunchRejection::Failed(status) = refused else {
+            panic!("a zero-cpu ask is a bad launch, not an overlap: {refused:?}");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        let reserved_anything = svc
+            .allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::controller_cancelled(key(7, 1)));
+        assert!(
+            !reserved_anything,
+            "the refusal must not have reserved anything under job 7"
+        );
+    }
+
     // The allocation is authoritative even when it disagrees with the spec.
     #[tokio::test]
     async fn cpuset_follows_the_controller_allocation_over_the_spec() {
@@ -13507,6 +16872,7 @@ mod tests {
             "spur0".into(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            false,
         ))
     }
 
@@ -13540,6 +16906,7 @@ mod tests {
         );
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 65,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
@@ -13584,6 +16951,7 @@ mod tests {
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 77,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
@@ -13691,6 +17059,7 @@ mod tests {
         );
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5350,
             spec: Some(JobSpec {
                 script,
@@ -13747,6 +17116,7 @@ mod tests {
         );
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5351,
             spec: Some(JobSpec {
                 script,
@@ -13792,6 +17162,7 @@ mod tests {
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5352,
             spec: Some(JobSpec {
                 script: "#!/bin/bash\ntrue\n".into(),
@@ -13837,6 +17208,7 @@ mod tests {
         let counter_path = work_dir.path().join("run_count.txt");
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5353,
             spec: Some(JobSpec {
                 script: format!(
@@ -13873,18 +17245,442 @@ mod tests {
         );
     }
 
-    // The monitor loop's reconcile step must reclaim an
-    // allocation whose job is no longer tracked, while sparing a job that is
-    // still in `running`. Exercises the real reconcile_orphaned_allocations
-    // wiring the monitor loop calls, without driving the timed loop.
+    // The kind is derived from the conflict, so an overlap the controller is
+    // told to look up can never arrive without the job to look up.
+    #[test]
+    fn a_refusal_that_names_nothing_never_claims_a_holder_to_look_up() {
+        let held = AllocationResult {
+            cpu_ids: vec![2, 3],
+            gpu_ids: vec![1],
+            memory_mb: 512,
+        };
+        let named = HeldRefusal::named(42, 7, &held).into_response();
+        assert!(!named.success);
+        assert_eq!(
+            named.failure_kind,
+            LaunchFailureKind::LaunchFailureLocalOverlap as i32
+        );
+        let conflict = named.conflict.expect("a named overlap must carry the job");
+        assert_eq!((conflict.job_id, conflict.run_attempt), (42, 7));
+        assert_eq!(conflict.cpu_ids, vec![2, 3]);
+        assert_eq!(conflict.gpu_devices, vec![1]);
+
+        let anonymous = HeldRefusal::unattributed("nothing to attribute").into_response();
+        assert!(!anonymous.success);
+        assert_eq!(
+            anonymous.failure_kind,
+            LaunchFailureKind::LaunchFailureResidualState as i32
+        );
+        assert!(anonymous.conflict.is_none());
+    }
+
+    #[test]
+    fn the_completion_retry_is_capped_but_never_gives_up() {
+        // Unbounded in attempts, bounded in rate: a long outage must not become
+        // a hot loop, and no attempt count may end the obligation.
+        let mut previous = std::time::Duration::ZERO;
+        for attempt in 0..40u32 {
+            let backoff = completion_backoff(attempt, 0);
+            assert!(backoff >= previous || previous >= COMPLETION_RETRY_CAP);
+            assert!(
+                backoff <= COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1),
+                "attempt {attempt} backed off past the cap"
+            );
+            previous = backoff;
+        }
+        assert!(
+            completion_backoff(1000, 0) <= COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn the_retry_is_jittered_so_nodes_do_not_all_return_together() {
+        assert_ne!(completion_backoff(3, 1), completion_backoff(3, 2));
+    }
+
     #[tokio::test]
-    async fn reconcile_reclaims_orphan_but_spares_tracked_job() {
+    async fn a_step_exit_no_longer_frees_the_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(7, 1, 2, 1000, &[]).unwrap();
+            alloc.commit_job(7, 1);
+        }
+        let mut run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        svc.admissions().admit_run(&run).expect("admit");
+
+        // No acknowledgement yet: the exit tells this node the work stopped and
+        // nothing else knows it.
+        assert_eq!(
+            release_acknowledged_allocation(
+                &svc.allocation,
+                &svc.admissions(),
+                key(7, 1),
+                spur_core::step::STEP_BATCH,
+            )
+            .await,
+            ReleaseOutcome::NotDue
+        );
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 6);
+
+        svc.admissions()
+            .record_controller_ack(key(7, 1), 42)
+            .expect("ack");
+        assert_eq!(
+            release_acknowledged_allocation(
+                &svc.allocation,
+                &svc.admissions(),
+                key(7, 1),
+                spur_core::step::STEP_BATCH,
+            )
+            .await,
+            ReleaseOutcome::Freed
+        );
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
+    }
+
+    // One owner nobody can name used to stop collection for the whole node, so
+    // the spool grew for as long as that single job lasted.
+    #[tokio::test]
+    async fn an_unnameable_charge_does_not_stop_the_node_from_collecting() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .restore_for_job(88, 0, &[0, 1], 1000, &[])
+                .expect("a charge that names no attempt");
+        }
+
+        let mut settled = crate::admission::RunAdmission::new(
+            77,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        settled.state = crate::admission::RunState::Cleaned;
+        admissions.admit_run(&settled).expect("admit");
+
+        let mut held = crate::admission::RunAdmission::new(
+            88,
+            4,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        held.state = crate::admission::RunState::Cleaned;
+        admissions.admit_run(&held).expect("admit");
+
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+
+        assert!(
+            admissions.load_run(key(77, 1)).is_err(),
+            "an unrelated job's settled record must still be collected"
+        );
+        assert!(
+            admissions.load_run(key(88, 4)).is_ok(),
+            "the unnameable charge keeps its own records, its release unproven"
+        );
+    }
+
+    // A completion the controller acknowledges late settles the record away from
+    // the release. The sweep must not collect the slice's only instruction.
+    #[tokio::test]
+    async fn a_late_acknowledgement_still_gets_its_slice_back() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(77, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(77, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let mut run = crate::admission::RunAdmission::new(
+            77,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            77,
+            1,
+            spur_core::step::STEP_BATCH,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+        );
+        participant.final_report.required = true;
+        admissions
+            .admit_participant(&participant)
+            .expect("participant");
+
+        // The controller is unreachable, so the report stays owed.
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+        release_due_allocations(&svc.allocation, &admissions).await;
+        assert!(
+            admissions.load_run(key(77, 1)).is_ok(),
+            "an owed report must keep its record"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an unacknowledged completion must not free anything"
+        );
+
+        // The controller returns and the retry loop delivers. The slice comes
+        // back here, on the path that settled it, not on some later sweep.
+        assert!(
+            settle_acknowledged_completion(
+                &svc.allocation,
+                &admissions,
+                key(77, 1),
+                spur_core::step::STEP_BATCH,
+            )
+            .await,
+            "the late delivery must free the slice it settled"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the slice must come back on the delivery that settled the record"
+        );
+
+        // The record-driven safety net finds nothing left to do, and collects.
+        release_due_allocations(&svc.allocation, &admissions).await;
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+        assert!(
+            admissions.load_run(key(77, 1)).is_err(),
+            "and the released record must not become immortal"
+        );
+    }
+
+    // A cancel is the controller resolving the hold. Nothing else clears one,
+    // so without this the record outlives the claim it preserved.
+    #[tokio::test]
+    async fn cancelling_an_untracked_claim_settles_the_record_it_leaves_behind() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(6, 1, 2, 1000, &[]).unwrap();
+            alloc.commit_job(6, 1);
+        }
+        let mut run = crate::admission::RunAdmission::new(
+            6,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit");
+        flag_unbacked_allocations(&[(6, 1)], &admissions).await;
+        assert!(admissions
+            .load_run(key(6, 1))
+            .expect("record")
+            .conflict_hold
+            .is_some());
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 6,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert!(
+            admissions
+                .load_run(key(6, 1))
+                .expect("record")
+                .conflict_hold
+                .is_none(),
+            "a hold the controller has resolved must not outlive the cancel"
+        );
+        assert_eq!(
+            admissions
+                .sweep(crate::admission::now_unix_ms(), 3_600_000, &HashSet::new())
+                .expect("sweep"),
+            1,
+            "a settled record must be collectable rather than immortal"
+        );
+    }
+
+    /// Seed a record for `job_id` attempt 1 whose batch step ran `digest`,
+    /// settled or still live, so the digest fence has something to compare to.
+    fn seed_recorded_command(svc: &AgentService, job_id: u32, digest: &str, settled: bool) {
+        let admissions = svc.admissions();
+        let node = svc.reporter.hostname.clone();
+        let mut run = crate::admission::RunAdmission::new(
+            job_id,
+            1,
+            &node,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        if settled {
+            run.state = crate::admission::RunState::Cleaned;
+            run.controller_ack.release_raft_index = Some(1);
+        }
+        admissions.admit_run(&run).expect("admit the run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            &node,
+            crate::admission::AdmittedResources::default(),
+        );
+        participant.command_digest = digest.into();
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+    }
+
+    fn launch_of(digest: &str) -> crate::admission::LaunchFences {
+        let now = crate::admission::now_unix_ms();
+        crate::admission::LaunchFences {
+            issued_at_unix_ms: now,
+            expires_at_unix_ms: now + 60_000,
+            command_digest: digest.into(),
+        }
+    }
+
+    /// A controller that lost its state reissues job id 1, which can land on a
+    /// node still holding the finished predecessor that wore that id.
+    #[tokio::test]
+    async fn a_settled_record_does_not_refuse_a_job_that_reuses_its_identity() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        seed_recorded_command(&svc, 1, "the-dead-predecessor", true);
+
+        assert_eq!(
+            svc.check_launch_fences(
+                1,
+                1,
+                spur_core::step::STEP_BATCH,
+                &launch_of("the-fresh-job")
+            ),
+            None,
+            "a dead predecessor's command says nothing about a new job's"
+        );
+    }
+
+    /// The check the exclusion must not cost us: one live identity being asked
+    /// to run two different commands is still a refusal.
+    #[tokio::test]
+    async fn a_live_record_still_refuses_a_second_command_for_one_identity() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        seed_recorded_command(&svc, 1, "the-running-command", false);
+
+        assert_eq!(
+            svc.check_launch_fences(
+                1,
+                1,
+                spur_core::step::STEP_BATCH,
+                &launch_of("a-different-command")
+            ),
+            Some(crate::admission::LaunchRefusal::ConflictingDigest)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_contested_gpu_is_refused_rather_than_taken_from_its_holder() {
+        // The worst form of the inference: it did not merely free a claim it
+        // could not account for, it handed the device to a different job.
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+
+        // A committed holder of GPU 0 that the agent no longer tracks.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(1, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(1, 1);
+        }
+
+        let spec = JobSpec {
+            gres: vec!["gpu:1".into()],
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        let allocated = ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices,
+        };
+
+        let refused = svc
+            .allocate_local_for_test(2, &spec, Some(&allocated))
+            .await;
+        assert!(refused.is_err(), "the dispatch must be refused");
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "the holder's GPU must still be held"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.conflicting_owners(&[0]),
+            vec![1],
+            "job 1 must still own it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untracked_claim_is_flagged_and_still_held() {
+        let state = tempfile::tempdir().expect("state dir");
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0, 1]),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
-        );
+        )
+        .with_runtime_state_dir(state.path());
 
         // job 1: tracked (live) and committed.
         svc.insert_test_job(1, TrackedJob::dummy(0)).await;
@@ -13899,17 +17695,63 @@ mod tests {
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
-        {
-            let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+        // Both get a record, so the tracked job's untouched hold is a real
+        // assertion rather than a file that was never written.
+        let admissions = svc.admissions();
+        for job_id in [1, 2] {
+            admissions
+                .admit_run(&crate::admission::RunAdmission::new(
+                    job_id,
+                    1,
+                    &svc.reporter.hostname,
+                    crate::admission::AdmittedResources::default(),
+                    crate::admission::now_unix_ms(),
+                ))
+                .expect("admit");
         }
 
-        // Orphan (job 2) reclaimed; live job 1 still holds its GPU.
+        let unbacked = {
+            let jobs = svc.running.lock().await;
+            let alloc = svc.allocation.lock().await;
+            alloc.unbacked_claims(
+                &jobs.keys().copied().collect(),
+                std::time::Instant::now(),
+                LAUNCHING_TTL,
+            )
+        };
+        assert_eq!(unbacked, vec![(2, 1)]);
+        flag_unbacked_allocations(&unbacked, &admissions).await;
+
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
+            0,
+            "a claim with no tracked job must be held, not reclaimed"
         );
+        let flagged = admissions.load_run(key(2, 1)).expect("record");
+        assert!(
+            flagged.conflict_hold.is_some(),
+            "it must be flagged for the controller to resolve"
+        );
+        assert!(
+            admissions
+                .load_run(key(1, 1))
+                .expect("record")
+                .conflict_hold
+                .is_none(),
+            "the tracked job must not be flagged"
+        );
+
+        // A held claim is never released, so a second pass must not rewrite the
+        // record and bury the reason the first one recorded.
+        flag_unbacked_allocations(&unbacked, &admissions).await;
+        assert_eq!(
+            admissions
+                .load_run(key(2, 1))
+                .expect("record")
+                .conflict_hold,
+            flagged.conflict_hold
+        );
+        assert_eq!(svc.free_gpu_count().await, 0);
     }
 
     #[derive(Clone, Default)]
@@ -13970,10 +17812,12 @@ mod tests {
             "monitor should reap the exited job within 5s"
         );
 
+        // The monitor reaps the job, but the controller here is unreachable
+        // (port 1), so no acknowledgement arrives and the slice stays held.
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "the completed job's GPU must be released"
+            0,
+            "an unacknowledged completion must not free the slice"
         );
         let output = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
         assert!(
@@ -13985,7 +17829,7 @@ mod tests {
     // A conflicting owner no longer in `running` is stale and must be reclaimed
     // so the dispatch succeeds instead of stranding the node.
     #[tokio::test]
-    async fn dispatch_reclaims_stale_gpu_owner_not_running() {
+    async fn dispatch_is_refused_when_an_untracked_owner_holds_the_gpu() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -14027,9 +17871,10 @@ mod tests {
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
         assert!(
-            res.is_ok(),
-            "dispatch must reclaim the stale owner's GPU and succeed, got {res:?}"
+            res.is_err(),
+            "the agent cannot tell a finished owner from an unobserved one, so it must refuse"
         );
+        assert_eq!(svc.free_gpu_count().await, 0, "the holder keeps its GPU");
     }
 
     // A conflicting owner still in `running` must never be reclaimed (that would
@@ -14075,8 +17920,11 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
-        let err = res.expect_err("must reject: the conflicting GPU owner is still running");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal =
+            held(res.expect_err("must reject: the conflicting GPU owner is still running"));
+        let conflict = refusal.conflict.expect("the holder is nameable");
+        assert_eq!((conflict.job_id, conflict.run_attempt), (99, 1));
+        assert_eq!(conflict.gpu_devices, vec![0]);
     }
 
     // A still-launching conflicting owner is a real duplicate: the reclaim must
@@ -14120,8 +17968,14 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
-        let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal =
+            held(res.expect_err("must reject: the conflicting GPU owner is still launching"));
+        // A launch in flight is a live duplicate, not a claim to adjudicate, so
+        // the node names nobody and the controller looks at the whole ledger.
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState
+        );
 
         // The launching owner must NOT have been reclaimed.
         assert_eq!(
@@ -14129,6 +17983,15 @@ mod tests {
             0,
             "launching owner must be spared"
         );
+    }
+
+    fn held(rejection: LaunchRejection) -> HeldRefusal {
+        match rejection {
+            LaunchRejection::Held(refusal) => refusal,
+            LaunchRejection::Failed(status) => {
+                panic!("expected a refusal naming what the node holds, got {status:?}")
+            }
+        }
     }
 
     fn gpu_alloc_request(device_ids: &[u32]) -> ResourceAllocations {
@@ -14151,7 +18014,7 @@ mod tests {
     // A dispatch spanning two GPUs each held by a distinct stale owner must
     // reclaim both and succeed.
     #[tokio::test]
-    async fn dispatch_reclaims_multiple_stale_owners() {
+    async fn dispatch_is_refused_when_several_untracked_owners_hold_the_gpus() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0, 1]),
             HooksConfig::default(),
@@ -14176,14 +18039,11 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
-        assert!(
-            res.is_ok(),
-            "both stale owners must be reclaimed, got {res:?}"
-        );
+        assert!(res.is_err(), "neither holder may be displaced");
+        assert_eq!(svc.free_gpu_count().await, 0);
     }
 
-    // A dispatch spanning a stale GPU and a still-running GPU must reject: the
-    // running owner cannot be reclaimed, so the retry still fails.
+    // A dispatch spanning an untracked GPU and a running one must reject.
     #[tokio::test]
     async fn dispatch_rejects_partial_overlap_with_running_owner() {
         let svc = AgentService::new(
@@ -14211,8 +18071,12 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
-        let err = res.expect_err("must reject: GPU 1's owner is still running");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal = held(res.expect_err("must reject: GPU 1's owner is still running"));
+        let conflict = refusal.conflict.expect("the stale holder is nameable");
+        assert_eq!(
+            conflict.job_id, 98,
+            "the unaccounted holder is the drift; the running one is the controller's own doing"
+        );
     }
 
     // A registered srun allocation must be committed AND tracked in `running`
@@ -14239,6 +18103,7 @@ mod tests {
             },
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            run_attempt: 1,
             job_id: 55,
             cpus: 1,
             allocated: Some(ResourceAllocations {
@@ -14257,15 +18122,22 @@ mod tests {
             "registered allocation holds the GPU"
         );
 
-        // The job is in `running`, so reconcile must spare it (not orphan-reclaim).
+        // The job is in `running`, so the sweep must not report it at all.
         {
             let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+            let alloc = svc.allocation.lock().await;
+            assert!(alloc
+                .unbacked_claims(
+                    &jobs.keys().copied().collect(),
+                    std::time::Instant::now(),
+                    LAUNCHING_TTL
+                )
+                .is_empty());
         }
         assert_eq!(
             svc.free_gpu_count().await,
             0,
-            "committed+tracked allocation must survive reconcile"
+            "a committed and tracked allocation must survive the sweep"
         );
     }
 
@@ -14288,7 +18160,8 @@ mod tests {
             alloc.allocate_for_job(42, 1, 1, 0, &[0]).unwrap();
             alloc.commit_job(42, 1);
         }
-        let reservation = LaunchReservationGuard::new(svc.allocation.clone(), 42, 1);
+        let reservation =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(42, 1));
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let status = {
@@ -14317,6 +18190,1237 @@ mod tests {
 
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
     // job so the controller can reconcile it — the strand this fix addresses.
+    /// The two trees a restart reads: `runtime/` for liveness, `admission/` for
+    /// entitlement. Built with a real store so the replay walks real files.
+    async fn svc_with_state_dir(state: &std::path::Path) -> AgentService {
+        let running = new_running_jobs();
+        let reporter = Arc::new(NodeReporter::new(
+            "n1".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 8192,
+                gpus: (0..2)
+                    .map(|device_id| spur_core::resource::GpuResource {
+                        device_id,
+                        gpu_type: "test".into(),
+                        memory_mb: 1024,
+                        peer_gpus: Vec::new(),
+                        link_type: spur_core::resource::GpuLinkType::PCIe,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "n1".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            running.clone(),
+            false,
+        ));
+        AgentService::with_cluster_config(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running,
+            false,
+        )
+        .with_runtime_state_dir(state)
+    }
+
+    async fn svc_with_epilog(state: &std::path::Path) -> AgentService {
+        let mut svc = svc_with_state_dir(state).await;
+        svc.hooks = Arc::new(HooksConfig {
+            epilog: Some("/bin/true".into()),
+            ..HooksConfig::default()
+        });
+        svc
+    }
+
+    fn an_allocation_only_job(run_attempt: u32) -> TrackedJob {
+        TrackedJob {
+            job: executor::RunningJob::AllocationOnly,
+            cgroup_path: None,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            stdout_path: "/dev/null".into(),
+            stderr_path: "/dev/null".into(),
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            _pty_master: None,
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            user: "testuser".into(),
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
+            mpi: String::new(),
+            run_attempt,
+        }
+    }
+
+    /// Re-points a run's supervisor at one the liveness read proves gone, which is
+    /// what a test sees after a hook's owner dies between the cancel and the sweep.
+    fn its_supervisor_has_since_died(
+        admissions: &crate::admission::AdmissionStore,
+        run: RunKey,
+        step_id: spur_core::step::StepId,
+    ) {
+        let path = admissions
+            .participant_path(run, step_id)
+            .expect("participant path");
+        let mut participant: crate::admission::ParticipantAdmission =
+            serde_json::from_slice(&std::fs::read(&path).expect("read the participant"))
+                .expect("decode the participant");
+        participant.supervisor = Some(a_gone_supervisor());
+        admissions
+            .admit_participant(&participant)
+            .expect("re-admit the participant");
+    }
+
+    /// One more participant on an already-admitted run, for a test that needs a
+    /// numbered step beside the one that owns the job's lifetime.
+    fn admit_a_participant_step(
+        admissions: &crate::admission::AdmissionStore,
+        node: &str,
+        job_id: u32,
+        step_id: spur_core::step::StepId,
+        supervisor: Option<crate::admission::SupervisorRef>,
+    ) {
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            step_id,
+            node,
+            crate::admission::AdmittedResources::default(),
+        );
+        participant.lifecycle = crate::admission::ParticipantLifecycle::Running;
+        participant.supervisor = supervisor;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+    }
+
+    /// The tracking entry a cancel drops, so a test asserting its removal is
+    /// asserting something was there to remove.
+    fn a_tracked_supervisor_session(
+        job_id: u32,
+        run_attempt: u32,
+        state: &std::path::Path,
+    ) -> crate::stepd::StepdDescriptor {
+        crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            std::process::id(),
+            crate::stepd::process_start_ticks(std::process::id()).expect("start ticks"),
+            state.join("stepd.sock"),
+            state.join("cgroup"),
+        )
+    }
+
+    /// The session that makes a cancel leave `job_id` tracked, naming the same
+    /// process the run's participant records as its supervisor.
+    async fn register_a_supervisor_session(
+        svc: &AgentService,
+        job_id: u32,
+        state: &std::path::Path,
+    ) {
+        let live = a_live_supervisor();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            live.pid,
+            live.start_ticks,
+            state.join(format!("unreachable-{job_id}.sock")),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+    }
+
+    /// A supervised run of `job_id` holding two cores, tracked and charged, as a
+    /// cancel finds it: the shape every test below cancels out from under.
+    async fn a_cancellable_supervised_run(
+        svc: &AgentService,
+        job_id: u32,
+        supervisor: crate::admission::SupervisorRef,
+    ) -> u32 {
+        admit_a_supervised_run(
+            &svc.admissions(),
+            &svc.reporter.hostname,
+            job_id,
+            vec![0, 1],
+            Some(supervisor),
+        );
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(job_id, 1, 2, 1_000, &[])
+                .expect("allocate");
+            alloc.commit_job(job_id, 1);
+        }
+        svc.insert_test_job(job_id, an_allocation_only_job(1)).await;
+        svc.allocation.lock().await.free_cpus()
+    }
+
+    #[tokio::test]
+    async fn the_claim_index_is_rebuilt_from_the_recorded_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![2, 3, 5],
+                memory_mb: 2048,
+                gpu_devices: vec![1],
+            },
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(outcomes.len(), 1);
+
+        // Exact, where a descriptor rebuild falls back to "the lowest free
+        // cores" and under-counts a job whose cores were never recorded.
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.allocated_gpu_ids(), vec![1]);
+        for cpu in [2u32, 3, 5] {
+            assert!(
+                alloc.allocated_cpus[cpu as usize],
+                "core {cpu} must still read as held"
+            );
+        }
+        assert!(
+            !alloc.allocated_cpus[0],
+            "an unrecorded core must stay free"
+        );
+    }
+
+    // A settled record that had already handed its slice back took the core
+    // again on every start, starving the runs that genuinely still held one.
+    #[tokio::test]
+    async fn a_released_slice_is_not_charged_again_at_startup() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0],
+                memory_mb: 1024,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit");
+        svc.admissions()
+            .record_slice_released(key(7, 1))
+            .expect("record the release");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the record still has to be reported to the controller"
+        );
+
+        let alloc = svc.allocation.lock().await;
+        assert!(
+            alloc.charged_runs().0.is_empty(),
+            "a slice already given back must not be taken again"
+        );
+        assert!(!alloc.allocated_cpus[0], "the core must still read as free");
+    }
+
+    // A stale record winning the race left a running job's cores unprotected
+    // for the rest of the agent's life: nothing restores a claim twice.
+    #[tokio::test]
+    async fn a_running_run_wins_a_core_a_gone_ones_record_also_names() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        // Named so the gone record sorts first, which is the order that lost it.
+        admit_a_supervised_run(&admissions, "n1", 1, vec![0, 1], Some(a_gone_supervisor()));
+        admit_a_supervised_run(&admissions, "n1", 2, vec![0, 1], Some(a_live_supervisor()));
+
+        svc.replay_admitted_allocations(&[]).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.charged_runs(),
+            (HashSet::from([key(2, 1)]), vec![]),
+            "the run still on those cores must be the one holding them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_supervisor_and_no_exit_is_held_as_unknown() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0, 1],
+                memory_mb: 1024,
+                gpu_devices: vec![],
+            },
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit");
+        svc.admissions()
+            .admit_participant(&crate::admission::ParticipantAdmission::new(
+                7,
+                1,
+                spur_core::step::STEP_BATCH,
+                "n1",
+                run.allocation.clone(),
+            ))
+            .expect("admit participant");
+        // Through the production writer: a hand-set field would hide the fact
+        // that nothing on the launch path records this.
+        assert!(svc
+            .admissions()
+            .record_supervisor(
+                key(7, 1),
+                spur_core::step::STEP_BATCH,
+                crate::admission::SupervisorRef {
+                    pid: 999_999,
+                    start_ticks: 1,
+                    boot_id: crate::admission::current_boot_id(),
+                },
+            )
+            .expect("record supervisor"));
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(
+            outcomes[0].disposition,
+            crate::admission::RunDisposition::Unknown
+        );
+
+        // The point of the whole ladder: not knowing is not a reason to free it.
+        let alloc = svc.allocation.lock().await;
+        assert!(alloc.allocated_cpus[0] && alloc.allocated_cpus[1]);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_exit_settles_a_run_whose_supervisor_is_gone() {
+        // Reading the exit from the live descriptor set made this unreachable:
+        // an exit only exists once the supervisor has gone.
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0],
+                memory_mb: 256,
+                gpu_devices: vec![],
+            },
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit");
+        svc.admissions()
+            .admit_participant(&crate::admission::ParticipantAdmission::new(
+                7,
+                1,
+                spur_core::step::STEP_BATCH,
+                "n1",
+                run.allocation.clone(),
+            ))
+            .expect("admit participant");
+        let store = crate::stepd::StepdStore::new(state.path());
+        store
+            .prepare_session_dir(7, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        store
+            .obligations(7, 1, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: 0,
+            })
+            .expect("record exit");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(
+            outcomes[0].disposition,
+            crate::admission::RunDisposition::SettledWithExit {
+                exit_code: 3,
+                signal: 0
+            }
+        );
+        // Settled is still not released: only the acknowledgement frees it.
+        assert!(svc.allocation.lock().await.allocated_cpus[0]);
+    }
+
+    #[tokio::test]
+    async fn a_ledger_that_cannot_be_read_still_replays_the_descriptors() {
+        // Returning empty here would advertise every running job's cores as
+        // free on the next heartbeat.
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        // A file where the ledger directory belongs: the scan fails, rather
+        // than reporting an empty but readable tree.
+        std::fs::create_dir_all(state.path()).expect("state dir");
+        std::fs::write(state.path().join("admission"), b"not a directory").expect("block");
+
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            9,
+            1,
+            spur_core::step::STEP_BATCH,
+            std::process::id(),
+            crate::stepd::process_start_ticks(std::process::id()).expect("ticks"),
+            state.path().join("runtime/9.1.4294967294/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 1,
+            cpu_ids: vec![7],
+            memory_mb: 128,
+            gpu_devices: vec![],
+            ..Default::default()
+        };
+
+        svc.replay_admitted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+        assert!(
+            svc.allocation.lock().await.allocated_cpus[7],
+            "a failed ledger read must not leave live cores reading free"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_predating_the_ledger_still_replays() {
+        // An in-place upgrade over a live node has sessions with no record;
+        // dropping them would free every running job's slice.
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            9,
+            1,
+            spur_core::step::STEP_BATCH,
+            std::process::id(),
+            crate::stepd::process_start_ticks(std::process::id()).expect("ticks"),
+            state.path().join("runtime/9.1.4294967294/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.boot_id = None;
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            cpu_ids: vec![4, 6],
+            memory_mb: 512,
+            gpu_devices: vec![],
+            ..Default::default()
+        };
+
+        let outcomes = svc
+            .replay_admitted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+        assert!(outcomes.is_empty(), "there is no record to classify");
+
+        let alloc = svc.allocation.lock().await;
+        assert!(
+            alloc.allocated_cpus[4] && alloc.allocated_cpus[6],
+            "the pre-ledger session's cores must still be held"
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_an_allocation_records_its_entitlement() {
+        let running = new_running_jobs();
+        let reporter = Arc::new(NodeReporter::new(
+            "n1".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "n1".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            running.clone(),
+            false,
+        ));
+        let svc = AgentService::with_cluster_config(
+            reporter.clone(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running,
+            false,
+        );
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = svc.with_runtime_state_dir(state_dir.path());
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 77,
+            cpus: 2,
+            run_attempt: 9,
+            allocated: Some(ResourceAllocations {
+                cpus: 2,
+                memory_mb: 512,
+                devices: std::collections::HashMap::new(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+
+        let run = svc
+            .admissions()
+            .load_run(key(77, 9))
+            .expect("the entitlement must outlive the process that claimed it");
+        assert_eq!(run.node, "n1");
+        assert_eq!(run.allocation.cpu_ids.len(), 2);
+        assert_eq!(run.allocation.memory_mb, 512);
+        assert!(
+            run.created_at_unix_ms > 0,
+            "a record with no age is uncollectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_launch_leaves_no_entitlement_behind() {
+        let running = new_running_jobs();
+        let reporter = Arc::new(NodeReporter::new(
+            "n1".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "n1".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            running.clone(),
+            false,
+        ));
+        let svc = AgentService::with_cluster_config(
+            reporter.clone(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running,
+            false,
+        );
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = svc.with_runtime_state_dir(state_dir.path());
+        let admissions = svc.admissions();
+
+        let run = crate::admission::RunAdmission::new(
+            5,
+            1,
+            "n1",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        admissions.admit_run(&run).expect("admit");
+        assert!(admissions.load_run(key(5, 1)).is_ok());
+
+        // Dropping while armed is the abort path: this process made the
+        // reservation and is giving up before spawning anything against it.
+        drop(LaunchReservationGuard::new(
+            svc.allocation.clone(),
+            admissions.clone(),
+            key(5, 1),
+        ));
+
+        assert!(
+            admissions.load_run(key(5, 1)).is_err(),
+            "an aborted launch must not leave a claim nothing holds"
+        );
+    }
+
+    /// Writes the pair `launch_job` writes before it spawns: a run and an owner
+    /// step that owes a report. That owed report is what no retention collects.
+    fn admit_a_launch(svc: &AgentService, job_id: u32) {
+        let admissions = svc.admissions();
+        let mut run = crate::admission::RunAdmission::new(
+            job_id,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0, 1],
+                memory_mb: 1000,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        // As `launch_job` writes it. Left unset, the owner guard waves through
+        // any step's acknowledgement and every case here tests the fallback.
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            &svc.reporter.hostname,
+            Default::default(),
+        );
+        participant.final_report.required = true;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit participant");
+    }
+
+    // Every settle/sweep/cut case is built on `admit_a_launch`'s hand-written
+    // pair. This is the one that makes the real launch path answer for it.
+    #[tokio::test]
+    async fn a_real_launch_writes_the_record_the_other_cases_assume() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let work_dir = tempfile::tempdir().expect("work dir");
+
+        let response = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 4242,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    script: "#!/bin/sh\ntrue\n".into(),
+                    cpus_per_task: 2,
+                    work_dir: work_dir.path().to_string_lossy().into(),
+                    ..Default::default()
+                }),
+                allocated: Some(ResourceAllocations {
+                    cpus: 2,
+                    memory_mb: 512,
+                    devices: std::collections::HashMap::new(),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("launch");
+        let inner = response.into_inner();
+        assert!(inner.success, "launch failed: {}", inner.error);
+
+        let run = svc
+            .admissions()
+            .load_run(key(4242, 1))
+            .expect("the launch must leave a run record");
+        assert_eq!(run.node, svc.reporter.hostname);
+        assert_eq!(run.state, crate::admission::RunState::Admitted);
+        assert_eq!(run.allocation.cpu_ids.len(), 2);
+        assert_eq!(run.allocation.memory_mb, 512);
+        assert_ne!(
+            run.created_at_unix_ms, 0,
+            "an ageless record never collects"
+        );
+        assert_eq!(
+            run.lifecycle_owner_step,
+            Some(spur_core::step::STEP_BATCH),
+            "the release gate keys on this; without it any step's ack frees the run"
+        );
+        assert!(!run.slice_released);
+
+        let (participants, rejected) = svc
+            .admissions()
+            .participants(key(4242, 1))
+            .expect("read participants");
+        assert!(rejected.is_empty());
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].step_id, spur_core::step::STEP_BATCH);
+        assert!(
+            participants[0].final_report.required,
+            "a launch that owes no report can never free its slice"
+        );
+        assert_eq!(
+            participants[0].allocation_subset.cpu_ids,
+            run.allocation.cpu_ids
+        );
+    }
+
+    // The guard frees a reservation nothing was spawned against. Once something
+    // has been, those are a live run's cores and only the controller ends them.
+    #[tokio::test]
+    async fn an_aborted_launch_that_already_spawned_keeps_its_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        admit_a_launch(&svc, 31);
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(31, 1, 4, 0, &[])
+            .expect("reserve");
+        let before = svc.allocation.lock().await.free_cpus();
+
+        {
+            let mut guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(31, 1));
+            guard.mark_spawned();
+        }
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            before,
+            "a running payload's cores must not go back on an aborted request"
+        );
+        assert!(
+            svc.admissions().load_run(key(31, 1)).is_ok(),
+            "the record is what still names the cores the payload holds"
+        );
+    }
+
+    // A controller that has forgotten a job never acknowledges its completion, so
+    // the cancel itself is what has to settle the run; nothing else ever will.
+    #[tokio::test]
+    async fn a_cancel_of_a_live_run_frees_its_slice_once_teardown_finishes() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 1,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel");
+
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a run still being torn down must keep its slice"
+        );
+
+        // What teardown finishing looks like: untracked, and the record cleaned.
+        svc.running.lock().await.remove(&7);
+        admissions
+            .mark_run_cleaned(key(7, 1), crate::admission::EpilogOwed::No)
+            .expect("cleaned");
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a cancelled run's slice must go back once its teardown is done"
+        );
+        assert_eq!(
+            admissions
+                .sweep(crate::admission::now_unix_ms(), 1, &HashSet::new())
+                .expect("sweep"),
+            1,
+            "and nothing of it may be left to re-advertise as a claim"
+        );
+    }
+
+    // The one answer that unsticks a run whose completion never landed: the
+    // controller's word that it is not accounting for it.
+    #[tokio::test]
+    async fn a_settle_from_the_controller_releases_a_run_nothing_else_can_free() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        let while_held = charge_a_slice(&svc, 7).await;
+        // The stranded shape: teardown done, no acknowledgement, slice charged.
+        // Driven through the teardown so the record says what this node owes.
+        tear_down_a_finished_run(&svc, 7, state.path()).await;
+        admissions
+            .take_conflict_hold(key(7, 1), "held with no tracked job on this agent")
+            .expect("hold");
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the cores the run was holding must go back to the node"
+        );
+        let run = admissions.load_run(key(7, 1)).expect("record");
+        assert!(run.slice_released);
+        assert!(
+            run.conflict_hold.is_none(),
+            "the hold is what kept asking for a reconcile that never resolved"
+        );
+    }
+
+    /// The monitor's own teardown, so a test reaches the record this node writes
+    /// rather than the one it would have to remember to write by hand.
+    async fn tear_down_a_finished_run(svc: &AgentService, job_id: u32, state: &std::path::Path) {
+        let cgroup = state.join(format!("cgroup_{job_id}"));
+        std::fs::create_dir_all(&cgroup).expect("cgroup");
+        let completed = CompletedJob {
+            run_attempt: 1,
+            ..completed_job(job_id, cgroup)
+        };
+        teardown_completed_job(
+            &completed,
+            &svc.lifecycle,
+            &svc.running,
+            &svc.allocation,
+            &svc.mpi_host,
+            &svc.admissions(),
+            epilog_owed(&svc.hooks),
+        )
+        .await;
+    }
+
+    /// Charge a run's slice to this node, as its launch did.
+    async fn charge_a_slice(svc: &AgentService, job_id: u32) -> u32 {
+        let mut alloc = svc.allocation.lock().await;
+        alloc
+            .allocate_for_job(job_id, 1, 2, 1000, &[])
+            .expect("allocate");
+        alloc.commit_job(job_id, 1);
+        alloc.free_cpus()
+    }
+
+    // Teardown finishes before the epilog runs. On a node with a hook the record
+    // has to carry that debt, or the settle frees cores it is about to run on.
+    #[tokio::test]
+    async fn a_settle_cannot_free_cores_an_epilog_has_not_started_on() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path())
+            .await
+            .with_epilog_hook("/usr/local/sbin/spur-epilog");
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        let while_held = charge_a_slice(&svc, 7).await;
+        tear_down_a_finished_run(&svc, 7, state.path()).await;
+
+        assert_eq!(
+            admissions.settle_permit(key(7, 1)).expect("permit"),
+            crate::admission::SettlePermit::NotQuiescent,
+            "the hook has not started, and only this record can say it is owed"
+        );
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "the operator's epilog has not run on these cores yet"
+        );
+        assert!(
+            !admissions
+                .load_run(key(7, 1))
+                .expect("record")
+                .slice_released,
+            "a cut that drops this entry stops advertising a claim the node holds"
+        );
+
+        // The hook runs, and the veto lifts with it and nothing else.
+        admissions
+            .record_epilog(key(7, 1), crate::admission::HookState::Succeeded)
+            .expect("epilog done");
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+        assert!(response.released);
+        assert_eq!(svc.allocation.lock().await.free_cpus(), while_held + 2);
+    }
+
+    // The restart this design exists for: the record is all that is left of the
+    // run, and adopting one is not evidence that its payload is gone.
+    #[tokio::test]
+    async fn a_settle_for_an_adopted_run_no_teardown_has_touched_is_declined() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        let while_held = charge_a_slice(&svc, 7).await;
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a restart rebuilds the ledger, not the process table"
+        );
+
+        assert_eq!(
+            admissions.settle_permit(key(7, 1)).expect("permit"),
+            crate::admission::SettlePermit::NotQuiescent,
+            "nothing here has torn this run down, so nothing may hand its cores back"
+        );
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert_eq!(svc.allocation.lock().await.free_cpus(), while_held);
+        assert!(
+            !admissions
+                .load_run(key(7, 1))
+                .expect("record")
+                .slice_released
+        );
+    }
+
+    // No acknowledgement may free a slice out from under a live payload; the
+    // agent declining costs one reconcile, obeying costs a double-allocated core.
+    #[tokio::test]
+    async fn a_settle_for_a_run_this_agent_is_still_running_is_declined() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a payload is still on these cores"
+        );
+        assert!(
+            !admissions
+                .load_run(key(7, 1))
+                .expect("record")
+                .slice_released
+        );
+    }
+
+    // Teardown drops the job from `running` and marks the record cleaned before
+    // the epilog runs, so both of the settle's own guards pass while a hook is live.
+    #[tokio::test]
+    async fn a_settle_while_an_epilog_is_still_running_is_declined() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        admissions
+            .mark_run_cleaned(key(7, 1), crate::admission::EpilogOwed::No)
+            .expect("cleaned");
+        admissions
+            .record_epilog(key(7, 1), crate::admission::HookState::Running)
+            .expect("epilog running");
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        assert_eq!(
+            admissions.settle_permit(key(7, 1)).expect("permit"),
+            crate::admission::SettlePermit::NotQuiescent,
+            "the gate itself must refuse, not merely the release downstream of it"
+        );
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(
+            !response.released,
+            "the controller cannot see the hook; only this side can veto on it"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an epilog is still on these cores"
+        );
+        let run = admissions.load_run(key(7, 1)).expect("record");
+        assert!(
+            !run.slice_released,
+            "a cut that drops this entry stops advertising a claim the node still holds"
+        );
+
+        // The veto lifts with the hook, and nothing else is needed to unstick it.
+        admissions
+            .record_epilog(key(7, 1), crate::admission::HookState::Succeeded)
+            .expect("epilog done");
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+        assert!(response.released);
+        assert_eq!(svc.allocation.lock().await.free_cpus(), while_held + 2);
+    }
+
+    // The controller counts what comes back as a release it caused, so a settle
+    // that found nothing to settle must not be counted as one.
+    #[tokio::test]
+    async fn a_settle_for_a_run_this_agent_has_no_record_of_reports_no_release() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert!(!response.error.is_empty(), "the caller is told why");
+    }
+
+    // Reconciling cancels a leaked attempt beside a live one, and PMIx
+    // namespaces are keyed by job alone, so the sibling's would go with it.
+    #[tokio::test]
+    async fn cancelling_a_stale_attempt_leaves_a_live_siblings_pmix_alone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let namespace = (7, spur_core::step::STEP_BATCH);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 2,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        let hosted = || {
+            svc.mpi_host
+                .active_namespaces
+                .lock()
+                .expect("namespaces")
+                .contains_key(&namespace)
+        };
+        svc.mpi_host
+            .active_namespaces
+            .lock()
+            .expect("namespaces")
+            .insert(namespace, "spur.7.2".into());
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 1,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel the stale attempt");
+
+        assert!(
+            hosted(),
+            "attempt 2 is still running under this job id and still needs its namespace"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 2,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel the tracked attempt");
+
+        assert!(
+            !hosted(),
+            "the attempt that owns the namespace must still take it down"
+        );
+    }
+
+    // A reaped launch produced nothing, and its record would owe a report
+    // nothing will acknowledge -- so no sweep could ever collect it.
+    #[tokio::test]
+    async fn a_launch_whose_workload_was_reaped_leaves_no_record() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 13);
+        admit_a_launch(&svc, 14);
+        assert_eq!(
+            admissions
+                .sweep(u64::MAX, 1, &HashSet::new())
+                .expect("sweep"),
+            0,
+            "an owed report is what makes a leftover launch record immortal"
+        );
+
+        let mut reaped =
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), key(13, 1));
+        reaped.mark_spawned();
+        reaped.mark_reaped();
+        drop(reaped);
+
+        assert!(
+            admissions.load_run(key(13, 1)).is_err(),
+            "a launch that produced nothing must leave no claim behind"
+        );
+
+        // The other side of the rule: a launch that really did leave something
+        // running must keep its record, or the live process reads as free capacity.
+        let mut running =
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), key(14, 1));
+        running.mark_spawned();
+        drop(running);
+
+        assert!(admissions.load_run(key(14, 1)).is_ok());
+    }
+
+    fn a_test_reporter() -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+            false,
+        ))
+    }
+
+    // The agent can name this the moment it sees it. Left for the routine sweep,
+    // the cores it holds stay out of the cluster for up to an hour.
+    #[tokio::test]
+    async fn a_claim_with_no_job_behind_it_asks_the_controller_to_reconcile() {
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let reporter = a_test_reporter();
+        reporter.set_admissions(admissions.clone());
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_live_supervisor()),
+        );
+
+        assert!(
+            !reporter.wants_reconcile().await,
+            "a run with a live supervisor behind it explains itself"
+        );
+
+        flag_unbacked_allocations(&[(42, 1)], &admissions).await;
+
+        assert!(
+            reporter.wants_reconcile().await,
+            "a claim the agent cannot account for must reach the controller now, not in an hour"
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_reports_held_allocation_only_job() {
         // One shared running map wired into both the reporter (heartbeat source)
@@ -14341,6 +19445,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
+            false,
         ));
         let svc = AgentService::with_cluster_config(
             reporter.clone(),
@@ -14358,6 +19463,10 @@ mod tests {
             running,
             false, // allow_root_jobs
         );
+        // Registration now persists an admission record; keep it off the
+        // runner's real /var/spool.
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = svc.with_runtime_state_dir(state_dir.path());
 
         assert!(
             reporter.held_job_ids().is_empty(),
@@ -14445,7 +19554,7 @@ mod tests {
         {
             let mut alloc = svc.allocation.lock().await;
             alloc.allocate_for_job(7, 1, 1, 0, &[0]).unwrap();
-            alloc.release_job(7);
+            alloc.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7)));
             alloc.allocate_for_job(7, 2, 1, 0, &[0]).unwrap();
         }
 
@@ -14541,7 +19650,8 @@ mod tests {
                 .await
                 .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9, 1);
+            let guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(9, 1));
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -14559,7 +19669,8 @@ mod tests {
                 .allocate_for_job(10, 1, 1, 0, &[0])
                 .unwrap();
             svc.allocation.lock().await.commit_job(10, 1);
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10, 1);
+            let mut guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(10, 1));
             guard.disarm();
             drop(guard);
         }
@@ -14587,12 +19698,18 @@ mod tests {
             .await
             .allocate_for_job(11, 1, 1, 0, &[0])
             .unwrap();
-        let guard = LaunchReservationGuard::new(svc.allocation.clone(), 11, 1);
+        let guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(11, 1));
 
         // A cancel races the still-in-flight launch, releasing attempt 1's
         // reservation; the controller redispatches attempt 2, which reserves
         // and commits before attempt 1's guard is ever dropped.
-        svc.allocation.lock().await.release_job(11);
+        svc.allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(
+                11,
+            )));
         svc.allocation
             .lock()
             .await
@@ -14657,6 +19774,8 @@ mod tests {
     /// unimplemented, so drifting onto an unmocked call fails loudly.
     struct MockController {
         reports: Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>,
+        /// How completion reports are answered; `None` accepts them.
+        refusal: Option<tonic::Code>,
     }
 
     /// The `async_trait` attribute has to be applied by the macro: it rewrites
@@ -14669,11 +19788,13 @@ mod tests {
                     &self,
                     request: tonic::Request<spur_proto::proto::ReportJobStatusRequest>,
                 ) -> Result<tonic::Response<()>, tonic::Status> {
-                    self.reports
-                        .lock()
-                        .expect("completion reports")
-                        .push(request.into_inner());
-                    Ok(tonic::Response::new(()))
+                    let report = request.into_inner();
+                    let job_id = report.job_id;
+                    self.reports.lock().expect("completion reports").push(report);
+                    match self.refusal {
+                        Some(code) => Err(tonic::Status::new(code, format!("job {job_id} not found"))),
+                        None => Ok(tonic::Response::new(())),
+                    }
                 }
                 $(
                     async fn $method(
@@ -14743,6 +19864,12 @@ mod tests {
     type CompletionReports = Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>;
 
     fn spawn_mock_controller() -> (String, CompletionReports) {
+        spawn_mock_controller_answering(None)
+    }
+
+    fn spawn_mock_controller_answering(
+        refusal: Option<tonic::Code>,
+    ) -> (String, CompletionReports) {
         let incoming = tonic::transport::server::TcpIncoming::bind(
             "127.0.0.1:0".parse().expect("loopback address"),
         )
@@ -14751,6 +19878,7 @@ mod tests {
         let reports: CompletionReports = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service = MockController {
             reports: reports.clone(),
+            refusal,
         };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -14769,6 +19897,10 @@ mod tests {
         store: &crate::stepd::StepdStore,
     ) -> CompletionListenerContext {
         CompletionListenerContext {
+            admissions: crate::admission::AdmissionStore::new(
+                std::env::temp_dir().join(format!("spur-test-adm-{}", uuid::Uuid::new_v4())),
+                "test-node",
+            ),
             running: running.clone(),
             step_completions: completions.clone(),
             allocation: allocation.clone(),
@@ -15065,6 +20197,920 @@ mod tests {
         svc.running.lock().await.remove(&job_id);
     }
 
+    // The cancel that ends a run is not the end of the work on its cores: an
+    // operator's epilog is still standing on them when the tracking goes away.
+    #[tokio::test]
+    async fn a_cancel_holds_the_slice_while_a_supervisor_owes_an_epilog() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 51, a_live_supervisor()).await;
+
+        svc.drop_tracked_job(51, 1).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a hook still running under the run must keep its cores"
+        );
+        let run = admissions.load_run(key(51, 1)).expect("record");
+        assert_eq!(run.cleanup.epilog, crate::admission::HookState::Pending);
+        assert!(!run.slice_released, "and the record must not say otherwise");
+        assert!(
+            run.cancelled_by_controller,
+            "the cancel has to be durable, or nothing finishes the release later"
+        );
+    }
+
+    // A gate that refuses everything looks exactly like one that works. With no
+    // hook configured there is nothing to wait for and the cores go back at once.
+    #[tokio::test]
+    async fn a_cancel_with_no_epilog_configured_releases_at_once() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let while_held = a_cancellable_supervised_run(&svc, 52, a_live_supervisor()).await;
+
+        svc.drop_tracked_job(52, 1).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "with no hook owed the cancel itself hands the cores back"
+        );
+        let run = svc.admissions().load_run(key(52, 1)).expect("record");
+        assert!(run.slice_released);
+        assert!(
+            run.cancelled_by_controller,
+            "the release still has to go through the cancel's own record"
+        );
+    }
+
+    // A failed hook has returned, so it is off the cores and nothing re-runs it.
+    // Holding for one would be a hold with no way out.
+    #[tokio::test]
+    async fn a_failed_epilog_hands_the_cancelled_run_its_slice_back() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_cancellable_supervised_run(&svc, 53, a_live_supervisor()).await;
+        svc.drop_tracked_job(53, 1).await;
+
+        // The supervisor's own ledger, which it writes before telling anyone.
+        store
+            .prepare_session_dir(53, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(53, 1, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 9,
+            })
+            .expect("record the exit");
+        obligations
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
+            .expect("record the epilog");
+
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        assert_eq!(
+            admissions
+                .load_run(key(53, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Failed
+        );
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a hook that has returned no longer holds anything"
+        );
+    }
+
+    // The outcome reaches the record through the supervisor's own ledger, not
+    // through anything the cancel tore down, so a live agent finishes the release.
+    #[tokio::test]
+    async fn a_finished_epilog_reaches_the_record_without_the_tracking_the_cancel_removed() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_cancellable_supervised_run(&svc, 55, a_live_supervisor()).await;
+        // Installed so the drop below has a tracking entry to take away; without
+        // one the assertion that it is gone is a statement about an empty map.
+        let tracked = a_tracked_supervisor_session(55, 1, state.path());
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&tracked), tracked.clone());
+
+        svc.drop_tracked_job(55, 1).await;
+
+        assert!(
+            svc.stepds.lock().await.is_empty(),
+            "the cancel owns no channel the outcome could have come back on"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "and the cores stay put until the ledger speaks, tracking or no tracking"
+        );
+
+        store
+            .prepare_session_dir(55, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        store
+            .obligations(55, 1, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
+            .expect("record the epilog");
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the slice comes back on the supervisor's own word"
+        );
+    }
+
+    // An agent that dies mid-hook leaves a debt nothing alive owes. Its restart
+    // settles it on proof the owner is gone, or the cores never come back.
+    #[tokio::test]
+    async fn a_cancelled_run_gets_its_cores_back_after_an_agent_restart() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 54, a_live_supervisor()).await;
+        svc.drop_tracked_job(54, 1).await;
+        its_supervisor_has_since_died(&admissions, key(54, 1), spur_core::step::STEP_BATCH);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "the cancel leaves the debt behind that could strand the cores"
+        );
+
+        // What replay_admitted_allocations does before it rebuilds the index.
+        admissions
+            .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
+            .expect("settle the hooks of a previous agent");
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a hook whose owner did not survive must not strand the cores"
+        );
+    }
+
+    // A supervisor outlives the agent that spawned it, so the restart sweep is
+    // not proof its hook ended. Settling one here frees cores it stands on.
+    #[tokio::test]
+    async fn an_agent_restart_leaves_a_live_supervisors_hook_alone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 57, a_live_supervisor()).await;
+        svc.drop_tracked_job(57, 1).await;
+
+        admissions
+            .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
+            .expect("sweep the hooks of a previous agent");
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            admissions
+                .load_run(key(57, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending,
+            "a restart says nothing about a supervisor that survived it"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "and the cores stay under the hook that is still running"
+        );
+    }
+
+    /// A run whose supervisor could not be recorded at launch. The supervisor is
+    /// live and will run the epilog; only the name of it is missing.
+    async fn a_cancellable_run_that_named_no_supervisor(svc: &AgentService, job_id: u32) -> u32 {
+        admit_a_supervised_run(
+            &svc.admissions(),
+            &svc.reporter.hostname,
+            job_id,
+            vec![0, 1],
+            None,
+        );
+        let while_held = {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(job_id, 1, 2, 1_000, &[])
+                .expect("allocate");
+            alloc.commit_job(job_id, 1);
+            alloc.free_cpus()
+        };
+        svc.insert_test_job(job_id, an_allocation_only_job(1)).await;
+        while_held
+    }
+
+    // One failed write at launch leaves a live supervisor unnamed. Reading that
+    // silence as "no hook is owed" hands the slice back under a live epilog.
+    #[tokio::test]
+    async fn a_cancelled_run_whose_supervisor_was_never_recorded_holds_its_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let while_held = a_cancellable_run_that_named_no_supervisor(&svc, 63).await;
+
+        svc.drop_tracked_job(63, 1).await;
+
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(63, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending,
+            "an unnamed owner is no evidence that no hook is owed"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "so the cores stay under the epilog that may still be running"
+        );
+    }
+
+    // The way out of the hold above, without which it would never end: a run
+    // that named nobody had the previous agent's hook, and it did not survive.
+    #[tokio::test]
+    async fn a_restart_settles_a_hook_whose_run_named_no_supervisor() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_run_that_named_no_supervisor(&svc, 64).await;
+        svc.drop_tracked_job(64, 1).await;
+
+        admissions
+            .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
+            .expect("sweep the hooks of a previous agent");
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a hook nothing is left to run must not strand the cores"
+        );
+    }
+
+    // The RPC is a separate site from the tracked-job drop, and has its own
+    // release. It has to answer to the same gate.
+    #[tokio::test]
+    async fn cancel_job_holds_the_slice_while_a_supervisor_owes_an_epilog() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 56, a_live_supervisor()).await;
+        // Nothing tracked is what sends the RPC down its own release path.
+        svc.running.lock().await.remove(&56);
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 56,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "the RPC must not free cores a hook is still running on"
+        );
+        assert_eq!(
+            admissions
+                .load_run(key(56, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending
+        );
+    }
+
+    // A cancel of a job still being torn down leaves the record for the supervisor
+    // to finish, and the hook it owes has to be written down there and then.
+    #[tokio::test]
+    async fn a_cancel_of_a_tracked_run_records_the_epilog_its_supervisor_owes() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 71, a_live_supervisor()).await;
+        // A registered supervisor is what leaves the job tracked through the
+        // signal, which is the branch this covers.
+        register_a_supervisor_session(&svc, 71, state.path()).await;
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 71,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert!(
+            svc.running.lock().await.contains_key(&71),
+            "a supervised job stays tracked through its cancel"
+        );
+        let run = admissions.load_run(key(71, 1)).expect("record");
+        assert_eq!(
+            run.cleanup.epilog,
+            crate::admission::HookState::Pending,
+            "a tracked cancel that records no hook is a gate nothing can close"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "and the cancel itself must not hand the cores back"
+        );
+    }
+
+    // The acknowledgement is the controller's word about its own accounting, not
+    // the hook's about the cores. Taken for both, it freed under a running epilog.
+    #[tokio::test]
+    async fn an_acknowledged_completion_does_not_settle_an_epilog_still_in_flight() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 72, a_live_supervisor()).await;
+        // Cancelled and still admitted, which is where a tracked cancel leaves it.
+        admissions
+            .mark_controller_cancelled(key(72, 1))
+            .expect("mark cancelled");
+        admissions
+            .record_epilog(key(72, 1), crate::admission::HookState::Pending)
+            .expect("record the owed hook");
+
+        let freed = settle_acknowledged_completion(
+            &svc.allocation,
+            &admissions,
+            key(72, 1),
+            spur_core::step::STEP_BATCH,
+        )
+        .await;
+
+        assert!(
+            !freed,
+            "the hook, not the acknowledgement, frees these cores"
+        );
+        assert_eq!(svc.allocation.lock().await.free_cpus(), while_held);
+        assert!(admissions
+            .load_run(key(72, 1))
+            .expect("record")
+            .cleanup
+            .epilog
+            .is_in_flight());
+    }
+
+    // A gate that never opens is worse than one that opens early. The hold an
+    // acknowledgement declines has to end when the supervisor's ledger answers.
+    #[tokio::test]
+    async fn the_hold_an_acknowledgement_declined_ends_when_the_epilog_answers() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_cancellable_supervised_run(&svc, 73, a_live_supervisor()).await;
+        register_a_supervisor_session(&svc, 73, state.path()).await;
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 73,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+        settle_acknowledged_completion(
+            &svc.allocation,
+            &admissions,
+            key(73, 1),
+            spur_core::step::STEP_BATCH,
+        )
+        .await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "the acknowledgement must find the hook still holding"
+        );
+
+        store
+            .prepare_session_dir(73, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(73, 1, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 9,
+            })
+            .expect("record the observed exit");
+        obligations
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
+            .expect("record the finished epilog");
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        release_due_allocations(&svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "once the hook has answered nothing may keep the cores"
+        );
+    }
+
+    // A second cancel must not put a hook that has already answered back in
+    // flight: nothing re-runs one, so that hold would have no way out.
+    #[tokio::test]
+    async fn a_cancel_does_not_re_hold_a_run_whose_epilog_already_answered() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        a_cancellable_supervised_run(&svc, 74, a_live_supervisor()).await;
+        register_a_supervisor_session(&svc, 74, state.path()).await;
+        admissions
+            .record_epilog(key(74, 1), crate::admission::HookState::Succeeded)
+            .expect("record the finished hook");
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 74,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert_eq!(
+            admissions
+                .load_run(key(74, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Succeeded
+        );
+    }
+
+    // The record is the only thing that can say a hook is owed, so a participant
+    // file the node cannot parse is not its word that none is.
+    #[tokio::test]
+    async fn a_cancel_holds_when_the_record_of_its_supervisor_cannot_be_read() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 58, a_live_supervisor()).await;
+        // The file naming the supervisor, corrupted: readable as neither a
+        // participant nor an absence of one.
+        let participant = admissions
+            .participant_path(key(58, 1), spur_core::step::STEP_BATCH)
+            .expect("participant path");
+        std::fs::write(&participant, b"{not json").expect("corrupt the participant");
+
+        svc.drop_tracked_job(58, 1).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an unreadable record must not read as a run that owes no hook"
+        );
+        assert_eq!(
+            admissions
+                .load_run(key(58, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending
+        );
+    }
+
+    // The read can fail outright rather than per-file. What it writes outlives the
+    // failure, so a cancel that read nothing must not leave a record saying so.
+    #[tokio::test]
+    async fn a_cancel_that_could_not_list_its_participants_still_records_the_debt() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 59, a_live_supervisor()).await;
+        // A file where the directory belongs: every listing of it fails, and
+        // none of those failures is a NotFound the caller may read as "none".
+        let dir = admissions
+            .participant_path(key(59, 1), spur_core::step::STEP_BATCH)
+            .expect("participant path")
+            .parent()
+            .expect("participants dir")
+            .to_path_buf();
+        std::fs::remove_dir_all(&dir).expect("drop the participants dir");
+        std::fs::write(&dir, b"").expect("put a file in its place");
+
+        svc.drop_tracked_job(59, 1).await;
+
+        assert_eq!(
+            admissions
+                .load_run(key(59, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending,
+            "a listing that could not be completed is not a run that owes no hook"
+        );
+        // Readable again, and the record written above is now the only account of
+        // what the cancel could not see.
+        std::fs::remove_file(&dir).expect("take the file away");
+        admit_a_participant_step(
+            &admissions,
+            &svc.reporter.hostname,
+            59,
+            spur_core::step::STEP_BATCH,
+            Some(a_live_supervisor()),
+        );
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "and the slice stays until the hook it could not rule out reports"
+        );
+    }
+
+    // The cancel reads the tracking map and acts on it much later. A launch of
+    // the same id must not land in between, or it is committed and then freed.
+    #[tokio::test]
+    async fn a_cancel_waits_for_a_launch_that_owns_the_job_id() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = Arc::new(svc_with_state_dir(state.path()).await);
+        let while_held = a_cancellable_supervised_run(&svc, 60, a_live_supervisor()).await;
+        // Nothing tracked is what sends the RPC down its own release path.
+        svc.running.lock().await.remove(&60);
+
+        // Stands in for a launch of the same id: it owns the id until it is done.
+        let launching = svc.lifecycle.acquire(60).await;
+        let cancel = tokio::spawn({
+            let svc = Arc::clone(&svc);
+            async move {
+                let mut req = Request::new(AgentCancelJobRequest {
+                    job_id: 60,
+                    signal: 0,
+                    run_attempt: 0,
+                });
+                req.extensions_mut().insert(controller_identity());
+                svc.cancel_job(req).await.expect("cancel");
+            }
+        });
+        // Long enough for a cancel that does not wait on the id to have read the
+        // tracking map; one that does is still parked ahead of the read.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("blocking pool");
+        }
+
+        // The launch finishing: its job is tracked before it lets the id go.
+        svc.insert_test_job(60, an_allocation_only_job(1)).await;
+        drop(launching);
+        cancel.await.expect("the cancel runs once the id is free");
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a cancel that read the map before the launch wrote it must not free its slice"
+        );
+    }
+
+    // A reservation whose launch never wrote a record has no hook to wait on, and
+    // under the id's guard its absence is settled rather than merely not yet.
+    #[tokio::test]
+    async fn a_cancel_releases_a_reservation_nothing_was_ever_spawned_against() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let while_held = {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(65, 1, 2, 1_000, &[])
+                .expect("allocate");
+            alloc.commit_job(65, 1);
+            alloc.free_cpus()
+        };
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 65,
+            signal: 0,
+            run_attempt: 0,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a claim with no record behind it must not be held for a hook that cannot exist"
+        );
+    }
+
+    // A numbered step runs no epilog and still reports one as not failed, so
+    // letting it answer for the run settles a hook that never started.
+    #[test]
+    fn a_numbered_steps_word_is_never_the_runs_epilog() {
+        let state = tempfile::tempdir().expect("state dir");
+        let admissions = crate::admission::AdmissionStore::new(state.path(), "n1");
+        admit_a_supervised_run(&admissions, "n1", 61, vec![0], Some(a_live_supervisor()));
+        admissions
+            .mark_run_cleaned(key(61, 1), crate::admission::EpilogOwed::Yes)
+            .expect("the debt the teardown leaves");
+
+        record_run_epilog(
+            &admissions,
+            key(61, 1),
+            0,
+            crate::admission::HookState::Succeeded,
+        );
+
+        assert_eq!(
+            admissions
+                .load_run(key(61, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending,
+            "a step that ran no hook cannot report one as finished"
+        );
+        record_run_epilog(
+            &admissions,
+            key(61, 1),
+            spur_core::step::STEP_BATCH,
+            crate::admission::HookState::Succeeded,
+        );
+        assert_eq!(
+            admissions
+                .load_run(key(61, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Succeeded,
+            "and the step that owns the hook still answers for it"
+        );
+    }
+
+    // The ledger is read per step, and a numbered step's says the hook passed
+    // whatever it did. A run whose owner step is unnamed must not fall to it.
+    #[tokio::test]
+    async fn the_runs_epilog_is_read_from_the_step_that_owns_the_hook() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_cancellable_supervised_run(&svc, 62, a_live_supervisor()).await;
+        // A numbered step of the same run, which sorts below the batch step, and
+        // a record from before the owner was named: the shape that picks it.
+        admit_a_participant_step(&admissions, "n1", 62, 0, Some(a_live_supervisor()));
+        let mut run = admissions.load_run(key(62, 1)).expect("record");
+        run.lifecycle_owner_step = None;
+        admissions.admit_run(&run).expect("re-admit");
+        svc.drop_tracked_job(62, 1).await;
+
+        // What a numbered step's supervisor writes: it ran no hook, and says so
+        // as a hook that did not fail.
+        store.prepare_session_dir(62, 1, 0).expect("session dir");
+        store
+            .obligations(62, 1, 0)
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
+            .expect("record the step's epilog");
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a numbered step's ledger must not release the job's slice"
+        );
+    }
+
+    // A ledger corrupt anywhere but its last line never parses again, so holding
+    // on the read alone is a hold with no way out.
+    #[tokio::test]
+    async fn an_unreadable_ledger_settles_once_its_supervisor_is_proven_gone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_cancellable_supervised_run(&svc, 63, a_live_supervisor()).await;
+        svc.drop_tracked_job(63, 1).await;
+        its_supervisor_has_since_died(&admissions, key(63, 1), spur_core::step::STEP_BATCH);
+        store
+            .prepare_session_dir(63, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(63, 1, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record the exit");
+        // Corruption before the final newline: the tail-tolerant read cannot
+        // skip it, so this log is unreadable for good.
+        let path = obligations.path().to_path_buf();
+        let mut contents = std::fs::read_to_string(&path).expect("read the log");
+        contents.insert_str(0, "{not json\n");
+        std::fs::write(&path, contents).expect("corrupt the log");
+
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a ledger nobody is left to write must not hold the cores for good"
+        );
+    }
+
+    /// An `srun --pty` allocation as the RPC leaves it, plus the supervisor
+    /// identity a unit test cannot spawn a real `spurstepd` to write.
+    async fn a_registered_allocation(svc: &AgentService, job_id: u32) -> u32 {
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id,
+            cpus: 2,
+            run_attempt: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 2,
+                memory_mb: 512,
+                devices: std::collections::HashMap::new(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register the allocation");
+        svc.admissions()
+            .record_supervisor(
+                key(job_id, 1),
+                spur_core::step::STEP_EXTERN,
+                a_live_supervisor(),
+            )
+            .expect("record the allocation supervisor");
+        svc.allocation.lock().await.free_cpus()
+    }
+
+    // The allocation path launches nothing the controller told it to, so its
+    // record was the one nobody wrote — and a cancel read that as owing no hook.
+    #[tokio::test]
+    async fn a_registered_allocation_names_the_step_that_owns_its_lifetime() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        a_registered_allocation(&svc, 70).await;
+
+        let admissions = svc.admissions();
+        assert_eq!(
+            admissions
+                .load_run(key(70, 1))
+                .expect("record")
+                .lifecycle_owner_step,
+            Some(spur_core::step::STEP_EXTERN),
+            "an allocation's own step has to be the one a release is keyed on"
+        );
+        let (admitted, rejected) = admissions.load_admitted(key(70, 1)).expect("participants");
+        assert!(rejected.is_empty());
+        assert_eq!(
+            hook_owner_step(&admitted),
+            Some(spur_core::step::STEP_EXTERN),
+            "without a participant the run has no step that could answer for a hook"
+        );
+    }
+
+    // Measured live: a cancelled pty job handed its cores to the next job 321ms
+    // in, while its own epilog still had ~29s left to run on them.
+    #[tokio::test]
+    async fn a_cancelled_allocation_holds_its_cores_until_its_epilog_ends() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_registered_allocation(&svc, 71).await;
+
+        svc.drop_tracked_job(71, 1).await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "cores an epilog is still running on are not free"
+        );
+
+        store
+            .prepare_session_dir(71, 1, spur_core::step::STEP_EXTERN)
+            .expect("session dir");
+        store
+            .obligations(71, 1, spur_core::step::STEP_EXTERN)
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
+            .expect("record the epilog's outcome");
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "and released once the hook's owner says it ended"
+        );
+    }
+
+    // Nothing was ever named to answer for this hook, so no ledger can say it
+    // ended. Waiting is not proof, and the slice stays put until a restart is.
+    #[tokio::test]
+    async fn an_epilog_whose_owner_was_never_recorded_holds_its_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+
+        admit_a_supervised_run(&admissions, &svc.reporter.hostname, 74, vec![0, 1], None);
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(74, 1, 2, 1_000, &[])
+                .expect("allocate");
+            alloc.commit_job(74, 1);
+        }
+        svc.insert_test_job(74, an_allocation_only_job(1)).await;
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        svc.drop_tracked_job(74, 1).await;
+        let admitted = admissions
+            .load_all()
+            .expect("the ledger")
+            .runs
+            .into_iter()
+            .find(|admitted| admitted.run.job_id == 74)
+            .expect("the record");
+        assert!(
+            hook_owner_step(&admitted).is_none(),
+            "no participant carries a supervisor, so no step owns the hook"
+        );
+        assert!(admitted.run.cleanup.epilog.is_in_flight());
+
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an epilog no one can answer for must not hand its cores on"
+        );
+        assert!(
+            admissions
+                .load_run(key(74, 1))
+                .expect("the record")
+                .cleanup
+                .epilog
+                .is_in_flight(),
+            "and the hook must still read as unfinished"
+        );
+    }
+
+    // The control for the hold above: a gate that refuses everything reads the
+    // same as one that refuses only what a hook is standing on.
+    #[tokio::test]
+    async fn a_cancelled_allocation_with_no_epilog_releases_at_once() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let while_held = a_registered_allocation(&svc, 72).await;
+
+        svc.drop_tracked_job(72, 1).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a node that runs no epilog has nothing to wait for"
+        );
+    }
+
+    // Holding for a hook with no deadline is right, and silent is not: the one
+    // line a cancel logs scrolls away long before an operator looks.
+    #[test]
+    fn a_hold_that_outlasts_the_threshold_is_said_again() {
+        let mut held_since = HashMap::new();
+        let run = key(64, 1);
+
+        assert!(
+            !epilog_hold_is_worth_saying(&mut held_since, run),
+            "a hook that just started is not news"
+        );
+
+        let stale = std::time::Instant::now()
+            .checked_sub(EPILOG_HOLD_STUCK_AFTER)
+            .expect("a threshold the clock can reach back past");
+        held_since.insert(run, stale);
+        assert!(
+            epilog_hold_is_worth_saying(&mut held_since, run),
+            "one that has held past the threshold is"
+        );
+        assert!(
+            !epilog_hold_is_worth_saying(&mut held_since, run),
+            "and saying it restarts its clock rather than repeating every tick"
+        );
+    }
+
     // A stale-epoch drop (peeked before a concurrent redispatch retracked the
     // same job_id under a newer attempt) must not evict the new tracking.
     #[tokio::test]
@@ -15075,33 +21121,9 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        fn allocation_only_job(run_attempt: u32) -> TrackedJob {
-            TrackedJob {
-                job: executor::RunningJob::AllocationOnly,
-                cgroup_path: None,
-                rootfs_mode: crate::container::RootfsMode::Extracted,
-                stdout_path: "/dev/null".into(),
-                stderr_path: "/dev/null".into(),
-                has_pid_namespace: false,
-                has_user_namespace: false,
-                has_mount_namespace: false,
-                _pty_master: None,
-                work_dir: "/tmp".into(),
-                uid: 0,
-                gid: 0,
-                user: "testuser".into(),
-                partition: String::new(),
-                gpu_devices: Vec::new(),
-                cpus: 1,
-                memory_mb: 0,
-                nodelist: String::new(),
-                mpi: String::new(),
-                run_attempt,
-            }
-        }
         let job_id = 903;
-        svc.insert_test_job(job_id, allocation_only_job(1)).await;
-        svc.insert_test_job(job_id, allocation_only_job(2)).await;
+        svc.insert_test_job(job_id, an_allocation_only_job(1)).await;
+        svc.insert_test_job(job_id, an_allocation_only_job(2)).await;
 
         svc.drop_tracked_job(job_id, 1).await;
 
@@ -15128,32 +21150,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         let job_id = 904;
-        svc.insert_test_job(
-            job_id,
-            TrackedJob {
-                job: executor::RunningJob::AllocationOnly,
-                cgroup_path: None,
-                rootfs_mode: crate::container::RootfsMode::Extracted,
-                stdout_path: "/dev/null".into(),
-                stderr_path: "/dev/null".into(),
-                has_pid_namespace: false,
-                has_user_namespace: false,
-                has_mount_namespace: false,
-                _pty_master: None,
-                work_dir: "/tmp".into(),
-                uid: 0,
-                gid: 0,
-                user: "testuser".into(),
-                partition: String::new(),
-                gpu_devices: Vec::new(),
-                cpus: 1,
-                memory_mb: 0,
-                nodelist: String::new(),
-                mpi: String::new(),
-                run_attempt: 1,
-            },
-        )
-        .await;
+        svc.insert_test_job(job_id, an_allocation_only_job(1)).await;
 
         let newer = crate::stepd::StepdDescriptor::new(
             job_id,
@@ -15476,6 +21473,8 @@ mod tests {
             &svc.running,
             &svc.allocation,
             &svc.mpi_host,
+            &svc.admissions(),
+            crate::admission::EpilogOwed::No,
         )
         .await;
 
@@ -15493,7 +21492,7 @@ mod tests {
     // The counterpart: with no live run under the id, the same teardown must
     // still release everything, so the guard above cannot just skip always.
     #[tokio::test]
-    async fn teardown_releases_a_job_id_nothing_holds() {
+    async fn teardown_cleans_up_without_releasing_the_slice() {
         let dir = tempfile::tempdir().unwrap();
         let cgroup = dir.path().join("job_908");
         std::fs::create_dir(&cgroup).unwrap();
@@ -15519,6 +21518,8 @@ mod tests {
             &svc.running,
             &svc.allocation,
             &svc.mpi_host,
+            &svc.admissions(),
+            crate::admission::EpilogOwed::No,
         )
         .await;
 
@@ -15526,10 +21527,12 @@ mod tests {
             !cgroup.exists(),
             "teardown must remove the finished run's cgroup"
         );
+        // Teardown cleans up but does not free the slice: only the controller's
+        // committed completion does.
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "teardown must release the finished run's reservation"
+            0,
+            "teardown must not release ahead of the acknowledgement"
         );
     }
 
@@ -15671,7 +21674,9 @@ mod tests {
 
         // Core 2 is 910's alone: had 911 replayed it verbatim, releasing 911
         // would clear a core 910 is still running on.
-        alloc.release_job(911);
+        alloc.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(
+            911,
+        )));
         assert!(alloc.allocated_cpus[2]);
         assert!(!alloc.allocated_cpus[3]);
     }

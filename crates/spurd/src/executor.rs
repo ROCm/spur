@@ -134,7 +134,13 @@ pub enum LaunchIo {
     File,
     /// PTY-backed: stdout/stderr/stdin all go through a pseudo-terminal.
     /// The master fd is returned in `LaunchResult::pty_master`.
-    Pty,
+    Pty(Option<crate::pty::WindowSize>),
+}
+
+impl LaunchIo {
+    pub fn is_pty(&self) -> bool {
+        matches!(self, Self::Pty(_))
+    }
 }
 
 pub struct JobLaunchConfig {
@@ -554,7 +560,7 @@ async fn spawn_job_process(
         .map_err(|e| classify_spool_error(&spool_dir, e))?;
 
     // Build resolved output paths (empty for PTY mode since output goes to the terminal).
-    let (stdout_resolved, stderr_resolved) = if cfg.io_mode == LaunchIo::Pty {
+    let (stdout_resolved, stderr_resolved) = if cfg.io_mode.is_pty() {
         ("/dev/null".to_string(), "/dev/null".to_string())
     } else {
         (
@@ -565,8 +571,9 @@ async fn spawn_job_process(
 
     // Build JobIo: a single object owning the fds for either file or PTY mode.
     let job_io = match cfg.io_mode {
-        LaunchIo::Pty => {
-            let (master, slave) = crate::pty::openpty_with_winsize(None).context("PTY openpty")?;
+        LaunchIo::Pty(winsize) => {
+            let (master, slave) =
+                crate::pty::openpty_with_winsize(winsize.as_ref()).context("PTY openpty")?;
             JobIo::Pty { master, slave }
         }
         LaunchIo::File => {
@@ -723,15 +730,17 @@ async fn spawn_job_process(
     };
 
     // Launch the process
-    let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
+    let piped_mpi_stdio = cfg.pmix_multi_task && !cfg.io_mode.is_pty();
     let mut cmd = Command::new(&launch_cmd);
     // Always its own process group (run_command does the same for pmix step
     // launches) so signal()/kill_signal's group-kill reaches the whole job
     // regardless of PMIx — only namespace isolation is pmix-conditional above.
-    cmd.args(&launch_args)
-        .current_dir(work_dir)
-        .envs(&env)
-        .process_group(0);
+    cmd.args(&launch_args).current_dir(work_dir).envs(&env);
+    // A terminal's own setsid() makes the group. Asking for one here first makes
+    // the child a group leader, for which setsid() is EPERM and the spawn fails.
+    if !cfg.io_mode.is_pty() {
+        cmd.process_group(0);
+    }
     if piped_mpi_stdio {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3421,6 +3430,45 @@ mod tests {
             io_mode: LaunchIo::File,
             pmix_multi_task: false,
         }
+    }
+
+    // A pty child calls setsid() between fork and exec. Asking for a process
+    // group as well makes it a group leader, and setsid() is then EPERM.
+    #[tokio::test]
+    async fn a_terminal_launch_reaches_exec_rather_than_failing_to_spawn() {
+        let work_dir = tempfile::tempdir().expect("tempdir");
+        let cfg = JobLaunchConfig {
+            script: "#!/bin/bash\nexec /bin/true\n".into(),
+            work_dir: work_dir.path().to_string_lossy().into_owned(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            io_mode: LaunchIo::Pty(Some(crate::pty::WindowSize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            })),
+            ..launch_cfg_for_paths(918_231, "terminal", "u", "node")
+        };
+
+        let mut result = match launch_job(&cfg, None).await {
+            Ok(result) => result,
+            Err(error) => panic!("a terminal must launch: {error}"),
+        };
+        assert!(
+            result.pty_master.is_some(),
+            "a terminal launch must hand back its master"
+        );
+        assert!(result.job.pid().expect("a terminal launch has a process") > 0);
+        while result
+            .job
+            .try_wait()
+            .expect("the shell must be reapable")
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+        cleanup_job_spool(cfg.job_id);
     }
 
     #[test]

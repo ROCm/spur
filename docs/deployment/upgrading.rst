@@ -223,6 +223,8 @@ The rolling upgrade is controlled with these ``-e`` flags:
    single-controller cluster still has a short outage while its own controller restarts —
    true zero-downtime requires an HA quorum of 3 or more controllers.
 
+.. _safe-upgrade-order:
+
 Safe Upgrade Order
 ~~~~~~~~~~~~~~~~~~~
 
@@ -231,7 +233,8 @@ Follow this order for any cluster upgrade:
 1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
-   controller at a time to preserve quorum.
+   controller at a time to preserve quorum. One release reverses this step; see
+   :ref:`node-reconciliation-upgrade`.
 3. **Drain agents before swapping binaries.** The rolling playbook drains automatically; a
    running job blocks the swap unless you force it.
 4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
@@ -401,6 +404,76 @@ a cgroup-device program is a net-admin program type, so ``CAP_BPF`` alone is not
 An agent without them logs ``device filter not installed`` and runs the job with no
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
+
+.. _node-reconciliation-upgrade:
+
+Node reconciliation and resource release
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing node reconciliation changes two things about a cluster
+whose ``spur.conf`` is untouched: the controller compares each node's account of
+what it is holding against its own record and resolves the difference, and a
+job's resources are freed on the controller's acknowledgement rather than when
+the job's processes exit. See :doc:`/user-guide/monitoring-jobs` for both.
+
+**This change adds no ordering rule.** :ref:`Safe Upgrade Order
+<safe-upgrade-order>` applies unchanged — controllers before agents, one
+controller at a time to preserve quorum, rebuild all binaries together, roll
+forward only.
+
+A controller asks a node to release a run it is no longer accounting for, and
+only the node can see whether an epilog is still running on those cores. An
+agent that predates that exchange does not answer it at all: it reports the
+request as unimplemented, which the controller reads as the node still holding.
+The pairing is safe in both directions, so neither side has to go first.
+
+**Reconciliation stays inert until the agents are upgraded.** A pre-upgrade agent
+sends no ledger with its registration, so the controller builds no comparison and
+gates nothing; a controller that pulls one from such an agent gets "not
+implemented" back and leaves the node alone. Reconciliation therefore starts
+working node by node as each agent is replaced, in either order.
+
+**A pre-upgrade controller can clear a node's unresolved-claim reason while the
+claim is still held.** It counts only the claims an agent released, so an agent's
+refusal leaves it nothing to name and it rewrites ``Reason=`` to empty. No
+resources move and no claim is dropped, but the operator signal pointing at that
+claim disappears until an upgraded controller reconciles the node again.
+
+**An upgraded agent under a pre-upgrade controller stalls rather than losing
+work.** Registration still succeeds: the old controller ignores the ledger and
+cancels nothing. But the new agent no longer frees a claim it has merely lost
+track of — forgetting a job is not evidence the job finished — and an old
+controller never reconciles it. Those claims stay booked, so the node's usable
+capacity shrinks until an upgraded controller is in place. Nothing is killed and
+no job record is lost, and the stall ends as each controller is upgraded.
+
+**Downgrading an agent strands whatever it was mid-teardown on.** An agent that
+owes a job's epilog records that debt on disk, and a pre-upgrade agent cannot
+read the record back. It keeps the record rather than guessing, but it does not
+restore that run's slice and reports its own inventory as incomplete, so those
+cores stay out of the pool until the record ages out. This is the general
+roll-forward rule in :ref:`Safe Upgrade Order <safe-upgrade-order>` applied to
+the node's own ledger; drain a node before rolling its agent back.
+
+**A new node reason appears.** While the controller is comparing a freshly
+registered node's ledger, that node reports ``reconciling with the controller``
+(``Reason=`` in ``scontrol show node``, ``%E`` in ``sinfo``) and takes no new
+work. It keeps its usual state — ``idle`` or ``mix``, not ``drain`` — so an
+operator sees an available node that is not being picked. It normally clears
+immediately, and the pass is capped at a minute, after which the node is let back
+in regardless. A rolling upgrade will show this on each node as its agent comes
+back.
+
+**Expect an allocated-but-empty window after each job.** Resources return on the
+controller's acknowledgement, so ``sinfo`` can show them allocated for a round
+trip after the work is done — and where the node runs an epilog, for however long
+that hook takes, plus the length of any controller outage.
+Held resources on an unreachable node are not schedulable anyway, and are
+resolved when it reconnects.
+
+Whether a registering node's ledger may be acted on destructively depends on
+``[admission] mode``, which defaults to ``open`` and withholds that half. This
+release does not change the default; see :doc:`/admin-guide/configuration`.
 
 See Also
 --------

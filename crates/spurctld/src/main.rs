@@ -3,10 +3,12 @@
 
 mod accounting;
 mod agent_client;
+mod agent_sessions;
 mod association_cache;
 mod auth_middleware;
 mod cluster;
 mod cluster_k8s;
+mod dispatch_tracker;
 mod fairshare_cache;
 mod hooks;
 mod limits_cache;

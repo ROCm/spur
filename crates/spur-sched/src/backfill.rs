@@ -96,6 +96,30 @@ struct ReservationCheck<'a> {
     reservations: &'a [Reservation],
 }
 
+/// Where a search ended. A search that ran out of horizon still yields a time to
+/// hold the slot at, but that time is its own bound and no date anything found.
+#[derive(Clone, Copy)]
+struct EarliestStart {
+    at: chrono::DateTime<Utc>,
+    exhausted: bool,
+}
+
+impl EarliestStart {
+    fn found(at: chrono::DateTime<Utc>) -> Self {
+        Self {
+            at,
+            exhausted: false,
+        }
+    }
+
+    fn exhausted(at: chrono::DateTime<Utc>) -> Self {
+        Self {
+            at,
+            exhausted: true,
+        }
+    }
+}
+
 impl BackfillScheduler {
     pub fn new(max_jobs: usize) -> Self {
         Self {
@@ -228,17 +252,22 @@ impl BackfillScheduler {
         request: &ResourceSet,
         duration: chrono::Duration,
         floor: chrono::DateTime<Utc>,
-    ) -> chrono::DateTime<Utc> {
-        let max_check = floor + chrono::Duration::days(365);
+    ) -> EarliestStart {
+        let max_check = floor + crate::timeline::PROJECTION_HORIZON;
         let mut candidate = floor;
         loop {
             if candidate > max_check {
-                return max_check;
+                return EarliestStart::exhausted(max_check);
             }
             candidate = self.timelines[ni].earliest_start(request, duration, candidate);
+            // The sweep reports its own exhaustion as that same bound, and a slot
+            // "found" at the edge of what was searched was not found at all.
+            if candidate >= max_check {
+                return EarliestStart::exhausted(max_check);
+            }
             match Self::reservation_blocker(res_check, candidate, duration) {
                 Some(end) => candidate = end,
-                None => return candidate,
+                None => return EarliestStart::found(candidate),
             }
         }
     }
@@ -477,26 +506,27 @@ impl Scheduler for BackfillScheduler {
             // Earliest start per node, folding resource and reservation
             // conflicts into one search. Exclusive jobs time against the
             // node's full capacity, not their own modest share.
-            let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
-                .iter()
-                .map(|&ni| {
-                    let res_check = ReservationCheck {
-                        job,
-                        node: &cluster.nodes[ni].name,
-                        reservations: cluster.reservations,
-                    };
-                    let start =
-                        self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
-                    debug!(
-                        job_id = job.job_id,
-                        node = %cluster.nodes[ni].name,
-                        earliest_start = %start,
-                        is_now = (start <= now),
-                        "earliest start for node"
-                    );
-                    (ni, start)
-                })
-                .collect();
+            let mut searched_out = false;
+            let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = Vec::new();
+            for &ni in &suitable {
+                let res_check = ReservationCheck {
+                    job,
+                    node: &cluster.nodes[ni].name,
+                    reservations: cluster.reservations,
+                };
+                let start =
+                    self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
+                searched_out |= start.exhausted;
+                debug!(
+                    job_id = job.job_id,
+                    node = %cluster.nodes[ni].name,
+                    earliest_start = %start.at,
+                    exhausted = start.exhausted,
+                    is_now = (start.at <= now),
+                    "earliest start for node"
+                );
+                node_starts.push((ni, start.at));
+            }
 
             // Free GPUs per candidate, evaluated at each node's own
             // earliest_start (not `now`, which can be stale by then).
@@ -611,26 +641,28 @@ impl Scheduler for BackfillScheduler {
             // at — an independently-computed per-node start can be stale
             // once shifted forward to match the slowest node in the set.
             let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
-            let common_horizon = now + chrono::Duration::days(365);
+            let common_horizon = now + crate::timeline::PROJECTION_HORIZON;
             loop {
-                let next = assigned_nodes
-                    .iter()
-                    .map(|&(ni, _)| {
-                        let res_check = ReservationCheck {
-                            job,
-                            node: &cluster.nodes[ni].name,
-                            reservations: cluster.reservations,
-                        };
-                        self.earliest_valid_start(
-                            ni,
-                            res_check,
-                            timing_request(ni),
-                            duration,
-                            earliest,
-                        )
-                    })
-                    .max()
-                    .unwrap_or(earliest);
+                let mut next = None;
+                for &(ni, _) in &assigned_nodes {
+                    let res_check = ReservationCheck {
+                        job,
+                        node: &cluster.nodes[ni].name,
+                        reservations: cluster.reservations,
+                    };
+                    let start = self.earliest_valid_start(
+                        ni,
+                        res_check,
+                        timing_request(ni),
+                        duration,
+                        earliest,
+                    );
+                    searched_out |= start.exhausted;
+                    next = Some(
+                        next.map_or(start.at, |seen: chrono::DateTime<Utc>| seen.max(start.at)),
+                    );
+                }
+                let next = next.unwrap_or(earliest);
                 // Advance before checking the horizon: the horizon only
                 // bounds iteration count, it must never discard a freshly
                 // computed (more accurate) value.
@@ -703,6 +735,9 @@ impl Scheduler for BackfillScheduler {
                     per_node_alloc,
                 });
             } else {
+                // A search that ran out of horizon reports its own bound, which is
+                // no projection. The slot still holds; only the date is withheld.
+                let projected = (!searched_out).then_some(job.job_id);
                 for (ni, _) in &assigned_nodes {
                     let node_alloc = per_node_alloc
                         .get(&cluster.nodes[*ni].name)
@@ -712,13 +747,13 @@ impl Scheduler for BackfillScheduler {
                         earliest,
                         earliest + duration,
                         node_alloc,
-                        Some(job.job_id),
+                        projected,
                     );
                 }
                 note(
                     UnplacedKind::FutureSlotReserved,
                     assigned_nodes.len(),
-                    Some(earliest),
+                    projected.map(|_| earliest),
                 );
             }
         }
@@ -910,6 +945,45 @@ mod tests {
         let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
         assert_eq!(outcome.kind, UnplacedKind::NoSuitableNodes);
         assert_eq!(outcome.needed_nodes, 1);
+    }
+
+    #[test]
+    fn a_fully_charged_node_absent_from_busy_until_is_not_placed_on() {
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut nodes = make_nodes(1);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+
+        let mut sched = BackfillScheduler::new(100);
+        let cluster = ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+        assert!(
+            sched.schedule(&[make_job(1, 1, 64)], &cluster).is_empty(),
+            "every core is charged, so there is nothing here to place on"
+        );
+
+        // Naming `now` as the horizon reserves a zero-width interval, which
+        // `accumulated_at` skips — the charge vanishes and the node reads free.
+        let mut sched = BackfillScheduler::new(100);
+        let now_horizon = std::collections::HashMap::from([(nodes[0].name.clone(), Utc::now())]);
+        let cluster = ClusterState {
+            busy_until: &now_horizon,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+        assert!(
+            !sched.schedule(&[make_job(2, 1, 64)], &cluster).is_empty(),
+            "if this ever stops double-booking, the guard above is free to relax"
+        );
     }
 
     #[test]
@@ -1991,6 +2065,45 @@ mod tests {
             .expect("job-keyed view must report the held slot");
         assert_eq!(nodes_held, vec!["node001"]);
         assert!(start > Utc::now());
+    }
+
+    // A search that runs out of horizon returns its own bound. Reporting that as
+    // a start puts a date a year out on a job nobody has projected anything for.
+    #[test]
+    fn a_slot_held_out_at_the_search_horizon_is_not_reported_as_a_start() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(1);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        // Occupied past the horizon, so the search runs out rather than finding a
+        // slot: the only start it can offer is the bound it gave up at.
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert(
+            "node001".to_string(),
+            Utc::now() + crate::timeline::PROJECTION_HORIZON + Duration::days(30),
+        );
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        assert!(sched.schedule(&[make_job(1, 1, 64)], &cluster).is_empty());
+        assert!(
+            !sched.planned_job_starts().contains_key(&1),
+            "the slot is still reserved; it is the fabricated date that must not be published"
+        );
+        let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
+        assert_eq!(outcome.kind, UnplacedKind::FutureSlotReserved);
+        assert!(
+            outcome.planned_start.is_none(),
+            "and the log must not carry the date the view withheld"
+        );
     }
 
     #[test]

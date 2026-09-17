@@ -120,6 +120,8 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
     for node in &nodes {
         match client
             .update_node(UpdateNodeRequest {
+                reconcile: false,
+                caller: String::new(),
                 name: node.to_string(),
                 state: None,
                 reason: None,

@@ -394,19 +394,18 @@ class SpurCluster:
         cmd_parts.extend(f"'{a}'" for a in args[1:])
         return self.nodes[0].exec(" ".join(cmd_parts))
 
-    def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
+    def cli_allow_fail(self, args: list[str], controller_addr: str | None = None,
+                       extra_env: dict[str, str] | None = None) -> str:
         """Run a spur CLI command, returning stdout+stderr regardless of exit
         code. Use to assert on expected submission rejections.
 
         *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
+        *extra_env* adds variables to the environment; pass ``SPUR_AUTH_TOKEN``
+        to drive an identity the controller verifies rather than the SSH user's.
         """
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
-        return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
+        return self.cli_with_exit(
+            args, controller_addr=controller_addr, extra_env=extra_env
+        )[1]
 
     def cli_as_user(
         self,
@@ -437,14 +436,18 @@ class SpurCluster:
         return self.nodes[0].exec_allow_fail(cmd)
 
     def cli_with_exit(
-        self, args: list[str], controller_addr: str | None = None
+        self, args: list[str], controller_addr: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> tuple[int, str]:
-        """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
+        """Run a spur CLI command and return (exit_code, combined stdout+stderr).
+        *extra_env* adds variables to the environment, as in :meth:`cli_as_user`."""
         cmd_parts = [
             f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
             f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
         ]
+        for key, value in (extra_env or {}).items():
+            cmd_parts.append(f"{key}='{value}'")
+        cmd_parts.append(f"'{self.bin_dir}/{args[0]}'")
         cmd_parts.extend(f"'{a}'" for a in args[1:])
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
@@ -864,6 +867,13 @@ class SpurCluster:
     def scontrol_show_node(self, node_name: str) -> str:
         return self.scontrol("show", "node", node_name)
 
+    def node_cpu_alloc(self, node_name: str) -> int:
+        """CPUs the controller currently counts as allocated on *node_name*."""
+        out = self.scontrol_show_node(node_name)
+        match = re.search(r"CPUAlloc=(\d+)", out)
+        assert match, f"no CPUAlloc in scontrol show node {node_name}:\n{out}"
+        return int(match.group(1))
+
     def node_gpu_count(self, node_name: str) -> int:
         """Return schedulable GPU count from scontrol show node."""
         out = self.scontrol_show_node(node_name)
@@ -993,13 +1003,17 @@ class SpurCluster:
             f"within {timeout}s"
         )
 
-    def restart_controller(self):
+    def restart_controller(self, forget_history: bool = False):
         """Restart spurctld without touching the agents. State is recovered
         from the Raft log on the existing state-dir. Waits for the controller
         to answer queries again (does not require nodes to be idle, since a
-        suspended job keeps its allocation)."""
+        suspended job keeps its allocation). With *forget_history* the Raft log is
+        discarded first, so the controller comes back knowing nothing of the runs
+        its agents still hold."""
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
         time.sleep(1)
+        if forget_history:
+            self.nodes[0].exec(f"rm -rf '{self.state_dir}/raft'")
         self._start_controller()
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -1492,6 +1506,18 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     raise TimeoutError(
         f"Job {job_id} did not finish within {timeout}s (last state: {last})"
     )
+
+
+def wait_until(predicate, message: str, timeout: int = 60, interval: float = 0.5):
+    """Poll *predicate* until it returns a truthy value, then return it. Fails with
+    *message* on timeout, so a stalled condition reads as the assertion it stands for."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = predicate()
+        if result:
+            return result
+        time.sleep(interval)
+    raise AssertionError(f"{message} (waited {timeout}s)")
 
 
 def wait_sacct_row(cluster: SpurCluster, job_id: int, fmt: str,
