@@ -15,7 +15,8 @@ use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, FenceRunRequest, JobSpec as ProtoJobSpec,
-    LaunchJobRequest, RegisterJobAllocationRequest, RequestNodeLedgerRequest, SubmitJobRequest,
+    LaunchJobRequest, RegisterJobAllocationRequest, RequestNodeLedgerRequest, SettleRunRequest,
+    SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -82,6 +83,20 @@ fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
     let entering = is_leader && !*was_leader;
     *was_leader = is_leader;
     entering
+}
+
+/// Drop everything a former leader may no longer speak for. Kept whole so state
+/// that only one term can vouch for is not left behind in one place and not another.
+pub(crate) fn relinquish_leadership(
+    cluster: &Arc<ClusterManager>,
+    scheduler: &mut BackfillScheduler,
+) {
+    cluster.set_planned_reservations(HashMap::new());
+    cluster.set_planned_job_starts(HashMap::new());
+    // Registrations during another term went to that leader, so what is recorded
+    // here may already name a lifetime that has been replaced.
+    cluster.agent_sessions().clear();
+    scheduler.clear_outcomes();
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -171,11 +186,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let entering_term = entering_leadership(&mut was_leader, is_leader);
 
         if !is_leader {
-            // A former leader must not keep serving planned-reservation info
-            // from before it lost leadership.
-            cluster.set_planned_reservations(HashMap::new());
-            cluster.set_planned_job_starts(HashMap::new());
-            scheduler.clear_outcomes();
+            relinquish_leadership(&cluster, &mut scheduler);
             continue;
         }
 
@@ -2585,7 +2596,14 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     match pulled {
         Ok(Ok(response)) => {
             if let Some(ledger) = response.into_inner().ledger {
-                crate::server::reconcile_node_ledger(cluster, node, ledger, &dispatched).await;
+                crate::server::reconcile_node_ledger(
+                    cluster,
+                    node,
+                    ledger,
+                    &dispatched,
+                    crate::server::CutProvenance::Pulled,
+                )
+                .await;
             }
         }
         // An agent that predates the pull keeps its pre-upgrade behaviour.
@@ -2662,6 +2680,51 @@ async fn fence_one_agent(
             warn!(job_id, agent = %agent_addr, %status, "agent refused a run fence")
         }
         Err(_) => warn!(job_id, agent = %agent_addr, "timed out fencing a run"),
+    }
+}
+
+/// Tell a node the controller is not accounting for a run it still holds, which
+/// is the acknowledgement that run's slice is waiting on. Whether it went back.
+pub async fn settle_run_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    run: spur_core::job::RunKey,
+) -> bool {
+    let job_id = run.job_id();
+    // A settle names one run's slice; the wildcard key names no slice to free.
+    let Some(run_attempt) = run.attempt() else {
+        return false;
+    };
+    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+        return false;
+    };
+    let Ok(mut client) = crate::agent_client::connect(addr).await else {
+        debug!(job_id, node = %node, "could not reach an agent to settle a run");
+        return false;
+    };
+    let settled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.settle_run(SettleRunRequest {
+            job_id,
+            run_attempt,
+        }),
+    )
+    .await;
+    match settled {
+        Ok(Ok(response)) => response.into_inner().released,
+        // An agent that predates the settle keeps holding; the next pass retries.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, node = %node, "agent predates run settlement");
+            false
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, node = %node, %status, "agent refused a run settlement");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node = %node, "timed out settling a run");
+            false
+        }
     }
 }
 
@@ -3539,6 +3602,17 @@ mod tests {
                     success: true,
                     error: String::new(),
                     reject_before_unix_ms: 0,
+                }))
+            }
+
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::SettleRunResponse {
+                    released: true,
+                    error: String::new(),
                 }))
             }
 

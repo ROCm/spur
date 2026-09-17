@@ -223,6 +223,8 @@ The rolling upgrade is controlled with these ``-e`` flags:
    single-controller cluster still has a short outage while its own controller restarts —
    true zero-downtime requires an HA quorum of 3 or more controllers.
 
+.. _safe-upgrade-order:
+
 Safe Upgrade Order
 ~~~~~~~~~~~~~~~~~~~
 
@@ -401,6 +403,54 @@ a cgroup-device program is a net-admin program type, so ``CAP_BPF`` alone is not
 An agent without them logs ``device filter not installed`` and runs the job with no
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
+
+Node reconciliation and resource release
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing node reconciliation changes two things about a cluster
+whose ``spur.conf`` is untouched: the controller compares each node's account of
+what it is holding against its own record and resolves the difference, and a
+job's resources are freed on the controller's acknowledgement rather than when
+the job's processes exit. See :doc:`/user-guide/monitoring-jobs` for both.
+
+No new ordering rule applies. :ref:`Safe Upgrade Order <safe-upgrade-order>`
+already requires controllers before agents and forward-only rolls, which is
+exactly what this change needs.
+
+**Reconciliation stays inert until the agents are upgraded.** A pre-upgrade agent
+sends no ledger with its registration, so the controller builds no comparison and
+gates nothing; a controller that pulls one from such an agent gets "not
+implemented" back and leaves the node alone. Upgrading controllers first
+therefore changes no node behaviour on its own — reconciliation starts working
+node by node, as each agent is replaced.
+
+**An upgraded agent under a pre-upgrade controller stalls rather than losing
+work.** Registration still succeeds: the old controller ignores the ledger and
+cancels nothing. But the new agent no longer frees a claim it has merely lost
+track of — forgetting a job is not evidence the job finished — and an old
+controller never reconciles it. Those claims stay booked, so the node's usable
+capacity shrinks until an upgraded controller is in place. Nothing is killed and
+no job record is lost; following the controllers-first order avoids the window
+entirely.
+
+**A new node reason appears.** While the controller is comparing a freshly
+registered node's ledger, that node reports ``reconciling with the controller``
+(``Reason=`` in ``scontrol show node``, ``%E`` in ``sinfo``) and takes no new
+work. It keeps its usual state — ``idle`` or ``mix``, not ``drain`` — so an
+operator sees an available node that is not being picked. It normally clears
+immediately, and the pass is capped at a minute, after which the node is let back
+in regardless. A rolling upgrade will show this on each node as its agent comes
+back.
+
+**Expect a brief allocated-but-empty window after each job.** Resources return on
+the controller's acknowledgement, so ``sinfo`` can show them allocated for a
+round trip after the work is done, and for the length of any controller outage.
+Held resources on an unreachable node are not schedulable anyway, and are
+resolved when it reconnects.
+
+Whether a registering node's ledger may be acted on destructively depends on
+``[admission] mode``, which defaults to ``open`` and withholds that half. This
+release does not change the default; see :doc:`/admin-guide/configuration`.
 
 See Also
 --------

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
@@ -13,7 +13,7 @@ use spur_proto::proto::{
     StepdRecoveryResponse,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
@@ -56,9 +56,12 @@ pub struct NodeReporter {
     /// The entitlement ledger, wired once the state root is known. Without one
     /// the agent registers with no ledger, which asserts nothing.
     admissions: std::sync::OnceLock<crate::admission::AdmissionStore>,
-    /// Identifies this agent process, so a cut from a session that ended before
-    /// the controller read it is discarded rather than applied as current.
+    /// Identifies this agent process. A cut whose session a later registration
+    /// has replaced is discarded rather than applied as current.
     agent_session_id: String,
+    /// Whether the last cut could see everything. Only the transition is worth
+    /// saying: the condition needs an operator, and it does not clear itself.
+    inventory_was_complete: AtomicBool,
 }
 
 impl NodeReporter {
@@ -90,6 +93,7 @@ impl NodeReporter {
             k0s_status: std::sync::OnceLock::new(),
             admissions: std::sync::OnceLock::new(),
             agent_session_id: uuid::Uuid::new_v4().to_string(),
+            inventory_was_complete: AtomicBool::new(true),
         }
     }
 
@@ -116,18 +120,45 @@ impl NodeReporter {
         Some(ledger_to_proto(cut))
     }
 
-    /// Re-read each heartbeat rather than latched, so it clears when the reconcile
-    /// lands and survives an agent restart until then.
-    pub(crate) fn needs_reconcile(&self) -> bool {
-        self.admissions.get().is_some_and(|admissions| {
-            admissions
-                .ledger_cut(&self.agent_session_id)
-                .needs_reconcile()
-        })
+    /// Whether to ask the controller to reconcile this node. Unlatched, so it
+    /// clears when the reconcile lands; off the runtime, because it reads disk.
+    pub(crate) async fn wants_reconcile(&self) -> bool {
+        let Some(admissions) = self.admissions.get().cloned() else {
+            return false;
+        };
+        let session = self.agent_session_id.clone();
+        match tokio::task::spawn_blocking(move || admissions.ledger_cut(&session)).await {
+            Ok(cut) => self.judge_cut(&cut),
+            Err(error) => {
+                warn!(%error, "could not read this node's ledger for the heartbeat");
+                false
+            }
+        }
     }
 
-    /// Identifies this agent process, so the controller can discard a cut taken
-    /// by a session that ended before it was read.
+    /// Only the transition is worth saying: an unreadable record needs an
+    /// operator, and no reconcile the controller could run would clear it.
+    fn judge_cut(&self, cut: &crate::admission::LedgerCut) -> bool {
+        let complete = cut.inventory_complete;
+        if self
+            .inventory_was_complete
+            .swap(complete, Ordering::Relaxed)
+            != complete
+        {
+            if complete {
+                info!("every admission record on this node is readable again");
+            } else {
+                error!(
+                    "an admission record on this node cannot be read; it may hold a claim \
+                     nothing can account for, and only an operator can clear it"
+                );
+            }
+        }
+        cut.wants_reconcile()
+    }
+
+    /// Identifies this agent process. A cut whose session a later registration
+    /// has replaced is discarded rather than applied as current.
     pub fn agent_session_id(&self) -> &str {
         &self.agent_session_id
     }
@@ -238,7 +269,7 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
-            let needs_reconcile = self.needs_reconcile();
+            let needs_reconcile = self.wants_reconcile().await;
             if needs_reconcile {
                 warn!("holding evidence only the controller can resolve; asking it to reconcile");
             }
@@ -548,7 +579,7 @@ pub fn ledger_to_proto(cut: crate::admission::LedgerCut) -> spur_proto::proto::N
                 cpu_ids: entry.allocation.cpu_ids,
                 memory_mb: entry.allocation.memory_mb,
                 gpu_devices: entry.allocation.gpu_devices,
-                disposition: entry.disposition,
+                disposition: entry.disposition.as_str().to_string(),
                 conflict_hold: entry.conflict_hold,
             })
             .collect(),

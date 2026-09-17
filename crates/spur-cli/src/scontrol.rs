@@ -43,7 +43,6 @@ pub enum ScontrolCommand {
     ///   scontrol create ReservationName=maint StartTime=now Duration=60 Nodes=n1
     Create {
         /// key=value pairs (e.g. PartitionName=gpu Nodes=n1 MaxTime=4:00:00)
-        #[arg(trailing_var_arg = true)]
         params: Vec<String>,
     },
     /// Update job/node/partition properties (Slurm-compatible inline syntax)
@@ -54,7 +53,6 @@ pub enum ScontrolCommand {
     ///   scontrol update NodeName=n1 State=drain Reason=maintenance
     Update {
         /// key=value pairs
-        #[arg(trailing_var_arg = true)]
         params: Vec<String>,
     },
     /// Delete a partition or reservation (Slurm-compatible inline syntax)
@@ -64,7 +62,6 @@ pub enum ScontrolCommand {
     ///   scontrol delete ReservationName=maint
     Delete {
         /// key=value pairs (e.g. PartitionName=gpu)
-        #[arg(trailing_var_arg = true)]
         params: Vec<String>,
     },
     /// Hold a job
@@ -311,6 +308,15 @@ pub enum ScontrolCommand {
     Version,
 }
 
+/// The param loops key everything on `=`, so a token without one reaches no
+/// branch at all. Refused rather than dropped: a typo must not read as a no-op.
+fn reject_non_pairs(params: &[String]) -> Result<()> {
+    let Some(stray) = params.iter().find(|param| !param.contains('=')) else {
+        return Ok(());
+    };
+    anyhow::bail!("scontrol: '{stray}' is not a key=value pair")
+}
+
 pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
@@ -383,9 +389,18 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             println!("job {} resumed", job_id);
             Ok(())
         }
-        ScontrolCommand::Create { params } => parse_and_create(&args.controller, &params).await,
-        ScontrolCommand::Update { params } => parse_and_update(&args.controller, &params).await,
-        ScontrolCommand::Delete { params } => parse_and_delete(&args.controller, &params).await,
+        ScontrolCommand::Create { params } => {
+            reject_non_pairs(&params)?;
+            parse_and_create(&args.controller, &params).await
+        }
+        ScontrolCommand::Update { params } => {
+            reject_non_pairs(&params)?;
+            parse_and_update(&args.controller, &params).await
+        }
+        ScontrolCommand::Delete { params } => {
+            reject_non_pairs(&params)?;
+            parse_and_delete(&args.controller, &params).await
+        }
         ScontrolCommand::CreatePartition {
             name,
             nodes,
@@ -2075,6 +2090,98 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn params_of(command: ScontrolCommand) -> Vec<String> {
+        match command {
+            ScontrolCommand::Create { params }
+            | ScontrolCommand::Update { params }
+            | ScontrolCommand::Delete { params } => params,
+            other => panic!("expected a key=value subcommand, got {other:?}"),
+        }
+    }
+
+    // Slurm's key=value arguments are order-independent, so a swallowed flag
+    // silently dials the default controller and reports a connection error.
+    #[test]
+    fn a_global_flag_after_the_params_is_still_parsed() {
+        for verb in ["create", "update", "delete"] {
+            let args = ScontrolArgs::try_parse_from([
+                "scontrol",
+                verb,
+                "NodeName=n1",
+                "Reconcile=yes",
+                "--controller",
+                "http://elsewhere:7000",
+            ])
+            .unwrap_or_else(|e| panic!("{verb}: a flag after the params must parse: {e}"));
+
+            assert_eq!(args.controller, "http://elsewhere:7000", "{verb}");
+            assert_eq!(
+                params_of(args.command),
+                vec!["NodeName=n1".to_string(), "Reconcile=yes".to_string()],
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_global_flag_between_params_does_not_swallow_the_next() {
+        let args = ScontrolArgs::try_parse_from([
+            "scontrol",
+            "update",
+            "NodeName=n1",
+            "--controller",
+            "http://elsewhere:7000",
+            "State=drain",
+        ])
+        .expect("a flag between params must parse");
+
+        assert_eq!(args.controller, "http://elsewhere:7000");
+        assert_eq!(
+            params_of(args.command),
+            vec!["NodeName=n1".to_string(), "State=drain".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_hyphenated_value_inside_a_pair_is_still_one_param() {
+        let args = ScontrolArgs::try_parse_from([
+            "scontrol",
+            "update",
+            "NodeName=n1",
+            "Reason=down for -maint",
+        ])
+        .expect("a pair whose value has a hyphen must parse");
+
+        assert_eq!(
+            params_of(args.command),
+            vec![
+                "NodeName=n1".to_string(),
+                "Reason=down for -maint".to_string()
+            ]
+        );
+    }
+
+    // A token with no `=` reaches no branch in the param loops, so accepting it
+    // silently applies nothing and reports success. Driven through the dispatch,
+    // so dropping the check from a verb is what this notices.
+    #[tokio::test]
+    async fn a_token_that_is_not_a_pair_is_refused_rather_than_dropped() {
+        for verb in ["update", "create", "delete"] {
+            let error = main_with_args(
+                ["scontrol", verb, "NodeName=n1", "Reconcile"]
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect(),
+            )
+            .await
+            .expect_err("a bare token names no key to set");
+            assert!(
+                error.to_string().contains("Reconcile"),
+                "{verb} must name the token it refused: {error}"
+            );
+        }
+    }
 
     fn pending_pinned_job() -> spur_proto::proto::JobInfo {
         spur_proto::proto::JobInfo {

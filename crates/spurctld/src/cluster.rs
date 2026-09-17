@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -22,7 +22,7 @@ use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
+    PendingReason, RunKey, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -426,9 +426,9 @@ pub struct ClusterManager {
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
     raft: RwLock<Option<SpurRaft>>,
-    /// Latch for `state_machine_ready`: a leader commits continuously, so an
-    /// instantaneous check would flap back off once replay had finished.
-    state_machine_ready: AtomicBool,
+    /// Latch for `state_machine_ready`, keyed to the term it was taken in: a
+    /// leader commits continuously, and a regained one replayed nothing.
+    state_machine_ready_term: AtomicU64,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
@@ -460,6 +460,9 @@ pub struct ClusterManager {
     /// Launches this controller has on the wire, so a ledger cut taken while one
     /// was in flight is not read as the node having let that job go.
     dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
+    /// The agent lifetime each node last registered under, so a cut from a
+    /// lifetime that has since been replaced is not read as current.
+    agent_sessions: Arc<crate::agent_sessions::AgentSessions>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -542,6 +545,12 @@ pub struct RequeueOutcome {
     pub skipped: Vec<String>,
 }
 
+/// A latch is only good for the term it was taken in: a controller that lost
+/// and regained leadership replayed nothing in between. Term 0 means never.
+fn readiness_latch_holds(latched_term: u64, current_term: u64) -> bool {
+    latched_term != 0 && latched_term == current_term
+}
+
 impl ClusterManager {
     #[cfg(test)]
     pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
@@ -586,7 +595,7 @@ impl ClusterManager {
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
-            state_machine_ready: AtomicBool::new(false),
+            state_machine_ready_term: AtomicU64::new(0),
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
@@ -600,6 +609,7 @@ impl ClusterManager {
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
+            agent_sessions: Arc::new(crate::agent_sessions::AgentSessions::default()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -2661,6 +2671,7 @@ impl ClusterManager {
                             wg_pubkey,
                             version,
                             source: source.clone(),
+                            reconcile_pending: None,
                         })
                         .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         info!(node = %name, "node comm address or metadata updated");
@@ -2682,6 +2693,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     source: source.clone(),
+                    reconcile_pending: None,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
@@ -5168,12 +5180,13 @@ impl ClusterManager {
     /// Whether this controller has applied its whole log, waiting up to `wait_for`.
     /// Until then an absence in cluster state is no evidence; unknown reads false.
     pub async fn state_machine_ready(&self, wait_for: std::time::Duration) -> bool {
-        if self.state_machine_ready.load(Ordering::Relaxed) {
-            return true;
-        }
         let Some(raft) = self.raft.read().clone() else {
             return false;
         };
+        let term = raft.metrics().borrow().current_term;
+        if readiness_latch_holds(self.state_machine_ready_term.load(Ordering::Relaxed), term) {
+            return true;
+        }
         let caught_up = raft
             .wait(Some(wait_for))
             .metrics(
@@ -5183,9 +5196,21 @@ impl ClusterManager {
             .await
             .is_ok();
         if caught_up {
-            self.state_machine_ready.store(true, Ordering::Relaxed);
+            let settled = raft.metrics().borrow().current_term;
+            self.state_machine_ready_term
+                .store(settled, Ordering::Relaxed);
         }
         caught_up
+    }
+
+    /// Cheap, locally-cached leadership check, for paths that act on agents
+    /// outside Raft and so cannot fail closed by a rejected proposal.
+    pub fn is_raft_leader(&self) -> bool {
+        let Some(raft) = self.raft.read().clone() else {
+            return false;
+        };
+        let metrics = raft.metrics().borrow().clone();
+        metrics.current_leader == Some(metrics.id)
     }
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
@@ -5755,12 +5780,21 @@ impl ClusterManager {
         }
     }
 
-    /// Hold a node out of scheduling, or release it. Proposed rather than set
-    /// locally so a follower promoted mid-reconcile does not schedule onto it.
+    /// Proposed rather than set locally so a follower promoted mid-reconcile does
+    /// not schedule onto it, and on `NodeUpdate` so an older controller can read it.
     pub fn set_reconcile_pending(&self, name: &str, pending: bool) {
-        if let Err(error) = self.propose(WalOperation::NodeReconcilePending {
+        // Carries the gate and nothing else: echoing back a read of the record
+        // would revert a registration that commits before this entry applies.
+        if let Err(error) = self.propose(WalOperation::NodeUpdate {
             name: name.to_string(),
-            pending,
+            hostname: String::new(),
+            resources: ResourceSet::default(),
+            address: String::new(),
+            port: 0,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: NodeSource::default(),
+            reconcile_pending: Some(pending),
         }) {
             warn!(node = %name, %error, "could not record the reconcile gate");
         }
@@ -5771,24 +5805,27 @@ impl ClusterManager {
         &self.dispatch_tracker
     }
 
-    /// Every non-finalized job Raft places on this node, with its attempt.
-    pub fn jobs_allocated_on_node(&self, node: &str) -> HashMap<JobId, u32> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|job| job.is_held_on(node))
-            .map(|job| (job.job_id, job.run_attempt))
-            .collect()
+    /// The agent lifetime each node last registered under.
+    pub(crate) fn agent_sessions(&self) -> &Arc<crate::agent_sessions::AgentSessions> {
+        &self.agent_sessions
     }
 
-    /// Every job on this node whose launch an agent confirmed, with its attempt.
+    /// Every non-finalized run Raft places on this node. Keyed by the run, not
+    /// the job: a leaked attempt beside a recorded one must not read as recorded.
+    pub fn jobs_allocated_on_node(&self, node: &str) -> HashSet<RunKey> {
+        Self::runs_on_node(&self.jobs.read(), |job| job.is_held_on(node))
+    }
+
+    /// Every run on this node whose launch an agent confirmed.
     /// Narrower than [`Self::jobs_allocated_on_node`]: no in-flight dispatches.
-    pub fn jobs_confirmed_on_node(&self, node: &str) -> HashMap<JobId, u32> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|job| job.is_confirmed_on(node))
-            .map(|job| (job.job_id, job.run_attempt))
+    pub fn jobs_confirmed_on_node(&self, node: &str) -> HashSet<RunKey> {
+        Self::runs_on_node(&self.jobs.read(), |job| job.is_confirmed_on(node))
+    }
+
+    fn runs_on_node(jobs: &HashMap<JobId, Job>, placed: impl Fn(&Job) -> bool) -> HashSet<RunKey> {
+        jobs.values()
+            .filter(|job| placed(job))
+            .filter_map(|job| RunKey::new(job.job_id, job.run_attempt))
             .collect()
     }
 
@@ -6656,11 +6693,6 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::NodeReconcilePending { name, pending } => {
-                if let Some(node) = nodes.get_mut(name) {
-                    node.reconcile_pending = *pending;
-                }
-            }
             WalOperation::NodeRegister {
                 name,
                 hostname,
@@ -6731,25 +6763,42 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 source,
+                reconcile_pending,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
-                    node.total_resources = resources.clone();
-                    if !hostname.is_empty() {
-                        node.hostname = hostname.clone();
+                    // An entry carrying nothing the node asserted is not the node
+                    // speaking: it moves the gate alone, overwriting nothing else.
+                    let asserted = !hostname.is_empty()
+                        || !address.is_empty()
+                        || !wg_pubkey.is_empty()
+                        || !version.is_empty()
+                        || *port != 0;
+                    if asserted {
+                        node.total_resources = resources.clone();
+                        if !hostname.is_empty() {
+                            node.hostname = hostname.clone();
+                        }
+                        if !address.is_empty() {
+                            node.address = Some(address.clone());
+                        }
+                        if *port != 0 {
+                            node.port = *port;
+                        }
+                        if !wg_pubkey.is_empty() {
+                            node.wg_pubkey = Some(wg_pubkey.clone());
+                        }
+                        if !version.is_empty() {
+                            node.version = Some(version.clone());
+                        }
+                        node.source =
+                            spur_core::node::resolve_wal_node_source(source, version, &node.labels);
+                        node.last_heartbeat = Some(Utc::now());
                     }
-                    if !address.is_empty() {
-                        node.address = Some(address.clone());
+                    // Only an entry that speaks to the gate moves it: a plain
+                    // re-registration must not release a reconcile it never saw.
+                    if let Some(pending) = reconcile_pending {
+                        node.reconcile_pending = *pending;
                     }
-                    node.port = *port;
-                    if !wg_pubkey.is_empty() {
-                        node.wg_pubkey = Some(wg_pubkey.clone());
-                    }
-                    if !version.is_empty() {
-                        node.version = Some(version.clone());
-                    }
-                    node.source =
-                        spur_core::node::resolve_wal_node_source(source, version, &node.labels);
-                    node.last_heartbeat = Some(Utc::now());
                 }
             }
             WalOperation::NodeStateChange {
@@ -6816,6 +6865,7 @@ impl ClusterManager {
                     }
                 }
                 nodes.remove(name);
+                self.agent_sessions.forget(name);
                 info!(
                     node = %name,
                     reason = reason.as_deref().unwrap_or(""),
@@ -8975,6 +9025,16 @@ mod tests {
         assert!(!cm.state_machine_ready(std::time::Duration::ZERO).await);
     }
 
+    // A controller that lost and regained leadership replayed nothing in the
+    // interval, so the latch it took in the old term says nothing about the new.
+    #[test]
+    fn a_readiness_latch_does_not_carry_across_a_term() {
+        assert!(!readiness_latch_holds(0, 0), "never latched is never ready");
+        assert!(!readiness_latch_holds(0, 4));
+        assert!(readiness_latch_holds(4, 4));
+        assert!(!readiness_latch_holds(4, 5));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readiness_latches_once_the_controller_has_caught_up() {
         // A leader commits continuously, so an unlatched check would report the
@@ -8987,11 +9047,13 @@ mod tests {
                 .await
         );
 
+        // Substituted so the second call cannot pass on the first one's raft:
+        // this handle alone reads as not ready, as its own test asserts.
         cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
 
         assert!(
             cm.state_machine_ready(std::time::Duration::ZERO).await,
-            "the same raft reads as not ready when it is the first one seen"
+            "a controller that has caught up in this term must not have to wait again"
         );
     }
 
@@ -22244,6 +22306,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcile_gate_carries_nothing_but_the_gate() {
+        // Anything else it carried would come from a read a registration
+        // committing before the entry applies has already made stale.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let before = cm.get_node("n1").unwrap();
+
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+
+        let after = cm.get_node("n1").unwrap();
+        assert_eq!(
+            after.total_resources, before.total_resources,
+            "the gate must not restate resources it could only have read stale"
+        );
+        assert_eq!((after.port, after.address), (before.port, before.address));
+        assert_eq!(
+            after.last_heartbeat, before.last_heartbeat,
+            "the gate is not the node speaking, so it must not stand in for a heartbeat"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gating_a_node_that_has_left_the_cluster_creates_nothing() {
+        // The gate is released from a `Drop` that can outlive the node, and a
+        // record conjured there would be one nothing ever registered.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.set_reconcile_pending("ghost", true);
+        cm.set_reconcile_pending("ghost", false);
+        assert!(cm.get_node("ghost").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_does_not_release_a_reconcile_it_never_saw() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+
+        // Takes the Update path, so it proposes a NodeUpdate of its own.
+        register_node(&cm, "n1", 16, 32000);
+        wait_for("resources updated", || {
+            cm.get_node("n1").unwrap().total_resources.cpus == 16
+        });
+        assert!(
+            cm.get_node("n1").unwrap().reconcile_pending,
+            "an unrelated update must leave the gate where it found it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn jobs_allocated_on_node_reports_what_the_agent_must_account_for() {
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
@@ -22298,9 +22416,12 @@ mod tests {
         }
 
         let placed = cm.jobs_allocated_on_node("n1");
-        assert_eq!(placed.get(&1), Some(&3), "a live job must be accounted for");
         assert!(
-            !placed.contains_key(&2),
+            placed.contains(&RunKey::new(1, 3).expect("attempt 3")),
+            "a live run must be accounted for, under the attempt that owns it"
+        );
+        assert!(
+            !placed.iter().any(|run| run.job_id() == 2),
             "a finished job is not something the agent still owes"
         );
         assert!(cm.jobs_allocated_on_node("other").is_empty());

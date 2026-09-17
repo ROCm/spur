@@ -143,7 +143,9 @@ mod tests {
         node.allocate_for_job(1, 1, 32, 128_000, &[]).unwrap();
         assert_eq!(node.free_cpus(), 32);
 
-        node.release_job(1);
+        node.release_job(spur_sched::cons_tres::ReleaseWarrant::controller_cancelled(
+            spur_core::job::RunKey::any_attempt(1),
+        ));
         assert_eq!(node.free_cpus(), 64);
         assert_eq!(node.free_memory_mb(), 256_000);
     }

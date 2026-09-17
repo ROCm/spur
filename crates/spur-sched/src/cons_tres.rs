@@ -9,7 +9,74 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use spur_core::job::RunKey;
 use spur_core::resource::{GpuResource, ResourceSet};
+
+/// Why a caller is entitled to hand a run's slice back. A slice is released only
+/// on a controller decision, so every ground names the decision it rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseGround {
+    /// The controller committed the run's completion at this Raft index.
+    Acknowledged(u64),
+    /// The controller ordered the run to end. Its cancel is its own word that
+    /// the run is over, so nothing further has to be acknowledged.
+    ControllerCancelled,
+    /// The reservation never had anything spawned against it, so there is no
+    /// payload to answer for and nothing for the controller to acknowledge.
+    NeverSpawned,
+}
+
+/// Licence to hand a run's slice back. Deliberately not `Clone` and built only
+/// through a named ground, so a release cannot be written without saying why.
+#[derive(Debug)]
+#[must_use = "a warrant does nothing until it is spent on a release"]
+pub struct ReleaseWarrant {
+    run: RunKey,
+    ground: ReleaseGround,
+}
+
+impl ReleaseWarrant {
+    /// The controller has committed this run's completion. Mint this from the
+    /// recorded acknowledgement, never from the agent's own reading of an exit.
+    pub fn acknowledged(run: RunKey, release_raft_index: u64) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::Acknowledged(release_raft_index),
+        }
+    }
+
+    pub fn controller_cancelled(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::ControllerCancelled,
+        }
+    }
+
+    pub fn never_spawned(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::NeverSpawned,
+        }
+    }
+
+    pub fn run(&self) -> RunKey {
+        self.run
+    }
+
+    pub fn ground(&self) -> ReleaseGround {
+        self.ground
+    }
+}
+
+impl std::fmt::Display for ReleaseGround {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acknowledged(index) => write!(f, "acknowledged at raft index {index}"),
+            Self::ControllerCancelled => f.write_str("controller cancelled"),
+            Self::NeverSpawned => f.write_str("never spawned"),
+        }
+    }
+}
 
 /// Why a reservation could not be made. Distinguished so the caller can map
 /// each to the right gRPC status instead of reporting every failure as GPU
@@ -198,7 +265,7 @@ impl NodeAllocation {
         {
             return Err(AllocError::MemoryUnavailable);
         }
-        self.release_job(job_id);
+        self.drop_owner(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
@@ -319,7 +386,7 @@ impl NodeAllocation {
             }
             gpu_indices.push(idx);
         }
-        self.release_job(job_id);
+        self.drop_owner(job_id);
 
         for &cpu in cpu_ids {
             self.allocated_cpus[cpu as usize] = true;
@@ -365,12 +432,9 @@ impl NodeAllocation {
         owned
     }
 
-    /// Release a job's allocation by id, regardless of which attempt owns it.
-    /// Idempotent: releasing an unknown or already-released job is a no-op
-    /// returning false. Only for callers that genuinely don't have a specific
-    /// attempt to compare (reconcile, foreign-owner reclaim) — everyone else
-    /// should use `release_job_if`.
-    pub fn release_job(&mut self, job_id: u32) -> bool {
+    /// Drop a job's ownership entry and free what it held. Private: every way
+    /// out of the allocator goes through `release_job`, which demands a warrant.
+    fn drop_owner(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
         let Some(owned) = self.owners.remove(&job_id) else {
             return false;
@@ -379,19 +443,21 @@ impl NodeAllocation {
         true
     }
 
-    /// Release a job's allocation only if `run_attempt` is still the current
-    /// owner, so a stale caller can't free a different, newer attempt's
-    /// reservation that has since superseded the one it thinks it owns.
-    pub fn release_job_if(&mut self, job_id: u32, run_attempt: u32) -> bool {
-        if self
+    /// The only way out of the allocator, so a release cannot be written without
+    /// a warrant. Idempotent; an exact key a newer attempt owns frees nothing.
+    pub fn release_job(&mut self, warrant: ReleaseWarrant) -> bool {
+        let run = warrant.run();
+        let job_id = run.job_id();
+        let owned_by_this_run = self
             .owners
             .get(&job_id)
-            .is_some_and(|owned| owned.run_attempt == run_attempt)
-        {
-            self.release_job(job_id)
-        } else {
-            false
+            .is_some_and(|owned| run.names_attempt(owned.run_attempt));
+        // A newer attempt already superseded the one this warrant names; freeing
+        // it here would hand away the reservation that replaced it.
+        if !owned_by_this_run && run.attempt().is_some() {
+            return false;
         }
+        self.drop_owner(job_id)
     }
 
     /// Release owned allocations whose job is neither live nor launching within
@@ -427,10 +493,10 @@ impl NodeAllocation {
 
     /// Every run this node still charges resources to, including launches in
     /// flight: anything the ledger must keep a record for until it is released.
-    pub fn charged_runs(&self) -> HashSet<(u32, u32)> {
+    pub fn charged_runs(&self) -> HashSet<RunKey> {
         self.owners
             .iter()
-            .map(|(job_id, owned)| (*job_id, owned.run_attempt))
+            .filter_map(|(job_id, owned)| RunKey::new(*job_id, owned.run_attempt))
             .collect()
     }
 }
@@ -477,6 +543,10 @@ impl AllocationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(job_id: u32, run_attempt: u32) -> RunKey {
+        RunKey::new(job_id, run_attempt).expect("attempts start at 1")
+    }
     use spur_core::resource::GpuLinkType;
 
     fn make_node(cpus: u32, mem: u64, num_gpus: usize, gpu_type: &str) -> NodeAllocation {
@@ -544,7 +614,7 @@ mod tests {
         assert!(node.allocate_for_job(1, 1, 0, 0, &[129, 131]).is_ok());
         assert_eq!(node.free_gpus(None), 2);
 
-        assert!(node.release_job(1));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
         assert_eq!(
             node.free_gpus(None),
             4,
@@ -564,7 +634,7 @@ mod tests {
         assert!(node.allocate_for_job(1, 1, 0, 0, &[200]).is_err());
         // A rejected allocation must not leave partial state behind.
         assert_eq!(node.free_gpus(None), 2);
-        assert!(!node.release_job(1));
+        assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
     }
 
     #[test]
@@ -593,12 +663,12 @@ mod tests {
         assert_eq!(node.free_gpus(None), 2);
         assert_eq!(node.free_memory_mb(), 224_000);
 
-        assert!(node.release_job(1));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
         assert_eq!(node.free_cpus(), 64);
         assert_eq!(node.free_gpus(None), 4);
         assert_eq!(node.free_memory_mb(), 256_000);
         // Idempotent: releasing again is a no-op.
-        assert!(!node.release_job(1));
+        assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
     }
 
     #[test]
@@ -615,7 +685,7 @@ mod tests {
         assert_eq!(node.free_cpus(), 56);
         assert_eq!(node.free_memory_mb(), 240_000);
         // After release the id is free to reserve again.
-        assert!(node.release_job(1));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
         assert!(node.allocate_for_job(1, 1, 8, 16_000, &[]).is_ok());
     }
 
@@ -657,7 +727,7 @@ mod tests {
         );
         assert_eq!(node.free_gpus(None), 1);
         // The failed job left no owner entry.
-        assert!(!node.release_job(2));
+        assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2))));
     }
 
     #[test]
@@ -702,9 +772,9 @@ mod tests {
         // Reporting is not reclaiming: the claim is still held afterwards.
         assert_eq!(node.free_gpus(None), 1);
 
-        assert!(node.release_job(2));
-        assert!(node.release_job(1));
-        assert!(node.release_job(3));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2))));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(3))));
         assert_eq!(node.free_gpus(None), 4);
     }
 
@@ -829,7 +899,7 @@ mod tests {
         // A reservation explicitly released before commit: the owner is gone,
         // so commit must report false and stay a no-op.
         node.allocate_for_job(2, 1, 4, 8_000, &[1]).unwrap();
-        node.release_job(2);
+        node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2)));
         assert!(
             !node.commit_job(2, 1),
             "commit of a released reservation returns false"
@@ -850,7 +920,7 @@ mod tests {
         // now-stale commit adopt attempt 2's reservation as its own.
         let mut node = make_node(64, 256_000, 0, "");
         node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
-        node.release_job(7);
+        node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7)));
         node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
         assert!(node.commit_job(7, 2), "the current attempt commits");
 
@@ -891,7 +961,7 @@ mod tests {
         // attempt 1's late commit lands while attempt 2 is still mid-launch.
         let mut node = make_node(64, 256_000, 0, "");
         node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
-        node.release_job(7);
+        node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7)));
         node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
 
         assert!(!node.commit_job(7, 1), "a superseded attempt cannot commit");
@@ -935,10 +1005,13 @@ mod tests {
         );
         assert_eq!(node.free_cpus(), 4, "rejected replay changed the ledger");
         assert_eq!(node.free_memory_mb(), 56_000);
-        assert!(!node.release_job(2), "rejected replay left an owner entry");
+        assert!(
+            !node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2))),
+            "rejected replay left an owner entry"
+        );
 
         // Job 1's cores are still exclusively its own to release.
-        assert!(node.release_job(1));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
         assert_eq!(node.free_cpus(), 8);
     }
 
@@ -969,7 +1042,7 @@ mod tests {
             Err(AllocError::Superseded)
         );
         assert_eq!(node.free_cpus(), 6);
-        assert!(node.release_job_if(9, 3));
+        assert!(node.release_job(ReleaseWarrant::controller_cancelled(key(9, 3))));
         assert_eq!(node.free_cpus(), 8);
     }
 
@@ -987,7 +1060,7 @@ mod tests {
             node.unbacked_claims(&live, Instant::now(), ttl),
             vec![(4, 1)]
         );
-        node.release_job(4);
+        node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(4)));
         assert_eq!(node.free_cpus(), 8);
 
         // A job still mid-launch when the agent restarted: adoption must clear
@@ -1013,7 +1086,10 @@ mod tests {
         assert_eq!(node.free_cpus(), 5);
         assert_eq!(node.free_memory_mb(), 48_000);
         assert_eq!(node.free_gpus(None), 0);
-        assert!(node.release_job_if(5, 1), "job 5 lost its owner entry");
+        assert!(
+            node.release_job(ReleaseWarrant::controller_cancelled(key(5, 1))),
+            "job 5 lost its owner entry"
+        );
         assert_eq!(node.free_cpus(), 7);
     }
 
@@ -1029,7 +1105,7 @@ mod tests {
         );
         assert_eq!(node.free_gpus(None), 1);
         assert_eq!(node.free_cpus(), 6, "rejected replay claimed cores anyway");
-        assert!(!node.release_job(2));
+        assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2))));
     }
 
     #[test]
@@ -1065,23 +1141,23 @@ mod tests {
             Err(AllocError::CpusUnavailable)
         );
         assert_eq!(node.free_cpus(), 4);
-        assert!(!node.release_job(1));
+        assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1))));
     }
 
     #[test]
     fn test_release_job_if_spares_a_reused_job_ids_reservation() {
         let mut node = make_node(64, 256_000, 0, "");
         node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
-        node.release_job(7);
+        node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7)));
         node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
 
         assert!(
-            !node.release_job_if(7, 1),
+            !node.release_job(ReleaseWarrant::controller_cancelled(key(7, 1))),
             "a stale attempt must not release a different, current attempt's reservation"
         );
         assert_eq!(node.free_cpus(), 56);
         assert!(
-            node.release_job_if(7, 2),
+            node.release_job(ReleaseWarrant::controller_cancelled(key(7, 2))),
             "the current attempt can release its own"
         );
         assert_eq!(node.free_cpus(), 64);
@@ -1095,7 +1171,7 @@ mod tests {
         let mut node = make_node(64, 256_000, 0, "");
         node.allocate_for_job(1, 1, 0, 16_000, &[]).unwrap();
         assert_eq!(node.free_memory_mb(), 240_000);
-        node.release_job(1);
+        node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(1)));
         assert_eq!(node.free_memory_mb(), 256_000);
     }
 

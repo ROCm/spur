@@ -476,6 +476,9 @@ service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
   rpc FenceRun(FenceRunRequest) returns (FenceRunResponse);
   rpc RequestNodeLedger(RequestNodeLedgerRequest) returns (RequestNodeLedgerResponse);
+  // The controller's own word that it is not accounting for this run on this
+  // node. That is the acknowledgement a held slice is waiting for.
+  rpc SettleRun(SettleRunRequest) returns (SettleRunResponse);
   // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
   // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
@@ -871,8 +874,8 @@ message RegisterAgentRequest {
 // What an agent believes it is entitled to. Absence and emptiness differ: only
 // a complete ledger licenses acting on what is missing from it.
 message NodeLedger {
-  // Identifies the agent process. A cut from a session that ended before the
-  // controller read it is discarded rather than applied as current.
+  // Identifies the agent process that took this cut. One whose session a later
+  // registration has replaced is discarded rather than applied as current.
   string agent_session_id = 1;
   // False when the agent could not enumerate its own state. The controller may
   // then add claims it did not know about, but must never remove any.
@@ -886,8 +889,8 @@ message LedgerEntry {
   repeated uint32 cpu_ids = 3;
   uint64 memory_mb = 4;
   repeated uint32 gpu_devices = 5;
-  // What the agent's local evidence says about this run, so the controller can
-  // tell "still running" from "finished, unreported" from "cannot tell".
+  // What this node's record says about the run. One of "held" (a live claim),
+  // "over_but_charged" (finished, slice not back), "unresolved" (held evidence).
   string disposition = 6;
   // The agent is preserving this run's evidence and cannot resolve it alone.
   bool conflict_hold = 7;
@@ -988,7 +991,7 @@ message LaunchJobRequest {
   uint32 array_job_id = 7;
   uint32 array_task_id = 8;
   // Run epoch for this dispatch; agent echoes it in ReportJobStatusRequest so
-  // the controller can drop stale-run reports. 0 = unset (legacy), check off.
+  // the controller can drop stale-run reports. Attempts start at 1; 0 is refused.
   uint32 run_attempt = 9;
   PmixLaunchPlan pmix_plan = 10;
   // True when this dispatch is itself a per-task fan-out mechanism (a
@@ -1012,8 +1015,6 @@ message LaunchJobRequest {
   string command_digest = 15;
 }
 
-// Refuse every launch for this run attempt issued at or before the cutoff, so
-// one already in flight cannot land after the decision that cancelled it.
 // Ask an agent for a fresh cut of its ledger. The heartbeat carries no
 // inventory, so the controller pulls when it has reason to.
 message RequestNodeLedgerRequest {
@@ -1024,6 +1025,8 @@ message RequestNodeLedgerResponse {
   NodeLedger ledger = 1;
 }
 
+// Refuse every launch for this run attempt issued at or before the cutoff, so
+// one already in flight cannot land after the decision that cancelled it.
 message FenceRunRequest {
   uint32 job_id = 1;
   uint32 run_attempt = 2;
@@ -1035,6 +1038,18 @@ message FenceRunResponse {
   string error = 2;
   // What the agent now enforces, which never moves backwards.
   uint64 reject_before_unix_ms = 3;
+}
+
+message SettleRunRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+}
+
+message SettleRunResponse {
+  // False when the agent still has a live payload for the run, which no
+  // acknowledgement may release out from under.
+  bool released = 1;
+  string error = 2;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -1425,6 +1440,7 @@ message RegisterJobAllocationRequest {
   string mpi = 10;
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
+  // Which run this allocation belongs to. Attempts start at 1; 0 is refused.
   uint32 run_attempt = 13;
 }
 

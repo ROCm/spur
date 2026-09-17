@@ -11,6 +11,10 @@ use spur_core::resource::{ResourceAllocations, ResourceSet};
 /// backfill sizing and spurctld's running-job busy_until estimate.
 pub const UNLIMITED_JOB_DURATION: Duration = Duration::days(365);
 
+/// How far ahead a slot search looks before giving up. A search that runs out
+/// returns this bound, which is the shape of "no answer", not an answer.
+pub const PROJECTION_HORIZON: Duration = UNLIMITED_JOB_DURATION;
+
 /// Per-node resource timeline for backfill scheduling.
 ///
 /// Tracks when resources become available on a node by maintaining
@@ -155,7 +159,7 @@ impl NodeTimeline {
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
         let mut candidate = after;
-        let max_check = after + Duration::days(365);
+        let max_check = after + PROJECTION_HORIZON;
         let mut sweep = AllocationSweep::new(&self.intervals, after);
 
         loop {
@@ -441,7 +445,7 @@ mod tests {
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
         let mut candidate = after;
-        let max_check = after + Duration::days(365);
+        let max_check = after + PROJECTION_HORIZON;
 
         loop {
             if candidate > max_check {

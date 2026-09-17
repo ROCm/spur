@@ -1107,7 +1107,8 @@ checker once at startup.
 ``[admission]``
 ---------------
 
-Controls which nodes may register with the controller.
+Controls which nodes may register with the controller, and whether a registering
+node's account of what it is holding may be acted on destructively.
 
 **Reload: Live.**
 
@@ -1123,9 +1124,50 @@ Controls which nodes may register with the controller.
      - string
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
-       registering ``spurd`` to present a valid admission token.
+       registering ``spurd`` to present a valid admission token. Also decides
+       whether a ledger arriving with a registration may license the controller
+       to cancel work — see below.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
+
+Admission mode and reconciliation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A registering ``spurd`` sends the controller a ledger: what that node believes it
+is holding. The controller compares that against its own record and resolves the
+difference — a claim the controller has no record of is cancelled on the node
+with ``SIGKILL``, and a job the node no longer holds is settled as failed. See
+:doc:`/user-guide/monitoring-jobs` for what a reconcile does and when one runs.
+
+``mode`` decides whether a ledger that arrives *with a registration* may license
+those two destructive halves:
+
+* ``token`` — the registering agent presented a valid admission token, so the
+  controller acts on what it sent: unrecorded claims are cancelled, and jobs the
+  node no longer holds are settled.
+* ``open`` (the default) — any host able to reach the controller's port may
+  assert any hostname, so the controller cannot place the caller at the node the
+  ledger names. Drift is still detected and written to the controller log, naming
+  the node and job each time, but nothing is cancelled or settled on the strength
+  of that registration.
+
+A ledger the controller *pulled* is licensed in either mode, because the
+controller chose to dial the node rather than being called by it. So an ``open``
+cluster still repairs itself — it just waits for the next pull instead of
+repairing at the moment a node registers.
+
+.. note::
+
+   Treat this as a misconfiguration guard, not a security boundary. Other
+   agent-facing RPCs — the per-node completion report among them — already act on
+   a node name the caller asserts, with no credential required, so ``open``
+   admission was never a trust boundary and ``token`` does not turn it into one.
+   Keep the control-plane port reachable only from hosts you trust either way.
+
+   What ``token`` buys is that the controller acts on a registering node's word
+   immediately. What the default costs is the wait for a pulled ledger: until one
+   comes around, drift is visible in the controller log but unrepaired, and the
+   resources it describes stay booked.
 
 ``[devices]``
 -------------

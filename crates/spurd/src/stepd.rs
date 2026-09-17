@@ -2598,51 +2598,64 @@ impl StepdStore {
             .unwrap_or(false))
     }
 
-    /// The session a supervisor published for one step of one run, as it is on
-    /// disk. `NotFound` means no session was ever published for that step.
-    pub(crate) fn published_session(
+    /// Every session this store holds for one run, whatever step it belongs to:
+    /// a run's payload is whatever any of its participants is still running.
+    pub(crate) fn published_sessions_for_run(
         &self,
         job_id: u32,
         run_attempt: u32,
-        step_id: spur_core::step::StepId,
-    ) -> io::Result<StepdDescriptor> {
-        self.load_descriptor(&self.session_dir(job_id, run_attempt, step_id))
+    ) -> io::Result<Vec<io::Result<StepdDescriptor>>> {
+        let prefix = format!("{job_id}.{run_attempt}.");
+        Ok(self
+            .session_dirs()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .map(|path| self.load_descriptor(&path))
+            .collect())
     }
 
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
-        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
-        let contents = fs::read(&descriptor_path)?;
-        let descriptor: StepdDescriptor = serde_json::from_slice(&contents).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid {}: {e}", descriptor_path.display()),
-            )
-        })?;
-        // A range, not equality: a descriptor this build still understands must
-        // survive a version bump, because rejecting one reaps its job's cgroup.
-        if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported runtime descriptor version {}",
-                    descriptor.format_version
-                ),
-            ));
-        }
-        if session_dir
-            != self.session_dir(
-                descriptor.job_id,
-                descriptor.run_attempt,
-                descriptor.step_id,
-            )
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime descriptor identity does not match its directory",
-            ));
-        }
-        Ok(descriptor)
+        load_descriptor_at(session_dir)
     }
+}
+
+/// Read the descriptor a session directory holds. Free-standing because the
+/// freshest copy is found from a descriptor's own path, not from a store handle.
+pub(crate) fn load_descriptor_at(session_dir: &Path) -> io::Result<StepdDescriptor> {
+    let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
+    let contents = fs::read(&descriptor_path)?;
+    let descriptor: StepdDescriptor = serde_json::from_slice(&contents).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {}: {e}", descriptor_path.display()),
+        )
+    })?;
+    // A range, not equality: a descriptor this build still understands must
+    // survive a version bump, because rejecting one reaps its job's cgroup.
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported runtime descriptor version {}",
+                descriptor.format_version
+            ),
+        ));
+    }
+    let named = format!(
+        "{}.{}.{}",
+        descriptor.job_id, descriptor.run_attempt, descriptor.step_id
+    );
+    if session_dir.file_name().and_then(|name| name.to_str()) != Some(named.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime descriptor identity does not match its directory",
+        ));
+    }
+    Ok(descriptor)
 }
 
 #[cfg(unix)]
@@ -2745,6 +2758,41 @@ pub(crate) fn supervisor_liveness(
     }
 }
 
+/// What a published descriptor says about a session's workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadLiveness {
+    /// The recorded `(pid, start_ticks)` still names a running process.
+    Live,
+    Gone,
+    /// Neither the descriptor nor the process behind it could be read, so
+    /// nothing is proven. Never read as gone, and never as licence to kill.
+    Unknown,
+}
+
+/// The one verdict on whether a session's workload is still running: the
+/// completion gate and the teardown fence must not disagree about one process.
+pub(crate) fn workload_liveness(published: &io::Result<StepdDescriptor>) -> WorkloadLiveness {
+    match published {
+        Ok(descriptor) => workload_process_liveness(descriptor),
+        // No session on disk: nothing published a workload, so there is none.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+/// The freshest copy of a session: what the supervisor last published, since the
+/// agent wrote its own before the launch returned and it names no workload.
+pub(crate) fn freshest_session(descriptor: &StepdDescriptor) -> io::Result<StepdDescriptor> {
+    let published = match descriptor.socket_path.parent() {
+        Some(session_dir) => load_descriptor_at(session_dir),
+        None => return Ok(descriptor.clone()),
+    };
+    match published {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(descriptor.clone()),
+        other => other,
+    }
+}
+
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
     supervisor_liveness(&crate::admission::SupervisorRef {
         pid: descriptor.pid,
@@ -2753,11 +2801,11 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
     })
 }
 
-/// Undetermined counts as executing; an unrecorded workload (`0`) holds nothing
-/// up. Unlike a supervisor, a zombie counts as gone -- it holds none of the slice.
-pub(crate) fn workload_may_be_live(descriptor: &StepdDescriptor) -> bool {
+/// An unrecorded workload (`0`) holds nothing up. Unlike a supervisor, a zombie
+/// counts as gone -- it holds none of the slice.
+pub(crate) fn workload_process_liveness(descriptor: &StepdDescriptor) -> WorkloadLiveness {
     if descriptor.workload_pid == 0 {
-        return false;
+        return WorkloadLiveness::Gone;
     }
     let recorded = crate::admission::SupervisorRef {
         pid: descriptor.workload_pid,
@@ -2767,11 +2815,56 @@ pub(crate) fn workload_may_be_live(descriptor: &StepdDescriptor) -> bool {
     if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
         == crate::admission::BootScope::Different
     {
-        return false;
+        return WorkloadLiveness::Gone;
     }
-    match process_liveness(descriptor.workload_pid, descriptor.workload_start_ticks) {
-        Ok(liveness) => liveness == StepdLiveness::Live,
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    workload_liveness_of_reading(process_liveness(
+        descriptor.workload_pid,
+        descriptor.workload_start_ticks,
+    ))
+}
+
+/// A `/proc` read that failed for anything but absence proves nothing: the pid
+/// may be anyone's, so it holds the slice without ever licensing a kill.
+pub(crate) fn workload_liveness_of_reading(reading: io::Result<StepdLiveness>) -> WorkloadLiveness {
+    match reading {
+        Ok(StepdLiveness::Live) => WorkloadLiveness::Live,
+        Ok(_) => WorkloadLiveness::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod workload_liveness_tests {
+    use super::{workload_liveness_of_reading, StepdLiveness, WorkloadLiveness};
+    use std::io;
+
+    #[test]
+    fn an_unreadable_process_is_undetermined_rather_than_live_or_gone() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                workload_liveness_of_reading(Err(io::Error::from(kind))),
+                WorkloadLiveness::Unknown,
+                "an undetermined {kind:?} read must not pass as proof of either state"
+            );
+        }
+        assert_eq!(
+            workload_liveness_of_reading(Err(io::Error::from(io::ErrorKind::NotFound))),
+            WorkloadLiveness::Gone,
+            "an absent process is the one positive proof of death"
+        );
+        assert_eq!(
+            workload_liveness_of_reading(Ok(StepdLiveness::Live)),
+            WorkloadLiveness::Live
+        );
+        assert_eq!(
+            workload_liveness_of_reading(Ok(StepdLiveness::Stale)),
+            WorkloadLiveness::Gone
+        );
     }
 }
 

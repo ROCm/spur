@@ -10,8 +10,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use spur_core::job::LAUNCH_LIFETIME_MS;
+use spur_core::job::{LedgerDisposition, RunKey, LAUNCH_LIFETIME_MS};
 use spur_core::step::StepId;
+use spur_sched::cons_tres::ReleaseWarrant;
 
 use crate::stepd::{create_private_dir_all, publish_private, verify_private_dir};
 
@@ -35,13 +36,14 @@ pub struct AdmittedResources {
     pub gpu_devices: Vec<u32>,
 }
 
+/// Two states, because every decision taken on one asks only whether teardown
+/// has finished. The aliases keep records written before that was spelled out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     #[default]
+    #[serde(alias = "running", alias = "cleaning")]
     Admitted,
-    Running,
-    Cleaning,
     Cleaned,
 }
 
@@ -74,19 +76,10 @@ impl HookState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CleanupPhase {
-    #[default]
-    NotStarted,
-    Running,
-    Complete,
-}
-
+/// Kept as its own node so a record written before the phase field was dropped
+/// still finds its epilog where it left it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupState {
-    #[serde(default)]
-    pub phase: CleanupPhase,
     #[serde(default)]
     pub epilog: HookState,
 }
@@ -139,8 +132,6 @@ pub struct RunAdmission {
     #[serde(default)]
     pub max_launch_expiry_unix_ms: u64,
     #[serde(default)]
-    pub prolog: HookState,
-    #[serde(default)]
     pub lifecycle_owner_step: Option<StepId>,
     #[serde(default)]
     pub cleanup: CleanupState,
@@ -176,7 +167,6 @@ impl RunAdmission {
             created_at_unix_ms,
             reject_before_unix_ms: 0,
             max_launch_expiry_unix_ms: 0,
-            prolog: HookState::NotStarted,
             lifecycle_owner_step: None,
             cleanup: CleanupState::default(),
             conflict_hold: None,
@@ -184,6 +174,12 @@ impl RunAdmission {
             cancelled_by_controller: false,
             slice_released: false,
         }
+    }
+
+    /// The run this record names, or `None` if it names attempt 0, which is no
+    /// run at all.
+    pub fn key(&self) -> Option<RunKey> {
+        RunKey::new(self.job_id, self.run_attempt)
     }
 
     /// Whether this run's fate is already decided. What such a record still
@@ -314,6 +310,10 @@ impl ParticipantAdmission {
         }
     }
 
+    pub fn key(&self) -> Option<RunKey> {
+        RunKey::new(self.job_id, self.run_attempt)
+    }
+
     /// A deadline only ever *extends* a run past its own floor. Absent reads as
     /// "adds nothing", so a pre-upgrade launch cannot pin its run forever.
     fn holds_run_until(&self) -> u64 {
@@ -417,12 +417,6 @@ pub enum RunDisposition {
 }
 
 impl RunDisposition {
-    /// Always false. The agent may refuse and may hold, but a refusal is
-    /// evidence for the controller to reconcile, never licence to free a slice.
-    pub fn releases_locally(self) -> bool {
-        false
-    }
-
     /// Whether the controller has to reconcile this run before the node is
     /// trusted: the agent cannot resolve it from local evidence alone.
     pub fn needs_reconciliation(self) -> bool {
@@ -481,8 +475,8 @@ impl LaunchFences {
         reject_before_unix_ms: u64,
         admitted_digest: Option<&str>,
     ) -> Option<LaunchRefusal> {
-        // Both sides are controller-stamped, so this comparison does not depend
-        // on the agent's clock and a clock jump cannot un-fence a stopped run.
+        // Both sides are controller-stamped, so a jump in the agent's clock cannot
+        // un-fence a stopped run -- though `fence_run` clamps what it stores.
         if reject_before_unix_ms > 0
             && self.issued_at_unix_ms > 0
             && self.issued_at_unix_ms <= reject_before_unix_ms
@@ -521,8 +515,20 @@ pub struct LedgerCutEntry {
     pub job_id: u32,
     pub run_attempt: u32,
     pub allocation: AdmittedResources,
-    pub disposition: String,
+    pub disposition: LedgerDisposition,
     pub conflict_hold: bool,
+}
+
+fn disposition_of(admitted: &AdmittedRun) -> LedgerDisposition {
+    // A finished teardown outranks a hold: it is positive proof the payload is
+    // gone, where a hold only says the agent could not account for the claim.
+    if admitted.run.state == RunState::Cleaned {
+        return LedgerDisposition::OverButCharged;
+    }
+    if admitted.run.conflict_hold.is_some() || admitted.run.is_over() {
+        return LedgerDisposition::Unresolved;
+    }
+    LedgerDisposition::Held
 }
 
 impl AdmissionStore {
@@ -546,7 +552,7 @@ impl AdmissionStore {
                 job_id: admitted.run.job_id,
                 run_attempt: admitted.run.run_attempt,
                 allocation: admitted.run.allocation.clone(),
-                disposition: String::new(),
+                disposition: disposition_of(admitted),
                 conflict_hold: admitted.run.conflict_hold.is_some(),
             })
             .collect();
@@ -561,10 +567,10 @@ impl AdmissionStore {
 }
 
 impl LedgerCut {
-    /// Holding something only the controller can settle: a claim with no job
-    /// behind it, or an unreadable record. Saying so is all the agent may do.
-    pub fn needs_reconcile(&self) -> bool {
-        !self.inventory_complete || self.entries.iter().any(|entry| entry.conflict_hold)
+    /// Holding something the controller can actually settle. An unreadable
+    /// record is not one: nothing it can do would ever clear that.
+    pub fn wants_reconcile(&self) -> bool {
+        self.entries.iter().any(|entry| entry.conflict_hold)
     }
 }
 
@@ -614,50 +620,62 @@ impl AdmissionStore {
         &self.root
     }
 
-    pub fn run_dir(&self, job_id: u32, run_attempt: u32) -> PathBuf {
-        self.root.join(format!("{job_id}.{run_attempt}"))
+    fn participant_path(&self, run_key: RunKey, step_id: StepId) -> io::Result<PathBuf> {
+        Ok(self
+            .participants_dir(run_key)?
+            .join(format!("{step_id}.json")))
     }
 
-    fn participants_dir(&self, job_id: u32, run_attempt: u32) -> PathBuf {
-        self.run_dir(job_id, run_attempt).join(PARTICIPANTS_DIR)
+    /// Where a run's records live. The tree is keyed per attempt, so a widened
+    /// key names a directory no run ever had and must not resolve to one.
+    pub fn run_dir(&self, run: RunKey) -> io::Result<PathBuf> {
+        let attempt = addressable_attempt(run)?;
+        Ok(self.root.join(format!("{}.{attempt}", run.job_id())))
+    }
+
+    fn participants_dir(&self, run: RunKey) -> io::Result<PathBuf> {
+        Ok(self.run_dir(run)?.join(PARTICIPANTS_DIR))
     }
 
     /// Every level, because `create_dir_all` leaves intermediates at the umask
     /// default and this tree holds the environment a run was admitted with.
-    pub(crate) fn prepare_run_dir(&self, job_id: u32, run_attempt: u32) -> io::Result<PathBuf> {
+    pub(crate) fn prepare_run_dir(&self, run: RunKey) -> io::Result<PathBuf> {
+        let dir = self.run_dir(run)?;
         create_private_dir_all(&self.root)?;
-        let dir = self.run_dir(job_id, run_attempt);
         create_private_dir_all(&dir)?;
         Ok(dir)
     }
 
-    fn prepare_participants_dir(&self, job_id: u32, run_attempt: u32) -> io::Result<PathBuf> {
-        let dir = self
-            .prepare_run_dir(job_id, run_attempt)?
-            .join(PARTICIPANTS_DIR);
+    fn prepare_participants_dir(&self, run: RunKey) -> io::Result<PathBuf> {
+        let dir = self.prepare_run_dir(run)?.join(PARTICIPANTS_DIR);
         create_private_dir_all(&dir)?;
         Ok(dir)
     }
 
-    /// Persist the entitlement before anything is spawned against it. A crash
-    /// before this leaves no record and no process; a crash after leaves both.
-    /// Monotonic fields carry forward: a relaunch of the same attempt must not
-    /// reset a cutoff and re-admit what it fenced.
+    /// Persist the entitlement before anything is spawned against it. Monotonic
+    /// fields carry forward, so a relaunch cannot re-admit what a cutoff fenced.
     pub fn admit_run(&self, run: &RunAdmission) -> io::Result<()> {
+        let key = run.key().ok_or_else(|| unaddressable(run.job_id))?;
         let mut run = run.clone();
-        if let Ok(existing) = self.load_run(run.job_id, run.run_attempt) {
-            run.reject_before_unix_ms = run
-                .reject_before_unix_ms
-                .max(existing.reject_before_unix_ms);
-            run.max_launch_expiry_unix_ms = run
-                .max_launch_expiry_unix_ms
-                .max(existing.max_launch_expiry_unix_ms);
-            // Carried forward only while this write is not itself clearing it.
-            if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
-                run.conflict_hold = existing.conflict_hold;
+        // Only a genuinely absent record starts from a blank slate; any other
+        // read failure would silently reset the cutoffs a launch is fenced by.
+        match self.load_run(key) {
+            Ok(existing) => {
+                run.reject_before_unix_ms = run
+                    .reject_before_unix_ms
+                    .max(existing.reject_before_unix_ms);
+                run.max_launch_expiry_unix_ms = run
+                    .max_launch_expiry_unix_ms
+                    .max(existing.max_launch_expiry_unix_ms);
+                // Carried forward only while this write is not itself clearing it.
+                if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
+                    run.conflict_hold = existing.conflict_hold;
+                }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        let dir = self.prepare_run_dir(run.job_id, run.run_attempt)?;
+        let dir = self.prepare_run_dir(key)?;
         publish_private(&dir, RUN_FILE, &encode(&run)?)
     }
 
@@ -681,7 +699,10 @@ impl AdmissionStore {
     }
 
     pub fn admit_participant(&self, participant: &ParticipantAdmission) -> io::Result<()> {
-        let dir = self.prepare_participants_dir(participant.job_id, participant.run_attempt)?;
+        let key = participant
+            .key()
+            .ok_or_else(|| unaddressable(participant.job_id))?;
+        let dir = self.prepare_participants_dir(key)?;
         publish_private(
             &dir,
             &format!("{}.json", participant.step_id),
@@ -689,26 +710,26 @@ impl AdmissionStore {
         )
     }
 
-    pub fn load_run(&self, job_id: u32, run_attempt: u32) -> io::Result<RunAdmission> {
-        let dir = self.run_dir(job_id, run_attempt);
+    pub fn load_run(&self, run_key: RunKey) -> io::Result<RunAdmission> {
+        let dir = self.run_dir(run_key)?;
         // A record the agent could not have written is one it cannot trust, and
         // the read side has to reach the same verdict the write side does.
         verify_private_dir(&dir)?;
         let run: RunAdmission = decode(&fs::read(dir.join(RUN_FILE))?)?;
-        self.validate_run(&run, job_id, run_attempt)?;
+        self.validate_run(&run, run_key)?;
         Ok(run)
     }
 
-    fn validate_run(&self, run: &RunAdmission, job_id: u32, run_attempt: u32) -> io::Result<()> {
+    fn validate_run(&self, run: &RunAdmission, run_key: RunKey) -> io::Result<()> {
         if run.schema_version > ADMISSION_SCHEMA_VERSION {
             return Err(invalid(format!(
                 "run record schema {} is newer than {ADMISSION_SCHEMA_VERSION}",
                 run.schema_version
             )));
         }
-        if run.job_id != job_id || run.run_attempt != run_attempt {
+        if run.key() != Some(run_key) {
             return Err(invalid(format!(
-                "run record names {}.{} but lives in {job_id}.{run_attempt}",
+                "run record names {}.{} but lives in {run_key}",
                 run.job_id, run.run_attempt
             )));
         }
@@ -724,10 +745,9 @@ impl AdmissionStore {
     /// This run's participants, plus the files that could not be read.
     pub fn participants(
         &self,
-        job_id: u32,
-        run_attempt: u32,
+        run_key: RunKey,
     ) -> io::Result<(Vec<ParticipantAdmission>, Vec<RejectedAdmission>)> {
-        let dir = self.participants_dir(job_id, run_attempt);
+        let dir = self.participants_dir(run_key)?;
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -744,7 +764,7 @@ impl AdmissionStore {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            match self.load_participant(&path, job_id, run_attempt) {
+            match self.load_participant(&path, run_key) {
                 Ok(participant) => {
                     found.insert(participant.step_id, participant);
                 }
@@ -756,12 +776,7 @@ impl AdmissionStore {
         Ok((found.into_values().collect(), rejected))
     }
 
-    fn load_participant(
-        &self,
-        path: &Path,
-        job_id: u32,
-        run_attempt: u32,
-    ) -> io::Result<ParticipantAdmission> {
+    fn load_participant(&self, path: &Path, run_key: RunKey) -> io::Result<ParticipantAdmission> {
         let participant: ParticipantAdmission = decode(&fs::read(path)?)?;
         if participant.schema_version > ADMISSION_SCHEMA_VERSION {
             return Err(invalid(format!(
@@ -769,12 +784,9 @@ impl AdmissionStore {
                 participant.schema_version
             )));
         }
-        if participant.job_id != job_id
-            || participant.run_attempt != run_attempt
-            || participant.node != self.node
-        {
+        if participant.key() != Some(run_key) || participant.node != self.node {
             return Err(invalid(format!(
-                "participant record at {} does not belong to {job_id}.{run_attempt} on '{}'",
+                "participant record at {} does not belong to {run_key} on '{}'",
                 path.display(),
                 self.node
             )));
@@ -809,7 +821,14 @@ impl AdmissionStore {
                 ));
                 continue;
             };
-            let run = match self.load_run(job_id, run_attempt) {
+            let Some(run_key) = RunKey::new(job_id, run_attempt) else {
+                loaded.rejected.push(RejectedAdmission::new(
+                    dir,
+                    "run directory names attempt 0, which is no run",
+                ));
+                continue;
+            };
+            let run = match self.load_run(run_key) {
                 Ok(run) => run,
                 Err(error) => {
                     loaded
@@ -818,7 +837,7 @@ impl AdmissionStore {
                     continue;
                 }
             };
-            match self.participants(job_id, run_attempt) {
+            match self.participants(run_key) {
                 Ok((participants, rejected)) => {
                     loaded.rejected.extend(rejected);
                     loaded.runs.push(AdmittedRun { run, participants });
@@ -833,8 +852,8 @@ impl AdmissionStore {
 
     /// Read-modify-write so cleanup cannot silently discard a conflict hold or
     /// the creation time the age rule depends on.
-    pub fn mark_run_cleaned(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
-        let mut run = match self.load_run(job_id, run_attempt) {
+    pub fn mark_run_cleaned(&self, run_key: RunKey) -> io::Result<bool> {
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -843,8 +862,6 @@ impl AdmissionStore {
             return Ok(true);
         }
         run.state = RunState::Cleaned;
-        run.cleanup.phase = CleanupPhase::Complete;
-        run.prolog = run.prolog.settled_after_owner_loss();
         run.cleanup.epilog = run.cleanup.epilog.settled_after_owner_loss();
         self.admit_run(&run)?;
         Ok(true)
@@ -854,15 +871,12 @@ impl AdmissionStore {
     /// so it cannot discard the deadline or digest the launch was admitted under.
     pub fn record_supervisor(
         &self,
-        job_id: u32,
-        run_attempt: u32,
+        run_key: RunKey,
         step_id: StepId,
         supervisor: SupervisorRef,
     ) -> io::Result<bool> {
-        let path = self
-            .participants_dir(job_id, run_attempt)
-            .join(format!("{step_id}.json"));
-        let mut participant = match self.load_participant(&path, job_id, run_attempt) {
+        let path = self.participant_path(run_key, step_id)?;
+        let mut participant = match self.load_participant(&path, run_key) {
             Ok(participant) => participant,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -875,13 +889,8 @@ impl AdmissionStore {
 
     /// Mark a run as needing the controller's attention, preserving everything
     /// already on it. Idempotent: the first reason recorded is the one kept.
-    pub fn take_conflict_hold(
-        &self,
-        job_id: u32,
-        run_attempt: u32,
-        reason: &str,
-    ) -> io::Result<HoldOutcome> {
-        let mut run = match self.load_run(job_id, run_attempt) {
+    pub fn take_conflict_hold(&self, run_key: RunKey, reason: &str) -> io::Result<HoldOutcome> {
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(HoldOutcome::NoRecord)
@@ -906,27 +915,20 @@ impl AdmissionStore {
 
     /// Raise a run's cutoff. Monotonic: a lower value is ignored, so a reordered
     /// or replayed fence can never un-cancel a run.
-    pub fn fence_run(
-        &self,
-        job_id: u32,
-        run_attempt: u32,
-        reject_before_unix_ms: u64,
-    ) -> io::Result<u64> {
-        // Attempts start at 1, so zero is a caller's wildcard, not an identity.
-        // A record invented for it holds a claim nothing can ever settle.
-        if run_attempt == 0 {
-            return Err(invalid(
-                "run attempt 0 names no run and cannot be fenced".to_string(),
-            ));
-        }
-        let mut run = match self.load_run(job_id, run_attempt) {
+    pub fn fence_run(&self, run_key: RunKey, reject_before_unix_ms: u64) -> io::Result<u64> {
+        let attempt = addressable_attempt(run_key)?;
+        // Agent clock against a controller cutoff: running ahead leaves the strand
+        // it prevents, behind can lower a cutoff past a launch that should fence.
+        let reject_before_unix_ms =
+            reject_before_unix_ms.min(now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS));
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             // Fencing a run this node has no record of still has to hold: the
             // record is created below so a launch already in flight is refused.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let mut fresh = RunAdmission::new(
-                    job_id,
-                    run_attempt,
+                    run_key.job_id(),
+                    attempt,
                     &self.node,
                     AdmittedResources::default(),
                     now_unix_ms(),
@@ -947,8 +949,8 @@ impl AdmissionStore {
 
     /// The cutoff this run enforces, or none if it has no record yet. Read on
     /// every launch, so it must outlive the agent that recorded it.
-    pub fn reject_before(&self, job_id: u32, run_attempt: u32) -> Option<u64> {
-        self.load_run(job_id, run_attempt)
+    pub fn reject_before(&self, run_key: RunKey) -> Option<u64> {
+        self.load_run(run_key)
             .ok()
             .map(|run| run.reject_before_unix_ms)
     }
@@ -957,13 +959,12 @@ impl AdmissionStore {
     /// completion acknowledged, and, per the record, no epilog still in flight.
     pub fn release_is_due(
         &self,
-        job_id: u32,
-        run_attempt: u32,
+        run_key: RunKey,
         step_id: StepId,
-    ) -> io::Result<bool> {
-        let run = match self.load_run(job_id, run_attempt) {
+    ) -> io::Result<Option<ReleaseWarrant>> {
+        let run = match self.load_run(run_key) {
             Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         // Without this the release fires for whichever participant happens to be
@@ -972,23 +973,21 @@ impl AdmissionStore {
             .lifecycle_owner_step
             .is_some_and(|owner| owner != step_id)
         {
-            return Ok(false);
+            return Ok(None);
         }
         if run.cleanup.epilog.is_in_flight() {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(run.controller_ack.release_raft_index.is_some())
+        Ok(run
+            .controller_ack
+            .release_raft_index
+            .map(|index| ReleaseWarrant::acknowledged(run_key, index)))
     }
 
     /// Record how this run's epilog is going. The gate reads this, so a hook
     /// whose outcome never lands here is a gate that cannot bite.
-    pub fn record_epilog(
-        &self,
-        job_id: u32,
-        run_attempt: u32,
-        state: HookState,
-    ) -> io::Result<bool> {
-        let mut run = match self.load_run(job_id, run_attempt) {
+    pub fn record_epilog(&self, run_key: RunKey, state: HookState) -> io::Result<bool> {
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -1005,11 +1004,10 @@ impl AdmissionStore {
     /// index is what distinguishes an acknowledgement from an unanswered RPC.
     pub fn record_controller_ack(
         &self,
-        job_id: u32,
-        run_attempt: u32,
+        run_key: RunKey,
         release_raft_index: u64,
     ) -> io::Result<bool> {
-        let mut run = match self.load_run(job_id, run_attempt) {
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -1024,8 +1022,8 @@ impl AdmissionStore {
 
     /// Record the controller's cancel. Never creates a record: a cancel for a
     /// run this node never admitted has nothing to settle.
-    pub fn mark_controller_cancelled(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
-        let mut run = match self.load_run(job_id, run_attempt) {
+    pub fn mark_controller_cancelled(&self, run_key: RunKey) -> io::Result<bool> {
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -1040,8 +1038,8 @@ impl AdmissionStore {
 
     /// Note that a run's slice has gone back to the node. Callers must have
     /// released it against an acknowledgement, not merely intend to.
-    pub fn record_slice_released(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
-        let mut run = match self.load_run(job_id, run_attempt) {
+    pub fn record_slice_released(&self, run_key: RunKey) -> io::Result<bool> {
+        let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -1056,37 +1054,30 @@ impl AdmissionStore {
 
     /// Discharge every report a run still owes. Sound only once the controller
     /// has taken the run's own completion: nothing answers a sibling's after that.
-    pub fn discharge_owed_reports(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
-        let (participants, _) = self.participants(job_id, run_attempt)?;
+    pub fn discharge_owed_reports(&self, run_key: RunKey) -> io::Result<()> {
+        let (participants, _) = self.participants(run_key)?;
         for participant in participants {
-            self.record_report_acknowledged(job_id, run_attempt, participant.step_id)?;
+            self.record_report_acknowledged(run_key, participant.step_id)?;
         }
         Ok(())
     }
 
-    /// Settle a cancelled run: the cancel is the controller's own acknowledgement.
-    /// Owed reports go with it -- one owed forever is what makes a record immortal.
-    pub fn settle_cancelled_run(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
-        if !self.record_controller_ack(job_id, run_attempt, 1)? {
+    /// Settle a run the controller has spoken for, whether by cancelling it or by
+    /// answering the claim. Owed reports go with it, or the record is immortal.
+    pub fn settle_acknowledged_run(&self, run_key: RunKey) -> io::Result<bool> {
+        if !self.record_controller_ack(run_key, 1)? {
             return Ok(false);
         }
-        self.discharge_owed_reports(job_id, run_attempt)?;
-        self.record_slice_released(job_id, run_attempt)?;
-        self.mark_run_cleaned(job_id, run_attempt)
+        self.discharge_owed_reports(run_key)?;
+        self.record_slice_released(run_key)?;
+        self.mark_run_cleaned(run_key)
     }
 
     /// Mark a participant's completion as acknowledged, so the durable retry
     /// stops rediscovering it.
-    pub fn record_report_acknowledged(
-        &self,
-        job_id: u32,
-        run_attempt: u32,
-        step_id: StepId,
-    ) -> io::Result<bool> {
-        let path = self
-            .participants_dir(job_id, run_attempt)
-            .join(format!("{step_id}.json"));
-        let mut participant = match self.load_participant(&path, job_id, run_attempt) {
+    pub fn record_report_acknowledged(&self, run_key: RunKey, step_id: StepId) -> io::Result<bool> {
+        let path = self.participant_path(run_key, step_id)?;
+        let mut participant = match self.load_participant(&path, run_key) {
             Ok(participant) => participant,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -1097,15 +1088,8 @@ impl AdmissionStore {
         Ok(true)
     }
 
-    pub fn remove_participant(
-        &self,
-        job_id: u32,
-        run_attempt: u32,
-        step_id: StepId,
-    ) -> io::Result<()> {
-        let path = self
-            .participants_dir(job_id, run_attempt)
-            .join(format!("{step_id}.json"));
+    pub fn remove_participant(&self, run_key: RunKey, step_id: StepId) -> io::Result<()> {
+        let path = self.participant_path(run_key, step_id)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1113,8 +1097,8 @@ impl AdmissionStore {
         }
     }
 
-    pub fn remove_run(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
-        match fs::remove_dir_all(self.run_dir(job_id, run_attempt)) {
+    pub fn remove_run(&self, run_key: RunKey) -> io::Result<()> {
+        match fs::remove_dir_all(self.run_dir(run_key)?) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -1127,7 +1111,7 @@ impl AdmissionStore {
         &self,
         now_unix_ms: u64,
         retention_ms: u64,
-        charged: &HashSet<(u32, u32)>,
+        charged: &HashSet<RunKey>,
     ) -> io::Result<usize> {
         // A zero floor would collect a run the instant it is admitted, which is
         // before its launch has even spawned.
@@ -1141,11 +1125,12 @@ impl AdmissionStore {
             }
             // The record is the only instruction to release a slice, so taking
             // one still charged strands it with nothing left to say so.
-            if charged.contains(&(run.job_id, run.run_attempt)) {
+            let Some(run_key) = run.key() else { continue };
+            if charged.contains(&run_key) {
                 continue;
             }
             if admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms) {
-                self.remove_run(run.job_id, run.run_attempt)?;
+                self.remove_run(run_key)?;
                 removed += 1;
             }
         }
@@ -1160,7 +1145,7 @@ impl AdmissionStore {
         rejected: &[RejectedAdmission],
         now_unix_ms: u64,
         retention_ms: u64,
-        charged: &HashSet<(u32, u32)>,
+        charged: &HashSet<RunKey>,
     ) -> io::Result<usize> {
         let mut removed = 0;
         for entry in rejected {
@@ -1170,7 +1155,10 @@ impl AdmissionStore {
                 continue;
             }
             // Unreadable is not evidence the slice it names came back.
-            if parse_run_dir_name(&entry.path).is_some_and(|run| charged.contains(&run)) {
+            if parse_run_dir_name(&entry.path)
+                .and_then(|(job_id, attempt)| RunKey::new(job_id, attempt))
+                .is_some_and(|run| charged.contains(&run))
+            {
                 continue;
             }
             if entry.modified_unix_ms == 0
@@ -1230,6 +1218,17 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
     serde_json::from_slice(bytes).map_err(|error| invalid(format!("parse admission: {error}")))
 }
 
+/// The one place a widened key is refused: the ledger tree is keyed per attempt,
+/// so there is no directory for "every attempt of this job".
+fn addressable_attempt(run: RunKey) -> io::Result<u32> {
+    run.attempt()
+        .ok_or_else(|| invalid(format!("{run} names no single run to address")))
+}
+
+fn unaddressable(job_id: u32) -> io::Error {
+    invalid(format!("run attempt 0 names no run of job {job_id}"))
+}
+
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -1260,6 +1259,10 @@ pub fn current_boot_id() -> Option<String> {
 mod tests {
     use super::*;
     use spur_core::step::STEP_BATCH;
+
+    fn key(job_id: u32, run_attempt: u32) -> RunKey {
+        RunKey::new(job_id, run_attempt).expect("attempts start at 1")
+    }
 
     fn store(dir: &tempfile::TempDir) -> AdmissionStore {
         AdmissionStore::new(dir.path(), "n1")
@@ -1316,13 +1319,17 @@ mod tests {
 
         let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(store.root().to_path_buf()), 0o700);
-        assert_eq!(mode(store.run_dir(7, 1)), 0o700);
-        assert_eq!(mode(store.participants_dir(7, 1)), 0o700);
-        assert_eq!(mode(store.run_dir(7, 1).join(RUN_FILE)), 0o600);
+        assert_eq!(mode(store.run_dir(key(7, 1)).unwrap()), 0o700);
+        assert_eq!(mode(store.participants_dir(key(7, 1)).unwrap()), 0o700);
+        assert_eq!(
+            mode(store.run_dir(key(7, 1)).unwrap().join(RUN_FILE)),
+            0o600
+        );
         assert_eq!(
             mode(
                 store
-                    .participants_dir(7, 1)
+                    .participants_dir(key(7, 1))
+                    .unwrap()
                     .join(format!("{STEP_BATCH}.json"))
             ),
             0o600
@@ -1355,8 +1362,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        std::fs::set_permissions(store.run_dir(7, 1), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            store.run_dir(key(7, 1)).unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
 
         let loaded = store.load_all().unwrap();
         assert!(
@@ -1376,7 +1386,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         let run = run_with(7, 1, 0);
-        let target = store.prepare_run_dir(9, 4).unwrap();
+        let target = store.prepare_run_dir(key(9, 4)).unwrap();
         publish_private(&target, RUN_FILE, &encode(&run).unwrap()).unwrap();
 
         let loaded = store.load_all().unwrap();
@@ -1402,7 +1412,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 0)).unwrap();
-        let broken = store.prepare_run_dir(8, 1).unwrap();
+        let broken = store.prepare_run_dir(key(8, 1)).unwrap();
         publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
 
         let loaded = store.load_all().unwrap();
@@ -1416,7 +1426,7 @@ mod tests {
         // the same broken directory on every tick, forever.
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        let broken = store.prepare_run_dir(8, 1).unwrap();
+        let broken = store.prepare_run_dir(key(8, 1)).unwrap();
         publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
 
         assert_eq!(
@@ -1465,10 +1475,15 @@ mod tests {
         let mut owed = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
         owed.final_report.required = true;
         store.admit_participant(&owed).unwrap();
-        publish_private(&store.run_dir(7, 1).join("participants"), "5.json", b"{ x").unwrap();
+        publish_private(
+            &store.run_dir(key(7, 1)).unwrap().join("participants"),
+            "5.json",
+            b"{ x",
+        )
+        .unwrap();
 
         assert_eq!(store.sweep(u64::MAX, 60_000, &HashSet::new()).unwrap(), 0);
-        assert!(store.load_run(7, 1).is_ok());
+        assert!(store.load_run(key(7, 1)).is_ok());
     }
 
     #[test]
@@ -1497,8 +1512,11 @@ mod tests {
         store.admit_participant(&unacked).unwrap();
 
         assert_eq!(store.sweep(10_000, 1_000, &HashSet::new()).unwrap(), 1);
-        assert!(store.load_run(1, 1).is_err());
-        assert!(store.load_run(2, 1).is_ok(), "an owed report must be kept");
+        assert!(store.load_run(key(1, 1)).is_err());
+        assert!(
+            store.load_run(key(2, 1)).is_ok(),
+            "an owed report must be kept"
+        );
     }
 
     #[test]
@@ -1510,10 +1528,10 @@ mod tests {
         settled.state = RunState::Cleaned;
         store.admit_run(&settled).unwrap();
 
-        let charged = HashSet::from([(1, 1)]);
+        let charged = HashSet::from([key(1, 1)]);
         assert_eq!(store.sweep(u64::MAX, 1_000, &charged).unwrap(), 0);
         assert!(
-            store.load_run(1, 1).is_ok(),
+            store.load_run(key(1, 1)).is_ok(),
             "the record is the only thing that can still order the release"
         );
         assert_eq!(store.sweep(u64::MAX, 1_000, &HashSet::new()).unwrap(), 1);
@@ -1523,10 +1541,10 @@ mod tests {
     fn sweep_keeps_an_unreadable_record_whose_slice_is_still_charged() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        let broken = store.prepare_run_dir(1, 1).unwrap();
+        let broken = store.prepare_run_dir(key(1, 1)).unwrap();
         publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
 
-        let charged = HashSet::from([(1, 1)]);
+        let charged = HashSet::from([key(1, 1)]);
         assert_eq!(store.sweep(u64::MAX, 1, &charged).unwrap(), 0);
         assert_eq!(store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(), 1);
     }
@@ -1538,7 +1556,7 @@ mod tests {
         let mut fenced = run_with(7, 1, 1_000);
         fenced.state = RunState::Cleaned;
         store.admit_run(&fenced).unwrap();
-        store.fence_run(7, 1, 10_000).unwrap();
+        store.fence_run(key(7, 1), 10_000).unwrap();
 
         assert_eq!(
             store
@@ -1547,7 +1565,7 @@ mod tests {
             0,
             "collecting the record would re-admit the launch the cutoff refuses"
         );
-        assert!(store.load_run(7, 1).is_ok());
+        assert!(store.load_run(key(7, 1)).is_ok());
         assert_eq!(
             store
                 .sweep(10_000 + LAUNCH_LIFETIME_MS, 1, &HashSet::new())
@@ -1568,7 +1586,7 @@ mod tests {
         owed.final_report.required = true;
         store.admit_participant(&owed).unwrap();
 
-        assert!(store.settle_cancelled_run(7, 1).unwrap());
+        assert!(store.settle_acknowledged_run(key(7, 1)).unwrap());
         assert_eq!(
             store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(),
             1,
@@ -1578,9 +1596,13 @@ mod tests {
 
     #[test]
     fn a_fence_for_attempt_zero_leaves_no_phantom_record() {
+        assert!(
+            RunKey::new(7, 0).is_none(),
+            "attempt 0 must not be nameable, or a fence invents a record for it"
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        assert!(store.fence_run(7, 0, 5_000).is_err());
+        assert!(store.fence_run(RunKey::any_attempt(7), 5_000).is_err());
         assert!(
             store.load_all().unwrap().runs.is_empty(),
             "a wildcard attempt must not be given a record to hold a claim with"
@@ -1626,8 +1648,8 @@ mod tests {
         store.admit_run(&aged).unwrap();
 
         assert_eq!(store.sweep(u64::MAX, 0, &HashSet::new()).unwrap(), 0);
-        assert!(store.load_run(7, 1).is_ok());
-        assert!(store.load_run(8, 1).is_ok());
+        assert!(store.load_run(key(7, 1)).is_ok());
+        assert!(store.load_run(key(8, 1)).is_ok());
     }
 
     #[test]
@@ -1677,8 +1699,7 @@ mod tests {
         // reaches neither Cleaned nor stays Admitted.
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        let mut stuck = run_with(7, 1, 1_000);
-        stuck.state = RunState::Running;
+        let stuck = run_with(7, 1, 1_000);
         store.admit_run(&stuck).unwrap();
         let mut exited = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
         exited.lifecycle = ParticipantLifecycle::Exited;
@@ -1697,7 +1718,7 @@ mod tests {
         store.admit_run(&run_with(7, 1, 0)).unwrap();
 
         assert_eq!(store.sweep(u64::MAX, 1_000, &HashSet::new()).unwrap(), 0);
-        assert!(store.load_run(7, 1).is_ok());
+        assert!(store.load_run(key(7, 1)).is_ok());
     }
 
     #[test]
@@ -1707,7 +1728,7 @@ mod tests {
         store.admit_run(&run_with(7, 1, 5_000)).unwrap();
 
         assert_eq!(store.sweep(5_000, 0, &HashSet::new()).unwrap(), 0);
-        assert!(store.load_run(7, 1).is_ok());
+        assert!(store.load_run(key(7, 1)).is_ok());
     }
 
     #[test]
@@ -1715,31 +1736,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         let mut run = run_with(7, 1, 1_234);
-        run.state = RunState::Running;
-        run.prolog = HookState::Running;
         run.conflict_hold = Some(ConflictHold {
             reason: "residual runtime state".into(),
             observed_at_unix_ms: 99,
         });
         store.admit_run(&run).unwrap();
 
-        assert!(store.mark_run_cleaned(7, 1).unwrap());
-        let after = store.load_run(7, 1).unwrap();
+        assert!(store.mark_run_cleaned(key(7, 1)).unwrap());
+        let after = store.load_run(key(7, 1)).unwrap();
         assert_eq!(after.state, RunState::Cleaned);
         assert_eq!(after.created_at_unix_ms, 1_234, "the age must survive");
         assert_eq!(after.allocation, run.allocation);
         assert!(after.conflict_hold.is_some(), "a hold must survive cleanup");
-        assert_eq!(
-            after.prolog,
-            HookState::Unknown,
-            "a hook still running when its owner went away is not a success"
-        );
     }
 
     #[test]
     fn marking_a_run_that_was_never_admitted_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!store(&dir).mark_run_cleaned(9, 9).unwrap());
+        assert!(!store(&dir).mark_run_cleaned(key(9, 9)).unwrap());
     }
 
     #[test]
@@ -1756,7 +1770,7 @@ mod tests {
                 Default::default(),
             ))
             .unwrap();
-        let participants = store.run_dir(7, 1).join("participants");
+        let participants = store.run_dir(key(7, 1)).unwrap().join("participants");
         publish_private(&participants, "5.json", b"{ not json").unwrap();
 
         let loaded = store.load_all().unwrap();
@@ -1861,10 +1875,30 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
 
-        assert_eq!(store.fence_run(7, 1, 5_000).unwrap(), 5_000);
+        assert_eq!(store.fence_run(key(7, 1), 5_000).unwrap(), 5_000);
         // A reordered or replayed fence must not un-cancel a stopped run.
-        assert_eq!(store.fence_run(7, 1, 1_000).unwrap(), 5_000);
-        assert_eq!(store.reject_before(7, 1), Some(5_000));
+        assert_eq!(store.fence_run(key(7, 1), 1_000).unwrap(), 5_000);
+        assert_eq!(store.reject_before(key(7, 1)), Some(5_000));
+    }
+
+    #[test]
+    fn a_fence_past_every_launch_it_could_cover_is_clamped() {
+        // A cutoff the clock never reaches fences the run for good, and the
+        // phantom record it creates has no other writer to lift it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let far_future = now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS * 1000);
+
+        let applied = store.fence_run(key(7, 1), far_future).unwrap();
+        assert!(
+            applied < far_future,
+            "a skewed cutoff must not be taken verbatim"
+        );
+        assert!(
+            applied <= now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS),
+            "a cutoff past the last launch it could cover never ages out"
+        );
+        assert_eq!(store.reject_before(key(7, 1)), Some(applied));
     }
 
     #[test]
@@ -1873,23 +1907,148 @@ mod tests {
         // nowhere to live and the launch would land after its own cancel.
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        assert_eq!(store.fence_run(7, 1, 5_000).unwrap(), 5_000);
-        assert_eq!(store.reject_before(7, 1), Some(5_000));
+        assert_eq!(store.fence_run(key(7, 1), 5_000).unwrap(), 5_000);
+        assert_eq!(store.reject_before(key(7, 1)), Some(5_000));
     }
 
     #[test]
     fn a_fence_preserves_what_the_run_already_holds() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        let mut run = run_with(7, 1, 42);
-        run.state = RunState::Running;
+        let run = run_with(7, 1, 42);
         store.admit_run(&run).unwrap();
 
-        store.fence_run(7, 1, 5_000).unwrap();
-        let after = store.load_run(7, 1).unwrap();
+        store.fence_run(key(7, 1), 5_000).unwrap();
+        let after = store.load_run(key(7, 1)).unwrap();
         assert_eq!(after.allocation, run.allocation);
         assert_eq!(after.created_at_unix_ms, 42);
-        assert_eq!(after.state, RunState::Running);
+    }
+
+    // Reading "no prior record" out of an IO error un-fences the run and writes
+    // over the only evidence that it may still hold a claim.
+    #[test]
+    fn a_record_that_cannot_be_read_is_not_a_record_that_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let damaged = store.prepare_run_dir(key(7, 1)).unwrap();
+        publish_private(&damaged, RUN_FILE, b"{ not json").unwrap();
+
+        let error = store
+            .admit_run(&run_with(7, 1, 1))
+            .expect_err("an unreadable prior record must not be written over");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+
+        let loaded = store.load_all().unwrap();
+        assert!(loaded.runs.is_empty());
+        assert_eq!(
+            loaded.rejected.len(),
+            1,
+            "the damaged record is the only thing saying this run may hold a claim"
+        );
+    }
+
+    // The controller cannot repair a file on this node, so asking it to try
+    // again on every heartbeat is a loop with no exit.
+    #[test]
+    fn an_unreadable_record_is_not_something_to_ask_the_controller_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let broken = store.prepare_run_dir(key(8, 1)).unwrap();
+        publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
+
+        let cut = store.ledger_cut("session-a");
+        assert!(
+            !cut.inventory_complete,
+            "the controller still has to be told"
+        );
+        assert!(
+            !cut.wants_reconcile(),
+            "nothing a reconcile can do would clear an unreadable record"
+        );
+
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
+            .unwrap();
+        assert!(
+            store.ledger_cut("session-a").wants_reconcile(),
+            "a claim with no job behind it is exactly what the controller settles"
+        );
+    }
+
+    // The strand this fixes: teardown finished, the report never landed, and a
+    // hold that reported "cannot tell" left the controller nothing to answer.
+    #[test]
+    fn a_finished_run_still_holding_its_slice_reports_that_it_is_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
+            .unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert_eq!(
+            entry.disposition,
+            LedgerDisposition::OverButCharged,
+            "a finished teardown is what licenses the controller to answer the claim"
+        );
+        assert!(
+            entry.conflict_hold,
+            "the hold still travels; it just no longer hides the teardown"
+        );
+    }
+
+    #[test]
+    fn a_run_the_agent_cannot_account_for_still_reports_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
+            .unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert_eq!(
+            entry.disposition,
+            LedgerDisposition::Unresolved,
+            "nothing proves this run is over, so nothing may settle it"
+        );
+        assert!(!entry.disposition.may_be_settled());
+    }
+
+    #[test]
+    fn a_cancel_whose_teardown_is_still_running_may_not_be_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_controller_cancelled(key(7, 1)).unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert!(
+            !entry.disposition.may_be_settled(),
+            "the payload may still be exiting; releasing its cores hands them to a second job"
+        );
+        assert!(
+            entry.disposition.already_accounted_for(),
+            "it is still not something to kill"
+        );
     }
 
     #[test]
@@ -1899,10 +2058,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        store.fence_run(7, 1, 5_000).unwrap();
+        store.fence_run(key(7, 1), 5_000).unwrap();
 
         store.admit_run(&run_with(7, 1, 9_000)).unwrap();
-        assert_eq!(store.reject_before(7, 1), Some(5_000));
+        assert_eq!(store.reject_before(key(7, 1)), Some(5_000));
     }
 
     #[test]
@@ -1913,12 +2072,12 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
         store
-            .take_conflict_hold(7, 1, "held with no tracked job")
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
             .unwrap();
-        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_some());
+        assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_some());
 
-        store.record_controller_ack(7, 1, 9).unwrap();
-        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_none());
+        store.record_controller_ack(key(7, 1), 9).unwrap();
+        assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_none());
     }
 
     #[test]
@@ -1928,15 +2087,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        store.record_controller_ack(7, 1, 9).unwrap();
+        store.record_controller_ack(key(7, 1), 9).unwrap();
 
         assert_eq!(
             store
-                .take_conflict_hold(7, 1, "held with no tracked job")
+                .take_conflict_hold(key(7, 1), "held with no tracked job")
                 .unwrap(),
             HoldOutcome::AlreadyReleased
         );
-        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_none());
+        assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_none());
     }
 
     #[test]
@@ -1944,10 +2103,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        store.take_conflict_hold(7, 1, "contested").unwrap();
+        store.take_conflict_hold(key(7, 1), "contested").unwrap();
 
         store.admit_run(&run_with(7, 1, 2)).unwrap();
-        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_some());
+        assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_some());
     }
 
     #[test]
@@ -1956,7 +2115,7 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
         store.admit_run(&run_with(8, 2, 1)).unwrap();
-        store.take_conflict_hold(8, 2, "contested").unwrap();
+        store.take_conflict_hold(key(8, 2), "contested").unwrap();
 
         let cut = store.ledger_cut("session-a");
         assert_eq!(cut.agent_session_id, "session-a");
@@ -1982,17 +2141,14 @@ mod tests {
         let mut cancels: BTreeMap<u32, u32> = BTreeMap::new();
         for pass in 0..5 {
             for entry in store.ledger_cut("session-a").entries {
+                let entry_key = key(entry.job_id, entry.run_attempt);
                 *cancels.entry(entry.job_id).or_default() += 1;
                 // Job 7 is still tearing down on the first pass, so its cancel
                 // can only be noted; the rest give the slice back outright.
                 if entry.job_id == 7 && pass == 0 {
-                    store
-                        .mark_controller_cancelled(entry.job_id, entry.run_attempt)
-                        .unwrap();
+                    store.mark_controller_cancelled(entry_key).unwrap();
                 } else {
-                    store
-                        .settle_cancelled_run(entry.job_id, entry.run_attempt)
-                        .unwrap();
+                    store.settle_acknowledged_run(entry_key).unwrap();
                 }
             }
         }
@@ -2018,9 +2174,9 @@ mod tests {
         for job_id in [7, 8, 9] {
             store.admit_run(&run_with(job_id, 1, 1)).unwrap();
         }
-        store.mark_run_cleaned(7, 1).unwrap();
-        store.mark_controller_cancelled(8, 1).unwrap();
-        store.record_controller_ack(9, 1, 42).unwrap();
+        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store.mark_controller_cancelled(key(8, 1)).unwrap();
+        store.record_controller_ack(key(9, 1), 42).unwrap();
 
         assert_eq!(
             store.ledger_cut("session-a").entries.len(),
@@ -2028,7 +2184,7 @@ mod tests {
             "every lifecycle state above still holds the cores it names"
         );
 
-        store.record_slice_released(8, 1).unwrap();
+        store.record_slice_released(key(8, 1)).unwrap();
         let left: Vec<u32> = store
             .ledger_cut("session-a")
             .entries
@@ -2047,20 +2203,20 @@ mod tests {
         owed.final_report.required = true;
         store.admit_participant(&owed).unwrap();
 
-        assert!(store.record_slice_released(7, 1).unwrap());
+        assert!(store.record_slice_released(key(7, 1)).unwrap());
         assert!(store.ledger_cut("session-a").entries.is_empty());
         assert_eq!(
             store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(),
             0,
             "the report it owes outlives the cores it gave back"
         );
-        assert!(store.load_run(7, 1).is_ok());
+        assert!(store.load_run(key(7, 1)).is_ok());
     }
 
     #[test]
     fn releasing_a_slice_for_a_run_with_no_record_records_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!store(&dir).record_slice_released(9, 9).unwrap());
+        assert!(!store(&dir).record_slice_released(key(9, 9)).unwrap());
     }
 
     #[test]
@@ -2105,7 +2261,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        let broken = store.prepare_run_dir(8, 1).unwrap();
+        let broken = store.prepare_run_dir(key(8, 1)).unwrap();
         publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
 
         let cut = store.ledger_cut("session-a");
@@ -2125,11 +2281,17 @@ mod tests {
         store.admit_run(&run).unwrap();
 
         assert!(
-            !store.release_is_due(7, 1, STEP_BATCH).unwrap(),
+            store
+                .release_is_due(key(7, 1), STEP_BATCH)
+                .unwrap()
+                .is_none(),
             "an exit is not a completion"
         );
-        store.record_controller_ack(7, 1, 42).unwrap();
-        assert!(store.release_is_due(7, 1, STEP_BATCH).unwrap());
+        store.record_controller_ack(key(7, 1), 42).unwrap();
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2141,10 +2303,13 @@ mod tests {
         let mut run = run_with(7, 1, 1);
         run.lifecycle_owner_step = Some(STEP_BATCH);
         store.admit_run(&run).unwrap();
-        store.record_controller_ack(7, 1, 42).unwrap();
+        store.record_controller_ack(key(7, 1), 42).unwrap();
 
-        assert!(!store.release_is_due(7, 1, 3).unwrap());
-        assert!(store.release_is_due(7, 1, STEP_BATCH).unwrap());
+        assert!(store.release_is_due(key(7, 1), 3).unwrap().is_none());
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2156,12 +2321,20 @@ mod tests {
         let mut run = run_with(7, 1, 1);
         run.lifecycle_owner_step = Some(STEP_BATCH);
         store.admit_run(&run).unwrap();
-        store.record_controller_ack(7, 1, 42).unwrap();
+        store.record_controller_ack(key(7, 1), 42).unwrap();
 
-        store.record_epilog(7, 1, HookState::Running).unwrap();
-        assert!(!store.release_is_due(7, 1, STEP_BATCH).unwrap());
-        store.record_epilog(7, 1, HookState::Succeeded).unwrap();
-        assert!(store.release_is_due(7, 1, STEP_BATCH).unwrap());
+        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_none());
+        store
+            .record_epilog(key(7, 1), HookState::Succeeded)
+            .unwrap();
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2174,11 +2347,14 @@ mod tests {
             let mut run = run_with(7, 1, 1);
             run.lifecycle_owner_step = Some(STEP_BATCH);
             store.admit_run(&run).unwrap();
-            store.record_controller_ack(7, 1, 42).unwrap();
-            store.record_epilog(7, 1, settled).unwrap();
+            store.record_controller_ack(key(7, 1), 42).unwrap();
+            store.record_epilog(key(7, 1), settled).unwrap();
 
             assert!(
-                store.release_is_due(7, 1, STEP_BATCH).unwrap(),
+                store
+                    .release_is_due(key(7, 1), STEP_BATCH)
+                    .unwrap()
+                    .is_some(),
                 "{settled:?} left the slice held"
             );
         }
@@ -2190,11 +2366,11 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
 
-        store.record_epilog(7, 1, HookState::Failed).unwrap();
-        store.mark_run_cleaned(7, 1).unwrap();
+        store.record_epilog(key(7, 1), HookState::Failed).unwrap();
+        store.mark_run_cleaned(key(7, 1)).unwrap();
 
         assert_eq!(
-            store.load_run(7, 1).unwrap().cleanup.epilog,
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
             HookState::Failed
         );
     }
@@ -2202,13 +2378,18 @@ mod tests {
     #[test]
     fn an_epilog_outcome_for_an_unknown_run_records_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!store(&dir).record_epilog(9, 9, HookState::Failed).unwrap());
+        assert!(!store(&dir)
+            .record_epilog(key(9, 9), HookState::Failed)
+            .unwrap());
     }
 
     #[test]
     fn a_run_with_no_record_releases_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!store(&dir).release_is_due(9, 9, STEP_BATCH).unwrap());
+        assert!(store(&dir)
+            .release_is_due(key(9, 9), STEP_BATCH)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2220,32 +2401,12 @@ mod tests {
         participant.final_report.required = true;
         store.admit_participant(&participant).unwrap();
 
-        assert!(store.record_report_acknowledged(7, 1, STEP_BATCH).unwrap());
-        let (participants, _) = store.participants(7, 1).unwrap();
+        assert!(store
+            .record_report_acknowledged(key(7, 1), STEP_BATCH)
+            .unwrap());
+        let (participants, _) = store.participants(key(7, 1)).unwrap();
         assert!(participants[0].final_report.acknowledged);
         assert_eq!(participants[0].lifecycle, ParticipantLifecycle::Exited);
-    }
-
-    #[test]
-    fn no_disposition_ever_releases_locally() {
-        // The invariant the whole ladder rests on: evidence buys the content of
-        // a report, never permission to act on it.
-        for disposition in [
-            RunDisposition::Running,
-            RunDisposition::SettledWithExit {
-                exit_code: 0,
-                signal: 0,
-            },
-            RunDisposition::DeadByReboot,
-            RunDisposition::NeverStarted,
-            RunDisposition::Unknown,
-            RunDisposition::Corrupt,
-        ] {
-            assert!(
-                !disposition.releases_locally(),
-                "{disposition:?} must not free a slice on the agent's own judgement"
-            );
-        }
     }
 
     #[test]
@@ -2409,8 +2570,11 @@ mod tests {
     fn frozen_records_still_load() {
         let run: RunAdmission = serde_json::from_str(FROZEN_RUN_V1).unwrap();
         assert_eq!(run.job_id, 42);
-        assert_eq!(run.state, RunState::Running);
-        assert_eq!(run.prolog, HookState::Succeeded);
+        assert_eq!(
+            run.state,
+            RunState::Admitted,
+            "a legacy in-flight state is not settled"
+        );
         assert_eq!(run.allocation.gpu_devices, vec![2]);
 
         let participant: ParticipantAdmission =
@@ -2431,7 +2595,6 @@ mod tests {
             serde_json::from_str(r#"{"schema_version":1,"job_id":1,"run_attempt":0,"node":"n1"}"#)
                 .unwrap();
         assert_eq!(run.state, RunState::Admitted);
-        assert_eq!(run.prolog, HookState::NotStarted);
         assert!(run.conflict_hold.is_none());
 
         let participant: ParticipantAdmission = serde_json::from_str(

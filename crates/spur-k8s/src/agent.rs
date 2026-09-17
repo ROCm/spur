@@ -578,6 +578,18 @@ impl SlurmAgent for VirtualAgent {
         }))
     }
 
+    /// Nothing here holds a slice waiting on an acknowledgement, so there is
+    /// none to answer: the ledger a settle would clear is always empty.
+    async fn settle_run(
+        &self,
+        _request: Request<spur_proto::proto::SettleRunRequest>,
+    ) -> Result<Response<spur_proto::proto::SettleRunResponse>, Status> {
+        Ok(Response::new(spur_proto::proto::SettleRunResponse {
+            released: true,
+            error: String::new(),
+        }))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,

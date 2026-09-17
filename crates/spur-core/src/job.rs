@@ -46,6 +46,104 @@ pub const OOM_SIGNAL_FLAG: i32 = 0x1000;
 /// with it; the agent keeps a cutoff this long so no launch it refuses outlives it.
 pub const LAUNCH_LIFETIME_MS: u64 = 120_000;
 
+/// Which run of a job something names. Attempts start at 1, so a caller holding
+/// only a job id has to widen deliberately rather than pass a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RunKey {
+    job_id: JobId,
+    run_attempt: Option<u32>,
+}
+
+impl RunKey {
+    /// `None` for attempt 0: it names no run, so a caller that meant every
+    /// attempt has to say so and one that did not has an error to report.
+    pub fn new(job_id: JobId, run_attempt: u32) -> Option<Self> {
+        (run_attempt > 0).then_some(Self {
+            job_id,
+            run_attempt: Some(run_attempt),
+        })
+    }
+
+    /// Every attempt of a job, for callers that genuinely have no one attempt to
+    /// name. Widening is the whole risk, so it is spelled out at the call site.
+    pub fn any_attempt(job_id: JobId) -> Self {
+        Self {
+            job_id,
+            run_attempt: None,
+        }
+    }
+
+    pub fn job_id(self) -> JobId {
+        self.job_id
+    }
+
+    /// The attempt this key names, or `None` when it names all of them. Anything
+    /// keyed per attempt must refuse the widened form rather than invent one.
+    pub fn attempt(self) -> Option<u32> {
+        self.run_attempt
+    }
+
+    /// Whether `attempt` is one this key names. A widened key names them all.
+    pub fn names_attempt(self, attempt: u32) -> bool {
+        self.run_attempt.is_none_or(|named| named == attempt)
+    }
+}
+
+/// What a node's record says about a claim it still holds, as carried on the
+/// wire. Only what the record answers for: runtime evidence is a separate question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerDisposition {
+    /// A live claim with nothing decided about it yet.
+    Held,
+    /// Teardown has finished and the slice has not gone back. Nothing is left
+    /// running under it, so the claim is waiting on an answer, not on a payload.
+    OverButCharged,
+    /// The agent is preserving evidence it cannot resolve on its own.
+    Unresolved,
+}
+
+impl LedgerDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::OverButCharged => "over_but_charged",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    /// `None` for anything this controller cannot name, which it must then treat
+    /// as an ordinary claim rather than as licence to leave it alone.
+    pub fn from_wire(disposition: &str) -> Option<Self> {
+        match disposition {
+            "held" => Some(Self::Held),
+            "over_but_charged" => Some(Self::OverButCharged),
+            "unresolved" => Some(Self::Unresolved),
+            _ => None,
+        }
+    }
+
+    /// Whether the agent has already accounted for this run itself. Its slice is
+    /// owed back, not held by a payload a signal would reach.
+    pub fn already_accounted_for(self) -> bool {
+        matches!(self, Self::OverButCharged | Self::Unresolved)
+    }
+
+    /// Whether a claim the controller has no record of may be answered by
+    /// settling it. Only a finished teardown proves there is nothing to end first.
+    pub fn may_be_settled(self) -> bool {
+        matches!(self, Self::OverButCharged)
+    }
+}
+
+impl std::fmt::Display for RunKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.run_attempt {
+            Some(attempt) => write!(f, "{}.{attempt}", self.job_id),
+            None => write!(f, "{}.*", self.job_id),
+        }
+    }
+}
+
 impl JobState {
     /// Short code used in squeue output (matches Slurm).
     pub fn code(&self) -> &'static str {

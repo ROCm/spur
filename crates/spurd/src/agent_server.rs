@@ -17,11 +17,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
-use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
+use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation, ReleaseWarrant};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
+use spur_core::job::RunKey;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
@@ -346,18 +347,29 @@ async fn runtime_teardown_confirmed(
 /// workload it left behind — it is a separate process the signal never reached.
 /// Escalate to the recorded workload and answer for that instead.
 async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> bool {
-    // Allocations hold no workload, and a descriptor written before this was
-    // recorded cannot be improved on here.
-    if descriptor.workload_pid == 0 {
-        return true;
+    // The agent's own copy was written before the launch returned, so it names
+    // no workload at all; only what the supervisor republished does.
+    let freshest = crate::stepd::freshest_session(descriptor);
+    match crate::stepd::workload_liveness(&freshest) {
+        crate::stepd::WorkloadLiveness::Gone => return true,
+        // Holding is all an undetermined reading licenses; a root SIGKILL on a
+        // pid whose identity it never confirmed is not.
+        crate::stepd::WorkloadLiveness::Unknown => {
+            warn!(
+                job_id = descriptor.job_id,
+                step_id = descriptor.step_id,
+                "could not prove this workload is gone, nor that its pid is still its own; it \
+                 stays held"
+            );
+            return false;
+        }
+        crate::stepd::WorkloadLiveness::Live => {}
     }
+    let Ok(session) = freshest else { return false };
     let alive =
-        || crate::stepd::process_is_live(descriptor.workload_pid, descriptor.workload_start_ticks);
-    if !alive() {
-        return true;
-    }
+        || crate::stepd::process_is_live(session.workload_pid, session.workload_start_ticks);
     crate::executor::kill_process_tree(
-        descriptor.workload_pid as i32,
+        session.workload_pid as i32,
         nix::sys::signal::Signal::SIGKILL,
     );
     for _ in 0..WORKLOAD_DEATH_POLLS {
@@ -369,7 +381,7 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
     warn!(
         job_id = descriptor.job_id,
         step_id = descriptor.step_id,
-        pid = descriptor.workload_pid,
+        pid = session.workload_pid,
         "workload outlived its supervisor and did not die on SIGKILL"
     );
     false
@@ -379,6 +391,21 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
 fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
     crate::executor::cleanup_cgroup(cgroup_path);
     !cgroup_path.exists()
+}
+
+/// The run a loose `(job, attempt)` pair names. Attempt 0 names no run, so a
+/// caller that cannot name one is told rather than left keying on a phantom.
+fn named_run(job_id: u32, run_attempt: u32) -> Option<RunKey> {
+    let key = RunKey::new(job_id, run_attempt);
+    if key.is_none() {
+        warn!(job_id, "a command named run attempt 0, which is no run");
+    }
+    key
+}
+
+#[cfg(test)]
+fn key(job_id: u32, run_attempt: u32) -> RunKey {
+    RunKey::new(job_id, run_attempt).expect("attempts start at 1")
 }
 
 /// Supervisors are per (job, step): a job may hold several at once.
@@ -492,6 +519,12 @@ fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDe
 /// process in the tree, so a supervised teardown must serve its grace period first.
 fn cgroup_to_reap_on_cancel(doomed_attempt: Option<u32>, supervised: bool) -> Option<u32> {
     doomed_attempt.filter(|_| !supervised)
+}
+
+/// PMIx namespaces are keyed by job, not by attempt, so tearing one down on
+/// behalf of a doomed attempt would strand a sibling still running under it.
+fn pmix_teardown_is_due(doomed_attempt: Option<u32>, tracked_attempt: Option<u32>) -> bool {
+    tracked_attempt.is_none_or(|tracked| doomed_attempt == Some(tracked))
 }
 
 /// The job's supervisors for one epoch. Attempt 0 means "whichever attempt this
@@ -822,8 +855,10 @@ async fn teardown_completed_job(
     let _ = allocation;
     // Marked, not removed: the record is the evidence a later reconcile reads,
     // and the sweep collects it once nothing is still owed.
-    if let Err(error) = admissions.mark_run_cleaned(job_id, completed.run_attempt) {
-        warn!(job_id, %error, "failed to settle the admission record after teardown");
+    if let Some(run) = named_run(job_id, completed.run_attempt) {
+        if let Err(error) = admissions.mark_run_cleaned(run) {
+            warn!(job_id, %error, "failed to settle the admission record after teardown");
+        }
     }
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
@@ -1354,19 +1389,17 @@ pub(crate) fn monitor_recovered_stepds(
                         );
                     } else {
                         // Only now may the slice go: the controller has it.
-                        let _ = admissions.record_epilog(
-                            completion.job_id,
-                            completion.run_attempt,
-                            epilog_outcome(completion.epilog_failed),
-                        );
-                        settle_acknowledged_completion(
-                            &allocation,
-                            &admissions,
-                            completion.job_id,
-                            completion.run_attempt,
-                            completion.step_id,
-                        )
-                        .await;
+                        if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                            let _ = admissions
+                                .record_epilog(run, epilog_outcome(completion.epilog_failed));
+                            settle_acknowledged_completion(
+                                &allocation,
+                                &admissions,
+                                run,
+                                completion.step_id,
+                            )
+                            .await;
+                        }
                         acknowledged.push(key);
                         attempts.remove(&key);
                     }
@@ -1554,19 +1587,10 @@ async fn fence_dead_stepd(
     if reported {
         // The supervisor died, so whether its epilog ran is unknowable. Recorded
         // as such rather than left reading as one that never started.
-        let _ = admissions.record_epilog(
-            descriptor.job_id,
-            descriptor.run_attempt,
-            crate::admission::HookState::Unknown,
-        );
-        settle_acknowledged_completion(
-            allocation,
-            admissions,
-            descriptor.job_id,
-            descriptor.run_attempt,
-            descriptor.step_id,
-        )
-        .await;
+        if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
+            let _ = admissions.record_epilog(run, crate::admission::HookState::Unknown);
+            settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id).await;
+        }
     }
 
     // The supervisor is gone, so no completion push is coming; without this the
@@ -1718,18 +1742,14 @@ async fn handle_completion_notification(
             // Recorded whatever the controller said: the record must describe
             // the hook that ran, not the delivery of the report about it.
             let admissions = context.admissions.clone();
-            let _ = admissions.record_epilog(job_id, run_attempt, epilog_outcome(epilog_failed));
-            // The acknowledgement, and only it, unlocks the slice. Without this
-            // the exit path holds correctly and nothing ever frees it again.
-            if reported {
-                settle_acknowledged_completion(
-                    &context.allocation,
-                    &admissions,
-                    job_id,
-                    run_attempt,
-                    step_id,
-                )
-                .await;
+            if let Some(run) = named_run(job_id, run_attempt) {
+                let _ = admissions.record_epilog(run, epilog_outcome(epilog_failed));
+                // The acknowledgement, and only it, unlocks the slice. Without
+                // this the exit path holds and nothing ever frees it again.
+                if reported {
+                    settle_acknowledged_completion(&context.allocation, &admissions, run, step_id)
+                        .await;
+                }
             }
             // A user step's exit ends the RPC that launched it, not the job, so
             // the controller report above was a no-op and this is the delivery.
@@ -1804,21 +1824,13 @@ pub async fn replay_unacknowledged_stepd_completions(
         .settled()
         {
             store.acknowledge_completion(&completion)?;
-            let _ = admissions.record_epilog(
-                completion.job_id,
-                completion.run_attempt,
-                epilog_outcome(completion.epilog_failed),
-            );
-            // A late delivery frees the slice here, like every other settled
-            // report: leaving it to a later sweep frees it with nothing said.
-            settle_acknowledged_completion(
-                allocation,
-                admissions,
-                completion.job_id,
-                completion.run_attempt,
-                completion.step_id,
-            )
-            .await;
+            if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                let _ = admissions.record_epilog(run, epilog_outcome(completion.epilog_failed));
+                // A late delivery frees the slice here, like every other settled
+                // report: leaving it to a later sweep frees it with nothing said.
+                settle_acknowledged_completion(allocation, admissions, run, completion.step_id)
+                    .await;
+            }
             reconciled.push((
                 completion.job_id,
                 completion.run_attempt,
@@ -1885,10 +1897,8 @@ fn an_exit_is_still_on_disk(
     })
 }
 
-/// Runs no session is left to speak for. Without this the agent never asks, is
-/// never acknowledged, and the record charges the node's cores for good.
-/// Whether the payload really stopped is answered for every report alike, on
-/// the way out; it is not this filter's to decide for one path only.
+/// Runs no session is left to speak for; without this nothing ever asks, and the
+/// record charges the node's cores for good.
 fn runs_nothing_can_speak_for(
     store: &crate::stepd::StepdStore,
     admissions: &crate::admission::AdmissionStore,
@@ -1919,7 +1929,7 @@ async fn report_runs_nothing_can_speak_for(
 ) {
     for admitted in runs_nothing_can_speak_for(store, admissions) {
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
-        let Some(step_id) = admitted.lifecycle_step() else {
+        let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
             continue;
         };
         let acknowledged = report_completion(
@@ -1944,10 +1954,10 @@ async fn report_runs_nothing_can_speak_for(
             );
             continue;
         }
-        settle_acknowledged_completion(allocation, admissions, job_id, run_attempt, step_id).await;
+        settle_acknowledged_completion(allocation, admissions, run, step_id).await;
         // The run's completion is committed, so no sibling's report will ever be
         // answered, and one left owed keeps the record forever.
-        if let Err(error) = admissions.discharge_owed_reports(job_id, run_attempt) {
+        if let Err(error) = admissions.discharge_owed_reports(run) {
             warn!(job_id, run_attempt, %error, "failed to discharge a lost run's owed reports");
         }
         warn!(
@@ -3015,7 +3025,8 @@ impl AgentService {
         fences: &crate::admission::LaunchFences,
     ) -> Option<crate::admission::LaunchRefusal> {
         let admissions = self.admissions();
-        let recorded = admissions.load_run(job_id, run_attempt).ok();
+        let run = named_run(job_id, run_attempt)?;
+        let recorded = admissions.load_run(run).ok();
         // Only a live run can be asked to run a second command. A settled one's
         // digest would refuse a fresh job that merely reuses its identity.
         let digest = recorded
@@ -3023,7 +3034,7 @@ impl AgentService {
             .filter(|run| !run.is_over())
             .and_then(|_| {
                 admissions
-                    .participants(job_id, run_attempt)
+                    .participants(run)
                     .ok()
                     .and_then(|(participants, _)| {
                         participants
@@ -3814,17 +3825,15 @@ impl AgentService {
                         };
                         // Marked before the hook: an agent that dies inside one
                         // leaves a `Running` that reloads as unknowable.
-                        let _ = admissions.record_epilog(
-                            c.job_id,
-                            c.run_attempt,
-                            crate::admission::HookState::Running,
-                        );
+                        let hooked = named_run(c.job_id, c.run_attempt);
+                        if let Some(run) = hooked {
+                            let _ =
+                                admissions.record_epilog(run, crate::admission::HookState::Running);
+                        }
                         let outcome = spur_core::hooks::run_hook(epilog_script, &ctx).await;
-                        let _ = admissions.record_epilog(
-                            c.job_id,
-                            c.run_attempt,
-                            epilog_outcome(outcome.is_err()),
-                        );
+                        if let Some(run) = hooked {
+                            let _ = admissions.record_epilog(run, epilog_outcome(outcome.is_err()));
+                        }
                         if let Err(e) = outcome {
                             error!(
                                 job_id = c.job_id,
@@ -3876,9 +3885,8 @@ impl AgentService {
                     .await
                     .settled();
                     if !acknowledged {
-                        // Held, not freed: the controller has not committed this
-                        // completion, so this node is still the only thing that
-                        // knows the work stopped. Reconcile resolves it.
+                        // Held, not freed: nothing but this node knows the work
+                        // stopped until the controller commits the completion.
                         warn!(
                             job_id = c.job_id,
                             run_attempt = c.run_attempt,
@@ -3886,14 +3894,15 @@ impl AgentService {
                         );
                         continue;
                     }
-                    settle_acknowledged_completion(
-                        &allocation,
-                        &admissions,
-                        c.job_id,
-                        c.run_attempt,
-                        spur_core::step::STEP_BATCH,
-                    )
-                    .await;
+                    if let Some(run) = named_run(c.job_id, c.run_attempt) {
+                        settle_acknowledged_completion(
+                            &allocation,
+                            &admissions,
+                            run,
+                            spur_core::step::STEP_BATCH,
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -3908,21 +3917,19 @@ pub(crate) struct DrainRequest {
 /// sized above a typical image pull and fork.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Flag claims the agent has no tracked job for. It does **not** free them: the
-/// agent not remembering a job is not evidence its work finished, and no
-/// timeout makes it so. The release comes from the controller.
+/// Flag claims the agent has no tracked job for. It does **not** free them:
+/// forgetting a job is not evidence its work finished, and no timeout makes it so.
 async fn flag_unbacked_allocations(
     unbacked: &[(u32, u32)],
     admissions: &crate::admission::AdmissionStore,
 ) {
     for &(job_id, run_attempt) in unbacked {
+        let Some(run) = named_run(job_id, run_attempt) else {
+            continue;
+        };
         let store = admissions.clone();
         let taken = tokio::task::spawn_blocking(move || {
-            store.take_conflict_hold(
-                job_id,
-                run_attempt,
-                "held with no tracked job on this agent",
-            )
+            store.take_conflict_hold(run, "held with no tracked job on this agent")
         })
         .await;
         match taken {
@@ -3968,10 +3975,10 @@ async fn settle_cancelled_runs(
             continue;
         }
         let (job_id, run_attempt) = (run.job_id, run.run_attempt);
+        let Some(run_key) = run.key() else { continue };
         let store = admissions.clone();
         let settled =
-            tokio::task::spawn_blocking(move || store.settle_cancelled_run(job_id, run_attempt))
-                .await;
+            tokio::task::spawn_blocking(move || store.settle_acknowledged_run(run_key)).await;
         match settled {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -3988,13 +3995,12 @@ async fn settle_cancelled_runs(
         let step_id = admitted
             .lifecycle_step()
             .unwrap_or(spur_core::step::STEP_BATCH);
-        release_acknowledged_allocation(allocation, admissions, job_id, run_attempt, step_id).await;
+        release_acknowledged_allocation(allocation, admissions, run_key, step_id).await;
     }
 }
 
-/// Free every run the records say is due. Idempotent and record-driven, so a
-/// report path that records an acknowledgement without releasing cannot strand
-/// a slice, and a restart mid-release picks it up again.
+/// Free every run the records say is due. Record-driven and idempotent, so a
+/// report that acknowledges without releasing cannot strand a slice.
 async fn release_due_allocations(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
@@ -4003,17 +4009,10 @@ async fn release_due_allocations(
         return;
     };
     for admitted in loaded.runs {
-        let Some(step_id) = admitted.lifecycle_step() else {
+        let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
             continue;
         };
-        release_acknowledged_allocation(
-            allocation,
-            admissions,
-            admitted.run.job_id,
-            admitted.run.run_attempt,
-            step_id,
-        )
-        .await;
+        release_acknowledged_allocation(allocation, admissions, run, step_id).await;
     }
 }
 
@@ -4057,40 +4056,34 @@ fn overlap_status(holder: Option<u32>) -> Status {
 async fn release_acknowledged_allocation(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
-    job_id: u32,
-    run_attempt: u32,
+    run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    match admissions.release_is_due(job_id, run_attempt, step_id) {
-        Ok(true) => {
-            // Generation-checked: a redispatch may already own this job id.
-            let released = allocation.lock().await.release_job_if(job_id, run_attempt);
-            // The cut is driven off this, so a slice given back without it
-            // recorded stays advertised as a claim the node no longer holds.
-            if let Err(error) = admissions.record_slice_released(job_id, run_attempt) {
-                warn!(job_id, run_attempt, %error, "failed to record a released slice");
-            }
-            if released {
-                info!(
-                    job_id,
-                    run_attempt, "released a run's slice on its acknowledgement"
-                );
-            } else {
-                // The audit reads the line above as the release; without this
-                // one, a slice freed elsewhere is indistinguishable from a leak.
-                debug!(
-                    job_id,
-                    run_attempt, "a run's slice was already free at its acknowledgement"
-                );
-            }
-            released
-        }
-        Ok(false) => false,
+    let warrant = match admissions.release_is_due(run, step_id) {
+        Ok(Some(warrant)) => warrant,
+        Ok(None) => return false,
         Err(error) => {
-            warn!(job_id, run_attempt, %error, "could not tell whether a release is due; holding");
-            false
+            warn!(%run, %error, "could not tell whether a release is due; holding");
+            return false;
         }
+    };
+    // Recorded on the release line below: the decision a slice rests on is the
+    // whole of the rule that only a committed acknowledgement may free one.
+    let ground = warrant.ground();
+    let released = allocation.lock().await.release_job(warrant);
+    // The cut is driven off this, so a slice given back without it recorded
+    // stays advertised as a claim the node no longer holds.
+    if let Err(error) = admissions.record_slice_released(run) {
+        warn!(%run, %error, "failed to record a released slice");
     }
+    if released {
+        info!(%run, %ground, "released a run's slice on its acknowledgement");
+    } else {
+        // The audit reads the line above as the release; without this one, a
+        // slice freed elsewhere is indistinguishable from a leak.
+        debug!(%run, %ground, "a run's slice was already free at its acknowledgement");
+    }
+    released
 }
 
 /// Settle a run the controller has taken the completion of, and free its slice.
@@ -4098,14 +4091,13 @@ async fn release_acknowledged_allocation(
 pub(crate) async fn settle_acknowledged_completion(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
-    job_id: u32,
-    run_attempt: u32,
+    run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    let _ = admissions.record_controller_ack(job_id, run_attempt, 1);
-    let _ = admissions.record_report_acknowledged(job_id, run_attempt, step_id);
-    let _ = admissions.mark_run_cleaned(job_id, run_attempt);
-    release_acknowledged_allocation(allocation, admissions, job_id, run_attempt, step_id).await
+    let _ = admissions.record_controller_ack(run, 1);
+    let _ = admissions.record_report_acknowledged(run, step_id);
+    let _ = admissions.mark_run_cleaned(run);
+    release_acknowledged_allocation(allocation, admissions, run, step_id).await
 }
 
 /// How a run's epilog ended, as the record spells it.
@@ -4123,8 +4115,7 @@ pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
     admissions: crate::admission::AdmissionStore,
-    job_id: u32,
-    run_attempt: u32,
+    run: RunKey,
     armed: bool,
     spawned: bool,
 }
@@ -4133,14 +4124,12 @@ impl LaunchReservationGuard {
     fn new(
         allocation: Arc<Mutex<NodeAllocation>>,
         admissions: crate::admission::AdmissionStore,
-        job_id: u32,
-        run_attempt: u32,
+        run: RunKey,
     ) -> Self {
         Self {
             allocation,
             admissions,
-            job_id,
-            run_attempt,
+            run,
             armed: true,
             spawned: false,
         }
@@ -4168,30 +4157,31 @@ impl Drop for LaunchReservationGuard {
         if !self.armed {
             return;
         }
-        let job_id = self.job_id;
-        let run_attempt = self.run_attempt;
+        let run = self.run;
+        // Something is running against this reservation, so the record and the
+        // slice both still describe it. Only the controller can end it now.
+        if self.spawned {
+            warn!(%run, "an aborted launch left a payload running; its slice stays held");
+            return;
+        }
         // Not forgetfulness: this is the process that made the reservation,
         // aborting before anything was spawned against it.
-        if !self.spawned {
-            if let Err(error) = self.admissions.remove_run(job_id, run_attempt) {
-                warn!(job_id, run_attempt, %error, "failed to drop the admission record of an aborted launch");
-            }
+        if let Err(error) = self.admissions.remove_run(run) {
+            warn!(%run, %error, "failed to drop the admission record of an aborted launch");
         }
-        // Generation-checked: a redispatch may have already superseded this
-        // reservation, and releasing it here must not free the new one.
         if let Ok(mut alloc) = self.allocation.try_lock() {
-            alloc.release_job_if(job_id, run_attempt);
+            alloc.release_job(ReleaseWarrant::never_spawned(run));
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
             handle.spawn(async move {
-                allocation.lock().await.release_job_if(job_id, run_attempt);
+                allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::never_spawned(run));
             });
         } else {
             // Nothing sweeps this now, so it has to be visible.
-            warn!(
-                job_id,
-                run_attempt, "could not release an aborted launch's reservation; it stays held"
-            );
+            warn!(%run, "could not release an aborted launch's reservation; it stays held");
         }
     }
 }
@@ -4777,34 +4767,35 @@ fn payload_still_executing(report: &CompletionReport<'_>) -> bool {
     let PayloadEvidence::Supervised(store) = report.payload else {
         return false;
     };
-    let Some(step_id) = report.step_id else {
-        return false;
-    };
-    let descriptor = match store.published_session(report.job_id, report.run_attempt, step_id) {
-        Ok(descriptor) => descriptor,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+    // Every participant, not the reporting step alone: this report ends the
+    // whole run, and a sibling's payload is as much of it as the owner's.
+    let sessions = match store.published_sessions_for_run(report.job_id, report.run_attempt) {
+        Ok(sessions) => sessions,
         Err(error) => {
             warn!(
                 job_id = report.job_id,
                 run_attempt = report.run_attempt,
-                step_id,
                 %error,
-                "could not read a run's session; withholding its completion report"
+                "could not enumerate a run's sessions; withholding its completion report"
             );
             return true;
         }
     };
-    if !crate::stepd::workload_may_be_live(&descriptor) {
-        return false;
+    for published in &sessions {
+        let live = crate::stepd::workload_liveness(published);
+        if live == crate::stepd::WorkloadLiveness::Gone {
+            continue;
+        }
+        warn!(
+            job_id = report.job_id,
+            run_attempt = report.run_attempt,
+            step_id = published.as_ref().map(|s| s.step_id).unwrap_or_default(),
+            ?live,
+            "this run's payload is still executing; withholding its completion report"
+        );
+        return true;
     }
-    warn!(
-        job_id = report.job_id,
-        run_attempt = report.run_attempt,
-        step_id,
-        pid = descriptor.workload_pid,
-        "this run's payload is still executing; withholding its completion report"
-    );
-    true
+    false
 }
 
 /// What the controller said when handed one node's account of a finished run.
@@ -5043,10 +5034,11 @@ impl SlurmAgent for AgentService {
         let admissions = self.admissions();
         let (job_id, run_attempt, cutoff) =
             (req.job_id, req.run_attempt, req.reject_before_unix_ms);
-        let fenced =
-            tokio::task::spawn_blocking(move || admissions.fence_run(job_id, run_attempt, cutoff))
-                .await
-                .map_err(|error| Status::internal(format!("fence task failed: {error}")))?;
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to fence"))?;
+        let fenced = tokio::task::spawn_blocking(move || admissions.fence_run(run, cutoff))
+            .await
+            .map_err(|error| Status::internal(format!("fence task failed: {error}")))?;
         match fenced {
             Ok(reject_before_unix_ms) => {
                 info!(
@@ -5061,6 +5053,59 @@ impl SlurmAgent for AgentService {
             }
             Err(error) => Err(Status::unavailable(format!(
                 "could not persist the fence for job {job_id}: {error}"
+            ))),
+        }
+    }
+
+    async fn settle_run(
+        &self,
+        request: Request<SettleRunRequest>,
+    ) -> Result<Response<SettleRunResponse>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let (job_id, run_attempt) = (req.job_id, req.run_attempt);
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to settle"))?;
+        // Declining costs a slice until the next reconcile; releasing one a
+        // payload is still on hands its cores to a second job.
+        if self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt)
+        {
+            warn!(
+                job_id,
+                run_attempt, "declining to settle a run this agent is still running"
+            );
+            return Ok(Response::new(SettleRunResponse {
+                released: false,
+                error: "this agent is still running the run".into(),
+            }));
+        }
+        self.allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::acknowledged(run, 1));
+        let admissions = self.admissions();
+        let settled = tokio::task::spawn_blocking(move || admissions.settle_acknowledged_run(run))
+            .await
+            .map_err(|error| Status::internal(format!("settle task failed: {error}")))?;
+        match settled {
+            Ok(_) => {
+                info!(
+                    job_id,
+                    run_attempt,
+                    "controller answered a claim it has no record of; released the slice"
+                );
+                Ok(Response::new(SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not settle run {job_id}.{run_attempt}: {error}"
             ))),
         }
     }
@@ -5124,6 +5169,8 @@ impl SlurmAgent for AgentService {
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
         let run_attempt = req.run_attempt;
+        let run_key = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to launch"))?;
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
@@ -5487,12 +5534,8 @@ impl SlurmAgent for AgentService {
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
         let admissions = self.admissions();
-        let mut reservation_guard = LaunchReservationGuard::new(
-            self.allocation.clone(),
-            admissions.clone(),
-            job_id,
-            run_attempt,
-        );
+        let mut reservation_guard =
+            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), run_key);
 
         // Durable before anything is spawned against it: a crash before this
         // leaves neither a record nor a process, a crash after leaves both.
@@ -5702,8 +5745,7 @@ impl SlurmAgent for AgentService {
                 reservation_guard.mark_spawned();
                 if let Some(ref descriptor) = runtime_descriptor {
                     if let Err(error) = admissions.record_supervisor(
-                        job_id,
-                        run_attempt,
+                        run_key,
                         launch_step,
                         crate::admission::SupervisorRef {
                             pid: descriptor.pid,
@@ -5972,7 +6014,6 @@ impl SlurmAgent for AgentService {
                 // the controller holding a job whose workload never starts.
                 warn!(job_id, run_attempt = req.run_attempt, %error,
                     "failed to release the supervised job");
-                let _ = stop_stepd_process(descriptor).await;
                 release_stepd_tracking(
                     &self.running,
                     &self.allocation,
@@ -5981,6 +6022,7 @@ impl SlurmAgent for AgentService {
                     "supervised job could not be released",
                 )
                 .await;
+                discard_stepd_session(descriptor).await;
                 return Err(Status::internal(format!(
                     "failed to release the supervised job: {error}"
                 )));
@@ -6004,22 +6046,20 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id, req.run_attempt).await;
         }
 
-        // The signal paths only act on a running job; release a still-launching
-        // reservation so a cancel-during-eviction doesn't strand it until the
-        // TTL. Hold the running lock across the release (matching launch_job's
-        // commit order) so this can't free a job that just became running, and
-        // generation-check the release itself so a redispatch that already
-        // reserved a newer attempt survives a cancel for the old one.
+        // Frees a still-launching reservation the signal paths never reach; held
+        // across the release, as launch_job commits, so a job that just started is safe.
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         let nothing_tracked = !jobs.contains_key(&job_id);
         if nothing_tracked {
-            let mut alloc = self.allocation.lock().await;
-            if req.run_attempt == 0 {
-                alloc.release_job(job_id);
-            } else {
-                alloc.release_job_if(job_id, req.run_attempt);
-            }
+            // Generation-checked, so a redispatch's newer reservation survives —
+            // except a cancel naming no attempt, whose widened key skips that.
+            let cancelled =
+                named_run(job_id, req.run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
+            self.allocation
+                .lock()
+                .await
+                .release_job(ReleaseWarrant::controller_cancelled(cancelled));
         }
         drop(jobs);
 
@@ -6045,17 +6085,26 @@ impl SlurmAgent for AgentService {
             ));
         }
 
-        if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
+        if !pmix_teardown_is_due(doomed_attempt, tracked_attempt) {
+            info!(
+                job_id,
+                doomed_attempt,
+                tracked_attempt,
+                "leaving PMIx alone; this job's namespaces belong to a live attempt"
+            );
+        } else if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
         }
 
         // Nothing tracked means the record is all that is left of the claim and
         // its slice just went back; a tracked one is still tearing down.
         if let Some(attempt) = doomed_attempt {
-            if nothing_tracked {
-                self.settle_cancelled_run(job_id, attempt).await;
-            } else {
-                self.mark_controller_cancelled(job_id, attempt).await;
+            if let Some(run) = named_run(job_id, attempt) {
+                if nothing_tracked {
+                    self.settle_cancelled_run(run).await;
+                } else {
+                    self.mark_controller_cancelled(run).await;
+                }
             }
         }
 
@@ -6280,6 +6329,9 @@ impl SlurmAgent for AgentService {
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
+        let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
+            Status::invalid_argument("run attempt 0 names no run to hold an allocation")
+        })?;
         let mut jobs = self.running.lock().await;
         if jobs.contains_key(&req.job_id) {
             return Err(Status::already_exists(format!(
@@ -6321,12 +6373,8 @@ impl SlurmAgent for AgentService {
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
         let admissions = self.admissions();
-        let mut reservation_guard = LaunchReservationGuard::new(
-            self.allocation.clone(),
-            admissions.clone(),
-            req.job_id,
-            req.run_attempt,
-        );
+        let mut reservation_guard =
+            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), alloc_run);
 
         // An srun allocation holds a slice with no launch of its own, so it
         // needs the same record: the claim outlives whatever steps join it.
@@ -6480,10 +6528,7 @@ impl SlurmAgent for AgentService {
                     run_attempt = req.run_attempt,
                     "stepd superseded by a newer attempt before it could be tracked; aborting"
                 );
-                if let Err(error) = stop_stepd_process(&descriptor).await {
-                    warn!(job_id = req.job_id, %error, "failed to stop superseded stepd");
-                }
-                cleanup_stepd_files(&descriptor);
+                discard_stepd_session(&descriptor).await;
                 return Err(Status::failed_precondition(format!(
                     "job {} was superseded by a newer attempt on this node",
                     req.job_id
@@ -6504,9 +6549,7 @@ impl SlurmAgent for AgentService {
                     .await
                     .remove(&(req.job_id, spur_core::step::STEP_EXTERN));
                 if let Some(descriptor) = removed {
-                    if let Err(error) = stop_stepd_process(&descriptor).await {
-                        warn!(job_id = req.job_id, %error, "failed to stop redundant stepd");
-                    }
+                    discard_stepd_session(&descriptor).await;
                 }
             }
             return Err(Status::already_exists(format!(
@@ -6535,8 +6578,8 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // Matches the epoch the allocation table was keyed with; 0 from an
-                // older controller keeps the previous stale-report-disabled behavior.
+                // Matches the epoch the allocation table was keyed with, which
+                // the attempt-0 refusal above has already made a real one.
                 run_attempt: req.run_attempt,
                 cgroup_path,
             },
@@ -8096,6 +8139,9 @@ impl AgentService {
     /// attempt between the caller's peek and this call, and that entry must
     /// survive.
     async fn drop_tracked_job(&self, job_id: u32, run_attempt: u32) {
+        // Both admission paths refuse attempt 0, so nothing production tracks
+        // widens here; the equality check below is what scopes the release.
+        let run = RunKey::new(job_id, run_attempt).unwrap_or(RunKey::any_attempt(job_id));
         // The cgroup removal and the release below both key off the id, so a launch
         // reusing it must not interleave with them.
         let _lifecycle = self.lifecycle.acquire(job_id).await;
@@ -8108,7 +8154,10 @@ impl AgentService {
                 .is_some_and(|current| current.run_attempt == run_attempt)
             {
                 let (tracked, cgroup) = remove_tracked_job(&mut jobs, job_id);
-                self.allocation.lock().await.release_job(job_id);
+                self.allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::controller_cancelled(run));
                 (tracked.is_some(), cgroup)
             } else {
                 (false, executor::CgroupGuard::new(None))
@@ -8120,7 +8169,9 @@ impl AgentService {
         }
         // The slice went back above, so the record describes nothing now. The
         // attempt is known here; a cancel that named none cannot infer it later.
-        self.settle_cancelled_run(job_id, run_attempt).await;
+        if run.attempt().is_some() {
+            self.settle_cancelled_run(run).await;
+        }
         let stale_sessions = {
             let mut sessions = self.stepds.lock().await;
             let stale: Vec<_> = stepds_for_job(&sessions, job_id)
@@ -8144,12 +8195,11 @@ impl AgentService {
 
     /// Settle a cancelled run's record, as an acknowledged completion settles one.
     /// Only sound once the slice is let go: earlier frees it from under the teardown.
-    async fn settle_cancelled_run(&self, job_id: u32, run_attempt: u32) {
+    async fn settle_cancelled_run(&self, run: RunKey) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
         let admissions = self.admissions();
-        let settled = tokio::task::spawn_blocking(move || {
-            admissions.settle_cancelled_run(job_id, run_attempt)
-        })
-        .await;
+        let settled =
+            tokio::task::spawn_blocking(move || admissions.settle_acknowledged_run(run)).await;
         match settled {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -8161,12 +8211,11 @@ impl AgentService {
 
     /// Note the controller's cancel on a run still being torn down. Settling it
     /// here would free the slice out from under processes that are still exiting.
-    async fn mark_controller_cancelled(&self, job_id: u32, run_attempt: u32) {
+    async fn mark_controller_cancelled(&self, run: RunKey) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
         let admissions = self.admissions();
-        let marked = tokio::task::spawn_blocking(move || {
-            admissions.mark_controller_cancelled(job_id, run_attempt)
-        })
-        .await;
+        let marked =
+            tokio::task::spawn_blocking(move || admissions.mark_controller_cancelled(run)).await;
         match marked {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -10591,6 +10640,141 @@ mod tests {
         let _ = child.wait();
     }
 
+    // The agent's tracked copy is written before the launch returns, so it names
+    // no workload. Answering from it declares a live payload dead.
+    #[tokio::test]
+    async fn fencing_reads_the_workload_the_supervisor_published_not_the_stale_copy() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let published = fenced_session_holding(&store, child.id());
+        let mut stale = published.clone();
+        stale.workload_pid = 0;
+        stale.workload_start_ticks = 0;
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&stale), stale.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        fence_dead_stepd(&context, stale).await;
+
+        assert!(
+            !crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks),
+            "the fence must kill the workload the supervisor published, not the one it was handed"
+        );
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "with the workload gone the run's completion must reach the controller"
+        );
+        let _ = child.wait();
+    }
+
+    // A run-ending report discharges every sibling's obligation, so the owner
+    // step's own evidence is not enough to license it.
+    #[tokio::test]
+    async fn a_sibling_step_still_running_withholds_the_runs_completion() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let owner = fenced_session(&store);
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+
+        let sibling_step = 0;
+        let mut sibling = crate::stepd::StepdDescriptor::new(
+            owner.job_id,
+            owner.run_attempt,
+            sibling_step,
+            owner.pid,
+            owner.process_start_ticks,
+            store
+                .session_dir(owner.job_id, owner.run_attempt, sibling_step)
+                .join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        sibling.workload_pid = child.id();
+        sibling.workload_start_ticks =
+            crate::stepd::process_start_ticks(child.id()).expect("workload start ticks");
+        store
+            .publish(&sibling)
+            .expect("publish the sibling session");
+
+        assert!(
+            payload_still_executing(&CompletionReport {
+                job_id: owner.job_id,
+                exit_code: 0,
+                signal: 0,
+                run_attempt: owner.run_attempt,
+                reporting_node: "test-node",
+                drain: None,
+                step_id: Some(owner.step_id),
+                payload: PayloadEvidence::Supervised(&store),
+            }),
+            "the owner step is done, but the run's payload is not"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // The gate that keeps a slice from being freed under a running payload. It
+    // is the report that must not go: an acknowledgement is what frees cores.
+    #[tokio::test]
+    async fn a_run_whose_payload_is_still_executing_reports_nothing() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let descriptor = fenced_session_holding(&store, child.id());
+
+        let outcome = report_completion(
+            &controller_addr,
+            CompletionReport {
+                job_id: descriptor.job_id,
+                exit_code: 0,
+                signal: 0,
+                run_attempt: descriptor.run_attempt,
+                reporting_node: "test-node",
+                drain: None,
+                step_id: Some(descriptor.step_id),
+                payload: PayloadEvidence::Supervised(&store),
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, CompletionOutcome::Undelivered);
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            0,
+            "a report the controller would acknowledge is a slice freed under a live payload"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     async fn fence_against_controller(controller_addr: String, store: &crate::stepd::StepdStore) {
         let descriptor = fenced_session(store);
         let running = new_running_jobs();
@@ -12776,6 +12960,7 @@ mod tests {
 
         let err = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 4242,
                 spec: Some(JobSpec {
                     // uid 0 is the default, but state it so the test's subject is unmissable.
@@ -12819,6 +13004,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 4243,
                 spec: Some(JobSpec {
                     uid: 0,
@@ -12858,6 +13044,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 7,
                 spec: Some(JobSpec {
                     name: "prolog-fail".into(),
@@ -12903,6 +13090,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 8,
                 spec: Some(JobSpec {
                     name: "prolog-missing".into(),
@@ -14485,6 +14673,7 @@ mod tests {
         );
 
         let mut req = Request::new(RegisterJobAllocationRequest {
+            run_attempt: 1,
             job_id: 49,
             uid: 1234,
             gid: 1234,
@@ -14518,6 +14707,7 @@ mod tests {
 
         let err = svc
             .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
                 job_id: 7,
                 target_node: "some-other-node".into(),
                 spec: Some(JobSpec {
@@ -14841,6 +15031,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            run_attempt: 1,
             job_id: 77,
             cpus: 1,
             ..Default::default()
@@ -15337,7 +15528,11 @@ mod tests {
             .expect_err("a launch reserving nothing must be refused");
 
         assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
-        let reserved_anything = svc.allocation.lock().await.release_job_if(7, 1);
+        let reserved_anything = svc
+            .allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::controller_cancelled(key(7, 1)));
         assert!(
             !reserved_anything,
             "the refusal must not have reserved anything under job 7"
@@ -15439,6 +15634,7 @@ mod tests {
         );
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 65,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
@@ -15483,6 +15679,7 @@ mod tests {
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 77,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
@@ -15590,6 +15787,7 @@ mod tests {
         );
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5350,
             spec: Some(JobSpec {
                 script,
@@ -15646,6 +15844,7 @@ mod tests {
         );
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5351,
             spec: Some(JobSpec {
                 script,
@@ -15691,6 +15890,7 @@ mod tests {
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5352,
             spec: Some(JobSpec {
                 script: "#!/bin/bash\ntrue\n".into(),
@@ -15736,6 +15936,7 @@ mod tests {
         let counter_path = work_dir.path().join("run_count.txt");
 
         let req = Request::new(LaunchJobRequest {
+            run_attempt: 1,
             job_id: 5353,
             spec: Some(JobSpec {
                 script: format!(
@@ -15835,8 +16036,7 @@ mod tests {
             !release_acknowledged_allocation(
                 &svc.allocation,
                 &svc.admissions(),
-                7,
-                1,
+                key(7, 1),
                 spur_core::step::STEP_BATCH,
             )
             .await
@@ -15844,14 +16044,13 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 6);
 
         svc.admissions()
-            .record_controller_ack(7, 1, 42)
+            .record_controller_ack(key(7, 1), 42)
             .expect("ack");
         assert!(
             release_acknowledged_allocation(
                 &svc.allocation,
                 &svc.admissions(),
-                7,
-                1,
+                key(7, 1),
                 spur_core::step::STEP_BATCH,
             )
             .await
@@ -15900,7 +16099,7 @@ mod tests {
         collect_settled_admissions(&svc.allocation, &admissions).await;
         release_due_allocations(&svc.allocation, &admissions).await;
         assert!(
-            admissions.load_run(77, 1).is_ok(),
+            admissions.load_run(key(77, 1)).is_ok(),
             "an owed report must keep its record"
         );
         assert_eq!(
@@ -15915,8 +16114,7 @@ mod tests {
             settle_acknowledged_completion(
                 &svc.allocation,
                 &admissions,
-                77,
-                1,
+                key(77, 1),
                 spur_core::step::STEP_BATCH,
             )
             .await,
@@ -15932,7 +16130,7 @@ mod tests {
         release_due_allocations(&svc.allocation, &admissions).await;
         collect_settled_admissions(&svc.allocation, &admissions).await;
         assert!(
-            admissions.load_run(77, 1).is_err(),
+            admissions.load_run(key(77, 1)).is_err(),
             "and the released record must not become immortal"
         );
     }
@@ -15961,7 +16159,7 @@ mod tests {
         admissions.admit_run(&run).expect("admit");
         flag_unbacked_allocations(&[(6, 1)], &admissions).await;
         assert!(admissions
-            .load_run(6, 1)
+            .load_run(key(6, 1))
             .expect("record")
             .conflict_hold
             .is_some());
@@ -15976,7 +16174,7 @@ mod tests {
 
         assert!(
             admissions
-                .load_run(6, 1)
+                .load_run(key(6, 1))
                 .expect("record")
                 .conflict_hold
                 .is_none(),
@@ -16194,14 +16392,14 @@ mod tests {
             0,
             "a claim with no tracked job must be held, not reclaimed"
         );
-        let flagged = admissions.load_run(2, 1).expect("record");
+        let flagged = admissions.load_run(key(2, 1)).expect("record");
         assert!(
             flagged.conflict_hold.is_some(),
             "it must be flagged for the controller to resolve"
         );
         assert!(
             admissions
-                .load_run(1, 1)
+                .load_run(key(1, 1))
                 .expect("record")
                 .conflict_hold
                 .is_none(),
@@ -16212,7 +16410,10 @@ mod tests {
         // record and bury the reason the first one recorded.
         flag_unbacked_allocations(&unbacked, &admissions).await;
         assert_eq!(
-            admissions.load_run(2, 1).expect("record").conflict_hold,
+            admissions
+                .load_run(key(2, 1))
+                .expect("record")
+                .conflict_hold,
             flagged.conflict_hold
         );
         assert_eq!(svc.free_gpu_count().await, 0);
@@ -16545,6 +16746,7 @@ mod tests {
             },
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            run_attempt: 1,
             job_id: 55,
             cpus: 1,
             allocated: Some(ResourceAllocations {
@@ -16602,7 +16804,7 @@ mod tests {
             alloc.commit_job(42, 1);
         }
         let reservation =
-            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 42, 1);
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(42, 1));
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let status = {
@@ -16684,7 +16886,7 @@ mod tests {
     async fn the_claim_index_is_rebuilt_from_the_recorded_slice() {
         let state = tempfile::tempdir().expect("state dir");
         let svc = svc_with_state_dir(state.path()).await;
-        let mut run = crate::admission::RunAdmission::new(
+        let run = crate::admission::RunAdmission::new(
             7,
             1,
             "n1",
@@ -16695,7 +16897,6 @@ mod tests {
             },
             crate::admission::now_unix_ms(),
         );
-        run.state = crate::admission::RunState::Running;
         svc.admissions().admit_run(&run).expect("admit");
 
         let outcomes = svc.replay_admitted_allocations(&[]).await;
@@ -16723,7 +16924,7 @@ mod tests {
     async fn a_released_slice_is_not_charged_again_at_startup() {
         let state = tempfile::tempdir().expect("state dir");
         let svc = svc_with_state_dir(state.path()).await;
-        let mut run = crate::admission::RunAdmission::new(
+        let run = crate::admission::RunAdmission::new(
             7,
             1,
             "n1",
@@ -16734,10 +16935,9 @@ mod tests {
             },
             crate::admission::now_unix_ms(),
         );
-        run.state = crate::admission::RunState::Running;
         svc.admissions().admit_run(&run).expect("admit");
         svc.admissions()
-            .record_slice_released(7, 1)
+            .record_slice_released(key(7, 1))
             .expect("record the release");
 
         let outcomes = svc.replay_admitted_allocations(&[]).await;
@@ -16770,7 +16970,7 @@ mod tests {
 
         assert_eq!(
             svc.allocation.lock().await.charged_runs(),
-            HashSet::from([(2, 1)]),
+            HashSet::from([key(2, 1)]),
             "the run still on those cores must be the one holding them"
         );
     }
@@ -16779,7 +16979,7 @@ mod tests {
     async fn a_run_with_no_supervisor_and_no_exit_is_held_as_unknown() {
         let state = tempfile::tempdir().expect("state dir");
         let svc = svc_with_state_dir(state.path()).await;
-        let mut run = crate::admission::RunAdmission::new(
+        let run = crate::admission::RunAdmission::new(
             7,
             1,
             "n1",
@@ -16790,7 +16990,6 @@ mod tests {
             },
             crate::admission::now_unix_ms(),
         );
-        run.state = crate::admission::RunState::Running;
         svc.admissions().admit_run(&run).expect("admit");
         svc.admissions()
             .admit_participant(&crate::admission::ParticipantAdmission::new(
@@ -16806,8 +17005,7 @@ mod tests {
         assert!(svc
             .admissions()
             .record_supervisor(
-                7,
-                1,
+                key(7, 1),
                 spur_core::step::STEP_BATCH,
                 crate::admission::SupervisorRef {
                     pid: 999_999,
@@ -17006,7 +17204,7 @@ mod tests {
 
         let run = svc
             .admissions()
-            .load_run(77, 9)
+            .load_run(key(77, 9))
             .expect("the entitlement must outlive the process that claimed it");
         assert_eq!(run.node, "n1");
         assert_eq!(run.allocation.cpu_ids.len(), 2);
@@ -17065,19 +17263,18 @@ mod tests {
             crate::admission::now_unix_ms(),
         );
         admissions.admit_run(&run).expect("admit");
-        assert!(admissions.load_run(5, 1).is_ok());
+        assert!(admissions.load_run(key(5, 1)).is_ok());
 
         // Dropping while armed is the abort path: this process made the
         // reservation and is giving up before spawning anything against it.
         drop(LaunchReservationGuard::new(
             svc.allocation.clone(),
             admissions.clone(),
-            5,
-            1,
+            key(5, 1),
         ));
 
         assert!(
-            admissions.load_run(5, 1).is_err(),
+            admissions.load_run(key(5, 1)).is_err(),
             "an aborted launch must not leave a claim nothing holds"
         );
     }
@@ -17110,6 +17307,103 @@ mod tests {
         admissions
             .admit_participant(&participant)
             .expect("admit participant");
+    }
+
+    // Every settle/sweep/cut case is built on `admit_a_launch`'s hand-written
+    // pair. This is the one that makes the real launch path answer for it.
+    #[tokio::test]
+    async fn a_real_launch_writes_the_record_the_other_cases_assume() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let work_dir = tempfile::tempdir().expect("work dir");
+
+        let response = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 4242,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    script: "#!/bin/sh\ntrue\n".into(),
+                    cpus_per_task: 2,
+                    work_dir: work_dir.path().to_string_lossy().into(),
+                    ..Default::default()
+                }),
+                allocated: Some(ResourceAllocations {
+                    cpus: 2,
+                    memory_mb: 512,
+                    devices: std::collections::HashMap::new(),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("launch");
+        let inner = response.into_inner();
+        assert!(inner.success, "launch failed: {}", inner.error);
+
+        let run = svc
+            .admissions()
+            .load_run(key(4242, 1))
+            .expect("the launch must leave a run record");
+        assert_eq!(run.node, svc.reporter.hostname);
+        assert_eq!(run.state, crate::admission::RunState::Admitted);
+        assert_eq!(run.allocation.cpu_ids.len(), 2);
+        assert_eq!(run.allocation.memory_mb, 512);
+        assert_ne!(
+            run.created_at_unix_ms, 0,
+            "an ageless record never collects"
+        );
+        assert_eq!(
+            run.lifecycle_owner_step,
+            Some(spur_core::step::STEP_BATCH),
+            "the release gate keys on this; without it any step's ack frees the run"
+        );
+        assert!(!run.slice_released);
+
+        let (participants, rejected) = svc
+            .admissions()
+            .participants(key(4242, 1))
+            .expect("read participants");
+        assert!(rejected.is_empty());
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].step_id, spur_core::step::STEP_BATCH);
+        assert!(
+            participants[0].final_report.required,
+            "a launch that owes no report can never free its slice"
+        );
+        assert_eq!(
+            participants[0].allocation_subset.cpu_ids,
+            run.allocation.cpu_ids
+        );
+    }
+
+    // The guard frees a reservation nothing was spawned against. Once something
+    // has been, those are a live run's cores and only the controller ends them.
+    #[tokio::test]
+    async fn an_aborted_launch_that_already_spawned_keeps_its_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        admit_a_launch(&svc, 31);
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(31, 1, 4, 0, &[])
+            .expect("reserve");
+        let before = svc.allocation.lock().await.free_cpus();
+
+        {
+            let mut guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(31, 1));
+            guard.mark_spawned();
+        }
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            before,
+            "a running payload's cores must not go back on an aborted request"
+        );
+        assert!(
+            svc.admissions().load_run(key(31, 1)).is_ok(),
+            "the record is what still names the cores the payload holds"
+        );
     }
 
     // A controller that has forgotten a job never acknowledges its completion, so
@@ -17154,7 +17448,7 @@ mod tests {
 
         // What teardown finishing looks like: untracked, and the record cleaned.
         svc.running.lock().await.remove(&7);
-        admissions.mark_run_cleaned(7, 1).expect("cleaned");
+        admissions.mark_run_cleaned(key(7, 1)).expect("cleaned");
         settle_cancelled_runs(&svc.allocation, &admissions).await;
 
         assert_eq!(
@@ -17168,6 +17462,154 @@ mod tests {
                 .expect("sweep"),
             1,
             "and nothing of it may be left to re-advertise as a claim"
+        );
+    }
+
+    // The one answer that unsticks a run whose completion never landed: the
+    // controller's word that it is not accounting for it.
+    #[tokio::test]
+    async fn a_settle_from_the_controller_releases_a_run_nothing_else_can_free() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        // The stranded shape: teardown done, no acknowledgement, slice charged.
+        admissions.mark_run_cleaned(key(7, 1)).expect("cleaned");
+        admissions
+            .take_conflict_hold(key(7, 1), "held with no tracked job on this agent")
+            .expect("hold");
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the cores the run was holding must go back to the node"
+        );
+        let run = admissions.load_run(key(7, 1)).expect("record");
+        assert!(run.slice_released);
+        assert!(
+            run.conflict_hold.is_none(),
+            "the hold is what kept asking for a reconcile that never resolved"
+        );
+    }
+
+    // No acknowledgement may free a slice out from under a live payload; the
+    // agent declining costs one reconcile, obeying costs a double-allocated core.
+    #[tokio::test]
+    async fn a_settle_for_a_run_this_agent_is_still_running_is_declined() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a payload is still on these cores"
+        );
+        assert!(
+            !admissions
+                .load_run(key(7, 1))
+                .expect("record")
+                .slice_released
+        );
+    }
+
+    // Reconciling cancels a leaked attempt beside a live one, and PMIx
+    // namespaces are keyed by job alone, so the sibling's would go with it.
+    #[tokio::test]
+    async fn cancelling_a_stale_attempt_leaves_a_live_siblings_pmix_alone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let namespace = (7, spur_core::step::STEP_BATCH);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 2,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        let hosted = || {
+            svc.mpi_host
+                .active_namespaces
+                .lock()
+                .expect("namespaces")
+                .contains_key(&namespace)
+        };
+        svc.mpi_host
+            .active_namespaces
+            .lock()
+            .expect("namespaces")
+            .insert(namespace, "spur.7.2".into());
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 1,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel the stale attempt");
+
+        assert!(
+            hosted(),
+            "attempt 2 is still running under this job id and still needs its namespace"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 2,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel the tracked attempt");
+
+        assert!(
+            !hosted(),
+            "the attempt that owns the namespace must still take it down"
         );
     }
 
@@ -17189,24 +17631,24 @@ mod tests {
         );
 
         let mut reaped =
-            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), 13, 1);
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), key(13, 1));
         reaped.mark_spawned();
         reaped.mark_reaped();
         drop(reaped);
 
         assert!(
-            admissions.load_run(13, 1).is_err(),
+            admissions.load_run(key(13, 1)).is_err(),
             "a launch that produced nothing must leave no claim behind"
         );
 
         // The other side of the rule: a launch that really did leave something
         // running must keep its record, or the live process reads as free capacity.
         let mut running =
-            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), 14, 1);
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), key(14, 1));
         running.mark_spawned();
         drop(running);
 
-        assert!(admissions.load_run(14, 1).is_ok());
+        assert!(admissions.load_run(key(14, 1)).is_ok());
     }
 
     fn a_test_reporter() -> Arc<NodeReporter> {
@@ -17248,14 +17690,14 @@ mod tests {
         );
 
         assert!(
-            !reporter.needs_reconcile(),
+            !reporter.wants_reconcile().await,
             "a run with a live supervisor behind it explains itself"
         );
 
         flag_unbacked_allocations(&[(42, 1)], &admissions).await;
 
         assert!(
-            reporter.needs_reconcile(),
+            reporter.wants_reconcile().await,
             "a claim the agent cannot account for must reach the controller now, not in an hour"
         );
     }
@@ -17392,7 +17834,7 @@ mod tests {
         {
             let mut alloc = svc.allocation.lock().await;
             alloc.allocate_for_job(7, 1, 1, 0, &[0]).unwrap();
-            alloc.release_job(7);
+            alloc.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7)));
             alloc.allocate_for_job(7, 2, 1, 0, &[0]).unwrap();
         }
 
@@ -17488,7 +17930,8 @@ mod tests {
                 .await
                 .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 9, 1);
+            let guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(9, 1));
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -17507,7 +17950,7 @@ mod tests {
                 .unwrap();
             svc.allocation.lock().await.commit_job(10, 1);
             let mut guard =
-                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 10, 1);
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(10, 1));
             guard.disarm();
             drop(guard);
         }
@@ -17535,12 +17978,18 @@ mod tests {
             .await
             .allocate_for_job(11, 1, 1, 0, &[0])
             .unwrap();
-        let guard = LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 11, 1);
+        let guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(11, 1));
 
         // A cancel races the still-in-flight launch, releasing attempt 1's
         // reservation; the controller redispatches attempt 2, which reserves
         // and commits before attempt 1's guard is ever dropped.
-        svc.allocation.lock().await.release_job(11);
+        svc.allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(
+                11,
+            )));
         svc.allocation
             .lock()
             .await
@@ -18491,9 +18940,8 @@ mod tests {
             !cgroup.exists(),
             "teardown must remove the finished run's cgroup"
         );
-        // Teardown cleans up, but it does not free the slice: until the
-        // controller has committed the completion, this node is the only
-        // thing that knows the work stopped.
+        // Teardown cleans up but does not free the slice: only the controller's
+        // committed completion does.
         assert_eq!(
             svc.free_gpu_count().await,
             0,
@@ -18639,7 +19087,9 @@ mod tests {
 
         // Core 2 is 910's alone: had 911 replayed it verbatim, releasing 911
         // would clear a core 910 is still running on.
-        alloc.release_job(911);
+        alloc.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(
+            911,
+        )));
         assert!(alloc.allocated_cpus[2]);
         assert!(!alloc.allocated_cpus[3]);
     }

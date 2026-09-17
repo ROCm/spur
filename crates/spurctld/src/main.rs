@@ -3,6 +3,7 @@
 
 mod accounting;
 mod agent_client;
+mod agent_sessions;
 mod association_cache;
 mod auth_middleware;
 mod cluster;
