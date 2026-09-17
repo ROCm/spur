@@ -111,12 +111,20 @@ struct PeerBuilder {
 /// wg-quick accumulates repeated `Address`/`AllowedIPs` lines rather than overwriting, so a second
 /// occurrence must extend the value; the comma-joined form is the equivalent single line.
 fn append_csv(slot: &mut Option<String>, value: String) {
+    if value.is_empty() {
+        return;
+    }
     match slot {
-        Some(existing) => {
+        // Trim a separator the operator already wrote, so the join cannot produce an empty element
+        // that `wg` then rejects as an address.
+        Some(existing) if !existing.is_empty() => {
+            while existing.ends_with(',') || existing.ends_with(' ') {
+                existing.pop();
+            }
             existing.push_str(", ");
             existing.push_str(&value);
         }
-        None => *slot = Some(value),
+        _ => *slot = Some(value),
     }
 }
 
@@ -711,6 +719,25 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(reparsed.peers[0].allowed_ips, "10.44.0.2/32");
+    }
+
+    /// An empty or already-comma-terminated value must not produce an empty list element — `wg`
+    /// rejects one as an address and refuses to bring the interface up.
+    #[test]
+    fn parse_merges_repeated_directives_without_empty_elements() {
+        let ini = "[Interface]\n\
+                   PrivateKey = key=\n\
+                   Address =\n\
+                   Address = 10.44.0.1/16\n\n\
+                   [Peer]\n\
+                   PublicKey = peerA=\n\
+                   AllowedIPs = 10.44.0.2/32,\n\
+                   AllowedIPs = 10.42.1.0/24\n";
+        let config = WgConfig::parse(ini).unwrap();
+        assert_eq!(config.address, "10.44.0.1/16");
+        assert_eq!(config.peers[0].allowed_ips, "10.44.0.2/32, 10.42.1.0/24");
+        assert!(!config.to_ini().contains(",,"));
+        assert!(!config.to_ini().contains("= ,"));
     }
 
     #[test]
