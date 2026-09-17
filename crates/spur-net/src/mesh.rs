@@ -25,7 +25,6 @@
 //! for the no-CNI case). Applying is **additive** — it does not prune peers for
 //! nodes removed from the membership.
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::wireguard::{self, WgPeer};
@@ -149,12 +148,16 @@ fn persist_mesh_peers(
     config_path: &std::path::Path,
     peers: &[wireguard::WgPeer],
 ) -> anyhow::Result<()> {
-    let mut config = wireguard::WgConfig::read_from(config_path).with_context(|| {
-        format!(
-            "no WireGuard config at {} — run `spur net init` or `spur net join` first",
-            config_path.display()
-        )
-    })?;
+    // No config to persist into means an interface Spur did not create; keep the live apply
+    // working as it did before peers were persisted at all, rather than refusing outright.
+    if !config_path.exists() {
+        tracing::warn!(
+            path = %config_path.display(),
+            "no WireGuard config to persist into; mesh peers will not survive an interface reload"
+        );
+        return Ok(());
+    }
+    let mut config = wireguard::WgConfig::read_from(config_path)?;
     for peer in peers {
         config.upsert_peer(peer.clone());
     }
@@ -370,6 +373,15 @@ mod tests {
 
     /// The persist half of `apply_mesh_durable` writes every computed peer to the config, and is
     /// additive: an unrelated pre-existing peer in the file survives.
+    #[test]
+    fn persist_mesh_peers_skips_a_missing_config_so_the_live_apply_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("spur0.conf"); // never written
+        let members = vec![node("10.44.0.1", None), node("10.44.0.2", None)];
+        persist_mesh_peers(&config_path, &mesh_peers_for("10.44.0.2", &members)).unwrap();
+        assert!(!config_path.exists(), "must not fabricate a config file");
+    }
+
     #[test]
     fn persist_mesh_peers_writes_every_peer_and_keeps_unrelated_ones() {
         let dir = tempfile::tempdir().unwrap();

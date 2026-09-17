@@ -471,16 +471,26 @@ pub fn remove_peer(interface: &str, public_key: &str) -> anyhow::Result<()> {
 /// config already reflects the intended state for a future reload or retry to converge on.
 pub fn add_peer_durable(interface: &str, config_path: &Path, peer: &WgPeer) -> anyhow::Result<()> {
     with_config_lock(config_path, || {
-        let mut config = WgConfig::read_from(config_path).with_context(|| {
-            format!(
-                "no WireGuard config at {} — run `spur net init` or `spur net join` first",
-                config_path.display()
-            )
-        })?;
-        config.upsert_peer(peer.clone());
-        config.write_to(config_path)?;
+        persist_peer_add(config_path, peer)?;
         add_peer(interface, peer)
     })
+}
+
+/// The persist half of [`add_peer_durable`], split out so it is testable without the `wg` binary
+/// the live half shells out to. Caller holds the config lock.
+fn persist_peer_add(config_path: &Path, peer: &WgPeer) -> anyhow::Result<()> {
+    // No config to persist into means an interface Spur did not create; keep the live apply
+    // working as it did before peers were persisted at all, rather than refusing outright.
+    if !config_path.exists() {
+        tracing::warn!(
+            path = %config_path.display(),
+            "no WireGuard config to persist into; the peer will not survive an interface reload"
+        );
+        return Ok(());
+    }
+    let mut config = WgConfig::read_from(config_path)?;
+    config.upsert_peer(peer.clone());
+    config.write_to(config_path)
 }
 
 /// Remove a peer both live and from the persisted config at `config_path` — the counterpart to
@@ -816,6 +826,47 @@ mod tests {
         let config_path = dir.path().join("spur0.conf"); // never written
         persist_peer_removal(&config_path, "peerA=").unwrap();
         assert!(!config_path.exists(), "must not fabricate a config file");
+    }
+
+    /// An interface Spur did not create has no config to persist into. Adding a peer must still
+    /// succeed so the live apply runs, matching the behaviour before peers were persisted at all.
+    #[test]
+    fn persist_peer_add_treats_missing_config_as_nothing_to_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("spur0.conf"); // never written
+        let peer = WgPeer {
+            public_key: "peerA=".into(),
+            allowed_ips: "10.44.0.2/32".into(),
+            ..Default::default()
+        };
+        persist_peer_add(&config_path, &peer).unwrap();
+        assert!(!config_path.exists(), "must not fabricate a config file");
+    }
+
+    /// The add path must still write through when a config does exist — the missing-file skip is
+    /// the exception, not the rule.
+    #[test]
+    fn persist_peer_add_writes_into_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("spur0.conf");
+        WgConfig {
+            private_key: "key=".into(),
+            address: "10.44.0.1/16".into(),
+            ..Default::default()
+        }
+        .write_to(&config_path)
+        .unwrap();
+
+        let peer = WgPeer {
+            public_key: "peerA=".into(),
+            allowed_ips: "10.44.0.2/32".into(),
+            ..Default::default()
+        };
+        persist_peer_add(&config_path, &peer).unwrap();
+
+        let persisted = WgConfig::read_from(&config_path).unwrap();
+        assert_eq!(persisted.peers.len(), 1);
+        assert_eq!(persisted.peers[0].public_key, "peerA=");
     }
 
     /// The realistic shape of "never ran `spur net init` here": the lock must still be takeable on
