@@ -45,7 +45,9 @@ run, revision, request ID and expiry and never falls back to cancel/requeue.
 Identical retries return a historical receipt, including after the run ends;
 a conflicting reuse refuses. Receipts are retained with the job, bounded to
 4096 successful renewals per job; further requests refuse instead of evicting
-idempotency history. Refused requests do not consume receipt storage.
+idempotency history. Refused requests do not consume receipt storage. Request IDs
+must contain 1–128 UTF-8 bytes (not characters); invalid IDs are rejected before
+Raft submission.
 
 Runway is not lifetime. An expiry 24 hours from now after one elapsed hour
 requires at least 25 hours of QoS, association and partition lifetime budget.
@@ -53,6 +55,15 @@ Existing MaxWall/MaxTime are never silently raised or reinterpreted. Configure
 an appropriately qualified policy before requesting that runway. Group-wall
 capped QoS is conservatively ineligible because cached accounting cannot reserve
 future group wall atomically. Jobs with suspension history are ineligible.
+
+For a comma-separated partition request, renewal enforces the tightest finite
+MaxTime among all requested partitions. The selected launch partition is not
+persisted, so extending an unchanged allocation cannot safely choose a more
+permissive alternative. Submission still treats the list as alternatives.
+Group node usage counts distinct occupied nodes, including the renewal candidate's
+actual placement; CPU, memory and GPU usage remain additive. A named reservation
+exempts its own nodes only while its user/account access still permits the owner,
+and still caps renewal at its end.
 
 **Existing-running-allocation limitation:** only runs launched after enabling the
 upgrade gate carry a replicated canonical start time and job specification.
@@ -70,15 +81,28 @@ the allocation wall-time enforcer; no node lease-update RPC is required.
 The watchdog commits a run/deadline-guarded timeout claim and checks its actual
 apply result before sending SIGTERM. A stale or duplicate claim sends nothing.
 Once claimed, renewal refuses. Grace completion is guarded by run and claim
-before finalizing and sending SIGKILL. Legacy runs cannot renew and therefore use
-run fencing without comparing their historically replica-local deadlines; the
-leader's replicated timeout instant is shared by every replica. Qualified new
-runs additionally compare their canonical deadline and revision.
+before finalizing and sending SIGKILL. Every guarded claim checks run attempt and
+deadline revision, including legacy runs. Only the absolute-deadline comparison
+is skipped for legacy replica-local start clocks; the leader's replicated timeout
+instant is shared by every replica. Historical unguarded WAL claims retain their
+original replay behavior.
 
 QoS and association policy publication is serialized with renewal commit. Renewal
 holds publication guards, not cache read locks: ordinary readers that hold the
-job-table lock remain able to read caches while a refresh waits to publish. Legacy active-job deadline/account/QoS/
-partition edits are refused to prevent bypassing this fence; pending edits retain
+job-table lock remain able to read caches while a refresh waits to publish.
+The blocking boundary starts before acquiring publication guards, in configuration,
+QoS, association order, and lasts through commit so waiting writers cannot starve
+Raft's runtime workers. Reservation create/update rechecks overlap atomically at
+apply against current job occupancy; rejected updates leave stored state unchanged.
+Defaulted WAL markers retain historical reservation validation and launch-spec
+replay semantics. New reservation apply validation is emitted only after the
+``upgraded_controllers`` acknowledgement; before that, reservation mutations keep
+the historical pre-proposal validation behavior so old and new replicas agree.
+During apply validation, active legacy allocations conservatively occupy their
+nodes regardless of replica-local estimated expiry, until they stop being active.
+The existing IgnoreJobs and same-reservation update exemptions still apply. New launches capture policy after the Running transition and
+preserve comments committed before launch apply.
+Legacy active-job deadline/account/QoS/partition edits are refused to prevent bypassing this fence; pending edits retain
 their ordinary path with lifetime-wall checks.
 
 The target is an owner-requested, in-place extension of an administrator-qualified,

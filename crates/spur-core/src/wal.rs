@@ -45,6 +45,9 @@ pub enum WalOperation {
         pending_reason_desc: Option<String>,
     },
     JobStart {
+        /// Older entries restore the entire captured spec, including its comment.
+        #[serde(default)]
+        preserve_comment: bool,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
         #[serde(default)]
@@ -310,9 +313,14 @@ pub enum WalOperation {
     },
 
     ReservationCreate {
+        /// Historical entries were validated before proposal, not during replay.
+        #[serde(default)]
+        validate_overlap: bool,
         reservation: Reservation,
     },
     ReservationUpdate {
+        #[serde(default)]
+        validate_overlap: bool,
         name: String,
         duration_minutes: u32,
         add_nodes: Vec<String>,
@@ -448,6 +456,7 @@ impl WalOperation {
         per_node_alloc: HashMap<String, ResourceAllocations>,
     ) -> Self {
         Self::JobStart {
+            preserve_comment: false,
             at: None,
             spec: None,
             job_id,
@@ -463,6 +472,21 @@ impl WalOperation {
 #[cfg(test)]
 mod job_state_change_wal_tests {
     use super::*;
+
+    #[test]
+    fn reservation_update_marker_defaults_for_historical_entries() {
+        let wire = serde_json::json!({
+            "ReservationUpdate": {
+                "name": "reserved", "duration_minutes": 60,
+                "add_nodes": [], "remove_nodes": [],
+                "add_users": [], "remove_users": [],
+                "add_accounts": [], "remove_accounts": []
+            }
+        });
+        assert!(matches!(serde_json::from_value::<WalOperation>(wire).unwrap(),
+            WalOperation::ReservationUpdate { validate_overlap: false, .. }));
+    }
+
 
     /// A reason's variant name is its wire form in the Raft log, and a controller
     /// on an older binary cannot read a name it does not know. Freeze the newest
@@ -732,6 +756,7 @@ mod reservation_wal_tests {
     fn reservation_create_round_trips() {
         let now = Utc::now();
         let op = WalOperation::ReservationCreate {
+            validate_overlap: false,
             reservation: Reservation {
                 name: "r1".into(),
                 start_time: now,
@@ -749,7 +774,7 @@ mod reservation_wal_tests {
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::ReservationCreate { reservation } => {
+            WalOperation::ReservationCreate { reservation, .. } => {
                 assert_eq!(reservation.name, "r1");
                 assert!(reservation.flags.maint);
             }

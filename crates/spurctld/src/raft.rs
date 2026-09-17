@@ -77,6 +77,8 @@ pub struct ClientResponse {
     #[serde(default)]
     pub reservation_created: bool,
     #[serde(default)]
+    pub reservation_validation: Option<Result<(), String>>,
+    #[serde(default)]
     pub partition_created: bool,
     #[serde(default)]
     pub timeout_claimed: bool,
@@ -1038,6 +1040,19 @@ pub async fn start_raft_with_recovery_mode(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn legacy_client_response_defaults_reservation_validation() {
+        let response: ClientResponse = serde_json::from_str(r#"{"reservation_created":true}"#).unwrap();
+        assert!(response.reservation_created);
+        assert!(response.reservation_validation.is_none());
+        let response = ClientResponse {
+            reservation_validation: Some(Err("busy nodes".into())),
+            ..Default::default()
+        };
+        let replay: ClientResponse = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(replay.reservation_validation, response.reservation_validation);
+    }
 
     struct NoopApplier;
     impl StateMachineApply for NoopApplier {

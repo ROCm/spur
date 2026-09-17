@@ -633,6 +633,24 @@ for 24 hours of runway needs 25 hours of lifetime budget. Jobs that have been
 suspended, jobs under a group-wall-capped QoS, and allocations launched before
 ``upgraded_controllers`` was enabled cannot be renewed.
 
+For comma-separated partition requests, renewal uses the tightest finite MaxTime
+among the requested partitions because the selected launch partition is not
+persisted. This does not change submission's alternative-partition semantics.
+Reservation access is rechecked for the current user/account; an authorized named
+reservation still caps the extension at its end. Group node caps count distinct
+occupied nodes, while CPU, memory and GPU usage stay additive.
+
+Once ``upgraded_controllers`` is enabled, reservation create/update also validates
+current occupancy at Raft apply. Active legacy allocations conservatively retain
+their nodes for this check regardless of their estimated expiry, because their
+start clocks were not replicated. IgnoreJobs and same-reservation update exemptions
+remain unchanged. With the upgrade acknowledgement disabled, reservation writes
+retain historical pre-proposal validation for mixed-version compatibility.
+
+The renewal request ID must contain 1–128 UTF-8 bytes, not characters. Invalid
+IDs are rejected before entering Raft; identical retries retain their original
+receipt and do not consume additional receipt capacity.
+
 ``[auth]``
 ----------
 

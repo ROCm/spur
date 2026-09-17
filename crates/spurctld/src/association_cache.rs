@@ -239,94 +239,112 @@ impl AssociationCache {
         allowed_qos: HashMap<(String, String), HashSet<String>>,
         admin_level: HashMap<String, String>,
     ) {
-        let _publication = self.publication.lock();
-        *self.snapshot.write() = Snapshot {
-            default_qos,
-            default_account,
-            memberships,
-            limits,
-            allowed_qos,
-            admin_level,
-            loaded: true,
-        };
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            *self.snapshot.write() = Snapshot {
+                default_qos,
+                default_account,
+                memberships,
+                limits,
+                allowed_qos,
+                admin_level,
+                loaded: true,
+            };
+        });
     }
 
     /// Test-only seam: returns the cache to its pre-first-fetch state, as a freshly
     /// started controller sees it while its predecessor's queue is already durable.
     #[cfg(test)]
     pub(crate) fn reset(&self) {
-        let _publication = self.publication.lock();
-        *self.snapshot.write() = Snapshot::default();
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            *self.snapshot.write() = Snapshot::default();
+        });
     }
 
     /// Test-only seam: populates the cache without a database.
     #[cfg(test)]
     pub(crate) fn insert_association(&self, user: &str, account: &str) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.memberships
-            .insert((user.to_owned(), account.to_owned()));
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.memberships
+                .insert((user.to_owned(), account.to_owned()));
+            snap.loaded = true;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn insert_admin_level(&self, user: &str, level: &str) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.admin_level.insert(user.to_owned(), level.to_owned());
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.admin_level.insert(user.to_owned(), level.to_owned());
+            snap.loaded = true;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn insert_default_qos(&self, user: &str, account: &str, qos: &str) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.memberships
-            .insert((user.to_owned(), account.to_owned()));
-        snap.default_qos
-            .insert((user.to_owned(), account.to_owned()), qos.to_owned());
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.memberships
+                .insert((user.to_owned(), account.to_owned()));
+            snap.default_qos
+                .insert((user.to_owned(), account.to_owned()), qos.to_owned());
+            snap.loaded = true;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn insert_allowed_qos(&self, user: &str, account: &str, qos: &[&str]) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.memberships
-            .insert((user.to_owned(), account.to_owned()));
-        snap.allowed_qos.insert(
-            (user.to_owned(), account.to_owned()),
-            qos.iter().map(|q| q.to_string()).collect(),
-        );
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.memberships
+                .insert((user.to_owned(), account.to_owned()));
+            snap.allowed_qos.insert(
+                (user.to_owned(), account.to_owned()),
+                qos.iter().map(|q| q.to_string()).collect(),
+            );
+            snap.loaded = true;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn insert_default_account(&self, user: &str, account: &str) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.memberships
-            .insert((user.to_owned(), account.to_owned()));
-        snap.default_account
-            .insert(user.to_owned(), account.to_owned());
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.memberships
+                .insert((user.to_owned(), account.to_owned()));
+            snap.default_account
+                .insert(user.to_owned(), account.to_owned());
+            snap.loaded = true;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn insert_limits(&self, user: &str, account: &str, limits: AccountLimits) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.memberships
-            .insert((user.to_owned(), account.to_owned()));
-        snap.limits
-            .insert((user.to_owned(), account.to_owned()), limits);
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.memberships
+                .insert((user.to_owned(), account.to_owned()));
+            snap.limits
+                .insert((user.to_owned(), account.to_owned()), limits);
+            snap.loaded = true;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn set_loaded_without_associations(&self) {
-        let _publication = self.publication.lock();
-        self.snapshot.write().loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            self.snapshot.write().loaded = true;
+        });
     }
 
     pub fn spawn_refresh_loop(self: &Arc<Self>, pool: PgPool, refresh_interval_secs: u64) {

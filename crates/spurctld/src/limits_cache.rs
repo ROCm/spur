@@ -64,19 +64,23 @@ impl QosCache {
     }
 
     fn replace(&self, new_qos: HashMap<String, Qos>) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.qos = new_qos;
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.qos = new_qos;
+            snap.loaded = true;
+        });
     }
 
     /// Test-only seam: populates the cache without a database.
     #[cfg(test)]
     pub(crate) fn insert(&self, qos: Qos) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.qos.insert(qos.name.clone(), qos);
-        snap.loaded = true;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.qos.insert(qos.name.clone(), qos);
+            snap.loaded = true;
+        });
     }
 
     /// Test-only seam: returns the cache to its pre-first-fetch state, as a
@@ -84,10 +88,12 @@ impl QosCache {
     /// predecessor are already queued.
     #[cfg(test)]
     pub(crate) fn reset(&self) {
-        let _publication = self.publication.lock();
-        let mut snap = self.snapshot.write();
-        snap.qos.clear();
-        snap.loaded = false;
+        crate::cluster::with_publication_blocking(|| {
+            let _publication = self.publication.lock();
+            let mut snap = self.snapshot.write();
+            snap.qos.clear();
+            snap.loaded = false;
+        });
     }
 
     pub fn spawn_refresh_loop(self: &Arc<Self>, pool: PgPool, refresh_interval_secs: u64) {
