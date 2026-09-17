@@ -10,6 +10,7 @@ mod cluster_k8s;
 mod fairshare_cache;
 mod hooks;
 mod limits_cache;
+mod logging;
 mod metrics_proto;
 mod metrics_server;
 mod pmix_dispatch;
@@ -77,12 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.parse().unwrap()),
-        )
-        .init();
+    logging::init(&args.log_level);
 
     info!(version = %spur_core::version::version_string(), "spurctld starting");
 
