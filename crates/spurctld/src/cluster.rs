@@ -3725,6 +3725,13 @@ impl ClusterManager {
             let mut reserved = PassReservations::default();
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
+            // An unplaceable job must not reserve grp-node quota it never uses.
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
+                match structural_unplaceable_reason(job, &nodes, &reservations) {
+                    Some(reason) => GateOutcome::Block(reason),
+                    None => GateOutcome::Keep,
+                }
+            });
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 let account_charge = match account_block_with(
                     job,
@@ -4858,13 +4865,12 @@ impl ClusterManager {
                 .collect();
 
             let required = spur_sched::backfill::job_resource_request(job);
-            if placement.nodelist_is_additive()
-                && eligible.iter().any(|node| {
-                    placement.is_listed(&node.name)
-                        && node.total_resources.can_satisfy(&required)
-                        && !placement.matches_for_reservation(node, cluster_state.reservations, now)
-                })
-            {
+            if placement.additive_listed_node_unavailable(
+                eligible.iter().copied(),
+                cluster_state.reservations,
+                now,
+                &required,
+            ) {
                 job_entry.set_pending_reason(PendingReason::ReqNodeNotAvail);
                 continue;
             }
@@ -7179,6 +7185,84 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
         }
     }
     None
+}
+
+/// `Some(reason)` when no eligible node is one real placement would ever use.
+/// Too-few-eligible is left alone: those nodes may still join.
+fn structural_unplaceable_reason(
+    job: &Job,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Option<PendingReason> {
+    // Safe to use `new` (not `new_ignoring_preferred_nodes`): this gate runs
+    // before qos/account credit anything into `job.preferred_nodes`.
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let now = chrono::Utc::now();
+    let needed = (job.spec.num_nodes as usize).max(1);
+    let required = spur_sched::backfill::job_resource_request(job);
+
+    let eligible: Vec<&Node> = nodes
+        .values()
+        .filter(|n| placement.eligible(n, reservations, now))
+        .collect();
+
+    // A k0s-claimed node would otherwise match: unlike a down node, it can
+    // free up on its own, so it must not be folded into a "will never place"
+    // verdict the way a truly dead node is. Capacity still has to hold —
+    // releasing a too-small node would never let the job place either.
+    let k0s_recoverable = |n: &&Node| {
+        n.is_k0s_reserved()
+            && placement.matches_ignoring_k0s(n, reservations, now)
+            && n.total_resources.can_satisfy(&required)
+    };
+
+    if placement.additive_listed_node_unavailable(
+        eligible.iter().copied(),
+        reservations,
+        now,
+        &required,
+    ) {
+        // Every listed node is independently mandatory, so this is only
+        // k0s-flavored when none of the *listed* nodes failed for some other,
+        // permanent reason (a coincidentally k0s-reserved but unlisted node
+        // elsewhere in `eligible` is irrelevant to this requirement).
+        let listed_blockers: Vec<&&Node> = eligible
+            .iter()
+            .filter(|n| {
+                placement.is_listed(&n.name)
+                    && n.total_resources.can_satisfy(&required)
+                    && !placement.matches_for_reservation(n, reservations, now)
+            })
+            .collect();
+        return Some(
+            if !listed_blockers.is_empty() && listed_blockers.iter().all(|n| k0s_recoverable(n)) {
+                PendingReason::K8sReserved
+            } else {
+                PendingReason::ReqNodeNotAvail
+            },
+        );
+    }
+
+    if eligible.len() < needed
+        || eligible
+            .iter()
+            .any(|n| placement.matches_for_reservation(n, reservations, now))
+    {
+        return None;
+    }
+
+    // General case: k0s-flavored only when enough of the blocked nodes would
+    // satisfy `needed` on their own once released — a stray down node
+    // elsewhere in `eligible` doesn't get to hide behind that classification.
+    Some(
+        if eligible.iter().filter(|n| k0s_recoverable(n)).count() >= needed {
+            PendingReason::K8sReserved
+        } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+            PendingReason::ReqNodeNotAvail
+        } else {
+            PendingReason::NodeDown
+        },
+    )
 }
 
 /// `Err(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
@@ -18354,6 +18438,386 @@ mod tests {
         );
         let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
         assert!(!pending.contains(&new_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_for_a_job_pinned_to_a_down_node() {
+        // A job pinned to a down node must not charge the QOS grp-node cap and
+        // starve a second job in the same QOS that could actually run.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("stuck-on-down-node");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 1;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        let mut placeable = basic_spec("should-still-run");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "job pinned to a down node must be tagged by real node state"
+        );
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            !pending.contains(&stuck_id),
+            "the unplaceable job must not be admitted"
+        );
+        assert!(
+            pending.contains(&placeable_id),
+            "an unplaceable job must not charge the QOS grp-node cap and starve a job that can actually run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_after_a_running_job_is_requeued_onto_a_down_node() {
+        // A running job (consuming real quota) requeues onto a now-down node —
+        // it must not keep charging the cap against a job that could run.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("pinned-then-fails");
+        spec.qos = Some("tight".into());
+        spec.num_nodes = 1;
+        spec.nodelist = Some("n1".into());
+        let running_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(1, 1000);
+        cm.start_job(
+            running_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, running_id, JobState::Running);
+
+        cm.requeue_job(running_id).unwrap();
+        settle(&cm, running_id, JobState::Pending);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+        // Bypass the real backoff window: simulate it having already lapsed.
+        if let Some(job) = cm.jobs.write().get_mut(&running_id) {
+            job.spec.begin_time = None;
+        }
+
+        let mut placeable = basic_spec("should-still-run-after-requeue");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(running_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "requeued job pinned to a now-down node must be tagged by real node state"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&running_id));
+        assert!(
+            pending.contains(&placeable_id),
+            "a requeued-but-unplaceable job must not keep charging the QOS cap after requeue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_when_a_required_listed_node_is_down() {
+        // -w n1 with --nodes=2 is additive: n2 pads the count, but n1 is
+        // required and down, so the whole job fails despite n2 being idle.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("pinned-plus-flex");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 2;
+        stuck.num_tasks = 2;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        let mut placeable = basic_spec("should-still-run");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "a required listed node being down must block the job even though n2 is idle"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&stuck_id));
+        assert!(
+            pending.contains(&placeable_id),
+            "a job stuck on its required-but-down listed node must not charge the QOS cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_still_blocks_for_a_job_that_can_place_but_exceeds_cap() {
+        // Guard: both nodes up, n1 has no spare capacity, so this must still
+        // block on the real cap instead of skipping it as unplaceable.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 0, 0);
+        register_node(&cm, "n2", 8, 128000);
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            let mut running = make_running_job(101, &["n1"], 1);
+            running.spec.qos = Some("tight".into());
+            jobs.insert(101, running);
+        }
+
+        let mut newjob = basic_spec("wants-a-second-node");
+        newjob.qos = Some("tight".into());
+        newjob.num_nodes = 1;
+        let new_id = submit_and_wait(&cm, newjob);
+
+        {
+            let job = cm.get_job(new_id).unwrap();
+            let nodes = cm.nodes.read();
+            let reservations = cm.get_reservations();
+            assert_eq!(
+                structural_unplaceable_reason(&job, &nodes, &reservations),
+                None,
+                "n2 is up and eligible, so the structural gate itself must not fire here"
+            );
+        }
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(new_id).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit,
+            "cap already at 1/1 with no spare capacity to reuse must still block, even though n2 is up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_when_the_only_up_node_is_k0s_reserved() {
+        // n1 is operationally Up but claimed by k0s: is_up() alone would miss
+        // that it's unavailable, but unlike a down node it can free up on its
+        // own, so it must still be reported as K8sReserved, not ReqNodeNotAvail.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.k0s_role = Some(K0sRole::Worker);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("stuck-on-k0s-node");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 1;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        let mut placeable = basic_spec("should-still-run");
+        placeable.qos = Some("tight".into());
+        placeable.num_nodes = 1;
+        let placeable_id = submit_and_wait(&cm, placeable);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::K8sReserved,
+            "a k0s-claimed node can free up on its own, unlike a down node"
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(!pending.contains(&stuck_id));
+        assert!(
+            pending.contains(&placeable_id),
+            "a job stuck on a k0s-reserved node must not charge the QOS cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_charge_when_every_node_is_k0s_reserved() {
+        // No nodelist pin: the whole inventory is claimed by the managed k0s
+        // cluster (`spur k8s up` with no --nodes scope). The job must still
+        // be reported K8sReserved, not NodeDown, so squeue/scontrol don't
+        // claim the node is dead.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        for name in ["n1", "n2"] {
+            if let Some(node) = cm.nodes.write().get_mut(name) {
+                node.k0s_role = Some(K0sRole::Worker);
+            }
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("stuck-k8s-reserved-cluster");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 1;
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::K8sReserved,
+            "every node being k0s-reserved is not the same as every node being down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_does_not_report_k8s_reserved_when_the_reserved_node_is_too_small() {
+        // The only node is k0s-reserved, but it could never fit this job's
+        // request even if k8s released it — releasing it changes nothing, so
+        // this must not be reported as the recoverable K8sReserved case.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 2, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.k0s_role = Some(K0sRole::Worker);
+        }
+
+        let mut stuck = basic_spec("too-big-for-the-k0s-node");
+        stuck.num_nodes = 1;
+        stuck.num_tasks = 1;
+        stuck.cpus_per_task = 8;
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::NodeDown,
+            "a k0s-reserved node too small for the request would never place even if released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_grp_node_still_reports_req_node_not_avail_when_a_down_node_is_the_actual_blocker()
+    {
+        // -w n1 with --nodes=2 is additive; n1 (required) is down. n3 is
+        // merely k0s-reserved and isn't even listed, so it must not paper
+        // over n1 being genuinely, permanently unavailable.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 128000);
+        register_node(&cm, "n2", 8, 128000);
+        register_node(&cm, "n3", 8, 128000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
+        if let Some(node) = cm.nodes.write().get_mut("n3") {
+            node.k0s_role = Some(K0sRole::Worker);
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "tight".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut stuck = basic_spec("pinned-to-down-plus-unrelated-k0s-node");
+        stuck.qos = Some("tight".into());
+        stuck.num_nodes = 2;
+        stuck.num_tasks = 2;
+        stuck.nodelist = Some("n1".into());
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "n1 being down is a real, permanent block regardless of n3's unrelated k0s reservation"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

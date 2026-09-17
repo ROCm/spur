@@ -4404,6 +4404,9 @@ mod tests {
             ))
             .await;
             register_node_at(&cm, "n1", addr);
+            // The prolog failure drains n1, so a second healthy node is needed for the
+            // released job to be genuinely placeable rather than just no-longer-held.
+            register_node_without_comm_addr(&cm, "n2");
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-release", 1));
             confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
