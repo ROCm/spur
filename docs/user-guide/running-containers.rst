@@ -70,7 +70,8 @@ runs inside the container.
      - Shell command run inside the container immediately before the job script
        (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
-     - Map the job user to root inside the container.
+     - Not yet implemented. Accepted for forward compatibility but has no effect
+       today. See `How Container Isolation Works`_.
 
 A GPU training job with a read-only data mount:
 
@@ -190,6 +191,34 @@ running container. Output is buffered — this is not an interactive terminal.
    For an interactive session inside a running job, use ``srun --jobid <id>
    --overlap`` or :doc:`spur attach <interactive>` instead — ``spur exec`` has no
    TTY mode.
+
+How Container Isolation Works
+-----------------------------
+
+Spur builds each container with Linux namespaces directly, in the same order
+runc and Podman use. There is no external runtime and no daemon.
+
+- **Root node agent (the default on a cluster).** The container keeps the host
+  user namespace, matching runc and Podman policy for a root daemon. Setup runs
+  as root, then the job drops to the submitting user's uid, gid, and
+  supplementary groups before the workload starts. The container still gets its
+  own mount and PID namespaces.
+- **Rootless node agent.** The container creates a user namespace first and maps
+  your uid and gid to root inside it, then creates the mount and PID namespaces
+  so they are owned by that user namespace. Your supplementary groups are still
+  honoured for device access.
+
+In both cases a small shepherd process anchors the container's namespaces and
+waits on the workload, which runs as PID 1 inside a fresh PID namespace. Nested
+steps and ``spur exec`` enter the running container through that shepherd. The
+job's cgroup is the authoritative kill set, so cancellation and cleanup tear the
+container down even if a process tries to outlive its supervisor.
+
+.. note::
+
+   ``--container-remap-root`` (mapping the job user to root inside the container
+   on a root node agent) is not yet available. The ordering above is what makes
+   it a purely additive change when it lands.
 
 See Also
 --------

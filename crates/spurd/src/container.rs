@@ -216,6 +216,88 @@ pub fn resolve_image(
     )
 }
 
+/// Which user namespace a container runs in. Sets the namespace-creation order
+/// and whether privileges are dropped. A requested user namespace is created
+/// and mapped before the mount and PID namespaces, so those are owned by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UserNamespaceMode {
+    /// No user namespace; the container drops to the submitter after setup.
+    #[default]
+    Host,
+    /// Maps namespace id 0 to the current user's uid/gid with `setgroups=deny`;
+    /// already root inside, so no privilege drop.
+    CurrentUserAsRoot,
+}
+
+impl UserNamespaceMode {
+    pub fn creates_user_namespace(self) -> bool {
+        !matches!(self, UserNamespaceMode::Host)
+    }
+}
+
+/// runc/Podman policy: root daemons use the host user namespace, rootless
+/// daemons create their own.
+pub fn user_namespace_mode(is_root: bool) -> UserNamespaceMode {
+    if is_root {
+        UserNamespaceMode::Host
+    } else {
+        UserNamespaceMode::CurrentUserAsRoot
+    }
+}
+
+/// Ordered `/proc/self/<file>` writes that install a `CurrentUserAsRoot` map.
+/// `setgroups=deny` must precede `gid_map`.
+fn userns_id_map_writes(uid: u32, gid: u32) -> [(&'static str, String); 3] {
+    [
+        ("uid_map", format!("0 {uid} 1\n")),
+        ("setgroups", "deny".to_string()),
+        ("gid_map", format!("0 {gid} 1\n")),
+    ]
+}
+
+/// Parse the outermost pid from a `/proc/<pid>/status` body: the `NSpid:` line
+/// lists pids from the init namespace inward, so the first field is host-global.
+fn parse_ns_global_pid(status: &str) -> Option<i32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|first| first.parse().ok())
+}
+
+/// This process's host-global pid. Must run before the container remounts
+/// `/proc`. Best-effort: `None` just means the owner falls back to the shepherd.
+fn read_ns_global_pid() -> Option<i32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_ns_global_pid(&status)
+}
+
+/// Readiness the workload writes once setup succeeds: `OK`, optionally followed
+/// by its host-global pid.
+pub fn readiness_message(workload_pid: Option<i32>) -> String {
+    match workload_pid {
+        Some(pid) => format!("OK {pid}"),
+        None => "OK".to_string(),
+    }
+}
+
+/// Parse a [`readiness_message`]. Empty or non-`OK` is a failure, so the owner
+/// fails closed on a truncated write or a crashed child.
+pub fn parse_readiness(buf: &[u8]) -> Result<Option<i32>, String> {
+    if buf.len() < 2 || &buf[..2] != b"OK" {
+        return Err(if buf.is_empty() {
+            "container init failed (no status)".to_string()
+        } else {
+            String::from_utf8_lossy(buf).to_string()
+        });
+    }
+    let pid = std::str::from_utf8(&buf[2..])
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 0);
+    Ok(pid)
+}
+
 /// How the rootfs was set up — determines cleanup strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootfsMode {
@@ -989,24 +1071,29 @@ pub fn resolve_supplementary_gids(uid: u32, gid: u32) -> Vec<u32> {
     gids
 }
 
-/// Set up a user namespace for non-root container operation.
-///
-/// Maps the calling user to root inside the namespace, giving
-/// CAP_SYS_ADMIN for mounts and pivot_root. Supplementary groups are
-/// inherited from the parent process by writing `"deny"` to
-/// `/proc/self/setgroups` (the crun/podman `keep-groups` approach).
-/// The groups show as `nobody` inside the container but the kernel
-/// still honours them for permission checks on device nodes.
-fn setup_user_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
-    nix::sched::unshare(
-        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID,
-    )
-    .context("unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)")?;
+/// Create the container's namespaces in runc/Podman order: a requested user
+/// namespace is created and mapped first, so the mount and PID namespaces are
+/// owned by it. `Host` skips the user namespace.
+fn create_namespaces(mode: UserNamespaceMode, uid: u32, gid: u32) -> anyhow::Result<()> {
+    if mode.creates_user_namespace() {
+        nix::sched::unshare(CloneFlags::CLONE_NEWUSER).context("unshare(CLONE_NEWUSER)")?;
+        install_id_maps(mode, uid, gid)?;
+    }
+    nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+        .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")
+}
 
-    std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid)).context("write uid_map")?;
-    std::fs::write("/proc/self/setgroups", "deny").context("write setgroups deny")?;
-    std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid)).context("write gid_map")?;
-
+/// Install id maps for a mapped user namespace. `setgroups=deny` lets
+/// supplementary groups pass through (crun/podman `keep-groups`): they show as
+/// `nobody` inside but the kernel still honours them for permission checks.
+fn install_id_maps(mode: UserNamespaceMode, uid: u32, gid: u32) -> anyhow::Result<()> {
+    if !mode.creates_user_namespace() {
+        return Ok(());
+    }
+    for (file, contents) in userns_id_map_writes(uid, gid) {
+        std::fs::write(format!("/proc/self/{file}"), contents)
+            .with_context(|| format!("write {file}"))?;
+    }
     Ok(())
 }
 
@@ -1023,11 +1110,12 @@ fn set_mount_propagation_private() -> anyhow::Result<()> {
     .context("set mount propagation to private")
 }
 
-/// Fork to enter a new PID namespace. The child (PID 1 inside the
-/// namespace) returns Ok(()); the parent waits for the child and exits.
-fn fork_into_pid_namespace() -> anyhow::Result<()> {
+/// Fork into a new PID namespace. The child becomes PID 1 (the workload) and
+/// returns its host-global pid, read before `/proc` is remounted; the shepherd
+/// parent stays outside as a stable anchor, waits, and exits with its status.
+fn fork_into_pid_namespace() -> anyhow::Result<Option<i32>> {
     match unsafe { nix::unistd::fork().context("fork for PID namespace")? } {
-        nix::unistd::ForkResult::Child => Ok(()),
+        nix::unistd::ForkResult::Child => Ok(read_ns_global_pid()),
         nix::unistd::ForkResult::Parent { child } => {
             let code = match nix::sys::wait::waitpid(child, None) {
                 Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
@@ -1061,12 +1149,22 @@ pub fn close_inherited_fds(preserve_fd: RawFd) {
     }
 }
 
-/// The main child-process function for container setup.
-pub fn container_init(
-    config: &ContainerConfig,
-    rootfs: &Path,
-) -> anyhow::Result<HashMap<String, String>> {
+/// The outcome of container setup, returned to the forked child's exec path.
+pub struct ContainerInit {
+    /// Environment contributed by `environ.d` hooks.
+    pub hook_env: HashMap<String, String>,
+    /// The workload's host-global pid (PID 1 in the container), when readable.
+    /// Distinct from the shepherd that anchors the namespaces.
+    pub workload_pid: Option<i32>,
+}
+
+/// Container setup, run in the forked shepherd: create namespaces
+/// (user-namespace-first when requested), fork the workload as PID 1, set up
+/// the rootfs, and drop to the submitter for `Host` mode. Returns in the
+/// workload process; the shepherd waits on it.
+pub fn container_init(config: &ContainerConfig, rootfs: &Path) -> anyhow::Result<ContainerInit> {
     let is_root = nix::unistd::geteuid().is_root();
+    let mode = user_namespace_mode(is_root);
 
     // Resolve supplementary GIDs while host /etc/group is still accessible.
     let mut supplementary_gids = resolve_supplementary_gids(config.uid, config.gid);
@@ -1077,16 +1175,10 @@ pub fn container_init(
         }
     }
 
-    if is_root {
-        nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
-            .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")?;
-    } else {
-        setup_user_namespace(config.uid, config.gid)
-            .context("rootless container setup failed while setting up user namespace")?;
-    }
+    create_namespaces(mode, config.uid, config.gid).context("create container namespaces")?;
 
     set_mount_propagation_private()?;
-    fork_into_pid_namespace()?;
+    let workload_pid = fork_into_pid_namespace()?;
 
     mount_filesystems(rootfs)?;
 
@@ -1108,11 +1200,16 @@ pub fn container_init(
     let workdir = config.workdir.as_deref().unwrap_or("/tmp");
     pivot_into_rootfs(rootfs, workdir)?;
 
-    if is_root {
+    // Only `Host` mode enters as root and must drop to the submitter.
+    // `CurrentUserAsRoot` is already the submitter mapped to namespace root.
+    if !mode.creates_user_namespace() {
         drop_privileges(config.uid, config.gid, &supplementary_gids)?;
     }
 
-    Ok(hook_env)
+    Ok(ContainerInit {
+        hook_env,
+        workload_pid,
+    })
 }
 
 /// Import a Docker/OCI image to squashfs format.
@@ -1177,6 +1274,85 @@ mod tests {
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // --- User namespace mode ---
+
+    #[test]
+    fn root_daemon_uses_host_user_namespace() {
+        let mode = user_namespace_mode(true);
+        assert_eq!(mode, UserNamespaceMode::Host);
+        assert!(!mode.creates_user_namespace());
+    }
+
+    #[test]
+    fn rootless_daemon_maps_current_user_as_root() {
+        let mode = user_namespace_mode(false);
+        assert_eq!(mode, UserNamespaceMode::CurrentUserAsRoot);
+        assert!(mode.creates_user_namespace());
+    }
+
+    #[test]
+    fn id_map_writes_deny_setgroups_before_gid_map() {
+        let writes = userns_id_map_writes(1000, 2000);
+        let files: Vec<&str> = writes.iter().map(|(f, _)| *f).collect();
+        assert_eq!(files, ["uid_map", "setgroups", "gid_map"]);
+        assert_eq!(writes[0].1, "0 1000 1\n");
+        assert_eq!(writes[1].1, "deny");
+        assert_eq!(writes[2].1, "0 2000 1\n");
+        let setgroups = files.iter().position(|f| *f == "setgroups").unwrap();
+        let gid_map = files.iter().position(|f| *f == "gid_map").unwrap();
+        assert!(setgroups < gid_map, "setgroups=deny must precede gid_map");
+    }
+
+    #[test]
+    fn ns_global_pid_reads_outermost_field() {
+        let status = "Name:\tsh\nState:\tR\nNSpid:\t40971\t1\nNStgid:\t40971\t1\n";
+        assert_eq!(parse_ns_global_pid(status), Some(40971));
+    }
+
+    #[test]
+    fn ns_global_pid_single_namespace() {
+        assert_eq!(parse_ns_global_pid("NSpid:\t1234\n"), Some(1234));
+    }
+
+    #[test]
+    fn ns_global_pid_absent_is_none() {
+        assert_eq!(parse_ns_global_pid("Name:\tsh\nState:\tR\n"), None);
+    }
+
+    // --- Readiness protocol ---
+
+    #[test]
+    fn readiness_round_trips_workload_pid() {
+        let msg = readiness_message(Some(40971));
+        assert_eq!(msg, "OK 40971");
+        assert_eq!(parse_readiness(msg.as_bytes()), Ok(Some(40971)));
+    }
+
+    #[test]
+    fn readiness_without_pid_is_ok_none() {
+        let msg = readiness_message(None);
+        assert_eq!(msg, "OK");
+        assert_eq!(parse_readiness(msg.as_bytes()), Ok(None));
+    }
+
+    #[test]
+    fn readiness_empty_fails_closed() {
+        assert!(parse_readiness(b"").is_err());
+    }
+
+    #[test]
+    fn readiness_error_text_is_surfaced() {
+        assert_eq!(
+            parse_readiness(b"E:mount /proc failed"),
+            Err("E:mount /proc failed".to_string())
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_non_positive_pid() {
+        assert_eq!(parse_readiness(b"OK 0"), Ok(None));
     }
 
     // --- Mount parsing ---

@@ -319,8 +319,12 @@ pub enum RunningJob {
     /// Non-container jobs managed by tokio::process::Child.
     Managed { child: tokio::process::Child },
     /// Container jobs: raw fork with optional pidfd for PID-recycling safety.
+    /// `pid` is the shepherd owning the user/mount namespaces; `workload_pid`
+    /// is PID 1 inside the container, tracked separately for validation and
+    /// signalling while the shepherd stays the lifecycle anchor.
     Forked {
         pid: i32,
+        workload_pid: Option<i32>,
         /// Holds a kernel reference preventing PID recycling. None on kernels < 5.3.
         _pidfd: Option<OwnedFd>,
         reaped: bool,
@@ -386,6 +390,15 @@ impl RunningJob {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
             RunningJob::AllocationOnly => None,
+        }
+    }
+
+    /// The workload's host pid (PID 1 inside the container), distinct from the
+    /// shepherd returned by [`Self::pid`]. `None` when unavailable.
+    pub fn workload_pid(&self) -> Option<i32> {
+        match self {
+            RunningJob::Forked { workload_pid, .. } => *workload_pid,
+            _ => None,
         }
     }
 
@@ -2153,8 +2166,8 @@ async fn launch_container_job(
             apply_memlock(cfg.memlock);
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
-            let hook_env = match crate::container::container_init(config, &rootfs) {
-                Ok(env) => env,
+            let init = match crate::container::container_init(config, &rootfs) {
+                Ok(init) => init,
                 Err(e) => {
                     let msg = format!("E:{:#}", e);
                     unsafe {
@@ -2164,11 +2177,12 @@ async fn launch_container_job(
                 }
             };
 
-            // Signal parent: setup complete
+            let ready_msg = crate::container::readiness_message(init.workload_pid);
             unsafe {
-                libc::write(ready_w, b"OK".as_ptr() as *const _, 2);
+                libc::write(ready_w, ready_msg.as_ptr() as *const _, ready_msg.len());
                 libc::close(ready_w);
             }
+            let hook_env = init.hook_env;
 
             // Build final environment: base + container_env + hook environ.d
             let mut final_env = env_snapshot;
@@ -2236,10 +2250,10 @@ async fn launch_container_job(
             let n = n.max(0) as usize;
             drop(pipe_r_owner);
 
-            if n < 2 || &buf[..2] != b"OK" {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                bail!("container init failed for job {}: {}", job_id, msg);
-            }
+            let workload_pid = match crate::container::parse_readiness(&buf[..n]) {
+                Ok(pid) => pid,
+                Err(msg) => bail!("container init failed for job {}: {}", job_id, msg),
+            };
 
             // Only now is the child's self-join guaranteed to have run. Verify
             // rather than write (DC2): the container tree inherits this membership.
@@ -2266,6 +2280,7 @@ async fn launch_container_job(
             Ok((
                 RunningJob::Forked {
                     pid: child_pid,
+                    workload_pid,
                     _pidfd: pidfd,
                     reaped: false,
                 },

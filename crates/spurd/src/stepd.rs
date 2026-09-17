@@ -1963,7 +1963,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     };
-    let workload_pid = job.pid().unwrap_or(0);
+    // Prefer the container workload (PID 1): killing it fences the whole
+    // namespace. Fall back to the tracked process otherwise.
+    let workload_pid = job
+        .workload_pid()
+        .filter(|p| *p > 0)
+        .map(|p| p as u32)
+        .unwrap_or_else(|| job.pid().unwrap_or(0));
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
         descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);

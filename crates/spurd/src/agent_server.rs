@@ -2159,9 +2159,13 @@ fn launch_namespaces(cfg: &executor::JobLaunchConfig, is_root: bool) -> LaunchNa
     // the launch never created makes adoption re-enter ones that do not exist.
     let unshared = executor::would_use_namespaces(cfg, is_root);
     let is_container = cfg.container.is_some();
+    // Same predicate as container_init: a user namespace exists exactly when
+    // the mode creates one (rootless), never for a root daemon.
+    let container_user_ns =
+        is_container && crate::container::user_namespace_mode(is_root).creates_user_namespace();
     LaunchNamespaces {
         pid: unshared || is_container,
-        user: is_container && !is_root,
+        user: container_user_ns,
         mount: unshared || is_container,
     }
 }
@@ -2421,8 +2425,8 @@ fn container_child_exec(
     crate::container::close_inherited_fds(ready_w_fd);
     executor::apply_memlock(memlock);
 
-    let hook_env = match crate::container::container_init(container_cfg, rootfs) {
-        Ok(env) => env,
+    let init = match crate::container::container_init(container_cfg, rootfs) {
+        Ok(init) => init,
         Err(e) => {
             let msg = format!("E:{e:#}");
             unsafe {
@@ -2432,9 +2436,11 @@ fn container_child_exec(
         }
     };
 
-    unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
+    let ready_msg = crate::container::readiness_message(init.workload_pid);
+    unsafe { libc::write(ready_w_fd, ready_msg.as_ptr() as *const _, ready_msg.len()) };
     drop(ready_w);
 
+    let hook_env = init.hook_env;
     let mut final_env = env_base;
     for (k, v) in &container_cfg.container_env {
         final_env.insert(k.clone(), v.clone());
@@ -2512,24 +2518,23 @@ fn container_parent_ready(
     ready_r: std::os::fd::OwnedFd,
     cgroup_required: bool,
     cgroup: Option<&std::path::Path>,
-) -> Result<(), Status> {
+) -> Result<Option<i32>, Status> {
     use std::os::fd::AsRawFd;
     let ready_r_fd = ready_r.as_raw_fd();
     let mut buf = [0u8; 256];
     let n = unsafe { libc::read(ready_r_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    let n = n.max(0) as usize;
     drop(ready_r);
-    if n < 2 || &buf[..2] != b"OK" {
-        let msg = if n > 0 {
-            String::from_utf8_lossy(&buf[..n.max(0) as usize]).to_string()
-        } else {
-            "container init failed (no status)".to_string()
-        };
-        let _ = unsafe { libc::kill(child_pid.as_raw(), libc::SIGKILL) };
-        let _ = nix::sys::wait::waitpid(child_pid, None);
-        return Err(Status::internal(format!(
-            "step container init failed: {msg}"
-        )));
-    }
+    let workload_pid = match crate::container::parse_readiness(&buf[..n]) {
+        Ok(pid) => pid,
+        Err(msg) => {
+            let _ = unsafe { libc::kill(child_pid.as_raw(), libc::SIGKILL) };
+            let _ = nix::sys::wait::waitpid(child_pid, None);
+            return Err(Status::internal(format!(
+                "step container init failed: {msg}"
+            )));
+        }
+    };
 
     if escaped_job_cgroup(cgroup_required, cgroup, Some(child_pid.as_raw() as u32)) {
         crate::executor::kill_process_tree(child_pid.as_raw(), nix::sys::signal::Signal::SIGKILL);
@@ -2538,7 +2543,7 @@ fn container_parent_ready(
             "[cgroup] required but the step did not join its cgroup",
         ));
     }
-    Ok(())
+    Ok(workload_pid)
 }
 
 /// Reap a directly-forked child and map its wait status to a shell-style exit
@@ -15225,6 +15230,7 @@ mod tests {
 
         let job = executor::RunningJob::Forked {
             pid,
+            workload_pid: None,
             _pidfd: None,
             reaped: false,
         };
