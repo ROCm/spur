@@ -1111,6 +1111,16 @@ fn assume_container_root() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Set the fs uid/gid to the mapped container root (0) for `SubmitterAsRoot`
+/// rootfs setup. Host root is unmapped in the userns, so inodes it creates on a
+/// userns-owned mount (the `/dev` tmpfs, device targets, symlinks) are rejected.
+/// `setfsuid`/`setfsgid` keep `CAP_SYS_ADMIN` for mounts and leave the real uid
+/// intact for later pivot_root.
+fn assume_container_root_fsids() {
+    nix::unistd::setfsgid(nix::unistd::Gid::from_raw(0));
+    nix::unistd::setfsuid(nix::unistd::Uid::from_raw(0));
+}
+
 fn merge_supplementary_gids(mut gids: Vec<u32>, extra: &[u32]) -> Vec<u32> {
     for &g in extra {
         if g > 0 && !gids.contains(&g) {
@@ -1320,6 +1330,10 @@ pub fn container_init(
 
     set_mount_propagation_private()?;
     let workload_pid = fork_into_pid_namespace()?;
+
+    if mode == UserNamespaceMode::SubmitterAsRoot {
+        assume_container_root_fsids();
+    }
 
     mount_filesystems(rootfs)?;
 
