@@ -924,6 +924,11 @@ pub struct Job {
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
 
+    /// Allocated nodes that run an epilog, recorded when the run starts. The
+    /// node's own report clears it; a requeue and deregistration also drop it.
+    #[serde(default)]
+    pub epilog_gated_nodes: HashSet<String>,
+
     /// Standalone srun: native step dispatch after allocation registration.
     #[serde(default)]
     pub srun_step_dispatch: bool,
@@ -993,15 +998,24 @@ impl Job {
     /// Whether this node is still charged for this job. One definition, so the
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
-        !self.state.is_finalized()
-            && self.allocated_nodes.iter().any(|n| n == node)
+        self.allocated_nodes.iter().any(|n| n == node)
             && !self.node_completions.contains_key(node)
+            // A finalized run keeps its slice only where the node still owes an
+            // epilog: the tasks are gone, the hook the node runs after them is not.
+            && (!self.state.is_finalized() || self.epilog_gated_nodes.contains(node))
+    }
+
+    /// Whether this node still owes this run's epilog, so a report is expected
+    /// from it even once the job itself is finalized.
+    pub fn is_epilog_gated_on(&self, node: &str) -> bool {
+        self.epilog_gated_nodes.contains(node)
     }
 
     /// Whether this node's agent has confirmed the launch, so its ledger can be
-    /// expected to name the job. A reservation is charged while still Pending.
+    /// expected to name the job. A Pending reservation is charged, not confirmed.
     pub fn is_confirmed_on(&self, node: &str) -> bool {
-        self.state.is_active() && self.is_held_on(node)
+        (self.state.is_active() || (self.state.is_finalized() && self.is_epilog_gated_on(node)))
+            && self.is_held_on(node)
     }
 
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
@@ -1043,6 +1057,7 @@ impl Job {
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            epilog_gated_nodes: HashSet::new(),
             time_limit_signaled_at: None,
             suspended_at: None,
             suspended_secs: 0,
@@ -1531,6 +1546,88 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    fn placed_job(state: JobState, gated: &[&str]) -> Job {
+        let mut job = make_job();
+        job.state = state;
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.epilog_gated_nodes = gated.iter().map(|n| (*n).to_string()).collect();
+        job
+    }
+
+    // A snapshot written before the gate existed must still restore: without the
+    // default, a controller replaying one crashes instead of reading it.
+    #[test]
+    fn a_job_recorded_before_the_gate_restores_with_none() {
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(placed_job(JobState::Running, &["n1"])).expect("serialize");
+        encoded
+            .as_object_mut()
+            .expect("object")
+            .remove("epilog_gated_nodes")
+            .expect("the field must exist to be worth defaulting");
+        let restored: Job = serde_json::from_value(encoded)
+            .expect("a pre-gate job must deserialize; the field needs #[serde(default)]");
+        assert!(restored.epilog_gated_nodes.is_empty());
+        assert!(restored.is_held_on("n1"));
+    }
+
+    #[test]
+    fn a_finalized_run_keeps_only_the_nodes_that_still_owe_an_epilog() {
+        let job = placed_job(JobState::Cancelled, &["n1"]);
+        assert!(job.is_held_on("n1"), "the epilog is still running there");
+        assert!(
+            !job.is_held_on("n2"),
+            "a node with no epilog to wait for must be released at once"
+        );
+    }
+
+    #[test]
+    fn a_live_run_holds_every_node_it_was_placed_on() {
+        let job = placed_job(JobState::Running, &["n1"]);
+        assert!(job.is_held_on("n1"));
+        assert!(job.is_held_on("n2"), "the gate must not narrow a live run");
+    }
+
+    #[test]
+    fn a_report_ends_the_hold_even_where_the_gate_still_names_the_node() {
+        let mut job = placed_job(JobState::Cancelled, &["n1"]);
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        assert!(!job.is_held_on("n1"));
+    }
+
+    #[test]
+    fn the_reconciler_can_see_a_run_finalized_while_a_node_still_owes_its_epilog() {
+        let job = placed_job(JobState::Cancelled, &["n1"]);
+        assert!(
+            job.is_confirmed_on("n1"),
+            "a hold no reconcile pass can reach is a hold with no way out"
+        );
+        assert!(!job.is_confirmed_on("n2"));
+    }
+
+    // A reservation is charged while still Pending, and the gate is written with
+    // it. Reading that as a confirmed launch lets a reconcile pass disown it.
+    #[test]
+    fn a_reservation_still_pending_is_not_confirmed_by_its_gate() {
+        let job = placed_job(JobState::Pending, &["n1"]);
+        assert!(job.is_held_on("n1"), "the reservation holds the slice");
+        assert!(
+            !job.is_confirmed_on("n1"),
+            "no agent has confirmed this launch; the cut cannot disown it"
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_gate_is_held_exactly_as_before() {
+        let running = placed_job(JobState::Running, &[]);
+        let finalized = placed_job(JobState::Completed, &[]);
+        for node in ["n1", "n2"] {
+            assert!(running.is_held_on(node));
+            assert!(!finalized.is_held_on(node));
+        }
     }
 
     #[test]

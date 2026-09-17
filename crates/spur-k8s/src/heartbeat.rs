@@ -98,6 +98,7 @@ mod tests {
 
     fn make_req(hostname: &str) -> RegisterAgentRequest {
         RegisterAgentRequest {
+            runs_job_epilog: false,
             ledger: None,
             hostname: hostname.into(),
             resources: None,

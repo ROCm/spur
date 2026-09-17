@@ -380,6 +380,10 @@ pub struct Node {
     /// Not a `NodeState`, which the WAL and the proto both serialize.
     #[serde(default)]
     pub reconcile_pending: bool,
+    /// Whether this node's agent runs an epilog after a run's tasks exit. False
+    /// for an agent that predates the declaration, which then never gates.
+    #[serde(default)]
+    pub runs_job_epilog: bool,
 }
 
 fn default_weight() -> u32 {
@@ -424,6 +428,7 @@ impl Node {
             k0s_pod_cidr: None,
             k0s_last_error: None,
             reconcile_pending: false,
+            runs_job_epilog: false,
         }
     }
 

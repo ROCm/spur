@@ -527,6 +527,11 @@ impl StepdObligationLog {
         Self { path }
     }
 
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn append(&self, obligation: &StepdObligation) -> io::Result<()> {
         let mut entry = serde_json::to_vec(obligation).map_err(|error| {
             io::Error::new(
@@ -2586,16 +2591,31 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<bool> {
+        Ok(self
+            .epilog_result(job_id, run_attempt, step_id)?
+            .unwrap_or(false))
+    }
+
+    /// How the supervisor's own ledger says its epilog ended, or `None` while it
+    /// has not said. Written by the hook's owner, so no teardown here loses it.
+    pub(crate) fn epilog_result(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<bool>> {
         let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
         Ok(obligations
             .iter()
             .rev()
             .find_map(|obligation| match obligation {
-                StepdObligation::EpilogCompleted { failed } => Some(*failed),
-                StepdObligation::ExitObserved { .. } => Some(false),
+                StepdObligation::EpilogCompleted { failed } => Some(Some(*failed)),
+                // An exit newer than the last result belongs to a session that
+                // has not reached its hook, so the older result does not answer it.
+                StepdObligation::ExitObserved { .. } => Some(None),
                 _ => None,
             })
-            .unwrap_or(false))
+            .flatten())
     }
 
     /// Every session this store holds for one run, whatever step it belongs to:
@@ -4733,6 +4753,50 @@ mod tests {
         )
         .expect("write corrupt log");
         assert!(log.read().is_err());
+    }
+
+    // The release gate has to tell "the hook has not finished" from "it finished
+    // and passed"; a boolean reads both as false and would open on the first.
+    #[test]
+    fn an_epilog_reads_as_unanswered_until_its_supervisor_records_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        store
+            .prepare_session_dir(9, 2, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(9, 2, spur_core::step::STEP_BATCH);
+        assert_eq!(
+            store
+                .epilog_result(9, 2, spur_core::step::STEP_BATCH)
+                .expect("epilog result"),
+            None,
+            "a session that has recorded nothing owes an answer"
+        );
+
+        obligations
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("append exit");
+        assert_eq!(
+            store
+                .epilog_result(9, 2, spur_core::step::STEP_BATCH)
+                .expect("epilog result"),
+            None,
+            "an observed exit is the hook starting, not the hook ending"
+        );
+
+        obligations
+            .append(&StepdObligation::EpilogCompleted { failed: true })
+            .expect("append epilog");
+        assert_eq!(
+            store
+                .epilog_result(9, 2, spur_core::step::STEP_BATCH)
+                .expect("epilog result"),
+            Some(true),
+            "and the supervisor's own word is the answer"
+        );
     }
 
     #[test]

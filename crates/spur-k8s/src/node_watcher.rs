@@ -128,8 +128,10 @@ pub async fn run(
                     info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
-                        // A virtual node keeps no local ledger of its own.
+                        // A virtual node keeps no local ledger of its own, and
+                        // runs no epilog for the controller to wait on.
                         ledger: None,
+                        runs_job_epilog: false,
                         hostname: name.clone(),
                         resources: Some(resources),
                         version: "spur-k8s-operator".into(),

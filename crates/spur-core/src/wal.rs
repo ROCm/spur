@@ -76,6 +76,10 @@ pub enum WalOperation {
         node_name: String,
         exit_code: i32,
         signal: i32,
+        /// The run this report speaks for, re-checked on apply so a report that
+        /// lost to a requeue cannot discharge the next run's debt. 0 is legacy.
+        #[serde(default)]
+        run_attempt: u32,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -234,6 +238,10 @@ pub enum WalOperation {
         labels: HashMap<String, String>,
         #[serde(default)]
         source: NodeSource,
+        /// Whether this node runs an epilog after a run's tasks exit. Absent from
+        /// a pre-declaration entry, which replays as a node that never gates.
+        #[serde(default)]
+        runs_job_epilog: bool,
     },
     NodeUpdate {
         name: String,
@@ -250,6 +258,10 @@ pub enum WalOperation {
         /// diffed against Raft, or release it. `None` leaves the gate as it is.
         #[serde(default)]
         reconcile_pending: Option<bool>,
+        /// Whether this node runs an epilog after a run's tasks exit. `None`
+        /// leaves the recorded answer alone, so a gate-only entry cannot clear it.
+        #[serde(default)]
+        runs_job_epilog: Option<bool>,
     },
     NodeStateChange {
         name: String,
@@ -928,6 +940,7 @@ mod tests {
     #[test]
     fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n0".into(),
@@ -1200,6 +1213,45 @@ mod deregistration_wal_tests {
         }
     }
 
+    // Frozen pre-epilog-declaration shape. A node that never declared must
+    // replay as one that runs no epilog, so the hold reduces to today's rule.
+    #[test]
+    fn a_pre_upgrade_node_register_declares_no_epilog() {
+        const REGISTER: &str = r#"{"NodeRegister":{"name":"n1","hostname":"n1","resources":{"cpus":2,"memory_mb":1000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.11.0","labels":{},"source":{"type":"NativeHost"}}}"#;
+        let op: WalOperation = serde_json::from_str(REGISTER)
+            .expect("frozen NodeRegister must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeRegister {
+                name,
+                runs_job_epilog,
+                ..
+            } => {
+                assert_eq!(name, "n1");
+                assert!(
+                    !runs_job_epilog,
+                    "an agent that never declared an epilog must never gate a slice"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_pre_upgrade_node_update_says_nothing_about_an_epilog() {
+        const UPDATE: &str = r#"{"NodeUpdate":{"name":"n1","hostname":"n1","resources":{"cpus":2,"memory_mb":1000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.11.0","source":{"type":"NativeHost"},"reconcile_pending":null}}"#;
+        let op: WalOperation = serde_json::from_str(UPDATE)
+            .expect("frozen NodeUpdate must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeUpdate {
+                runs_job_epilog, ..
+            } => assert_eq!(
+                runs_job_epilog, None,
+                "an entry that predates the declaration must not be read as clearing it"
+            ),
+            _ => panic!("wrong variant"),
+        }
+    }
+
     // The other half of the upgrade: a controller predating the gate has to read
     // an entry carrying it, which holds only while unknown fields stay ignored.
     #[test]
@@ -1231,6 +1283,7 @@ mod deregistration_wal_tests {
                 version: "0.8.0".into(),
                 source: NodeSource::default(),
                 reconcile_pending: gate,
+                runs_job_epilog: None,
             })
             .expect("serialize");
 

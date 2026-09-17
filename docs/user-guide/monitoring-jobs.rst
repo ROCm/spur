@@ -301,6 +301,11 @@ may nonetheless be skipped by the scheduler, and says so in the same field
        no new work until the controller has compared that against its own
        records. Usually immediate, but a controller still replaying its own log
        waits for that first, and the whole pass is capped at a minute.
+   * - ``holding claims the controller has no record of: <ids>``
+     - The node is holding resources for runs the controller cannot place, and
+       could not resolve them itself. The node keeps working; the named runs are
+       what an operator should look at. It clears itself once the node reports
+       them or they are otherwise settled.
    * - ``dispatch cooldown after a failed launch (<n>s remaining)``
      - A launch failed on this node, so the scheduler skips it for
        ``controller.dispatch_reject_cooldown_secs`` instead of re-picking it
@@ -328,9 +333,18 @@ committed the job's completion — not when the job's processes exit. The agent
 reports the exit, waits for the controller to acknowledge it, and only then frees
 the slice.
 
-The visible effect is a short lag: for a moment after a job finishes, ``sinfo``
-and ``scontrol show node`` still count its resources as allocated on a node where
-nothing is running. Normally this is one round trip and you will rarely catch it.
+The visible effect is a lag: for a moment after a job finishes, ``sinfo`` and
+``scontrol show node`` still count its resources as allocated on a node where
+nothing is running. With no epilog configured this is one round trip and you will
+rarely catch it. Where the node runs an epilog, the slice stays booked for as long
+as that hook takes, so the next job cannot start on top of the cleanup.
+
+A node still running a finished job's epilog reports as ``mix`` or ``alloc`` with
+a nonzero ``CPUAlloc`` and nothing for it in ``squeue`` — the tasks are gone, the
+hook is not. It reads as ``drng`` only if an operator has also drained it. The
+hold ends when the node reports, when the job is requeued, or when the node is
+removed from the cluster — never on a timer, and not merely because the node
+stopped answering.
 
 If the controller is unreachable, the lag lasts as long as the outage. The agent
 keeps retrying the completion report — backing off to at most a minute between
@@ -933,10 +947,9 @@ accept ``State=``, ``Reason=``, and ``Reconcile=``.
    scontrol update NodeName=node01 State=drain Reason="maintenance"
    scontrol update NodeName=node01 Reconcile=yes
 
-``--controller`` and the other global flags are parsed as flags wherever they
-appear, including after the ``key=value`` pairs. A token among those pairs that
-is not a ``key=value`` pair is an error naming the token, rather than being
-silently dropped.
+``--controller`` is parsed as a flag wherever it appears, including after the
+``key=value`` pairs. A token among those pairs that is not a ``key=value`` pair
+is an error naming the token, rather than being silently dropped.
 
 ``Reconcile=yes`` asks the node for a fresh account of what it believes it is
 running and compares that against the controller's own record, resolving any
@@ -948,13 +961,24 @@ about it:
 - finished, with its resources not yet handed back — the controller answers
   that it is not accounting for the run, which releases those resources. This
   is the acknowledgement such a run is waiting for, and without it the node
-  holds those CPUs, GPUs and memory indefinitely, including across a restart;
+  holds those CPUs, GPUs and memory indefinitely, including across a restart.
+  The node keeps a veto it alone can exercise: while a cleanup hook is still
+  running under the job, it declines and the next reconcile asks again;
 - neither — the node cannot account for the claim and the controller has no
   record of it, so nothing may end it and nothing proves it is over. It is left
   alone and named in the node's reason as ``holding claims the controller has
-  no record of``, followed by the job ids. The reason clears itself once the
-  claims resolve, and never overwrites a reason an operator set. Only an
-  operator can clear the underlying condition.
+  no record of``, followed by the job ids. Only an operator can clear the
+  underlying condition.
+
+The reason is written only where the controller has no other reason to
+overwrite, and is cleared only once a reconcile that could see every claim finds
+none left. A node carrying any other reason — an operator's, or one the
+controller set for something else such as a missed heartbeat — keeps it, and the
+drift is reported in the controller log instead. Naming needs an
+attested reconcile: under the default ``open`` node admission a ledger that
+arrives with a registration cannot license it, so on those clusters the reason
+is written by a reconcile the controller initiated. See
+:doc:`/admin-guide/configuration` for how ``admission.mode`` decides that.
 
 The controller already reconciles a node on its own:
 
@@ -981,6 +1005,13 @@ but no settlements.
 Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see
 :doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
+
+Asking for one by hand requires admin rights, because it can end running work::
+
+    scontrol update NodeName=node01 Reconcile=yes
+
+The command returns once the pass is done. It reports nothing about what the pass
+found — read the controller log, or the node's reason, for that.
 
 The reconcile a node runs as part of registering gates that node: it reports a
 reason of ``reconciling with the controller`` and accepts no new work until the

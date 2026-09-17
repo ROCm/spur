@@ -1135,15 +1135,19 @@ Admission mode and reconciliation
 
 A registering ``spurd`` sends the controller a ledger: what that node believes it
 is holding. The controller compares that against its own record and resolves the
-difference — a claim the controller has no record of is cancelled on the node
-with ``SIGKILL``, and a job the node no longer holds is settled as failed. See
+difference. A claim the controller has no record of gets one of three answers,
+depending on what the node says about it: it is cancelled on the node with
+``SIGKILL``; or, if the node reports it as finished but still holding resources,
+the controller tells the node it is not accounting for the run, which releases
+them; or it is left alone and named in the node's reason for an operator. A job
+the node no longer holds is settled as failed. See
 :doc:`/user-guide/monitoring-jobs` for what a reconcile does and when one runs.
 
 ``mode`` decides whether a ledger that arrives *with a registration* may license
 those two destructive halves:
 
 * ``token`` — the registering agent presented a valid admission token, so the
-  controller acts on what it sent: unrecorded claims are cancelled, and jobs the
+  controller acts on what it sent: unrecorded claims are answered, and jobs the
   node no longer holds are settled.
 * ``open`` (the default) — any host able to reach the controller's port may
   assert any hostname, so the controller cannot place the caller at the node the

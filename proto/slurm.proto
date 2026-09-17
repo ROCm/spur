@@ -477,7 +477,8 @@ service SlurmAgent {
   rpc FenceRun(FenceRunRequest) returns (FenceRunResponse);
   rpc RequestNodeLedger(RequestNodeLedgerRequest) returns (RequestNodeLedgerResponse);
   // The controller's own word that it is not accounting for this run on this
-  // node. That is the acknowledgement a held slice is waiting for.
+  // node. Caller-gated only under auth.mode = required, as every RPC here is;
+  // what frees a slice is the agent's own preconditions, not the caller's word.
   rpc SettleRun(SettleRunRequest) returns (SettleRunResponse);
   // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
@@ -869,6 +870,9 @@ message RegisterAgentRequest {
   // One immutable cut of this agent's ledger, taken at registration. Absent
   // from an agent that predates it, which asserts no evidence and is not gated.
   optional NodeLedger ledger = 9;
+  // Whether a run's tasks exiting leaves an epilog still running here, so the
+  // controller holds this node's slice past the run's end instead of reusing it.
+  bool runs_job_epilog = 10;
 }
 
 // What an agent believes it is entitled to. Absence and emptiness differ: only
@@ -1078,8 +1082,8 @@ enum LaunchFailureKind {
   LAUNCH_FAILURE_TARGET_MISMATCH = 7;
 }
 
-// What the node was already holding when it refused, so the controller can act
-// in the same round trip instead of guessing.
+// What the node named as already held when it refused. Diagnostic: the
+// controller re-derives the claim from the node's ledger before acting on it.
 message LaunchConflict {
   uint32 job_id = 1;
   uint32 run_attempt = 2;

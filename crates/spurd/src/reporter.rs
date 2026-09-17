@@ -62,6 +62,9 @@ pub struct NodeReporter {
     /// Whether the last cut could see everything. Only the transition is worth
     /// saying: the condition needs an operator, and it does not clear itself.
     inventory_was_complete: AtomicBool,
+    /// Declared at registration so the controller knows a run's slice outlives
+    /// its tasks here. Static config: there is no agent-side reconfigure.
+    runs_job_epilog: bool,
 }
 
 impl NodeReporter {
@@ -76,6 +79,7 @@ impl NodeReporter {
         wg_iface: String,
         wg_config_dir: std::path::PathBuf,
         held_jobs: Arc<dyn HeldJobs>,
+        runs_job_epilog: bool,
     ) -> Self {
         Self {
             hostname,
@@ -94,6 +98,7 @@ impl NodeReporter {
             admissions: std::sync::OnceLock::new(),
             agent_session_id: uuid::Uuid::new_v4().to_string(),
             inventory_was_complete: AtomicBool::new(true),
+            runs_job_epilog,
         }
     }
 
@@ -189,6 +194,7 @@ impl NodeReporter {
                 labels,
                 join_token: self.join_token.clone(),
                 ledger: self.ledger_cut(),
+                runs_job_epilog: self.runs_job_epilog,
             })
             .await
             .context("registration failed")?;

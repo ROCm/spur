@@ -537,6 +537,7 @@ async fn main() -> anyhow::Result<()> {
         wg_iface,
         wg_config_dir,
         running_jobs.clone(),
+        spurd::agent_server::runs_job_epilog(&hooks_config),
     ));
 
     // Wired before registration so the first cut carries this node's claims:
