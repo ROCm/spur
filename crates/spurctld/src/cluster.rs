@@ -15216,10 +15216,11 @@ mod tests {
         let err = cm
             .apply_submission_time_default(&mut spec, &cm.partitions.read(), 60)
             .unwrap_err();
-        let SubmitError::Unavailable(message) = err else {
-            panic!("expected unavailable account policy, got {err:?}");
-        };
-        assert!(message.contains("DefaultTimeUnlimited requires account limits"));
+        assert!(matches!(
+            err,
+            SubmitError::Unavailable(ref message)
+                if message.contains("DefaultTimeUnlimited requires account limits")
+        ));
         assert_eq!(spec.time_limit, None);
 
         cm.association_cache().set_loaded_without_associations();
