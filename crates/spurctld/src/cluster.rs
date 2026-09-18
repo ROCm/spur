@@ -15204,6 +15204,30 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_default_rechecks_account_cache_before_defaulting() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.accounting.database_url = "postgres://unused-in-test".into();
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.qos_cache().insert(unlimited_default_qos());
+        let mut spec = unlimited_default_spec();
+
+        let err = cm
+            .apply_submission_time_default(&mut spec, &cm.partitions.read(), 60)
+            .unwrap_err();
+        let SubmitError::Unavailable(message) = err else {
+            panic!("expected unavailable account policy, got {err:?}");
+        };
+        assert!(message.contains("DefaultTimeUnlimited requires account limits"));
+        assert_eq!(spec.time_limit, None);
+
+        cm.association_cache().set_loaded_without_associations();
+        cm.apply_submission_time_default(&mut spec, &[], 60)
+            .unwrap();
+        assert_eq!(spec.time_limit, None);
+    }
+
     fn qos_with_limits(name: &str, limits: spur_core::accounting::QosLimits, deny: bool) -> Qos {
         Qos {
             name: name.into(),

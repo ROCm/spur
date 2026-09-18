@@ -607,8 +607,9 @@ defaulting; a finite time supplied by the hook is preserved.
 Accounting changes take effect after the controller caches refresh, not
 necessarily when ``sacctmgr`` returns. The refresh interval is
 ``accounting.fairshare_refresh_secs`` (default 300 seconds, ten-second minimum).
-Failed refreshes retain the last successful policy. Submissions needing unavailable initial
-accounting policy fail retryably rather than assuming unlimited permission.
+Failed refreshes retain the last successful policy. When initial accounting
+policy is unavailable, submissions return an error that allows a retry rather
+than assuming unlimited permission.
 
 The flag changes neither existing jobs/allocations nor named reservations. A
 new unlimited allocation needs no periodic wall-time renewal, but reservations
