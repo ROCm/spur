@@ -4,7 +4,6 @@
 //! Tower middleware that records controller RPC handler durations on the leader.
 
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -107,24 +106,27 @@ pub(crate) fn peer_addr(extensions: &http::Extensions) -> Option<String> {
     extensions
         .get::<tonic::transport::server::TcpConnectInfo>()
         .and_then(|info| info.remote_addr())
-        .map(canonical_peer)
-}
-
-/// A dual-stack listener reports an IPv4 client as `[::ffff:a.b.c.d]:port`,
-/// which nobody would search for. Record the plain IPv4 form instead.
-fn canonical_peer(addr: SocketAddr) -> String {
-    match addr.ip() {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()).to_string(),
-            None => addr.to_string(),
-        },
-        IpAddr::V4(_) => addr.to_string(),
-    }
+        .map(spur_core::peer::canonical_peer)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards this copy of `peer_addr`: a dual-stack listener hands us the
+    /// IPv4-mapped form, and every daemon must log the plain IPv4 form.
+    #[test]
+    fn peer_addr_unwraps_an_ipv4_mapped_client() {
+        let mut ext = http::Extensions::new();
+        ext.insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some("[::ffff:10.0.0.4]:51234".parse().unwrap()),
+        });
+        assert_eq!(peer_addr(&ext).as_deref(), Some("10.0.0.4:51234"));
+
+        // No connection info at all (a non-TCP or test transport) is not an error.
+        assert_eq!(peer_addr(&http::Extensions::new()), None);
+    }
 
     #[test]
     fn grpc_operation_name_parses_method_from_path() {
@@ -133,25 +135,6 @@ mod tests {
             "SubmitJob"
         );
         assert_eq!(grpc_operation_name("/unknown"), "unknown");
-    }
-
-    /// Every IPv4 caller arrives mapped on the deployed dual-stack listener,
-    /// and storing that form made the documented `Peer=<ipv4>` query return nothing.
-    #[test]
-    fn canonical_peer_unwraps_an_ipv4_mapped_client() {
-        let mapped: SocketAddr = "[::ffff:10.11.99.183]:45218".parse().unwrap();
-        assert_eq!(canonical_peer(mapped), "10.11.99.183:45218");
-
-        let plain: SocketAddr = "10.11.99.183:45218".parse().unwrap();
-        assert_eq!(canonical_peer(plain), "10.11.99.183:45218");
-    }
-
-    #[test]
-    fn canonical_peer_leaves_a_real_ipv6_client_bracketed() {
-        // Genuine IPv6 keeps `SocketAddr`'s bracketed form, which the audit
-        // query matches with its bracketed arm.
-        let v6: SocketAddr = "[2001:db8::1]:6817".parse().unwrap();
-        assert_eq!(canonical_peer(v6), "[2001:db8::1]:6817");
     }
 
     #[test]
