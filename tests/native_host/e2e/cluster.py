@@ -373,8 +373,11 @@ class SpurCluster:
     def teardown(self):
         """Kill all daemons and remove the working directory."""
         self.stop()
+        # Detached supervisors survive stop(), so reap them or they leak across
+        # tests — at teardown, not stop_agents(), so a test can still watch one survive.
         rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
         for node in self.nodes:
+            self._pkill(node, f"{self.bin_dir}/spurstepd", use_sudo=self.agent_as_root)
             node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
         logger.info("Cluster torn down")
 
