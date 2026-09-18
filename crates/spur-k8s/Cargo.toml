@@ -41,6 +41,7 @@ backon = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,226 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The one way the operator opens a channel to spurctld.
+
+use std::future::Future;
+use std::time::Duration;
+
+use tonic::transport::{Channel, Endpoint};
+use tonic::Status;
+
+use spur_proto::controller_rpc_retryable;
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+
+// A Service with no ready endpoint drops the SYN and the kernel retries it for
+// over two minutes. Give up long before that, so the task's retry loop opens a
+// fresh connection soon after the controller becomes ready.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// A killed controller Pod leaves the channel open until the kernel gives up on
+// it, and every RPC waits with it. Pings find the dead peer in seconds; the
+// request bound is the backstop. No RPC on this channel streams.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn controller_url(addr: &str) -> String {
+    if addr.starts_with("http") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
+pub async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<Channel>> {
+    let channel = Endpoint::from_shared(controller_url(addr))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .timeout(REQUEST_TIMEOUT)
+        .connect()
+        .await?;
+    Ok(SlurmControllerClient::new(channel)
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE))
+}
+
+/// The readiness probe only asks whether the controller accepts a connection.
+/// kubelet's own timeout decides readiness; the connect bound only frees the
+/// handler, which a dropped SYN would otherwise hold for the kernel's SYN retries.
+pub async fn probe(addr: &str) -> anyhow::Result<()> {
+    Endpoint::from_shared(controller_url(addr))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .connect()
+        .await?;
+    Ok(())
+}
+
+/// The one long-lived client of a task: reconnects after a transport error.
+pub struct ControllerClient {
+    addr: String,
+    client: Option<SlurmControllerClient<Channel>>,
+}
+
+impl ControllerClient {
+    /// The first call opens the channel, so a task can start before the
+    /// controller is ready instead of failing and backing off.
+    pub fn new(addr: &str) -> Self {
+        Self {
+            addr: addr.to_string(),
+            client: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_channel(&self) -> bool {
+        self.client.is_some()
+    }
+
+    pub async fn call<T, F, Fut>(&mut self, rpc: F) -> Result<T, Status>
+    where
+        F: FnOnce(SlurmControllerClient<Channel>) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let client = match &self.client {
+            Some(client) => client.clone(),
+            None => {
+                let client = connect(&self.addr).await.map_err(|e| {
+                    Status::unavailable(format!("cannot reach the controller: {e}"))
+                })?;
+                self.client.insert(client).clone()
+            }
+        };
+        let result = rpc(client).await;
+        // A dead peer answers nothing until the kernel gives up, and the request
+        // bound alone does not close the channel, so the next call would wait
+        // on the same dead connection.
+        if let Err(status) = &result {
+            if controller_rpc_retryable(status) {
+                self.client = None;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unconnected() -> ControllerClient {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        ControllerClient {
+            addr: "127.0.0.1:1".to_string(),
+            client: Some(SlurmControllerClient::new(channel)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_drops_the_channel_and_a_refusal_keeps_it() {
+        let mut ctrl = unconnected();
+        let refused: Result<(), Status> = ctrl
+            .call(|_| async { Err(Status::not_found("no such job")) })
+            .await;
+        assert!(refused.is_err());
+        assert!(
+            ctrl.client.is_some(),
+            "a refusal is an answer, the channel is fine"
+        );
+
+        let gone: Result<(), Status> = ctrl
+            .call(|_| async { Err(Status::cancelled("Timeout expired")) })
+            .await;
+        assert!(gone.is_err());
+        assert!(
+            ctrl.client.is_none(),
+            "a timeout means the peer may be gone"
+        );
+    }
+
+    /// A peer that accepts the connection and never answers is what a killed
+    /// Pod looks like until the kernel gives up. The connect runs on the real
+    /// clock, because loopback I/O must be polled; the paused clock afterwards
+    /// jumps straight to the timers, so the real bounds apply and the test
+    /// still ends at once.
+    #[tokio::test]
+    async fn a_silent_peer_fails_the_call_in_bounded_time_and_drops_the_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let client = connect(&addr)
+            .await
+            .expect("the kernel completes the handshake");
+        let mut ctrl = ControllerClient {
+            addr,
+            client: Some(client),
+        };
+
+        tokio::time::pause();
+        let err = ctrl
+            .call(|mut c| async move { c.ping(()).await })
+            .await
+            .expect_err("nothing answers on that socket");
+        assert!(controller_rpc_retryable(&err), "{err}");
+        assert!(ctrl.client.is_none(), "the dead channel must not be reused");
+    }
+
+    /// The client starts without a channel and the first call opens it. After
+    /// a transport error the next call opens a new one.
+    #[tokio::test]
+    async fn the_next_call_after_a_transport_error_reconnects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut ctrl = ControllerClient::new(&addr);
+        assert!(
+            ctrl.client.is_none(),
+            "nothing connects before the first call"
+        );
+
+        let gone: Result<(), Status> = ctrl
+            .call(|_| async { Err(Status::cancelled("Timeout expired")) })
+            .await;
+        assert!(gone.is_err());
+        assert!(ctrl.client.is_none(), "the channel is dropped");
+
+        let answered: Result<(), Status> = ctrl.call(|_| async { Ok(()) }).await;
+        assert!(answered.is_ok());
+        assert!(ctrl.client.is_some(), "the call reconnected");
+    }
+
+    /// Nothing listens on port 1, so the kernel refuses the connect at once.
+    #[tokio::test]
+    async fn a_refused_connect_is_unavailable_and_leaves_no_channel() {
+        let mut ctrl = ControllerClient::new("127.0.0.1:1");
+
+        let err = ctrl
+            .call(|mut c| async move { c.ping(()).await })
+            .await
+            .expect_err("nothing listens on port 1");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        assert!(ctrl.client.is_none());
+    }
+
+    /// Nothing listens on port 1, so the kernel refuses the connect at once.
+    #[tokio::test]
+    async fn a_probe_of_a_refused_port_fails() {
+        assert!(probe("127.0.0.1:1").await.is_err());
+    }
+
+    #[test]
+    fn controller_url_adds_a_scheme_only_when_one_is_missing() {
+        assert_eq!(
+            controller_url("spurctld-client:6817"),
+            "http://spurctld-client:6817"
+        );
+        assert_eq!(
+            controller_url("http://spurctld:6817"),
+            "http://spurctld:6817"
+        );
+        assert_eq!(
+            controller_url("https://spurctld:6817"),
+            "https://spurctld:6817"
+        );
+    }
+}
