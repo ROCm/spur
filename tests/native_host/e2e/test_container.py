@@ -535,6 +535,36 @@ class TestContainerRemapRootSrun:
             f"bind-mount file must be owned by the submitter on the host, got uid {owner}"
         )
 
+    def test_remap_does_not_inherit_root_group(self, remap_cluster):
+        # The remapped workload must carry the submitter's groups on the host, not
+        # the root daemon's (esp. gid 0), or it could reach group-root host files.
+        cluster = remap_cluster
+        bind_dir = f"{cluster.remote_dir}/grp-bind"
+        sudo = cluster._sudo_prefix()
+        for node in cluster.nodes:
+            node.exec(f"rm -rf '{bind_dir}'; mkdir -p '{bind_dir}'; chmod 755 '{bind_dir}'")
+            node.exec(
+                f"echo GROUP_ROOT_SECRET | {sudo}tee '{bind_dir}/g' >/dev/null; "
+                f"{sudo}chown root:root '{bind_dir}/g'; {sudo}chmod 0640 '{bind_dir}/g'"
+            )
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02",
+            f"--container-image={cluster.remap_image}",
+            "--container-remap-root",
+            f"--container-mounts={bind_dir}:/mnt/g",
+            "bash", "-c",
+            "if cat /mnt/g/g 2>/dev/null; then echo GRPREAD=leak; "
+            "else echo GRPREAD=blocked; fi; echo DONE",
+        ])
+        assert code == 0 and "DONE" in out, f"srun failed (exit {code}):\n{out}"
+        vals = _parse_kv(out)
+        assert vals.get("GRPREAD") == "blocked", (
+            f"container-root must NOT read a root-group file (root-group leak):\n{out}"
+        )
+        assert "GROUP_ROOT_SECRET" not in out, (
+            f"root-group file contents leaked into the container:\n{out}"
+        )
+
 
 class TestContainerRemapRootSbatch:
     def test_with_remap_is_root_and_writes_root(self, remap_cluster):

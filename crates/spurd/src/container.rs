@@ -1333,6 +1333,16 @@ pub fn container_init(
         }
     }
 
+    // Shed root's groups (esp. gid 0) to the submitter's while we still hold
+    // CAP_SETGID; the userns setgroups=deny freezes them right after.
+    if mode == UserNamespaceMode::SubmitterAsRoot {
+        let gids: Vec<nix::unistd::Gid> = supplementary_gids
+            .iter()
+            .map(|g| nix::unistd::Gid::from_raw(*g))
+            .collect();
+        nix::unistd::setgroups(&gids).context("setgroups to submitter before remap")?;
+    }
+
     create_namespaces(mode, config.uid, config.gid, map_sock)
         .context("create container namespaces")?;
 
