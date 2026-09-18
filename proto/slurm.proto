@@ -1674,8 +1674,8 @@ message CreateQosRequest {
   optional uint32 max_submit_jobs_per_account = 16;
   // Max submitted (pending + running) jobs across all users in this QOS.
   optional uint32 grp_submit_jobs = 17;
-  // Comma-separated QOS flags. Recognized: DenyOnLimit. Unset preserves the
-  // stored flags; explicit empty clears them.
+  // Comma-separated QOS flags: DenyOnLimit, DefaultTimeUnlimited.
+  // Unset preserves stored flags; explicit empty clears them.
   optional string flags = 18;
 }
 

@@ -57,21 +57,28 @@ fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>,
     }
 }
 
-/// Validate and canonicalize the QOS `flags` string. Only `DenyOnLimit` is
-/// recognized; an unknown token errors loudly rather than being silently
-/// dropped (a dropped flag reads as "set" but never takes effect).
+/// Unknown flags must error rather than appear to be set without taking effect.
 fn canonicalize_qos_flags(raw: &str) -> Result<String, Status> {
-    let mut deny_on_limit = false;
+    let supported = ["DenyOnLimit", "DefaultTimeUnlimited"];
+    let mut enabled = [false; 2];
     for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if token.eq_ignore_ascii_case("denyonlimit") {
-            deny_on_limit = true;
-        } else {
+        let Some(index) = supported
+            .iter()
+            .position(|flag| token.eq_ignore_ascii_case(flag))
+        else {
             return Err(Status::invalid_argument(format!(
-                "unknown QOS flag '{token}'. Supported: DenyOnLimit"
+                "unknown QOS flag '{token}'. Supported: {}",
+                supported.join(", ")
             )));
-        }
+        };
+        enabled[index] = true;
     }
-    Ok(if deny_on_limit { "DenyOnLimit" } else { "" }.to_string())
+    Ok(supported
+        .into_iter()
+        .zip(enabled)
+        .filter_map(|(flag, enabled)| enabled.then_some(flag))
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 /// Fairshare is a whole share count stored as `INTEGER`, but the proto carries
@@ -1219,7 +1226,16 @@ mod tests {
             canonicalize_qos_flags(" DENYONLIMIT , ").unwrap(),
             "DenyOnLimit"
         );
-        let err = canonicalize_qos_flags("bogus").unwrap_err();
+        assert_eq!(canonicalize_qos_flags(" , ").unwrap(), "");
+        assert_eq!(
+            canonicalize_qos_flags(" defaulttimeUNLIMITED , DefaultTimeUnlimited ").unwrap(),
+            "DefaultTimeUnlimited"
+        );
+        assert_eq!(
+            canonicalize_qos_flags("DefaultTimeUnlimited,denyonlimit,DenyOnLimit").unwrap(),
+            "DenyOnLimit,DefaultTimeUnlimited"
+        );
+        let err = canonicalize_qos_flags("DefaultTimeUnlimited,bogus").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("bogus"));
     }
