@@ -34,7 +34,7 @@ impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
 pub struct NodeReporter {
     pub hostname: String,
     pub controller_addr: String,
-    pub resources: ResourceSet,
+    pub resources: RwLock<ResourceSet>,
     pub node_address: spur_net::NodeAddress,
     pub labels: HashMap<String, String>,
     pub free_memory_mb: AtomicU64,
@@ -71,7 +71,7 @@ impl NodeReporter {
         Self {
             hostname,
             controller_addr,
-            resources,
+            resources: RwLock::new(resources),
             node_address,
             labels,
             free_memory_mb: AtomicU64::new(0),
@@ -102,8 +102,32 @@ impl NodeReporter {
         self.held_jobs.held_job_ids()
     }
 
-    /// Register with the controller.
+    pub fn snapshot_resources(&self) -> ResourceSet {
+        self.resources.read().unwrap().clone()
+    }
+
+    /// Swap the reported inventory if its schedulable content changed. Ignores
+    /// `generation` so a pure generation bump does not itself count as a change.
+    pub fn update_resources(&self, fresh: ResourceSet) -> bool {
+        let mut cur = self.resources.write().unwrap();
+        let changed = cur.cpus != fresh.cpus
+            || cur.memory_mb != fresh.memory_mb
+            || cur.gpus != fresh.gpus
+            || cur.generic != fresh.generic;
+        *cur = fresh;
+        changed
+    }
+
+    /// Register with the controller, reporting the reporter's current inventory.
     pub async fn register(&self) -> anyhow::Result<()> {
+        self.register_with(&self.snapshot_resources()).await
+    }
+
+    /// Register with the controller reporting a specific inventory. The refresh
+    /// task uses this to converge on a fresh set WITHOUT first committing it to
+    /// the reporter baseline, so a failed register leaves the baseline unchanged
+    /// and the next tick re-detects the same delta and retries.
+    pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
         let channel = spur_client::connect_channel(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for registration")?;
@@ -112,10 +136,11 @@ impl NodeReporter {
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
+        let resources = resource_to_proto(resources);
         let resp = client
             .register_agent(RegisterAgentRequest {
                 hostname: self.hostname.clone(),
-                resources: Some(resource_to_proto(&self.resources)),
+                resources: Some(resources),
                 version: env!("CARGO_PKG_VERSION").into(),
                 address: self.node_address.ip.clone(),
                 port: self.node_address.port as u32,
@@ -272,6 +297,120 @@ fn warn_without_node_identity(node_token: &str) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InventoryDelta {
+    Unchanged,
+    FreeCapacityChanged,
+    AllocatedDevicesLost,
+}
+
+/// Default cadence of the periodic inventory-refresh task.
+pub const DEFAULT_INVENTORY_REFRESH_SECS: u64 = 60;
+
+/// What a debounced refresh tick resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshAction {
+    /// Nothing to do: inventory unchanged, or a change not yet seen twice.
+    Wait,
+    /// Apply the fresh set as new free capacity, then converge the controller.
+    ApplyCapacity,
+    /// A held device vanished; converge so the controller's advertised GRES
+    /// reflects the shrunk inventory. This does not drain the affected job.
+    ReportLost,
+}
+
+/// Fingerprint of a schedulable set, used to debounce on inventory identity.
+pub type InventoryFingerprint = (u32, u64, Vec<u32>, Vec<(String, u64)>);
+
+/// Debounced per-tick decision. A non-`Unchanged` delta acts only when it
+/// repeats AND the fresh inventory identity matches the previous tick's, so two
+/// DIFFERENT partial reads that both classify the same delta never converge on
+/// a topology observed only once. Returns the action plus the delta and
+/// fingerprint to carry into the next tick.
+pub fn next_refresh_action(
+    delta: &InventoryDelta,
+    fresh_fp: &InventoryFingerprint,
+    last_delta: &InventoryDelta,
+    last_fp: &InventoryFingerprint,
+) -> (RefreshAction, InventoryDelta) {
+    // Reset on unchanged; arm (but don't act) on a first sighting or when either
+    // the delta or the observed inventory differs from the prior tick.
+    if *delta == InventoryDelta::Unchanged || delta != last_delta || fresh_fp != last_fp {
+        return (RefreshAction::Wait, delta.clone());
+    }
+    let action = match delta {
+        InventoryDelta::FreeCapacityChanged => RefreshAction::ApplyCapacity,
+        InventoryDelta::AllocatedDevicesLost => RefreshAction::ReportLost,
+        InventoryDelta::Unchanged => RefreshAction::Wait,
+    };
+    (action, InventoryDelta::Unchanged)
+}
+
+/// Whether the reporter baseline should be advanced to the just-converged set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineCommit {
+    Commit,
+    Keep,
+}
+
+/// Resolve the baseline commit and debounce carry after a converge attempt.
+///
+/// The reporter baseline is the source `classify` compares against, so it must
+/// advance ONLY once the controller has acknowledged the fresh set. On success
+/// commit and reset the carry; on failure keep the old baseline (so the next
+/// tick re-detects the same delta) and re-arm that delta so the retry fires on
+/// the very next tick instead of re-serving the seen-twice debounce.
+pub fn post_converge(
+    acted_delta: &InventoryDelta,
+    registered_ok: bool,
+) -> (BaselineCommit, InventoryDelta) {
+    if registered_ok {
+        (BaselineCommit::Commit, InventoryDelta::Unchanged)
+    } else {
+        (BaselineCommit::Keep, acted_delta.clone())
+    }
+}
+
+/// A zero, empty, or unparseable value falls back to the default; zero would
+/// otherwise panic `tokio::time::interval`.
+fn parse_refresh_secs(raw: Option<String>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_INVENTORY_REFRESH_SECS)
+}
+
+/// Cadence of the inventory-refresh task, from `SPUR_INVENTORY_REFRESH_SECS`
+/// (so e2e can drive convergence fast) or the default.
+pub fn inventory_refresh_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(parse_refresh_secs(
+        std::env::var("SPUR_INVENTORY_REFRESH_SECS").ok(),
+    ))
+}
+
+/// Classify how the reported inventory changed between refreshes. Distinguishes a device that
+/// is merely absent (free capacity shrank) from one that is absent AND currently allocated to a
+/// job (the refresh task must fence/hold instead of silently losing track of it).
+pub fn classify(
+    old: &ResourceSet,
+    new: &ResourceSet,
+    allocated_stable_ids: &std::collections::HashSet<u32>,
+) -> InventoryDelta {
+    if old.cpus == new.cpus
+        && old.memory_mb == new.memory_mb
+        && old.gpus == new.gpus
+        && old.generic == new.generic
+    {
+        return InventoryDelta::Unchanged;
+    }
+    let new_ids: std::collections::HashSet<u32> = new.gpus.iter().map(|g| g.stable_id).collect();
+    let lost_held = allocated_stable_ids.iter().any(|id| !new_ids.contains(id));
+    if lost_held {
+        InventoryDelta::AllocatedDevicesLost
+    } else {
+        InventoryDelta::FreeCapacityChanged
+    }
+}
+
 /// Discover local node resources from sysfs / /proc + device registry.
 pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
     let cpus = discover_cpus();
@@ -283,6 +422,8 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         memory_mb,
         gpus,
         generic: generic_from_registry(registry),
+        // Bumped by the periodic refresh task on topology rebuild, not here.
+        generation: 0,
     }
 }
 
@@ -321,6 +462,7 @@ fn gpus_from_registry(registry: &DeviceRegistry) -> Vec<GpuResource> {
             memory_mb: entry.memory_mb,
             peer_gpus: build_peer_gpus(entry.links.as_deref(), &gpu_device_ids),
             link_type: link_type_to_gpu(resolve_link_type(entry)),
+            stable_id: entry.stable_id,
         })
         .collect()
 }
@@ -468,6 +610,7 @@ pub fn allocations_to_proto(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -488,9 +631,11 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
                     GpuLinkType::NVLink => spur_proto::proto::GpuLinkType::GpuLinkNvlink as i32,
                     GpuLinkType::PCIe => spur_proto::proto::GpuLinkType::GpuLinkPcie as i32,
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic.clone(),
+        generation: r.generation,
     }
 }
 
@@ -541,6 +686,47 @@ mod tests {
         let gpus = gpus_from_registry(&reg);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
+    }
+
+    #[test]
+    fn gpus_from_registry_sets_stable_id_from_render_minor() {
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: vec![CdiDevice {
+                name: "0".into(),
+                annotations: [
+                    (annotations::GPU_TYPE.into(), "mi300x".into()),
+                    (annotations::RENDER_MINOR.into(), "129".into()),
+                ]
+                .into(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![DeviceNode {
+                        path: "/dev/dri/renderD129".into(),
+                        host_path: None,
+                        r#type: None,
+                        major: None,
+                        minor: None,
+                        file_mode: None,
+                        permissions: None,
+                        uid: None,
+                        gid: None,
+                    }],
+                    ..Default::default()
+                }),
+            }],
+            container_edits: None,
+        };
+
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&cache, &GresCache::from_entries(&[]));
+
+        let gpus = gpus_from_registry(&reg);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].stable_id, 129);
     }
 
     #[test]
@@ -661,5 +847,198 @@ mod tests {
         let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
             Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
         assert_eq!(map.held_job_ids(), vec![7]);
+    }
+
+    fn test_reporter(resources: ResourceSet) -> NodeReporter {
+        NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            resources,
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
+        )
+    }
+
+    #[test]
+    fn classify_detects_free_growth_and_allocated_loss() {
+        use std::collections::HashSet;
+        let g = |d: u32, s: u32| GpuResource {
+            device_id: d,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            stable_id: s,
+        };
+        let rs = |gpus: Vec<GpuResource>| ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus,
+            generic: Default::default(),
+            generation: 0,
+        };
+        let two = rs(vec![g(0, 128), g(1, 129)]);
+        let three = rs(vec![g(0, 128), g(1, 129), g(2, 130)]);
+        let one = rs(vec![g(0, 128)]);
+
+        // unchanged
+        assert_eq!(
+            classify(&two, &two, &HashSet::new()),
+            InventoryDelta::Unchanged
+        );
+        // grew, nothing allocated -> free capacity change
+        assert_eq!(
+            classify(&two, &three, &HashSet::new()),
+            InventoryDelta::FreeCapacityChanged
+        );
+        // 129 removed but not allocated -> free capacity change
+        assert_eq!(
+            classify(&two, &one, &HashSet::new()),
+            InventoryDelta::FreeCapacityChanged
+        );
+        // 129 removed AND held -> allocated loss
+        let held: HashSet<u32> = [129].into_iter().collect();
+        assert_eq!(
+            classify(&two, &one, &held),
+            InventoryDelta::AllocatedDevicesLost
+        );
+    }
+
+    #[test]
+    fn update_resources_reports_change_ignoring_generation() {
+        let base = ResourceSet {
+            cpus: 4,
+            memory_mb: 512,
+            gpus: vec![],
+            generic: Default::default(),
+            generation: 1,
+        };
+        let reporter = test_reporter(base.clone());
+        // same content, different generation -> not a change
+        let mut same = base.clone();
+        same.generation = 2;
+        assert!(!reporter.update_resources(same));
+        // different cpu count -> change
+        let mut diff = base.clone();
+        diff.cpus = 8;
+        assert!(reporter.update_resources(diff));
+        assert_eq!(reporter.snapshot_resources().cpus, 8);
+    }
+
+    fn fp(cpus: u32, gpu_ids: &[u32]) -> InventoryFingerprint {
+        (cpus, 1024, gpu_ids.to_vec(), Vec::new())
+    }
+
+    #[test]
+    fn unchanged_tick_never_acts_and_resets_last_delta() {
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::Unchanged,
+            &fp(8, &[0, 1]),
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0, 1]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::Unchanged);
+    }
+
+    #[test]
+    fn a_change_seen_once_only_arms_then_acts_on_the_second() {
+        // First sighting: arm, do not act.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0, 1]),
+            &InventoryDelta::Unchanged,
+            &fp(0, &[]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::FreeCapacityChanged);
+        // Same delta AND same inventory again: act, and reset the carry.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0, 1]),
+            &last,
+            &fp(8, &[0, 1]),
+        );
+        assert_eq!(action, RefreshAction::ApplyCapacity);
+        assert_eq!(last, InventoryDelta::Unchanged);
+    }
+
+    #[test]
+    fn allocated_loss_seen_twice_selects_report_lost() {
+        let (action, _) = next_refresh_action(
+            &InventoryDelta::AllocatedDevicesLost,
+            &fp(8, &[0]),
+            &InventoryDelta::AllocatedDevicesLost,
+            &fp(8, &[0]),
+        );
+        assert_eq!(action, RefreshAction::ReportLost);
+    }
+
+    #[test]
+    fn a_different_change_on_the_second_tick_re_arms_instead_of_acting() {
+        // Free-capacity armed last tick, but this tick reads a held-device loss:
+        // the two disagree, so re-arm on the new delta rather than act on either.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::AllocatedDevicesLost,
+            &fp(8, &[0]),
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::AllocatedDevicesLost);
+    }
+
+    #[test]
+    fn same_delta_but_different_inventory_does_not_act() {
+        // Two ticks both classify FreeCapacityChanged, but the observed GPU sets
+        // differ (one topology was never seen twice) -> arm, do not act.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[128, 129]),
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[130, 131]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::FreeCapacityChanged);
+    }
+
+    #[test]
+    fn a_failed_register_keeps_the_baseline_and_re_arms_for_retry() {
+        // The invariant that fixes convergence-loss: on register failure the
+        // baseline must NOT advance, and the acted delta is re-armed so the very
+        // next tick retries instead of re-serving the seen-twice debounce.
+        let (commit, next) = post_converge(&InventoryDelta::AllocatedDevicesLost, false);
+        assert_eq!(commit, BaselineCommit::Keep);
+        assert_eq!(next, InventoryDelta::AllocatedDevicesLost);
+    }
+
+    #[test]
+    fn a_successful_register_commits_the_baseline_and_resets() {
+        let (commit, next) = post_converge(&InventoryDelta::FreeCapacityChanged, true);
+        assert_eq!(commit, BaselineCommit::Commit);
+        assert_eq!(next, InventoryDelta::Unchanged);
+    }
+
+    #[test]
+    fn refresh_secs_falls_back_on_unset_zero_and_garbage() {
+        assert_eq!(parse_refresh_secs(None), DEFAULT_INVENTORY_REFRESH_SECS);
+        assert_eq!(
+            parse_refresh_secs(Some("0".into())),
+            DEFAULT_INVENTORY_REFRESH_SECS
+        );
+        assert_eq!(
+            parse_refresh_secs(Some("nope".into())),
+            DEFAULT_INVENTORY_REFRESH_SECS
+        );
+        assert_eq!(parse_refresh_secs(Some("5".into())), 5);
     }
 }

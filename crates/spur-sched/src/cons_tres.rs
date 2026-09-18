@@ -30,6 +30,17 @@ pub enum AllocError {
     CpusUnavailable,
 }
 
+/// Outcome of applying a fresh inventory to a node's live allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapacityChange {
+    /// Applied cleanly: cpu/mem/gpu capacity rebuilt from `fresh`; any live
+    /// allocations remain valid (their stable_ids still present).
+    Applied,
+    /// One or more stable_ids that a job currently holds are gone in `fresh`.
+    /// Capacity is NOT modified. Carries the affected (job_id, lost_stable_ids).
+    AllocatedDevicesLost(Vec<(u32, Vec<u32>)>),
+}
+
 /// Per-node resource allocation state.
 /// Tracks which specific cores and GPUs are allocated.
 #[derive(Debug, Clone)]
@@ -72,6 +83,58 @@ impl NodeAllocation {
         }
     }
 
+    /// Apply a freshly-discovered inventory to this node's live allocation.
+    /// Rebuilds capacity when every live-held GPU is still present; otherwise
+    /// reports the lost devices and leaves capacity untouched so the caller
+    /// can drive policy (drain/fail) before anything is mutated.
+    pub fn update_capacity(&mut self, fresh: &ResourceSet) -> CapacityChange {
+        let fresh_ids: HashSet<u32> = fresh.gpus.iter().map(|g| g.stable_id).collect();
+
+        // Which live-owned stable ids are gone in the fresh set?
+        let mut lost: Vec<(u32, Vec<u32>)> = self
+            .owners
+            .iter()
+            .filter_map(|(job, owned)| {
+                let alloc = &owned.result;
+                let gone: Vec<u32> = alloc
+                    .gpu_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !fresh_ids.contains(id))
+                    .collect();
+                (!gone.is_empty()).then_some((*job, gone))
+            })
+            .collect();
+        // A held core above the new cpu count would be truncated by the resize,
+        // freeing a bit its owner still holds. Defer like the GPU case; entries
+        // carry an empty device list since the loss is a CPU id, not a stable_id.
+        for (job, owned) in &self.owners {
+            if owned.result.cpu_ids.iter().any(|&c| c >= fresh.cpus) {
+                lost.push((*job, Vec::new()));
+            }
+        }
+        if !lost.is_empty() {
+            lost.sort_by_key(|(job, _)| *job);
+            return CapacityChange::AllocatedDevicesLost(lost);
+        }
+
+        // Safe to rebuild: no held device disappeared. Preserve allocation
+        // bitmaps by re-deriving them from owners against the new gpu table.
+        self.total_cpus = fresh.cpus;
+        self.allocated_cpus.resize(fresh.cpus as usize, false);
+        self.total_memory_mb = fresh.memory_mb;
+        self.gpus = fresh.gpus.clone();
+        self.gpu_allocated = vec![false; self.gpus.len()];
+        for owned in self.owners.values() {
+            for &sid in &owned.result.gpu_ids {
+                if let Some(idx) = self.gpus.iter().position(|g| g.stable_id == sid) {
+                    self.gpu_allocated[idx] = true;
+                }
+            }
+        }
+        CapacityChange::Applied
+    }
+
     /// Available (unallocated) CPU count.
     pub fn free_cpus(&self) -> u32 {
         self.allocated_cpus.iter().filter(|&&a| !a).count() as u32
@@ -83,13 +146,13 @@ impl NodeAllocation {
             .saturating_sub(self.allocated_memory_mb)
     }
 
-    /// Device ids of all currently-allocated GPUs (for diagnostics).
+    /// Stable ids of all currently-allocated GPUs (for diagnostics).
     pub fn allocated_gpu_ids(&self) -> Vec<u32> {
         self.gpu_allocated
             .iter()
             .enumerate()
             .filter(|(_, &a)| a)
-            .filter_map(|(i, _)| self.gpus.get(i).map(|g| g.device_id))
+            .filter_map(|(i, _)| self.gpus.get(i).map(|g| g.stable_id))
             .collect()
     }
 
@@ -127,7 +190,7 @@ impl NodeAllocation {
 
     /// Free the bitmaps/counters an allocation held. Internal helper: callers
     /// go through `release_job` so per-job ownership stays consistent. GPU ids
-    /// are device ids, matched against the node's GPU table the same way
+    /// are stable ids, matched against the node's GPU table the same way
     /// `allocate_for_job` records them.
     fn release(&mut self, alloc: &AllocationResult) {
         for &cpu in &alloc.cpu_ids {
@@ -136,14 +199,14 @@ impl NodeAllocation {
             }
         }
         self.allocated_memory_mb = self.allocated_memory_mb.saturating_sub(alloc.memory_mb);
-        for &device_id in &alloc.gpu_ids {
-            if let Some(idx) = self.gpus.iter().position(|g| g.device_id == device_id) {
+        for &stable_id in &alloc.gpu_ids {
+            if let Some(idx) = self.gpus.iter().position(|g| g.stable_id == stable_id) {
                 self.gpu_allocated[idx] = false;
             }
         }
     }
 
-    /// Reserve resources for a job, keyed by job id. GPU device ids are the
+    /// Reserve resources for a job, keyed by job id. GPU stable ids are the
     /// hard gate (unknown or in-use → `GpusUnavailable`); a launch already in
     /// flight for the same job id → `DuplicateJob`. CPU is best-effort since the
     /// controller owns placement. Memory is always accounted so release stays
@@ -178,7 +241,7 @@ impl NodeAllocation {
             let idx = self
                 .gpus
                 .iter()
-                .position(|g| g.device_id == id)
+                .position(|g| g.stable_id == id)
                 .ok_or(AllocError::GpusUnavailable)?;
             if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
                 return Err(AllocError::GpusUnavailable);
@@ -269,7 +332,7 @@ impl NodeAllocation {
             let idx = self
                 .gpus
                 .iter()
-                .position(|g| g.device_id == id)
+                .position(|g| g.stable_id == id)
                 .ok_or(AllocError::GpusUnavailable)?;
             if (self.gpu_allocated[idx] && !held_gpus.contains(&id)) || gpu_indices.contains(&idx) {
                 return Err(AllocError::GpusUnavailable);
@@ -445,6 +508,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: device_id,
             })
             .collect();
 
@@ -976,5 +1040,159 @@ mod tests {
         };
         assert_eq!(alloc.cpu_list(), "0,1,2,3");
         assert_eq!(alloc.gpu_list(), "0,1");
+    }
+
+    #[test]
+    fn update_capacity_grows_and_preserves_live_allocation() {
+        let mk = |ids: &[(u32, u32)]| ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: ids
+                .iter()
+                .map(|&(d, s)| GpuResource {
+                    device_id: d,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: s,
+                })
+                .collect(),
+            generic: Default::default(),
+            generation: 1,
+        };
+        // start with 2 gpus (stable 128,129); job holds stable 129
+        let mut node = NodeAllocation::new("n".into(), &mk(&[(0, 128), (1, 129)]));
+        node.allocate_for_job(7, 0, 0, 0, &[129]).unwrap();
+        // grow to 4 gpus (SPX->CPX-ish); 129 still present
+        let change = node.update_capacity(&mk(&[(0, 128), (1, 129), (2, 130), (3, 131)]));
+        assert!(matches!(change, CapacityChange::Applied));
+        // free count reflects new total minus the still-held one
+        assert_eq!(node.gpus.len(), 4);
+        assert_eq!(node.free_gpus(None), 3);
+        // the held allocation is intact: releasing it frees exactly one
+        assert!(node.release_job(7));
+        assert_eq!(node.free_gpus(None), 4);
+    }
+
+    #[test]
+    fn update_capacity_reports_lost_allocated_device_without_applying() {
+        let mk = |ids: &[(u32, u32)]| ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: ids
+                .iter()
+                .map(|&(d, s)| GpuResource {
+                    device_id: d,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: s,
+                })
+                .collect(),
+            generic: Default::default(),
+            generation: 1,
+        };
+        let mut node = NodeAllocation::new("n".into(), &mk(&[(0, 128), (1, 129)]));
+        node.allocate_for_job(7, 0, 0, 0, &[129]).unwrap();
+        // 129 vanishes (the device the job holds)
+        let change = node.update_capacity(&mk(&[(0, 128)]));
+        match change {
+            CapacityChange::AllocatedDevicesLost(v) => assert_eq!(v, vec![(7, vec![129])]),
+            other => panic!("expected AllocatedDevicesLost, got {other:?}"),
+        }
+        // capacity untouched: still 2 gpus, job still holds its device
+        assert_eq!(node.gpus.len(), 2);
+    }
+
+    #[test]
+    fn update_capacity_defers_cpu_shrink_that_would_truncate_held_core() {
+        let node_rs = |cpus: u32| ResourceSet {
+            cpus,
+            memory_mb: 1024,
+            gpus: vec![],
+            ..Default::default()
+        };
+        let mut node = NodeAllocation::new("n".into(), &node_rs(8));
+        // Hold core 6, which lies above a shrink to 4 cpus.
+        let alloc = node.allocate_for_job(7, 0, 8, 0, &[]).unwrap();
+        assert!(alloc.cpu_ids.contains(&6));
+
+        let change = node.update_capacity(&node_rs(4));
+        match change {
+            CapacityChange::AllocatedDevicesLost(v) => assert_eq!(v, vec![(7, Vec::new())]),
+            other => panic!("expected AllocatedDevicesLost, got {other:?}"),
+        }
+        // Capacity untouched: still 8 cpus, core 6 still held.
+        assert_eq!(node.total_cpus, 8);
+        assert_eq!(node.allocated_cpus.len(), 8);
+        assert!(node.allocated_cpus[6]);
+    }
+
+    #[test]
+    fn update_capacity_applies_benign_cpu_shrink_with_no_held_core_above() {
+        let node_rs = |cpus: u32| ResourceSet {
+            cpus,
+            memory_mb: 1024,
+            gpus: vec![],
+            ..Default::default()
+        };
+        let mut node = NodeAllocation::new("n".into(), &node_rs(8));
+        // Hold only cores 0..2, below the shrink target.
+        node.allocate_for_job(7, 0, 2, 0, &[]).unwrap();
+
+        let change = node.update_capacity(&node_rs(4));
+        assert!(matches!(change, CapacityChange::Applied));
+        assert_eq!(node.total_cpus, 4);
+        assert_eq!(node.allocated_cpus.len(), 4);
+    }
+
+    #[test]
+    fn allocation_survives_positional_renumber_by_stable_id() {
+        // Node has 3 GPUs; device_id is positional (0,1,2), stable_id is durable
+        // (128,129,130). A job holds the middle GPU (stable 129). After the first
+        // GPU vanishes and capacity is rebuilt with device_id renumbered (0,1) but
+        // stable_id preserved (129,130), the job's GPU must still resolve.
+        let gpus = vec![
+            GpuResource {
+                device_id: 0,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                stable_id: 128,
+            },
+            GpuResource {
+                device_id: 1,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                stable_id: 129,
+            },
+            GpuResource {
+                device_id: 2,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                stable_id: 130,
+            },
+        ];
+        let rs = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus,
+            generic: Default::default(),
+            generation: 1,
+        };
+        let mut node = NodeAllocation::new("n".into(), &rs);
+        // allocate by stable id 129
+        node.allocate_for_job(7, 0, 0, 0, &[129]).unwrap();
+        assert_eq!(node.free_gpus(None), 2);
+        // release by the same stable id frees it
+        assert!(node.release_job(7));
+        assert_eq!(node.free_gpus(None), 3);
     }
 }

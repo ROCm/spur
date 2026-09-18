@@ -249,6 +249,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: spur_core::resource::GpuLinkType::PCIe,
+                stable_id: i as u32,
             })
             .collect();
         NodeTimeline::new(
@@ -342,6 +343,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    stable_id: i as u32,
                 })
                 .collect(),
             ..Default::default()
@@ -371,6 +373,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    stable_id: i as u32,
                 })
                 .collect(),
             ..Default::default()
@@ -648,6 +651,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    stable_id: i as u32,
                 })
                 .collect(),
             ..Default::default()

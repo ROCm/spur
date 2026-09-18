@@ -34,6 +34,7 @@ pub struct DeviceEntry {
     pub device_edits: ContainerEdits,
     pub shared_edits: ContainerEdits,
     pub device_paths: Vec<String>,
+    pub stable_id: u32,
 }
 
 impl DeviceEntry {
@@ -82,6 +83,7 @@ pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
         device_edits,
         shared_edits,
         device_paths,
+        stable_id: meta.render_minor.unwrap_or(0),
     }
 }
 
@@ -204,6 +206,7 @@ mod tests {
             device_edits: ContainerEdits::default(),
             shared_edits: ContainerEdits::default(),
             device_paths: Vec::new(),
+            stable_id: 0,
         }
     }
 }

@@ -776,6 +776,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
         memory_mb: memory,
         gpus: Vec::new(),
         generic,
+        generation: 0,
     }
 }
 
@@ -790,6 +791,7 @@ fn placeholder_gpus(count: u32, gpu_type: Option<&str>) -> Vec<spur_core::resour
             memory_mb: 0,
             peer_gpus: Vec::new(),
             link_type: spur_core::resource::GpuLinkType::PCIe,
+            stable_id: 0,
         })
         .collect()
 }
@@ -1336,6 +1338,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: i,
             })
             .collect();
         let mut node = Node::new(
