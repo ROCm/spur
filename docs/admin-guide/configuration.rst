@@ -303,19 +303,20 @@ and Raft high-availability topology.
      - string
      - ``redacted``
      - Live
-     - How much of another user's job an identified non-owner (non-admin) may
-       read via ``get_job`` / ``get_job_steps``. ``redacted`` (default) shows
-       identity, state, timing, and account but blanks the working directory,
+     - How much of another user's job an identified Operator may still redact
+       on list/get. Identified Users (non-operators) cannot list or fetch
+       another tenant's job at all (``get_job`` is ``NOT_FOUND``, matching the
+       job-list pin). ``redacted`` (default) blanks the working directory,
        command, submit line, stdio paths, comment, the allocated, requested,
        and planned node lists, and both the allocated and requested resource
        detail (``ReqTRES``, ``Features``, and the per-node minima);
        ``owner_only`` returns ``NOT_FOUND`` for other users' jobs; ``full`` is the
-       legacy behaviour where every field is visible to any caller. Owners and
-       admins always see the full record. Scoping applies only to identified
-       callers — under ``auth.mode = required``, or when a credential is
-       presented under ``permissive``; with authentication disabled or no
-       credential presented, the full record is returned (so no-auth deployments
-       and internal consumers are unaffected).
+       legacy behaviour where every field is visible to a caller who is allowed
+       to see the record. Owners and admins always see the full record. Scoping
+       applies only to identified callers — under ``auth.mode = required``, or
+       when a credential is presented under ``permissive``; with authentication
+       disabled or no credential presented, the full record is returned (so
+       no-auth deployments and internal consumers are unaffected).
 
 ``[accounting]``
 ----------------
@@ -1629,6 +1630,13 @@ OpenMetrics HTTP export from ``spurctld``.
        cancel require a Bearer credential when ``mode = required``, and submit
        binds the job to that identity. Enable it only where that policy is
        acceptable.
+   * - ``allow_non_loopback``
+     - bool
+     - ``false``
+     - Restart
+     - Permit REST on a non-loopback ``controller.rest_addr`` when
+       ``[auth] plugin = "spur"`` and ``mode = "required"``. Without this,
+       ``spurctld`` refuses to start. Set it only behind a trusted gateway.
 
 ``[hooks]``
 -----------

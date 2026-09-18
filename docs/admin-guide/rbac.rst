@@ -63,8 +63,16 @@ the accounting admin level never applies on a node. They use
 JWT ``admin`` claim or verified UID 0, when deciding who may attach to, exec
 in, or stream a job.
 
+Job list pins a non-operator to their own jobs. ``get_job`` and
+``get_job_steps`` use the same pin: an identified User asking for another
+tenant's job id gets ``NOT_FOUND``. Operators and Administrators still see
+every job.
+
 Controller-to-agent RPCs carry a separate controller identity rather than a
-user credential, and are not subject to any of the above.
+user credential, and are not subject to any of the above. Each token is minted
+for one agent: the controller Pings that agent, then stamps
+``spur/<cluster>/agent/<hostname>`` and the advertised boot epoch. A captured
+token is not valid on another agent.
 
 See :ref:`privileged-operations` in :doc:`configuration` for which operations
 require which role, and :doc:`/developer/native-credential-mint` for how

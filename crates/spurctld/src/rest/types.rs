@@ -85,6 +85,10 @@ pub fn forbidden_response(msg: &str) -> RestError {
     api_error_response(StatusCode::FORBIDDEN, msg)
 }
 
+pub fn unauthorized_response(msg: &str) -> RestError {
+    api_error_response(StatusCode::UNAUTHORIZED, msg)
+}
+
 pub fn unavailable_response(msg: &str) -> RestError {
     api_error_response(StatusCode::SERVICE_UNAVAILABLE, msg)
 }

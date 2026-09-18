@@ -308,6 +308,16 @@ async fn main() -> anyhow::Result<()> {
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
         if !rest_addr.ip().is_loopback() {
+            if config.auth.plugin == "spur"
+                && config.auth.mode == spur_core::config::AuthMode::Required
+                && !config.rest_api.allow_non_loopback
+            {
+                anyhow::bail!(
+                    "REST API is enabled on non-loopback {rest_addr} with [auth] plugin = \"spur\" \
+                     and mode = \"required\"; bind loopback or set rest_api.allow_non_loopback = true \
+                     behind a trusted gateway"
+                );
+            }
             tracing::warn!(
                 addr = %rest_addr,
                 "REST API is enabled on a non-loopback address: credentials are verified, but \

@@ -20,7 +20,6 @@ use crate::native_mint::CLOCK_SKEW_SECS;
 
 pub const CONTROLLER_RPC_TTL_SECS: u64 = 300;
 pub const NODE_IDENTITY_TTL_SECS: u64 = 7 * 24 * 3600;
-pub const CONTROLLER_TO_AGENT_AUDIENCE: &str = "controller-to-agent";
 
 #[derive(Clone)]
 pub struct ControllerServiceSigner {
@@ -36,12 +35,13 @@ impl ControllerServiceSigner {
         }
     }
 
-    pub fn mint(&self, now: u64) -> Result<String, CredentialError> {
+    pub fn mint(&self, audience: &str, epoch: u64, now: u64) -> Result<String, CredentialError> {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rng().fill(&mut nonce);
         let cred = ControllerRpcCredential {
             cluster_id: self.cluster_id.clone(),
-            audience: CONTROLLER_TO_AGENT_AUDIENCE.into(),
+            audience: audience.into(),
+            audience_epoch: epoch,
             issued_at: now,
             expires_at: now.saturating_add(CONTROLLER_RPC_TTL_SECS),
             nonce,
@@ -55,6 +55,8 @@ pub fn verify_controller_rpc(
     token: &str,
     keys: &Ed25519VerifyKeySet,
     cluster_id: &str,
+    audience: &str,
+    epoch: u64,
     now: u64,
     replay: &crate::native_replay::ReplayCache,
 ) -> Result<Identity, CredentialError> {
@@ -68,15 +70,18 @@ pub fn verify_controller_rpc(
     if cred.cluster_id != cluster_id {
         return Err(CredentialError::ClusterMismatch);
     }
-    if cred.audience != CONTROLLER_TO_AGENT_AUDIENCE {
+    if cred.audience != audience {
         return Err(CredentialError::AudienceMismatch);
+    }
+    if cred.audience_epoch != epoch {
+        return Err(CredentialError::AudienceEpochMismatch);
     }
     cred.validate_time(now, CLOCK_SKEW_SECS)?;
     replay.check_and_insert_raw(
         crate::native_replay::ReplayKey::new(
             cred.cluster_id.clone(),
             cred.audience.clone(),
-            0,
+            cred.audience_epoch,
             cred.key_id.clone(),
             cred.nonce,
         ),
@@ -208,17 +213,84 @@ mod tests {
     fn controller_rpc_verifies_as_controller_not_as_user() {
         let keys = sign_set();
         let signer = ControllerServiceSigner::new("cluster-a", Arc::clone(&keys));
-        let token = signer.mint(100).unwrap();
+        let audience = crate::auth::agent_audience("cluster-a", "gpu01");
+        let token = signer.mint(&audience, 7, 100).unwrap();
         let replay = crate::native_replay::ReplayCache::new(16);
-        let id =
-            verify_controller_rpc(&token, &verify_set(&keys), "cluster-a", 100, &replay).unwrap();
+        let id = verify_controller_rpc(
+            &token,
+            &verify_set(&keys),
+            "cluster-a",
+            &audience,
+            7,
+            100,
+            &replay,
+        )
+        .unwrap();
         assert!(id.is_controller());
         assert_eq!(id.user, CONTROLLER_SUBJECT);
-        assert!(
-            verify_controller_rpc(&token, &verify_set(&keys), "cluster-a", 100, &replay).is_err()
-        );
+        assert!(verify_controller_rpc(
+            &token,
+            &verify_set(&keys),
+            "cluster-a",
+            &audience,
+            7,
+            100,
+            &replay
+        )
+        .is_err());
         let replay2 = crate::native_replay::ReplayCache::new(16);
-        assert!(verify_controller_rpc(&token, &verify_set(&keys), "other", 100, &replay2).is_err());
+        assert!(verify_controller_rpc(
+            &token,
+            &verify_set(&keys),
+            "other",
+            &audience,
+            7,
+            100,
+            &replay2
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn controller_rpc_is_bound_to_agent_audience_and_epoch() {
+        let keys = sign_set();
+        let signer = ControllerServiceSigner::new("cluster-a", Arc::clone(&keys));
+        let gpu01 = crate::auth::agent_audience("cluster-a", "gpu01");
+        let gpu02 = crate::auth::agent_audience("cluster-a", "gpu02");
+        let token = signer.mint(&gpu01, 7, 100).unwrap();
+        let replay = crate::native_replay::ReplayCache::new(16);
+        assert!(verify_controller_rpc(
+            &token,
+            &verify_set(&keys),
+            "cluster-a",
+            &gpu02,
+            7,
+            100,
+            &replay
+        )
+        .is_err());
+        let replay2 = crate::native_replay::ReplayCache::new(16);
+        assert!(verify_controller_rpc(
+            &token,
+            &verify_set(&keys),
+            "cluster-a",
+            &gpu01,
+            8,
+            100,
+            &replay2
+        )
+        .is_err());
+        let replay3 = crate::native_replay::ReplayCache::new(16);
+        assert!(verify_controller_rpc(
+            &token,
+            &verify_set(&keys),
+            "cluster-a",
+            &gpu01,
+            7,
+            100,
+            &replay3
+        )
+        .is_ok());
     }
 
     #[test]
@@ -235,9 +307,16 @@ mod tests {
     fn hmac_user_token_is_not_a_controller_or_node_credential() {
         let keys = sign_set();
         let replay = crate::native_replay::ReplayCache::new(8);
-        assert!(
-            verify_controller_rpc("aaaa", &verify_set(&keys), "cluster-a", 1, &replay).is_err()
-        );
+        assert!(verify_controller_rpc(
+            "aaaa",
+            &verify_set(&keys),
+            "cluster-a",
+            &crate::auth::agent_audience("cluster-a", "gpu01"),
+            1,
+            1,
+            &replay
+        )
+        .is_err());
         let signer = NodeIdentitySigner::new("cluster-a", keys);
         assert!(signer.verify("bbbb", "gpu01", 1).is_err());
     }

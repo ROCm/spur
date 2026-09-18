@@ -253,6 +253,7 @@ pub struct ForwardedIdentity {
 pub struct ControllerRpcCredential {
     pub cluster_id: String,
     pub audience: String,
+    pub audience_epoch: u64,
     pub issued_at: u64,
     pub expires_at: u64,
     pub nonce: [u8; NONCE_LEN],
@@ -549,6 +550,7 @@ impl ControllerRpcCredential {
         w.str(CONTROLLER_RPC_CONTEXT)?;
         w.str(&self.cluster_id)?;
         w.str(&self.audience)?;
+        w.u64(self.audience_epoch);
         w.u64(self.issued_at);
         w.u64(self.expires_at);
         w.fixed(&self.nonce);
@@ -576,6 +578,7 @@ impl ControllerRpcCredential {
         let cred = Self {
             cluster_id: r.str()?,
             audience: r.str()?,
+            audience_epoch: r.u64()?,
             issued_at: r.u64()?,
             expires_at: r.u64()?,
             nonce: r.fixed()?,

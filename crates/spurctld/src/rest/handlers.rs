@@ -11,7 +11,8 @@ use super::convert::{job_to_json, node_to_json, parse_states_query, partition_to
 use super::types::*;
 use super::RestState;
 use crate::server::{
-    identity_operates_jobs, job_info_disclosure, viewer_is_privileged, JobInfoDisclosure,
+    identified_user_may_view_job, identity_operates_jobs, job_info_disclosure,
+    viewer_is_privileged, JobInfoDisclosure,
 };
 
 pub async fn ping(
@@ -211,11 +212,11 @@ fn rest_job_json(
     identity: Option<&spur_core::auth::Identity>,
     cluster: &crate::cluster::ClusterManager,
 ) -> Option<serde_json::Value> {
-    let privileged = viewer_is_privileged(
-        identity,
-        &job.spec.user,
-        identity_operates_jobs(cluster, identity),
-    );
+    let operates = identity_operates_jobs(cluster, identity);
+    if !identified_user_may_view_job(identity, &job.spec.user, operates) {
+        return None;
+    }
+    let privileged = viewer_is_privileged(identity, &job.spec.user, operates);
     match job_info_disclosure(privileged, cluster.config().controller.job_info_visibility) {
         JobInfoDisclosure::Hidden => None,
         JobInfoDisclosure::Full => Some(job_to_json(job)),
@@ -245,8 +246,12 @@ pub async fn cancel_job(
         return Err(unavailable_response("not the Raft leader"));
     }
 
-    let identity = request.extensions().get::<spur_core::auth::Identity>();
-    let user = identity.map(|id| id.user.as_str()).unwrap_or("");
+    let Some(identity) = request.extensions().get::<spur_core::auth::Identity>() else {
+        return Err(unauthorized_response(
+            "REST job cancel requires an authenticated caller (Authorization: Bearer).",
+        ));
+    };
+    let user = identity.user.as_str();
 
     let job = state.cluster.get_job(job_id);
 
@@ -255,7 +260,7 @@ pub async fn cancel_job(
         .cancel_job_for(
             job_id,
             user,
-            identity_operates_jobs(&state.cluster, identity),
+            identity_operates_jobs(&state.cluster, Some(identity)),
         )
         .map_err(rest_cancel_map_err)?;
 

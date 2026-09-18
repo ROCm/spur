@@ -264,6 +264,7 @@ FQDN
 GDS
 OpenPMIx
 loopback
+allow_non_loopback
 modex
 routable
 unlaunched

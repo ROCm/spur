@@ -624,6 +624,8 @@ fn verify_native_bearer(token: &str, native: &NativeAuth) -> Result<Identity, Au
                 token,
                 keys.as_ref(),
                 &native.cluster_id,
+                &native.audience,
+                native.epoch,
                 now,
                 native.replay.as_ref(),
             )

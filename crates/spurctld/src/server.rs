@@ -807,6 +807,21 @@ impl ControllerService {
         identity_operates_jobs(&self.cluster, identity)
     }
 
+    /// Who may cancel a job they do not own.
+    ///
+    /// Verified Operators/Administrators always may. The k8s operator talks to
+    /// spurctld with no bearer and `CancelJobRequest.user = ""`; that pair is the
+    /// in-cluster daemon, not an anonymous REST caller (REST cancel requires a
+    /// Bearer before it reaches `ClusterManager`). A named unauthenticated user
+    /// is still an ordinary owner check — `"root"` is not special.
+    fn caller_may_cancel_unowned(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        user: &str,
+    ) -> bool {
+        self.caller_is_operator(identity) || (identity.is_none() && user.is_empty())
+    }
+
     fn caller_role(
         &self,
         identity: Option<&spur_core::auth::Identity>,
@@ -971,17 +986,18 @@ impl ControllerService {
     }
 
     /// Apply `[controller] job_info_visibility` for `get_job`. Owner, admin, and unauthenticated
-    /// callers (see [`viewer_is_privileged`]) get the full record; an identified non-owner gets
-    /// `Full` (legacy), `None` → `NOT_FOUND` (`OwnerOnly`), or the targeting-sensitive fields blanked
-    /// (`Redacted`, the default).
-    /// Disclosure level for one job. Split out so the single-job and list handlers share one policy
-    /// decision; the list path annotates in a single batch and so cannot reuse `scoped_job_info`.
+    /// callers (see [`viewer_is_privileged`]) get the full record. An identified User cannot fetch
+    /// another tenant's job (same pin as `get_jobs`); Operators still see every job.
     fn disclosure_for(
         &self,
         owner: &str,
         identity: Option<&spur_core::auth::Identity>,
     ) -> JobInfoDisclosure {
-        let privileged = viewer_is_privileged(identity, owner, self.caller_is_operator(identity));
+        let operates = self.caller_is_operator(identity);
+        if !identified_user_may_view_job(identity, owner, operates) {
+            return JobInfoDisclosure::Hidden;
+        }
+        let privileged = viewer_is_privileged(identity, owner, operates);
         job_info_disclosure(
             privileged,
             self.cluster.config().controller.job_info_visibility,
@@ -1482,7 +1498,7 @@ impl SlurmController for ControllerService {
             .cancel_job_for(
                 job_id,
                 &req.user,
-                self.caller_is_operator(__identity.as_ref()),
+                self.caller_may_cancel_unowned(__identity.as_ref(), &req.user),
             )
             .map_err(cancel_err_to_status)?;
 
@@ -2771,28 +2787,16 @@ impl SlurmController for ControllerService {
             return Ok(resp);
         }
 
-        // Scope step visibility to the same policy as get_job: step names can leak intent, so they
-        // are blanked under `redacted` and the list is empty under `owner_only`. Resolve the parent
-        // job first and return NOT_FOUND if it is gone — matching get_job, and so the owner is never
-        // mis-derived as `""` (which would treat the true owner as unprivileged).
+        // Same visibility as get_job: identified Users cannot probe another tenant's steps.
         let job = self
             .cluster
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-        let privileged = viewer_is_privileged(
-            identity.as_ref(),
-            &job.spec.user,
-            self.caller_is_operator(identity.as_ref()),
-        );
-        let redact_names = match job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        ) {
+        let redact_names = match self.disclosure_for(&job.spec.user, identity.as_ref()) {
             JobInfoDisclosure::Full => false,
             JobInfoDisclosure::Redacted => true,
-            // Owner-only: the job is invisible to this caller, so are its steps.
             JobInfoDisclosure::Hidden => {
-                return Ok(Response::new(GetJobStepsResponse { steps: Vec::new() }));
+                return Err(Status::not_found(format!("job {job_id} not found")));
             }
         };
 
@@ -4940,6 +4944,20 @@ pub(crate) fn viewer_is_privileged(
     }
 }
 
+/// Identified Users cannot see another tenant's job, matching `get_jobs` pinning.
+/// Unauthenticated callers and Operators/Administrators are not pinned.
+pub(crate) fn identified_user_may_view_job(
+    identity: Option<&spur_core::auth::Identity>,
+    owner: &str,
+    operates_jobs: bool,
+) -> bool {
+    match identity {
+        None => true,
+        Some(_) if operates_jobs => true,
+        Some(id) => id.user == owner,
+    }
+}
+
 /// The user an assoc-mgr read is scoped to. A privileged caller — an admin, or
 /// an unauthenticated one under `permissive`/`disabled`, the same treatment
 /// `viewer_is_privileged` gives — reads whichever user the request names, or
@@ -5910,9 +5928,11 @@ mod tests {
         assert!(viewer_is_privileged(Some(&alice), "bob", true));
         // A different, non-admin identified user is not.
         assert!(!viewer_is_privileged(Some(&alice), "bob", false));
-        // No verified identity (auth disabled, or permissive with no credential, or an internal
-        // consumer like the k8s operator) is privileged: scoping only applies to identified callers.
         assert!(viewer_is_privileged(None, "bob", false));
+        assert!(identified_user_may_view_job(None, "bob", false));
+        assert!(identified_user_may_view_job(Some(&bob), "bob", false));
+        assert!(!identified_user_may_view_job(Some(&alice), "bob", false));
+        assert!(identified_user_may_view_job(Some(&alice), "bob", true));
     }
 
     #[test]
@@ -6078,15 +6098,12 @@ mod tests {
             assert_eq!(info.work_dir, "/home/bob");
         }
 
-        // An identified non-owner is redacted: the work_dir (and other sensitive fields) are blanked,
-        // but the non-sensitive identity fields survive.
-        let other = svc
+        // An identified User cannot fetch another tenant's job (same pin as get_jobs).
+        let err = svc
             .get_job(get_job_req(job_id, Some(viewer("alice", false))))
             .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(other.work_dir, "", "a non-owner must not see the work_dir");
-        assert_eq!(other.user, "bob", "non-sensitive fields survive redaction");
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9430,6 +9447,42 @@ mod tests {
             svc.cluster.get_job(job_id).unwrap().state,
             spur_core::job::JobState::Cancelled
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_unauthenticated_empty_user_is_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.cancel_job(Request::new(CancelJobRequest {
+            job_id,
+            user: String::new(),
+            ..Default::default()
+        }))
+        .await
+        .expect("k8s operator cancel uses empty user and no bearer");
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            spur_core::job::JobState::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_unauthenticated_root_string_is_not_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .cancel_job(Request::new(CancelJobRequest {
+                job_id,
+                user: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the root username is not an internal caller");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

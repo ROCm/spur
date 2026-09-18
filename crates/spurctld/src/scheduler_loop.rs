@@ -3983,7 +3983,7 @@ mod tests {
             settle(&cm, job_id, JobState::Running);
 
             // Suspend routes through Completing; no node reports completion.
-            cm.suspend_job(job_id, "").unwrap();
+            cm.suspend_job_for(job_id, "", true).unwrap();
             settle(&cm, job_id, JobState::Suspended);
             let mut job = cm.get_job(job_id).unwrap();
             job.transition(JobState::Completing).unwrap();

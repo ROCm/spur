@@ -81,6 +81,11 @@ only and cannot mint these tokens.
   controller-issued node identity at token admission. Distinct from the
   controller-to-agent key.
 
+The controller Pings the agent (no credential) and mints a controller-to-agent
+token for that Ping's audience and boot epoch — the same binding user RPCs
+use. Agents reject a token whose audience or epoch is not their own, so a
+token captured on one node cannot be replayed on another.
+
 A Raft follower authenticates the user once, consumes the user nonce, and
 forwards a signed identity envelope (``x-spur-identity`` / ``x-spur-forwarded``)
 instead of the original user credential.

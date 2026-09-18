@@ -59,7 +59,8 @@ pub fn main_with_args(args: Vec<String>) -> Result<()> {
             signing,
             verify,
         } => {
-            let (sign, ver) = spur_core::native_jwks::generate_ed25519_jwks(&kid);
+            let (sign, ver) = spur_core::native_jwks::generate_ed25519_jwks(&kid)
+                .with_context(|| format!("generate Ed25519 JWKS kid={kid}"))?;
             write_mode_0600(Path::new(&signing), sign.as_bytes())
                 .with_context(|| format!("write {signing}"))?;
             write_mode_0600(Path::new(&verify), ver.as_bytes())

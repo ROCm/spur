@@ -237,6 +237,11 @@ pub struct RestApiConfig {
     /// loopback/administrative interface.
     #[serde(default)]
     pub enabled: bool,
+    /// Allow REST on a non-loopback address when native auth is `plugin = "spur"` and
+    /// `mode = "required"`. Off by default: that combination otherwise refuses to start.
+    /// Set this only when a trusted gateway sits in front of the listen address.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 /// Prolog and epilog hook script configuration.
@@ -2001,6 +2006,25 @@ impl SlurmConfig {
                         mode cannot verify credentials without one)"
                         .into(),
             });
+        }
+        if self.rest_api.enabled
+            && self.auth.plugin == "spur"
+            && self.auth.mode == AuthMode::Required
+            && !self.rest_api.allow_non_loopback
+        {
+            match self.controller.rest_addr.parse::<std::net::SocketAddr>() {
+                Ok(addr) if !addr.ip().is_loopback() => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "controller.rest_addr".into(),
+                        value: format!(
+                            "{addr} (native auth mode \"required\" refuses REST on a non-loopback \
+                             address; bind loopback or set rest_api.allow_non_loopback = true \
+                             behind a trusted gateway)"
+                        ),
+                    });
+                }
+                _ => {}
+            }
         }
 
         if self.cluster.enabled {
@@ -3880,6 +3904,67 @@ mode = "required"
         let config = SlurmConfig::load_from_str(toml).expect("native plugin does not use jwt_key");
         assert_eq!(config.auth.plugin, "spur");
         assert_eq!(config.auth.mode, AuthMode::Required);
+    }
+
+    #[test]
+    fn native_required_rest_on_non_loopback_is_refused() {
+        let err = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("rest_addr") || err.to_string().contains("non-loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn native_required_rest_non_loopback_allowed_with_override() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+allow_non_loopback = true
+"#,
+        )
+        .expect("explicit override must start");
+        assert!(config.rest_api.allow_non_loopback);
+    }
+
+    #[test]
+    fn native_required_rest_on_loopback_is_accepted() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[controller]
+rest_addr = "127.0.0.1:6820"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+"#,
+        )
+        .expect("loopback REST is allowed without override");
+        assert!(!config.rest_api.allow_non_loopback);
     }
 
     #[test]

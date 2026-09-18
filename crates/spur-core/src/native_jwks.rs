@@ -559,11 +559,12 @@ pub fn generate_hmac_jwks(kid: &str) -> String {
 }
 
 /// Ed25519 signing document plus the public-only verification document.
-pub fn generate_ed25519_jwks(kid: &str) -> (String, String) {
+pub fn generate_ed25519_jwks(kid: &str) -> Result<(String, String), JwksError> {
     use rand::RngExt;
     let mut seed = [0u8; ED25519_LEN];
     rand::rng().fill(&mut seed);
-    let pair = Ed25519KeyPair::from_seed_unchecked(&seed).expect("ed25519 seed");
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed)
+        .map_err(|_| JwksError::BadMaterial(kid.to_string()))?;
     let d = URL_SAFE_NO_PAD.encode(seed);
     let x = URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
     let signing = serde_json::json!({
@@ -589,7 +590,7 @@ pub fn generate_ed25519_jwks(kid: &str) -> (String, String) {
         }]
     })
     .to_string();
-    (signing, verification)
+    Ok((signing, verification))
 }
 
 fn read_jwks_file(path: &Path) -> Result<Vec<u8>, JwksError> {
@@ -839,6 +840,17 @@ mod tests {
     fn missing_file_fails_closed() {
         let err = HmacKeySet::from_path(Path::new("/no/such/auth.jwks"), NOW).unwrap_err();
         assert!(matches!(err, JwksError::NotFound(_)));
+    }
+
+    #[test]
+    fn generate_ed25519_jwks_loads_as_sign_and_verify_sets() {
+        let (sign_doc, verify_doc) = generate_ed25519_jwks("k1").unwrap();
+        let sign = Ed25519SigningKeySet::from_bytes(sign_doc.as_bytes(), NOW).unwrap();
+        let verify = Ed25519VerifyKeySet::from_bytes(verify_doc.as_bytes(), NOW).unwrap();
+        let msg = user_bytes();
+        let (kid, sig) = sign.sign(&msg, NOW).unwrap();
+        assert_eq!(kid, "k1");
+        verify.verify("k1", &msg, &sig, NOW).unwrap();
     }
 
     #[test]

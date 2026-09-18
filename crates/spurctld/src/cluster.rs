@@ -1321,22 +1321,19 @@ impl ClusterManager {
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
     ///
-    /// These are control-plane paths where `user` has already been bound to the verified identity
-    /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller, a
-    /// literal `"root"` is the admin override, and `operates_jobs` is a verified Operator or
-    /// Administrator. The raw [`spur_core::auth::check_job_owner`] no longer infers that itself.
+    /// Privilege is only `operates_jobs` (verified Operator/Administrator, or an explicit
+    /// daemon-internal call). Empty and `"root"` strings are ordinary usernames.
     fn check_job_owner_for(
         user: &str,
         owner: &str,
         action: &str,
         operates_jobs: bool,
     ) -> Result<(), spur_core::auth::AuthError> {
-        let is_internal = operates_jobs || user.is_empty() || user == "root";
-        spur_core::auth::check_job_owner(user, is_internal, owner, action)
+        spur_core::auth::check_job_owner(user, operates_jobs, owner, action)
     }
 
-    /// Cancel a job. The requesting `user` must be the job owner, root, or
-    /// empty (trusted internal/daemon calls).
+    /// Cancel a job. The requesting `user` must be the job owner, or the caller
+    /// must pass `operates_jobs` (verified operator / daemon-internal).
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> Result<(), CancelError> {
         self.cancel_job_for(job_id, user, false)
     }
@@ -20260,23 +20257,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancel_job_root_allowed() {
+    async fn cancel_job_root_string_is_not_privileged() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("root-cancel"));
-        cm.cancel_job(job_id, "root").unwrap();
-        settle(&cm, job_id, JobState::Cancelled);
-        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
+        let err = cm.cancel_job(job_id, "root").unwrap_err();
+        assert!(matches!(err, CancelError::NotOwner(_)));
+        assert!(!cm.get_job(job_id).unwrap().state.is_terminal());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancel_job_empty_user_allowed() {
+    async fn cancel_job_empty_user_is_not_privileged() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("internal-cancel"));
-        cm.cancel_job(job_id, "").unwrap();
+        let err = cm.cancel_job(job_id, "").unwrap_err();
+        assert!(matches!(err, CancelError::NotOwner(_)));
+        assert!(!cm.get_job(job_id).unwrap().state.is_terminal());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_internal_flag_allows_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("internal-cancel"));
+        cm.cancel_job_for(job_id, "", true).unwrap();
         settle(&cm, job_id, JobState::Cancelled);
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
     }
@@ -20322,7 +20330,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn suspend_job_root_allowed() {
+    async fn suspend_job_root_string_is_not_privileged() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -20337,9 +20345,9 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
-        cm.suspend_job(id, "root").unwrap();
-        settle(&cm, id, JobState::Suspended);
-        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+        let err = cm.suspend_job(id, "root").unwrap_err();
+        assert!(err.to_string().contains("cannot") && err.to_string().contains("suspend"));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20395,7 +20403,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resume_job_root_allowed() {
+    async fn resume_job_root_string_is_not_privileged() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -20412,9 +20420,9 @@ mod tests {
         cm.suspend_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Suspended);
 
-        cm.resume_job(id, "root").unwrap();
-        settle(&cm, id, JobState::Running);
-        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        let err = cm.resume_job(id, "root").unwrap_err();
+        assert!(err.to_string().contains("cannot") && err.to_string().contains("resume"));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
