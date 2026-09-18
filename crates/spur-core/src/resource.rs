@@ -20,6 +20,11 @@ pub struct GpuResource {
     pub memory_mb: u64,
     pub peer_gpus: Vec<u32>,
     pub link_type: GpuLinkType,
+    /// Stable per-logical-device identity (KFD render_minor). Unlike `device_id`
+    /// (a positional visible index for injection), this survives a mid-set
+    /// removal without renumbering, so allocation accounting keys on it.
+    #[serde(default)]
+    pub stable_id: u32,
 }
 
 /// A set of compute resources (node-level inventory).
@@ -29,6 +34,11 @@ pub struct ResourceSet {
     pub memory_mb: u64,
     pub gpus: Vec<GpuResource>,
     pub generic: HashMap<String, u64>,
+    /// Bumped by the agent on every topology rebuild. An allocation records the
+    /// generation it was made under; a repartition that reuses a stable_id value
+    /// for a different logical device is caught by a generation mismatch.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// Tracks consumed resources (per-node or per-job allocation accounting).
@@ -38,6 +48,11 @@ pub struct ResourceAllocations {
     pub memory_mb: u64,
     /// Key = gres_name ("gpu", "nic", "bandwidth", ...).
     pub devices: HashMap<String, Vec<AllocatedDevice>>,
+    /// The node inventory `generation` this allocation was stamped under. The
+    /// agent rejects a dispatch whose generation no longer matches its live
+    /// inventory, so a repartition between schedule and launch is caught.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// A single allocated device entry.
@@ -99,7 +114,7 @@ impl ResourceAllocations {
                         inventory
                             .gpus
                             .iter()
-                            .find(|g| g.device_id == d.device_id)
+                            .find(|g| g.stable_id == d.device_id)
                             .map(|g| g.gpu_type.as_str())
                             == Some(gtype)
                     } else {
@@ -172,12 +187,34 @@ impl ResourceAllocations {
         Self {
             cpus,
             memory_mb,
-            devices: HashMap::new(),
+            ..Default::default()
         }
     }
 }
 
 impl ResourceSet {
+    /// Backfill a stable id from the positional device id for legacy/mixed-version
+    /// inventories that predate stable_id (serde/proto default it to 0).
+    pub fn backfill_stable_ids(&mut self) {
+        for g in &mut self.gpus {
+            if g.stable_id == 0 {
+                g.stable_id = g.device_id;
+            }
+        }
+    }
+
+    /// Identity of the schedulable set, independent of `generation`. Two ticks
+    /// with an equal fingerprint observed the same topology, so a debounce can
+    /// tell "same change seen twice" from "two different partial reads".
+    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<u32>, Vec<(String, u64)>) {
+        let mut gpu_ids: Vec<u32> = self.gpus.iter().map(|g| g.stable_id).collect();
+        gpu_ids.sort_unstable();
+        let mut generic: Vec<(String, u64)> =
+            self.generic.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        generic.sort();
+        (self.cpus, self.memory_mb, gpu_ids, generic)
+    }
+
     /// Check if this inventory can satisfy a count-based request with no prior allocation.
     pub fn can_satisfy(&self, request: &ResourceSet) -> bool {
         self.can_satisfy_with_allocated(&ResourceAllocations::default(), request)
@@ -198,7 +235,7 @@ impl ResourceSet {
         let mut avail_gpus = self.gpu_counts();
         let total_avail: u32 = avail_gpus.values().sum();
         for dev in allocated.devices.get("gpu").into_iter().flatten() {
-            if let Some(gpu) = self.gpus.iter().find(|g| g.device_id == dev.device_id) {
+            if let Some(gpu) = self.gpus.iter().find(|g| g.stable_id == dev.device_id) {
                 *avail_gpus.entry(gpu.gpu_type.clone()).or_insert(0) = avail_gpus
                     .get(&gpu.gpu_type)
                     .copied()
@@ -249,7 +286,7 @@ impl ResourceSet {
             self.gpus
                 .iter()
                 .filter(|g| {
-                    if allocated_ids.contains(&g.device_id) {
+                    if allocated_ids.contains(&g.stable_id) {
                         return false;
                     }
                     match device_type {
@@ -257,7 +294,7 @@ impl ResourceSet {
                         Some(t) => g.gpu_type == t,
                     }
                 })
-                .map(|g| g.device_id)
+                .map(|g| g.stable_id)
                 .collect()
         } else {
             Vec::new()
@@ -324,13 +361,14 @@ pub fn parse_gres(gres: &str) -> Option<(String, Option<String>, u32)> {
 /// Build a full-node allocation for exclusive jobs.
 pub fn build_exclusive_allocation(inventory: &ResourceSet, memory_mb: u64) -> ResourceAllocations {
     let mut alloc = ResourceAllocations::with_scalar(inventory.cpus, memory_mb);
+    alloc.generation = inventory.generation;
     if !inventory.gpus.is_empty() {
         alloc.devices.insert(
             "gpu".into(),
             inventory
                 .gpus
                 .iter()
-                .map(|g| AllocatedDevice::injectable(g.device_id))
+                .map(|g| AllocatedDevice::injectable(g.stable_id))
                 .collect(),
         );
     }
@@ -367,6 +405,7 @@ pub fn build_node_allocation(
     request: &ResourceSet,
 ) -> ResourceAllocations {
     let mut alloc = ResourceAllocations::with_scalar(request.cpus, request.memory_mb);
+    alloc.generation = inventory.generation;
 
     let req_gpus = request.gpu_counts();
     for (gpu_type, count) in req_gpus {
@@ -416,6 +455,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![1],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
                 },
                 GpuResource {
                     device_id: 1,
@@ -423,9 +463,11 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![0],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 1,
                 },
             ],
             generic: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -441,8 +483,10 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: 0,
             }],
             generic: HashMap::new(),
+            generation: 0,
         };
         assert!(avail.can_satisfy(&req));
     }
@@ -464,8 +508,10 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: 0,
             }],
             generic: HashMap::new(),
+            generation: 0,
         };
         assert!(inventory.can_satisfy_with_allocated(&allocated, &req_one));
 
@@ -477,6 +523,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
                 },
                 GpuResource {
                     device_id: 1,
@@ -484,6 +531,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
                 },
             ],
             ..Default::default()
@@ -510,10 +558,53 @@ mod tests {
 
     #[test]
     fn test_available_device_ids() {
-        let inventory = sample_inventory();
+        let mut inventory = sample_inventory();
+        // Positional device_id equals stable_id here so the classic meaning holds.
+        inventory.gpus[0].stable_id = 0;
+        inventory.gpus[1].stable_id = 1;
         let allocated = ResourceAllocations::from_device_ids("gpu", &[0]);
         let free = inventory.available_device_ids(&allocated, "gpu", Some("mi300x"));
         assert_eq!(free, vec![1]);
+    }
+
+    /// After an out-of-band repartition a GPU's positional `device_id` and its
+    /// stable identity diverge; allocation must key on `stable_id` so the ids
+    /// handed to the agent match its stable_id-based accounting.
+    #[test]
+    fn available_device_ids_returns_stable_ids_not_positional() {
+        let inventory = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            gpus: vec![
+                GpuResource {
+                    device_id: 0,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 128,
+                },
+                GpuResource {
+                    device_id: 1,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 129,
+                },
+            ],
+            generic: HashMap::new(),
+            generation: 7,
+        };
+        // Nothing allocated: both stable ids are free.
+        let free =
+            inventory.available_device_ids(&ResourceAllocations::default(), "gpu", Some("mi300x"));
+        assert_eq!(free, vec![128, 129]);
+
+        // Allocating stable_id 128 leaves 129 free (not positional index 1).
+        let allocated = ResourceAllocations::from_device_ids("gpu", &[128]);
+        let free = inventory.available_device_ids(&allocated, "gpu", Some("mi300x"));
+        assert_eq!(free, vec![129]);
     }
 
     #[test]
@@ -528,8 +619,10 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: 0,
             }],
             generic: HashMap::new(),
+            generation: 0,
         };
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         assert_eq!(alloc.cpus, 8);
@@ -548,6 +641,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
                 },
                 GpuResource {
                     device_id: 1,
@@ -555,6 +649,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 1,
                 },
                 GpuResource {
                     device_id: 2,
@@ -562,6 +657,7 @@ mod tests {
                     memory_mb: 80_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    stable_id: 2,
                 },
                 GpuResource {
                     device_id: 3,
@@ -569,9 +665,11 @@ mod tests {
                     memory_mb: 80_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    stable_id: 3,
                 },
             ],
             generic: HashMap::new(),
+            generation: 0,
         };
         let request = ResourceSet {
             cpus: 8,
@@ -583,6 +681,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
                 },
                 GpuResource {
                     device_id: 1,
@@ -590,9 +689,11 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    stable_id: 0,
                 },
             ],
             generic: HashMap::new(),
+            generation: 0,
         };
         let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
         let mut ids = alloc.device_ids("gpu");
@@ -629,6 +730,7 @@ mod accounting_tests {
             memory_mb: 65536,
             peer_gpus: Vec::new(),
             link_type: GpuLinkType::XGMI,
+            stable_id: device_id,
         }
     }
 
@@ -638,6 +740,7 @@ mod accounting_tests {
             memory_mb: 131_072,
             gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
             generic: HashMap::from([("bandwidth".to_string(), 100u64)]),
+            generation: 0,
         }
     }
 
@@ -767,12 +870,49 @@ mod accounting_tests {
             memory_mb: 1024,
             gpus: Vec::new(),
             generic: HashMap::from([("licenses".to_string(), 0u64)]),
+            generation: 0,
         };
         let alloc = build_exclusive_allocation(&inv, 1024);
 
         assert!(!alloc.devices.contains_key("gpu"));
         assert!(!alloc.devices.contains_key("licenses"));
         assert!(!alloc.has_devices());
+    }
+
+    /// On real KFD nodes positional `device_id` (0,1) and `stable_id` (128,129)
+    /// diverge. Exclusive allocation must emit stable_ids so the agent, whose
+    /// accounting keys on stable_id, resolves the right devices.
+    #[test]
+    fn build_exclusive_allocation_emits_stable_ids_not_positional() {
+        let inv = ResourceSet {
+            cpus: 16,
+            memory_mb: 1024,
+            gpus: vec![
+                GpuResource {
+                    device_id: 0,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 196_608,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 128,
+                },
+                GpuResource {
+                    device_id: 1,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 196_608,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 129,
+                },
+            ],
+            generic: HashMap::new(),
+            generation: 0,
+        };
+        let alloc = build_exclusive_allocation(&inv, 1024);
+
+        let mut ids = alloc.device_ids("gpu");
+        ids.sort_unstable();
+        assert_eq!(ids, [128, 129], "exclusive claims GPUs by stable_id");
     }
 
     /// Aggregation folds nodes with `add`, which merges on device_id, so two
@@ -807,5 +947,108 @@ mod accounting_tests {
         assert_eq!(inv.total_gpus(), 3);
         assert_eq!(inv.gpu_counts().get("mi300x"), Some(&2));
         assert_eq!(ResourceSet::default().total_gpus(), 0);
+    }
+
+    /// Legacy inventories default every stable_id to 0; backfill must derive a
+    /// distinct stable_id from device_id while leaving a real nonzero one intact.
+    #[test]
+    fn backfill_stable_ids_fills_legacy_zeros_only() {
+        let mut inv = ResourceSet {
+            cpus: 0,
+            memory_mb: 0,
+            gpus: vec![
+                GpuResource {
+                    device_id: 0,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
+                },
+                GpuResource {
+                    device_id: 1,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 0,
+                },
+                GpuResource {
+                    device_id: 5,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 129,
+                },
+            ],
+            generic: HashMap::new(),
+            generation: 0,
+        };
+        inv.backfill_stable_ids();
+        let ids: Vec<u32> = inv.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(ids, vec![0, 1, 129], "legacy zeros distinct, real id kept");
+    }
+
+    /// A typed GPU held by stable_id (not positional device_id) must be removed
+    /// from availability; otherwise a backfilled inventory double-books it.
+    #[test]
+    fn feasibility_subtracts_held_gpu_by_stable_id() {
+        let inv = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: vec![GpuResource {
+                device_id: 0,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: Vec::new(),
+                link_type: GpuLinkType::XGMI,
+                stable_id: 128,
+            }],
+            generic: HashMap::new(),
+            generation: 0,
+        };
+        let allocated = ResourceAllocations::from_device_ids("gpu", &[128]);
+        assert_eq!(allocated.allocated_count("gpu", Some("mi300x"), &inv), 1);
+
+        let req = ResourceSet {
+            cpus: 1,
+            memory_mb: 1,
+            gpus: vec![GpuResource {
+                device_id: 0,
+                gpu_type: "mi300x".into(),
+                memory_mb: 0,
+                peer_gpus: Vec::new(),
+                link_type: GpuLinkType::XGMI,
+                stable_id: 0,
+            }],
+            generic: HashMap::new(),
+            generation: 0,
+        };
+        assert!(
+            !inv.can_satisfy_with_allocated(&allocated, &req),
+            "the held stable_id 128 mi300x must not be re-offered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod convergence_fields_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_resource_deserializes_without_stable_id() {
+        // Old Raft/JSON entries have no stable_id; must default to 0.
+        let json = r#"{"device_id":3,"gpu_type":"mi300x","memory_mb":196608,"peer_gpus":[],"link_type":"XGMI"}"#;
+        let g: GpuResource = serde_json::from_str(json).unwrap();
+        assert_eq!(g.stable_id, 0);
+        assert_eq!(g.device_id, 3);
+    }
+
+    #[test]
+    fn resource_set_deserializes_without_generation() {
+        let json = r#"{"cpus":8,"memory_mb":1024,"gpus":[],"generic":{}}"#;
+        let r: ResourceSet = serde_json::from_str(json).unwrap();
+        assert_eq!(r.generation, 0);
     }
 }

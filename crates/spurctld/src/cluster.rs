@@ -6428,7 +6428,10 @@ impl ClusterManager {
                 labels,
                 source,
             } => {
-                let mut node = Node::new(name.clone(), resources.clone());
+                // Normalize legacy Raft entries so replay can't collide on stable_id==0.
+                let mut resources = resources.clone();
+                resources.backfill_stable_ids();
+                let mut node = Node::new(name.clone(), resources);
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -6486,7 +6489,10 @@ impl ClusterManager {
                 source,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
-                    node.total_resources = resources.clone();
+                    // Normalize legacy Raft entries so replay can't collide on stable_id==0.
+                    let mut resources = resources.clone();
+                    resources.backfill_stable_ids();
+                    node.total_resources = resources;
                     if !hostname.is_empty() {
                         node.hostname = hostname.clone();
                     }

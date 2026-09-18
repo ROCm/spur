@@ -2770,7 +2770,7 @@ impl AgentService {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "unknown".into()),
-            &reporter.resources,
+            &reporter.snapshot_resources(),
         );
 
         // Load SPANK plugins from plugstack.conf if available
@@ -3002,6 +3002,12 @@ impl AgentService {
     /// this process exiting.
     pub fn stepds_handle(&self) -> Arc<Mutex<StepdMap>> {
         self.stepds.clone()
+    }
+
+    /// The live per-node allocation, for the periodic inventory-refresh task to
+    /// read held stable ids and apply fresh capacity without an RPC round-trip.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
     }
 
     /// The job's own process, asked of its supervisor over the control socket —
@@ -4068,6 +4074,20 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
     }
 }
 
+/// Reject a dispatch whose stamped inventory generation no longer matches this
+/// node's live generation, so an out-of-band GPU repartition between schedule
+/// and launch cannot bind a job to devices that have since been renumbered.
+/// A zero on either side is unset/legacy and skips the check for compatibility
+/// with controllers and Raft entries predating the generation field.
+fn check_dispatch_generation(dispatch: u64, live: u64) -> Result<(), Status> {
+    if dispatch != 0 && live != 0 && dispatch != live {
+        return Err(Status::failed_precondition(format!(
+            "dispatch made against stale node inventory generation {dispatch} != {live}"
+        )));
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
@@ -4443,6 +4463,9 @@ impl SlurmAgent for AgentService {
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
 
+        // The generation check is performed inside `allocate_local_resources`
+        // under the same allocation lock as the allocate, so a refresh publish
+        // cannot slip a newer topology between the check and the bind.
         let (alloc_result, allocated_device_ids) = self
             .allocate_local_resources(
                 job_id,
@@ -5007,9 +5030,9 @@ impl SlurmAgent for AgentService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<NodeResourcesResponse>, Status> {
-        let resources = &self.reporter.resources;
+        let resources = self.reporter.snapshot_resources();
         Ok(Response::new(NodeResourcesResponse {
-            total: Some(crate::reporter::resource_to_proto(resources)),
+            total: Some(crate::reporter::resource_to_proto(&resources)),
             used: Some(crate::reporter::allocations_to_proto(
                 &spur_core::resource::ResourceAllocations::default(),
             )),
@@ -5131,6 +5154,8 @@ impl SlurmAgent for AgentService {
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
 
         let allocated = req.allocated.as_ref();
+        // The generation check is performed under the allocation lock below, so a
+        // refresh publish cannot slip a newer topology between it and the bind.
         let mut controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -5181,6 +5206,15 @@ impl SlurmAgent for AgentService {
         }
         let alloc_result = {
             let mut alloc = self.allocation.lock().await;
+            // Atomic with the bind: the refresh task publishes inventory via
+            // update_capacity under this same lock, so no newer generation can
+            // land between this check and allocate_for_job.
+            if let Some(a) = allocated {
+                check_dispatch_generation(
+                    a.generation,
+                    self.reporter.snapshot_resources().generation,
+                )?;
+            }
             let result = alloc
                 .allocate_for_job(
                     req.job_id,
@@ -7034,6 +7068,13 @@ impl AgentService {
         let live: std::collections::HashSet<u32> = running.keys().copied().collect();
 
         let mut alloc = self.allocation.lock().await;
+
+        // Generation check under the allocation lock: the refresh task mutates
+        // inventory via update_capacity under this same lock, so checking here
+        // is atomic with the bind below — no publish can interleave.
+        if let Some(a) = allocated {
+            check_dispatch_generation(a.generation, self.reporter.snapshot_resources().generation)?;
+        }
 
         let result = match alloc.allocate_for_job(
             job_id,
@@ -13485,6 +13526,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: device_id,
             })
             .collect();
         Arc::new(NodeReporter::new(
@@ -13551,6 +13593,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices,
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -13565,6 +13608,164 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "GPU allocation must be released after a post-record launch failure"
+        );
+    }
+
+    /// The generation guard rejects only a genuine mismatch; a zero on either
+    /// side is unset/legacy and passes so pre-generation controllers still work.
+    #[test]
+    fn dispatch_generation_guard_matrix() {
+        assert!(check_dispatch_generation(7, 7).is_ok(), "equal passes");
+        assert!(
+            check_dispatch_generation(0, 7).is_ok(),
+            "unset dispatch skips"
+        );
+        assert!(check_dispatch_generation(7, 0).is_ok(), "unset live skips");
+        assert!(check_dispatch_generation(0, 0).is_ok(), "both unset skips");
+        let err = check_dispatch_generation(5, 7).expect_err("mismatch rejects");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("5 != 7"), "names both generations");
+    }
+
+    fn test_reporter_with_generation(generation: u64) -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                generation,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+        ))
+    }
+
+    /// A dispatch stamped under a superseded inventory generation is refused
+    /// before any resource is committed, so a repartition between schedule and
+    /// launch cannot bind the job to devices that have since been renumbered.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_stale_generation() {
+        let svc = AgentService::new(
+            test_reporter_with_generation(7),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 51,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                generation: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a dispatch under a stale generation must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused dispatch must not leave a tracked job"
+        );
+    }
+
+    /// launch_job runs the generation check inside allocate_local_resources under
+    /// the allocation lock; a stale-generation dispatch is refused before any
+    /// resource is bound, leaving no tracked job and no GPU held.
+    #[tokio::test]
+    async fn launch_job_rejects_stale_generation_before_binding() {
+        let reporter = Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                gpus: vec![spur_core::resource::GpuResource {
+                    device_id: 0,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::XGMI,
+                    stable_id: 128,
+                }],
+                generic: Default::default(),
+                generation: 7,
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+        ));
+        let svc = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 128,
+                    count: 1,
+                }],
+            },
+        );
+        let req = Request::new(LaunchJobRequest {
+            job_id: 52,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                gres: vec!["gpu:1".into()],
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+                generation: 5,
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .launch_job(req)
+            .await
+            .expect_err("a launch under a stale generation must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused launch must not leave a tracked job"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a refused launch must not hold the GPU"
         );
     }
 
@@ -13595,6 +13796,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -13705,6 +13907,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             // Default (false): a genuine sbatch batch script, not an
             // explicit srun task fan-out.
@@ -13761,6 +13964,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             task_fanout: true,
             ..Default::default()
@@ -13807,6 +14011,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             // Default (false): a genuine sbatch job, not a routed srun
             // request — no pmix_plan is supplied either, so if this reached
@@ -13855,6 +14060,7 @@ mod tests {
                 cpus: 2,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -14021,6 +14227,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -14070,6 +14277,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -14115,6 +14323,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -14145,6 +14354,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: map,
+            generation: 0,
         }
     }
 
@@ -14245,6 +14455,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices,
+                generation: 0,
             }),
             ..Default::default()
         }))
@@ -14372,6 +14583,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         }))

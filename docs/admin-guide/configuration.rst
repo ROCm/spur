@@ -1136,8 +1136,12 @@ See :doc:`accounting` for managing admission tokens with ``spur token``.
 GPU and generic-resource discovery.
 
 **Reload: Agent restart** for every field below, including each
-``[[devices.gres]]`` entry — the device registry is built once when ``spurd``
-starts.
+``[[devices.gres]]`` entry — the device registry built from these settings is
+first read when ``spurd`` starts. After startup, ``spurd`` periodically
+re-discovers the live device inventory and re-registers with the controller
+when the schedulable inventory changed, so ``scontrol show node`` GRES
+converges to hardware changes without an agent restart — see
+`Node inventory convergence`_ below.
 
 .. list-table::
    :header-rows: 1
@@ -1177,6 +1181,29 @@ and ``flags`` ([string]). Examples:
    type = "lustre"
    count = 4096
    flags = ["count_only"]
+
+Node inventory convergence
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Beyond the startup scan, ``spurd`` re-discovers device inventory on an interval
+and re-registers with the controller whenever the schedulable inventory
+changed. This is how an out-of-band AMD MI300X compute-partition switch
+(SPX/CPX, via ``amd-smi``) reaches the controller: ``scontrol show node`` GRES
+converges to the new device count without restarting ``spurd``.
+
+* The refresh interval defaults to 60s and is overridable per-agent with the
+  ``SPUR_INVENTORY_REFRESH_SECS`` environment variable.
+* A partition switch is a hardware constraint: it must be performed on a
+  **drained, idle** node. Once the switch completes, the agent's next refresh
+  picks up the new inventory and converges automatically.
+
+.. note::
+
+   Convergence only sees changes on the AMD KFD auto-detect path
+   (``auto_detect = true``). On nodes provisioned with static on-disk CDI specs
+   (``cdi_spec_dirs``), re-discovery re-reads the same spec files each tick, so
+   the reported inventory only changes if those specs are regenerated out of
+   band.
 
 ``[isolation]``
 ---------------

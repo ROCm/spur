@@ -4666,7 +4666,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
 }
 
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
-    spur_core::resource::ResourceSet {
+    // Backfill so no stable_id==0 from a legacy/mixed-version agent reaches accounting.
+    let mut rs = spur_core::resource::ResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
         gpus: r
@@ -4682,10 +4683,14 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
                     2 => spur_core::resource::GpuLinkType::NVLink,
                     _ => spur_core::resource::GpuLinkType::PCIe,
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic,
-    }
+        generation: r.generation,
+    };
+    rs.backfill_stable_ids();
+    rs
 }
 
 /// What a caller may see of a job, once ownership/admin status and the visibility policy are known.
@@ -5164,6 +5169,7 @@ pub(crate) fn allocations_to_proto(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -5191,6 +5197,7 @@ pub(crate) fn proto_to_allocations(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -5219,9 +5226,11 @@ pub(crate) fn resource_to_proto(
                         spur_proto::proto::GpuLinkType::GpuLinkPcie as i32
                     }
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic.clone(),
+        generation: r.generation,
     }
 }
 
@@ -5490,6 +5499,29 @@ mod tests {
 
     fn job_state(cluster: &crate::cluster::ClusterManager, job_id: u32) -> Option<JobState> {
         cluster.get_job(job_id).map(|j| j.state)
+    }
+
+    #[test]
+    fn resource_set_proto_round_trip_preserves_stable_id_and_generation() {
+        use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+        let rs = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: vec![GpuResource {
+                device_id: 1,
+                gpu_type: "mi300x".into(),
+                memory_mb: 196_608,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                stable_id: 129,
+            }],
+            generic: Default::default(),
+            generation: 42,
+        };
+        let back = proto_to_resource_set(resource_to_proto(&rs));
+        assert_eq!(back.generation, 42);
+        assert_eq!(back.gpus[0].stable_id, 129);
+        assert_eq!(back.gpus[0].device_id, 1);
     }
 
     #[test]
@@ -6143,6 +6175,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -6333,6 +6366,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n2".to_string(), res.clone());
@@ -6480,6 +6514,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());

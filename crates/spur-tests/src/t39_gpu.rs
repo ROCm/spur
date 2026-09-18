@@ -50,6 +50,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -66,6 +67,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::PCIe,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -86,6 +88,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -102,6 +105,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::PCIe,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -122,6 +126,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -137,6 +142,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::PCIe,
+                stable_id: 0,
             }],
             ..Default::default()
         };
@@ -156,6 +162,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -172,6 +179,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::PCIe,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()
@@ -392,6 +400,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    stable_id: i,
                 })
                 .collect(),
             ..Default::default()

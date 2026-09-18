@@ -18,6 +18,7 @@ message ResourceSet {
   uint64 memory_mb = 2;
   repeated GpuResource gpus = 3;
   map<string, uint64> generic = 4;  // licenses, etc.
+  uint64 generation = 5;  // bumped by the agent on each topology rebuild
 }
 
 message AllocatedDevice {
@@ -33,6 +34,7 @@ message ResourceAllocations {
   uint32 cpus = 1;
   uint64 memory_mb = 2;
   map<string, DeviceAllocations> devices = 3;
+  uint64 generation = 4;  // node inventory generation this allocation was made under
 }
 
 message GpuResource {
@@ -41,6 +43,7 @@ message GpuResource {
   uint64 memory_mb = 3;
   repeated uint32 peer_gpus = 4;
   GpuLinkType link_type = 5;
+  uint32 stable_id = 6;   // KFD render_minor; stable per-logical-device identity
 }
 
 enum GpuLinkType {

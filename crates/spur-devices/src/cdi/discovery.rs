@@ -299,6 +299,7 @@ impl DiscoveredGpu {
             compute_partition: self.compute_partition.clone(),
             memory_partition: self.memory_partition.clone(),
             unique_id: self.unique_id.clone(),
+            render_minor: Some(self.render_minor),
         };
 
         let render_stat = stat_device_node(&render_path);
