@@ -5,7 +5,7 @@ use crate::env_defaults::{apply_csv, apply_str, apply_string, env_first, was_cli
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
-use spur_proto::proto::{JobSpec, SubmitJobRequest};
+use spur_proto::proto::{GetJobRequest, JobSpec, JobState, SubmitJobRequest};
 use std::collections::HashMap;
 
 /// Submit a batch job script.
@@ -255,6 +255,10 @@ pub struct SbatchArgs {
     /// Print only the job ID on success
     #[arg(long)]
     pub parsable: bool,
+
+    /// Block until the job terminates; exit code reflects the job outcome
+    #[arg(short = 'W', long)]
+    pub wait: bool,
 
     /// Wrap the given command in a minimal shell script (mutually exclusive with a script file)
     #[arg(long, conflicts_with = "script")]
@@ -534,6 +538,7 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(container_mount_home, "container_mount_home");
     fallback!(container_entrypoint, "container_entrypoint");
     fallback!(container_remap_root, "container_remap_root");
+    fallback!(wait, "wait");
     fallback!(controller, "controller");
     fallback!(script, "script");
     // gres replaces rather than accumulates, so it merges like the scalars.
@@ -1018,7 +1023,9 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 
     let controller = args.controller.clone();
     let parsable = args.parsable;
+    let wait = args.wait;
     let job_spec = build_sbatch_job_spec(args, nodelist, &crate::submitline::render(&cli_args))?;
+    let submit_user = job_spec.user.clone();
 
     // Submit to controller
     let channel = crate::authclient::connect(&controller)
@@ -1044,7 +1051,96 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         println!("Submitted batch job {}", job_id);
     }
 
+    if wait {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(wait_for_job(&mut client, job_id, &submit_user).await);
+    }
+
     Ok(())
+}
+
+fn terminal_exit_code(state: JobState, exit_code: i32) -> i32 {
+    match state {
+        JobState::JobCompleted => exit_code,
+        JobState::JobFailed => exit_code.max(1),
+        _ => 1,
+    }
+}
+
+/// Poll `GetJob` until the job reaches a terminal state, cancelling on Ctrl-C.
+async fn wait_for_job(
+    client: &mut spur_proto::proto::slurm_controller_client::SlurmControllerClient<
+        crate::authclient::AuthChannel,
+    >,
+    job_id: u32,
+    submit_user: &str,
+) -> i32 {
+    crate::interactive::install_ctrl_c_cancel(
+        client.clone(),
+        job_id,
+        submit_user.to_string(),
+        "sbatch",
+    );
+
+    let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    let mut warned_unknown_state = false;
+    let mut confirm_terminal = false;
+
+    loop {
+        poll_interval.tick().await;
+
+        match client.get_job(GetJobRequest { job_id }).await {
+            Ok(resp) => {
+                let job = resp.into_inner();
+                match JobState::try_from(job.state) {
+                    Ok(state) if spur_core::job::JobState::from_proto(state).is_terminal() => {
+                        // Requeue is not atomic: the controller briefly lands on
+                        // Failed before proposing back to Pending. Re-poll once
+                        // to avoid exiting during that window.
+                        if !confirm_terminal
+                            && !matches!(state, JobState::JobCompleted)
+                            && job.requeue
+                        {
+                            confirm_terminal = true;
+                            continue;
+                        }
+                        return terminal_exit_code(state, job.exit_code);
+                    }
+                    Ok(_) => {
+                        confirm_terminal = false;
+                    }
+                    Err(_) if !warned_unknown_state => {
+                        warned_unknown_state = true;
+                        eprintln!(
+                            "sbatch: warning: job {} has unrecognized state {}",
+                            job_id, job.state
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.code(),
+                    tonic::Code::Unavailable
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::Aborted
+                        | tonic::Code::Internal
+                        | tonic::Code::Unknown
+                ) =>
+            {
+                if !warned_unknown_state {
+                    warned_unknown_state = true;
+                    eprintln!("sbatch: warning: {}", e.message());
+                }
+            }
+            Err(e) => {
+                eprintln!("sbatch: error: {}", e.message());
+                return 1;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1808,5 +1904,182 @@ echo "hello world"
             image_path.to_string_lossy(),
             "bare 'busybox' must resolve to the image imported as 'docker://busybox:latest'"
         );
+    }
+
+    // --- sbatch --wait ---
+
+    #[test]
+    fn wait_flag_parsed_long() {
+        let args = SbatchArgs::try_parse_from(["sbatch", "--wait", "--wrap=echo hi"]).unwrap();
+        assert!(args.wait);
+    }
+
+    #[test]
+    fn wait_flag_parsed_short() {
+        let args = SbatchArgs::try_parse_from(["sbatch", "-W", "--wrap=echo hi"]).unwrap();
+        assert!(args.wait);
+    }
+
+    #[test]
+    fn wait_flag_default_false() {
+        let args = SbatchArgs::try_parse_from(["sbatch", "--wrap=echo hi"]).unwrap();
+        assert!(!args.wait);
+    }
+
+    #[test]
+    fn wait_combined_with_parsable() {
+        let args = SbatchArgs::try_parse_from(["sbatch", "--wait", "--parsable", "--wrap=echo hi"])
+            .unwrap();
+        assert!(args.wait);
+        assert!(args.parsable);
+    }
+
+    #[test]
+    fn wait_directive_sets_flag() {
+        let args = parse_merged(&["--wait"], &["sbatch"]);
+        assert!(args.wait);
+    }
+
+    #[test]
+    fn terminal_exit_code_completed_propagates() {
+        use spur_proto::proto::JobState;
+        assert_eq!(terminal_exit_code(JobState::JobCompleted, 0), 0);
+        assert_eq!(terminal_exit_code(JobState::JobCompleted, 42), 42);
+    }
+
+    #[test]
+    fn terminal_exit_code_failed_clamps_to_nonzero() {
+        use spur_proto::proto::JobState;
+        assert_eq!(terminal_exit_code(JobState::JobFailed, 1), 1);
+        assert_eq!(terminal_exit_code(JobState::JobFailed, 42), 42);
+        assert_eq!(terminal_exit_code(JobState::JobFailed, 0), 1);
+        assert_eq!(terminal_exit_code(JobState::JobFailed, -1), 1);
+    }
+
+    #[test]
+    fn terminal_exit_code_other_states_exit_one() {
+        use spur_proto::proto::JobState;
+        for state in [
+            JobState::JobCancelled,
+            JobState::JobTimeout,
+            JobState::JobNodeFail,
+            JobState::JobDeadline,
+            JobState::JobOutOfMemory,
+        ] {
+            assert_eq!(terminal_exit_code(state, 0), 1, "state {:?}", state);
+        }
+    }
+
+    #[test]
+    fn non_terminal_states_excluded_from_is_terminal() {
+        for state in [
+            spur_core::job::JobState::Pending,
+            spur_core::job::JobState::Running,
+            spur_core::job::JobState::Completing,
+            spur_core::job::JobState::Suspended,
+            spur_core::job::JobState::Preempted,
+            spur_core::job::JobState::Requeued,
+        ] {
+            assert!(!state.is_terminal(), "{:?} must not be terminal", state);
+        }
+    }
+
+    // --- wait_for_job integration tests against mock controller ---
+
+    fn job_info(state: i32, exit_code: i32) -> spur_proto::proto::JobInfo {
+        spur_proto::proto::JobInfo {
+            state,
+            exit_code,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_polls_through_pending_to_completed() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_submit_job_id(99);
+        capture.set_get_job_sequence(vec![
+            job_info(0, 0), // PENDING
+            job_info(1, 0), // RUNNING
+            job_info(3, 0), // COMPLETED
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 99, "testuser").await;
+        assert_eq!(code, 0);
+        assert!(capture.get_job_calls() >= 3);
+    }
+
+    #[tokio::test]
+    async fn wait_propagates_nonzero_exit_code() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_sequence(vec![
+            job_info(0, 0),  // PENDING
+            job_info(4, 42), // FAILED exit 42
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 1, "testuser").await;
+        assert_eq!(code, 42);
+    }
+
+    #[tokio::test]
+    async fn wait_clamps_negative_exit_code() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_sequence(vec![
+            job_info(4, -1), // FAILED sentinel
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 1, "testuser").await;
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_skips_suspended_and_preempted() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_sequence(vec![
+            job_info(1, 0), // RUNNING
+            job_info(9, 0), // SUSPENDED
+            job_info(8, 0), // PREEMPTED
+            job_info(0, 0), // PENDING (requeued)
+            job_info(1, 0), // RUNNING again
+            job_info(3, 7), // COMPLETED exit 7
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 1, "testuser").await;
+        assert_eq!(code, 7);
+        assert!(capture.get_job_calls() >= 6);
+    }
+
+    #[tokio::test]
+    async fn wait_exits_on_permanent_rpc_error() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_error(tonic::Code::NotFound);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 1, "testuser").await;
+        assert_eq!(code, 1);
+        assert_eq!(capture.get_job_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_cancelled_exits_one() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_sequence(vec![
+            job_info(0, 0),  // PENDING
+            job_info(5, -1), // CANCELLED
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 1, "testuser").await;
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_exits_one() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_sequence(vec![
+            job_info(1, 0),  // RUNNING
+            job_info(6, -1), // TIMEOUT
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+        let code = wait_for_job(&mut client, 1, "testuser").await;
+        assert_eq!(code, 1);
     }
 }

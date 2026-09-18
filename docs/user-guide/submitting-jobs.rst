@@ -214,6 +214,11 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--parsable``
      -
      - Print only the job ID on success.
+   * - ``--wait``
+     - ``-W``
+     - Block until the job terminates; exit code reflects the job outcome.
+       Works with ``--parsable`` (ID printed at submission, then blocks).
+       Also accepted as an ``#SBATCH --wait`` directive in scripts.
 
 .. _submit-export:
 
