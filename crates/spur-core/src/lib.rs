@@ -25,6 +25,7 @@ pub mod native_replay;
 pub mod native_service;
 pub mod node;
 pub mod partition;
+pub mod peer;
 pub mod privilege;
 pub mod process;
 pub mod qos;

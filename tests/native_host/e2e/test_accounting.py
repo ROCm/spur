@@ -1214,14 +1214,14 @@ class TestNodeAudit:
 
             drained = [r for r in rows if r[0] == "update" and r[2] == "success"]
             assert drained, f"no successful node update recorded: {rows}"
-            action, where, _outcome, peer, info = drained[0]
+            _action, where, _outcome, peer, info = drained[0]
             assert where == f"node:{node}", drained
             assert reason in info, f"the requested reason must be captured: {info}"
             # No jwt_key here and no user field on UpdateNode, so the peer
             # address is the only attribution left — which is why it exists.
             assert peer, f"an unauthenticated action must still record a peer: {drained[0]}"
 
-            # #860's node-record attribution and the audit log must agree.
+            # The node record's own attribution and the audit log must agree.
             assert reason in c.cli(["sinfo", "-R"]), "sinfo -R should show the drain reason"
         finally:
             # Leaving a node drained would starve every later test.

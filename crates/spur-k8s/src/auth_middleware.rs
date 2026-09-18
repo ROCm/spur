@@ -21,7 +21,7 @@ fn peer_addr(extensions: &http::Extensions) -> Option<String> {
     extensions
         .get::<tonic::transport::server::TcpConnectInfo>()
         .and_then(|info| info.remote_addr())
-        .map(|addr| addr.to_string())
+        .map(spur_core::peer::canonical_peer)
 }
 
 #[derive(Clone)]
@@ -133,6 +133,21 @@ mod tests {
         generate_token("spurctld", 0, true, key.as_bytes(), 300).unwrap()
     }
 
+    /// Guards this copy of `peer_addr`: a dual-stack listener hands us the
+    /// IPv4-mapped form, and every daemon must log the plain IPv4 form.
+    #[test]
+    fn peer_addr_unwraps_an_ipv4_mapped_client() {
+        let mut ext = http::Extensions::new();
+        ext.insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some("[::ffff:10.0.0.4]:51234".parse().unwrap()),
+        });
+        assert_eq!(peer_addr(&ext).as_deref(), Some("10.0.0.4:51234"));
+
+        // No connection info at all (a non-TCP or test transport) is not an error.
+        assert_eq!(peer_addr(&http::Extensions::new()), None);
+    }
+
     #[test]
     fn required_refuses_an_uncredentialed_caller() {
         assert!(matches!(
@@ -209,5 +224,50 @@ mod tests {
             .unwrap();
         let resp = svc.call(req).await.unwrap();
         assert!(resp.headers().get("grpc-status").is_none());
+    }
+
+    /// Counts calls so a test can assert the inner service was never reached.
+    #[derive(Clone, Default)]
+    struct CountingInner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Service<Request<()>> for CountingInner {
+        type Response = Response<tonic::body::Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(Response::new(tonic::body::Body::default())))
+        }
+    }
+
+    /// A forged credential is refused here, so pod creation is never reached.
+    /// That short-circuit is also why the refusal is logged in this module.
+    #[tokio::test]
+    async fn a_forged_credential_never_reaches_the_inner_service() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key")
+            .layer(CountingInner(calls.clone()));
+        let req = Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", controller_token("attacker-key")),
+            )
+            .body(())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a forged credential must not reach the operator's agent surface"
+        );
+        let status = tonic::Status::from_header_map(resp.headers()).expect("grpc-status");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 }
