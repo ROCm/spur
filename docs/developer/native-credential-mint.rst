@@ -4,8 +4,10 @@ Native credential mint
 The credential mint issues short-lived native user-RPC credentials from kernel
 peer credentials on a Unix-domain socket. It is not a JWT issuer.
 
-Login-only hosts run ``spurauthd``. ``spurctld`` and ``spurd`` will embed the
-same server so compute and controller hosts do not need a second process.
+Run ``spurauthd`` on every host that mints: login nodes (CLI) and compute
+nodes (``spurd`` register/heartbeat/completion). ``spurctld`` and ``spurd``
+verify credentials; they do not embed this server. Without a mint socket,
+``auth.mode = "required"`` rejects those RPCs.
 
 Socket path
 -----------
@@ -38,8 +40,8 @@ and boot epoch. A verifier restart chooses a new random epoch, so in-flight
 credentials stop verifying.
 
 Agents use the same mint for controller RPCs (register, heartbeat, completion)
-after Ping. Each compute host therefore needs a mint socket (``spurauthd``, or
-the embedded server once ``spurd`` hosts it). Without that, ``auth.mode =
+after Ping. Each compute host therefore needs ``spurauthd`` (or
+``$SPUR_AUTH_SOCKET`` pointing at one). Without that, ``auth.mode =
 "required"`` rejects agent calls before join or node tokens in the body are
 read.
 

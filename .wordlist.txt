@@ -326,3 +326,16 @@ IPIP
 VNIC
 subnet
 unencapsulated
+HMAC
+hmac
+JWKS
+jwks
+PID
+Verifier
+verifier
+auth
+ctrl
+idempotency
+spurauthd
+tmp
+adminlevel

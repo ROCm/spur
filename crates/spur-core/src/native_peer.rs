@@ -75,7 +75,7 @@ impl PeerVerifier {
     ) -> Result<String, CredentialError> {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rng().fill(&mut nonce);
-        let mut env = ForwardedIdentity {
+        let env = ForwardedIdentity {
             cluster_id: self.cluster_id.clone(),
             source_controller_id: self.controller_id,
             dest_leader_id,
@@ -97,8 +97,9 @@ impl PeerVerifier {
             .keys
             .sign(&payload, now)
             .map_err(|_| CredentialError::BadSignature)?;
-        env.key_id = kid.clone();
-        let payload = env.to_signing_bytes()?;
+        if kid != env.key_id {
+            return Err(CredentialError::Malformed("kid"));
+        }
         SignedToken {
             key_id: kid,
             payload,

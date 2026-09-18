@@ -1,8 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Login-host credential mint. Controller and agent hosts embed the same
-//! server in `spurctld` / `spurd`; this binary is for hosts that only run the CLI.
+//! Credential mint for hosts that run the Spur CLI or agent-to-controller RPCs.
+//!
+//! `spurctld` and `spurd` verify credentials; they do not listen on the mint
+//! socket. Run this binary on every login node and every compute node.
 
 use std::path::PathBuf;
 use std::sync::Arc;

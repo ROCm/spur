@@ -588,8 +588,8 @@ class SpurCluster:
                 members.add(fields[0])
         return members
 
-    def scancel(self, job_id: str) -> str:
-        return self.cli(["scancel", job_id])
+    def scancel(self, job_id: int | str) -> str:
+        return self.cli(["scancel", str(job_id)])
 
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))

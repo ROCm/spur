@@ -5,9 +5,9 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, Permissions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 #[derive(Parser, Debug)]
@@ -77,6 +77,8 @@ fn write_mode_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode()` only applies on create; chmod so a 0644/0666 overwrite is not left world-readable.
+    f.set_permissions(Permissions::from_mode(0o600))?;
     f.write_all(bytes)?;
     f.write_all(b"\n")?;
     Ok(())
@@ -90,5 +92,17 @@ mod tests {
     #[test]
     fn parser_is_well_formed() {
         AuthKeysArgs::command().debug_assert();
+    }
+
+    #[test]
+    fn overwrite_chmods_existing_world_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.jwks");
+        std::fs::write(&path, b"old\n").unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        write_mode_0600(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret\n");
     }
 }

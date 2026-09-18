@@ -114,6 +114,9 @@ pub fn sign_execution(
     let (kid, signature) = keys
         .sign(&payload, now)
         .map_err(|_| CredentialError::BadSignature)?;
+    if kid != cred.key_id {
+        return Err(CredentialError::Malformed("kid"));
+    }
     SignedToken {
         key_id: kid,
         payload,
@@ -145,12 +148,50 @@ struct AcceptedLaunch {
     credential_id: [u8; CREDENTIAL_ID_LEN],
     digest: [u8; DIGEST_LEN],
     cancelled: bool,
+    retain_until: u64,
+}
+
+const DEFAULT_ACCEPTANCE_CAPACITY: usize = 8_192;
+
+struct AcceptanceInner {
+    entries: HashMap<(u32, u32, u32), AcceptedLaunch>,
+    capacity: usize,
+}
+
+impl AcceptanceInner {
+    fn evict_expired(&mut self, now: u64) {
+        self.entries.retain(|_, e| e.retain_until > now);
+    }
+
+    fn evict_earliest(&mut self) {
+        let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.retain_until)
+            .map(|(k, _)| *k)
+        else {
+            return;
+        };
+        self.entries.remove(&victim);
+    }
+
+    fn insert(&mut self, key: (u32, u32, u32), entry: AcceptedLaunch) {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
+            self.evict_earliest();
+        }
+        self.entries.insert(key, entry);
+    }
 }
 
 /// Per-agent record of accepted execution credentials for idempotency.
-#[derive(Default)]
 pub struct LaunchAcceptance {
-    inner: Mutex<HashMap<(u32, u32, u32), AcceptedLaunch>>,
+    inner: Mutex<AcceptanceInner>,
+}
+
+impl Default for LaunchAcceptance {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_ACCEPTANCE_CAPACITY)
+    }
 }
 
 impl LaunchAcceptance {
@@ -158,8 +199,30 @@ impl LaunchAcceptance {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<(u32, u32, u32), AcceptedLaunch>> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(AcceptanceInner {
+                entries: HashMap::new(),
+                capacity: capacity.max(1),
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AcceptanceInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn now() -> u64 {
+        crate::native_mint::unix_now().unwrap_or(0)
+    }
+
+    fn retain_until(cred: &ExecutionCredential, now: u64) -> u64 {
+        let exp = if cred.expires_at == 0 {
+            now.saturating_add(JOB_CREDENTIAL_TTL_SECS)
+        } else {
+            cred.expires_at
+        };
+        exp.saturating_add(CLOCK_SKEW_SECS)
     }
 
     /// First presentation records the credential. An exact duplicate is ok.
@@ -167,8 +230,10 @@ impl LaunchAcceptance {
     /// attempts stay rejected until a newer `run_attempt`.
     pub fn accept(&self, cred: &ExecutionCredential) -> Result<bool, CredentialError> {
         let key = (cred.job_id, cred.step_id, cred.run_attempt);
+        let now = Self::now();
         let mut inner = self.lock();
-        match inner.get(&key) {
+        inner.evict_expired(now);
+        match inner.entries.get(&key) {
             None => {
                 inner.insert(
                     key,
@@ -176,6 +241,7 @@ impl LaunchAcceptance {
                         credential_id: cred.credential_id,
                         digest: cred.command_digest,
                         cancelled: false,
+                        retain_until: Self::retain_until(cred, now),
                     },
                 );
                 Ok(true)
@@ -192,20 +258,30 @@ impl LaunchAcceptance {
     }
 
     pub fn cancel(&self, job_id: u32, step_id: u32, run_attempt: u32) {
+        let now = Self::now();
         let mut inner = self.lock();
-        inner
-            .entry((job_id, step_id, run_attempt))
-            .and_modify(|e| e.cancelled = true)
-            .or_insert(AcceptedLaunch {
+        inner.evict_expired(now);
+        let key = (job_id, step_id, run_attempt);
+        if let Some(e) = inner.entries.get_mut(&key) {
+            e.cancelled = true;
+            return;
+        }
+        inner.insert(
+            key,
+            AcceptedLaunch {
                 credential_id: [0u8; CREDENTIAL_ID_LEN],
                 digest: [0u8; DIGEST_LEN],
                 cancelled: true,
-            });
+                retain_until: now.saturating_add(JOB_CREDENTIAL_TTL_SECS + CLOCK_SKEW_SECS),
+            },
+        );
     }
 
     pub fn cancel_attempt(&self, job_id: u32, run_attempt: u32) {
+        let now = Self::now();
         let mut inner = self.lock();
-        for ((j, _, a), entry) in inner.iter_mut() {
+        inner.evict_expired(now);
+        for ((j, _, a), entry) in inner.entries.iter_mut() {
             if *j == job_id && *a == run_attempt {
                 entry.cancelled = true;
             }
@@ -221,13 +297,16 @@ impl LaunchAcceptance {
         credential_id: [u8; CREDENTIAL_ID_LEN],
         digest: [u8; DIGEST_LEN],
     ) {
+        let now = Self::now();
         let mut inner = self.lock();
+        inner.evict_expired(now);
         inner.insert(
             (job_id, step_id, run_attempt),
             AcceptedLaunch {
                 credential_id,
                 digest,
                 cancelled: false,
+                retain_until: now.saturating_add(JOB_CREDENTIAL_TTL_SECS + CLOCK_SKEW_SECS),
             },
         );
     }
@@ -322,6 +401,28 @@ mod tests {
         let mut next = a;
         next.run_attempt = 2;
         assert!(cache.accept(&next).unwrap());
+    }
+
+    #[test]
+    fn acceptance_capacity_evicts_the_soonest_expiry() {
+        let now = crate::native_mint::unix_now().unwrap();
+        let cache = LaunchAcceptance::with_capacity(2);
+        let mut a = cred();
+        a.job_id = 1;
+        a.expires_at = now + 10;
+        a.credential_id = [1u8; CREDENTIAL_ID_LEN];
+        let mut b = a.clone();
+        b.job_id = 2;
+        b.expires_at = now + 50;
+        b.credential_id = [2u8; CREDENTIAL_ID_LEN];
+        let mut c = a.clone();
+        c.job_id = 3;
+        c.expires_at = now + 80;
+        c.credential_id = [3u8; CREDENTIAL_ID_LEN];
+        assert!(cache.accept(&a).unwrap());
+        assert!(cache.accept(&b).unwrap());
+        assert!(cache.accept(&c).unwrap());
+        assert!(cache.accept(&a).unwrap());
     }
 
     #[test]

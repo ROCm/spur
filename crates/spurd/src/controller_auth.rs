@@ -50,11 +50,29 @@ impl tonic::service::Interceptor for AgentControllerInterceptor {
 static NATIVE_SOCKET: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn install(plugin: &str, cluster_name: &str) {
-    let socket = (plugin == "spur").then(|| {
-        resolve_socket_path(cluster_name)
-            .unwrap_or_else(|_| PathBuf::from(format!("/run/spur/{cluster_name}/auth.sock")))
-    });
-    let _ = NATIVE_SOCKET.set(socket);
+    if plugin != "spur" {
+        let _ = NATIVE_SOCKET.set(None);
+        return;
+    }
+    match resolve_socket_path(cluster_name) {
+        Ok(socket) => {
+            if !socket.exists() {
+                tracing::warn!(
+                    path = %socket.display(),
+                    "native auth mint socket is missing; start spurauthd on this host"
+                );
+            }
+            let _ = NATIVE_SOCKET.set(Some(socket));
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                cluster = cluster_name,
+                "native plugin requires a valid cluster name and a spurauthd socket"
+            );
+            let _ = NATIVE_SOCKET.set(None);
+        }
+    }
 }
 
 /// Dial the controller and attach a native bearer when the plugin is `spur`.

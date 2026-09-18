@@ -22,6 +22,9 @@ const TOKEN_ENV: &str = "SPUR_AUTH_TOKEN";
 /// Override `[auth] plugin` without rewriting the config file (tests and login-host debugging).
 const PLUGIN_ENV: &str = "SPUR_AUTH_PLUGIN";
 
+/// Cluster name when `plugin = "spur"` and no config file is loaded.
+const CLUSTER_ENV: &str = "SPUR_CLUSTER_NAME";
+
 /// Credential file, relative to the user's home directory.
 const TOKEN_FILE: &str = ".spur/token";
 
@@ -139,17 +142,34 @@ fn interceptor(_audience: &str) -> AuthInterceptor {
     }
 }
 
-fn native_interceptor(audience: &str, epoch: u64) -> AuthInterceptor {
-    let cfg = crate::spur_config::load_spur_config();
-    let socket = resolve_socket_path(&cfg.cluster_name)
-        .unwrap_or_else(|_| PathBuf::from(format!("/run/spur/{}/auth.sock", cfg.cluster_name)));
-    AuthInterceptor {
+fn native_cluster_name() -> anyhow::Result<String> {
+    let path_str = std::env::var("SPUR_CONF").unwrap_or_else(|_| "/etc/spur/spur.conf".to_string());
+    if let Ok(cfg) = spur_core::config::SlurmConfig::load_from_file(std::path::Path::new(&path_str))
+    {
+        return Ok(cfg.cluster_name);
+    }
+    std::env::var(CLUSTER_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "SPUR_CLUSTER_NAME is required when SPUR_AUTH_PLUGIN=spur and no config file is loaded"
+            )
+        })
+}
+
+fn native_interceptor(audience: &str, epoch: u64) -> anyhow::Result<AuthInterceptor> {
+    let cluster = native_cluster_name()?;
+    let socket = resolve_socket_path(&cluster)
+        .unwrap_or_else(|_| PathBuf::from(format!("/run/spur/{cluster}/auth.sock")));
+    Ok(AuthInterceptor {
         attach: CredAttach::Native(NativeMintParams {
             socket,
             audience: audience.to_string(),
             epoch,
         }),
-    }
+    })
 }
 
 /// Wrap an already-established channel, binding JWT credentials if present.
@@ -188,7 +208,7 @@ pub async fn wrap_after_controller_ping(channel: Channel) -> anyhow::Result<Auth
     }
     Ok(InterceptedService::new(
         channel,
-        native_interceptor(&ping.auth_audience, ping.auth_epoch),
+        native_interceptor(&ping.auth_audience, ping.auth_epoch)?,
     ))
 }
 
@@ -207,7 +227,7 @@ pub async fn wrap_after_agent_ping(channel: Channel) -> anyhow::Result<AuthChann
     }
     Ok(InterceptedService::new(
         channel,
-        native_interceptor(&ping.auth_audience, ping.auth_epoch),
+        native_interceptor(&ping.auth_audience, ping.auth_epoch)?,
     ))
 }
 
@@ -333,5 +353,36 @@ mod tests {
             let name = User::from_uid(Uid::from_raw(uid)).unwrap().unwrap().name;
             assert_eq!(cred.user, name);
         }
+    }
+
+    /// Both env cases live in one test: `$SPUR_CONF` / `$SPUR_CLUSTER_NAME` are process-global.
+    #[test]
+    fn native_cluster_name_requires_env_without_config() {
+        let prev_conf = std::env::var("SPUR_CONF").ok();
+        let prev_cluster = std::env::var(CLUSTER_ENV).ok();
+        unsafe {
+            std::env::set_var("SPUR_CONF", "/no/such/spur.conf");
+            std::env::remove_var(CLUSTER_ENV);
+        }
+        let missing = native_cluster_name();
+        unsafe {
+            std::env::set_var(CLUSTER_ENV, "cluster-a");
+        }
+        let got = native_cluster_name();
+        unsafe {
+            match prev_conf {
+                Some(v) => std::env::set_var("SPUR_CONF", v),
+                None => std::env::remove_var("SPUR_CONF"),
+            }
+            match prev_cluster {
+                Some(v) => std::env::set_var(CLUSTER_ENV, v),
+                None => std::env::remove_var(CLUSTER_ENV),
+            }
+        }
+        assert!(
+            missing.is_err(),
+            "missing cluster name must fail closed: {missing:?}"
+        );
+        assert_eq!(got.unwrap(), "cluster-a");
     }
 }

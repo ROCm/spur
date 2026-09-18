@@ -578,10 +578,10 @@ How client requests are authenticated.
      - ``"jwt"``
      - Restart
      - ``"jwt"`` (default) uses bearer tokens from ``spur token user`` /
-       ``$SPUR_AUTH_TOKEN``. ``"spur"`` is the native plugin: the CLI mints a
-       fresh credential from the local Unix-socket mint on every user RPC, and
-       ``spurctld`` / ``spurd`` verify HMAC, cluster, kind, lifetime, audience,
-       boot epoch, and nonce replay from
+       ``$SPUR_AUTH_TOKEN``. ``"spur"`` is the native plugin: the CLI and
+       ``spurd`` mint a fresh credential from a local ``spurauthd`` Unix socket
+       on every user RPC, and ``spurctld`` / ``spurd`` verify HMAC, cluster,
+       kind, lifetime, audience, boot epoch, and nonce replay from
        ``/etc/spur/auth.jwks`` (see :doc:`/developer/native-credential-mint`).
        Controllers also load Ed25519 ``controller-signing.jwks``,
        ``node-signing.jwks``, and ``cred-signing.jwks``; agents load
