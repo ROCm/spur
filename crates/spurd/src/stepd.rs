@@ -90,6 +90,12 @@ pub struct StepdLaunchSpec {
     /// Absent unless this launch hosts a PMIx server; see [`StepdPmix`].
     #[serde(default)]
     pub pmix: Option<StepdPmix>,
+    #[serde(default)]
+    pub cred_id: String,
+    #[serde(default)]
+    pub cred_kid: String,
+    #[serde(default)]
+    pub cred_digest: String,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -219,6 +225,9 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 mpi: config.mpi.clone(),
             },
             pmix: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
         })
     }
 }
@@ -830,6 +839,12 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    #[serde(default)]
+    pub cred_id: String,
+    #[serde(default)]
+    pub cred_kid: String,
+    #[serde(default)]
+    pub cred_digest: String,
 }
 
 impl StepdDescriptor {
@@ -866,6 +881,9 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
         }
     }
 }
@@ -1872,6 +1890,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
     descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+    descriptor.cred_id = launch_spec.cred_id.clone();
+    descriptor.cred_kid = launch_spec.cred_kid.clone();
+    descriptor.cred_digest = launch_spec.cred_digest.clone();
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
@@ -3007,6 +3028,9 @@ mod tests {
             allocation_only: false,
             pmix_multi_task: false,
             pmix: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
         }
     }
 

@@ -116,11 +116,13 @@ environment exported (``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_NODELIST``,
 partition/account/QOS variables, and their ``SLURM_*`` twins). When you exit the
 shell, the allocation is released. Ctrl-C cancels it.
 
-When authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN`` (or
-``~/.spur/token``) into the allocation shell so step commands can authenticate
-to the controller. ``SPUR_JOB_USER`` records the job owner bound at submit time
-(for example the JWT subject); ``srun`` inside the shell uses it when step RPCs
-run without a token.
+When JWT authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN``
+(or ``~/.spur/token``) into the allocation shell so step commands can
+authenticate to the controller. With ``[auth] plugin = "spur"``, the shell does
+not inherit a bearer; each command mints a fresh credential from the local
+socket. ``SPUR_JOB_USER`` records the job owner bound at submit time (for
+example the JWT subject); ``srun`` inside the shell uses it when step RPCs run
+without a token.
 
 Inside that shell, ``srun`` runs as a job step. With no step-level ``-N`` or
 ``-w``, it uses the allocation's nodes and inherits the allocation's task count

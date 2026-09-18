@@ -24,6 +24,7 @@ import tomli_w
 logger = logging.getLogger(__name__)
 
 BINARIES = ["spurctld", "spurd", "spur", "spurstepd"]
+OPTIONAL_BINARIES = ["spurauthd"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
@@ -141,6 +142,21 @@ class SshNode:
         self.client.close()
 
 
+def _upload_binary(nodes: list[SshNode], local_path: Path, bin_dir: str, name: str):
+    local_size = local_path.stat().st_size
+    for node in nodes:
+        remote_path = f"{bin_dir}/{name}"
+        remote_size = node.exec_allow_fail(
+            f"stat -c%s '{remote_path}' 2>/dev/null || echo 0"
+        ).strip()
+        if remote_size == str(local_size):
+            logger.debug("Binary %s already present on %s", name, node.host)
+            continue
+        logger.info("Uploading %s to %s", name, node.host)
+        node.upload(str(local_path), remote_path)
+        node.exec(f"chmod +x '{remote_path}'")
+
+
 def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
                 with_accounting: bool = False, with_mpi_plugin: bool = False):
     """
@@ -162,21 +178,14 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
                 f"Missing binary: {local_path}\n"
                 f"Set SPUR_TEST_BINARIES_DIR or run: cargo build --release"
             )
-        local_size = local_path.stat().st_size
+        _upload_binary(nodes, local_path, bin_dir, name)
 
-        for node in nodes:
-            remote_path = f"{bin_dir}/{name}"
-            remote_size = node.exec_allow_fail(
-                f"stat -c%s '{remote_path}' 2>/dev/null || echo 0"
-            ).strip()
-
-            if remote_size == str(local_size):
-                logger.debug("Binary %s already present on %s", name, node.host)
-                continue
-
-            logger.info("Uploading %s to %s", name, node.host)
-            node.upload(str(local_path), remote_path)
-            node.exec(f"chmod +x '{remote_path}'")
+    for name in OPTIONAL_BINARIES:
+        local_path = Path(binaries_dir) / name
+        if local_path.is_file():
+            _upload_binary(nodes, local_path, bin_dir, name)
+        else:
+            logger.info("Optional binary %s not present; skipping upload", name)
 
     # Create CLI symlinks
     symlink_cmd = (
@@ -246,6 +255,10 @@ class SpurCluster:
         self.accounting_enabled: bool = False
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
         self._pg_port: int | None = None
+        self.cli_env: dict[str, str] = {}
+        self.daemon_env: dict[str, str] = {}
+        self.controller_env: dict[str, str] = {}
+        self.agent_env: dict[str, str] = {}
 
     @property
     def _db_url(self) -> str:
@@ -313,6 +326,7 @@ class SpurCluster:
         """Kill all daemons but keep the working directory intact."""
         self.stop_agents()
         self.stop_controller()
+        self._kill_mint()
         if self.accounting_enabled:
             self._stop_postgres()
 
@@ -380,18 +394,24 @@ class SpurCluster:
 
     # --- CLI wrappers ---
 
+    def _cli_env_assignments(self, controller_addr: str | None = None) -> list[str]:
+        parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+        ]
+        for key, value in self.cli_env.items():
+            parts.append(f"{key}={shlex.quote(str(value))}")
+        return parts
+
     def cli(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command on the controller node.
 
         *controller_addr* overrides the endpoint(s) passed via
         ``SPUR_CONTROLLER_ADDR`` (e.g. a comma-separated failover list).
         """
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        cmd_parts = self._cli_env_assignments(controller_addr)
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        cmd_parts.extend(shlex.quote(a) for a in args[1:])
         return self.nodes[0].exec(" ".join(cmd_parts))
 
     def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
@@ -400,12 +420,9 @@ class SpurCluster:
 
         *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
         """
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        cmd_parts = self._cli_env_assignments(controller_addr)
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        cmd_parts.extend(shlex.quote(a) for a in args[1:])
         return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
 
     def cli_as_user(
@@ -425,27 +442,21 @@ class SpurCluster:
         *extra_env* adds variables to the environment. Pass ``SPUR_AUTH_TOKEN`` to
         separate the identity the controller verifies from the invoking account.
         """
-        inner = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-        ]
+        inner = self._cli_env_assignments(controller_addr)
         for key, value in (extra_env or {}).items():
-            inner.append(f"{key}='{value}'")
-        inner.append(f"'{self.bin_dir}/{args[0]}'")
-        inner.extend(f"'{a}'" for a in args[1:])
-        cmd = f"{self._sudo_prefix()}-u '{run_as}' env {' '.join(inner)}"
+            inner.append(f"{key}={shlex.quote(str(value))}")
+        inner.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        inner.extend(shlex.quote(a) for a in args[1:])
+        cmd = f"{self._sudo_prefix()}-u {shlex.quote(run_as)} env {' '.join(inner)}"
         return self.nodes[0].exec_allow_fail(cmd)
 
     def cli_with_exit(
         self, args: list[str], controller_addr: str | None = None
     ) -> tuple[int, str]:
         """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        cmd_parts = self._cli_env_assignments(controller_addr)
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        cmd_parts.extend(shlex.quote(a) for a in args[1:])
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
@@ -455,11 +466,8 @@ class SpurCluster:
 
     def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr)."""
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
-            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            shlex.quote(f"{self.bin_dir}/srun"),
-        ]
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
@@ -479,11 +487,8 @@ class SpurCluster:
         removes variables (via ``env -u``) so an empty value does not fall through
         to ``~/.spur/token``.
         """
-        cmd_parts = [
-            f"SPUR_JOB_ID={job_id}",
-            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
-            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-        ]
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(f"SPUR_JOB_ID={job_id}")
         for key, value in (extra_env or {}).items():
             cmd_parts.append(f"{key}={shlex.quote(str(value))}")
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
@@ -513,11 +518,8 @@ class SpurCluster:
             f"#!/bin/bash\nset -euo pipefail\n{shell_body}\n",
         )
 
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
-            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            f"SHELL={shlex.quote(script_path)}",
-        ]
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(f"SHELL={shlex.quote(script_path)}")
         for key, value in (extra_env or {}).items():
             cmd_parts.append(f"{key}={shlex.quote(str(value))}")
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/spur"))
@@ -739,6 +741,74 @@ class SpurCluster:
             if content.strip():
                 combined.append(content)
         return "\n".join(combined)
+
+    def install_native_jwks(self) -> dict[str, str]:
+        """Generate native JWKS under ``remote_dir/jwks`` on every node."""
+        jwks_dir = f"{self.remote_dir}/jwks"
+        spur = f"{self.bin_dir}/spur"
+        n0 = self.nodes[0]
+        n0.exec(f"mkdir -p '{jwks_dir}'")
+        n0.exec(f"'{spur}' auth-keys hmac --kid auth-1 --out '{jwks_dir}/auth.jwks'")
+        n0.exec(
+            f"'{spur}' auth-keys ed25519 --kid cred-1 "
+            f"--signing '{jwks_dir}/cred-signing.jwks' "
+            f"--verify '{jwks_dir}/cred-verification.jwks'"
+        )
+        n0.exec(
+            f"'{spur}' auth-keys ed25519 --kid ctrl-1 "
+            f"--signing '{jwks_dir}/controller-signing.jwks' "
+            f"--verify '{jwks_dir}/controller-verification.jwks'"
+        )
+        n0.exec(
+            f"'{spur}' auth-keys ed25519 --kid node-1 "
+            f"--signing '{jwks_dir}/node-signing.jwks' "
+            f"--verify '{jwks_dir}/node-verification.jwks'"
+        )
+        names = [
+            "auth.jwks",
+            "cred-signing.jwks",
+            "cred-verification.jwks",
+            "controller-signing.jwks",
+            "controller-verification.jwks",
+            "node-signing.jwks",
+            "node-verification.jwks",
+        ]
+        for name in names:
+            path = f"{jwks_dir}/{name}"
+            n0.exec(f"chmod 600 '{path}'")
+        # Signing material stays on the controller host. Agents get verification
+        # JWKS plus the HMAC auth set (needed to run spurauthd locally).
+        agent_names = [
+            "auth.jwks",
+            "cred-verification.jwks",
+            "controller-verification.jwks",
+            "node-verification.jwks",
+        ]
+        for name in agent_names:
+            path = f"{jwks_dir}/{name}"
+            body = n0.read_file(path)
+            for node in self.nodes[1:]:
+                node.exec(f"mkdir -p '{jwks_dir}'")
+                node.write_file(path, body, mode=0o600)
+        return {name.rsplit(".", 1)[0]: f"{jwks_dir}/{name}" for name in names}
+
+    def start_native_mint(self, jwks: str, socket: str):
+        """Start ``spurauthd`` on every node so agents can mint controller RPCs."""
+        remote = f"{self.bin_dir}/spurauthd"
+        present = self.nodes[0].exec_allow_fail(
+            f"test -x '{remote}' && echo ok || true"
+        ).strip()
+        if present != "ok":
+            pytest.skip("spurauthd is not deployed; cargo build --release -p spurauthd")
+        self._kill_mint()
+        for node, name in zip(self.nodes, self.node_names):
+            cmd = (
+                f"nohup '{self.bin_dir}/spurauthd' --cluster e2e-test "
+                f"--jwks {shlex.quote(jwks)} --socket {shlex.quote(socket)} "
+                f"> '{self.log_dir}/spurauthd.log' 2>&1 & echo $!"
+            )
+            pid = node.exec(cmd).strip()
+            logger.info("spurauthd started on %s (pid %s)", name, pid)
 
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""
@@ -1242,10 +1312,19 @@ tar -C "$R" -czf '{local_tar}' .
         for node in self.nodes:
             node.write_file(f"{self.etc_dir}/spur.conf", config)
 
+    def _daemon_env_assignments(self, extra: dict[str, str] | None = None) -> str:
+        merged = {**self.daemon_env, **(extra or {})}
+        if not merged:
+            return ""
+        return " ".join(
+            f"{key}={shlex.quote(str(value))}" for key, value in merged.items()
+        ) + " "
+
     def _start_controller(self):
         listen = f"[::]:{CONTROLLER_PORT}"
+        extra = self._daemon_env_assignments(self.controller_env)
         cmd = (
-            f"nohup '{self.bin_dir}/spurctld' "
+            f"nohup env {extra}'{self.bin_dir}/spurctld' "
             f"-f '{self.etc_dir}/spur.conf' "
             f"--listen '{listen}' --state-dir '{self.state_dir}' --log-level info -D "
             f"> '{self.log_dir}/spurctld.log' 2>&1 & echo $!"
@@ -1321,6 +1400,10 @@ tar -C "$R" -czf '{local_tar}' .
     def _kill_controller(self):
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld")
 
+    def _kill_mint(self):
+        for node in self.nodes:
+            self._pkill(node, f"{self.bin_dir}/spurauthd")
+
     def _kill_agents(self, use_sudo: bool = False, broad: bool = False):
         for node in self.nodes:
             self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=use_sudo)
@@ -1339,7 +1422,9 @@ tar -C "$R" -czf '{local_tar}' .
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
         # `env VAR=val` runs under any sudo prefix, so the canary lands in spurd's
         # own environment in both the rootless and rootful launch shapes.
-        daemon_env = f"env SPUR_DAEMON_ENV_CANARY={DAEMON_ENV_CANARY}"
+        daemon_env = (
+            f"env SPUR_DAEMON_ENV_CANARY={DAEMON_ENV_CANARY} {self._daemon_env_assignments(self.agent_env)}"
+        )
         spurd_bin = (
             f"{self._sudo_prefix()}{daemon_env} '{self.bin_dir}/spurd'"
             if self.agent_as_root

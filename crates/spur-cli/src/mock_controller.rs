@@ -171,6 +171,7 @@ mock_controller_impl! {
                 step_id: MOCK_STEP_ID,
                 node_addr: String::new(),
                 container: None,
+                execution_credential: String::new(),
             }))
         }
 
@@ -367,7 +368,10 @@ pub(crate) fn lazy_client(
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("valid endpoint")
         .connect_lazy();
-    spur_proto::controller_client(crate::authclient::wrap(channel))
+    spur_proto::controller_client(crate::authclient::wrap_with_audience(
+        channel,
+        &format!("http://{addr}"),
+    ))
 }
 
 /// Reserve a localhost port and release it, so connecting to it is refused

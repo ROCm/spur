@@ -1008,6 +1008,7 @@ address = "http://peer-a:6817"
                     user: "alice".into(),
                     container: None,
                     non_interactive: false,
+                    execution_credential: String::new(),
                 },
             )),
         };

@@ -7,12 +7,13 @@
 //! call goes through here rather than `SlurmAgentClient::connect` directly. That keeps a new call
 //! site from silently becoming an unauthenticated one.
 //!
-//! The credential is a short-lived token signed with the cluster's `[auth] jwt_key` — the same key
-//! the node-admission path already uses — so no new secret is introduced. It is minted per
-//! connection rather than cached: the TTL is short, connections are not hot, and a cache would have
-//! to handle rotation. This design assumes connections are short-lived (one RPC per connect); a
-//! long-lived connection would hold a credential that expires mid-session and get rejected on the
-//! next call without an obvious reason.
+//! With `[auth] plugin = "spur"`, each connection mints a native `ControllerRpc` token from the
+//! controller Ed25519 signing JWKS. Otherwise it mints a short-lived JWT with subject
+//! [`CONTROLLER_SUBJECT`], signed with `[auth] jwt_key` (the node-admission HMAC). Either way the
+//! token is minted per connection rather than cached: the TTL is short, connections are not hot,
+//! and a cache would have to handle rotation. This design assumes connections are short-lived (one
+//! RPC per connect); a long-lived connection would hold a credential that expires mid-session and
+//! get rejected on the next call without an obvious reason.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +134,21 @@ fn credential_with_key(key: &str) -> ControllerCredential {
 }
 
 fn credential() -> ControllerCredential {
+    if let Some(signer) = crate::native_keys::controller_rpc_signer() {
+        let now = spur_core::native_mint::unix_now().unwrap_or(0);
+        return match signer.mint(now) {
+            Ok(t) => ControllerCredential {
+                header: MetadataValue::try_from(format!("Bearer {t}")).ok(),
+            },
+            Err(e) => {
+                error!(
+                    "failed to mint native controller credential for agent calls: {e}; \
+                     connections will carry no credential — agents in `required` mode will refuse them"
+                );
+                ControllerCredential::default()
+            }
+        };
+    }
     let key = SIGNING_KEY
         .get()
         .filter(|k| !k.is_empty())

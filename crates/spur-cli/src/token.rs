@@ -90,6 +90,12 @@ fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &st
     };
     let cfg = spur_core::config::SlurmConfig::load_from_file(std::path::Path::new(config_path))
         .map_err(|e| anyhow::anyhow!("read {config_path}: {e}"))?;
+    if cfg.auth.plugin == "spur" {
+        anyhow::bail!(
+            "{config_path} has [auth] plugin = \"spur\"; user RPCs are minted from the local \
+             credential socket. `spur token user` signs a JWT from jwt_key and is JWT-plugin only"
+        );
+    }
     let resolved = cfg
         .auth
         .resolved_jwt_key()
@@ -223,5 +229,17 @@ mod tests {
         assert!(parse_ttl("-1h").is_err());
         assert!(parse_ttl("1.5h").is_err());
         assert!(parse_ttl("h").is_err());
+    }
+
+    #[test]
+    fn user_token_is_refused_when_plugin_is_spur() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur.conf");
+        std::fs::write(&path, "cluster_name = \"t\"\n[auth]\nplugin = \"spur\"\n").unwrap();
+        let err = cmd_user_token("alice", false, None, path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("plugin = \"spur\""),
+            "unexpected error: {err}"
+        );
     }
 }

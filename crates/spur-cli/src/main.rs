@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod auth_keys;
 mod authclient;
 mod env_defaults;
 mod exec;
@@ -152,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         "image" => return runtime.block_on(image::main()),
         "exec" => return runtime.block_on(exec::main()),
         "token" => return runtime.block_on(token::main()),
+        "auth-keys" => return auth_keys::main(),
         _ => {}
     }
 
@@ -188,7 +190,7 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "node" | "k8s" | "image" | "exec" | "token" => Some(args[1].as_str()),
+        "net" | "node" | "k8s" | "image" | "exec" | "token" | "auth-keys" => Some(args[1].as_str()),
         _ => None,
     };
 
@@ -242,6 +244,7 @@ fn main() -> anyhow::Result<()> {
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             "token" => runtime.block_on(token::main_with_args(rewritten)),
+            "auth-keys" => auth_keys::main_with_args(rewritten),
             _ => unreachable!(),
         };
         return result;
@@ -331,6 +334,7 @@ fn print_usage() {
     eprintln!("  attach      Attach to a running job's I/O");
     eprintln!("  crontab     Manage recurring cron-style jobs");
     eprintln!("  health      Node health monitoring");
+    eprintln!("  auth-keys   Generate JWKS files for native authentication");
     eprintln!("  version     Show version (--check to check for updates)");
     eprintln!("  self-update Download and install the latest version (--nightly)");
     eprintln!();
@@ -373,5 +377,6 @@ mod tests {
         crate::sstat::SstatArgs::command().debug_assert();
         crate::strigger::StriggerArgs::command().debug_assert();
         crate::token::TokenArgs::command().debug_assert();
+        crate::auth_keys::AuthKeysArgs::command().debug_assert();
     }
 }

@@ -812,7 +812,7 @@ async fn dispatch_step(
     let io = params.io;
     let step_mpi = params.mpi;
     let ntasks = crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes);
-    let step_id = client
+    let created = client
         .create_job_step(CreateJobStepRequest {
             job_id,
             command: args.command.clone(),
@@ -824,16 +824,15 @@ async fn dispatch_step(
             node: String::new(),
             user: params.user.to_string(),
             uid: nix::unistd::geteuid().as_raw(),
-            // The buffered path carries the container on RunStep; this call only
-            // registers the step to obtain its id.
-            container: None,
+            container: container_spec_from_srun_args(args),
             num_nodes: params.explicit_num_nodes.unwrap_or(0),
             nodelist: params.requested_nodelist.unwrap_or_default().to_string(),
         })
         .await
         .context("failed to create job step")?
-        .into_inner()
-        .step_id;
+        .into_inner();
+    let step_id = created.step_id;
+    let execution_credential = created.execution_credential;
 
     for warning in step_unsupported_warnings(args) {
         eprintln!("{warning}");
@@ -870,6 +869,7 @@ async fn dispatch_step(
             mpi: step_mpi.to_string(),
             user: params.user.to_string(),
             container: container_spec_from_srun_args(args),
+            execution_credential,
         })
         .await
         .context("RunStep dispatch failed")?
@@ -1536,7 +1536,7 @@ async fn run_interactive_pty(
     let winsize = crate::interactive::get_terminal_size();
 
     let mut created_step: Option<u32> = None;
-    let mut cached_step: Option<(u32, String)> = None;
+    let mut cached_step: Option<(u32, String, String)> = None;
     // The controller resolves the step's own container against the parent job's
     // (inheriting `salloc/sbatch --container-image`) and echoes the effective spec;
     // persisted across retries since a cached step skips the CreateJobStep call.
@@ -1550,7 +1550,7 @@ async fn run_interactive_pty(
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
 
-            let (step_id, node_addr) = if let Some(ref cached) = cached_step {
+            let (step_id, node_addr, step_cred) = if let Some(ref cached) = cached_step {
                 cached.clone()
             } else {
                 let step_resp = match ctrl
@@ -1593,7 +1593,11 @@ async fn run_interactive_pty(
                         job_id
                     ));
                 }
-                let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
+                let pair = (
+                    step_resp.step_id,
+                    format!("http://{}", step_resp.node_addr),
+                    step_resp.execution_credential,
+                );
                 cached_step = Some(pair.clone());
                 pair
             };
@@ -1612,6 +1616,7 @@ async fn run_interactive_pty(
                 true,
                 user,
                 effective_container.clone(),
+                step_cred,
             )
             .await
             {

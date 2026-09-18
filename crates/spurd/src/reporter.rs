@@ -104,10 +104,9 @@ impl NodeReporter {
 
     /// Register with the controller.
     pub async fn register(&self) -> anyhow::Result<()> {
-        let channel = spur_client::connect_channel(&self.controller_addr)
+        let mut client = crate::controller_auth::connect(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for registration")?;
-        let mut client = spur_proto::controller_client(channel);
 
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
@@ -143,10 +142,9 @@ impl NodeReporter {
     /// Notify the controller that this agent is shutting down.
     pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
         let current_token = self.node_token.read().unwrap().clone();
-        let channel = spur_client::connect_channel(&self.controller_addr)
+        let mut client = crate::controller_auth::connect(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for deregistration")?;
-        let mut client = spur_proto::controller_client(channel);
 
         client
             .deregister_agent(spur_proto::proto::DeregisterAgentRequest {
@@ -168,10 +166,9 @@ impl NodeReporter {
         step_id: spur_core::step::StepId,
         stale_descriptor: bool,
     ) -> anyhow::Result<StepdRecoveryResponse> {
-        let channel = spur_client::connect_channel(&self.controller_addr)
+        let mut client = crate::controller_auth::connect(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for runtime recovery")?;
-        let mut client = spur_proto::controller_client(channel);
         let node_token = self
             .node_token
             .read()
@@ -211,9 +208,8 @@ impl NodeReporter {
                 })
                 .collect();
 
-            match spur_client::connect_channel(&self.controller_addr).await {
-                Ok(channel) => {
-                    let mut client = spur_proto::controller_client(channel);
+            match crate::controller_auth::connect(&self.controller_addr).await {
+                Ok(mut client) => {
                     match client
                         .heartbeat(spur_proto::proto::HeartbeatRequest {
                             hostname: self.hostname.clone(),

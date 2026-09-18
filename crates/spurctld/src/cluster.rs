@@ -1322,21 +1322,32 @@ impl ClusterManager {
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
     ///
     /// These are control-plane paths where `user` has already been bound to the verified identity
-    /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller and
-    /// a literal `"root"` is the admin override, so both are treated as internal here; the raw
-    /// [`spur_core::auth::check_job_owner`] no longer infers that itself.
-    fn check_job_owner(
+    /// (or is a daemon-internal call that leaves it empty). An empty `user` is the daemon caller, a
+    /// literal `"root"` is the admin override, and `operates_jobs` is a verified Operator or
+    /// Administrator. The raw [`spur_core::auth::check_job_owner`] no longer infers that itself.
+    fn check_job_owner_for(
         user: &str,
         owner: &str,
         action: &str,
+        operates_jobs: bool,
     ) -> Result<(), spur_core::auth::AuthError> {
-        let is_internal = user.is_empty() || user == "root";
+        let is_internal = operates_jobs || user.is_empty() || user == "root";
         spur_core::auth::check_job_owner(user, is_internal, owner, action)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or
     /// empty (trusted internal/daemon calls).
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> Result<(), CancelError> {
+        self.cancel_job_for(job_id, user, false)
+    }
+
+    /// Like [`Self::cancel_job`], plus Operators/Administrators (`operates_jobs`).
+    pub fn cancel_job_for(
+        &self,
+        job_id: JobId,
+        user: &str,
+        operates_jobs: bool,
+    ) -> Result<(), CancelError> {
         {
             let jobs = self.jobs.read();
             let job = jobs.get(&job_id).ok_or(CancelError::NotFound(job_id))?;
@@ -1346,7 +1357,8 @@ impl ClusterManager {
                     state: job.state,
                 });
             }
-            Self::check_job_owner(user, &job.spec.user, "cancel").map_err(CancelError::NotOwner)?;
+            Self::check_job_owner_for(user, &job.spec.user, "cancel", operates_jobs)
+                .map_err(CancelError::NotOwner)?;
         }
 
         // Use JobComplete (not JobStateChange) so that resource deallocation
@@ -1517,11 +1529,23 @@ impl ClusterManager {
     }
 
     /// Complete a standalone srun allocation after its step finishes.
+    #[cfg(test)]
     pub fn finish_srun_job(
         &self,
         job_id: JobId,
         exit_code: i32,
         user: &str,
+    ) -> Result<Job, SrunCompleteError> {
+        self.finish_srun_job_for(job_id, exit_code, user, false)
+    }
+
+    /// Like [`Self::finish_srun_job`], plus Operators/Administrators (`operates_jobs`).
+    pub fn finish_srun_job_for(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        user: &str,
+        operates_jobs: bool,
     ) -> Result<Job, SrunCompleteError> {
         let job = {
             let jobs = self.jobs.read();
@@ -1540,12 +1564,12 @@ impl ClusterManager {
                     state: job.state,
                 });
             }
-            Self::check_job_owner(user, &job.spec.user, "complete").map_err(|_| {
-                SrunCompleteError::NotOwner {
+            Self::check_job_owner_for(user, &job.spec.user, "complete", operates_jobs).map_err(
+                |_| SrunCompleteError::NotOwner {
                     job_id,
                     user: user.to_string(),
-                }
-            })?;
+                },
+            )?;
             job.clone()
         };
 
@@ -1566,7 +1590,18 @@ impl ClusterManager {
 
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
+    #[cfg(test)]
     pub fn suspend_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
+        self.suspend_job_for(job_id, user, false)
+    }
+
+    /// Like [`Self::suspend_job`], plus Operators/Administrators (`operates_jobs`).
+    pub fn suspend_job_for(
+        &self,
+        job_id: JobId,
+        user: &str,
+        operates_jobs: bool,
+    ) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1575,7 +1610,7 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
-            Self::check_job_owner(user, &job.spec.user, "suspend")?;
+            Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
         }
         self.propose(WalOperation::JobSuspend {
             job_id,
@@ -1589,7 +1624,18 @@ impl ClusterManager {
 
     /// Resume a suspended job: validate state, record through Raft, fold suspended time.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
+    #[cfg(test)]
     pub fn resume_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
+        self.resume_job_for(job_id, user, false)
+    }
+
+    /// Like [`Self::resume_job`], plus Operators/Administrators (`operates_jobs`).
+    pub fn resume_job_for(
+        &self,
+        job_id: JobId,
+        user: &str,
+        operates_jobs: bool,
+    ) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1598,7 +1644,7 @@ impl ClusterManager {
             if job.state != JobState::Suspended {
                 anyhow::bail!("job {} is not suspended (state {:?})", job_id, job.state);
             }
-            Self::check_job_owner(user, &job.spec.user, "resume")?;
+            Self::check_job_owner_for(user, &job.spec.user, "resume", operates_jobs)?;
         }
         self.propose(WalOperation::JobResume {
             job_id,
@@ -20236,6 +20282,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_operator_flag_allows_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("operator-cancel"));
+        cm.cancel_job_for(job_id, "ops", true).unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn suspend_job_wrong_user_rejected() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -20281,6 +20338,27 @@ mod tests {
         settle(&cm, id, JobState::Running);
 
         cm.suspend_job(id, "root").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_job_operator_flag_allows_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("sus-ops"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.suspend_job_for(id, "ops", true).unwrap();
         settle(&cm, id, JobState::Suspended);
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
     }
@@ -20335,6 +20413,29 @@ mod tests {
         settle(&cm, id, JobState::Suspended);
 
         cm.resume_job(id, "root").unwrap();
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_job_operator_flag_allows_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("res-ops"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        cm.suspend_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Suspended);
+
+        cm.resume_job_for(id, "ops", true).unwrap();
         settle(&cm, id, JobState::Running);
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
     }
@@ -25674,6 +25775,19 @@ mod tests {
             cm.finish_srun_job(id, 0, "otheruser"),
             Err(SrunCompleteError::NotOwner { job_id, user }) if job_id == id && user == "otheruser"
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_operator_flag_allows_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-ops"));
+        start_srun_job_on(&cm, id, "n1");
+
+        let returned = cm.finish_srun_job_for(id, 0, "ops", true).unwrap();
+        assert_eq!(returned.job_id, id);
+        settle(&cm, id, JobState::Completed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

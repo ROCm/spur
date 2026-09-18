@@ -11,6 +11,7 @@ pub mod agent_server;
 pub mod auth_middleware;
 pub mod cluster;
 pub mod container;
+pub mod controller_auth;
 pub(crate) mod device_cgroup;
 pub mod executor;
 pub mod job_entry;

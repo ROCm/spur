@@ -12,6 +12,7 @@ mod quota;
 mod quota_controller;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBuilder};
@@ -62,9 +63,16 @@ struct Args {
     auth_mode: String,
 
     /// Cluster JWT signing key (`[auth] jwt_key`) the operator's agent surface verifies credentials
-    /// against. Required when `--auth-mode required`.
+    /// against. Required when `--auth-mode required` unless `[auth] plugin = "spur"` in `--config`.
     #[arg(long, env = "SPUR_JWT_KEY")]
     jwt_key: Option<String>,
+
+    /// Spur config (`[auth] plugin`, JWKS paths). When the file exists, native
+    /// `plugin = "spur"` is loaded the same way as `spurd`. When it does not,
+    /// set `$SPUR_AUTH_PLUGIN=spur` plus JWKS env paths and `$SPUR_CLUSTER_NAME`
+    /// (required; it is part of the agent audience).
+    #[arg(long, default_value = "/etc/spur/spur.conf")]
+    config: PathBuf,
 
     /// Log level
     #[arg(long, default_value = "info")]
@@ -218,22 +226,61 @@ async fn main() -> anyhow::Result<()> {
 
     // Authenticate callers of the virtual-agent surface: this port carries a cluster-wide
     // pod-create privilege, so reaching it must not be enough to ask the operator to run work.
-    let auth_mode = parse_auth_mode(&args.auth_mode)?;
-    let jwt_key = args.jwt_key.clone().unwrap_or_default();
+    let slurm_cfg = if args.config.is_file() {
+        Some(
+            spur_core::config::SlurmConfig::load_from_file(&args.config)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", args.config.display()))?,
+        )
+    } else {
+        None
+    };
+    let auth_mode = slurm_cfg
+        .as_ref()
+        .map(|c| c.auth.mode)
+        .unwrap_or(parse_auth_mode(&args.auth_mode)?);
+    let jwt_key = args
+        .jwt_key
+        .clone()
+        .or_else(|| {
+            slurm_cfg
+                .as_ref()
+                .and_then(|c| c.auth.resolved_jwt_key().ok().flatten())
+        })
+        .unwrap_or_default();
+    let bearer = match slurm_cfg.as_ref() {
+        Some(c) => spur_core::auth::BearerAuth::from_config(
+            c,
+            jwt_key.as_bytes(),
+            spur_core::auth::VerifierKind::Agent,
+        )
+        .map_err(|e| anyhow::anyhow!("native auth key set: {e}"))?,
+        None => spur_core::auth::BearerAuth::from_env_or_jwt(
+            auth_mode,
+            jwt_key.as_bytes(),
+            spur_core::auth::VerifierKind::Agent,
+        )
+        .map_err(|e| anyhow::anyhow!("native auth key set: {e}"))?,
+    };
     match auth_mode {
-        spur_core::config::AuthMode::Required if jwt_key.is_empty() => anyhow::bail!(
-            "--auth-mode required but no --jwt-key / SPUR_JWT_KEY is set: the operator agent could \
-             never verify a credential and would refuse every launch"
-        ),
+        spur_core::config::AuthMode::Required
+            if bearer.native.is_none() && jwt_key.is_empty() =>
+        {
+            anyhow::bail!(
+                "--auth-mode required but no --jwt-key / SPUR_JWT_KEY or native JWKS is set: \
+                 the operator agent could never verify a credential and would refuse every launch"
+            )
+        }
         spur_core::config::AuthMode::Required => {
             info!("operator agent requires a cluster credential on every RPC")
         }
-        spur_core::config::AuthMode::Permissive if jwt_key.is_empty() => tracing::warn!(
-            "operator agent is permissive but has no --jwt-key / SPUR_JWT_KEY: uncredentialed calls \
-             are allowed, but a controller that DOES present a credential is REJECTED (no key to \
-             verify it against). Set the key so presented credentials verify, then move to \
-             --auth-mode required."
-        ),
+        spur_core::config::AuthMode::Permissive if bearer.native.is_none() && jwt_key.is_empty() => {
+            tracing::warn!(
+                "operator agent is permissive but has no --jwt-key / SPUR_JWT_KEY: uncredentialed calls \
+                 are allowed, but a controller that DOES present a credential is REJECTED (no key to \
+                 verify it against). Set the key so presented credentials verify, then move to \
+                 --auth-mode required."
+            )
+        }
         spur_core::config::AuthMode::Permissive => tracing::warn!(
             "operator agent accepts uncredentialed RPCs (auth.mode = permissive): any peer that can \
              reach this port can ask the operator to create a pod. Set --auth-mode required once \
@@ -246,11 +293,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start virtual agent gRPC server
-    let virtual_agent = agent::VirtualAgent::new(client);
+    let mut virtual_agent = agent::VirtualAgent::new(client);
+    virtual_agent.apply_auth_handshake(&bearer);
     info!(%listen_addr, "virtual agent gRPC server listening");
 
     tonic::transport::Server::builder()
-        .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
+        .layer(auth_middleware::AgentAuthLayer::from_bearer(bearer))
         .add_service(spur_proto::agent_server(virtual_agent))
         .serve(listen_addr)
         .await?;

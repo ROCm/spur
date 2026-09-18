@@ -473,6 +473,8 @@ service SlurmController {
 // -- Agent service (slurmd) --
 
 service SlurmAgent {
+  // Health plus native auth handshake (`auth_audience` / `auth_epoch`).
+  rpc Ping(google.protobuf.Empty) returns (PingResponse);
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
   // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
@@ -705,6 +707,10 @@ message PingResponse {
   string version = 3;
   repeated string federation_peers = 4;
   string cluster_name = 5;
+  // Native plugin handshake: the audience and boot epoch the caller must mint
+  // into user-RPC credentials. Empty when `[auth] plugin` is not `spur`.
+  string auth_audience = 6;
+  uint64 auth_epoch = 7;
 }
 
 message JobStateCount {
@@ -968,6 +974,8 @@ message LaunchJobRequest {
   bool task_fanout = 11;
   // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
   bool pmix_prepared = 12;
+  // Controller-signed job execution credential. Required when [auth] plugin = "spur".
+  string execution_credential = 13;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -1072,6 +1080,8 @@ message RunStepRequest {
   // Step-level container override. Absent = inherit from the parent job's
   // container config (empty image = run on the host / enter the parent).
   ContainerSpec container = 11;
+  // Controller-signed step credential from CreateJobStep. Empty when plugin is jwt.
+  string execution_credential = 12;
 }
 
 // Container settings carried on a step RPC, mirroring the JobSpec container
@@ -1315,6 +1325,8 @@ message RunCommandRequest {
   // Step node subset (comma-separated names). Empty = use the job allocation
   // nodelist. Drives SPUR_NODELIST / SPUR_NNODES / SPUR_NODEID for the step.
   string nodelist = 16;
+  // Controller-signed step credential. Required when [auth] plugin = "spur".
+  string execution_credential = 17;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1390,6 +1402,7 @@ message InitSession {
   string user = 8;           // Requesting user; verified identity must own the job; the controller/admin credential overrides
   ContainerSpec container = 9;  // Effective container the step runs in (empty image = host); resolved by the controller
   bool non_interactive = 10;    // Client stdin is not a TTY: input-stream close is stdin-EOF (drain output), not a hangup (SIGHUP)
+  string execution_credential = 11; // Controller-signed step credential for a PTY launch; empty for attach
 }
 
 message InteractiveInput {
@@ -1750,6 +1763,7 @@ message CreateJobStepResponse {
   uint32 step_id = 1;
   string node_addr = 2;        // Address of the first resolved step node; host:port for agent
   ContainerSpec container = 3; // Effective container for the step (step's own, else inherited from the job); empty image = host
+  string execution_credential = 4; // Controller-signed step credential; empty when plugin is jwt
 }
 
 message CompleteJobStepRequest {

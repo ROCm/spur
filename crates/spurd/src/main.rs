@@ -14,7 +14,7 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use spurd::reporter::NodeReporter;
-use spurd::{agent_server, auth_middleware, executor, reporter, stepd};
+use spurd::{agent_server, auth_middleware, controller_auth, executor, reporter, stepd};
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
@@ -338,6 +338,15 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    match config.as_ref() {
+        Some(c) => controller_auth::install(&c.auth.plugin, &c.cluster_name),
+        None => {
+            let plugin = std::env::var("SPUR_AUTH_PLUGIN").unwrap_or_default();
+            let cluster = std::env::var("SPUR_CLUSTER_NAME").unwrap_or_default();
+            controller_auth::install(&plugin, &cluster);
+        }
+    }
+
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
     let stepd_state_dir = args.state_dir.clone().unwrap_or_else(|| {
@@ -616,7 +625,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let agent_service = agent_server::AgentService::with_cluster_config(
+    let mut agent_service = agent_server::AgentService::with_cluster_config(
         reporter.clone(),
         hooks_config,
         registry.clone(),
@@ -628,6 +637,9 @@ async fn main() -> anyhow::Result<()> {
         allow_root_jobs,
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
+    if let Some(config) = config.as_ref() {
+        agent_service.apply_auth_policy(&config.auth);
+    }
     agent_service.adopt_stepds(&recovered_stepds).await;
     agent_service
         .replay_adopted_allocations(&recovered_stepds)
@@ -682,10 +694,19 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?
         .flatten()
         .unwrap_or_default();
+    let bearer = match config.as_ref() {
+        Some(c) => spur_core::auth::BearerAuth::from_config(
+            c,
+            jwt_key.as_bytes(),
+            spur_core::auth::VerifierKind::Agent,
+        )?,
+        None => spur_core::auth::BearerAuth::jwt(auth_mode, jwt_key.as_bytes()),
+    };
+    agent_service.apply_auth_handshake(&bearer);
     match auth_mode {
-        spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
+        spur_core::config::AuthMode::Required if bearer.native.is_none() && jwt_key.is_empty() => {
             anyhow::bail!(
-                "[auth] mode = \"required\" but no jwt_key or jwt_key_file is configured on this \
+                "[auth] mode = \"required\" but no jwt_key or auth.jwks is configured on this \
                  node: the agent could never verify a credential and would refuse every launch"
             )
         }
@@ -704,7 +725,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server_future = tonic::transport::Server::builder()
-        .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
+        .layer(auth_middleware::AgentAuthLayer::from_bearer(bearer))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
     let server_task = tokio::spawn(server_future);

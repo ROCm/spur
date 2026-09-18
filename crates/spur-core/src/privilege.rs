@@ -49,6 +49,11 @@ pub fn named_user_is_privileged(user: &str) -> Result<bool, AuthError> {
 
 /// Group names of a named user. Uses `getgrouplist` rather than reading `/etc/group` so
 /// directory-provided supplementary groups (LDAP/sssd) count.
+pub fn named_user_groups(user: &str) -> Result<Vec<String>, AuthError> {
+    let (_uid, gid) = crate::auth::resolve_unix_credentials(user)?;
+    user_group_names(user, gid)
+}
+
 fn user_group_names(user: &str, gid: u32) -> Result<Vec<String>, AuthError> {
     let name = std::ffi::CString::new(user)
         .map_err(|_| AuthError::UnknownUser(format!("{user}: embedded NUL")))?;

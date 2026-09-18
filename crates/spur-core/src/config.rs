@@ -747,8 +747,9 @@ impl AuthMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Auth plugin: "jwt" (implemented) or "none". "munge" is recognised but not implemented and is
-    /// rejected at startup rather than silently ignored.
+    /// Auth plugin: `"jwt"` (bearer tokens), `"spur"` (native per-RPC mint), or `"none"`.
+    /// `"munge"` is recognised but not implemented and is rejected at startup rather
+    /// than silently ignored.
     pub plugin: String,
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
@@ -767,6 +768,18 @@ pub struct AuthConfig {
     /// cluster where every submitter is already trusted with root.
     #[serde(default)]
     pub allow_root_jobs: bool,
+    /// Usernames that bind Administrator regardless of accounting.
+    #[serde(default)]
+    pub cluster_admins: Vec<String>,
+    /// NSS groups that bind Administrator. Matching is case-insensitive.
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
+    /// NSS groups that bind Operator.
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
+    /// When true, a verified UID 0 native identity is Administrator.
+    #[serde(default)]
+    pub allow_uid_zero_administrator: bool,
 }
 
 impl Default for AuthConfig {
@@ -777,6 +790,10 @@ impl Default for AuthConfig {
             jwt_key: None,
             jwt_key_file: None,
             allow_root_jobs: false,
+            cluster_admins: Vec::new(),
+            admin_groups: Vec::new(),
+            operator_groups: Vec::new(),
+            allow_uid_zero_administrator: false,
         }
     }
 }
@@ -1946,17 +1963,18 @@ impl SlurmConfig {
         // and get no authentication with no warning — worse than the field not existing. Reject
         // anything unimplemented instead of silently ignoring it.
         match self.auth.plugin.as_str() {
-            "jwt" | "none" => {}
+            "jwt" | "none" | "spur" => {}
             "munge" => {
                 return Err(ConfigError::InvalidValue {
                     field: "auth.plugin".into(),
-                    value: "munge (not implemented; use \"jwt\", or \"none\" to disable)".into(),
+                    value: "munge (not implemented; use \"jwt\", \"spur\", or \"none\" to disable)"
+                        .into(),
                 })
             }
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "auth.plugin".into(),
-                    value: format!("{other} (expected \"jwt\" or \"none\")"),
+                    value: format!("{other} (expected \"jwt\", \"spur\", or \"none\")"),
                 })
             }
         }
@@ -1968,10 +1986,12 @@ impl SlurmConfig {
                     .into(),
             });
         }
-        // Without a key, `required` would fall back to a well-known signing constant —
+        // Without a key, JWT `required` would fall back to a well-known signing constant —
         // forgeable, so strictly worse than the default. Refuse to start instead.
+        // Native `plugin = "spur"` verifies HMAC JWKS, not `jwt_key`.
         let resolved_jwt_key = self.auth.resolved_jwt_key()?;
         if self.auth.mode == AuthMode::Required
+            && self.auth.plugin != "spur"
             && resolved_jwt_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::InvalidValue {
@@ -3846,6 +3866,32 @@ jwt_key = "a-real-secret"
         let config = SlurmConfig::load_from_str(toml).expect("required + a key must be accepted");
         assert_eq!(config.auth.mode, AuthMode::Required);
         assert_eq!(config.auth.jwt_key.as_deref(), Some("a-real-secret"));
+    }
+
+    #[test]
+    fn auth_plugin_spur_is_accepted_without_jwt_key() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("native plugin does not use jwt_key");
+        assert_eq!(config.auth.plugin, "spur");
+        assert_eq!(config.auth.mode, AuthMode::Required);
+    }
+
+    #[test]
+    fn auth_plugin_unknown_is_refused() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"not-a-plugin\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("auth.plugin"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

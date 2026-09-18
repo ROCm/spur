@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
@@ -62,14 +63,88 @@ fn validate_target_node(
     }
 }
 
+fn verify_launch_credential(
+    keys: &spur_core::native_jwks::Ed25519VerifyKeySet,
+    cluster_id: &str,
+    hostname: &str,
+    req: &LaunchJobRequest,
+) -> Result<(), Status> {
+    if req.execution_credential.is_empty() {
+        spur_core::native_metrics::inc_exec_fail();
+        return Err(Status::unauthenticated("execution credential required"));
+    }
+    let spec = req
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+    let now = spur_core::native_mint::unix_now().unwrap_or(0);
+    let cred =
+        spur_core::native_exec::verify_execution(&req.execution_credential, keys, cluster_id, now)
+            .map_err(map_exec_err)?;
+    cred.require_kind(spur_core::native_cred::CredentialKind::Job)
+        .map_err(map_exec_err)?;
+    let node = if req.target_node.is_empty() {
+        hostname
+    } else {
+        req.target_node.as_str()
+    };
+    cred.require_node(node).map_err(map_exec_err)?;
+    cred.require_run_attempt(req.run_attempt)
+        .map_err(map_exec_err)?;
+    cred.require_unix(spec.uid, spec.gid)
+        .map_err(map_exec_err)?;
+    let digest =
+        spur_core::native_exec::command_digest(&spec.script, &spec.argv, &spec.container_image);
+    cred.require_command_digest(&digest).map_err(map_exec_err)?;
+    let (cpus, memory_mb, devices) = spur_core::native_exec::proto_slice_devices(&req.allocated);
+    cred.require_slice(node, cpus, memory_mb, &devices)
+        .map_err(map_exec_err)?;
+    spur_core::native_metrics::inc_exec_ok();
+    Ok(())
+}
+
+fn map_exec_err(err: spur_core::native_cred::CredentialError) -> Status {
+    spur_core::native_metrics::inc_exec_fail();
+    use spur_core::native_cred::CredentialStatusCode;
+    match err.status_code() {
+        CredentialStatusCode::FailedPrecondition => Status::failed_precondition(err.to_string()),
+        CredentialStatusCode::PermissionDenied => Status::permission_denied(err.to_string()),
+        CredentialStatusCode::Unauthenticated => Status::unauthenticated(err.to_string()),
+    }
+}
+
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
+    cluster_id: String,
+    cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
+    hostname: String,
+    auth_audience: String,
+    auth_epoch: u64,
 }
 
 impl VirtualAgent {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            cluster_id: String::new(),
+            cred_keys: None,
+            hostname: hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            auth_audience: String::new(),
+            auth_epoch: 0,
+        }
+    }
+
+    pub fn apply_auth_handshake(&mut self, bearer: &spur_core::auth::BearerAuth) {
+        let (audience, epoch) = bearer.advertised_handshake();
+        self.auth_audience = audience;
+        self.auth_epoch = epoch;
+        if let Some(native) = &bearer.native {
+            self.cluster_id = native.cluster_id.clone();
+            self.cred_keys = native.cred_keys.clone();
+        }
     }
 
     /// Look up the SpurJob labeled `spur.amd.com/job-id=<id>` and return its placement facts.
@@ -148,6 +223,18 @@ impl SlurmAgent for VirtualAgent {
     type InteractiveSessionStream =
         tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    async fn ping(&self, _request: Request<()>) -> Result<Response<PingResponse>, Status> {
+        Ok(Response::new(PingResponse {
+            hostname: self.hostname.clone(),
+            server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            version: env!("CARGO_PKG_VERSION").into(),
+            federation_peers: Vec::new(),
+            cluster_name: self.cluster_id.clone(),
+            auth_audience: self.auth_audience.clone(),
+            auth_epoch: self.auth_epoch,
+        }))
+    }
+
     /// Steps here run as pods the kubelet owns, so there is no supervisor
     /// session for a lost caller to re-park on.
     async fn await_step(
@@ -164,6 +251,9 @@ impl SlurmAgent for VirtualAgent {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
+        if let Some(keys) = &self.cred_keys {
+            verify_launch_credential(keys, &self.cluster_id, &self.hostname, &req)?;
+        }
         let job_id = req.job_id;
         let job = self.resolve_job(job_id).await?;
         let ns = job.namespace;
@@ -1310,5 +1400,15 @@ mod tests {
         assert_eq!(gpu_request_to_gres(8, Some("mi300x")), "gpu:mi300x:8");
         assert_eq!(gpu_request_to_gres(4, Some("mi250x")), "gpu:mi250x:4");
         assert_eq!(gpu_request_to_gres(1, Some("gfx942")), "gpu:gfx942:1");
+    }
+
+    #[test]
+    fn map_exec_err_matches_native_agent_status_codes() {
+        let err = map_exec_err(spur_core::native_cred::CredentialError::WrongNode);
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let err = map_exec_err(spur_core::native_cred::CredentialError::IdentityMismatch);
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let err = map_exec_err(spur_core::native_cred::CredentialError::BadSignature);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 }
