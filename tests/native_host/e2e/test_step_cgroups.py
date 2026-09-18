@@ -207,3 +207,53 @@ class TestTaskHookContainment:
         assert em and em.group(1) == job_uid, (
             f"TaskEpilog must run as the job user ({job_uid})\nmarker:\n{epilog_marker!r}"
         )
+
+    def test_container_srun_print_reaches_the_live_tail(self, cgroup_cluster, tmp_path):
+        """A standalone ``srun --container-image`` takes the legacy path, where srun
+        live-tails the step's spool output — so the TaskProlog ``print`` must land on the
+        spool fd (not be spliced into the RPC body the live tail skips)."""
+        cluster = cgroup_cluster
+        cluster.container_preflight()
+        image = cluster.build_container_image(tmp_path)
+        # Unredirected (no ``-o``) so srun live-tails the step's stdout.
+        code, out = cluster.srun_with_exit(
+            [
+                "-N", "1", "-w", cluster.node_names[0], "-t", "2",
+                "--cpus-per-task=1", "--mem=256",
+                f"--container-image={image}",
+                "bash", "-c", "echo PAYLOAD_RAN",
+            ]
+        )
+        assert code == 0, f"container srun failed (exit {code}):\n{out}"
+        assert "HOOK_PRINT_MARKER" in out and "PAYLOAD_RAN" in out, (
+            f"TaskProlog `print` must reach the container srun's live-tailed output\n{out}"
+        )
+        assert out.index("HOOK_PRINT_MARKER") < out.index("PAYLOAD_RAN"), (
+            f"TaskProlog `print` must precede the payload in the live tail\n{out}"
+        )
+
+    def test_task_epilog_runs_when_the_launch_fails_after_the_prolog(self, cgroup_cluster):
+        """If TaskProlog succeeds but the payload spawn then fails, TaskEpilog must still
+        run for paired cleanup. A non-existent ``--chdir`` fails the spawn after TaskProlog
+        has run (its own work_dir falls back to /tmp)."""
+        cluster = cgroup_cluster
+        payload = cluster.write_file("th-fail.sh", "#!/bin/bash\necho unreached\n")
+        job_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "thfail", "-N", "1", "-w", cluster.node_names[0], "-t", "2",
+                 "--cpus-per-task=1", "--mem=256", "--chdir=/nonexistent/spur-e2e", payload]
+            )
+        )
+        assert job_id is not None, "sbatch failed to return a job id"
+        wait_job(cluster, job_id, timeout=120)  # reaches a terminal (failed) state
+
+        prolog_marker = cluster.nodes[0].read_file(_PROLOG_MARKER)
+        assert "uid=" in prolog_marker, (
+            f"TaskProlog should have run before the failed spawn\nmarker:\n{prolog_marker!r}"
+        )
+        # The regression: the paired TaskEpilog runs even though the launch failed.
+        epilog_marker = cluster.nodes[0].read_file(_EPILOG_MARKER)
+        assert "ran=1" in epilog_marker, (
+            f"TaskEpilog must run even when the launch fails after TaskProlog\n"
+            f"marker:\n{epilog_marker!r}\n{cluster.debug_job(job_id)}"
+        )
