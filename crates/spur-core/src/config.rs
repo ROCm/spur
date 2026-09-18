@@ -1047,7 +1047,8 @@ pub struct ClusterConfig {
     /// Filesystem path to the k0s binary (install target + what the systemd unit runs).
     #[serde(default = "default_k0s_binary")]
     pub k0s_binary: String,
-    /// CNI mode: "kuberouter" (k0s default) or "calico" (`bird` native routing over the mesh when
+    /// CNI mode: "kuberouter" (k0s default, run with `overlay-type=full` so pod traffic is
+    /// IPIP-tunnelled on any underlay) or "calico" (`bird` native routing over the mesh when
     /// `network.wg_enabled`, else its own `vxlan` overlay; kubelet `--node-ip` is pinned to its
     /// advertised address for Calico only). Both carry `pod_cidr`/`service_cidr` into the generated
     /// k0s config.
