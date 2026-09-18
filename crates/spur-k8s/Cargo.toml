@@ -38,5 +38,9 @@ hostname = "0.4.2"
 tokio-stream = "0.1"
 backon = { workspace = true }
 
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
 [lints]
 workspace = true
