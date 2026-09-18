@@ -12,7 +12,7 @@ use std::process::Stdio;
 
 use anyhow::Context;
 use tokio::io::AsyncReadExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 use spur_core::hooks::{secure_hook_command, spawn_hook_in_work_dir, HookContext};
 
@@ -118,6 +118,12 @@ async fn run_task_hook(
     task_environment: &HashMap<String, String>,
     cgroup_path: Option<&Path>,
 ) -> anyhow::Result<TaskHookOutput> {
+    info!(
+        job_id = context.job_id,
+        hook = %context.script_context,
+        script = script_path,
+        "running task hook"
+    );
     // Built parent-side: nothing between fork and exec may allocate.
     let mut secure = secure_hook_command(script_path)?;
     let cgroup_join = CgroupJoin::for_cgroup(cgroup_path);

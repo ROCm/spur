@@ -252,6 +252,7 @@ impl StepdLaunchSpec {
             container: self.container,
             prolog_script: None,
             task_prolog_script: self.hooks.task_prolog.clone(),
+            task_epilog_script: self.hooks.task_epilog.clone(),
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,

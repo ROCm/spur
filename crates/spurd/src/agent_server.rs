@@ -4583,6 +4583,11 @@ impl SlurmAgent for AgentService {
             } else {
                 self.hooks.task_prolog.clone()
             },
+            task_epilog_script: if spec.pty {
+                None
+            } else {
+                self.hooks.task_epilog.clone()
+            },
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             mpi: spec.mpi.clone(),
@@ -5291,6 +5296,7 @@ impl SlurmAgent for AgentService {
                 container: None,
                 prolog_script: None,
                 task_prolog_script: None,
+                task_epilog_script: None,
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
                 mpi: req.mpi.clone(),
@@ -5788,8 +5794,9 @@ impl SlurmAgent for AgentService {
         // Redirect the step's stdout/stderr to per-step spool files so
         // stream_job_output can tail them live and output stays bounded on this
         // node. Paths are recorded in active_steps so the tail can find them.
-        let step_files = crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
-            .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let mut step_files =
+            crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
         let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
         let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
         {
@@ -5838,6 +5845,7 @@ impl SlurmAgent for AgentService {
                 container: None,
                 prolog_script: None,
                 task_prolog_script: None,
+                task_epilog_script: None,
                 partition: partition.clone(),
                 nodelist: job_nodelist.clone(),
                 mpi: job_mpi.clone(),
@@ -5885,6 +5893,16 @@ impl SlurmAgent for AgentService {
                 }
             }
         }
+
+        // Put TaskProlog's `print` on the spool stdout before the workload writes so
+        // srun's live tail and the read-back both include it (empty on supervised steps).
+        if !task_prolog_printed.is_empty() {
+            if let Err(e) = std::io::Write::write_all(&mut step_files.stdout, &task_prolog_printed)
+            {
+                warn!(job_id, error = %e, "failed to write TaskProlog print to step stdout");
+            }
+        }
+
         // The legacy dispatch consumes `env`; keep a copy for TaskEpilog.
         let task_epilog_env: HashMap<String, String> = if supervise_step {
             HashMap::new()
@@ -6216,14 +6234,7 @@ impl SlurmAgent for AgentService {
                 }
             }
         };
-        let mut stdout = read_back(stdout_path).await;
-        if !task_prolog_printed.is_empty() {
-            stdout = format!(
-                "{}{}",
-                String::from_utf8_lossy(&task_prolog_printed),
-                stdout
-            );
-        }
+        let stdout = read_back(stdout_path).await;
         Ok(Response::new(RunCommandResponse {
             exit_code: spur_core::process::shell_exit_code(&status),
             stdout,
@@ -11477,6 +11488,7 @@ mod tests {
             container: None,
             prolog_script: None,
             task_prolog_script: None,
+            task_epilog_script: None,
             partition: String::new(),
             nodelist: String::new(),
             mpi: String::new(),
