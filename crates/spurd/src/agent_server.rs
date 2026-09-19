@@ -34,6 +34,12 @@ use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
+/// A forced cancellation is not complete until its node allocation is gone.
+/// This must stay below spurctld's CancelJob RPC budget so a successful RPC is
+/// a real release acknowledgement rather than merely a delivered signal.
+const CANCEL_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+const CANCEL_RELEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
@@ -4900,7 +4906,13 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        if req.signal > 0 {
+        if req.signal == nix::sys::signal::Signal::SIGKILL as i32 {
+            // A signal alone leaves a supervising stepd active after its
+            // workload exits, which keeps the local ledger reserved.
+            self.graceful_cancel(job_id, req.run_attempt).await;
+            self.send_explicit_signal(job_id, req.run_attempt, req.signal)
+                .await;
+        } else if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
         } else {
@@ -4949,6 +4961,17 @@ impl SlurmAgent for AgentService {
 
         if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
+        }
+
+        // A terminal cancel can make the controller reuse this node as soon as
+        // it receives our reply. Signal 0 is the agent's graceful cancel
+        // operation (including its SIGKILL escalation), while a direct SIGKILL
+        // is already forced; neither reply is safe before ledger teardown.
+        // SIGTERM itself remains asynchronous because the controller owns its
+        // explicit grace window.
+        if req.signal == 0 || req.signal == nix::sys::signal::Signal::SIGKILL as i32 {
+            self.wait_for_cancelled_allocation_release(job_id, req.run_attempt)
+                .await?;
         }
 
         Ok(Response::new(()))
@@ -7120,6 +7143,46 @@ impl AgentService {
 
         let gpu_ids = controller_gpu_ids;
         Ok((result, gpu_ids))
+    }
+
+    /// Wait until a terminal cancellation has removed its own ledger entry.
+    /// `run_attempt == 0` names the attempt that was current when cancellation
+    /// began, matching the CancelJob wire contract.
+    async fn wait_for_cancelled_allocation_release(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Result<(), Status> {
+        let attempt = if run_attempt == 0 {
+            self.running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|tracked| tracked.run_attempt)
+        } else {
+            Some(run_attempt)
+        };
+        let Some(attempt) = attempt else {
+            return Ok(());
+        };
+
+        let deadline = tokio::time::Instant::now() + CANCEL_RELEASE_TIMEOUT;
+        loop {
+            if !self
+                .allocation
+                .lock()
+                .await
+                .owns_run_attempt(job_id, attempt)
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "timed out waiting for cancellation of job {job_id} attempt {attempt} to release local resources"
+                )));
+            }
+            tokio::time::sleep(CANCEL_RELEASE_POLL_INTERVAL).await;
+        }
     }
 
     /// Resolve the per-node budget the way `launch_job` does, then reserve, so
@@ -14418,16 +14481,61 @@ mod tests {
 
         svc.cancel_job(Request::new(AgentCancelJobRequest {
             job_id: 7,
-            signal: 9,
+            signal: 0,
             run_attempt: 1,
         }))
         .await
-        .expect("cancel_job");
+        .expect("terminal cancel reply");
 
         assert_eq!(
             svc.free_gpu_count().await,
             1,
-            "cancel must release a launching (never-committed) reservation"
+            "a graceful terminal-cancel reply must release a launching reservation"
+        );
+    }
+
+    // A dispatch abort may retry this node as soon as CancelJob returns. The
+    // reply must therefore wait for the same monitor teardown that drops the
+    // running entry and gives its GPU back, rather than only acknowledging the
+    // SIGKILL delivery.
+    #[tokio::test]
+    async fn forced_cancel_acknowledges_after_releasing_the_local_allocation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 71;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(job_id, tracked).await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job(job_id, 1, 1, 0, &[0])
+                .expect("reserve GPU for tracked job");
+            assert!(allocation.commit_job(job_id, 1));
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: nix::sys::signal::Signal::SIGKILL as i32,
+            run_attempt: 1,
+        }))
+        .await
+        .expect("forced cancel must wait for its release");
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a successful CancelJob reply must not leave its run tracked"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a successful CancelJob reply must make the GPU dispatchable again"
         );
     }
 

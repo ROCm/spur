@@ -9,6 +9,9 @@ service RaftInternal {
   rpc AppendEntries(RaftRequest) returns (RaftResponse);
   rpc Vote(RaftRequest) returns (RaftResponse);
   rpc InstallSnapshot(RaftRequest) returns (RaftResponse);
+  // An older controller returns UNIMPLEMENTED, which deliberately keeps a
+  // mixed cluster on the old-readable NodeStateChange bridge.
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
 }
 
 message RaftRequest {
@@ -17,4 +20,10 @@ message RaftRequest {
 
 message RaftResponse {
   bytes payload = 1;
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  bool release_quarantine_v1 = 1;
 }

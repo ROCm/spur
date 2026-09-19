@@ -9,7 +9,9 @@ environment variable propagation, failure semantics, and execution ordering.
 
 import time
 
-from cluster import parse_job_id, wait_job, job_state
+import pytest
+
+from cluster import parse_job_id, wait_job, wait_job_state, job_state
 
 
 LOGGING_PROLOG = """\
@@ -323,6 +325,112 @@ class TestHookExecution:
 
 class TestHookFailure:
     """Verify failure semantics for all hook types."""
+
+    def test_partial_multinode_dispatch_cleans_up_the_launched_peer(
+        self, unstarted_cluster
+    ):
+        """A node-local launch rejection must not leave its peer allocated."""
+        cluster = unstarted_cluster
+        if len(cluster.nodes) < 2:
+            pytest.skip("partial dispatch test requires at least two nodes")
+
+        launched_node, rejecting_node = cluster.node_names[:2]
+        prolog_path = f"{cluster.remote_dir}/hooks/partial-dispatch-prolog.sh"
+        release_rejection = f"{cluster.remote_dir}/release-partial-dispatch-rejection"
+        sleep_marker = str(8_000_000 + time.time_ns() % 1_000_000)
+
+        # Wait for the peer's successful launch before releasing this rejection,
+        # so the controller must clean up a real partial admission.
+        cluster.nodes[0].exec(f"mkdir -p '{cluster.remote_dir}/hooks'")
+        cluster.nodes[0].write_file(prolog_path, "#!/bin/bash\nexit 0\n", mode=0o755)
+        cluster.nodes[1].exec(f"mkdir -p '{cluster.remote_dir}/hooks'")
+        cluster.nodes[1].write_file(
+            prolog_path,
+            "#!/bin/bash\n"
+            f"while [ ! -e '{release_rejection}' ]; do sleep 0.1; done\n"
+            "exit 1\n",
+            mode=0o755,
+        )
+        for node in cluster.nodes[2:]:
+            node.exec(f"mkdir -p '{cluster.remote_dir}/hooks'")
+            node.write_file(prolog_path, "#!/bin/bash\nexit 0\n", mode=0o755)
+
+        cluster.start({"hooks": {"prolog": prolog_path}})
+        script = cluster.write_file(
+            "partial-dispatch.sh",
+            "#!/bin/bash\n"
+            f"exec sleep {sleep_marker}\n",
+        )
+        job_id = None
+        try:
+            job_id = parse_job_id(
+                cluster.sbatch(
+                    [
+                        "-J",
+                        "partial-dispatch",
+                        "-N",
+                        "2",
+                        f"--nodelist={launched_node},{rejecting_node}",
+                        script,
+                    ]
+                )
+            )
+            assert job_id is not None
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                log = cluster.spurd_log(0)
+                if any(
+                    f"job_id={job_id}" in line and "job launched successfully" in line
+                    for line in log.splitlines()
+                ):
+                    break
+                time.sleep(1)
+            else:
+                raise AssertionError("the successful peer never confirmed its launch")
+
+            cluster.nodes[1].exec(f"touch '{release_rejection}'")
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                running = cluster.nodes[0].exec_allow_fail(
+                    f"pgrep -f '[s]leep {sleep_marker}' || true"
+                ).strip()
+                if not running:
+                    break
+                time.sleep(1)
+            else:
+                raise AssertionError(
+                    "the peer that accepted the launch survived the partial-dispatch abort"
+                )
+
+            wait_job_state(cluster, job_id, "PD", timeout=30)
+
+            recovery = cluster.write_file(
+                "partial-dispatch-recovery.sh", "#!/bin/bash\necho RECOVERED\n"
+            )
+            recovery_id = parse_job_id(
+                cluster.sbatch(
+                    [
+                        "-J",
+                        "partial-dispatch-recovery",
+                        "-N",
+                        "1",
+                        f"--nodelist={launched_node}",
+                        recovery,
+                    ]
+                )
+            )
+            assert recovery_id is not None
+            state = wait_job(cluster, recovery_id, timeout=60)
+            assert state in ("CD", "GONE"), (
+                "the successful peer must accept a new dispatch after its partial "
+                f"launch cleanup, got {state}"
+            )
+        finally:
+            cluster.nodes[1].exec_allow_fail(f"touch '{release_rejection}'")
+            if job_id is not None:
+                cluster.cli_allow_fail(["scancel", str(job_id)])
 
     def test_prolog_failure_fails_job_and_drains_node(self, unstarted_cluster):
         # TODO: Slurm requeues+holds the job on prolog failure. Spur currently

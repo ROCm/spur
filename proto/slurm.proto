@@ -858,6 +858,9 @@ message RegisterAgentRequest {
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
+  // True only when CancelJob's successful reply proves the local allocation
+  // has been released for the requested run attempt.
+  bool release_quarantine_v1 = 9;
 }
 
 message RegisterAgentResponse {
@@ -878,6 +881,7 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  bool release_quarantine_v1 = 8;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.

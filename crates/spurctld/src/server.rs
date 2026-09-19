@@ -944,10 +944,19 @@ impl ControllerService {
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
         for fin in evicted {
-            if let Some(job) = self.cluster.get_job(fin.job_id) {
+            let job_id = fin.job_id;
+            let fences = self.cluster.release_quarantines_by_attempt_for_job(job_id);
+            for (run_attempt, nodes) in fences {
                 let cluster = self.cluster.clone();
                 tokio::spawn(async move {
-                    crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
+                    crate::scheduler_loop::send_cancel_to_nodes(
+                        &cluster,
+                        job_id,
+                        run_attempt,
+                        &nodes,
+                        9,
+                    )
+                    .await;
                 });
             }
         }
@@ -2122,6 +2131,8 @@ impl SlurmController for ControllerService {
                 caller_privileged,
             )
             .map_err(register_node_rpc_status)?;
+        self.cluster
+            .record_release_quarantine_agent_capability(&req.hostname, req.release_quarantine_v1);
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -2285,6 +2296,10 @@ impl SlurmController for ControllerService {
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
         {
+            self.cluster.record_release_quarantine_agent_capability(
+                &req.hostname,
+                req.release_quarantine_v1,
+            );
             // Learn a mesh key that appeared/changed after registration so the node joins ApplyMesh
             // without a restart. Only meaningful once the node is known (heartbeat accepted).
             if self

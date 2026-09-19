@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
+use spur_core::wal::ReleaseQuarantine;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
@@ -23,10 +24,13 @@ use crate::cluster::{ClusterManager, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
-/// Upper bound on a single CancelJob RPC (connect + call) when the caller
-/// awaits delivery. Best-effort cleanup must not stall eviction on an
-/// unreachable agent.
+/// Upper bound on a single CancelJob RPC (connect + call). A successful
+/// forced-cancel reply means the agent has released its local allocation, not
+/// merely accepted the signal, so this includes its bounded teardown wait.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_RELEASE_RPC_TIMEOUT: Duration = Duration::from_secs(35);
+const RELEASE_QUARANTINE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const SIGKILL: i32 = 9;
 
 /// Grace between SIGTERM and SIGKILL when force-finishing a job. The time-limit
 /// and inactive-limit watchdogs share it so the two windows can't drift apart.
@@ -63,6 +67,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let inactive_raft = raft.clone();
     tokio::spawn(async move {
         enforce_inactive_limits(inactive_cluster, inactive_raft).await;
+    });
+    let quarantine_cluster = cluster.clone();
+    let quarantine_raft = raft.clone();
+    tokio::spawn(async move {
+        reconcile_release_quarantines(quarantine_cluster, quarantine_raft).await;
     });
     // Captured once at loop start: the tick interval, per-cycle job cap, and
     // topology tree are baked into loop-local state and are NOT picked up by
@@ -139,7 +148,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
         cluster.purge_expired_reservations();
-        cluster.enforce_reservation_end_times();
+        for job in cluster.enforce_reservation_end_times() {
+            let cluster = cluster.clone();
+            tokio::spawn(async move {
+                send_cancel_to_agents(&cluster, &job, 0).await;
+            });
+        }
         cluster.evict_expired_terminal_jobs();
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
@@ -264,6 +278,28 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             hit_depth_limit,
         );
     }
+}
+
+async fn reconcile_release_quarantines(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
+    let mut interval = tokio::time::interval(RELEASE_QUARANTINE_RETRY_INTERVAL);
+    loop {
+        interval.tick().await;
+        if !raft.is_leader() {
+            continue;
+        }
+        reconcile_release_quarantines_once(&cluster).await;
+    }
+}
+
+async fn reconcile_release_quarantines_once(cluster: &Arc<ClusterManager>) {
+    let mut retries = tokio::task::JoinSet::new();
+    for ((job_id, run_attempt), nodes) in cluster.release_quarantines_by_job_and_attempt() {
+        let cluster = cluster.clone();
+        retries.spawn(async move {
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, SIGKILL).await;
+        });
+    }
+    while retries.join_next().await.is_some() {}
 }
 
 /// Process one scheduler assignment: dispatch/confirm on its nodes, start the
@@ -547,8 +583,8 @@ async fn start_job_on_nodes(
     node_names: &[String],
 ) -> bool {
     let mut set = tokio::task::JoinSet::new();
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(start_one_agent(agent_addr, job_id, run_attempt));
+    for target in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(start_one_agent(target.agent_addr, job_id, run_attempt));
     }
     let mut released = 0usize;
     let mut expected = 0usize;
@@ -1962,7 +1998,25 @@ async fn confirm_dispatch_on_nodes(
 
     // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
     // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
-    cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
+    let cleanup = cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
+    if cleanup.release_unconfirmed {
+        let detail = format!(
+            "{confirmation_detail}; cancellation did not confirm local resource release on every node"
+        );
+        let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+        warn!(
+            job_id,
+            "holding dispatch retry because cancellation did not confirm every node released its allocation"
+        );
+        if spec.interactive {
+            if let Err(error) = cluster.cancel_job(job_id, &spec.user) {
+                error!(job_id, %error, "failed to cancel interactive job after incomplete cleanup");
+            }
+        } else if let Err(error) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
+            error!(job_id, %error, "failed to hold job after incomplete cleanup");
+        }
+        return DispatchConfirmOutcome::Aborted;
+    }
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -2087,6 +2141,11 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 "grace period expired — force-killing job"
             );
 
+            if let Err(e) = cluster.quarantine_job_release(job.job_id) {
+                warn!(job_id = job.job_id, error = %e, "failed to fence job before time-limit finalization");
+                continue;
+            }
+
             if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
             {
                 warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
@@ -2192,6 +2251,11 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
                         "InactiveLimit grace expired — force-killing allocation"
                     );
 
+                    if let Err(e) = cluster.quarantine_job_release(job_id) {
+                        warn!(job_id, error = %e, "failed to fence job before InactiveLimit finalization");
+                        continue;
+                    }
+
                     if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
                         warn!(job_id, error = %e, "failed to reap inactive allocation");
                         continue;
@@ -2279,6 +2343,11 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
 
     if !missing.is_empty() {
         cancel_job_on_nodes(cluster, job.job_id, job.run_attempt, &missing, 9).await;
+    }
+
+    if let Err(e) = cluster.quarantine_job_release(job.job_id) {
+        warn!(job_id = job.job_id, error = %e, "failed to fence completing job before finalization");
+        return;
     }
 
     info!(
@@ -2404,9 +2473,8 @@ pub async fn send_cancel_to_agents(
 /// isn't at the mercy of `job.allocated_nodes` having been mutated in the
 /// meantime (e.g. cleared by a requeue-on-eviction side effect).
 ///
-/// Fire-and-forget: each node's cancel runs on its own task and this returns
-/// immediately. Use `cancel_job_on_nodes` when the cancel must be delivered
-/// before subsequent work (e.g. a requeue that could re-dispatch the job).
+/// Non-terminal signals are fire-and-forget. A terminal cancellation awaits
+/// agent teardown so it can retain or lift the durable release fence.
 pub async fn send_cancel_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -2414,27 +2482,96 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+    if terminal_cancel(signal) {
+        let _ = cancel_job_on_nodes(cluster, job_id, run_attempt, node_names, signal).await;
+        return;
+    }
+    for target in cancel_agent_addrs(cluster, job_id, node_names) {
+        tokio::spawn(cancel_one_agent(target, job_id, run_attempt, signal));
     }
 }
 
-/// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
-/// returning so the caller can establish a happens-before ordering against
-/// later actions. Each RPC is bounded by `CANCEL_RPC_TIMEOUT` so an
-/// unreachable agent can't stall the caller indefinitely.
-pub async fn cancel_job_on_nodes(
+/// Like `send_cancel_to_nodes`, but awaits each terminal cancellation's
+/// attempt-specific local-release acknowledgement before returning. Every
+/// supplied node is fenced before the RPC; a missing address, connection
+/// failure, status failure, or timeout leaves that node fenced.
+///
+/// `release_unconfirmed` means an agent specifically timed out while waiting
+/// for teardown (or the controller could not persist the fence). Delivery
+/// failures retain the fence but do not turn an otherwise retryable dispatch
+/// error into a permanently held batch job.
+#[derive(Default)]
+pub(crate) struct CancelReleaseResult {
+    pub release_unconfirmed: bool,
+}
+
+pub(crate) async fn cancel_job_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
     node_names: &[String],
     signal: i32,
-) {
-    let mut set = tokio::task::JoinSet::new();
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+) -> CancelReleaseResult {
+    let terminal = terminal_cancel(signal);
+    let quarantines: Vec<_> = if terminal {
+        node_names
+            .iter()
+            .cloned()
+            .map(|node_name| ReleaseQuarantine {
+                node_name,
+                job_id,
+                run_attempt,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if terminal {
+        if let Err(error) = cluster.quarantine_release_entries(quarantines.clone()) {
+            error!(job_id, %error, "failed to persist release quarantine before cancellation");
+            return CancelReleaseResult {
+                release_unconfirmed: true,
+            };
+        }
     }
-    while set.join_next().await.is_some() {}
+
+    let mut set = tokio::task::JoinSet::new();
+    let targets = cancel_agent_addrs(cluster, job_id, node_names);
+    for target in targets {
+        set.spawn(cancel_one_agent(target, job_id, run_attempt, signal));
+    }
+    let mut result = CancelReleaseResult::default();
+    while let Some(outcome) = set.join_next().await {
+        match outcome {
+            Ok(CancelAgentResult {
+                quarantine,
+                outcome: CancelJobOutcome::Acknowledged,
+            }) if terminal => {
+                if !cluster.release_quarantine_agent_capable(&quarantine.node_name) {
+                    result.release_unconfirmed = true;
+                    continue;
+                }
+                if let Err(error) = cluster.clear_release_quarantine_entries(vec![quarantine]) {
+                    error!(job_id, %error, "failed to clear acknowledged release quarantine");
+                    result.release_unconfirmed = true;
+                }
+            }
+            Ok(CancelAgentResult {
+                outcome: CancelJobOutcome::Acknowledged,
+                ..
+            }) => {}
+            Ok(CancelAgentResult {
+                outcome: CancelJobOutcome::ReleaseUnconfirmed,
+                ..
+            }) => result.release_unconfirmed = true,
+            Ok(CancelAgentResult {
+                outcome: CancelJobOutcome::DeliveryFailed,
+                ..
+            })
+            | Err(_) => {}
+        }
+    }
+    result
 }
 
 /// Cancel an in-flight srun step on the given nodes without tearing down the
@@ -2448,9 +2585,9 @@ pub async fn cancel_step_on_nodes(
     signal: i32,
 ) {
     let mut set = tokio::task::JoinSet::new();
-    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+    for target in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_step_agent(
-            agent_addr,
+            target.agent_addr,
             job_id,
             run_attempt,
             step_id,
@@ -2523,19 +2660,27 @@ async fn cancel_one_step_agent(
     }
 }
 
-/// Resolve `node_names` to agent URLs, logging and skipping any node whose
-/// address is unknown.
+struct CancelTarget {
+    node_name: String,
+    agent_addr: String,
+}
+
+/// Resolve `node_names` to agent URLs, logging any node whose address is
+/// unknown. Terminal cancellation retains a fence for the unresolved node.
 fn cancel_agent_addrs(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     node_names: &[String],
-) -> Vec<String> {
+) -> Vec<CancelTarget> {
     let mut addrs = Vec::with_capacity(node_names.len());
     for node_name in node_names {
         match cluster.get_node(node_name) {
             Some(ref n) => {
                 if let Some(url) = node_comm_http_url(n) {
-                    addrs.push(url);
+                    addrs.push(CancelTarget {
+                        node_name: node_name.clone(),
+                        agent_addr: url,
+                    });
                 } else {
                     warn!(
                         job_id,
@@ -2556,15 +2701,37 @@ fn cancel_agent_addrs(
     addrs
 }
 
-/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
-/// timeouts are logged, never propagated: a cancel is best-effort cleanup and
-/// must not block the caller past the timeout.
+/// Deliver one CancelJob RPC, bounded by `CANCEL_RELEASE_RPC_TIMEOUT`. Errors
+/// and timeouts are logged, never propagated: a cancel is best-effort cleanup
+/// and must not block the caller past the timeout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancelJobOutcome {
+    Acknowledged,
+    DeliveryFailed,
+    ReleaseUnconfirmed,
+}
+
+struct CancelAgentResult {
+    quarantine: ReleaseQuarantine,
+    outcome: CancelJobOutcome,
+}
+
+fn terminal_cancel(signal: i32) -> bool {
+    signal == 0 || signal == SIGKILL
+}
+
 async fn cancel_one_agent(
-    agent_addr: String,
+    target: CancelTarget,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
     signal: i32,
-) {
+) -> CancelAgentResult {
+    let agent_addr = target.agent_addr;
+    let quarantine = ReleaseQuarantine {
+        node_name: target.node_name,
+        job_id,
+        run_attempt,
+    };
     let attempt = async {
         match crate::agent_client::connect(agent_addr.clone())
             .await
@@ -2588,8 +2755,14 @@ async fn cancel_one_agent(
                         error = %e,
                         "CancelJob RPC failed"
                     );
+                    if e.code() == tonic::Code::DeadlineExceeded {
+                        CancelJobOutcome::ReleaseUnconfirmed
+                    } else {
+                        CancelJobOutcome::DeliveryFailed
+                    }
                 } else {
                     info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
+                    CancelJobOutcome::Acknowledged
                 }
             }
             Err(e) => {
@@ -2599,18 +2772,29 @@ async fn cancel_one_agent(
                     error = %e,
                     "failed to connect to agent for cancel"
                 );
+                CancelJobOutcome::DeliveryFailed
             }
         }
     };
-    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
-        .await
-        .is_err()
-    {
-        warn!(
-            job_id,
-            agent = %agent_addr,
-            "CancelJob RPC timed out"
-        );
+    let timeout = if terminal_cancel(signal) {
+        CANCEL_RELEASE_RPC_TIMEOUT
+    } else {
+        CANCEL_RPC_TIMEOUT
+    };
+    let outcome = match tokio::time::timeout(timeout, attempt).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            warn!(
+                job_id,
+                agent = %agent_addr,
+                "CancelJob RPC timed out"
+            );
+            CancelJobOutcome::ReleaseUnconfirmed
+        }
+    };
+    CancelAgentResult {
+        quarantine,
+        outcome,
     }
 }
 
@@ -3709,6 +3893,9 @@ mod tests {
                 .await
                 .expect("single-node raft did not self-elect within 5s");
             cm.set_raft(handle.raft);
+            // Scheduler tests use current-version mock agents. The empty
+            // voter set keeps that model local without a test Raft RPC server.
+            cm.set_raft_voters(std::collections::BTreeMap::new());
             cm
         }
 
@@ -3747,6 +3934,7 @@ mod tests {
             wait_for(&format!("node '{n}' registered"), || {
                 cm.get_node(&n).is_some()
             });
+            cm.record_release_quarantine_agent_capability(name, true);
         }
 
         fn register_node_without_comm_addr(cm: &ClusterManager, name: &str) {
@@ -4617,6 +4805,38 @@ mod tests {
                 1,
                 "n1 launched the job, so it must be stopped before the job settles"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn release_quarantine_retries_clear_each_attempt() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (first_addr, first_cancels) = spawn_mock_agent().await;
+            let (second_addr, second_cancels) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", first_addr);
+            register_node_at(&cm, "n2", second_addr);
+            cm.record_release_quarantine_agent_capability("n1", true);
+            cm.record_release_quarantine_agent_capability("n2", true);
+
+            cm.quarantine_release_entries(vec![
+                ReleaseQuarantine {
+                    node_name: "n1".into(),
+                    job_id: 41,
+                    run_attempt: 3,
+                },
+                ReleaseQuarantine {
+                    node_name: "n2".into(),
+                    job_id: 41,
+                    run_attempt: 4,
+                },
+            ])
+            .unwrap();
+
+            reconcile_release_quarantines_once(&cm).await;
+
+            assert!(cm.release_quarantines_by_job_and_attempt().is_empty());
+            assert_eq!(first_cancels.load(Ordering::SeqCst), 1);
+            assert_eq!(second_cancels.load(Ordering::SeqCst), 1);
         }
 
         // ── measured admission latency ──

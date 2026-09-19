@@ -12,7 +12,9 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use spur_proto::raft_proto::raft_internal_server::{RaftInternal, RaftInternalServer};
-use spur_proto::raft_proto::{RaftRequest, RaftResponse};
+use spur_proto::raft_proto::{
+    CapabilitiesRequest, CapabilitiesResponse, RaftRequest, RaftResponse,
+};
 
 use crate::raft::{SpurRaft, SpurTypeConfig, RAFT_MAX_MESSAGE_SIZE};
 
@@ -84,6 +86,15 @@ impl RaftInternal for RaftInternalService {
 
         Ok(Response::new(RaftResponse { payload }))
     }
+
+    async fn get_capabilities(
+        &self,
+        _request: Request<CapabilitiesRequest>,
+    ) -> Result<Response<CapabilitiesResponse>, Status> {
+        Ok(Response::new(CapabilitiesResponse {
+            release_quarantine_v1: true,
+        }))
+    }
 }
 
 /// Build the Raft gRPC service with message-size limits raised to
@@ -146,6 +157,15 @@ mod tests {
             let len = request.into_inner().payload.len() as u64;
             Ok(Response::new(RaftResponse {
                 payload: len.to_le_bytes().to_vec(),
+            }))
+        }
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<CapabilitiesRequest>,
+        ) -> Result<Response<CapabilitiesResponse>, Status> {
+            Ok(Response::new(CapabilitiesResponse {
+                release_quarantine_v1: true,
             }))
         }
     }

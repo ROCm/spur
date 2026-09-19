@@ -51,10 +51,10 @@ class TestCompletingTimeoutCancel:
         job_id = parse_job_id(sb)
         assert job_id is not None
 
-        # Force-finish sets a job with an unreported node to Failed; reaching a
-        # terminal state confirms the completing-timeout path ran.
+        # A concurrent completion report can produce CD; the terminal state
+        # and the orphan check below together confirm timeout cleanup ran.
         state = wait_job(cluster, job_id, timeout=self.COMPLETE_WAIT + 60)
-        assert state in ("F", "GONE"), (
+        assert state in ("CD", "F", "GONE"), (
             f"expected force-finish to a terminal state, got {state}"
         )
 
