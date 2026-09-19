@@ -21,7 +21,7 @@ use http::{Request, Response};
 use tower::{Layer, Service};
 use tracing::warn;
 
-use spur_core::auth::BearerOutcome;
+use spur_core::auth::{BearerAuth, BearerOutcome};
 use spur_core::config::AuthMode;
 
 /// Marker inserted alongside the identity so handlers can tell "verified" from "asserted" without
@@ -31,24 +31,26 @@ pub struct Verified;
 
 #[derive(Clone)]
 pub struct AuthLayer {
-    inner: Arc<AuthConfig>,
-}
-
-struct AuthConfig {
-    mode: AuthMode,
-    /// HS256 key. Empty disables verification regardless of mode (startup refuses that combination
-    /// for `required`, so an empty key here can only mean `disabled`/`permissive`).
-    jwt_key: Vec<u8>,
+    inner: Arc<BearerAuth>,
+    peer: Option<std::sync::Arc<spur_core::native_peer::PeerVerifier>>,
 }
 
 impl AuthLayer {
+    #[allow(dead_code)]
     pub fn new(mode: AuthMode, jwt_key: &str) -> Self {
+        Self::from_bearer(BearerAuth::jwt(mode, jwt_key.as_bytes()))
+    }
+
+    pub fn from_bearer(auth: BearerAuth) -> Self {
         Self {
-            inner: Arc::new(AuthConfig {
-                mode,
-                jwt_key: jwt_key.as_bytes().to_vec(),
-            }),
+            inner: Arc::new(auth),
+            peer: None,
         }
+    }
+
+    pub fn with_peer(mut self, peer: std::sync::Arc<spur_core::native_peer::PeerVerifier>) -> Self {
+        self.peer = Some(peer);
+        self
     }
 }
 
@@ -59,6 +61,7 @@ impl<S> Layer<S> for AuthLayer {
         AuthMiddleware {
             inner,
             config: self.inner.clone(),
+            peer: self.peer.clone(),
         }
     }
 }
@@ -66,18 +69,14 @@ impl<S> Layer<S> for AuthLayer {
 #[derive(Clone)]
 pub struct AuthMiddleware<S> {
     inner: S,
-    config: Arc<AuthConfig>,
+    config: Arc<BearerAuth>,
+    peer: Option<std::sync::Arc<spur_core::native_peer::PeerVerifier>>,
 }
 
 /// The ruling itself lives in `spur_core::auth` so the controller and the agent cannot drift apart
 /// on a security decision; this module only supplies the Tower plumbing.
-fn decide(config: &AuthConfig, header: Option<&str>) -> BearerOutcome {
-    spur_core::auth::authenticate_bearer(
-        config.mode,
-        &config.jwt_key,
-        header,
-        "pass a token (see `spur token user`)",
-    )
+fn decide(config: &BearerAuth, header: Option<&str>) -> BearerOutcome {
+    config.authenticate(header, "pass a token (see `spur token user`)")
 }
 
 impl<S, B> Service<Request<B>> for AuthMiddleware<S>
@@ -98,6 +97,47 @@ where
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
         let config = self.config.clone();
+        if spur_core::auth::is_unauthenticated_auth_handshake(req.uri().path()) {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+        }
+        let forwarded = req
+            .headers()
+            .get(spur_core::native_peer::FORWARDED_HEADER)
+            .is_some();
+        if forwarded {
+            if let Some(peer) = self.peer.clone() {
+                let env = req
+                    .headers()
+                    .get(spur_core::native_peer::IDENTITY_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let Some(env) = env else {
+                    let resp = tonic::Status::unauthenticated(
+                        "forwarded RPC missing signed identity envelope",
+                    )
+                    .into_http();
+                    return Box::pin(async move { Ok(resp) });
+                };
+                let now = spur_core::native_mint::unix_now().unwrap_or(0);
+                match peer.verify(&env, now) {
+                    Ok((identity, binding)) => {
+                        req.extensions_mut().insert(identity);
+                        req.extensions_mut().insert(binding);
+                        req.extensions_mut().insert(Verified);
+                        let mut inner = self.inner.clone();
+                        return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+                    }
+                    Err(e) => {
+                        let resp = tonic::Status::unauthenticated(format!(
+                            "invalid forwarded identity: {e}"
+                        ))
+                        .into_http();
+                        return Box::pin(async move { Ok(resp) });
+                    }
+                }
+            }
+        }
         let header = req
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -136,11 +176,8 @@ mod tests {
     use super::*;
     use spur_core::auth::generate_token;
 
-    fn cfg(mode: AuthMode, key: &str) -> AuthConfig {
-        AuthConfig {
-            mode,
-            jwt_key: key.as_bytes().to_vec(),
-        }
+    fn cfg(mode: AuthMode, key: &str) -> BearerAuth {
+        BearerAuth::jwt(mode, key.as_bytes())
     }
 
     fn token(key: &str) -> String {

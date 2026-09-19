@@ -19,6 +19,7 @@ members = [
     "crates/spur-tests",
     "crates/spur-update",
     "crates/spur-devices",
+    "crates/spurauthd",
 ]
 
 [workspace.package]

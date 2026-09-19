@@ -1109,6 +1109,7 @@ struct AgentDispatchParams<'a> {
     modex_fence_timeout_secs: u32,
     modex_verify_timeout_secs: u32,
     pmix_prepared: bool,
+    execution_credential: &'a str,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -1337,6 +1338,7 @@ async fn dispatch_to_agent(
             pmix_plan,
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
+            execution_credential: params.execution_credential.to_string(),
         })
         .await
         .map_err(|s| match s.code() {
@@ -1744,6 +1746,25 @@ async fn confirm_dispatch_on_nodes(
         node_agents.push((node_name.clone(), agent_addr));
     }
 
+    let execution_credential = match crate::native_keys::sign_dispatch_credential(
+        &cluster.config().cluster_name,
+        job_id,
+        run_attempt,
+        &spec,
+        &per_node_allocs,
+        node_agents.iter().map(|(n, _)| n.as_str()),
+    ) {
+        Ok(token) => token,
+        Err(e) => {
+            error!(job_id, error = %e, "failed to sign job execution credential");
+            return abort_pending_pmix_dispatch(
+                &cluster,
+                job_id,
+                format!("failed to sign job execution credential: {e}"),
+            );
+        }
+    };
+
     let mut pmix_prepare_guard = None;
 
     if needs_pmix_prepare {
@@ -1797,6 +1818,7 @@ async fn confirm_dispatch_on_nodes(
                 modex_fence_timeout_secs,
                 modex_verify_timeout_secs,
                 pmix_prepared: false,
+                execution_credential: "",
             };
             let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
                 Ok(Some(plan)) => plan,
@@ -1854,6 +1876,7 @@ async fn confirm_dispatch_on_nodes(
         let allocated_nodelist = allocated_nodelist.clone();
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
+        let execution_credential = execution_credential.clone();
         set.spawn(async move {
             let params = AgentDispatchParams {
                 job_id,
@@ -1872,6 +1895,7 @@ async fn confirm_dispatch_on_nodes(
                 modex_fence_timeout_secs,
                 modex_verify_timeout_secs,
                 pmix_prepared: needs_pmix_prepare,
+                execution_credential: &execution_credential,
             };
             let dispatch = dispatch_to_agent(&agent_addr, &params);
             // The join below drains every node, so one agent that accepts the call and never answers
@@ -3253,6 +3277,16 @@ mod tests {
                 Ok(tonic::Response::new(()))
             }
 
+            async fn ping(
+                &self,
+                _request: tonic::Request<()>,
+            ) -> Result<tonic::Response<spur_proto::proto::PingResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::PingResponse::default(),
+                ))
+            }
+
             async fn await_step(
                 &self,
                 _request: tonic::Request<spur_proto::proto::AwaitStepRequest>,
@@ -3964,7 +3998,7 @@ mod tests {
             settle(&cm, job_id, JobState::Running);
 
             // Suspend routes through Completing; no node reports completion.
-            cm.suspend_job(job_id, "").unwrap();
+            cm.suspend_job_for(job_id, "", true).unwrap();
             settle(&cm, job_id, JobState::Suspended);
             let mut job = cm.get_job(job_id).unwrap();
             job.transition(JobState::Completing).unwrap();

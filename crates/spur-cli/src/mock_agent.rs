@@ -126,6 +126,13 @@ mock_agent_impl! {
         ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
             Err(Status::unimplemented("interactive_session"))
         }
+
+        async fn ping(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<proto::PingResponse>, Status> {
+            Ok(Response::new(proto::PingResponse::default()))
+        }
     }
     unimplemented {
         launch_job(proto::LaunchJobRequest) -> proto::LaunchJobResponse;
@@ -179,9 +186,12 @@ pub(crate) async fn spawn() -> (SocketAddr, StreamCapture) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial(env_injection)]
     async fn unmocked_rpc_reports_unimplemented() {
+        let _env = crate::env_defaults::EnvGuard::new();
         let (addr, _capture) = spawn().await;
         let status = crate::interactive::connect_agent(&format!("http://{addr}"))
             .await

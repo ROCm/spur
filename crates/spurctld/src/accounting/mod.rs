@@ -50,6 +50,8 @@ pub(crate) fn start(
     }
 
     let service = AccountingService::unavailable("connecting to accounting database");
+    service.attach_association_cache(cluster.association_cache().clone());
+    service.attach_auth(config.auth.clone());
     let bringup = service.clone();
     let url = config.accounting.database_url.clone();
     let params = ActivationParams::from_config(config);

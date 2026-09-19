@@ -1,11 +1,12 @@
 Developer Guide
 ===============
 
-Spur is a Rust workspace (Cargo) that builds four binaries — ``spurctld``,
-``spurd``, ``spurstepd``, and ``spur``. This guide covers working on it.
+Spur is a Rust workspace (Cargo) that builds ``spurctld``,
+``spurd``, ``spurstepd``, ``spur``, and ``spurauthd``. This guide covers working on it.
 
 - :doc:`building` — build from source, run the unit and end-to-end test suites.
   The end-to-end tests need real hardware.
 - :doc:`documentation` — build and preview these docs locally.
 - :doc:`contributing` — commit and pull-request conventions, license headers, and
   the pre-commit hook.
+- :doc:`native-credential-mint` — Unix-socket service that mints native user credentials.

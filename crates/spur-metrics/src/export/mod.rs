@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicU64;
 /// HTTP `Content-Type` for OpenMetrics 1.0 text responses.
 pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
+pub mod auth;
 pub mod jobs;
 pub mod jobs_users_accts;
 pub mod k8s_cluster;

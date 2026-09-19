@@ -50,6 +50,10 @@ def _denied(combined: str) -> bool:
         or "cannot attach" in lower
         or "permission denied" in lower
         or "not job owner" in lower
+        # Identified Users cannot GetJob another tenant's job, so the step
+        # path fails with NOT_FOUND before an ownership string is produced.
+        or "look up job owner" in lower
+        or ("job " in lower and "not found" in lower)
     )
 
 
@@ -148,7 +152,11 @@ unset SPUR_AUTH_TOKEN
             cluster.scancel(str(job_id))
 
     def test_srun_step_jwt_non_owner_denied(self, cluster):
-        """A JWT for a different subject cannot run a step in another user's job."""
+        """A JWT for a different subject cannot run a step in another user's job.
+
+        GetJob for that job is NOT_FOUND for the non-owner (same pin as the job
+        list), so the step never starts.
+        """
         ssh_user = _ssh_user()
         if ssh_user == JWT_OWNER:
             pytest.skip("SSH user is root; need a distinct non-owner account")

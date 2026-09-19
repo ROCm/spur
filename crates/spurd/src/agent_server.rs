@@ -51,6 +51,9 @@ struct StepdLaunchOptions {
     hooks: HooksConfig,
     plugstack_path: String,
     pmix: Option<crate::stepd::StepdPmix>,
+    cred_id: String,
+    cred_kid: String,
+    cred_digest: String,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -191,6 +194,9 @@ async fn launch_stepd(
     launch_spec.hooks = options.hooks;
     launch_spec.plugstack_path = options.plugstack_path;
     launch_spec.pmix = options.pmix;
+    launch_spec.cred_id = options.cred_id;
+    launch_spec.cred_kid = options.cred_kid;
+    launch_spec.cred_digest = options.cred_digest;
     let store = crate::stepd::StepdStore::new(state_dir);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt, launch_spec.step_id)
@@ -213,6 +219,9 @@ async fn launch_stepd(
     descriptor.uid = config.uid;
     descriptor.gid = config.gid;
     descriptor.work_dir = config.work_dir.clone();
+    descriptor.cred_id = launch_spec.cred_id.clone();
+    descriptor.cred_kid = launch_spec.cred_kid.clone();
+    descriptor.cred_digest = launch_spec.cred_digest.clone();
     let namespaces = launch_namespaces(config, nix::unistd::geteuid().is_root());
     descriptor.has_pid_namespace = namespaces.pid;
     descriptor.has_user_namespace = namespaces.user;
@@ -393,6 +402,39 @@ fn launch_step_id(pty: bool) -> spur_core::step::StepId {
     } else {
         spur_core::step::STEP_BATCH
     }
+}
+
+fn execution_status(err: spur_core::native_cred::CredentialError) -> Status {
+    use spur_core::native_cred::CredentialStatusCode;
+    match err.status_code() {
+        CredentialStatusCode::FailedPrecondition => Status::failed_precondition(err.to_string()),
+        CredentialStatusCode::PermissionDenied => Status::permission_denied(err.to_string()),
+        CredentialStatusCode::Unauthenticated => Status::unauthenticated(err.to_string()),
+    }
+}
+
+fn decode_fixed_b64<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let bytes = spur_core::native_cred::payload_from_base64url(s).ok()?;
+    bytes.try_into().ok()
+}
+
+fn persist_execution_meta(
+    cred: &spur_core::native_cred::ExecutionCredential,
+) -> (String, String, String) {
+    (
+        spur_core::native_cred::payload_to_base64url(&cred.credential_id),
+        cred.key_id.clone(),
+        spur_core::native_cred::payload_to_base64url(&cred.command_digest),
+    )
+}
+
+fn map_exec_err(err: spur_core::native_cred::CredentialError) -> Status {
+    spur_core::native_metrics::inc_exec_fail();
+    execution_status(err)
+}
+
+fn proto_slice_devices(alloc: &Option<ResourceAllocations>) -> (u32, u64, Vec<(String, u32, u64)>) {
+    spur_core::native_exec::proto_slice_devices(alloc)
 }
 
 /// Read a cgroup's member pids.
@@ -2714,6 +2756,13 @@ pub struct AgentService {
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
     /// path through a real RPC on an unprivileged runner.
     spurd_is_root: bool,
+    /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
+    auth_audience: String,
+    auth_epoch: u64,
+    cluster_id: String,
+    cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
+    launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
+    auth_policy: spur_core::config::AuthConfig,
 }
 
 impl AgentService {
@@ -2841,6 +2890,12 @@ impl AgentService {
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
+            auth_audience: String::new(),
+            auth_epoch: 0,
+            cluster_id: String::new(),
+            cred_keys: None,
+            launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
+            auth_policy: spur_core::config::AuthConfig::default(),
         }
     }
 
@@ -2866,6 +2921,21 @@ impl AgentService {
         self.k0s.clone()
     }
 
+    pub fn apply_auth_handshake(&mut self, bearer: &spur_core::auth::BearerAuth) {
+        let (audience, epoch) = bearer.advertised_handshake();
+        self.auth_audience = audience;
+        self.auth_epoch = epoch;
+        if let Some(native) = &bearer.native {
+            self.cluster_id = native.cluster_id.clone();
+            self.cred_keys = native.cred_keys.clone();
+        }
+    }
+
+    pub fn apply_auth_policy(&mut self, auth: &spur_core::config::AuthConfig) {
+        self.auth_policy = auth.clone();
+        self.allow_root_jobs = auth.allow_root_jobs;
+    }
+
     pub fn with_runtime_state_dir(mut self, state_dir: impl Into<std::path::PathBuf>) -> Self {
         self.stepd_state_dir = state_dir.into();
         self
@@ -2887,7 +2957,21 @@ impl AgentService {
                 );
                 descriptor.cgroup_path = std::path::PathBuf::new();
             }
-            sessions.insert(stepd_key(&descriptor), descriptor);
+            sessions.insert(stepd_key(&descriptor), descriptor.clone());
+            if let (Some(id), Some(digest)) = (
+                decode_fixed_b64::<{ spur_core::native_cred::CREDENTIAL_ID_LEN }>(
+                    &descriptor.cred_id,
+                ),
+                decode_fixed_b64::<{ spur_core::native_cred::DIGEST_LEN }>(&descriptor.cred_digest),
+            ) {
+                self.launch_acceptance.restore(
+                    descriptor.job_id,
+                    descriptor.step_id,
+                    descriptor.run_attempt,
+                    id,
+                    digest,
+                );
+            }
         }
     }
 
@@ -3029,6 +3113,7 @@ impl AgentService {
         pmix: Option<crate::stepd::StepdPmix>,
         step_files: crate::executor::StepOutputFiles,
         step_key: (u32, u32),
+        persist_cred: (String, String, String),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
         let (job_id, step_id) = step_key;
         let run_attempt = cfg.run_attempt;
@@ -3064,6 +3149,9 @@ impl AgentService {
                 hooks: (*self.hooks).clone(),
                 plugstack_path: self.plugstack_path.clone(),
                 pmix,
+                cred_id: persist_cred.0,
+                cred_kid: persist_cred.1,
+                cred_digest: persist_cred.2,
             },
         )
         .await;
@@ -3939,6 +4027,9 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 );
                 ControllerRpcError::Connect(e)
             })?;
+        let mut client = crate::controller_auth::wrap(channel)
+            .await
+            .map_err(ControllerRpcError::Rpc)?;
         let req = ReportJobStatusRequest {
             step_id,
             job_id,
@@ -3951,18 +4042,15 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
             reporting_node: reporting_node.to_string(),
             run_attempt,
         };
-        spur_proto::controller_client(channel)
-            .report_job_status(req)
-            .await
-            .map_err(|e| {
-                warn!(
-                    job_id,
-                    attempt,
-                    error = %e,
-                    "ReportJobStatus RPC failed"
-                );
-                ControllerRpcError::Rpc(e)
-            })
+        client.report_job_status(req).await.map_err(|e| {
+            warn!(
+                job_id,
+                attempt,
+                error = %e,
+                "ReportJobStatus RPC failed"
+            );
+            ControllerRpcError::Rpc(e)
+        })
     })
     .await;
 
@@ -4024,23 +4112,23 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
                 );
                 ControllerRpcError::Connect(e)
             })?;
+        let mut client = crate::controller_auth::wrap(channel)
+            .await
+            .map_err(ControllerRpcError::Rpc)?;
         let req = DrainNodeRequest {
             name: node_name.to_string(),
             reason: reason.to_string(),
         };
-        spur_proto::controller_client(channel)
-            .drain_node(req)
-            .await
-            .map_err(|e| {
-                warn!(
-                    job_id,
-                    node = %node_name,
-                    attempt,
-                    error = %e,
-                    "DrainNode RPC failed"
-                );
-                ControllerRpcError::Rpc(e)
-            })
+        client.drain_node(req).await.map_err(|e| {
+            warn!(
+                job_id,
+                node = %node_name,
+                attempt,
+                error = %e,
+                "DrainNode RPC failed"
+            );
+            ControllerRpcError::Rpc(e)
+        })
     })
     .await;
 
@@ -4073,12 +4161,86 @@ impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
     type InteractiveSessionStream = ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    async fn ping(&self, _request: Request<()>) -> Result<Response<PingResponse>, Status> {
+        Ok(Response::new(PingResponse {
+            hostname: self.reporter.hostname.clone(),
+            server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            version: env!("CARGO_PKG_VERSION").into(),
+            federation_peers: Vec::new(),
+            cluster_name: String::new(),
+            auth_audience: self.auth_audience.clone(),
+            auth_epoch: self.auth_epoch,
+        }))
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        let spec = req
+            .spec
+            .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+        let mut persist_cred = (String::new(), String::new(), String::new());
+        if let Some(keys) = &self.cred_keys {
+            if req.execution_credential.is_empty() {
+                spur_core::native_metrics::inc_exec_fail();
+                return Err(Status::unauthenticated("execution credential required"));
+            }
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            let cred = spur_core::native_exec::verify_execution(
+                &req.execution_credential,
+                keys,
+                &self.cluster_id,
+                now,
+            )
+            .map_err(map_exec_err)?;
+            cred.require_kind(spur_core::native_cred::CredentialKind::Job)
+                .map_err(map_exec_err)?;
+            let hostname = if req.target_node.is_empty() {
+                self.reporter.hostname.as_str()
+            } else {
+                req.target_node.as_str()
+            };
+            cred.require_node(hostname).map_err(map_exec_err)?;
+            cred.require_run_attempt(req.run_attempt)
+                .map_err(map_exec_err)?;
+            cred.require_unix(spec.uid, spec.gid)
+                .map_err(map_exec_err)?;
+            let digest = spur_core::native_exec::command_digest(
+                &spec.script,
+                &spec.argv,
+                &spec.container_image,
+            );
+            cred.require_command_digest(&digest).map_err(map_exec_err)?;
+            let (cpus, memory_mb, devices) = proto_slice_devices(&req.allocated);
+            cred.require_slice(hostname, cpus, memory_mb, &devices)
+                .map_err(map_exec_err)?;
+            persist_cred = persist_execution_meta(&cred);
+            match self.launch_acceptance.accept(&cred) {
+                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
+                Ok(false) => {
+                    spur_core::native_metrics::inc_exec_ok();
+                    let paths = self
+                        .running
+                        .lock()
+                        .await
+                        .get(&req.job_id)
+                        .filter(|tracked| tracked.run_attempt == req.run_attempt)
+                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
+                        .unwrap_or_default();
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: true,
+                        error: String::new(),
+                        stdout_path: paths.0,
+                        stderr_path: paths.1,
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    }));
+                }
+                Err(e) => return Err(map_exec_err(e)),
+            }
+        }
         let job_id = req.job_id;
         // A launch names the node the controller scheduled it onto. If it does not name this host it
         // was aimed at the wrong agent — refuse rather than run another node's allocation here.
@@ -4095,16 +4257,13 @@ impl SlurmAgent for AgentService {
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
         let run_attempt = req.run_attempt;
-        let spec = req
-            .spec
-            .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
         // A pty launch stays on the legacy path: its terminal is the agent's to own.
         let stepd_enabled = !spec.pty;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
 
-        // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
-        // refuse root execution here — before anything is spawned — rather than relying on the
+        // The uid is part of the (user-supplied) job spec. Refuse root execution
+        // here — before anything is spawned — rather than relying on the
         // privilege drop, which treats uid 0 as "nothing to drop".
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             spec.uid,
@@ -4285,7 +4444,7 @@ impl SlurmAgent for AgentService {
             let gid = spec.gid;
             let home_dir = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", username));
 
-            let cfg = crate::container::ContainerConfig {
+            let mut cfg = crate::container::ContainerConfig {
                 image: spec.container_image.clone(),
                 mounts,
                 workdir: if spec.container_workdir.is_empty() {
@@ -4319,6 +4478,12 @@ impl SlurmAgent for AgentService {
                 home_dir,
                 device_plan: None, // set after GRES allocation
             };
+            crate::container::maybe_bind_auth_socket(
+                &mut cfg.mounts,
+                &self.cluster_id,
+                uid,
+                self.allow_root_jobs,
+            );
 
             let image_path = crate::container::resolve_image(
                 &spec.container_image,
@@ -4612,6 +4777,9 @@ impl SlurmAgent for AgentService {
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
                     pmix: supervised_pmix,
+                    cred_id: persist_cred.0,
+                    cred_kid: persist_cred.1,
+                    cred_digest: persist_cred.2,
                 },
             )
             .await
@@ -4811,6 +4979,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<PreparePmixRequest>,
     ) -> Result<Response<PreparePmixResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         let plan = req
             .pmix_plan
@@ -4837,6 +5006,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
+        Self::require_controller(&request)?;
         // PreparePmix only validates, so a prepare that never launched left no
         // server here to roll back. Kept on the wire for controller compatibility.
         let _ = request.into_inner().job_id;
@@ -4899,6 +5069,8 @@ impl SlurmAgent for AgentService {
         Self::require_controller(&request)?;
         let req = request.into_inner();
         let job_id = req.job_id;
+        self.launch_acceptance
+            .cancel_attempt(job_id, req.run_attempt);
 
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
@@ -4960,6 +5132,8 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        self.launch_acceptance
+            .cancel(req.job_id, req.step_id, req.run_attempt);
         // Step ids restart at 0 on a requeue, so a cancel from a superseded
         // attempt would otherwise signal the redispatch's step of the same id.
         if !self.runs_attempt(req.job_id, req.run_attempt).await {
@@ -5316,6 +5490,9 @@ impl SlurmAgent for AgentService {
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
                     pmix: None,
+                    cred_id: String::new(),
+                    cred_kid: String::new(),
+                    cred_digest: String::new(),
                 },
             )
             .await
@@ -5424,10 +5601,64 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
-        Self::require_controller(&request)?;
+        let identity = Self::verified_identity(&request).cloned();
+        let has_step_cred = !request.get_ref().execution_credential.is_empty();
+        match identity.as_ref() {
+            Some(id) if id.is_controller() => {}
+            None => {}
+            Some(_) if has_step_cred && self.cred_keys.is_some() => {}
+            Some(id) => {
+                return Err(Status::permission_denied(format!(
+                    "this RPC is reachable only by the cluster controller; caller '{}' is not the \
+                     controller — route the request through spurctld",
+                    id.user
+                )))
+            }
+        }
         let req = request.into_inner();
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
+        }
+        let mut persist_cred = (String::new(), String::new(), String::new());
+        if let Some(keys) = &self.cred_keys {
+            if req.execution_credential.is_empty() {
+                spur_core::native_metrics::inc_exec_fail();
+                return Err(Status::unauthenticated("execution credential required"));
+            }
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            let cred = spur_core::native_exec::verify_execution(
+                &req.execution_credential,
+                keys,
+                &self.cluster_id,
+                now,
+            )
+            .map_err(map_exec_err)?;
+            cred.require_kind(spur_core::native_cred::CredentialKind::Step)
+                .map_err(map_exec_err)?;
+            let hostname = self.reporter.hostname.as_str();
+            cred.require_node(hostname).map_err(map_exec_err)?;
+            cred.require_unix(req.uid, req.gid).map_err(map_exec_err)?;
+            let image = req
+                .container
+                .as_ref()
+                .map(|c| c.image.as_str())
+                .unwrap_or("");
+            let digest = spur_core::native_exec::command_digest("", &req.command, image);
+            cred.require_command_digest(&digest).map_err(map_exec_err)?;
+            if let Some(attempt) = self
+                .running
+                .lock()
+                .await
+                .get(&req.job_id)
+                .map(|tracked| tracked.run_attempt)
+            {
+                cred.require_run_attempt(attempt).map_err(map_exec_err)?;
+            }
+            persist_cred = persist_execution_meta(&cred);
+            match self.launch_acceptance.accept(&cred) {
+                Ok(_) => spur_core::native_metrics::inc_exec_ok(),
+                Err(e) => return Err(map_exec_err(e)),
+            }
         }
         // Steps carry their own uid straight from the wire — gate them exactly like a batch launch.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
@@ -5448,6 +5679,10 @@ impl SlurmAgent for AgentService {
         let job_id = req.job_id;
         if job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
+        }
+        if identity.as_ref().is_some_and(|id| !id.is_controller()) {
+            self.check_job_access(job_id, identity.as_ref(), "", "run a step of")
+                .await?;
         }
 
         let num_tasks = req.num_tasks.max(1);
@@ -5872,6 +6107,7 @@ impl SlurmAgent for AgentService {
                 supervised_pmix.take(),
                 step_files,
                 step_key,
+                persist_cred,
             )
             .await?
         } else if job_entry.has_namespaces() && job_entry.pid > 0 {
@@ -5969,7 +6205,7 @@ impl SlurmAgent for AgentService {
                 .cloned()
                 .unwrap_or_else(|| format!("/home/{username}"));
 
-            let container_cfg = crate::container::ContainerConfig {
+            let mut container_cfg = crate::container::ContainerConfig {
                 image: c.image.clone(),
                 mounts,
                 // --container-workdir wins; fall back to --chdir (req.work_dir)
@@ -6016,6 +6252,12 @@ impl SlurmAgent for AgentService {
                 home_dir,
                 device_plan: container_device_plan,
             };
+            crate::container::maybe_bind_auth_socket(
+                &mut container_cfg.mounts,
+                &self.cluster_id,
+                step_uid,
+                self.allow_root_jobs,
+            );
 
             let image_path = crate::container::resolve_image(&c.image, None, Some(step_uid))
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
@@ -6524,6 +6766,41 @@ impl SlurmAgent for AgentService {
 
         self.check_job_access(init.job_id, identity.as_ref(), &init.user, "attach to")
             .await?;
+
+        if let Some(keys) = &self.cred_keys {
+            let launching = !init.execution_credential.is_empty()
+                || !init.argv.is_empty()
+                || init.container.as_ref().is_some_and(|c| !c.image.is_empty());
+            if launching {
+                if init.execution_credential.is_empty() {
+                    spur_core::native_metrics::inc_exec_fail();
+                    return Err(Status::unauthenticated("execution credential required"));
+                }
+                let now = spur_core::native_mint::unix_now().unwrap_or(0);
+                let cred = spur_core::native_exec::verify_execution(
+                    &init.execution_credential,
+                    keys,
+                    &self.cluster_id,
+                    now,
+                )
+                .map_err(map_exec_err)?;
+                cred.require_kind(spur_core::native_cred::CredentialKind::Step)
+                    .map_err(map_exec_err)?;
+                cred.require_node(self.reporter.hostname.as_str())
+                    .map_err(map_exec_err)?;
+                let image = init
+                    .container
+                    .as_ref()
+                    .map(|c| c.image.as_str())
+                    .unwrap_or("");
+                let digest = spur_core::native_exec::command_digest("", &init.argv, image);
+                cred.require_command_digest(&digest).map_err(map_exec_err)?;
+                match self.launch_acceptance.accept(&cred) {
+                    Ok(_) => spur_core::native_metrics::inc_exec_ok(),
+                    Err(e) => return Err(map_exec_err(e)),
+                }
+            }
+        }
 
         let entry = self.job_entry(init.job_id).await?;
 
@@ -7487,7 +7764,24 @@ impl AgentService {
             .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
 
         let (user, is_internal) = match identity {
-            Some(id) => (id.user.as_str(), id.is_admin),
+            Some(id) => {
+                let groups = if self.auth_policy.admin_groups.is_empty()
+                    && self.auth_policy.operator_groups.is_empty()
+                {
+                    Vec::new()
+                } else {
+                    spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
+                };
+                let role = spur_core::rbac::resolve_role(
+                    id,
+                    &self.auth_policy,
+                    None,
+                    true,
+                    &groups,
+                    false,
+                );
+                (id.user.as_str(), id.is_controller() || role.operates_jobs())
+            }
             None => (asserted_user, false),
         };
         spur_core::auth::check_job_owner(user, is_internal, &tracked.user, action)
@@ -7826,7 +8120,7 @@ impl AgentService {
             .filter_map(|m| crate::container::parse_mount(m).ok())
             .collect();
 
-        let container_cfg = crate::container::ContainerConfig {
+        let mut container_cfg = crate::container::ContainerConfig {
             image: container.image.clone(),
             mounts,
             workdir: if !container.workdir.is_empty() {
@@ -7854,6 +8148,12 @@ impl AgentService {
             home_dir,
             device_plan: container_device_plan,
         };
+        crate::container::maybe_bind_auth_socket(
+            &mut container_cfg.mounts,
+            &self.cluster_id,
+            entry.uid,
+            self.allow_root_jobs,
+        );
 
         let image_path = crate::container::resolve_image(&container.image, None, Some(entry.uid))
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
@@ -12308,6 +12608,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         }
     }
 
@@ -12317,6 +12618,7 @@ mod tests {
             uid: 0,
             gid: 0,
             is_admin: true,
+            trusted_unix: false,
         }
     }
 

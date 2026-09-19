@@ -20,6 +20,7 @@ sqlx = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

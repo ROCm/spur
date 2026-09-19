@@ -158,6 +158,34 @@ pub struct ContainerConfig {
     pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
 }
 
+/// Bind-mount the host mint socket so nested `srun` can mint. Host UID 0 does
+/// not receive the socket unless root jobs are explicitly allowed.
+pub fn maybe_bind_auth_socket(
+    mounts: &mut Vec<BindMount>,
+    cluster_id: &str,
+    uid: u32,
+    allow_root_jobs: bool,
+) {
+    if cluster_id.is_empty() || (uid == 0 && !allow_root_jobs) {
+        return;
+    }
+    let Ok(path) = spur_core::native_mint::resolve_socket_path(cluster_id) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let displayed = path.display().to_string();
+    if mounts.iter().any(|m| m.source == displayed) {
+        return;
+    }
+    mounts.push(BindMount {
+        source: displayed.clone(),
+        target: displayed,
+        readonly: false,
+    });
+}
+
 /// Resolve image reference to a rootfs path.
 ///
 /// Supports:

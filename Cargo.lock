@@ -3687,6 +3687,8 @@ name = "spur-core"
 version = "0.12.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
+ "base64 0.23.1",
  "chrono",
  "chrono-tz",
  "jsonwebtoken",
@@ -3887,6 +3889,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spurauthd"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "spur-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "spurctld"
 version = "0.12.0"
 dependencies = [
@@ -3901,6 +3915,7 @@ dependencies = [
  "mlua",
  "openraft",
  "parking_lot",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

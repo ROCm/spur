@@ -134,6 +134,9 @@ pub struct ControllerService {
     /// compatibility fallback is public and cannot establish node identity.
     node_identity_key_configured: bool,
     incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>,
+    /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
+    auth_audience: String,
+    auth_epoch: u64,
 }
 
 enum StepdRecoveryCohortState {
@@ -282,7 +285,8 @@ pub(crate) fn resolve_startup_jwt_key(
 impl ControllerService {
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
-    fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    fn check_leader<T: prost::Message>(&self, request: &Request<T>) -> Result<(), Status> {
+        Self::enforce_forward_binding(request)?;
         if self.raft.is_leader() {
             return Ok(());
         }
@@ -292,6 +296,26 @@ impl ControllerService {
         }
 
         Err(self.not_leader_status())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn enforce_forward_binding<T: prost::Message>(request: &Request<T>) -> Result<(), Status> {
+        let Some(binding) = request
+            .extensions()
+            .get::<spur_core::native_peer::ForwardedBinding>()
+        else {
+            return Ok(());
+        };
+        let mut buf = Vec::new();
+        request
+            .get_ref()
+            .encode(&mut buf)
+            .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
+        let digest = spur_core::native_peer::request_digest(&buf);
+        let action = std::any::type_name::<T>();
+        binding.require(action, &digest).map_err(|e| {
+            Status::unauthenticated(format!("forwarded identity does not match this RPC: {e}"))
+        })
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -493,7 +517,7 @@ impl ControllerService {
     ) -> Result<StepdReporter, Status> {
         // Without a signing key there is nothing to verify the node against, so
         // the report is taken on trust rather than dropping a live supervisor.
-        if !self.node_identity_key_configured {
+        if !self.node_identity_key_configured && crate::native_keys::node_signer().is_none() {
             warn!(
                 hostname,
                 "accepting unverified stepd recovery ([auth] jwt_key unset); \
@@ -520,11 +544,7 @@ impl ControllerService {
             );
             return Ok(StepdReporter::Unproven);
         }
-        let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
-            .map_err(|error| Status::unauthenticated(error.to_string()))?;
-        if identity.hostname != hostname {
-            return Err(Status::permission_denied("node token hostname mismatch"));
-        }
+        self.verify_issued_node_token(hostname, node_token)?;
         if self.cluster.get_node(hostname).is_none() {
             return Err(Status::not_found(format!(
                 "node {hostname} is not registered"
@@ -602,6 +622,14 @@ impl ControllerService {
         )
     }
 
+    /// Same digest/action bind as writes: a forwarded read still carries a
+    /// `ForwardedBinding` and must not serve a swapped body.
+    #[allow(clippy::result_large_err)]
+    fn prepare_read<T: prost::Message>(&self, request: &Request<T>) -> Result<bool, Status> {
+        Self::enforce_forward_binding(request)?;
+        Ok(self.read_should_forward(request))
+    }
+
     /// Best-effort forward of a read to the leader: `Some(payload)` forwards
     /// (clone lazily via `forward.then(|| ...)`), `None` serves local state. Any
     /// forward error is swallowed to local — safe only while read handlers return
@@ -610,20 +638,24 @@ impl ControllerService {
         &self,
         meta: tonic::metadata::MetadataMap,
         payload: Option<T>,
+        identity: Option<spur_core::auth::Identity>,
         rpc: &str,
         call: F,
     ) -> Option<Response<R>>
     where
+        T: prost::Message,
         F: FnOnce(SlurmControllerClient<tonic::transport::Channel>, Request<T>) -> Fut,
         Fut: std::future::Future<Output = Result<Response<R>, Status>>,
     {
         let payload = payload?;
         let client = self.leader_proxy.try_get_leader_client().await?;
+        let mut buf = Vec::new();
+        let _ = prost::Message::encode(&payload, &mut buf);
+        let digest = spur_core::native_peer::request_digest(&buf);
+        let action = std::any::type_name::<T>();
         let mut fwd = Request::new(payload);
-        // Carry the caller's credential, so a forwarded read is authorized as the original caller
-        // rather than arriving anonymous — otherwise `auth.mode = required` would reject every hop
-        // and silently degrade these reads to local (stale) answers.
-        *fwd.metadata_mut() = Self::forwarded_metadata_preserving(&meta);
+        *fwd.metadata_mut() =
+            Self::forwarded_metadata_for(&meta, identity.as_ref(), digest, action);
         match call(client, fwd).await {
             Ok(resp) => Some(resp),
             Err(e) => {
@@ -679,48 +711,122 @@ impl ControllerService {
         *asserted = id.user.clone();
     }
 
+    /// Job-list user filter: pin a non-operator to their credential, leave an
+    /// operator's (possibly empty) asserted user so they can see the whole queue.
+    fn pin_job_list_user(
+        asserted: &mut String,
+        identity: Option<&spur_core::auth::Identity>,
+        is_operator: bool,
+    ) {
+        if is_operator {
+            return;
+        }
+        Self::authoritative_user(asserted, identity);
+    }
+
     /// Bind a submitted spec to the authenticated caller.
     ///
     /// Overwrites `user`/`uid`/`gid` from the verified identity rather than trusting what the client
-    /// sent, and derives uid/gid from the username through NSS (the token carries no gid, and a
-    /// client-chosen uid is what allowed a job to run as an arbitrary user). Unauthenticated callers
-    /// are left as-is so `permissive` keeps working; `required` never reaches here without an
-    /// identity because the auth layer rejects first.
+    /// sent. JWT identities re-resolve uid/gid through NSS on this host (the token's uid is
+    /// untrusted and it carries no gid). Native identities already carry mint-host uid/gid and
+    /// must not be looked up again. Unauthenticated callers are left as-is so `permissive` keeps
+    /// working; `required` never reaches here without an identity because the auth layer rejects first.
     fn bind_spec_to_identity(
         spec: &mut spur_core::job::JobSpec,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Result<(), Status> {
-        let Some(id) = identity else { return Ok(()) };
-        let (uid, gid) = spur_core::auth::resolve_unix_credentials(&id.user).map_err(|e| {
-            // Fail closed: never fall back to the wire's uid (or to 0) for a user we cannot resolve.
-            Status::failed_precondition(format!(
-                "cannot resolve UNIX credentials for authenticated user '{}': {e}",
-                id.user
-            ))
-        })?;
-        if spec.user != id.user && !spec.user.is_empty() {
-            warn!(
-                claimed = %spec.user,
-                authenticated = %id.user,
-                "job spec claimed a different user than the credential; using the authenticated one"
-            );
+        if let Some(id) = identity {
+            if spec.user != id.user && !spec.user.is_empty() {
+                warn!(
+                    claimed = %spec.user,
+                    authenticated = %id.user,
+                    "job spec claimed a different user than the credential; using the authenticated one"
+                );
+            }
         }
-        spec.user = id.user.clone();
-        spec.uid = uid;
-        spec.gid = gid;
-        Ok(())
+        spur_core::auth::bind_job_spec(spec, identity).map_err(|e| {
+            Status::failed_precondition(format!(
+                "cannot resolve UNIX credentials for authenticated user: {e}"
+            ))
+        })
     }
 
-    /// Whether the verified caller is an administrator for policy decisions that are neither
-    /// job-ownership nor k0s-cluster gates: priority ceilings, job-info visibility.
-    ///
-    /// Accepts either the token's `admin` claim or the accounting `Admin` level, so the check works
-    /// before the accounting DB is populated and stays consistent with the rest of the control plane
-    /// (`is_k0s_admin`). An unauthenticated caller (permissive/disabled) is not an admin.
+    /// Overwrite wire identity fields from a verified native credential (uid/gid).
+    fn authoritative_unix(
+        uid: &mut u32,
+        gid: Option<&mut u32>,
+        identity: Option<&spur_core::auth::Identity>,
+    ) {
+        let Some(id) = identity.filter(|i| i.trusted_unix) else {
+            return;
+        };
+        *uid = id.uid;
+        if let Some(g) = gid {
+            *g = id.gid;
+        }
+    }
+
+    /// Whether the verified caller is an administrator: JWT `admin`, `[auth]
+    /// cluster_admins` / NSS groups, uid-0 when enabled, or accounting Admin
+    /// once the cache is loaded. Unauthenticated callers are not admin.
     fn caller_is_admin(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
-        identity.is_some_and(|id| {
-            id.is_admin || is_k0s_admin(self.cluster.association_cache(), &id.user)
-        })
+        self.caller_role(identity)
+            .is_some_and(|r| r.administers_cluster())
+    }
+
+    fn k0s_caller_is_admin(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        caller: &str,
+    ) -> bool {
+        k0s_admin_allowed(
+            self.caller_is_admin(identity),
+            identity.is_some(),
+            self.cluster.association_cache(),
+            caller,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn require_k0s_admin(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        caller: &str,
+        op: &str,
+    ) -> Result<(), Status> {
+        if self.k0s_caller_is_admin(identity, caller) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "{op} requires cluster admin"
+            )))
+        }
+    }
+
+    fn caller_is_operator(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        identity_operates_jobs(&self.cluster, identity)
+    }
+
+    /// Who may cancel a job they do not own.
+    ///
+    /// Verified Operators/Administrators always may. The k8s operator talks to
+    /// spurctld with no bearer and `CancelJobRequest.user = ""`; that pair is the
+    /// in-cluster daemon, not an anonymous REST caller (REST cancel requires a
+    /// Bearer before it reaches `ClusterManager`). A named unauthenticated user
+    /// is still an ordinary owner check — `"root"` is not special.
+    fn caller_may_cancel_unowned(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        user: &str,
+    ) -> bool {
+        self.caller_is_operator(identity) || (identity.is_none() && user.is_empty())
+    }
+
+    fn caller_role(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Option<spur_core::rbac::Role> {
+        identity_role(&self.cluster, identity)
     }
 
     /// Fire a best-effort audit record and a structured log line for a reservation
@@ -813,6 +919,8 @@ impl ControllerService {
         if self.caller_is_privileged(Self::verified_identity(request)) {
             Ok(())
         } else {
+            spur_core::native_metrics::inc_role_deny();
+            tracing::warn!(op, "rbac denied: cluster administrator required");
             Err(Status::permission_denied(format!(
                 "{op} requires cluster admin"
             )))
@@ -838,7 +946,7 @@ impl ControllerService {
     ) -> Result<(), Status> {
         // Skipping the lookup for a verified admin keeps a credential working on a controller that
         // shares no user directory with the login nodes and cannot resolve the name at all.
-        if self.caller_is_admin(identity) {
+        if self.caller_is_admin(identity) || self.caller_is_operator(identity) {
             return Ok(());
         }
         // NSS can reach sssd/LDAP over the network, so it must not run on a runtime worker.
@@ -877,22 +985,14 @@ impl ControllerService {
         }
     }
 
-    /// Apply `[controller] job_info_visibility` for `get_job`. Owner, admin, and unauthenticated
-    /// callers (see [`viewer_is_privileged`]) get the full record; an identified non-owner gets
-    /// `Full` (legacy), `None` → `NOT_FOUND` (`OwnerOnly`), or the targeting-sensitive fields blanked
-    /// (`Redacted`, the default).
-    /// Disclosure level for one job. Split out so the single-job and list handlers share one policy
-    /// decision; the list path annotates in a single batch and so cannot reuse `scoped_job_info`.
-    fn disclosure_for(
+    /// Identified Users cannot fetch another tenant's job (same pin as `get_jobs`).
+    /// Operators, Administrators, and unauthenticated callers see every job in full.
+    fn caller_may_see_job(
         &self,
         owner: &str,
         identity: Option<&spur_core::auth::Identity>,
-    ) -> JobInfoDisclosure {
-        let privileged = viewer_is_privileged(identity, owner, self.caller_is_admin(identity));
-        job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        )
+    ) -> bool {
+        identified_user_may_view_job(identity, owner, self.caller_is_operator(identity))
     }
 
     fn scoped_job_info(
@@ -900,22 +1000,12 @@ impl ControllerService {
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
-        match self.disclosure_for(&job.spec.user, identity) {
-            JobInfoDisclosure::Hidden => None,
-            disclosure => {
-                let mut info = job_to_proto(job);
-                // Annotate before redacting, so the redacted branch strips the
-                // planned nodelist rather than having it added back after.
-                annotate_jobs_with_planned_reservations(
-                    std::slice::from_mut(&mut info),
-                    &self.cluster,
-                );
-                if disclosure == JobInfoDisclosure::Redacted {
-                    redact_sensitive_job_info(&mut info);
-                }
-                Some(info)
-            }
+        if !self.caller_may_see_job(&job.spec.user, identity) {
+            return None;
         }
+        let mut info = job_to_proto(job);
+        annotate_jobs_with_planned_reservations(std::slice::from_mut(&mut info), &self.cluster);
+        Some(info)
     }
 
     /// Forwarding metadata that carries the caller's credential through to the leader.
@@ -934,9 +1024,42 @@ impl ControllerService {
         meta
     }
 
-    /// Re-wrap a request for forwarding to the leader, preserving the caller's credential.
-    fn forward_request<T>(request: Request<T>) -> Request<T> {
-        let meta = Self::forwarded_metadata_preserving(request.metadata());
+    fn forwarded_metadata_for(
+        orig: &tonic::metadata::MetadataMap,
+        identity: Option<&spur_core::auth::Identity>,
+        digest: [u8; 32],
+        action: &str,
+    ) -> tonic::metadata::MetadataMap {
+        if let (Some(peer), Some(id)) = (crate::native_keys::peer(), identity) {
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            let (dest, term) = crate::native_keys::leader_and_term();
+            if let Ok(token) = peer.sign(id, dest, term, action, digest, now) {
+                if let Ok(value) = token.parse() {
+                    let mut meta = Self::forwarded_metadata();
+                    meta.insert(spur_core::native_peer::IDENTITY_HEADER, value);
+                    return meta;
+                }
+            }
+        }
+        Self::forwarded_metadata_preserving(orig)
+    }
+
+    /// Re-wrap a request for forwarding to the leader.
+    ///
+    /// Native plugin: a signed identity envelope replaces the original user
+    /// credential so the leader does not see a consumed nonce. JWT plugin:
+    /// the Authorization header is preserved as before.
+    fn forward_request<T: prost::Message>(request: Request<T>) -> Request<T> {
+        let identity = request
+            .extensions()
+            .get::<spur_core::auth::Identity>()
+            .cloned();
+        let mut buf = Vec::new();
+        let _ = prost::Message::encode(request.get_ref(), &mut buf);
+        let digest = spur_core::native_peer::request_digest(&buf);
+        let action = std::any::type_name::<T>();
+        let meta =
+            Self::forwarded_metadata_for(request.metadata(), identity.as_ref(), digest, action);
         let mut fwd = Request::new(request.into_inner());
         *fwd.metadata_mut() = meta;
         fwd
@@ -984,18 +1107,29 @@ impl ControllerService {
             return Ok(String::new());
         }
 
-        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
-            .map_err(|e| Status::internal(e.to_string()))
+        self.mint_node_token(hostname)
     }
 
     /// Whether node identity is attested at all. Both halves are required: token
     /// admission issues the credential, the signing key is what can verify it.
     fn enforces_node_identity(&self) -> bool {
-        self.node_identity_key_configured
+        (self.node_identity_key_configured || crate::native_keys::node_signer().is_some())
             && matches!(
                 self.cluster.config().admission.mode,
                 spur_core::config::AdmissionMode::Token
             )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn mint_node_token(&self, hostname: &str) -> Result<String, Status> {
+        if let Some(signer) = crate::native_keys::node_signer() {
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            return signer
+                .mint(hostname, now)
+                .map_err(|e| Status::internal(e.to_string()));
+        }
+        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     /// Gates on controller configuration, never on whether the request carried a
@@ -1007,6 +1141,18 @@ impl ControllerService {
         }
         if node_token.is_empty() {
             return Err(Status::unauthenticated("node token required"));
+        }
+        self.verify_issued_node_token(hostname, node_token)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_issued_node_token(&self, hostname: &str, node_token: &str) -> Result<(), Status> {
+        if let Some(signer) = crate::native_keys::node_signer() {
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            signer
+                .verify(node_token, hostname, now)
+                .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            return Ok(());
         }
         let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -1062,20 +1208,24 @@ fn resolve_user_namespace_sa(
     ))
 }
 
-/// Whether `caller` may perform k0s cluster-admin ops: `root` always, otherwise an accounting
-/// `Admin`. An empty caller is NOT privileged. Fails closed when accounting is off (the cache
-/// reports no admins), leaving only `root`.
+/// Whether `caller` may perform k0s cluster-admin ops when no verified identity
+/// is present: `root` always, otherwise an accounting `Admin`. An empty caller
+/// is NOT privileged. Fails closed when accounting is off (the cache reports no
+/// admins), leaving only `root`.
+///
+/// Authenticated callers must use [`k0s_admin_allowed`] / `resolve_role` instead
+/// of this string check, so `[auth] cluster_admins` cannot be ignored.
 fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
-    // NOTE: `caller` is supplied by the client and is not authenticated, so this check is an
-    // operator-error guard, not a security boundary. Anything that hands out a credential must
-    // carry its own opt-in (see `cluster.allow_admin_kubeconfig`) until user auth is enforced.
-    //
-    // The former `caller.is_empty()` bypass is gone: nothing in-tree sends an empty caller (the CLI
-    // always fills it, falling back to "unknown"), so it granted admin to a two-character forgery
-    // and bought nothing. `root` is retained deliberately — with accounting disabled the cache
-    // reports no admins at all, and removing it would strand `spur k8s up` on every cluster that
-    // does not run accounting.
     caller == "root" || cache.is_admin(caller)
+}
+
+fn k0s_admin_allowed(
+    resolved_admin: bool,
+    has_identity: bool,
+    cache: &crate::association_cache::AssociationCache,
+    caller: &str,
+) -> bool {
+    resolved_admin || (!has_identity && is_k0s_admin(cache, caller))
 }
 
 /// Ruling for a non-admin caller, split from the lookup so the policy is testable without the
@@ -1185,15 +1335,20 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::pin_job_list_user(
+            &mut req.user,
+            __identity.as_ref(),
+            identity_operates_jobs(&self.cluster, __identity.as_ref()),
+        );
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then(|| req.clone()),
+                __identity.clone(),
                 "get_jobs",
                 |mut c, r| async move { c.get_jobs(r).await },
             )
@@ -1242,21 +1397,13 @@ impl SlurmController for ControllerService {
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
 
-        // An identified caller is already scoped to their own jobs by the user filter above, so
-        // this only bites if that scoping is ever loosened — but it keeps the two read paths from
-        // disagreeing about what a non-owner may see.
+        // Operators may list other tenants; identified Users stay pinned to own jobs.
         let proto_jobs: Vec<JobInfo> = jobs
             .iter()
             .zip(proto_jobs)
-            .filter_map(|(job, mut info)| {
-                match self.disclosure_for(&job.spec.user, __identity.as_ref()) {
-                    JobInfoDisclosure::Hidden => None,
-                    JobInfoDisclosure::Redacted => {
-                        redact_sensitive_job_info(&mut info);
-                        Some(info)
-                    }
-                    JobInfoDisclosure::Full => Some(info),
-                }
+            .filter_map(|(job, info)| {
+                self.caller_may_see_job(&job.spec.user, __identity.as_ref())
+                    .then_some(info)
             })
             .collect();
 
@@ -1264,7 +1411,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         // Capture identity before the forward so the serving node (leader or read-allowed follower)
         // can scope the record to the caller; the credential is preserved on forward, so a forwarded
@@ -1276,6 +1423,7 @@ impl SlurmController for ControllerService {
             .forward_read_optional(
                 meta,
                 forward.then_some(req),
+                identity.clone(),
                 "get_job",
                 |mut c, r| async move { c.get_job(r).await },
             )
@@ -1289,9 +1437,6 @@ impl SlurmController for ControllerService {
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        // A non-owner, non-admin caller does not get another tenant's work_dir, command, stdio
-        // paths, or (the targeting-sensitive one) allocated nodelist. Policy is configurable; the
-        // default redacts those fields while leaving the Slurm-standard queue view intact.
         self.scoped_job_info(&job, identity.as_ref())
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))
@@ -1321,7 +1466,11 @@ impl SlurmController for ControllerService {
         let job = self.cluster.get_job(job_id);
 
         self.cluster
-            .cancel_job(job_id, &req.user)
+            .cancel_job_for(
+                job_id,
+                &req.user,
+                self.caller_may_cancel_unowned(__identity.as_ref(), &req.user),
+            )
             .map_err(cancel_err_to_status)?;
 
         // Send cancel signal to agents so the process is actually killed
@@ -1358,7 +1507,12 @@ impl SlurmController for ControllerService {
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job = self
             .cluster
-            .finish_srun_job(req.job_id, req.exit_code, &req.user)
+            .finish_srun_job_for(
+                req.job_id,
+                req.exit_code,
+                &req.user,
+                self.caller_is_operator(__identity.as_ref()),
+            )
             .map_err(|e| match e {
                 crate::cluster::SrunCompleteError::NotFound(id) => {
                     Status::not_found(format!("job {id} not found"))
@@ -1428,7 +1582,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             None,
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -1473,7 +1627,11 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
-            .suspend_job(job_id, &req.user)
+            .suspend_job_for(
+                job_id,
+                &req.user,
+                self.caller_is_operator(__identity.as_ref()),
+            )
             .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -1508,7 +1666,11 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
-            .resume_job(job_id, &req.user)
+            .resume_job_for(
+                job_id,
+                &req.user,
+                self.caller_is_operator(__identity.as_ref()),
+            )
             .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -1549,7 +1711,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
         spur_core::auth::check_job_owner(
             &req.user,
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             "modify",
         )
@@ -1605,8 +1767,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    let fwd = Self::forward_request(request);
                     return client.requeue_job(fwd).await;
                 }
                 Err(e) => {
@@ -1617,7 +1778,7 @@ impl SlurmController for ControllerService {
         }
 
         let __identity = Self::verified_identity(&request).cloned();
-        let caller_is_admin = self.caller_is_admin(__identity.as_ref());
+        let caller_is_admin = self.caller_is_operator(__identity.as_ref());
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let outcome = self
@@ -1644,13 +1805,15 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then(|| req.clone()),
+                identity,
                 "get_nodes",
                 |mut c, r| async move { c.get_nodes(r).await },
             )
@@ -1687,13 +1850,15 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then(|| req.clone()),
+                identity,
                 "get_node",
                 |mut c, r| async move { c.get_node(r).await },
             )
@@ -1886,12 +2051,14 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then(|| request.into_inner()),
+                identity,
                 "get_partitions",
                 |mut c, r| async move { c.get_partitions(r).await },
             )
@@ -1925,16 +2092,20 @@ impl SlurmController for ControllerService {
             version: env!("CARGO_PKG_VERSION").into(),
             federation_peers,
             cluster_name: self.cluster.config().cluster_name.clone(),
+            auth_audience: self.auth_audience.clone(),
+            auth_epoch: self.auth_epoch,
         }))
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then_some(()),
+                identity,
                 "get_job_metrics",
                 |mut c, r| async move { c.get_job_metrics(r).await },
             )
@@ -1953,12 +2124,14 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then_some(()),
+                identity,
                 "get_node_metrics",
                 |mut c, r| async move { c.get_node_metrics(r).await },
             )
@@ -2016,7 +2189,7 @@ impl SlurmController for ControllerService {
         }
 
         let identity = Self::verified_identity(&request).cloned();
-        let caller_is_admin = self.caller_is_admin(identity.as_ref());
+        let caller_is_admin = self.caller_is_operator(identity.as_ref());
         let req = request.into_inner();
         let filter = assoc_mgr_scope_user(identity.as_ref(), &req.user, caller_is_admin);
         let info = self.cluster.assoc_mgr_info(filter.as_deref());
@@ -2567,7 +2740,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
@@ -2576,6 +2749,7 @@ impl SlurmController for ControllerService {
             .forward_read_optional(
                 meta,
                 forward.then_some(req),
+                identity.clone(),
                 "get_job_steps",
                 |mut c, r| async move { c.get_job_steps(r).await },
             )
@@ -2584,30 +2758,14 @@ impl SlurmController for ControllerService {
             return Ok(resp);
         }
 
-        // Scope step visibility to the same policy as get_job: step names can leak intent, so they
-        // are blanked under `redacted` and the list is empty under `owner_only`. Resolve the parent
-        // job first and return NOT_FOUND if it is gone — matching get_job, and so the owner is never
-        // mis-derived as `""` (which would treat the true owner as unprivileged).
+        // Same visibility as get_job: identified Users cannot probe another tenant's steps.
         let job = self
             .cluster
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-        let privileged = viewer_is_privileged(
-            identity.as_ref(),
-            &job.spec.user,
-            self.caller_is_admin(identity.as_ref()),
-        );
-        let redact_names = match job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        ) {
-            JobInfoDisclosure::Full => false,
-            JobInfoDisclosure::Redacted => true,
-            // Owner-only: the job is invisible to this caller, so are its steps.
-            JobInfoDisclosure::Hidden => {
-                return Ok(Response::new(GetJobStepsResponse { steps: Vec::new() }));
-            }
-        };
+        if !self.caller_may_see_job(&job.spec.user, identity.as_ref()) {
+            return Err(Status::not_found(format!("job {job_id} not found")));
+        }
 
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
@@ -2615,11 +2773,7 @@ impl SlurmController for ControllerService {
             .map(|s| JobStepInfo {
                 job_id: s.job_id,
                 step_id: s.step_id,
-                name: if redact_names {
-                    String::new()
-                } else {
-                    s.name.clone()
-                },
+                name: s.name.clone(),
                 state: s.state.display().to_string(),
                 num_tasks: s.num_tasks,
             })
@@ -2648,6 +2802,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -2658,7 +2813,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             Some(req.uid),
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -2707,7 +2862,7 @@ impl SlurmController for ControllerService {
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
             resources: spur_core::resource::ResourceAllocations::default(),
-            nodes: step_nodes,
+            nodes: step_nodes.clone(),
             distribution: spur_core::step::TaskDistribution::Block,
             start_time: Some(chrono::Utc::now()),
             end_time: None,
@@ -2718,6 +2873,20 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
+        let execution_credential = crate::native_keys::sign_step_credential(
+            &self.cluster.config().cluster_name,
+            &job,
+            step_id,
+            &req.command,
+            &step_nodes,
+            req.container
+                .as_ref()
+                .map(|c| c.image.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| job.spec.container_image.as_deref().unwrap_or("")),
+        )
+        .map_err(|e| Status::internal(format!("failed to sign step credential: {e}")))?;
+
         // Resolve the effective container so the interactive-PTY client can forward it
         // to the agent: the agent connects directly (bypassing the controller) and cannot
         // see the parent job spec to inherit `salloc/sbatch --container-image`.
@@ -2727,6 +2896,7 @@ impl SlurmController for ControllerService {
             step_id,
             node_addr,
             container,
+            execution_credential,
         }))
     }
 
@@ -2751,6 +2921,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -2761,7 +2932,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             Some(req.uid),
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -3215,13 +3386,15 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
                 meta,
                 forward.then(|| req.clone()),
+                identity,
                 "list_reservations",
                 |mut c, r| async move { c.list_reservations(r).await },
             )
@@ -3278,7 +3451,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             None,
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -3342,6 +3515,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -3354,7 +3528,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             Some(req.uid),
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -3574,6 +3748,7 @@ impl SlurmController for ControllerService {
             let container = step_container.clone();
             let step_nodelist = step_nodelist.clone();
             let step_user = job.spec.user.clone();
+            let execution_credential = req.execution_credential.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -3601,6 +3776,7 @@ impl SlurmController for ControllerService {
                         pmix_prepared: needs_pmix_prepare,
                         container,
                         nodelist: step_nodelist.clone(),
+                        execution_credential: execution_credential.clone(),
                     })
                     .await;
 
@@ -3734,11 +3910,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster up requires cluster admin",
-            ));
-        }
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster up")?;
         let state = self.cluster.k0s_state();
         let nodes = self.cluster.get_nodes();
         let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
@@ -3853,8 +4025,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    let fwd = Self::forward_request(request);
                     return client.cluster_add_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -3863,12 +4034,10 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster add-nodes requires cluster admin",
-            ));
-        }
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster add-nodes")?;
 
         let state = self.cluster.k0s_state();
         // Online add only makes sense on a running cluster.
@@ -3933,8 +4102,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    let fwd = Self::forward_request(request);
                     return client.cluster_remove_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -3943,12 +4111,10 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster remove-nodes requires cluster admin",
-            ));
-        }
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster remove-nodes")?;
 
         let state = self.cluster.k0s_state();
         if !matches!(
@@ -4083,11 +4249,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster down requires cluster admin",
-            ));
-        }
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster down")?;
         self.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Down,
@@ -4135,7 +4297,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
-        let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
+        let is_admin = self.k0s_caller_is_admin(__identity.as_ref(), &req.caller);
 
         if req.admin {
             // Admin check first, opt-in second — deliberately in that order. Both must pass, so the
@@ -4147,10 +4309,9 @@ impl SlurmController for ControllerService {
                     "the cluster-admin kubeconfig requires cluster admin",
                 ));
             }
-            // Serving the cluster-admin credential is gated on an explicit opt-in, not just on the
-            // admin check above: `caller` is client-supplied and unauthenticated, so without this
-            // any peer that can reach the controller could ask for a cluster-admin kubeconfig by
-            // claiming to be root. Off by default; get it on the control-plane node instead.
+            // Serving the cluster-admin credential is gated on an explicit opt-in in addition to
+            // the admin check: under permissive auth an unidentified caller can still claim `root`.
+            // Off by default; get it on the control-plane node instead.
             if !self.cluster.config().cluster.allow_admin_kubeconfig {
                 return Err(Status::permission_denied(
                     "serving the cluster-admin kubeconfig over RPC is disabled \
@@ -4211,6 +4372,7 @@ pub async fn serve(
     accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
     jwt_key: String,
+    bearer: spur_core::auth::BearerAuth,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -4227,15 +4389,9 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
-    let node_identity_key_configured = cluster.config().auth.has_jwt_key();
-    let auth_mode = cluster.config().auth.mode;
-    // Unlike node admission, an unset key here must reject every credential, never fall back
-    // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
-    let auth_verification_key = cluster
-        .config()
-        .auth
-        .resolved_jwt_key()?
-        .unwrap_or_default();
+    let node_identity_key_configured =
+        cluster.config().auth.has_jwt_key() || crate::native_keys::node_signer().is_some();
+    let (auth_audience, auth_epoch) = bearer.advertised_handshake();
 
     let service = ControllerService {
         cluster,
@@ -4248,12 +4404,17 @@ pub async fn serve(
         jwt_key,
         node_identity_key_configured,
         incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+        auth_audience,
+        auth_epoch,
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
-    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &auth_verification_key);
+    let mut auth_layer = crate::auth_middleware::AuthLayer::from_bearer(bearer);
+    if let Some(peer) = crate::native_keys::peer() {
+        auth_layer = auth_layer.with_peer(peer);
+    }
 
     let mut builder = tonic::transport::Server::builder()
         .layer(stats_layer)
@@ -4688,39 +4849,58 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
     }
 }
 
-/// What a caller may see of a job, once ownership/admin status and the visibility policy are known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobInfoDisclosure {
-    /// Full record.
-    Full,
-    /// Full record minus the targeting-sensitive fields (see [`redact_sensitive_job_info`]).
-    Redacted,
-    /// Not disclosed at all — the caller sees `NOT_FOUND`.
-    Hidden,
+pub(crate) fn identity_role(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
+) -> Option<spur_core::rbac::Role> {
+    let id = identity?;
+    let auth = &cluster.config().auth;
+    let cache = cluster.association_cache();
+    let groups = if auth.admin_groups.is_empty() && auth.operator_groups.is_empty() {
+        Vec::new()
+    } else {
+        spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
+    };
+    Some(spur_core::rbac::resolve_role(
+        id,
+        auth,
+        cache.admin_level(&id.user).as_deref(),
+        cache.is_loaded(),
+        &groups,
+        false,
+    ))
 }
 
-/// Whether a caller may see a job's full record unconditionally: the owner, an admin, or a caller
-/// with no verified identity at all. The last case preserves the pre-auth behaviour — scoping only
-/// bites once callers are actually identified, so no-auth/permissive deployments and internal
-/// unauthenticated consumers (the k8s operator's nodelist read) are unaffected. Pure for testing.
-fn viewer_is_privileged(
+pub(crate) fn identity_operates_jobs(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
+) -> bool {
+    identity.is_some_and(|id| {
+        cluster.association_cache().is_operator(&id.user)
+            || identity_role(cluster, Some(id)).is_some_and(|r| r.operates_jobs())
+    })
+}
+
+/// Identified Users cannot see another tenant's job, matching `get_jobs` pinning.
+/// Unauthenticated callers and Operators/Administrators are not pinned.
+pub(crate) fn identified_user_may_view_job(
     identity: Option<&spur_core::auth::Identity>,
     owner: &str,
-    caller_is_admin: bool,
+    operates_jobs: bool,
 ) -> bool {
     match identity {
         None => true,
-        Some(id) => id.user == owner || caller_is_admin,
+        Some(_) if operates_jobs => true,
+        Some(id) => id.user == owner,
     }
 }
 
 /// The user an assoc-mgr read is scoped to. A privileged caller — an admin, or
-/// an unauthenticated one under `permissive`/`disabled`, the same treatment
-/// `viewer_is_privileged` gives — reads whichever user the request names, or
-/// every user when it names none. A non-admin authenticated caller is pinned to
-/// their own identity, so they can neither read another tenant's usage nor
-/// enumerate the cluster-wide scope inventory. Pure so the policy is testable
-/// without a live service.
+/// an unauthenticated one under `permissive`/`disabled` — reads whichever user
+/// the request names, or every user when it names none. A non-admin authenticated
+/// caller is pinned to their own identity, so they can neither read another
+/// tenant's usage nor enumerate the cluster-wide scope inventory. Pure so the
+/// policy is testable without a live service.
 fn assoc_mgr_scope_user(
     identity: Option<&spur_core::auth::Identity>,
     requested: &str,
@@ -4730,49 +4910,6 @@ fn assoc_mgr_scope_user(
         return (!requested.is_empty()).then(|| requested.to_string());
     }
     identity.map(|id| id.user.clone())
-}
-
-/// Resolve the disclosure level for a job-info read. The owner and admins (`privileged`) always get
-/// the full record; everyone else is governed by the configured policy. Pure so the policy matrix is
-/// unit-testable without a live service.
-fn job_info_disclosure(
-    privileged: bool,
-    visibility: spur_core::config::JobInfoVisibility,
-) -> JobInfoDisclosure {
-    use spur_core::config::JobInfoVisibility;
-    if privileged {
-        return JobInfoDisclosure::Full;
-    }
-    match visibility {
-        JobInfoVisibility::Full => JobInfoDisclosure::Full,
-        JobInfoVisibility::Redacted => JobInfoDisclosure::Redacted,
-        JobInfoVisibility::OwnerOnly => JobInfoDisclosure::Hidden,
-    }
-}
-
-/// Blank what a non-owner should not see, keeping identity/state/timing/account
-/// so the Slurm-standard queue view still works.
-fn redact_sensitive_job_info(info: &mut JobInfo) {
-    info.work_dir = String::new();
-    info.command = String::new();
-    info.stdout_path = String::new();
-    info.stderr_path = String::new();
-    info.stdin_path = String::new();
-    info.comment = String::new();
-    info.nodelist = String::new();
-    info.resources = None;
-    // The submit line re-exposes most of the above, and the requested lists are
-    // the same targeting oracle as the allocated one.
-    info.submit_line = String::new();
-    info.req_nodelist = String::new();
-    info.exc_nodelist = String::new();
-    info.sched_nodelist = String::new();
-    // The requested shape restates the resource detail blanked above.
-    info.req_tres = String::new();
-    info.features = String::new();
-    info.min_cpus_node = 0;
-    info.min_memory_node_mb = 0;
-    info.min_memory_is_per_cpu = false;
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -5644,89 +5781,26 @@ mod tests {
     }
 
     #[test]
-    fn job_info_disclosure_matrix() {
-        use spur_core::config::JobInfoVisibility::*;
-        // The owner/admin (privileged) always sees the full record, whatever the policy.
-        for v in [Redacted, OwnerOnly, Full] {
-            assert_eq!(job_info_disclosure(true, v), JobInfoDisclosure::Full);
-        }
-        // A non-owner is governed by the policy.
-        assert_eq!(
-            job_info_disclosure(false, Redacted),
-            JobInfoDisclosure::Redacted
-        );
-        assert_eq!(
-            job_info_disclosure(false, OwnerOnly),
-            JobInfoDisclosure::Hidden
-        );
-        assert_eq!(job_info_disclosure(false, Full), JobInfoDisclosure::Full);
-    }
-
-    #[test]
-    fn viewer_privilege_owner_admin_and_anonymous() {
+    fn identified_user_job_view_owner_operator_and_anonymous() {
         use spur_core::auth::Identity;
         let bob = Identity {
             user: "bob".into(),
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         };
         let alice = Identity {
             user: "alice".into(),
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         };
-        // Owner and admin are privileged.
-        assert!(viewer_is_privileged(Some(&bob), "bob", false));
-        assert!(viewer_is_privileged(Some(&alice), "bob", true));
-        // A different, non-admin identified user is not.
-        assert!(!viewer_is_privileged(Some(&alice), "bob", false));
-        // No verified identity (auth disabled, or permissive with no credential, or an internal
-        // consumer like the k8s operator) is privileged: scoping only applies to identified callers.
-        assert!(viewer_is_privileged(None, "bob", false));
-    }
-
-    #[test]
-    fn redact_blanks_sensitive_fields_and_keeps_the_rest() {
-        let mut info = JobInfo {
-            job_id: 42,
-            name: "train".into(),
-            user: "bob".into(),
-            account: "team-b".into(),
-            state_reason: "Running".into(),
-            // sensitive
-            work_dir: "/home/bob/run".into(),
-            command: "python train.py --secret".into(),
-            stdout_path: "/home/bob/out".into(),
-            stderr_path: "/home/bob/err".into(),
-            stdin_path: "/home/bob/in".into(),
-            comment: "internal".into(),
-            nodelist: "gpu-b-[01-04]".into(),
-            submit_line: "sbatch --wrap 'python train.py --secret'".into(),
-            req_nodelist: "gpu-b-[01-04]".into(),
-            exc_nodelist: "gpu-b-05".into(),
-            ..Default::default()
-        };
-        redact_sensitive_job_info(&mut info);
-        // Sensitive fields are gone — the nodelist in particular (the co-residency targeting oracle).
-        assert!(info.work_dir.is_empty());
-        assert!(info.command.is_empty());
-        assert!(info.stdout_path.is_empty());
-        assert!(info.stderr_path.is_empty());
-        assert!(info.stdin_path.is_empty());
-        assert!(info.comment.is_empty());
-        assert!(info.nodelist.is_empty());
-        assert!(info.resources.is_none());
-        assert!(info.submit_line.is_empty());
-        assert!(info.req_nodelist.is_empty());
-        assert!(info.exc_nodelist.is_empty());
-        // Non-sensitive identity/state fields survive so the queue view still works.
-        assert_eq!(info.job_id, 42);
-        assert_eq!(info.name, "train");
-        assert_eq!(info.user, "bob");
-        assert_eq!(info.account, "team-b");
-        assert_eq!(info.state_reason, "Running");
+        assert!(identified_user_may_view_job(None, "bob", false));
+        assert!(identified_user_may_view_job(Some(&bob), "bob", false));
+        assert!(!identified_user_may_view_job(Some(&alice), "bob", false));
+        assert!(identified_user_may_view_job(Some(&alice), "bob", true));
     }
 
     /// Identity for a viewer in the get_job/get_job_steps handler tests. No NSS resolution happens
@@ -5737,6 +5811,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin,
+            trusted_unix: false,
         }
     }
 
@@ -5826,7 +5901,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_scopes_by_identity_under_default_redacted_policy() {
+    async fn get_job_hides_other_tenants_from_identified_users() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let job_id = svc
@@ -5849,34 +5924,7 @@ mod tests {
             assert_eq!(info.work_dir, "/home/bob");
         }
 
-        // An identified non-owner is redacted: the work_dir (and other sensitive fields) are blanked,
-        // but the non-sensitive identity fields survive.
-        let other = svc
-            .get_job(get_job_req(job_id, Some(viewer("alice", false))))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(other.work_dir, "", "a non-owner must not see the work_dir");
-        assert_eq!(other.user, "bob", "non-sensitive fields survive redaction");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_owner_only_hides_the_job_from_a_non_owner() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut config = step_test_config();
-        config.controller.job_info_visibility = spur_core::config::JobInfoVisibility::OwnerOnly;
-        let svc = test_service_with(&dir, config).await;
-        let job_id = svc
-            .cluster
-            .submit_job(owned_job("bob", "/home/bob"))
-            .unwrap()
-            .job_id;
-
-        // Owner still sees the job; a non-owner gets NOT_FOUND rather than a redacted record.
-        assert!(svc
-            .get_job(get_job_req(job_id, Some(viewer("bob", false))))
-            .await
-            .is_ok());
+        // An identified User cannot fetch another tenant's job (same pin as get_jobs).
         let err = svc
             .get_job(get_job_req(job_id, Some(viewer("alice", false))))
             .await
@@ -5906,6 +5954,62 @@ mod tests {
         // Operator is not full admin; a plain member isn't either.
         assert!(!is_k0s_admin(&cache, "dave"));
         assert!(!is_k0s_admin(&cache, "erin"));
+    }
+
+    #[test]
+    fn k0s_admin_honors_resolved_role_and_blocks_spoofed_root() {
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(k0s_admin_allowed(true, true, &cache, "erin"));
+        assert!(!k0s_admin_allowed(false, true, &cache, "root"));
+        assert!(k0s_admin_allowed(false, false, &cache, "root"));
+        cache.insert_admin_level("carol", "Admin");
+        assert!(k0s_admin_allowed(false, false, &cache, "carol"));
+        assert!(!k0s_admin_allowed(false, true, &cache, "carol"));
+    }
+
+    #[test]
+    fn enforce_forward_binding_rejects_mismatched_digest_on_submit() {
+        let inner = SubmitJobRequest { spec: None };
+        let mut request = Request::new(inner);
+        request
+            .extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: std::any::type_name::<SubmitJobRequest>().into(),
+                request_digest: [0u8; 32],
+            });
+        let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn enforce_forward_binding_accepts_matching_digest() {
+        use prost::Message;
+        let inner = SubmitJobRequest { spec: None };
+        let mut buf = Vec::new();
+        inner.encode(&mut buf).unwrap();
+        let digest = spur_core::native_peer::request_digest(&buf);
+        let mut request = Request::new(inner);
+        request
+            .extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: std::any::type_name::<SubmitJobRequest>().into(),
+                request_digest: digest,
+            });
+        ControllerService::enforce_forward_binding(&request).unwrap();
+    }
+
+    #[test]
+    fn enforce_forward_binding_rejects_mismatched_digest_on_get_nodes() {
+        let inner = GetNodesRequest::default();
+        let mut request = Request::new(inner);
+        request
+            .extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: std::any::type_name::<GetNodesRequest>().into(),
+                request_digest: [1u8; 32],
+            });
+        let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
@@ -5960,6 +6064,8 @@ mod tests {
             jwt_key: String::new(),
             node_identity_key_configured: false,
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            auth_audience: String::new(),
+            auth_epoch: 0,
         }
     }
 
@@ -6006,10 +6112,8 @@ mod tests {
         assert_eq!(jobs[0].job_id, 1);
     }
 
-    /// `scontrol show job` and `squeue` both read through `get_jobs`, so this — not the
-    /// `get_job` redaction — is what stops one user reading another's submit line and
-    /// requested nodes. Spoofing the wire `user` field, and naming the job id outright,
-    /// must both come back empty.
+    /// `scontrol show job` and `squeue` both read through `get_jobs`. Spoofing the
+    /// wire `user` field, and naming the job id outright, must both come back empty.
     #[tokio::test]
     async fn get_jobs_never_returns_another_users_job_to_an_identified_caller() {
         use crate::raft::StateMachineApply;
@@ -6636,6 +6740,8 @@ mod tests {
             jwt_key,
             node_identity_key_configured,
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            auth_audience: String::new(),
+            auth_epoch: 0,
         }
     }
 
@@ -6647,6 +6753,21 @@ mod tests {
         let svc = test_service(&dir).await;
         let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
         assert_eq!(resp.cluster_name, "test");
+        assert!(
+            resp.auth_audience.is_empty(),
+            "jwt-plugin tests advertise no native audience"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_reports_native_auth_handshake() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut svc = test_service(&dir).await;
+        svc.auth_audience = "spur/test/controller/ctld".into();
+        svc.auth_epoch = 42;
+        let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
+        assert_eq!(resp.auth_audience, "spur/test/controller/ctld");
+        assert_eq!(resp.auth_epoch, 42);
     }
 
     /// A service with a configured node-identity signing key, for stepd
@@ -6691,6 +6812,12 @@ mod tests {
             _request: Request<spur_proto::proto::LaunchJobRequest>,
         ) -> Result<Response<spur_proto::proto::LaunchJobResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
+        }
+        async fn ping(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<spur_proto::proto::PingResponse>, Status> {
+            Ok(Response::new(spur_proto::proto::PingResponse::default()))
         }
         async fn start_job(
             &self,
@@ -9051,6 +9178,7 @@ mod tests {
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         });
 
         let err = svc
@@ -9097,6 +9225,63 @@ mod tests {
             }))
             .await
             .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_allows_operator_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(CancelJobRequest {
+            job_id,
+            user: "carol".into(),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(viewer("carol", true));
+        svc.cancel_job(req)
+            .await
+            .expect("a verified operator/admin must be able to cancel another user's job");
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            spur_core::job::JobState::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_unauthenticated_empty_user_is_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.cancel_job(Request::new(CancelJobRequest {
+            job_id,
+            user: String::new(),
+            ..Default::default()
+        }))
+        .await
+        .expect("k8s operator cancel uses empty user and no bearer");
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            spur_core::job::JobState::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_unauthenticated_root_string_is_not_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .cancel_job(Request::new(CancelJobRequest {
+                job_id,
+                user: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the root username is not an internal caller");
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
@@ -9470,6 +9655,55 @@ mod tests {
             .expect("an Admin-level caller may bring the cluster up")
             .into_inner();
         assert!(resp.accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_allowed_for_cluster_admins_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.auth.cluster_admins = vec!["erin".into()];
+        let svc = test_service_with(&dir, config).await;
+        register_plain_node(&svc, "cp-a", 6818).await;
+        let mut request = Request::new(ClusterUpRequest {
+            caller: "mallory".into(),
+            control_plane_replicas: Some(1),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(spur_core::auth::Identity {
+            user: "erin".into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+            trusted_unix: true,
+        });
+        let resp = svc
+            .cluster_up(request)
+            .await
+            .expect("cluster_admins identity may bring the cluster up")
+            .into_inner();
+        assert!(resp.accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_bound_user_cannot_claim_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let mut request = Request::new(ClusterUpRequest {
+            caller: "root".into(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        });
+        let err = svc
+            .cluster_up(request)
+            .await
+            .expect_err("a bound non-admin must not become root by request field");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     async fn register_plain_node(svc: &ControllerService, name: &str, port: u16) {
@@ -10209,29 +10443,6 @@ mod tests {
         // A running job holds no future slot; a leftover entry must not surface.
         assert!(jobs[1].planned_start_time.is_none());
         assert!(jobs[1].sched_nodelist.is_empty());
-    }
-
-    #[test]
-    fn redaction_strips_the_planned_nodelist() {
-        // Ordering guard: annotation runs before redaction, so the planned list
-        // must not reappear on a redacted record.
-        let mut info = JobInfo {
-            sched_nodelist: "gpu-b-[01-04]".into(),
-            req_tres: "cpu=16,mem=64G,gres/gpu=8".into(),
-            features: "mi300x".into(),
-            min_cpus_node: 16,
-            min_memory_node_mb: 65536,
-            min_memory_is_per_cpu: true,
-            ..Default::default()
-        };
-        redact_sensitive_job_info(&mut info);
-        assert!(info.sched_nodelist.is_empty());
-        // The requested shape restates the allocated detail, so it goes too.
-        assert!(info.req_tres.is_empty());
-        assert!(info.features.is_empty());
-        assert_eq!(info.min_cpus_node, 0);
-        assert_eq!(info.min_memory_node_mb, 0);
-        assert!(!info.min_memory_is_per_cpu);
     }
 
     #[test]
@@ -11440,6 +11651,7 @@ mod tests {
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "bob");
@@ -11453,9 +11665,41 @@ mod tests {
             uid: 1002,
             gid: 1002,
             is_admin: false,
+            trusted_unix: false,
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "carol");
+    }
+
+    #[test]
+    fn pin_job_list_user_leaves_operator_query_alone() {
+        let mut user = String::new();
+        let id = spur_core::auth::Identity {
+            user: "erin".into(),
+            uid: 1003,
+            gid: 1003,
+            is_admin: false,
+            trusted_unix: true,
+        };
+        ControllerService::pin_job_list_user(&mut user, Some(&id), true);
+        assert!(user.is_empty(), "operator with no filter sees everyone");
+        user = "bob".into();
+        ControllerService::pin_job_list_user(&mut user, Some(&id), true);
+        assert_eq!(user, "bob", "operator may still filter by user");
+    }
+
+    #[test]
+    fn pin_job_list_user_pins_non_operator_to_identity() {
+        let mut user = "mallory".into();
+        let id = spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        };
+        ControllerService::pin_job_list_user(&mut user, Some(&id), false);
+        assert_eq!(user, "alice");
     }
 
     // --- assoc_mgr_scope_user (assoc-mgr read authorization) ---
@@ -11466,6 +11710,7 @@ mod tests {
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         }
     }
 
@@ -11516,6 +11761,7 @@ mod tests {
             uid: 4_000_000_000, // > i32::MAX: must survive as i64, not wrap negative
             gid: 0,
             is_admin: false,
+            trusted_unix: false,
         };
         let rec = ControllerService::build_reservation_txn(
             TxnAction::Create,
@@ -11580,6 +11826,7 @@ mod tests {
             uid: 9999,
             gid: 9999,
             is_admin: true,
+            trusted_unix: false,
         };
         ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap();
         assert_eq!(spec.user, "root");
@@ -11596,6 +11843,7 @@ mod tests {
             uid: 0,
             gid: 0,
             is_admin: false,
+            trusted_unix: false,
         };
         let err = ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap_err();
         assert_eq!(
@@ -11606,5 +11854,18 @@ mod tests {
         // Spec must not be partially mutated.
         assert_eq!(spec.user, "alice");
         assert_eq!(spec.uid, 1000);
+    }
+
+    #[test]
+    fn bind_spec_uses_mint_uid_gid_without_nss() {
+        let mut spec = spec_for("impersonated", 1, 1);
+        let mut id = ident("this_user_does_not_exist_in_nss_7f3a");
+        id.uid = 4242;
+        id.gid = 4243;
+        id.trusted_unix = true;
+        ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap();
+        assert_eq!(spec.user, "this_user_does_not_exist_in_nss_7f3a");
+        assert_eq!(spec.uid, 4242);
+        assert_eq!(spec.gid, 4243);
     }
 }

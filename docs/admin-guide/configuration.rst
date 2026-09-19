@@ -299,23 +299,6 @@ and Raft high-availability topology.
        bounded only by this value. A node that exceeds it is skipped for new
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
-   * - ``job_info_visibility``
-     - string
-     - ``redacted``
-     - Live
-     - How much of another user's job an identified non-owner (non-admin) may
-       read via ``get_job`` / ``get_job_steps``. ``redacted`` (default) shows
-       identity, state, timing, and account but blanks the working directory,
-       command, submit line, stdio paths, comment, the allocated, requested,
-       and planned node lists, and both the allocated and requested resource
-       detail (``ReqTRES``, ``Features``, and the per-node minima);
-       ``owner_only`` returns ``NOT_FOUND`` for other users' jobs; ``full`` is the
-       legacy behaviour where every field is visible to any caller. Owners and
-       admins always see the full record. Scoping applies only to identified
-       callers — under ``auth.mode = required``, or when a credential is
-       presented under ``permissive``; with authentication disabled or no
-       credential presented, the full record is returned (so no-auth deployments
-       and internal consumers are unaffected).
 
 ``[accounting]``
 ----------------
@@ -577,12 +560,21 @@ How client requests are authenticated.
      - string
      - ``"jwt"``
      - Restart
-     - Constrains startup only: ``"munge"`` and any unrecognised value are
-       rejected rather than silently ignored, and ``"none"`` with
-       ``mode = "required"`` is refused as contradictory. Nothing reads it
-       afterwards — whether a presented credential is verified is decided by
-       ``mode`` and the configured signing key alone, so ``plugin = "none"``
-       does **not** turn verification off.
+     - ``"jwt"`` (default) uses bearer tokens from ``spur token user`` /
+       ``$SPUR_AUTH_TOKEN``. ``"spur"`` is the native plugin: the CLI and
+       ``spurd`` mint a fresh credential from a local ``spurauthd`` Unix socket
+       on every user RPC, and ``spurctld`` / ``spurd`` verify HMAC, cluster,
+       kind, lifetime, audience, boot epoch, and nonce replay from
+       ``/etc/spur/auth.jwks`` (see :doc:`/developer/native-credential-mint`).
+       Controllers also load Ed25519 ``controller-signing.jwks``,
+       ``node-signing.jwks``, and ``cred-signing.jwks``; agents load
+       ``controller-verification.jwks`` and ``cred-verification.jwks``. Missing
+       required files fail startup. JWT user tokens are refused on this plugin. ``"munge"`` and any
+       unrecognised value are rejected rather than silently ignored, and
+       ``"none"`` with ``mode = "required"`` is refused as contradictory.
+       ``plugin = "none"`` does **not** turn verification off; ``mode`` still
+       decides whether a presented JWT is required. ``plugin = "spur"`` with
+       ``mode = "required"`` does not require ``jwt_key``.
    * - ``mode``
      - string
      - ``"permissive"``
@@ -612,15 +604,38 @@ How client requests are authenticated.
      - ``false``
      - Agent restart
      - Permit jobs to run as UID 0. Consumed by ``spurd`` at its own startup.
+   * - ``cluster_admins``
+     - list of strings
+     - empty
+     - Restart
+     - Usernames bound to Administrator regardless of accounting.
+   * - ``admin_groups``
+     - list of strings
+     - empty
+     - Restart
+     - NSS groups bound to Administrator (case-insensitive).
+   * - ``operator_groups``
+     - list of strings
+     - empty
+     - Restart
+     - NSS groups bound to Operator (job/reservation/accounting management, not node drain).
+   * - ``allow_uid_zero_administrator``
+     - bool
+     - ``false``
+     - Restart
+     - When true, a verified native UID 0 identity is Administrator.
 
 .. warning::
 
    Under the default ``mode = "permissive"``, a caller that presents no
    credential is unauthenticated, and the username it asserts in the request is
    taken at face value. Identity-dependent decisions — job ownership, reservation
-   management, job-info visibility — are then only as trustworthy as the network.
-   Set ``mode = "required"`` (with ``jwt_key`` or ``jwt_key_file``) to make them
-   enforceable, and restrict the controller port at the network layer either way.
+   management, and who may list or fetch another tenant's job — are then only as
+   trustworthy as the network. An unauthenticated gRPC ``CancelJob`` with an
+   empty ``user`` is treated as the in-cluster daemon and can cancel any job
+   (REST cancel still requires a Bearer token). Set ``mode = "required"`` (with
+   ``jwt_key`` or ``jwt_key_file``) to make these checks enforceable, and
+   restrict the controller port at the network layer either way.
    ``spurctld`` warns at startup whenever it binds a non-loopback address without
    ``required``.
 
@@ -641,22 +656,32 @@ Privileged operations
 
 The control-plane mutations that define cluster tenancy — partitions, node state
 and labels (``scontrol update NodeName=``, ``spur node drain``, ``spur node
-remove``), ``reconfigure``, admission tokens, reservations, and the accounting
-account/user/QOS records — require a **cluster admin**. A caller with
-a verified non-admin identity is refused with ``PermissionDenied``. A caller with
-*no* verified identity is allowed, so that ``disabled`` and credential-less
-``permissive`` deployments keep working; under ``mode = "required"`` every caller
-is authenticated, so the bar binds everyone.
+remove``), ``reconfigure``, admission tokens, and k0s — require
+**Administrator**. Operators may manage jobs, reservations, and
+accounting CRUD, but cannot drain or remove nodes.
 
-Admin means one of the following:
+A caller with a verified identity below the required role is refused with
+``PermissionDenied``. A caller with *no* verified identity is allowed, so that
+``disabled`` and credential-less ``permissive`` deployments keep working; under
+``mode = "required"`` every caller is authenticated, so the bar binds everyone.
 
-* a credential minted with ``spur token user --admin``;
-* a credential for the user ``root``;
-* an accounting admin level of ``Admin`` (see :doc:`accounting`).
+Roles (highest wins; sources that do not apply to the plugin are skipped):
 
-Only the first counts for the accounting service's own mutations: it holds no
-association cache and does not special-case ``root``, so it accepts the token
-claim alone. The controller RPCs honour all three.
+* **Administrator** — ``[auth] cluster_admins``; ``admin_groups``; accounting
+  level ``Administrator``/``Admin`` (cache loaded). Under ``plugin = "jwt"``,
+  also ``spur token user --admin``. Under ``plugin = "spur"``, also verified
+  UID 0 when ``allow_uid_zero_administrator`` is true (the native mint has no
+  admin claim; JWT user tokens are refused).
+* **Operator** — ``operator_groups``; accounting level ``Operator``.
+* **Coordinator** — reserved; grant table is not shipped yet.
+* **User** — everyone else.
+
+Accounting mutations use the same role resolution as the controller: Operator
+or Administrator (including ``cluster_admins``, groups, and accounting
+``admin_level``). After a user/account/QOS write, the association cache is
+kicked so role bindings refresh without waiting for the poll interval.
+
+See :doc:`rbac` and :doc:`/developer/native-credential-mint`.
 
 Reservations are the one exception, and are stricter in two ways. An
 unidentified caller is **not** waved through, and membership of ``sudo`` or
@@ -1586,9 +1611,17 @@ OpenMetrics HTTP export from ``spurctld``.
      - ``false``
      - Restart
      - Start the Slurm-compatible REST server (default port 6820). Off by
-       default: the REST surface performs no authentication, so enabling it on a
-       reachable address exposes unauthenticated job submission. Enable it only
-       behind an authenticating proxy or on a loopback interface.
+       default. REST uses the same ``[auth]`` plugin and mode as gRPC: list and
+       cancel require a Bearer credential when ``mode = required``, and submit
+       binds the job to that identity. Enable it only where that policy is
+       acceptable.
+   * - ``allow_non_loopback``
+     - bool
+     - ``false``
+     - Restart
+     - Permit REST on a non-loopback ``controller.rest_addr`` when
+       ``[auth] plugin = "spur"`` and ``mode = "required"``. Without this,
+       ``spurctld`` refuses to start. Set it only behind a trusted gateway.
 
 ``[hooks]``
 -----------

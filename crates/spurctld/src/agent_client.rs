@@ -7,12 +7,13 @@
 //! call goes through here rather than `SlurmAgentClient::connect` directly. That keeps a new call
 //! site from silently becoming an unauthenticated one.
 //!
-//! The credential is a short-lived token signed with the cluster's `[auth] jwt_key` — the same key
-//! the node-admission path already uses — so no new secret is introduced. It is minted per
-//! connection rather than cached: the TTL is short, connections are not hot, and a cache would have
-//! to handle rotation. This design assumes connections are short-lived (one RPC per connect); a
-//! long-lived connection would hold a credential that expires mid-session and get rejected on the
-//! next call without an obvious reason.
+//! With `[auth] plugin = "spur"`, each connection Pings the agent (no credential) and mints a
+//! native `ControllerRpc` token for that agent's advertised audience and boot epoch. Otherwise it
+//! mints a short-lived JWT with subject [`CONTROLLER_SUBJECT`], signed with `[auth] jwt_key` (the
+//! node-admission HMAC). Either way the token is minted per connection rather than cached: the TTL
+//! is short, connections are not hot, and a cache would have to handle rotation. This design
+//! assumes connections are short-lived (one RPC per connect); a long-lived connection would hold a
+//! credential that expires mid-session and get rejected on the next call without an obvious reason.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,7 +133,7 @@ fn credential_with_key(key: &str) -> ControllerCredential {
     ControllerCredential { header }
 }
 
-fn credential() -> ControllerCredential {
+fn jwt_credential() -> ControllerCredential {
     let key = SIGNING_KEY
         .get()
         .filter(|k| !k.is_empty())
@@ -141,10 +142,56 @@ fn credential() -> ControllerCredential {
     credential_with_key(&key)
 }
 
+fn native_credential_from_ping(audience: &str, epoch: u64) -> ControllerCredential {
+    let Some(signer) = crate::native_keys::controller_rpc_signer() else {
+        return ControllerCredential::default();
+    };
+    if audience.is_empty() {
+        error!(
+            "agent Ping advertised no native audience; \
+             connections will carry no credential — agents in `required` mode will refuse them"
+        );
+        return ControllerCredential::default();
+    }
+    let now = spur_core::native_mint::unix_now().unwrap_or(0);
+    match signer.mint(audience, epoch, now) {
+        Ok(t) => ControllerCredential {
+            header: MetadataValue::try_from(format!("Bearer {t}")).ok(),
+        },
+        Err(e) => {
+            error!(
+                "failed to mint native controller credential for agent calls: {e}; \
+                 connections will carry no credential — agents in `required` mode will refuse them"
+            );
+            ControllerCredential::default()
+        }
+    }
+}
+
+async fn credential_for_channel(channel: Channel) -> ControllerCredential {
+    if crate::native_keys::controller_rpc_signer().is_none() {
+        return jwt_credential();
+    }
+    let mut ping_client = SlurmAgentClient::new(channel);
+    match ping_client.ping(Request::new(())).await {
+        Ok(resp) => {
+            let ping = resp.into_inner();
+            native_credential_from_ping(&ping.auth_audience, ping.auth_epoch)
+        }
+        Err(e) => {
+            error!(
+                "failed to Ping agent for native controller credential audience: {e}; \
+                 connections will carry no credential — agents in `required` mode will refuse them"
+            );
+            ControllerCredential::default()
+        }
+    }
+}
+
 /// Connect to an agent, presenting the controller's credential.
 ///
 /// Same signature shape as `SlurmAgentClient::connect`, so call sites only change which function
-/// they call.
+/// they call. Native plugin connections Ping first so the token names that agent.
 pub async fn connect(
     endpoint: String,
 ) -> Result<SlurmAgentClient<AgentChannel>, tonic::transport::Error> {
@@ -165,9 +212,9 @@ pub async fn connect(
         }
     }
     let channel = builder.connect().await?;
+    let cred = credential_for_channel(channel.clone()).await;
     Ok(SlurmAgentClient::new(InterceptedService::new(
-        channel,
-        credential(),
+        channel, cred,
     )))
 }
 

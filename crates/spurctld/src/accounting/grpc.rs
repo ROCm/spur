@@ -87,13 +87,35 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
-/// Rejects an identified non-admin from an account/user/QOS mutation; anonymous is allowed, same as
-/// the controller's gate. Narrower than `caller_is_admin`: token `admin` claim only, no cache handle here.
-fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
-    let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
-    match request.extensions().get::<spur_core::auth::Identity>() {
-        Some(id) => id.require_admin().map_err(|_| denied()),
-        None => Ok(()),
+/// Rejects an identified caller below Operator from an account/user/QOS mutation.
+/// Anonymous is allowed, matching the controller's gate.
+fn require_admin_identity(
+    identity: Option<&spur_core::auth::Identity>,
+    auth: &spur_core::config::AuthConfig,
+    cache: Option<&crate::association_cache::AssociationCache>,
+    op: &str,
+) -> Result<(), Status> {
+    let denied = || {
+        spur_core::native_metrics::inc_role_deny();
+        Status::permission_denied(format!("{op} requires cluster operator or administrator"))
+    };
+    let Some(id) = identity else {
+        return Ok(());
+    };
+    let (level, loaded) = match cache {
+        Some(cache) => (cache.admin_level(&id.user), cache.is_loaded()),
+        None => (None, false),
+    };
+    let groups = if auth.admin_groups.is_empty() && auth.operator_groups.is_empty() {
+        Vec::new()
+    } else {
+        spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
+    };
+    let role = spur_core::rbac::resolve_role(id, auth, level.as_deref(), loaded, &groups, false);
+    if role.operates_jobs() {
+        Ok(())
+    } else {
+        Err(denied())
     }
 }
 
@@ -110,6 +132,8 @@ pub(crate) struct AccountingService {
 struct AccountingInner {
     pool: parking_lot::RwLock<Option<PgPool>>,
     reason: parking_lot::RwLock<&'static str>,
+    assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
+    auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
 }
 
 impl Clone for AccountingService {
@@ -126,6 +150,8 @@ impl AccountingService {
             inner: std::sync::Arc::new(AccountingInner {
                 pool: parking_lot::RwLock::new(None),
                 reason: parking_lot::RwLock::new(reason),
+                assoc: parking_lot::RwLock::new(None),
+                auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
             }),
         }
     }
@@ -141,6 +167,34 @@ impl AccountingService {
     /// stale one.
     pub(crate) fn mark_unavailable(&self, reason: &'static str) {
         *self.inner.reason.write() = reason;
+    }
+
+    pub(crate) fn attach_association_cache(
+        &self,
+        cache: std::sync::Arc<crate::association_cache::AssociationCache>,
+    ) {
+        *self.inner.assoc.write() = Some(cache);
+    }
+
+    pub(crate) fn attach_auth(&self, auth: spur_core::config::AuthConfig) {
+        *self.inner.auth.write() = auth;
+    }
+
+    fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
+        let auth = self.inner.auth.read();
+        let assoc = self.inner.assoc.read();
+        require_admin_identity(
+            request.extensions().get::<spur_core::auth::Identity>(),
+            &auth,
+            assoc.as_ref().map(std::sync::Arc::as_ref),
+            op,
+        )
+    }
+
+    fn kick_assoc(&self) {
+        if let Some(cache) = self.inner.assoc.read().as_ref() {
+            cache.kick_refresh();
+        }
     }
 
     fn pool(&self) -> Result<PgPool, Status> {
@@ -456,7 +510,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
-        require_admin(&request, "create account")?;
+        self.require_admin(&request, "create account")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -474,6 +528,7 @@ impl SlurmAccounting for AccountingService {
         db::upsert_account(pool, &req.name, update)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -481,13 +536,14 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
-        require_admin(&request, "delete account")?;
+        self.require_admin(&request, "delete account")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
         db::delete_account(pool, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -518,7 +574,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
-        require_admin(&request, "add user")?;
+        self.require_admin(&request, "add user")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -600,6 +656,7 @@ impl SlurmAccounting for AccountingService {
         db::add_user(pool, &req.user, &req.account, update)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -607,7 +664,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
-        require_admin(&request, "remove user")?;
+        self.require_admin(&request, "remove user")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -622,6 +679,7 @@ impl SlurmAccounting for AccountingService {
             };
             return Err(Status::not_found(format!("{target} does not exist")));
         }
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -668,7 +726,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
-        require_admin(&request, "create qos")?;
+        self.require_admin(&request, "create qos")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -740,17 +798,19 @@ impl SlurmAccounting for AccountingService {
         db::upsert_qos(pool, &req.name, update)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
-        require_admin(&request, "delete qos")?;
+        self.require_admin(&request, "delete qos")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
         db::delete_qos(pool, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -1043,6 +1103,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin,
+            trusted_unix: false,
         }
     }
 
@@ -1053,21 +1114,41 @@ mod tests {
     /// gate binds real users only in `required` mode.
     #[test]
     fn require_admin_gates_accounting_mutations() {
+        let service = AccountingService::unavailable("no DB needed for this test");
         let mut admin = Request::new(AddUserRequest::default());
         admin.extensions_mut().insert(identity("root", true));
-        assert!(require_admin(&admin, "add user").is_ok());
+        assert!(service.require_admin(&admin, "add user").is_ok());
 
         let mut non_admin = Request::new(AddUserRequest::default());
         non_admin
             .extensions_mut()
             .insert(identity("mallory", false));
-        let err = require_admin(&non_admin, "add user").expect_err("non-admin must be rejected");
+        let err = service
+            .require_admin(&non_admin, "add user")
+            .expect_err("non-admin must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-        // No verified identity (disabled, or permissive with no credential) is allowed — the gate
-        // enforces once callers are identified, not in the non-enforcing modes.
         let anon = Request::new(AddUserRequest::default());
-        assert!(require_admin(&anon, "add user").is_ok());
+        assert!(service.require_admin(&anon, "add user").is_ok());
+    }
+
+    #[test]
+    fn cluster_admins_and_accounting_operator_pass_without_jwt_admin_claim() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+        service.attach_auth(spur_core::config::AuthConfig {
+            cluster_admins: vec!["erin".into()],
+            ..Default::default()
+        });
+        let mut named = Request::new(AddUserRequest::default());
+        named.extensions_mut().insert(identity("erin", false));
+        assert!(service.require_admin(&named, "add user").is_ok());
+
+        let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
+        cache.insert_admin_level("bob", "Operator");
+        service.attach_association_cache(cache);
+        let mut op = Request::new(AddUserRequest::default());
+        op.extensions_mut().insert(identity("bob", false));
+        assert!(service.require_admin(&op, "add user").is_ok());
     }
 
     /// Table test over every gated accounting RPC, enumerated so a handler that drops its

@@ -40,17 +40,19 @@ fn routes() -> Router<Arc<RestState>> {
 
 /// Authenticate a REST request, mirroring the gRPC policy in [`crate::auth_middleware`].
 ///
-/// `/ping` is exempt so health checks keep working without a credential — it exposes no state.
+/// `/ping` is exempt so health checks keep working without a credential. It
+/// reports liveness only; native audience and epoch stay on gRPC `Ping`.
 async fn rest_auth(
-    mode: spur_core::config::AuthMode,
-    jwt_key: Vec<u8>,
-    req: axum::extract::Request,
+    auth: spur_core::auth::BearerAuth,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use spur_core::auth::BearerOutcome;
     use spur_core::config::AuthMode;
 
-    if req.uri().path().ends_with("/ping") || mode == AuthMode::Disabled {
+    if req.uri().path().ends_with("/ping") || auth.mode == AuthMode::Disabled {
         return next.run(req).await;
     }
     let header = req
@@ -60,31 +62,13 @@ async fn rest_auth(
         .map(str::to_owned);
 
     let deny = |msg: &str| (StatusCode::UNAUTHORIZED, msg.to_string()).into_response();
-    use axum::response::IntoResponse;
 
-    match header {
-        None => {
-            if mode == AuthMode::Required {
-                return deny("authentication required: pass 'Authorization: Bearer <token>'");
-            }
+    match auth.authenticate(header.as_deref(), "pass 'Authorization: Bearer <token>'") {
+        BearerOutcome::Authenticated(identity) => {
+            req.extensions_mut().insert(*identity);
         }
-        Some(h) => {
-            let Some(token) = h
-                .strip_prefix("Bearer ")
-                .or_else(|| h.strip_prefix("bearer "))
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-            else {
-                return deny("malformed authorization header: expected 'Bearer <token>'");
-            };
-            if jwt_key.is_empty() {
-                return deny("a token was presented but no auth.jwt_key is configured");
-            }
-            // As on the gRPC side, a bad credential is rejected even in permissive mode.
-            if let Err(e) = spur_core::auth::verify_token(token, &jwt_key) {
-                return deny(&format!("invalid credential: {e}"));
-            }
-        }
+        BearerOutcome::Anonymous => {}
+        BearerOutcome::Reject(msg) => return deny(&msg),
     }
     next.run(req).await
 }
@@ -94,27 +78,16 @@ pub async fn serve(
     listen: SocketAddr,
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
+    auth: spur_core::auth::BearerAuth,
 ) -> anyhow::Result<()> {
-    // Same policy as gRPC: verify a presented credential, and under `required` refuse a request
-    // without one. The REST surface has no per-user handling of its own, so this gate is what keeps
-    // it from being a way around the authenticated gRPC path.
-    let auth_mode = cluster.config().auth.mode;
-    let jwt_key = cluster
-        .config()
-        .auth
-        .resolved_jwt_key()
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .into_bytes();
     let state = Arc::new(RestState { cluster, raft });
 
     let app = Router::new()
         .nest("/api/v1", routes())
         .nest("/slurm/v0.0.42", routes())
         .layer(axum::middleware::from_fn(move |req, next| {
-            let key = jwt_key.clone();
-            async move { rest_auth(auth_mode, key, req, next).await }
+            let auth = auth.clone();
+            async move { rest_auth(auth, req, next).await }
         }))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -143,13 +116,13 @@ mod tests {
 
     /// Build a minimal Router with rest_auth wired, backed by a trivial handler that always 200s.
     fn app(mode: AuthMode, key: &str) -> Router {
-        let jwt_key = key.as_bytes().to_vec();
+        let auth = spur_core::auth::BearerAuth::jwt(mode, key.as_bytes());
         Router::new()
             .route("/api/v1/jobs", axum::routing::get(|| async { "ok" }))
             .route("/api/v1/ping", axum::routing::get(|| async { "pong" }))
             .layer(axum::middleware::from_fn(move |req, next| {
-                let k = jwt_key.clone();
-                async move { rest_auth(mode, k, req, next).await }
+                let auth = auth.clone();
+                async move { rest_auth(auth, req, next).await }
             }))
     }
 

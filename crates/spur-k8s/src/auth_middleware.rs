@@ -13,26 +13,18 @@ use http::{Request, Response};
 use tower::{Layer, Service};
 use tracing::warn;
 
-use spur_core::auth::BearerOutcome;
+use spur_core::auth::{BearerAuth, BearerOutcome};
 use spur_core::config::AuthMode;
 
 #[derive(Clone)]
 pub struct AgentAuthLayer {
-    inner: Arc<AgentAuthConfig>,
-}
-
-struct AgentAuthConfig {
-    mode: AuthMode,
-    jwt_key: Vec<u8>,
+    inner: Arc<BearerAuth>,
 }
 
 impl AgentAuthLayer {
-    pub fn new(mode: AuthMode, jwt_key: &str) -> Self {
+    pub fn from_bearer(auth: BearerAuth) -> Self {
         Self {
-            inner: Arc::new(AgentAuthConfig {
-                mode,
-                jwt_key: jwt_key.as_bytes().to_vec(),
-            }),
+            inner: Arc::new(auth),
         }
     }
 }
@@ -51,13 +43,11 @@ impl<S> Layer<S> for AgentAuthLayer {
 #[derive(Clone)]
 pub struct AgentAuthMiddleware<S> {
     inner: S,
-    config: Arc<AgentAuthConfig>,
+    config: Arc<BearerAuth>,
 }
 
-fn decide(config: &AgentAuthConfig, header: Option<&str>) -> BearerOutcome {
-    spur_core::auth::authenticate_bearer(
-        config.mode,
-        &config.jwt_key,
+fn decide(config: &BearerAuth, header: Option<&str>) -> BearerOutcome {
+    config.authenticate(
         header,
         "the k8s operator only accepts agent calls carrying the cluster credential",
     )
@@ -80,6 +70,10 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
+        if spur_core::auth::is_unauthenticated_auth_handshake(req.uri().path()) {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+        }
         let header = req
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -115,11 +109,8 @@ mod tests {
     use super::*;
     use spur_core::auth::generate_token;
 
-    fn cfg(mode: AuthMode, key: &str) -> AgentAuthConfig {
-        AgentAuthConfig {
-            mode,
-            jwt_key: key.as_bytes().to_vec(),
-        }
+    fn cfg(mode: AuthMode, key: &str) -> BearerAuth {
+        BearerAuth::jwt(mode, key.as_bytes())
     }
 
     fn controller_token(key: &str) -> String {
@@ -182,14 +173,17 @@ mod tests {
 
     #[tokio::test]
     async fn required_mode_rejects_an_uncredentialed_call_through_the_real_layer() {
-        let mut svc = AgentAuthLayer::new(AuthMode::Required, "k").layer(StubInner);
+        let mut svc =
+            AgentAuthLayer::from_bearer(BearerAuth::jwt(AuthMode::Required, b"k")).layer(StubInner);
         let resp = svc.call(Request::new(())).await.unwrap();
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "16");
     }
 
     #[tokio::test]
     async fn required_mode_forwards_a_valid_credential_through_the_real_layer() {
-        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key").layer(StubInner);
+        let mut svc =
+            AgentAuthLayer::from_bearer(BearerAuth::jwt(AuthMode::Required, b"cluster-key"))
+                .layer(StubInner);
         let req = Request::builder()
             .header(
                 http::header::AUTHORIZATION,

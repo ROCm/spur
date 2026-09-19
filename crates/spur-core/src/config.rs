@@ -237,6 +237,11 @@ pub struct RestApiConfig {
     /// loopback/administrative interface.
     #[serde(default)]
     pub enabled: bool,
+    /// Allow REST on a non-loopback address when native auth is `plugin = "spur"` and
+    /// `mode = "required"`. Off by default: that combination otherwise refuses to start.
+    /// Set this only when a trusted gateway sits in front of the listen address.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 /// Prolog and epilog hook script configuration.
@@ -365,36 +370,6 @@ pub struct ControllerConfig {
     /// How long to wait for a ping response before dropping the connection (default 10).
     #[serde(default = "default_agent_keepalive_timeout_secs")]
     pub agent_keepalive_timeout_secs: u64,
-
-    /// How much of another user's job a non-owner may see via `get_job` /
-    /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
-    /// the full record; this governs everyone else. Default: `redacted`.
-    #[serde(default)]
-    pub job_info_visibility: JobInfoVisibility,
-}
-
-/// Controls how much of another user's job a non-owner (non-admin) caller can
-/// read back from `get_job` / `get_job_steps`.
-///
-/// The list RPC `get_jobs` already scopes to the caller; the single-fetch paths
-/// historically did not, exposing every job's work_dir, command line, stdio
-/// paths, and — most usefully to an attacker — its allocated nodelist. This
-/// setting closes that leak while leaving the Slurm-standard cluster-visible
-/// queue intact for the fields that are not targeting-sensitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum JobInfoVisibility {
-    /// Non-owners see identity/state/timing/account/priority, but work_dir,
-    /// command, stdio paths, allocated nodelist, comment, and resource detail are
-    /// blanked. The default: preserves visibility, removes the targeting oracle.
-    #[default]
-    Redacted,
-    /// Non-owners get `NOT_FOUND` — the job is invisible unless you own it (or
-    /// are an admin). Strictest; matches `get_jobs`' owner-scoped behaviour.
-    OwnerOnly,
-    /// Legacy: every field is visible to any caller. Opt-in for deployments that
-    /// relied on the previous unscoped behaviour.
-    Full,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -497,7 +472,6 @@ impl Default for ControllerConfig {
             agent_connect_timeout_secs: default_agent_connect_timeout_secs(),
             agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
             agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
-            job_info_visibility: JobInfoVisibility::default(),
         }
     }
 }
@@ -747,8 +721,9 @@ impl AuthMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Auth plugin: "jwt" (implemented) or "none". "munge" is recognised but not implemented and is
-    /// rejected at startup rather than silently ignored.
+    /// Auth plugin: `"jwt"` (bearer tokens), `"spur"` (native per-RPC mint), or `"none"`.
+    /// `"munge"` is recognised but not implemented and is rejected at startup rather
+    /// than silently ignored.
     pub plugin: String,
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
@@ -767,6 +742,18 @@ pub struct AuthConfig {
     /// cluster where every submitter is already trusted with root.
     #[serde(default)]
     pub allow_root_jobs: bool,
+    /// Usernames that bind Administrator regardless of accounting.
+    #[serde(default)]
+    pub cluster_admins: Vec<String>,
+    /// NSS groups that bind Administrator. Matching is case-insensitive.
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
+    /// NSS groups that bind Operator.
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
+    /// When true, a verified UID 0 native identity is Administrator.
+    #[serde(default)]
+    pub allow_uid_zero_administrator: bool,
 }
 
 impl Default for AuthConfig {
@@ -777,6 +764,10 @@ impl Default for AuthConfig {
             jwt_key: None,
             jwt_key_file: None,
             allow_root_jobs: false,
+            cluster_admins: Vec::new(),
+            admin_groups: Vec::new(),
+            operator_groups: Vec::new(),
+            allow_uid_zero_administrator: false,
         }
     }
 }
@@ -1946,17 +1937,18 @@ impl SlurmConfig {
         // and get no authentication with no warning — worse than the field not existing. Reject
         // anything unimplemented instead of silently ignoring it.
         match self.auth.plugin.as_str() {
-            "jwt" | "none" => {}
+            "jwt" | "none" | "spur" => {}
             "munge" => {
                 return Err(ConfigError::InvalidValue {
                     field: "auth.plugin".into(),
-                    value: "munge (not implemented; use \"jwt\", or \"none\" to disable)".into(),
+                    value: "munge (not implemented; use \"jwt\", \"spur\", or \"none\" to disable)"
+                        .into(),
                 })
             }
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "auth.plugin".into(),
-                    value: format!("{other} (expected \"jwt\" or \"none\")"),
+                    value: format!("{other} (expected \"jwt\", \"spur\", or \"none\")"),
                 })
             }
         }
@@ -1968,10 +1960,12 @@ impl SlurmConfig {
                     .into(),
             });
         }
-        // Without a key, `required` would fall back to a well-known signing constant —
+        // Without a key, JWT `required` would fall back to a well-known signing constant —
         // forgeable, so strictly worse than the default. Refuse to start instead.
+        // Native `plugin = "spur"` verifies HMAC JWKS, not `jwt_key`.
         let resolved_jwt_key = self.auth.resolved_jwt_key()?;
         if self.auth.mode == AuthMode::Required
+            && self.auth.plugin != "spur"
             && resolved_jwt_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::InvalidValue {
@@ -1981,6 +1975,25 @@ impl SlurmConfig {
                         mode cannot verify credentials without one)"
                         .into(),
             });
+        }
+        if self.rest_api.enabled
+            && self.auth.plugin == "spur"
+            && self.auth.mode == AuthMode::Required
+            && !self.rest_api.allow_non_loopback
+        {
+            match self.controller.rest_addr.parse::<std::net::SocketAddr>() {
+                Ok(addr) if !addr.ip().is_loopback() => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "controller.rest_addr".into(),
+                        value: format!(
+                            "{addr} (native auth mode \"required\" refuses REST on a non-loopback \
+                             address; bind loopback or set rest_api.allow_non_loopback = true \
+                             behind a trusted gateway)"
+                        ),
+                    });
+                }
+                _ => {}
+            }
         }
 
         if self.cluster.enabled {
@@ -3846,6 +3859,93 @@ jwt_key = "a-real-secret"
         let config = SlurmConfig::load_from_str(toml).expect("required + a key must be accepted");
         assert_eq!(config.auth.mode, AuthMode::Required);
         assert_eq!(config.auth.jwt_key.as_deref(), Some("a-real-secret"));
+    }
+
+    #[test]
+    fn auth_plugin_spur_is_accepted_without_jwt_key() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("native plugin does not use jwt_key");
+        assert_eq!(config.auth.plugin, "spur");
+        assert_eq!(config.auth.mode, AuthMode::Required);
+    }
+
+    #[test]
+    fn native_required_rest_on_non_loopback_is_refused() {
+        let err = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("rest_addr") || err.to_string().contains("non-loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn native_required_rest_non_loopback_allowed_with_override() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+allow_non_loopback = true
+"#,
+        )
+        .expect("explicit override must start");
+        assert!(config.rest_api.allow_non_loopback);
+    }
+
+    #[test]
+    fn native_required_rest_on_loopback_is_accepted() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[controller]
+rest_addr = "127.0.0.1:6820"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+"#,
+        )
+        .expect("loopback REST is allowed without override");
+        assert!(!config.rest_api.allow_non_loopback);
+    }
+
+    #[test]
+    fn auth_plugin_unknown_is_refused() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"not-a-plugin\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("auth.plugin"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
