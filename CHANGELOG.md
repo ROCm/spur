@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.13.0](https://github.com/ROCm/spur/compare/v0.12.0...v0.13.0) (2026-09-19)
+
+
+### Features
+
+* **auth:** add native spur credentials, mint, and RBAC ([#893](https://github.com/ROCm/spur/issues/893)) ([dfa4b5d](https://github.com/ROCm/spur/commit/dfa4b5d1e11c88df3db046f86c235024bb9f50dc))
+
+
+### Bug Fixes
+
+* **deploy:** mount spur.conf from a Secret ([#851](https://github.com/ROCm/spur/issues/851)) ([9ea65a8](https://github.com/ROCm/spur/commit/9ea65a8fe84ea8e55eb8c80ff38a43d9b8149b04))
+* **k8s:** keep the cancel of a deleted SpurJob ([#808](https://github.com/ROCm/spur/issues/808)) ([9db3a59](https://github.com/ROCm/spur/commit/9db3a59b76cd2ef7ce9169aea0d84b264ce1ea68))
+* **k8s:** recover a node the controller has forgotten ([#809](https://github.com/ROCm/spur/issues/809)) ([1688248](https://github.com/ROCm/spur/commit/16882487b82be097a97bd3f944e700cb31fab05e))
+* **spur-cli:** accept --noconvert on accounting commands ([#859](https://github.com/ROCm/spur/issues/859)) ([467d521](https://github.com/ROCm/spur/commit/467d5215373795bbb4e29a0c090a96f341682817))
+* **spur-k8s:** fail fast on a controller that does not answer ([#854](https://github.com/ROCm/spur/issues/854)) ([6609192](https://github.com/ROCm/spur/commit/66091921d9aa92363617f27b64346950eb560822))
+* **spur-net:** persist WireGuard peer mutations to the interface config ([#792](https://github.com/ROCm/spur/issues/792)) ([8d32f80](https://github.com/ROCm/spur/commit/8d32f80def9df098cb586bfed018ab79a6054899))
+* **spurctld:** keep the node record when its agent shuts down ([#784](https://github.com/ROCm/spur/issues/784)) ([65c703b](https://github.com/ROCm/spur/commit/65c703b96069fb39f9d32d56f8c6db5009303e5d))
+* **spurctld:** run kube-router in full overlay and pin its CIDRs ([#861](https://github.com/ROCm/spur/issues/861)) ([6469094](https://github.com/ROCm/spur/commit/646909496de313bacb7df77d3b032dbe6b78e44d))
+* **spurctld:** stop charging QOS/account grp-node quota for unplaceable jobs ([#883](https://github.com/ROCm/spur/issues/883)) ([2d7b78a](https://github.com/ROCm/spur/commit/2d7b78ab6066592f80a2050b1da68e1250fb9388))
+
 ## [0.12.0](https://github.com/ROCm/spur/compare/v0.11.0...v0.12.0) (2026-09-15)
 
 
