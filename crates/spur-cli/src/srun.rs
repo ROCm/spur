@@ -693,23 +693,7 @@ fn install_ctrl_c_cancel(
     job_id: u32,
     submit_user: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut client = client;
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\nsrun: cancelling job {}...", job_id);
-            let cancel_user =
-                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
-                    .await;
-            let _ = client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 2,
-                    user: cancel_user,
-                })
-                .await;
-            std::process::exit(130);
-        }
-    })
+    crate::interactive::install_ctrl_c_cancel(client, job_id, submit_user, "srun")
 }
 
 struct RunningAllocation {

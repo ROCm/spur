@@ -141,29 +141,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let job_id = response.job_id;
     eprintln!("salloc: Pending job allocation {}...", job_id);
 
-    // Set up Ctrl+C handler to cancel the job on interrupt
-    let cancel_client = client.clone();
-    let cancel_submit_user = submit_user.clone();
-    tokio::spawn(async move {
-        let mut cancel_client = cancel_client;
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\nsalloc: cancelling job {}...", job_id);
-            let cancel_user = crate::interactive::resolve_job_owner_for_cancel(
-                &mut cancel_client,
-                job_id,
-                &cancel_submit_user,
-            )
-            .await;
-            let _ = cancel_client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 2, // SIGINT
-                    user: cancel_user,
-                })
-                .await;
-            std::process::exit(130); // Standard SIGINT exit code
-        }
-    });
+    crate::interactive::install_ctrl_c_cancel(
+        client.clone(),
+        job_id,
+        submit_user.clone(),
+        "salloc",
+    );
 
     // Wait for the job to start running (with timeout and progress)
     let job_info;

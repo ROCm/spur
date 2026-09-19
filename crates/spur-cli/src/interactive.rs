@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    interactive_input, interactive_output, GetJobRequest, InitSession, InteractiveInput,
-    JobKeepaliveRequest,
+    interactive_input, interactive_output, CancelJobRequest, GetJobRequest, InitSession,
+    InteractiveInput, JobKeepaliveRequest,
 };
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -165,6 +165,30 @@ pub async fn resolve_job_owner_for_cancel(
         }
         Err(_) => submit_user.to_string(),
     }
+}
+
+/// Spawn a Ctrl-C handler that cancels `job_id` and exits 130.
+pub fn install_ctrl_c_cancel(
+    client: SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    submit_user: String,
+    tool: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut client = client;
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n{tool}: cancelling job {job_id}...");
+            let cancel_user = resolve_job_owner_for_cancel(&mut client, job_id, &submit_user).await;
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 2,
+                    user: cancel_user,
+                })
+                .await;
+            std::process::exit(130);
+        }
+    })
 }
 
 /// Propagate the caller's auth token into a child process (allocation shell).
