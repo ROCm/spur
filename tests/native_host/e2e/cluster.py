@@ -464,6 +464,18 @@ class SpurCluster:
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
+    def sbatch_with_exit(self, args: list[str]) -> tuple[int, str]:
+        """Run sbatch and return (exit_code, combined stdout+stderr)."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/sbatch"),
+        ]
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
     def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr)."""
         cmd_parts = self._cli_env_assignments()

@@ -34,6 +34,8 @@ pub(crate) struct StepCapture {
     get_job_calls: Arc<AtomicU32>,
     /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
     get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
+    /// Sequence of `JobInfo` for successive `get_job` calls; last entry repeats.
+    get_job_sequence: Arc<Mutex<Vec<proto::JobInfo>>>,
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
@@ -48,6 +50,8 @@ pub(crate) struct StepCapture {
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
+    submit_job_id: Arc<AtomicU32>,
+    cancel_job_calls: Arc<AtomicU32>,
 }
 
 impl StepCapture {
@@ -119,6 +123,19 @@ impl StepCapture {
 
     pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
         *self.update_node_fail_names.lock().unwrap() = names;
+    }
+
+    pub(crate) fn set_submit_job_id(&self, id: u32) {
+        self.submit_job_id.store(id, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_get_job_sequence(&self, seq: Vec<proto::JobInfo>) {
+        *self.get_job_sequence.lock().unwrap() = seq;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cancel_job_calls(&self) -> u32 {
+        self.cancel_job_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -192,7 +209,16 @@ mock_controller_impl! {
             &self,
             _request: tonic::Request<proto::GetJobRequest>,
         ) -> Result<tonic::Response<proto::JobInfo>, tonic::Status> {
-            self.capture.get_job_calls.fetch_add(1, Ordering::SeqCst);
+            let call_idx = self.capture.get_job_calls.fetch_add(1, Ordering::SeqCst) as usize;
+
+            {
+                let seq = self.capture.get_job_sequence.lock().unwrap();
+                if !seq.is_empty() {
+                    let idx = call_idx.min(seq.len() - 1);
+                    return Ok(tonic::Response::new(seq[idx].clone()));
+                }
+            }
+
             match self.capture.get_job_response.lock().unwrap().clone() {
                 Some(Ok(user)) => Ok(tonic::Response::new(proto::JobInfo {
                     user,
@@ -201,6 +227,24 @@ mock_controller_impl! {
                 Some(Err(code)) => Err(tonic::Status::new(code, "mock get_job failure")),
                 None => Err(tonic::Status::unimplemented("get_job")),
             }
+        }
+
+        async fn submit_job(
+            &self,
+            _request: tonic::Request<proto::SubmitJobRequest>,
+        ) -> Result<tonic::Response<proto::SubmitJobResponse>, tonic::Status> {
+            Ok(tonic::Response::new(proto::SubmitJobResponse {
+                job_id: self.capture.submit_job_id.load(Ordering::SeqCst),
+                warnings: Vec::new(),
+            }))
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: tonic::Request<proto::CancelJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            self.capture.cancel_job_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(()))
         }
 
         async fn run_step(
@@ -287,9 +331,7 @@ mock_controller_impl! {
         }
     }
     unimplemented {
-        submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
-        cancel_job(proto::CancelJobRequest) -> ();
         complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
