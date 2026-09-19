@@ -27,15 +27,37 @@ impl TxnAction {
     }
 }
 
+/// The kind of object an audited action targeted. Stored as a lowercase string
+/// so `sacctmgr show txn Entity=` filters read the same as Slurm's `Where`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxnEntity {
+    Node,
+    Job,
+    Partition,
     Reservation,
+    Account,
+    User,
+    Qos,
+    Token,
+    Cluster,
+    /// Controller configuration as a whole (`scontrol reconfigure`), which has
+    /// no named target.
+    Config,
 }
 
 impl TxnEntity {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Node => "node",
+            Self::Job => "job",
+            Self::Partition => "partition",
             Self::Reservation => "reservation",
+            Self::Account => "account",
+            Self::User => "user",
+            Self::Qos => "qos",
+            Self::Token => "token",
+            Self::Cluster => "cluster",
+            Self::Config => "config",
         }
     }
 }
@@ -85,6 +107,9 @@ pub struct TxnRecord {
     /// permissive/disabled anonymous callers (asserted, trust-on-wire) and for
     /// `System` rows (trusted by being internal, which `source` conveys).
     pub verified: bool,
+    /// Empty when unavailable. The only attribution left for an unauthenticated
+    /// caller under `permissive`, which makes host auth logs joinable.
+    pub peer_addr: String,
     pub source: TxnSource,
     pub action: TxnAction,
     pub entity_type: TxnEntity,
@@ -145,6 +170,44 @@ pub fn update_details(
         "add_accounts": add_accounts,
         "remove_accounts": remove_accounts,
     })
+}
+
+/// `state` is absent when only labels change.
+pub fn node_update_details(
+    state: Option<&str>,
+    reason: Option<&str>,
+    labels: &std::collections::HashMap<String, String>,
+    remove_labels: &[String],
+) -> serde_json::Value {
+    let mut v = serde_json::Map::new();
+    if let Some(s) = state {
+        v.insert("state".into(), serde_json::Value::String(s.to_string()));
+    }
+    if let Some(r) = reason {
+        v.insert("reason".into(), serde_json::Value::String(r.to_string()));
+    }
+    if !labels.is_empty() {
+        v.insert("labels".into(), serde_json::json!(labels));
+    }
+    if !remove_labels.is_empty() {
+        v.insert("remove_labels".into(), serde_json::json!(remove_labels));
+    }
+    serde_json::Value::Object(v)
+}
+
+pub fn node_drain_details(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "reason": reason })
+}
+
+/// `force` skips the running-job check, so it is the field that matters after
+/// the fact.
+pub fn node_remove_details(reason: &str, force: bool) -> serde_json::Value {
+    serde_json::json!({ "reason": reason, "force": force })
+}
+
+/// Agent-initiated deregistration, i.e. `spurd` shutting down.
+pub fn node_deregister_details(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "reason": reason })
 }
 
 /// Details for a reservation delete. `reason` is set for internal purges.
@@ -219,11 +282,47 @@ mod tests {
     }
 
     #[test]
+    fn node_update_details_omits_absent_fields() {
+        let empty = node_update_details(None, None, &std::collections::HashMap::new(), &[]);
+        assert_eq!(empty, serde_json::json!({}));
+
+        let drain = node_update_details(
+            Some("drain"),
+            Some("dc cycle"),
+            &std::collections::HashMap::new(),
+            &["gpu".to_string()],
+        );
+        assert_eq!(drain["state"], "drain");
+        assert_eq!(drain["reason"], "dc cycle");
+        assert_eq!(drain["remove_labels"], serde_json::json!(["gpu"]));
+        assert!(
+            drain.get("labels").is_none(),
+            "an empty label map must not be recorded"
+        );
+    }
+
+    #[test]
+    fn node_remove_details_records_force() {
+        let v = node_remove_details("decommission", true);
+        assert_eq!(v["reason"], "decommission");
+        assert_eq!(v["force"], true);
+    }
+
+    #[test]
     fn enum_str_values_are_stable() {
         assert_eq!(TxnAction::Create.as_str(), "create");
         assert_eq!(TxnAction::Update.as_str(), "update");
         assert_eq!(TxnAction::Delete.as_str(), "delete");
+        assert_eq!(TxnEntity::Node.as_str(), "node");
+        assert_eq!(TxnEntity::Job.as_str(), "job");
+        assert_eq!(TxnEntity::Partition.as_str(), "partition");
         assert_eq!(TxnEntity::Reservation.as_str(), "reservation");
+        assert_eq!(TxnEntity::Account.as_str(), "account");
+        assert_eq!(TxnEntity::User.as_str(), "user");
+        assert_eq!(TxnEntity::Qos.as_str(), "qos");
+        assert_eq!(TxnEntity::Token.as_str(), "token");
+        assert_eq!(TxnEntity::Cluster.as_str(), "cluster");
+        assert_eq!(TxnEntity::Config.as_str(), "config");
         assert_eq!(TxnOutcome::Success.as_str(), "success");
         assert_eq!(TxnOutcome::Denied.as_str(), "denied");
         assert_eq!(TxnOutcome::Error.as_str(), "error");

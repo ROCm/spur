@@ -101,9 +101,32 @@ pub(crate) fn grpc_operation_name(path: &str) -> String {
         .to_string()
 }
 
+/// Caller address for a request, `None` when the transport did not record one.
+pub(crate) fn peer_addr(extensions: &http::Extensions) -> Option<String> {
+    extensions
+        .get::<tonic::transport::server::TcpConnectInfo>()
+        .and_then(|info| info.remote_addr())
+        .map(spur_core::peer::canonical_peer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards this copy of `peer_addr`: a dual-stack listener hands us the
+    /// IPv4-mapped form, and every daemon must log the plain IPv4 form.
+    #[test]
+    fn peer_addr_unwraps_an_ipv4_mapped_client() {
+        let mut ext = http::Extensions::new();
+        ext.insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some("[::ffff:10.0.0.4]:51234".parse().unwrap()),
+        });
+        assert_eq!(peer_addr(&ext).as_deref(), Some("10.0.0.4:51234"));
+
+        // No connection info at all (a non-TCP or test transport) is not an error.
+        assert_eq!(peer_addr(&http::Extensions::new()), None);
+    }
 
     #[test]
     fn grpc_operation_name_parses_method_from_path() {
