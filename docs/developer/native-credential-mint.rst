@@ -55,9 +55,9 @@ A nonce is recorded in a bounded replay cache until expiry plus clock skew;
 the same credential cannot be accepted twice at that audience. Username, UID,
 and GID come from the signed credential; the verifier does not call
 ``getpwuid``. JWT user tokens are rejected on this plugin. gRPC and REST on
-the same controller share one verifier and replay cache. ``Ping`` (gRPC) and
-``/ping`` (REST) do not require a credential and advertise the audience and
-epoch.
+the same controller share one verifier and replay cache. gRPC ``Ping`` does
+not require a credential and advertises the audience and epoch so a client
+can mint. REST ``/ping`` is liveness only and does not return those fields.
 
 Without a config file (for example the k8s operator when ``--config`` is
 absent), set ``$SPUR_AUTH_PLUGIN=spur`` and ``$SPUR_CLUSTER_NAME`` to the same

@@ -985,23 +985,14 @@ impl ControllerService {
         }
     }
 
-    /// Apply `[controller] job_info_visibility` for `get_job`. Owner, admin, and unauthenticated
-    /// callers (see [`viewer_is_privileged`]) get the full record. An identified User cannot fetch
-    /// another tenant's job (same pin as `get_jobs`); Operators still see every job.
-    fn disclosure_for(
+    /// Identified Users cannot fetch another tenant's job (same pin as `get_jobs`).
+    /// Operators, Administrators, and unauthenticated callers see every job in full.
+    fn caller_may_see_job(
         &self,
         owner: &str,
         identity: Option<&spur_core::auth::Identity>,
-    ) -> JobInfoDisclosure {
-        let operates = self.caller_is_operator(identity);
-        if !identified_user_may_view_job(identity, owner, operates) {
-            return JobInfoDisclosure::Hidden;
-        }
-        let privileged = viewer_is_privileged(identity, owner, operates);
-        job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        )
+    ) -> bool {
+        identified_user_may_view_job(identity, owner, self.caller_is_operator(identity))
     }
 
     fn scoped_job_info(
@@ -1009,22 +1000,12 @@ impl ControllerService {
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
-        match self.disclosure_for(&job.spec.user, identity) {
-            JobInfoDisclosure::Hidden => None,
-            disclosure => {
-                let mut info = job_to_proto(job);
-                // Annotate before redacting, so the redacted branch strips the
-                // planned nodelist rather than having it added back after.
-                annotate_jobs_with_planned_reservations(
-                    std::slice::from_mut(&mut info),
-                    &self.cluster,
-                );
-                if disclosure == JobInfoDisclosure::Redacted {
-                    redact_sensitive_job_info(&mut info);
-                }
-                Some(info)
-            }
+        if !self.caller_may_see_job(&job.spec.user, identity) {
+            return None;
         }
+        let mut info = job_to_proto(job);
+        annotate_jobs_with_planned_reservations(std::slice::from_mut(&mut info), &self.cluster);
+        Some(info)
     }
 
     /// Forwarding metadata that carries the caller's credential through to the leader.
@@ -1416,20 +1397,13 @@ impl SlurmController for ControllerService {
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
 
-        // Operators may list other tenants; hide or redact per job_info_visibility
-        // so list and get_job stay on the same policy.
+        // Operators may list other tenants; identified Users stay pinned to own jobs.
         let proto_jobs: Vec<JobInfo> = jobs
             .iter()
             .zip(proto_jobs)
-            .filter_map(|(job, mut info)| {
-                match self.disclosure_for(&job.spec.user, __identity.as_ref()) {
-                    JobInfoDisclosure::Hidden => None,
-                    JobInfoDisclosure::Redacted => {
-                        redact_sensitive_job_info(&mut info);
-                        Some(info)
-                    }
-                    JobInfoDisclosure::Full => Some(info),
-                }
+            .filter_map(|(job, info)| {
+                self.caller_may_see_job(&job.spec.user, __identity.as_ref())
+                    .then_some(info)
             })
             .collect();
 
@@ -1463,9 +1437,6 @@ impl SlurmController for ControllerService {
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        // A non-owner, non-admin caller does not get another tenant's work_dir, command, stdio
-        // paths, or (the targeting-sensitive one) allocated nodelist. Policy is configurable; the
-        // default redacts those fields while leaving the Slurm-standard queue view intact.
         self.scoped_job_info(&job, identity.as_ref())
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))
@@ -2792,13 +2763,9 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-        let redact_names = match self.disclosure_for(&job.spec.user, identity.as_ref()) {
-            JobInfoDisclosure::Full => false,
-            JobInfoDisclosure::Redacted => true,
-            JobInfoDisclosure::Hidden => {
-                return Err(Status::not_found(format!("job {job_id} not found")));
-            }
-        };
+        if !self.caller_may_see_job(&job.spec.user, identity.as_ref()) {
+            return Err(Status::not_found(format!("job {job_id} not found")));
+        }
 
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
@@ -2806,11 +2773,7 @@ impl SlurmController for ControllerService {
             .map(|s| JobStepInfo {
                 job_id: s.job_id,
                 step_id: s.step_id,
-                name: if redact_names {
-                    String::new()
-                } else {
-                    s.name.clone()
-                },
+                name: s.name.clone(),
                 state: s.state.display().to_string(),
                 num_tasks: s.num_tasks,
             })
@@ -4886,17 +4849,6 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
     }
 }
 
-/// What a caller may see of a job, once ownership/admin status and the visibility policy are known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JobInfoDisclosure {
-    /// Full record.
-    Full,
-    /// Full record minus the targeting-sensitive fields (see [`redact_sensitive_job_info`]).
-    Redacted,
-    /// Not disclosed at all — the caller sees `NOT_FOUND`.
-    Hidden,
-}
-
 pub(crate) fn identity_role(
     cluster: &crate::cluster::ClusterManager,
     identity: Option<&spur_core::auth::Identity>,
@@ -4929,21 +4881,6 @@ pub(crate) fn identity_operates_jobs(
     })
 }
 
-/// Whether a caller may see a job's full record unconditionally: the owner, an admin, or a caller
-/// with no verified identity at all. The last case preserves the pre-auth behaviour — scoping only
-/// bites once callers are actually identified, so no-auth/permissive deployments and internal
-/// unauthenticated consumers (the k8s operator's nodelist read) are unaffected. Pure for testing.
-pub(crate) fn viewer_is_privileged(
-    identity: Option<&spur_core::auth::Identity>,
-    owner: &str,
-    caller_is_admin: bool,
-) -> bool {
-    match identity {
-        None => true,
-        Some(id) => id.user == owner || caller_is_admin,
-    }
-}
-
 /// Identified Users cannot see another tenant's job, matching `get_jobs` pinning.
 /// Unauthenticated callers and Operators/Administrators are not pinned.
 pub(crate) fn identified_user_may_view_job(
@@ -4959,12 +4896,11 @@ pub(crate) fn identified_user_may_view_job(
 }
 
 /// The user an assoc-mgr read is scoped to. A privileged caller — an admin, or
-/// an unauthenticated one under `permissive`/`disabled`, the same treatment
-/// `viewer_is_privileged` gives — reads whichever user the request names, or
-/// every user when it names none. A non-admin authenticated caller is pinned to
-/// their own identity, so they can neither read another tenant's usage nor
-/// enumerate the cluster-wide scope inventory. Pure so the policy is testable
-/// without a live service.
+/// an unauthenticated one under `permissive`/`disabled` — reads whichever user
+/// the request names, or every user when it names none. A non-admin authenticated
+/// caller is pinned to their own identity, so they can neither read another
+/// tenant's usage nor enumerate the cluster-wide scope inventory. Pure so the
+/// policy is testable without a live service.
 fn assoc_mgr_scope_user(
     identity: Option<&spur_core::auth::Identity>,
     requested: &str,
@@ -4974,49 +4910,6 @@ fn assoc_mgr_scope_user(
         return (!requested.is_empty()).then(|| requested.to_string());
     }
     identity.map(|id| id.user.clone())
-}
-
-/// Resolve the disclosure level for a job-info read. The owner and admins (`privileged`) always get
-/// the full record; everyone else is governed by the configured policy. Pure so the policy matrix is
-/// unit-testable without a live service.
-pub(crate) fn job_info_disclosure(
-    privileged: bool,
-    visibility: spur_core::config::JobInfoVisibility,
-) -> JobInfoDisclosure {
-    use spur_core::config::JobInfoVisibility;
-    if privileged {
-        return JobInfoDisclosure::Full;
-    }
-    match visibility {
-        JobInfoVisibility::Full => JobInfoDisclosure::Full,
-        JobInfoVisibility::Redacted => JobInfoDisclosure::Redacted,
-        JobInfoVisibility::OwnerOnly => JobInfoDisclosure::Hidden,
-    }
-}
-
-/// Blank what a non-owner should not see, keeping identity/state/timing/account
-/// so the Slurm-standard queue view still works.
-fn redact_sensitive_job_info(info: &mut JobInfo) {
-    info.work_dir = String::new();
-    info.command = String::new();
-    info.stdout_path = String::new();
-    info.stderr_path = String::new();
-    info.stdin_path = String::new();
-    info.comment = String::new();
-    info.nodelist = String::new();
-    info.resources = None;
-    // The submit line re-exposes most of the above, and the requested lists are
-    // the same targeting oracle as the allocated one.
-    info.submit_line = String::new();
-    info.req_nodelist = String::new();
-    info.exc_nodelist = String::new();
-    info.sched_nodelist = String::new();
-    // The requested shape restates the resource detail blanked above.
-    info.req_tres = String::new();
-    info.features = String::new();
-    info.min_cpus_node = 0;
-    info.min_memory_node_mb = 0;
-    info.min_memory_is_per_cpu = false;
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -5888,26 +5781,7 @@ mod tests {
     }
 
     #[test]
-    fn job_info_disclosure_matrix() {
-        use spur_core::config::JobInfoVisibility::*;
-        // The owner/admin (privileged) always sees the full record, whatever the policy.
-        for v in [Redacted, OwnerOnly, Full] {
-            assert_eq!(job_info_disclosure(true, v), JobInfoDisclosure::Full);
-        }
-        // A non-owner is governed by the policy.
-        assert_eq!(
-            job_info_disclosure(false, Redacted),
-            JobInfoDisclosure::Redacted
-        );
-        assert_eq!(
-            job_info_disclosure(false, OwnerOnly),
-            JobInfoDisclosure::Hidden
-        );
-        assert_eq!(job_info_disclosure(false, Full), JobInfoDisclosure::Full);
-    }
-
-    #[test]
-    fn viewer_privilege_owner_admin_and_anonymous() {
+    fn identified_user_job_view_owner_operator_and_anonymous() {
         use spur_core::auth::Identity;
         let bob = Identity {
             user: "bob".into(),
@@ -5923,58 +5797,10 @@ mod tests {
             is_admin: false,
             trusted_unix: false,
         };
-        // Owner and admin are privileged.
-        assert!(viewer_is_privileged(Some(&bob), "bob", false));
-        assert!(viewer_is_privileged(Some(&alice), "bob", true));
-        // A different, non-admin identified user is not.
-        assert!(!viewer_is_privileged(Some(&alice), "bob", false));
-        assert!(viewer_is_privileged(None, "bob", false));
         assert!(identified_user_may_view_job(None, "bob", false));
         assert!(identified_user_may_view_job(Some(&bob), "bob", false));
         assert!(!identified_user_may_view_job(Some(&alice), "bob", false));
         assert!(identified_user_may_view_job(Some(&alice), "bob", true));
-    }
-
-    #[test]
-    fn redact_blanks_sensitive_fields_and_keeps_the_rest() {
-        let mut info = JobInfo {
-            job_id: 42,
-            name: "train".into(),
-            user: "bob".into(),
-            account: "team-b".into(),
-            state_reason: "Running".into(),
-            // sensitive
-            work_dir: "/home/bob/run".into(),
-            command: "python train.py --secret".into(),
-            stdout_path: "/home/bob/out".into(),
-            stderr_path: "/home/bob/err".into(),
-            stdin_path: "/home/bob/in".into(),
-            comment: "internal".into(),
-            nodelist: "gpu-b-[01-04]".into(),
-            submit_line: "sbatch --wrap 'python train.py --secret'".into(),
-            req_nodelist: "gpu-b-[01-04]".into(),
-            exc_nodelist: "gpu-b-05".into(),
-            ..Default::default()
-        };
-        redact_sensitive_job_info(&mut info);
-        // Sensitive fields are gone — the nodelist in particular (the co-residency targeting oracle).
-        assert!(info.work_dir.is_empty());
-        assert!(info.command.is_empty());
-        assert!(info.stdout_path.is_empty());
-        assert!(info.stderr_path.is_empty());
-        assert!(info.stdin_path.is_empty());
-        assert!(info.comment.is_empty());
-        assert!(info.nodelist.is_empty());
-        assert!(info.resources.is_none());
-        assert!(info.submit_line.is_empty());
-        assert!(info.req_nodelist.is_empty());
-        assert!(info.exc_nodelist.is_empty());
-        // Non-sensitive identity/state fields survive so the queue view still works.
-        assert_eq!(info.job_id, 42);
-        assert_eq!(info.name, "train");
-        assert_eq!(info.user, "bob");
-        assert_eq!(info.account, "team-b");
-        assert_eq!(info.state_reason, "Running");
     }
 
     /// Identity for a viewer in the get_job/get_job_steps handler tests. No NSS resolution happens
@@ -6075,7 +5901,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_scopes_by_identity_under_default_redacted_policy() {
+    async fn get_job_hides_other_tenants_from_identified_users() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let job_id = svc
@@ -6099,30 +5925,6 @@ mod tests {
         }
 
         // An identified User cannot fetch another tenant's job (same pin as get_jobs).
-        let err = svc
-            .get_job(get_job_req(job_id, Some(viewer("alice", false))))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_owner_only_hides_the_job_from_a_non_owner() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut config = step_test_config();
-        config.controller.job_info_visibility = spur_core::config::JobInfoVisibility::OwnerOnly;
-        let svc = test_service_with(&dir, config).await;
-        let job_id = svc
-            .cluster
-            .submit_job(owned_job("bob", "/home/bob"))
-            .unwrap()
-            .job_id;
-
-        // Owner still sees the job; a non-owner gets NOT_FOUND rather than a redacted record.
-        assert!(svc
-            .get_job(get_job_req(job_id, Some(viewer("bob", false))))
-            .await
-            .is_ok());
         let err = svc
             .get_job(get_job_req(job_id, Some(viewer("alice", false))))
             .await
@@ -6310,10 +6112,8 @@ mod tests {
         assert_eq!(jobs[0].job_id, 1);
     }
 
-    /// `scontrol show job` and `squeue` both read through `get_jobs`, so this — not the
-    /// `get_job` redaction — is what stops one user reading another's submit line and
-    /// requested nodes. Spoofing the wire `user` field, and naming the job id outright,
-    /// must both come back empty.
+    /// `scontrol show job` and `squeue` both read through `get_jobs`. Spoofing the
+    /// wire `user` field, and naming the job id outright, must both come back empty.
     #[tokio::test]
     async fn get_jobs_never_returns_another_users_job_to_an_identified_caller() {
         use crate::raft::StateMachineApply;
@@ -10643,29 +10443,6 @@ mod tests {
         // A running job holds no future slot; a leftover entry must not surface.
         assert!(jobs[1].planned_start_time.is_none());
         assert!(jobs[1].sched_nodelist.is_empty());
-    }
-
-    #[test]
-    fn redaction_strips_the_planned_nodelist() {
-        // Ordering guard: annotation runs before redaction, so the planned list
-        // must not reappear on a redacted record.
-        let mut info = JobInfo {
-            sched_nodelist: "gpu-b-[01-04]".into(),
-            req_tres: "cpu=16,mem=64G,gres/gpu=8".into(),
-            features: "mi300x".into(),
-            min_cpus_node: 16,
-            min_memory_node_mb: 65536,
-            min_memory_is_per_cpu: true,
-            ..Default::default()
-        };
-        redact_sensitive_job_info(&mut info);
-        assert!(info.sched_nodelist.is_empty());
-        // The requested shape restates the allocated detail, so it goes too.
-        assert!(info.req_tres.is_empty());
-        assert!(info.features.is_empty());
-        assert_eq!(info.min_cpus_node, 0);
-        assert_eq!(info.min_memory_node_mb, 0);
-        assert!(!info.min_memory_is_per_cpu);
     }
 
     #[test]

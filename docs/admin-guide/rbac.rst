@@ -7,9 +7,9 @@ authentication plugin is in use.
 
 * **User** — submit and manage own jobs.
 * **Coordinator** — reserved for a future grant hierarchy. Not assigned today.
-* **Operator** — manage jobs, reservations, job-info visibility, and accounting
-  records. Cannot drain/remove nodes, change partitions, mint admission tokens,
-  or reconfigure the cluster.
+* **Operator** — manage jobs, reservations, and accounting records. Cannot
+  drain/remove nodes, change partitions, mint admission tokens, or reconfigure
+  the cluster.
 * **Administrator** — full control-plane tenancy.
 
 Binding
@@ -65,8 +65,19 @@ in, or stream a job.
 
 Job list pins a non-operator to their own jobs. ``get_job`` and
 ``get_job_steps`` use the same pin: an identified User asking for another
-tenant's job id gets ``NOT_FOUND``. Operators and Administrators still see
-every job.
+tenant's job id gets ``NOT_FOUND``. Operators and Administrators see every
+job in full. A caller with no verified identity is not pinned either, so they
+also see every job in full; that path exists only under ``mode = "permissive"``
+or ``"disabled"``. Under ``mode = "required"`` the auth layer rejects the call
+before the handler.
+
+``CancelJob`` with no verified identity and an empty ``user`` is treated as the
+in-cluster daemon (the Kubernetes operator) and can cancel any job. A named
+unauthenticated user is still an ordinary owner check. REST cancel always
+requires a Bearer token, so it does not have this hole. On a native-host
+controller, do not leave gRPC reachable under ``permissive``: set
+``mode = "required"`` so an unauthenticated empty-user cancel never reaches
+the handler, and restrict port 6817 at the network layer either way.
 
 Controller-to-agent RPCs carry a separate controller identity rather than a
 user credential, and are not subject to any of the above. Each token is minted

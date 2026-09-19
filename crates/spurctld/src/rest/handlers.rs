@@ -10,10 +10,7 @@ use axum::Extension;
 use super::convert::{job_to_json, node_to_json, parse_states_query, partition_to_json};
 use super::types::*;
 use super::RestState;
-use crate::server::{
-    identified_user_may_view_job, identity_operates_jobs, job_info_disclosure,
-    viewer_is_privileged, JobInfoDisclosure,
-};
+use crate::server::{identified_user_may_view_job, identity_operates_jobs};
 
 pub async fn ping(
     State(state): State<Arc<RestState>>,
@@ -33,8 +30,6 @@ pub async fn ping(
                 "replica"
             }
             .into(),
-            auth_audience: state.auth_audience.clone(),
-            auth_epoch: state.auth_epoch,
         }],
     }))
 }
@@ -213,28 +208,7 @@ fn rest_job_json(
     cluster: &crate::cluster::ClusterManager,
 ) -> Option<serde_json::Value> {
     let operates = identity_operates_jobs(cluster, identity);
-    if !identified_user_may_view_job(identity, &job.spec.user, operates) {
-        return None;
-    }
-    let privileged = viewer_is_privileged(identity, &job.spec.user, operates);
-    match job_info_disclosure(privileged, cluster.config().controller.job_info_visibility) {
-        JobInfoDisclosure::Hidden => None,
-        JobInfoDisclosure::Full => Some(job_to_json(job)),
-        JobInfoDisclosure::Redacted => Some(redact_sensitive_job_json(job_to_json(job))),
-    }
-}
-
-fn redact_sensitive_job_json(mut json: serde_json::Value) -> serde_json::Value {
-    for key in [
-        "current_working_directory",
-        "command",
-        "standard_output",
-        "standard_error",
-        "nodes",
-    ] {
-        json[key] = serde_json::json!("");
-    }
-    json
+    identified_user_may_view_job(identity, &job.spec.user, operates).then(|| job_to_json(job))
 }
 
 pub async fn cancel_job(
@@ -419,23 +393,5 @@ mod tests {
             Some("alice")
         );
         assert_eq!(rest_list_user_from_flags(None, None, false), None);
-    }
-
-    #[test]
-    fn redact_sensitive_job_json_blanks_targeting_fields() {
-        let json = redact_sensitive_job_json(serde_json::json!({
-            "job_id": 1,
-            "user_name": "alice",
-            "command": "/bin/sleep",
-            "nodes": "gpu01",
-            "current_working_directory": "/home/alice",
-            "standard_output": "a.out",
-            "standard_error": "a.err",
-        }));
-        assert_eq!(json["job_id"], 1);
-        assert_eq!(json["user_name"], "alice");
-        assert_eq!(json["command"], "");
-        assert_eq!(json["nodes"], "");
-        assert_eq!(json["current_working_directory"], "");
     }
 }

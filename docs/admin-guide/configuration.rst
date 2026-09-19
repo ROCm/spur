@@ -299,24 +299,6 @@ and Raft high-availability topology.
        bounded only by this value. A node that exceeds it is skipped for new
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
-   * - ``job_info_visibility``
-     - string
-     - ``redacted``
-     - Live
-     - How much of another user's job an identified Operator may still redact
-       on list/get. Identified Users (non-operators) cannot list or fetch
-       another tenant's job at all (``get_job`` is ``NOT_FOUND``, matching the
-       job-list pin). ``redacted`` (default) blanks the working directory,
-       command, submit line, stdio paths, comment, the allocated, requested,
-       and planned node lists, and both the allocated and requested resource
-       detail (``ReqTRES``, ``Features``, and the per-node minima);
-       ``owner_only`` returns ``NOT_FOUND`` for other users' jobs; ``full`` is the
-       legacy behaviour where every field is visible to a caller who is allowed
-       to see the record. Owners and admins always see the full record. Scoping
-       applies only to identified callers — under ``auth.mode = required``, or
-       when a credential is presented under ``permissive``; with authentication
-       disabled or no credential presented, the full record is returned (so
-       no-auth deployments and internal consumers are unaffected).
 
 ``[accounting]``
 ----------------
@@ -648,9 +630,12 @@ How client requests are authenticated.
    Under the default ``mode = "permissive"``, a caller that presents no
    credential is unauthenticated, and the username it asserts in the request is
    taken at face value. Identity-dependent decisions — job ownership, reservation
-   management, job-info visibility — are then only as trustworthy as the network.
-   Set ``mode = "required"`` (with ``jwt_key`` or ``jwt_key_file``) to make them
-   enforceable, and restrict the controller port at the network layer either way.
+   management, and who may list or fetch another tenant's job — are then only as
+   trustworthy as the network. An unauthenticated gRPC ``CancelJob`` with an
+   empty ``user`` is treated as the in-cluster daemon and can cancel any job
+   (REST cancel still requires a Bearer token). Set ``mode = "required"`` (with
+   ``jwt_key`` or ``jwt_key_file``) to make these checks enforceable, and
+   restrict the controller port at the network layer either way.
    ``spurctld`` warns at startup whenever it binds a non-loopback address without
    ``required``.
 
@@ -672,7 +657,7 @@ Privileged operations
 The control-plane mutations that define cluster tenancy — partitions, node state
 and labels (``scontrol update NodeName=``, ``spur node drain``, ``spur node
 remove``), ``reconfigure``, admission tokens, and k0s — require
-**Administrator**. Operators may manage jobs, reservations, visibility, and
+**Administrator**. Operators may manage jobs, reservations, and
 accounting CRUD, but cannot drain or remove nodes.
 
 A caller with a verified identity below the required role is refused with

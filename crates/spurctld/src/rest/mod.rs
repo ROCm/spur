@@ -21,8 +21,6 @@ use crate::raft::RaftHandle;
 pub struct RestState {
     pub cluster: Arc<ClusterManager>,
     pub raft: Arc<RaftHandle>,
-    pub auth_audience: String,
-    pub auth_epoch: u64,
 }
 
 fn routes() -> Router<Arc<RestState>> {
@@ -42,7 +40,8 @@ fn routes() -> Router<Arc<RestState>> {
 
 /// Authenticate a REST request, mirroring the gRPC policy in [`crate::auth_middleware`].
 ///
-/// `/ping` is exempt so health checks keep working without a credential — it exposes no state.
+/// `/ping` is exempt so health checks keep working without a credential. It
+/// reports liveness only; native audience and epoch stay on gRPC `Ping`.
 async fn rest_auth(
     auth: spur_core::auth::BearerAuth,
     mut req: axum::extract::Request,
@@ -81,13 +80,7 @@ pub async fn serve(
     raft: Arc<RaftHandle>,
     auth: spur_core::auth::BearerAuth,
 ) -> anyhow::Result<()> {
-    let (auth_audience, auth_epoch) = auth.advertised_handshake();
-    let state = Arc::new(RestState {
-        cluster,
-        raft,
-        auth_audience,
-        auth_epoch,
-    });
+    let state = Arc::new(RestState { cluster, raft });
 
     let app = Router::new()
         .nest("/api/v1", routes())

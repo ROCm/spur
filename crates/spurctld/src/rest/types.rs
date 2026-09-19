@@ -121,9 +121,6 @@ pub struct PingInfo {
     pub pinged: String,
     pub latency: u64,
     pub mode: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub auth_audience: String,
-    pub auth_epoch: u64,
 }
 
 #[derive(Deserialize)]

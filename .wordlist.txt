@@ -182,6 +182,7 @@ glibc
 libibverbs
 libpmix
 lifecycle
+liveness
 MaxTRESPerJob
 MaxTRESPerUser
 MaxWall

@@ -370,36 +370,6 @@ pub struct ControllerConfig {
     /// How long to wait for a ping response before dropping the connection (default 10).
     #[serde(default = "default_agent_keepalive_timeout_secs")]
     pub agent_keepalive_timeout_secs: u64,
-
-    /// How much of another user's job a non-owner may see via `get_job` /
-    /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
-    /// the full record; this governs everyone else. Default: `redacted`.
-    #[serde(default)]
-    pub job_info_visibility: JobInfoVisibility,
-}
-
-/// Controls how much of another user's job a non-owner (non-admin) caller can
-/// read back from `get_job` / `get_job_steps`.
-///
-/// The list RPC `get_jobs` already scopes to the caller; the single-fetch paths
-/// historically did not, exposing every job's work_dir, command line, stdio
-/// paths, and — most usefully to an attacker — its allocated nodelist. This
-/// setting closes that leak while leaving the Slurm-standard cluster-visible
-/// queue intact for the fields that are not targeting-sensitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum JobInfoVisibility {
-    /// Non-owners see identity/state/timing/account/priority, but work_dir,
-    /// command, stdio paths, allocated nodelist, comment, and resource detail are
-    /// blanked. The default: preserves visibility, removes the targeting oracle.
-    #[default]
-    Redacted,
-    /// Non-owners get `NOT_FOUND` — the job is invisible unless you own it (or
-    /// are an admin). Strictest; matches `get_jobs`' owner-scoped behaviour.
-    OwnerOnly,
-    /// Legacy: every field is visible to any caller. Opt-in for deployments that
-    /// relied on the previous unscoped behaviour.
-    Full,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -502,7 +472,6 @@ impl Default for ControllerConfig {
             agent_connect_timeout_secs: default_agent_connect_timeout_secs(),
             agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
             agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
-            job_info_visibility: JobInfoVisibility::default(),
         }
     }
 }
