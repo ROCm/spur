@@ -31,6 +31,34 @@ pub struct HookContext {
     pub memory_mb: u64,
 }
 
+impl HookContext {
+    /// The Slurm/SPUR context variables shared by every hook — node prolog/epilog
+    /// and task hooks. Returned as a map so a task hook can layer it over the
+    /// task environment before exec.
+    pub fn environment(&self) -> std::collections::HashMap<String, String> {
+        let username = resolve_username(self.uid);
+        let gpu_list: String = self
+            .gpu_devices
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut env = SpurEnv::new();
+        env.set_with_slurm_twin("SPUR_JOB_ID", self.job_id);
+        env.set_with_slurm_twin("SPUR_JOB_PARTITION", &self.partition);
+        env.set_with_slurm_twin("SPUR_JOB_NODELIST", &self.nodelist);
+        env.set_with_slurm_twin("SPUR_CPUS_ON_NODE", self.cpus);
+        env.set("SPUR_JOB_USER", &username);
+        env.set("SPUR_JOB_UID", self.uid);
+        env.set("SPUR_JOB_GID", self.gid);
+        env.set("SPUR_JOB_WORK_DIR", &self.work_dir);
+        env.set("SPUR_JOB_GPUS", &gpu_list);
+        env.set("SPUR_JOB_MEMORY_MB", self.memory_mb);
+        env.set("SPUR_SCRIPT_CONTEXT", &self.script_context);
+        env.into_map()
+    }
+}
+
 /// Run a prolog/epilog hook script with rich environment variables.
 ///
 /// Stderr is captured and logged; stdout is discarded.
@@ -43,34 +71,14 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
         "running hook"
     );
 
-    let username = resolve_username(ctx.uid);
-
-    let gpu_list: String = ctx
-        .gpu_devices
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let mut env = SpurEnv::new();
-    env.set_with_slurm_twin("SPUR_JOB_ID", ctx.job_id);
-    env.set_with_slurm_twin("SPUR_JOB_PARTITION", &ctx.partition);
-    env.set_with_slurm_twin("SPUR_JOB_NODELIST", &ctx.nodelist);
-    env.set_with_slurm_twin("SPUR_CPUS_ON_NODE", ctx.cpus);
-    env.set("SPUR_JOB_USER", &username);
-    env.set("SPUR_JOB_UID", ctx.uid);
-    env.set("SPUR_JOB_GID", ctx.gid);
-    env.set("SPUR_JOB_WORK_DIR", &ctx.work_dir);
-    env.set("SPUR_JOB_GPUS", &gpu_list);
-    env.set("SPUR_JOB_MEMORY_MB", ctx.memory_mb);
-    env.set("SPUR_SCRIPT_CONTEXT", &ctx.script_context);
-
-    let mut cmd = Command::new(script_path);
-    for (k, v) in env.into_map() {
+    // secure_hook_command validates + execs the fd; hold it alive until spawn.
+    let mut secure = secure_hook_command(script_path)?;
+    let cmd = secure.command_mut();
+    for (k, v) in ctx.environment() {
         cmd.env(k, v);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
+    let child = spawn_hook_in_work_dir(cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
         .with_context(|| {
             format!(
                 "{} script failed to execute: {}",
@@ -169,7 +177,7 @@ const SUBMIT_HOOK_MAX_REASON_BYTES: usize = 4096;
 /// silently run the wrong binary. The config contract requires a fully-qualified path.
 pub fn require_absolute_hook_path(script_path: &str) -> anyhow::Result<()> {
     if !std::path::Path::new(script_path).is_absolute() {
-        anyhow::bail!("job_submit hook path must be absolute: {script_path}");
+        anyhow::bail!("operator hook path must be absolute: {script_path}");
     }
     Ok(())
 }
@@ -182,15 +190,13 @@ pub fn require_absolute_hook_path(script_path: &str) -> anyhow::Result<()> {
 pub fn require_secure_hook_file(script_path: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(script_path)
-        .with_context(|| format!("job_submit hook not found: {script_path}"))?;
+        .with_context(|| format!("operator hook not found: {script_path}"))?;
     let euid = nix::unistd::geteuid().as_raw();
     if meta.uid() != 0 && meta.uid() != euid {
-        anyhow::bail!(
-            "job_submit hook must be owned by root or the controller user: {script_path}"
-        );
+        anyhow::bail!("operator hook must be owned by root or the daemon account: {script_path}");
     }
     if meta.mode() & 0o022 != 0 {
-        anyhow::bail!("job_submit hook must not be group- or world-writable: {script_path}");
+        anyhow::bail!("operator hook must not be group- or world-writable: {script_path}");
     }
     Ok(())
 }
@@ -206,18 +212,16 @@ pub fn require_secure_hook_file(_script_path: &str) -> anyhow::Result<()> {
 pub fn open_secure_hook_file(script_path: &str) -> anyhow::Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
     let file = std::fs::File::open(script_path)
-        .with_context(|| format!("job_submit hook not found: {script_path}"))?;
+        .with_context(|| format!("operator hook not found: {script_path}"))?;
     let meta = file
         .metadata()
-        .with_context(|| format!("failed to stat job_submit hook: {script_path}"))?;
+        .with_context(|| format!("failed to stat operator hook: {script_path}"))?;
     let euid = nix::unistd::geteuid().as_raw();
     if meta.uid() != 0 && meta.uid() != euid {
-        anyhow::bail!(
-            "job_submit hook must be owned by root or the controller user: {script_path}"
-        );
+        anyhow::bail!("operator hook must be owned by root or the daemon account: {script_path}");
     }
     if meta.mode() & 0o022 != 0 {
-        anyhow::bail!("job_submit hook must not be group- or world-writable: {script_path}");
+        anyhow::bail!("operator hook must not be group- or world-writable: {script_path}");
     }
     Ok(file)
 }
@@ -235,7 +239,60 @@ pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
 #[cfg(not(unix))]
 pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
     std::fs::read_to_string(script_path)
-        .with_context(|| format!("job_submit lua script unreadable: {script_path}"))
+        .with_context(|| format!("operator hook unreadable: {script_path}"))
+}
+
+/// A validated operator-hook command. `argv[0]` is the fd we fstat-checked, so a
+/// swap between the check and exec cannot substitute a different file; the open
+/// handle is held until spawn so the exec'd `/proc/self/fd/N` stays resolvable.
+pub struct SecureHookCommand {
+    command: Command,
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl SecureHookCommand {
+    pub fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+}
+
+/// Build a command for an operator hook (prolog/epilog/task/job_submit): require
+/// an absolute path, validate owner and mode on the open handle, and exec the
+/// validated fd. Callers add env, stdio, and cwd, then spawn while this is alive.
+pub fn secure_hook_command(script_path: &str) -> anyhow::Result<SecureHookCommand> {
+    require_absolute_hook_path(script_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = open_secure_hook_file(script_path)?;
+        let fd = file.as_raw_fd();
+        let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+        // A shebang interpreter re-opens argv[0] itself, so the fd must survive
+        // exec, not just resolve during it. SAFETY: the closure only calls fcntl.
+        unsafe {
+            command.pre_exec(move || {
+                let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
+                nix::fcntl::fcntl(
+                    borrowed,
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+        Ok(SecureHookCommand {
+            command,
+            _file: file,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        require_secure_hook_file(script_path)?;
+        Ok(SecureHookCommand {
+            command: Command::new(script_path),
+        })
+    }
 }
 
 /// Truncate an over-long hook rejection reason to roughly the last
@@ -258,13 +315,8 @@ pub async fn run_submit_hook(
     script_path: &str,
     ctx: &SubmitHookContext,
 ) -> anyhow::Result<SubmitHookOutcome> {
-    require_absolute_hook_path(script_path)?;
-    // Exec the fd the security check just validated (via /proc/self/fd),
-    // not a fresh path lookup, so a swap in between can't slip through.
-    #[cfg(unix)]
-    let hook_file = open_secure_hook_file(script_path)?;
-    #[cfg(not(unix))]
-    require_secure_hook_file(script_path)?;
+    // secure_hook_command validates + execs the fd; hold it alive until spawn.
+    let mut secure = secure_hook_command(script_path)?;
     info!(
         target: "audit",
         hook = "job_submit",
@@ -282,28 +334,7 @@ pub async fn run_submit_hook(
     env.set("SPUR_JOB_GID", ctx.gid);
     env.set("SPUR_SCRIPT_CONTEXT", "job_submit");
 
-    #[cfg(unix)]
-    let mut cmd = {
-        use std::os::unix::io::AsRawFd;
-        let fd = hook_file.as_raw_fd();
-        let mut c = Command::new(format!("/proc/self/fd/{fd}"));
-        // A shebang interpreter re-opens argv[0] itself, so the fd must survive
-        // exec, not just resolve during it. SAFETY: the closure only calls fcntl.
-        unsafe {
-            c.pre_exec(move || {
-                let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
-                nix::fcntl::fcntl(
-                    borrowed,
-                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                )
-                .map_err(std::io::Error::from)?;
-                Ok(())
-            });
-        }
-        c
-    };
-    #[cfg(not(unix))]
-    let mut cmd = Command::new(script_path);
+    let cmd = secure.command_mut();
     for (k, v) in env.into_map() {
         cmd.env(k, v);
     }
@@ -607,7 +638,7 @@ pub fn apply_submit_changes(spec: &mut JobSpec, changes: &SubmitHookChanges) -> 
 /// Spawn a hook in `work_dir`, retrying from `/tmp` if the spawn fails there.
 /// A missing/untraversable `work_dir` must not fail the hook (spurd drains the
 /// node on hook failure); only a failure that also persists from `/tmp` is real.
-fn spawn_hook_in_work_dir(
+pub fn spawn_hook_in_work_dir(
     cmd: &mut Command,
     work_dir: &str,
     job_id: JobId,
@@ -826,6 +857,35 @@ mod tests {
         ctx.work_dir = "/nonexistent/submitted/dir".into();
         let result = run_hook("/nonexistent/hook_script.sh", &ctx).await;
         assert!(result.is_err());
+    }
+
+    // A node hook must be validated before it runs as root: a relative path could
+    // resolve through $PATH to the wrong binary.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn run_hook_rejects_a_relative_path() {
+        let err = run_hook("hook.sh", &test_ctx())
+            .await
+            .expect_err("relative hook path must not resolve through PATH");
+        assert!(err.to_string().contains("absolute"), "got: {err}");
+    }
+
+    // A group/world-writable node hook is an arbitrary-root-code surface and must
+    // be refused. Root bypasses the ownership arm, so skip as root.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn run_hook_rejects_a_world_writable_script() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let script = make_script("exit 0");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = run_hook(script.to_str().unwrap(), &test_ctx())
+            .await
+            .expect_err("world-writable operator hook must be refused");
+        assert!(err.to_string().contains("writable"), "got: {err}");
     }
 
     fn submit_ctx() -> SubmitHookContext {
