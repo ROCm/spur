@@ -525,8 +525,8 @@ QOS keys
        where the behaviour departs from Slurm.
    * - ``flags``
      - ``""``
-     - Comma-separated QOS flags. ``DenyOnLimit`` is supported (see
-       :ref:`deny-on-limit`).
+     - Comma-separated QOS flags: ``DenyOnLimit`` (see :ref:`deny-on-limit`)
+       and ``DefaultTimeUnlimited`` (see :ref:`unlimited-time-default`).
 
 .. _deny-on-limit:
 
@@ -569,6 +569,56 @@ Set ``DenyOnLimit`` through the QOS ``flags`` key:
 
    sacctmgr modify qos name=highprio set flags=DenyOnLimit
 
+.. _unlimited-time-default:
+
+Administrator-controlled unlimited defaults
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``DefaultTimeUnlimited`` opts a QOS out of finite partition ``DefaultTime`` and
+cluster fallback times for **new** submissions with no finite requested time.
+Unlike ``maxwall=-1`` alone, it overrides those defaults. It does not override
+hard ceilings: the QOS and applicable association/account ``maxwall`` must be
+unlimited, and **every** requested partition must have unlimited ``MaxTime``.
+Any finite ceiling, including zero, rejects an unlimited-default submission with
+a conflicting-policy error, regardless of ``DenyOnLimit`` or partition-limit
+enforcement mode. Explicit or hook-supplied finite times retain normal enforcement.
+
+After upgrading **all controllers** in a cluster, an authenticated administrator
+can enable the capability with:
+
+.. code-block:: bash
+
+   sacctmgr --controller <controller-url> modify qos name=amd-oss-qos set maxwall=-1 flags=DefaultTimeUnlimited
+   sacctmgr --controller <controller-url> show qos name=amd-oss-qos format=Name,MaxWall,Flags
+
+Run separately for each cluster. These examples do not configure or deploy any
+site. ``flags=`` **replaces** the flag set; include existing flags to retain them,
+for example ``flags=DenyOnLimit,DefaultTimeUnlimited``. Flag names are
+case-insensitive. ``flags=`` clears all flags; omitting the key preserves them.
+Older controllers do not implement this flag and may reject it or apply finite
+defaults, so do not enable it during a mixed-version controller upgrade.
+
+``sbatch`` without ``--time`` uses this policy. ``salloc`` supplies a one-hour
+CLI default: use ``salloc --qos=amd-oss-qos --time=UNLIMITED`` to avoid that finite
+request. ``UNLIMITED`` represents an absent finite request, not permission to
+bypass a ceiling. A ``job_submit`` hook's final QOS, account and partition govern
+defaulting; a finite time supplied by the hook is preserved.
+
+Accounting changes take effect after the controller caches refresh, not
+necessarily when ``sacctmgr`` returns. The refresh interval is
+``accounting.fairshare_refresh_secs`` (default 300 seconds, ten-second minimum).
+Failed refreshes retain the last successful policy. When initial accounting
+policy is unavailable, submissions return an error that allows a retry rather
+than assuming unlimited permission.
+
+The flag changes neither existing jobs/allocations nor named reservations. A
+new unlimited allocation needs no periodic wall-time renewal, but reservations
+can still end it, and cancellation, failures, maintenance, access restrictions,
+and other resource limits still apply. This flag adds no authentication:
+configure required authentication and use an authorized administrator identity
+before exposing accounting management; authentication-disabled deployments do
+not provide an administrator-only security boundary.
+
 .. _maxwall-default:
 
 MaxWall as the default time limit
@@ -587,7 +637,8 @@ The limit is filled in at submit, so ``squeue`` and ``scontrol show job`` report
 it, and it is the job's own limit from then on: a later change to the QOS does
 not move it.
 
-Precedence for a job that requests nothing, first match winning:
+Without ``DefaultTimeUnlimited``, precedence for a job that requests nothing,
+first match winning:
 
 1. The partition's ``DefaultTime``, or the chain described under
    ``default_time_limit_minutes`` in :doc:`configuration`.

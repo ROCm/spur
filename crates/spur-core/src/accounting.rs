@@ -310,6 +310,9 @@ pub struct Qos {
     /// `DenyOnLimit` flag; the submit-count family always denies regardless.
     #[serde(default)]
     pub deny_on_limit: bool,
+    /// Opt out of finite wall-time defaults, but never of hard wall-time ceilings.
+    #[serde(default)]
+    pub default_time_unlimited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -382,6 +385,7 @@ impl Default for Qos {
             usage_factor: 1.0,
             preempt: Vec::new(),
             deny_on_limit: false,
+            default_time_unlimited: false,
         }
     }
 }
@@ -389,6 +393,18 @@ impl Default for Qos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_qos_defaults_to_finite_time_policy() {
+        let mut legacy = serde_json::to_value(Qos::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("default_time_unlimited");
+        let qos: Qos = serde_json::from_value(legacy).unwrap();
+        assert!(!qos.default_time_unlimited);
+        assert!(!Qos::default().default_time_unlimited);
+    }
 
     #[test]
     fn test_tres_format_parse() {

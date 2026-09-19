@@ -259,18 +259,17 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
         },
         usage_factor: r.usage_factor,
-        deny_on_limit: parse_deny_on_limit(&r.flags),
+        deny_on_limit: has_qos_flag(&r.flags, "DenyOnLimit"),
+        default_time_unlimited: has_qos_flag(&r.flags, "DefaultTimeUnlimited"),
     }
 }
 
-/// Parse the QOS `flags` column (comma-separated) for the `DenyOnLimit` flag.
-/// Unknown flags are ignored on read (writes reject them via
-/// `canonicalize_qos_flags`); this tolerates rows imported from Slurm dumps that
-/// carry flags Spur does not model yet.
-fn parse_deny_on_limit(flags: &str) -> bool {
+/// Unknown flags are ignored on read to tolerate imported Slurm rows;
+/// writes reject them via `canonicalize_qos_flags`.
+fn has_qos_flag(flags: &str, flag: &str) -> bool {
     flags
         .split(',')
-        .any(|f| f.trim().eq_ignore_ascii_case("denyonlimit"))
+        .any(|f| f.trim().eq_ignore_ascii_case(flag))
 }
 
 #[cfg(test)]
@@ -380,13 +379,14 @@ mod tests {
             grp_tres: Some("gpu=8".into()),
             grp_wall_min: Some(120),
             preempt_exempt_time: None,
-            flags: "DenyOnLimit".into(),
+            flags: " DenyOnLimit, DEFAULTTIMEUNLIMITED,DefaultTimeUnlimited,ImportedFlag ".into(),
         };
 
         let qos = qos_from_record(record);
 
         assert_eq!(qos.name, "high");
         assert!(qos.deny_on_limit);
+        assert!(qos.default_time_unlimited);
         assert_eq!(qos.limits.max_submit_jobs_per_account, Some(40));
         assert_eq!(qos.limits.grp_submit_jobs, Some(30));
         assert_eq!(qos.priority, 100);
