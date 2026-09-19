@@ -61,6 +61,40 @@ pub(crate) fn raft_client(
         .max_encoding_message_size(RAFT_MAX_MESSAGE_SIZE)
 }
 
+/// Return true only when every configured voting controller advertises the
+/// release-fence WAL feature. An unavailable or older peer keeps the caller on
+/// the compatibility representation.
+pub(crate) async fn all_peers_support_release_quarantine(peers: &BTreeMap<NodeId, String>) -> bool {
+    for addr in peers.values() {
+        let url = if addr.starts_with("http") {
+            addr.clone()
+        } else {
+            format!("http://{addr}")
+        };
+        let Ok(endpoint) = tonic::transport::Channel::from_shared(url) else {
+            return false;
+        };
+        let Ok(channel) = endpoint
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+        else {
+            return false;
+        };
+        let Ok(response) = raft_client(channel)
+            .get_capabilities(spur_proto::raft_proto::CapabilitiesRequest {})
+            .await
+        else {
+            return false;
+        };
+        if !response.into_inner().release_quarantine_v1 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Set when a committed WAL entry transitions a job to a terminal state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct JobFinalized {

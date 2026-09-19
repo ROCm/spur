@@ -182,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
 
     let raft_handle = Arc::new(handle);
     cluster.set_raft(raft_handle.raft.clone());
+    cluster.set_raft_voters(raft_handle.peers.clone());
 
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
@@ -248,10 +249,19 @@ async fn main() -> anyhow::Result<()> {
             }
             let evicted = health_cluster.check_node_health(hb_timeout, mark_down);
             for fin in &evicted {
-                if let Some(job) = health_cluster.get_job(fin.job_id) {
+                let job_id = fin.job_id;
+                let fences = health_cluster.release_quarantines_by_attempt_for_job(job_id);
+                for (run_attempt, nodes) in fences {
                     let c = health_cluster.clone();
                     tokio::spawn(async move {
-                        crate::scheduler_loop::send_cancel_to_agents(&c, &job, 9).await;
+                        crate::scheduler_loop::send_cancel_to_nodes(
+                            &c,
+                            job_id,
+                            run_attempt,
+                            &nodes,
+                            9,
+                        )
+                        .await;
                     });
                 }
             }

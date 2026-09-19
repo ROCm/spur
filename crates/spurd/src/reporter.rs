@@ -122,6 +122,7 @@ impl NodeReporter {
                 wg_pubkey: self.wg_pubkey(),
                 labels,
                 join_token: self.join_token.clone(),
+                release_quarantine_v1: true,
             })
             .await
             .context("registration failed")?;
@@ -231,6 +232,7 @@ impl NodeReporter {
                                     install_duration_seconds: install_secs,
                                 }
                             }),
+                            release_quarantine_v1: true,
                         })
                         .await
                     {

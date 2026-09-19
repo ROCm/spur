@@ -23,7 +23,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Requesting any of these fixtures (directly or transitively) makes a test a GPU
 # test; conftest auto-marks it `gpu` so CI can route it without a manual tag.
-_GPU_FIXTURES = frozenset({"gpu_cluster", "gpu_container_cluster"})
+_GPU_FIXTURES = frozenset(
+    {"gpu_cluster", "gpu_container_cluster", "unstarted_gpu_cluster"}
+)
 
 
 def pytest_configure(config):
@@ -193,6 +195,26 @@ def unstarted_cluster(ssh_nodes, remote_bin_dir):
     ``cluster.start(config_overrides)`` to bring up the daemons with
     the desired configuration.
     """
+    spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
+    yield spur_cluster
+    spur_cluster.teardown()
+
+
+@pytest.fixture
+def unstarted_gpu_cluster(ssh_nodes, remote_bin_dir):
+    """Provision a GPU-capable cluster without starting its daemons.
+
+    This is the GPU counterpart to :func:`unstarted_cluster`: tests can
+    install startup-time hooks before starting the controller and agents.
+    """
+    if len(ssh_nodes) < 1:
+        pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
+    if not _any_node_has_gpu(ssh_nodes):
+        pytest.skip(
+            "no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) "
+            "on any node"
+        )
+
     spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
     yield spur_cluster
     spur_cluster.teardown()

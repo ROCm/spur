@@ -23,6 +23,18 @@ use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
 const NS_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
+const POD_TEARDOWN_BUDGET: Duration = Duration::from_secs(25);
+const POD_TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const JOB_ID_LABEL: &str = "spur.amd.com/job-id";
+const RUN_ATTEMPT_LABEL: &str = "spur.amd.com/run-attempt";
+
+fn job_attempt_selector(job_id: u32, run_attempt: u32) -> String {
+    format!("{JOB_ID_LABEL}={job_id},{RUN_ATTEMPT_LABEL}={run_attempt}")
+}
+
+fn job_attempt_service_name(job_id: u32, run_attempt: u32) -> String {
+    format!("spur-job-{job_id}-attempt-{run_attempt}")
+}
 
 /// The placement facts the agent reads off a job's SpurJob before creating pods: which namespace it
 /// belongs to, and which nodes the controller recorded as its allocation.
@@ -146,6 +158,53 @@ impl VirtualAgent {
     /// Look up the namespace of the SpurJob labeled `spur.amd.com/job-id=<id>`.
     async fn resolve_namespace(&self, job_id: u32) -> Result<String, Status> {
         Ok(self.resolve_job(job_id).await?.namespace)
+    }
+
+    async fn delete_attempt_pods(
+        &self,
+        namespace: &str,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Result<(), Status> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let selector = job_attempt_selector(job_id, run_attempt);
+        let list_params = ListParams::default().labels(&selector);
+        let deadline = tokio::time::Instant::now() + POD_TEARDOWN_BUDGET;
+
+        loop {
+            let pod_list = pods
+                .list(&list_params)
+                .await
+                .map_err(|error| Status::unavailable(format!("failed to list Pods: {error}")))?;
+            if pod_list.items.is_empty() {
+                return Ok(());
+            }
+
+            for pod in pod_list {
+                let name = pod
+                    .metadata
+                    .name
+                    .ok_or_else(|| Status::internal("listed Pod has no name"))?;
+                match pods.delete(&name, &DeleteParams::default()).await {
+                    Ok(_) => info!(job_id, run_attempt, pod = %name, "deleted Pod"),
+                    Err(kube::Error::Api(error)) if error.code == 404 => {
+                        debug!(job_id, run_attempt, pod = %name, "Pod already gone");
+                    }
+                    Err(error) => {
+                        return Err(Status::unavailable(format!(
+                            "failed to delete Pod {name}: {error}"
+                        )));
+                    }
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "timed out waiting for Pods to terminate",
+                ));
+            }
+            tokio::time::sleep(POD_TEARDOWN_POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -428,7 +487,8 @@ impl SlurmAgent for VirtualAgent {
 
         // Build labels
         let mut labels = BTreeMap::new();
-        labels.insert("spur.amd.com/job-id".to_string(), job_id.to_string());
+        labels.insert(JOB_ID_LABEL.to_string(), job_id.to_string());
+        labels.insert(RUN_ATTEMPT_LABEL.to_string(), req.run_attempt.to_string());
         labels.insert(
             "spur.amd.com/managed-by".to_string(),
             "spur-k8s-operator".to_string(),
@@ -442,7 +502,10 @@ impl SlurmAgent for VirtualAgent {
 
         // For multi-node jobs, create headless Service for DNS discovery
         if num_peers > 1 {
-            if let Err(e) = self.ensure_headless_service(job_id, &labels, &ns).await {
+            if let Err(e) = self
+                .ensure_headless_service(job_id, req.run_attempt, &labels, &ns)
+                .await
+            {
                 warn!(job_id, error = %e, "failed to create headless service");
             }
         }
@@ -458,7 +521,7 @@ impl SlurmAgent for VirtualAgent {
         let (hostname, subdomain) = if num_peers > 1 && !target_node.is_empty() {
             (
                 Some(sanitize_k8s_name(&target_node)),
-                Some(format!("spur-job-{}", job_id)),
+                Some(job_attempt_service_name(job_id, req.run_attempt)),
             )
         } else {
             (None, None)
@@ -565,40 +628,26 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
+        let run_attempt = req.run_attempt;
+        if run_attempt == 0 {
+            return Err(Status::failed_precondition(
+                "K8s cancellation requires a nonzero run attempt",
+            ));
+        }
         let ns = self.resolve_namespace(job_id).await?;
 
-        // Delete all pods for this job by label selector
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
+        self.delete_attempt_pods(&ns, job_id, run_attempt).await?;
 
-        match pods.list(&lp).await {
-            Ok(pod_list) => {
-                for pod in pod_list {
-                    let name = pod.metadata.name.unwrap_or_default();
-                    match pods.delete(&name, &DeleteParams::default()).await {
-                        Ok(_) => info!(job_id, pod = %name, "deleted Pod"),
-                        Err(kube::Error::Api(e)) if e.code == 404 => {
-                            debug!(job_id, pod = %name, "Pod already gone");
-                        }
-                        Err(e) => {
-                            error!(job_id, pod = %name, error = %e, "failed to delete Pod");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!(job_id, error = %e, "failed to list Pods for cancellation");
-            }
-        }
-
-        // Also clean up the headless service if it exists
+        // A service names one run so a late cancel cannot delete a replacement's DNS.
         let services: Api<Service> = Api::namespaced(self.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_attempt_service_name(job_id, run_attempt);
         match services.delete(&svc_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(job_id, "deleted headless Service"),
+            Ok(_) => debug!(job_id, run_attempt, "deleted headless Service"),
             Err(kube::Error::Api(e)) if e.code == 404 => {}
             Err(e) => {
-                debug!(job_id, error = %e, "failed to delete headless Service");
+                return Err(Status::unavailable(format!(
+                    "failed to delete headless Service: {e}"
+                )));
             }
         }
 
@@ -880,13 +929,17 @@ impl VirtualAgent {
     async fn ensure_headless_service(
         &self,
         job_id: u32,
+        run_attempt: u32,
         labels: &BTreeMap<String, String>,
         namespace: &str,
     ) -> Result<(), kube::Error> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_attempt_service_name(job_id, run_attempt);
 
-        let selector = BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
+        let selector = BTreeMap::from([
+            (JOB_ID_LABEL.to_string(), job_id.to_string()),
+            (RUN_ATTEMPT_LABEL.to_string(), run_attempt.to_string()),
+        ]);
 
         let svc = Service {
             metadata: ObjectMeta {
@@ -1346,6 +1399,56 @@ mod resolve_job_tests {
 
     fn server_listing(jobs: &[serde_json::Value]) -> FakeApiServer {
         FakeApiServer::answering(StatusCode::OK, &list_response(jobs))
+    }
+
+    #[test]
+    fn attempt_identity_scopes_pod_selection_and_service_names() {
+        assert_eq!(
+            job_attempt_selector(JOB_ID, 4),
+            "spur.amd.com/job-id=7,spur.amd.com/run-attempt=4"
+        );
+        assert_eq!(job_attempt_service_name(JOB_ID, 4), "spur-job-7-attempt-4");
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_an_attempt_is_rejected_before_k8s_io() {
+        let server = server_listing(&[]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .cancel_job(Request::new(AgentCancelJobRequest {
+                job_id: JOB_ID,
+                signal: 9,
+                run_attempt: 0,
+            }))
+            .await
+            .expect_err("an unspecified attempt cannot acknowledge teardown");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn teardown_checks_only_the_requested_attempt() {
+        let empty_pods: Vec<Pod> = Vec::new();
+        let server = FakeApiServer::answering(StatusCode::OK, &list_response(&empty_pods));
+        let agent = VirtualAgent::new(server.client());
+
+        agent
+            .delete_attempt_pods("team-a", JOB_ID, 4)
+            .await
+            .expect("an empty requested attempt is already released");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/v1/namespaces/team-a/pods");
+        assert!(
+            requests[0]
+                .decoded_query()
+                .contains("spur.amd.com/job-id=7%2Cspur.amd.com/run-attempt=4"),
+            "teardown must select the requested run attempt, got {:?}",
+            requests[0].query
+        );
     }
 
     fn assert_lists_by_job_label(server: &FakeApiServer) {

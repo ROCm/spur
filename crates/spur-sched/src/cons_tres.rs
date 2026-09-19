@@ -351,6 +351,17 @@ impl NodeAllocation {
         }
     }
 
+    /// Whether this allocation still belongs to the given run attempt.
+    ///
+    /// Callers that wait for teardown use this instead of the aggregate
+    /// bitmaps: another job may legitimately hold the same resource after this
+    /// run has released it.
+    pub fn owns_run_attempt(&self, job_id: u32, run_attempt: u32) -> bool {
+        self.owners
+            .get(&job_id)
+            .is_some_and(|owned| owned.run_attempt == run_attempt)
+    }
+
     /// Release owned allocations whose job is neither live nor launching within
     /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
     /// or a dropped launch instead of stranding the node until spurd restart.

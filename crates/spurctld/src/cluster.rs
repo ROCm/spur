@@ -33,7 +33,7 @@ use spur_core::qos::{
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
-use spur_core::wal::WalOperation;
+use spur_core::wal::{ReleaseQuarantine, WalOperation};
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
@@ -477,6 +477,21 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// Replicated release fences whose controller allocation was freed before
+    /// their matching agent allocation was confirmed gone. Unlike a dispatch
+    /// cooldown, this is never bypassed by a pinned job.
+    node_release_quarantines: RwLock<HashSet<ReleaseQuarantine>>,
+    /// Release fences represented as a normal node drain so older controllers
+    /// can replay their conservative scheduling effect during an upgrade.
+    compatibility_release_quarantines: RwLock<HashSet<ReleaseQuarantine>>,
+    /// Agents that have reported the terminal cancellation acknowledgement
+    /// required before a native release fence may be cleared.
+    release_quarantine_capable_agents: RwLock<HashSet<String>>,
+    /// The configured Raft voters. Missing topology deliberately selects the
+    /// compatibility representation until startup has completed.
+    raft_voters: RwLock<Option<BTreeMap<crate::raft::NodeId, String>>>,
+    /// Serializes compatibility-drain reads with local node-state proposals.
+    node_state_transition: parking_lot::Mutex<()>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
     /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
@@ -501,6 +516,68 @@ const HEALTH_FORCE_DRAIN_PREFIX: &str = "health-check(pending): ";
 /// drain is sticky: the node stays out of service for an operator to inspect,
 /// exactly like Slurm's failed `HealthCheckProgram`. It never auto-resumes.
 const HEALTH_FAIL_DRAIN_PREFIX: &str = "health-check(failed): ";
+
+const RELEASE_QUARANTINE_DRAIN_PREFIX: &str = "spur:release-quarantine:v1:";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CompatibilityReleaseQuarantine {
+    entries: Vec<ReleaseQuarantine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore: Option<CompatibilityReleaseQuarantineRestore>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CompatibilityReleaseQuarantineRestore {
+    state: NodeState,
+    state_reason: Option<String>,
+    admin_locked: bool,
+    reason_uid: Option<u32>,
+    reason_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    remove_on_clear: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remove_reason: Option<String>,
+}
+
+struct ProposedNodeStateChange {
+    name: String,
+    old_state: NodeState,
+    new_state: NodeState,
+    reason: Option<String>,
+    admin_locked: bool,
+    reason_uid: Option<u32>,
+    reason_time: Option<DateTime<Utc>>,
+}
+
+fn compatibility_release_quarantine(
+    reason: Option<&str>,
+) -> Option<CompatibilityReleaseQuarantine> {
+    let payload = reason?.strip_prefix(RELEASE_QUARANTINE_DRAIN_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+fn compatibility_release_quarantines(reason: Option<&str>) -> Option<Vec<ReleaseQuarantine>> {
+    compatibility_release_quarantine(reason).map(|fence| fence.entries)
+}
+
+fn compatibility_release_quarantine_reason(
+    entries: impl IntoIterator<Item = ReleaseQuarantine>,
+    restore: Option<CompatibilityReleaseQuarantineRestore>,
+) -> anyhow::Result<String> {
+    let mut entries: Vec<_> = entries.into_iter().collect();
+    entries.sort_by(|left, right| {
+        (&left.node_name, left.job_id, left.run_attempt).cmp(&(
+            &right.node_name,
+            right.job_id,
+            right.run_attempt,
+        ))
+    });
+    entries.dedup();
+    Ok(format!(
+        "{RELEASE_QUARANTINE_DRAIN_PREFIX}{}",
+        serde_json::to_string(&CompatibilityReleaseQuarantine { entries, restore })?
+    ))
+}
 
 /// The node a health-check job targets, parsed from its reserved name
 /// (`{HEALTH_JOB_PREFIX}{idx}.{node}`). `None` for any non-health name.
@@ -602,6 +679,11 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
+            node_release_quarantines: RwLock::new(HashSet::new()),
+            compatibility_release_quarantines: RwLock::new(HashSet::new()),
+            release_quarantine_capable_agents: RwLock::new(HashSet::new()),
+            raft_voters: RwLock::new(None),
+            node_state_transition: parking_lot::Mutex::new(()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
         };
 
@@ -656,6 +738,427 @@ impl ClusterManager {
         let mut cooldowns = self.node_dispatch_cooldowns.write();
         cooldowns.retain(|_, &mut until| until > now);
         cooldowns.keys().cloned().collect()
+    }
+
+    /// Persist a scheduling fence before relinquishing controller ownership of
+    /// an active run. Completed nodes are intentionally excluded: their
+    /// `JobNodeComplete` report follows agent-side teardown and has already
+    /// released the matching local ledger entry.
+    pub fn quarantine_job_release(&self, job_id: JobId) -> anyhow::Result<Vec<ReleaseQuarantine>> {
+        let entries: Vec<ReleaseQuarantine> = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(Vec::new());
+            };
+            if !matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) {
+                return Ok(Vec::new());
+            }
+            job.allocated_nodes
+                .iter()
+                .filter(|name| !job.node_completions.contains_key(*name))
+                .map(|node_name| ReleaseQuarantine {
+                    node_name: node_name.clone(),
+                    job_id,
+                    run_attempt: job.run_attempt,
+                })
+                .collect()
+        };
+        self.quarantine_release_entries(entries.clone())?;
+        Ok(entries)
+    }
+
+    /// Fence every peer allocation that a node-down eviction will release.
+    /// The down node itself is unschedulable, but a multinode job's healthy
+    /// peers become Idle in the same eviction and must remain protected.
+    fn quarantine_node_evictions(&self, node_name: &str) -> anyhow::Result<()> {
+        let job_ids: Vec<JobId> = self
+            .jobs
+            .read()
+            .values()
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && job.allocated_nodes.iter().any(|name| name == node_name)
+            })
+            .map(|job| job.job_id)
+            .collect();
+        for job_id in job_ids {
+            self.quarantine_job_release(job_id)?;
+        }
+        Ok(())
+    }
+
+    /// Persist explicit fences for a launch that may have reached agents even
+    /// though it never committed as Running in the controller.
+    pub fn quarantine_release_entries(
+        &self,
+        entries: Vec<ReleaseQuarantine>,
+    ) -> anyhow::Result<()> {
+        let entries: Vec<_> = {
+            let mut existing = self.node_release_quarantines.read().clone();
+            existing.extend(
+                self.compatibility_release_quarantines
+                    .read()
+                    .iter()
+                    .cloned(),
+            );
+            entries
+                .into_iter()
+                .filter(|entry| !existing.contains(entry))
+                .collect()
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if self.native_release_quarantine_enabled()
+            && self.compatibility_release_quarantines.read().is_empty()
+        {
+            self.propose(WalOperation::ReleaseQuarantine { entries })?;
+        } else {
+            self.quarantine_release_entries_compatibility(entries)?;
+        }
+        Ok(())
+    }
+
+    /// A cancellation reply is a positive, attempt-specific proof that these
+    /// local ledgers are gone, so their replicated fences may be removed.
+    pub fn clear_release_quarantine_entries(
+        &self,
+        entries: Vec<ReleaseQuarantine>,
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let compatibility = self.compatibility_release_quarantines.read().clone();
+        let (compatibility_entries, native_entries): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| compatibility.contains(entry));
+        if !native_entries.is_empty() {
+            self.propose(WalOperation::ReleaseQuarantineClear {
+                entries: native_entries,
+            })?;
+        }
+        if !compatibility_entries.is_empty() {
+            self.clear_release_quarantine_entries_compatibility(compatibility_entries)?;
+        }
+        Ok(())
+    }
+
+    fn quarantine_release_entries_compatibility(
+        &self,
+        entries: Vec<ReleaseQuarantine>,
+    ) -> anyhow::Result<()> {
+        let mut by_node: BTreeMap<String, Vec<ReleaseQuarantine>> = BTreeMap::new();
+        for entry in entries {
+            by_node
+                .entry(entry.node_name.clone())
+                .or_default()
+                .push(entry);
+        }
+
+        let _transition = self.node_state_transition.lock();
+        for (node_name, new_entries) in by_node {
+            let Some(node) = self.get_node(&node_name) else {
+                continue;
+            };
+            let Some(existing) = compatibility_release_quarantine(node.state_reason.as_deref())
+            else {
+                let reason = compatibility_release_quarantine_reason(
+                    new_entries,
+                    Some(CompatibilityReleaseQuarantineRestore {
+                        state: node.state,
+                        state_reason: node.state_reason.clone(),
+                        admin_locked: node.admin_locked,
+                        reason_uid: node.reason_uid,
+                        reason_time: node.reason_time,
+                        remove_on_clear: false,
+                        remove_reason: None,
+                    }),
+                )?;
+                self.propose(WalOperation::NodeStateChange {
+                    name: node_name,
+                    old_state: node.state,
+                    new_state: NodeState::Drain,
+                    reason: Some(reason),
+                    admin_locked: true,
+                    reason_uid: None,
+                    reason_time: Some(Utc::now()),
+                })?;
+                continue;
+            };
+
+            let reason = compatibility_release_quarantine_reason(
+                existing.entries.into_iter().chain(new_entries),
+                existing.restore,
+            )?;
+            self.propose(WalOperation::NodeStateChange {
+                name: node_name,
+                old_state: node.state,
+                new_state: NodeState::Drain,
+                reason: Some(reason),
+                admin_locked: true,
+                reason_uid: None,
+                reason_time: Some(Utc::now()),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn clear_release_quarantine_entries_compatibility(
+        &self,
+        entries: Vec<ReleaseQuarantine>,
+    ) -> anyhow::Result<()> {
+        let mut by_node: BTreeMap<String, HashSet<ReleaseQuarantine>> = BTreeMap::new();
+        for entry in entries {
+            by_node
+                .entry(entry.node_name.clone())
+                .or_default()
+                .insert(entry);
+        }
+
+        let _transition = self.node_state_transition.lock();
+        for (node_name, cleared_entries) in by_node {
+            let Some(node) = self.get_node(&node_name) else {
+                continue;
+            };
+            let Some(existing) = compatibility_release_quarantine(node.state_reason.as_deref())
+            else {
+                continue;
+            };
+            let remaining: Vec<_> = existing
+                .entries
+                .into_iter()
+                .filter(|entry| !cleared_entries.contains(entry))
+                .collect();
+            if !remaining.is_empty() {
+                self.propose(WalOperation::NodeStateChange {
+                    name: node_name,
+                    old_state: node.state,
+                    new_state: NodeState::Drain,
+                    reason: Some(compatibility_release_quarantine_reason(
+                        remaining,
+                        existing.restore,
+                    )?),
+                    admin_locked: true,
+                    reason_uid: None,
+                    reason_time: Some(Utc::now()),
+                })?;
+                continue;
+            }
+
+            if existing
+                .restore
+                .as_ref()
+                .is_some_and(|restore| restore.remove_on_clear)
+            {
+                let reason = existing.restore.and_then(|restore| restore.remove_reason);
+                let response = self.propose(WalOperation::NodeRemove {
+                    name: node_name.clone(),
+                    reason,
+                })?;
+                self.k8s_metrics
+                    .remove_node(&self.config().cluster_name, &node_name);
+                self.run_all_finalized_side_effects(&response);
+                self.compatibility_release_quarantines
+                    .write()
+                    .retain(|entry| entry.node_name != node_name);
+                continue;
+            }
+
+            let mut resumed = node.clone();
+            if let Some(restore) = existing.restore {
+                resumed.state = restore.state;
+                resumed.state_reason = restore.state_reason;
+                resumed.admin_locked = restore.admin_locked;
+                resumed.reason_uid = restore.reason_uid;
+                resumed.reason_time = restore.reason_time;
+            } else {
+                resumed.state = NodeState::Idle;
+                resumed.state_reason = None;
+                resumed.admin_locked = false;
+                resumed.reason_uid = None;
+                resumed.reason_time = None;
+            }
+            resumed.update_state_from_alloc();
+            self.propose(WalOperation::NodeStateChange {
+                name: node_name,
+                old_state: node.state,
+                new_state: resumed.state,
+                reason: resumed.state_reason,
+                admin_locked: resumed.admin_locked,
+                reason_uid: resumed.reason_uid,
+                reason_time: resumed.reason_time,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn propose_node_state_change(
+        &self,
+        mut change: ProposedNodeStateChange,
+    ) -> anyhow::Result<ClientResponse> {
+        if compatibility_release_quarantine(change.reason.as_deref()).is_none() {
+            if let Some(existing) = self
+                .get_node(&change.name)
+                .and_then(|node| compatibility_release_quarantine(node.state_reason.as_deref()))
+            {
+                let remove_on_clear = existing
+                    .restore
+                    .as_ref()
+                    .is_some_and(|restore| restore.remove_on_clear);
+                let remove_reason = existing
+                    .restore
+                    .as_ref()
+                    .and_then(|restore| restore.remove_reason.clone());
+                let restore = CompatibilityReleaseQuarantineRestore {
+                    state: change.new_state,
+                    state_reason: change.reason,
+                    admin_locked: change.admin_locked,
+                    reason_uid: change.reason_uid,
+                    reason_time: change.reason_time,
+                    remove_on_clear,
+                    remove_reason,
+                };
+                change.new_state = if change.new_state == NodeState::Down {
+                    NodeState::Down
+                } else {
+                    NodeState::Drain
+                };
+                change.reason = Some(compatibility_release_quarantine_reason(
+                    existing.entries,
+                    Some(restore),
+                )?);
+                change.admin_locked = true;
+                change.reason_uid = None;
+                change.reason_time = Some(Utc::now());
+            }
+        }
+        self.propose(WalOperation::NodeStateChange {
+            name: change.name,
+            old_state: change.old_state,
+            new_state: change.new_state,
+            reason: change.reason,
+            admin_locked: change.admin_locked,
+            reason_uid: change.reason_uid,
+            reason_time: change.reason_time,
+        })
+    }
+
+    fn defer_compatibility_node_removal(
+        &self,
+        name: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<Option<ClientResponse>> {
+        let Some(node) = self.get_node(name) else {
+            return Ok(None);
+        };
+        let Some(existing) = compatibility_release_quarantine(node.state_reason.as_deref()) else {
+            return Ok(None);
+        };
+        let mut restore = existing
+            .restore
+            .unwrap_or(CompatibilityReleaseQuarantineRestore {
+                state: NodeState::Down,
+                state_reason: None,
+                admin_locked: true,
+                reason_uid: None,
+                reason_time: None,
+                remove_on_clear: false,
+                remove_reason: None,
+            });
+        restore.remove_on_clear = true;
+        restore.remove_reason = reason;
+        let reason = compatibility_release_quarantine_reason(existing.entries, Some(restore))?;
+        self.propose(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state: node.state,
+            new_state: NodeState::Down,
+            reason: Some(reason),
+            admin_locked: true,
+            reason_uid: None,
+            reason_time: Some(Utc::now()),
+        })
+        .map(Some)
+    }
+
+    /// Return the still-fenced nodes grouped by their old run so eviction
+    /// follow-up cannot cancel one attempt with another attempt's epoch.
+    pub fn release_quarantines_by_attempt_for_job(
+        &self,
+        job_id: JobId,
+    ) -> BTreeMap<u32, Vec<String>> {
+        let mut by_attempt: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        let mut entries = self.node_release_quarantines.read().clone();
+        entries.extend(
+            self.compatibility_release_quarantines
+                .read()
+                .iter()
+                .cloned(),
+        );
+        for entry in entries.iter().filter(|entry| entry.job_id == job_id) {
+            by_attempt
+                .entry(entry.run_attempt)
+                .or_default()
+                .push(entry.node_name.clone());
+        }
+        for nodes in by_attempt.values_mut() {
+            nodes.sort();
+        }
+        by_attempt
+    }
+
+    /// Return every outstanding release fence keyed by the run it protects.
+    pub fn release_quarantines_by_job_and_attempt(&self) -> BTreeMap<(JobId, u32), Vec<String>> {
+        let mut quarantines = BTreeMap::new();
+        let mut entries = self.node_release_quarantines.read().clone();
+        entries.extend(
+            self.compatibility_release_quarantines
+                .read()
+                .iter()
+                .cloned(),
+        );
+        for entry in &entries {
+            quarantines
+                .entry((entry.job_id, entry.run_attempt))
+                .or_insert_with(Vec::new)
+                .push(entry.node_name.clone());
+        }
+        for nodes in quarantines.values_mut() {
+            nodes.sort();
+        }
+        quarantines
+    }
+
+    /// A node-completion report is an independent, attempt-specific proof of
+    /// teardown. It can arrive after controller finalization or requeue, when
+    /// the job record no longer carries the old node allocation.
+    fn clear_release_quarantine_for_completion(
+        &self,
+        job_id: JobId,
+        node_name: &str,
+        run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        let mut quarantines = self.node_release_quarantines.read().clone();
+        quarantines.extend(
+            self.compatibility_release_quarantines
+                .read()
+                .iter()
+                .cloned(),
+        );
+        let entries: Vec<_> = quarantines
+            .iter()
+            .filter(|entry| {
+                entry.job_id == job_id
+                    && entry.node_name == node_name
+                    && entry.run_attempt == run_attempt
+            })
+            .cloned()
+            .collect();
+        self.clear_release_quarantine_entries(entries)
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -1349,6 +1852,9 @@ impl ClusterManager {
             Self::check_job_owner(user, &job.spec.user, "cancel").map_err(CancelError::NotOwner)?;
         }
 
+        self.quarantine_job_release(job_id)
+            .map_err(CancelError::Internal)?;
+
         // Use JobComplete (not JobStateChange) so that resource deallocation
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
         // so the deallocation loop is a no-op.
@@ -1490,6 +1996,10 @@ impl ClusterManager {
             _ => None,
         };
 
+        if snapshot.is_some() {
+            self.quarantine_job_release(job_id)?;
+        }
+
         let resp = self.propose(WalOperation::JobUserRequeue {
             job_id,
             hold,
@@ -1554,6 +2064,11 @@ impl ClusterManager {
         } else {
             JobState::Failed
         };
+        self.quarantine_job_release(job_id)
+            .map_err(|e| SrunCompleteError::Internal {
+                job_id,
+                message: e.to_string(),
+            })?;
         self.complete_job(job_id, exit_code, state).map_err(|e| {
             warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
             SrunCompleteError::Internal {
@@ -1743,6 +2258,8 @@ impl ClusterManager {
         signal: i32,
         run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
+        self.clear_release_quarantine_for_completion(job_id, node_name, run_attempt)
+            .map_err(|source| NodeCompleteError::RaftPropose { source })?;
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1895,6 +2412,7 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Suspended)
             }
             PreemptMode::Cancel => {
+                self.quarantine_job_release(job_id)?;
                 let resp = self.propose(WalOperation::JobPreemptCancel {
                     job_id,
                     preempted_by,
@@ -1925,6 +2443,7 @@ impl ClusterManager {
                     .get(&job_id)
                     .and_then(|j| j.spec.begin_time)
                     .map_or(hold, |user_begin| user_begin.max(hold));
+                self.quarantine_job_release(job_id)?;
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
                     job_id,
                     begin_time,
@@ -2388,6 +2907,8 @@ impl ClusterManager {
             (job.state, self.launch_backoff_until(job))
         };
 
+        self.quarantine_job_release(job_id)?;
+
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
         self.propose(WalOperation::JobComplete {
@@ -2509,6 +3030,7 @@ impl ClusterManager {
                 return Ok(());
             }
         }
+        self.quarantine_job_release(job_id)?;
         let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(())
@@ -2787,7 +3309,14 @@ impl ClusterManager {
     /// `--nodelist` (its only option). Exclusion is resource-agnostic by design.
     pub fn nodes_off_dispatch_cooldown(&self, pending: &[Job]) -> Vec<Node> {
         let cooling = self.nodes_on_dispatch_cooldown();
-        if cooling.is_empty() {
+        let mut quarantined = self.node_release_quarantines.read().clone();
+        quarantined.extend(
+            self.compatibility_release_quarantines
+                .read()
+                .iter()
+                .cloned(),
+        );
+        if cooling.is_empty() && quarantined.is_empty() {
             return self.nodes.read().values().cloned().collect();
         }
         let pinned: HashSet<String> = pending
@@ -2799,7 +3328,10 @@ impl ClusterManager {
         self.nodes
             .read()
             .values()
-            .filter(|n| !cooling.contains(&n.name) || pinned.contains(&n.name))
+            .filter(|n| {
+                !quarantined.iter().any(|entry| entry.node_name == n.name)
+                    && (!cooling.contains(&n.name) || pinned.contains(&n.name))
+            })
             .cloned()
             .collect()
     }
@@ -2894,6 +3426,7 @@ impl ClusterManager {
         };
 
         if state == JobState::Running {
+            self.quarantine_job_release(job_id)?;
             self.propose(WalOperation::JobComplete {
                 job_id,
                 exit_code: -1,
@@ -3135,6 +3668,10 @@ impl ClusterManager {
         reason: Option<String>,
         reason_uid: Option<u32>,
     ) -> anyhow::Result<()> {
+        if state == NodeState::Down {
+            self.quarantine_node_evictions(name)?;
+        }
+        let _transition = self.node_state_transition.lock();
         let (old_state, effective_state) = {
             let nodes = self.nodes.read();
             let node = nodes
@@ -3162,7 +3699,7 @@ impl ClusterManager {
 
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
 
-        self.propose(WalOperation::NodeStateChange {
+        self.propose_node_state_change(ProposedNodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: effective_state,
@@ -3377,7 +3914,12 @@ impl ClusterManager {
                         self.get_node(&name).as_ref(),
                         Some("Not responding".into()),
                     );
-                    match self.propose(WalOperation::NodeStateChange {
+                    if let Err(e) = self.quarantine_node_evictions(&name) {
+                        warn!(node = %name, error = %e, "failed to fence jobs before node DOWN");
+                        continue;
+                    }
+                    let _transition = self.node_state_transition.lock();
+                    match self.propose_node_state_change(ProposedNodeStateChange {
                         name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
@@ -3401,6 +3943,7 @@ impl ClusterManager {
                     }
                 }
                 HealthAction::Recover { name, old_state } => {
+                    let _transition = self.node_state_transition.lock();
                     let node = self.get_node(&name);
                     let admin_locked = node.as_ref().is_some_and(|n| n.admin_locked);
                     let recovered_state = recovered_node_state(node.as_ref());
@@ -3412,7 +3955,7 @@ impl ClusterManager {
                         _ => (None, None, None),
                     };
                     info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
-                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
+                    if let Err(e) = self.propose_node_state_change(ProposedNodeStateChange {
                         name,
                         old_state,
                         new_state: recovered_state,
@@ -3437,6 +3980,7 @@ impl ClusterManager {
         reason: Option<String>,
         reason_uid: Option<u32>,
     ) -> anyhow::Result<(NodeState, u32)> {
+        let _transition = self.node_state_transition.lock();
         let (old_state, running_count) = {
             // Lock order is jobs before nodes, matching apply_operation. Taking
             // nodes first deadlocks against a raft apply that already holds jobs
@@ -3466,7 +4010,7 @@ impl ClusterManager {
             NodeState::Drain
         };
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
-        self.propose(WalOperation::NodeStateChange {
+        self.propose_node_state_change(ProposedNodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: target_state,
@@ -3507,6 +4051,8 @@ impl ClusterManager {
         name: &str,
         reason: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
+        self.quarantine_node_evictions(name)?;
+        let _transition = self.node_state_transition.lock();
         let (old_state, admin_locked, reason, reason_uid, reason_time) = {
             let nodes = self.nodes.read();
             let node = nodes
@@ -3521,7 +4067,7 @@ impl ClusterManager {
                 reason_time,
             )
         };
-        let resp = self.propose(WalOperation::NodeStateChange {
+        let resp = self.propose_node_state_change(ProposedNodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: NodeState::Down,
@@ -3556,6 +4102,16 @@ impl ClusterManager {
                 "node '{}' has running jobs; use --force to evict them",
                 name
             );
+        }
+
+        if force {
+            self.quarantine_node_evictions(name)?;
+        }
+        if let Some(resp) = self.defer_compatibility_node_removal(name, reason.clone())? {
+            self.k8s_metrics
+                .set_node_up(&self.config().cluster_name, name, false);
+            self.run_all_finalized_side_effects(&resp);
+            return Ok(resp.jobs_finalized);
         }
 
         let resp = self.propose(WalOperation::NodeRemove {
@@ -4722,7 +5278,7 @@ impl ClusterManager {
     }
 
     /// Cancel running jobs whose reservation window has ended (after optional grace).
-    pub fn enforce_reservation_end_times(&self) {
+    pub fn enforce_reservation_end_times(&self) -> Vec<Job> {
         let now = Utc::now();
         let grace = chrono::Duration::minutes(self.config().scheduler.resv_overrun_minutes as i64);
         let reservations: std::collections::HashMap<String, Reservation> = self
@@ -4730,7 +5286,7 @@ impl ClusterManager {
             .into_iter()
             .map(|r| (r.name.clone(), r))
             .collect();
-        let to_cancel: Vec<JobId> = self
+        let to_cancel: Vec<Job> = self
             .jobs
             .read()
             .values()
@@ -4744,17 +5300,26 @@ impl ClusterManager {
                 let res_name = job.spec.reservation.as_ref()?;
                 let res = reservations.get(res_name)?;
                 if now > res.end_time + grace {
-                    Some(job.job_id)
+                    Some(job.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        for job_id in to_cancel {
+        let mut cancelled = Vec::new();
+        for job in to_cancel {
+            let job_id = job.job_id;
+            if let Err(e) = self.quarantine_job_release(job_id) {
+                warn!(job_id, error = %e, "failed to fence job before reservation cancellation");
+                continue;
+            }
             if let Err(e) = self.complete_job(job_id, -1, JobState::Cancelled) {
                 warn!(job_id, error = %e, "failed to cancel job after reservation ended");
+            } else {
+                cancelled.push(job);
             }
         }
+        cancelled
     }
 
     fn validate_reservation_job_overlap(
@@ -5108,6 +5673,46 @@ impl ClusterManager {
 
     pub fn set_raft(&self, raft: SpurRaft) {
         *self.raft.write() = Some(raft);
+    }
+
+    pub fn set_raft_voters(&self, voters: BTreeMap<crate::raft::NodeId, String>) {
+        *self.raft_voters.write() = Some(voters);
+    }
+
+    pub fn record_release_quarantine_agent_capability(&self, node_name: &str, capable: bool) {
+        let mut capable_agents = self.release_quarantine_capable_agents.write();
+        if capable {
+            capable_agents.insert(node_name.to_string());
+        } else {
+            capable_agents.remove(node_name);
+        }
+    }
+
+    pub fn release_quarantine_agent_capable(&self, node_name: &str) -> bool {
+        self.release_quarantine_capable_agents
+            .read()
+            .contains(node_name)
+    }
+
+    fn native_release_quarantine_enabled(&self) -> bool {
+        let Some(voters) = self.raft_voters.read().clone() else {
+            return false;
+        };
+        let capable_agents = self.release_quarantine_capable_agents.read();
+        if self
+            .nodes
+            .read()
+            .values()
+            .filter(|node| node.state.is_up())
+            .any(|node| !capable_agents.contains(&node.name))
+        {
+            return false;
+        }
+        drop(capable_agents);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(crate::raft::all_peers_support_release_quarantine(&voters))
+        })
     }
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
@@ -6098,6 +6703,17 @@ impl ClusterManager {
                     job.launch_failure_detail = Some(detail.clone());
                 }
             }
+            WalOperation::ReleaseQuarantine { entries } => {
+                self.node_release_quarantines
+                    .write()
+                    .extend(entries.iter().cloned());
+            }
+            WalOperation::ReleaseQuarantineClear { entries } => {
+                let mut quarantines = self.node_release_quarantines.write();
+                for entry in entries {
+                    quarantines.remove(entry);
+                }
+            }
             WalOperation::JobStart {
                 job_id,
                 nodes: node_names,
@@ -6527,6 +7143,14 @@ impl ClusterManager {
                         node.last_heartbeat = None;
                     }
                 }
+                let compatibility_entries = compatibility_release_quarantines(reason.as_deref())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|entry| entry.node_name == *name)
+                    .collect::<HashSet<_>>();
+                let mut compatibility = self.compatibility_release_quarantines.write();
+                compatibility.retain(|entry| entry.node_name != *name);
+                compatibility.extend(compatibility_entries);
                 if *new_state == NodeState::Down {
                     Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
                 }
@@ -6938,6 +7562,11 @@ struct ClusterSnapshot {
     /// from survivors alone would reissue used ids; restore takes max(rebuilt, this).
     #[serde(default)]
     next_job_id: JobId,
+    /// Nodes that remain fenced after controller capacity was released but
+    /// before an agent confirmed its matching local teardown. Absent in old
+    /// snapshots because those controllers had no such state to preserve.
+    #[serde(default)]
+    release_quarantines: HashSet<ReleaseQuarantine>,
 }
 
 impl ClusterManager {
@@ -7004,12 +7633,15 @@ impl StateMachineApply for ClusterManager {
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
             k0s: self.k0s.read().clone(),
             next_job_id: self.next_job_id.load(Ordering::Relaxed),
+            release_quarantines: self.node_release_quarantines.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
 
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
+
+        *self.node_release_quarantines.write() = snap.release_quarantines.clone();
 
         // Fold in the persisted high-water mark so evicting the high-id tail
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
@@ -7026,6 +7658,12 @@ impl StateMachineApply for ClusterManager {
         for node in snap.nodes {
             nodes.insert(node.name.clone(), node);
         }
+        let compatibility_entries: HashSet<_> = nodes
+            .values()
+            .filter_map(|node| compatibility_release_quarantines(node.state_reason.as_deref()))
+            .flatten()
+            .collect();
+        *self.compatibility_release_quarantines.write() = compatibility_entries;
         self.k0s_role_counts
             .recompute_from(nodes.values().map(|n| n.k0s_role));
 
@@ -8702,6 +9340,9 @@ mod tests {
             .await
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
+        // Most unit tests model a converged new-version cluster. The empty
+        // voter set keeps that model local without a test Raft RPC listener.
+        cm.set_raft_voters(std::collections::BTreeMap::new());
         cm
     }
 
@@ -8911,6 +9552,357 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_quarantine_excludes_a_pinned_node_and_survives_snapshot_restore() {
+        let source = TempDir::new().unwrap();
+        let cm = test_cluster(&source).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let pending = cm.get_job(job_id).unwrap();
+        let fence = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 77,
+            run_attempt: 3,
+        };
+        cm.quarantine_release_entries(vec![fence.clone()]).unwrap();
+
+        let names: HashSet<String> = cm
+            .nodes_off_dispatch_cooldown(std::slice::from_ref(&pending))
+            .into_iter()
+            .map(|node| node.name)
+            .collect();
+        assert!(
+            !names.contains("n1"),
+            "a release fence must not be bypassed by --nodelist"
+        );
+        assert!(names.contains("n2"));
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        let restored_pending = restored.get_job(job_id).unwrap();
+        assert!(
+            !restored
+                .nodes_off_dispatch_cooldown(std::slice::from_ref(&restored_pending))
+                .iter()
+                .any(|node| node.name == "n1"),
+            "a leadership catch-up snapshot must retain the release fence"
+        );
+
+        restored
+            .clear_release_quarantine_entries(vec![fence])
+            .unwrap();
+        assert!(
+            restored
+                .nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .any(|node| node.name == "n1"),
+            "only an attempt-specific positive acknowledgement may reopen the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_old_snapshot_defaults_release_quarantines() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("release_quarantines");
+
+        cm.restore_from_snapshot(&serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        assert!(
+            cm.node_release_quarantines.read().is_empty(),
+            "old snapshots must restore with no release fences"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compatibility_release_fence_survives_snapshot_and_clears_each_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        // An unreachable voter models a controller that cannot advertise the
+        // additive capability, which selects the compatibility representation.
+        cm.set_raft_voters(std::collections::BTreeMap::from([(
+            1,
+            "[::1]:0".to_string(),
+        )]));
+        register_node(&cm, "n1", 4, 8000);
+        let first = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 17,
+            run_attempt: 1,
+        };
+        let second = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 18,
+            run_attempt: 2,
+        };
+
+        cm.quarantine_release_entries(vec![first.clone(), second.clone()])
+            .unwrap();
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert!(node.admin_locked);
+        assert_eq!(
+            compatibility_release_quarantines(node.state_reason.as_deref())
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([first.clone(), second.clone()]),
+        );
+        assert!(cm.node_release_quarantines.read().is_empty());
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert!(
+            restored
+                .nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .all(|node| node.name != "n1"),
+            "the old-compatible drain must remain a scheduler fence after restore"
+        );
+
+        restored
+            .clear_release_quarantine_entries(vec![first])
+            .unwrap();
+        assert_eq!(restored.get_node("n1").unwrap().state, NodeState::Drain);
+        restored
+            .clear_release_quarantine_entries(vec![second])
+            .unwrap();
+        assert_eq!(restored.get_node("n1").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compatibility_release_fence_preserves_an_existing_admin_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_raft_voters(std::collections::BTreeMap::from([(
+            1,
+            "[::1]:0".to_string(),
+        )]));
+        register_node(&cm, "n1", 4, 8000);
+        cm.update_node_state(
+            "n1",
+            NodeState::Drain,
+            Some("operator maintenance".into()),
+            Some(42),
+        )
+        .unwrap();
+        wait_for("node n1 drained", || {
+            cm.get_node("n1").is_some_and(|node| {
+                node.state == NodeState::Drain
+                    && node.state_reason.as_deref() == Some("operator maintenance")
+            })
+        });
+
+        let fence = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 17,
+            run_attempt: 1,
+        };
+        cm.quarantine_release_entries(vec![fence.clone()]).unwrap();
+        wait_for("compatibility fence persisted over admin hold", || {
+            cm.release_quarantines_by_job_and_attempt()
+                .get(&(17, 1))
+                .is_some_and(|nodes| nodes == &["n1".to_string()])
+        });
+        assert!(
+            compatibility_release_quarantines(
+                cm.get_node("n1")
+                    .and_then(|node| node.state_reason)
+                    .as_deref()
+            )
+            .is_some(),
+            "the held node must retain a durable release fence until acknowledgement"
+        );
+
+        cm.clear_release_quarantine_entries(vec![fence]).unwrap();
+        wait_for("operator drain restored after acknowledgement", || {
+            cm.get_node("n1").is_some_and(|node| {
+                node.state == NodeState::Drain
+                    && node.admin_locked
+                    && node.state_reason.as_deref() == Some("operator maintenance")
+                    && node.reason_uid == Some(42)
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compatibility_release_fence_survives_later_node_state_changes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_raft_voters(std::collections::BTreeMap::from([(
+            1,
+            "[::1]:0".to_string(),
+        )]));
+        register_node(&cm, "n1", 4, 8000);
+        let fence = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 17,
+            run_attempt: 1,
+        };
+        cm.quarantine_release_entries(vec![fence.clone()]).unwrap();
+
+        cm.update_node_state("n1", NodeState::Idle, Some("operator resume".into()), None)
+            .unwrap();
+        let held = cm.get_node("n1").unwrap();
+        assert_eq!(held.state, NodeState::Drain);
+        assert!(compatibility_release_quarantines(held.state_reason.as_deref()).is_some());
+        assert!(
+            !cm.nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .any(|node| node.name == "n1"),
+            "an admin state change must not make a fenced node schedulable"
+        );
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        restored
+            .clear_release_quarantine_entries(vec![fence])
+            .unwrap();
+        let resumed = restored.get_node("n1").unwrap();
+        assert_eq!(resumed.state, NodeState::Idle);
+        assert_eq!(resumed.state_reason.as_deref(), Some("operator resume"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compatibility_force_removal_waits_for_release_after_snapshot_restore() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_raft_voters(std::collections::BTreeMap::from([(
+            1,
+            "[::1]:0".to_string(),
+        )]));
+        register_node(&cm, "n1", 4, 8000);
+        let fence = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 17,
+            run_attempt: 1,
+        };
+        cm.quarantine_release_entries(vec![fence.clone()]).unwrap();
+        cm.remove_node("n1", true, Some("decommission".into()))
+            .unwrap();
+
+        let held = cm.get_node("n1").unwrap();
+        assert_eq!(held.state, NodeState::Down);
+        assert!(compatibility_release_quarantines(held.state_reason.as_deref()).is_some());
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert!(restored.get_node("n1").is_some());
+        assert!(
+            !restored
+                .nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .any(|node| node.name == "n1"),
+            "a force-removed node must remain fenced until teardown is acknowledged"
+        );
+
+        restored
+            .clear_release_quarantine_entries(vec![fence])
+            .unwrap();
+        assert!(restored.get_node("n1").is_none());
+        assert!(restored.release_quarantines_by_job_and_attempt().is_empty());
+    }
+
+    #[test]
+    fn compatibility_release_fence_decodes_a_pre_removal_metadata_payload() {
+        let reason = format!(
+            "{RELEASE_QUARANTINE_DRAIN_PREFIX}{}",
+            serde_json::json!({
+                "entries": [{"node_name": "n1", "job_id": 17, "run_attempt": 1}],
+                "restore": {
+                    "state": serde_json::to_value(NodeState::Idle).expect("node state serializes"),
+                    "state_reason": null,
+                    "admin_locked": false,
+                    "reason_uid": null,
+                    "reason_time": null
+                }
+            })
+        );
+        let decoded = compatibility_release_quarantine(Some(&reason)).unwrap();
+        let restore = decoded.restore.unwrap();
+        assert!(!restore.remove_on_clear);
+        assert!(restore.remove_reason.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_quarantines_keep_nodes_grouped_by_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        cm.quarantine_release_entries(vec![
+            ReleaseQuarantine {
+                node_name: "n1".into(),
+                job_id: 9,
+                run_attempt: 1,
+            },
+            ReleaseQuarantine {
+                node_name: "n2".into(),
+                job_id: 9,
+                run_attempt: 2,
+            },
+            ReleaseQuarantine {
+                node_name: "n3".into(),
+                job_id: 9,
+                run_attempt: 1,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cm.release_quarantines_by_attempt_for_job(9),
+            BTreeMap::from([
+                (1, vec!["n1".to_string(), "n3".to_string()]),
+                (2, vec!["n2".to_string()]),
+            ]),
+            "each cancellation RPC must retain the fence's own run attempt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_node_completion_releases_a_terminal_cancel_fence() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("cancelled"));
+        start_job_on(&cm, job_id, "n1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert!(
+            !cm.nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .any(|node| node.name == "n1"),
+            "terminal cancellation must fence the controller-freed node"
+        );
+
+        assert!(matches!(
+            cm.node_complete(job_id, "n1", -1, 9, run_attempt).unwrap(),
+            NodeCompleteResult::AlreadyTerminal
+        ));
+        assert!(
+            cm.nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .any(|node| node.name == "n1"),
+            "a late completion from the fenced attempt must release the node"
+        );
+    }
+
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
     /// after reconfigure, not just the swapped config value. A job whose
     /// `requeue_count` sits between the old and new caps is a no-op under the
@@ -9082,6 +10074,7 @@ mod tests {
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
         });
+        cm.record_release_quarantine_agent_capability(name, true);
     }
 
     fn health_check(program: &str, interval_secs: u64) -> HealthCheck {
@@ -24962,6 +25955,7 @@ mod tests {
             burst_buffer_total_gb: 0,
             k0s: spur_core::k0s::K0sClusterState::default(),
             next_job_id: 0,
+            release_quarantines: HashSet::new(),
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();

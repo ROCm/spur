@@ -363,10 +363,17 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
             }
         }
 
-        // Delete headless Service
+        // A requeued job may have created more than one attempt-specific Service.
         let services: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
-        let _ = services.delete(&svc_name, &DeleteParams::default()).await;
+        if let Ok(service_list) = services.list(&lp).await {
+            for service in service_list {
+                if let Some(service_name) = service.metadata.name {
+                    let _ = services
+                        .delete(&service_name, &DeleteParams::default())
+                        .await;
+                }
+            }
+        }
     }
 
     Ok(Action::await_change())

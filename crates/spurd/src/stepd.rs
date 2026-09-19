@@ -1535,20 +1535,38 @@ pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()
     }
 }
 
+/// Outcome of a supervisor's pre-launch gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GateOutcome {
+    Started,
+    Cancelled,
+    Disconnected,
+}
+
 /// Serves the control socket before the job exists, so spurd's handshake
-/// completes without waiting on the launch. Returns once Start arrives.
+/// completes without waiting on the launch. Returns once Start or terminal
+/// teardown arrives.
 async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> io::Result<()> {
     // Connections are served concurrently: the agent's readiness probe and its
     // later Start arrive on separate connections, and the first must not block
     // the second.
-    let (released, mut is_released) = tokio::sync::mpsc::channel::<()>(1);
+    let (outcomes, mut outcome) = tokio::sync::mpsc::channel::<GateOutcome>(1);
     loop {
         tokio::select! {
-            _ = is_released.recv() => return Ok(()),
+            result = outcome.recv() => match result {
+                Some(GateOutcome::Started) => return Ok(()),
+                Some(GateOutcome::Cancelled) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "job cancelled before the supervisor start gate opened",
+                    ));
+                }
+                Some(GateOutcome::Disconnected) | None => {}
+            },
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let descriptor = descriptor.clone();
-                let released = released.clone();
+                let outcomes = outcomes.clone();
                 tokio::spawn(async move {
                     let hello = tokio::time::timeout(
                         STEPD_HANDSHAKE_TIMEOUT,
@@ -1567,10 +1585,10 @@ async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> i
                         }
                     };
                     match serve_until_start(stream, &descriptor).await {
-                        Ok(true) => {
-                            let _ = released.send(()).await;
+                        Ok(outcome @ (GateOutcome::Started | GateOutcome::Cancelled)) => {
+                            let _ = outcomes.send(outcome).await;
                         }
-                        Ok(false) => {}
+                        Ok(GateOutcome::Disconnected) => {}
                         Err(error) => {
                             tracing::warn!(%error, "pre-launch control connection failed")
                         }
@@ -1581,9 +1599,11 @@ async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> i
     }
 }
 
-/// Answers requests on one connection until Start. `Ok(true)` means the job
-/// was released; `Ok(false)` means the peer hung up without releasing it.
-async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> io::Result<bool> {
+/// Answers requests on one connection until Start or cancellation.
+async fn serve_until_start(
+    stream: UnixStream,
+    descriptor: &StepdDescriptor,
+) -> io::Result<GateOutcome> {
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -1596,7 +1616,7 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
             io::Error::new(io::ErrorKind::TimedOut, "control connection idle timeout")
         })??;
         if read == 0 {
-            return Ok(false);
+            return Ok(GateOutcome::Disconnected);
         }
         let request: StepdRequest = serde_json::from_str(&line).map_err(|error| {
             io::Error::new(
@@ -1604,9 +1624,18 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
                 format!("invalid runtime request: {error}"),
             )
         })?;
-        let started = matches!(request, StepdRequest::Start);
+        let outcome = match request {
+            StepdRequest::Start => Some(GateOutcome::Started),
+            StepdRequest::BeginTeardown | StepdRequest::Shutdown => Some(GateOutcome::Cancelled),
+            _ => None,
+        };
         let response = match request {
             StepdRequest::Start => StepdResponse::Acknowledged,
+            // A partial dispatch can be cancelled while this supervisor is
+            // still waiting for Start. Acknowledge the terminal teardown and
+            // return so its process exits; otherwise its uncommitted ledger
+            // reservation survives until the gate's timeout.
+            StepdRequest::BeginTeardown | StepdRequest::Shutdown => StepdResponse::Acknowledged,
             // The agent probes readiness with QueryState before releasing the
             // job, so refusing it here would deadlock the launch.
             StepdRequest::QueryState => StepdResponse::State {
@@ -1631,8 +1660,8 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
         })?;
         reader.get_mut().write_all(&encoded).await?;
         reader.get_mut().write_all(b"\n").await?;
-        if started {
-            return Ok(true);
+        if let Some(outcome) = outcome {
+            return Ok(outcome);
         }
     }
 }
@@ -4745,7 +4774,10 @@ mod tests {
             serde_json::from_str::<StepdResponse>(&line).expect("decode"),
             StepdResponse::Acknowledged
         ));
-        assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(
+            server.await.expect("join").expect("serve"),
+            GateOutcome::Started
+        );
     }
 
     #[tokio::test]
@@ -4770,7 +4802,53 @@ mod tests {
             serde_json::from_str::<StepdResponse>(&ack).expect("decode"),
             StepdResponse::Acknowledged
         ));
-        assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(
+            server.await.expect("join").expect("serve"),
+            GateOutcome::Started
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gate_acknowledges_terminal_teardown_without_starting() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let descriptor = gate_descriptor();
+        let server =
+            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let (reader, mut writer) = client_stream.into_split();
+        send(&mut writer, StepdRequest::Shutdown).await;
+        let mut response = String::new();
+        BufReader::new(reader)
+            .read_line(&mut response)
+            .await
+            .expect("read shutdown acknowledgement");
+        assert!(matches!(
+            serde_json::from_str::<StepdResponse>(&response).expect("decode"),
+            StepdResponse::Acknowledged
+        ));
+        assert_eq!(
+            server.await.expect("join").expect("serve"),
+            GateOutcome::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_teardown_unblocks_the_pre_start_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+        shutdown_allocation(&descriptor, "cancel".into())
+            .await
+            .expect("shutdown accepted while the gate is closed");
+        let error = gate
+            .await
+            .expect("join")
+            .expect_err("terminal teardown must abort the pre-start gate");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     // Start and the readiness probe arrive on separate connections, so the
@@ -4807,7 +4885,10 @@ mod tests {
         let server =
             tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
         drop(client_stream);
-        assert!(!server.await.expect("join").expect("serve"));
+        assert_eq!(
+            server.await.expect("join").expect("serve"),
+            GateOutcome::Disconnected
+        );
     }
 
     /// How long a wedged supervisor in the tests below stays silent. It hangs up

@@ -13,6 +13,19 @@ use std::collections::HashMap;
 
 use crate::resource::{ResourceAllocations, ResourceSet};
 
+/// A node whose controller-side allocation was released before its agent
+/// confirmed that the matching local allocation had gone away.
+///
+/// This lives in the Raft log rather than a leader-local retry map: a new
+/// leader must retain the scheduling fence while an old agent can still hold
+/// its cgroup or GPU ledger entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReleaseQuarantine {
+    pub node_name: String,
+    pub job_id: JobId,
+    pub run_attempt: u32,
+}
+
 fn default_port() -> u16 {
     6818
 }
@@ -193,6 +206,16 @@ pub enum WalOperation {
     JobLaunchFailureDetail {
         job_id: JobId,
         detail: String,
+    },
+    /// Prevent scheduling on nodes whose old local allocation may still be
+    /// live. Proposed before the transition that releases controller capacity.
+    ReleaseQuarantine {
+        entries: Vec<ReleaseQuarantine>,
+    },
+    /// Remove only the matching attempt's release fences after the agent has
+    /// positively acknowledged teardown.
+    ReleaseQuarantineClear {
+        entries: Vec<ReleaseQuarantine>,
     },
 
     // Node operations
@@ -1291,6 +1314,38 @@ mod evict_wal_tests {
                 assert_eq!(restored.name, "hostname");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod release_quarantine_wal_tests {
+    use super::*;
+
+    #[test]
+    fn release_quarantine_ops_round_trip_with_the_attempt_key() {
+        let entry = ReleaseQuarantine {
+            node_name: "n1".into(),
+            job_id: 42,
+            run_attempt: 3,
+        };
+        for op in [
+            WalOperation::ReleaseQuarantine {
+                entries: vec![entry.clone()],
+            },
+            WalOperation::ReleaseQuarantineClear {
+                entries: vec![entry.clone()],
+            },
+        ] {
+            let json = serde_json::to_string(&op).unwrap();
+            let restored: WalOperation = serde_json::from_str(&json).unwrap();
+            match restored {
+                WalOperation::ReleaseQuarantine { entries }
+                | WalOperation::ReleaseQuarantineClear { entries } => {
+                    assert_eq!(entries, vec![entry.clone()]);
+                }
+                _ => panic!("wrong variant"),
+            }
         }
     }
 }
