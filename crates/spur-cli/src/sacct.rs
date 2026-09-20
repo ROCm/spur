@@ -100,6 +100,7 @@ pub fn sacct_header(spec: char) -> &'static str {
         'y' => "PreemptedBy",
         'm' => "PreemptMode",
         'q' => "PreemptQOS",
+        'W' => "Borrowed",
         _ => "?",
     }
 }
@@ -127,6 +128,7 @@ fn sacct_field_spec(name: &str) -> Option<char> {
         "preemptedby" => Some('y'),
         "preemptmode" => Some('m'),
         "preemptqos" => Some('q'),
+        "borrowed" => Some('W'),
         _ => None,
     }
 }
@@ -256,6 +258,16 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
                 job.preempt_qos.clone()
             }
         }
+        // ReqMem had a header and a name lookup but no resolver, so `--format=ReqMem`
+        // rendered "?". Suffixed the way scontrol renders it, with a bare 0 for an
+        // unset floor.
+        'R' => match job.min_memory_node_mb {
+            0 => "0".to_string(),
+            mb => format!("{mb}M"),
+        },
+        // Whether the run took borrowed capacity. Same letter as squeue's %W so the
+        // two commands agree on how to ask.
+        'W' => if job.idle_fill { "yes" } else { "no" }.into(),
         _ => "?".into(),
     }
 }
@@ -372,6 +384,75 @@ mod tests {
         ];
         for (s, expected) in cases {
             assert_eq!(parse_acct_state(s), Some(expected as i32), "state {s}");
+        }
+    }
+
+    #[test]
+    fn borrowed_field_reports_whether_the_run_took_borrowed_capacity() {
+        let mut borrowed = JobInfo::default();
+        borrowed.idle_fill = true;
+        assert_eq!(resolve_sacct_field(&borrowed, 'W'), "yes");
+
+        let ordinary = JobInfo::default();
+        assert_eq!(resolve_sacct_field(&ordinary, 'W'), "no");
+    }
+
+    #[test]
+    fn reqmem_renders_suffixed_matching_scontrol() {
+        // Regression: this field was registered in the header and name tables but had no
+        // resolver, so `sacct --format=ReqMem` printed "?". Found by the three-way
+        // registration test below.
+        let mut j = job(0, 0, 0);
+        assert_eq!(resolve_sacct_field(&j, 'R'), "0");
+        j.min_memory_node_mb = 16000;
+        assert_eq!(resolve_sacct_field(&j, 'R'), "16000M");
+    }
+
+    #[test]
+    fn every_named_field_resolves_to_a_header_and_a_value() {
+        // A field is only usable when all three registrations agree: the name -> letter
+        // lookup, the letter -> header name, and the letter -> value resolver. Half-
+        // registering one is silent, and shipped documentation once described a field
+        // that had a column and a header but no resolver, so this walks the whole set.
+        let names = [
+            "jobid",
+            "jobname",
+            "user",
+            "account",
+            "partition",
+            "state",
+            "elapsed",
+            "nnodes",
+            "exitcode",
+            "derivedexitcode",
+            "start",
+            "end",
+            "submit",
+            "timelimit",
+            "nodelist",
+            "ncpus",
+            "reqmem",
+            "qos",
+            "preemptedby",
+            "preemptmode",
+            "preemptqos",
+            "borrowed",
+        ];
+        let job = JobInfo::default();
+        for name in names {
+            let spec = sacct_field_spec(name).unwrap_or_else(|| panic!("{name} has no field spec"));
+            assert_ne!(
+                sacct_header(spec),
+                "?",
+                "{name} maps to '{spec}' which has no header name"
+            );
+            // An unresolved letter falls through to "?", so this catches a letter that
+            // was added to the tables but never given a value.
+            assert_ne!(
+                resolve_sacct_field(&job, spec),
+                "?",
+                "{name} maps to '{spec}' which has no value resolver"
+            );
         }
     }
 

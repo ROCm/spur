@@ -369,14 +369,25 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``%`` letters. Available fields include ``JobID``, ``JobName``, ``User``,
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
-``NCPUS``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, and ``PreemptQOS``. Set a
-per-field width with ``Field%N``, e.g. ``JobName%20``.
+``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
+and ``Borrowed``. Set a per-field width with ``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
 ``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS name that
 authorized the preemption under ``preempt_type = qos_priority``; ``N/A`` for
 plain priority-based preemption. All three appear in the long format (``-l``).
+
+``Borrowed`` is ``yes`` when the run took borrowed capacity under
+:doc:`/admin-guide/idle-fill-scheduling`, and ``no`` otherwise. It is the same
+question ``squeue``'s ``%W`` answers for a running job:
+
+.. code-block:: console
+
+   $ sacct --format=JobID,User,State,Borrowed
+   JobID  User     State      Borrowed
+   19     ifbob    PREEMPTED  yes
+   21     ifalice  COMPLETED  no
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.

@@ -198,6 +198,7 @@ An over-quota job that has *not* been lent capacity keeps reporting its real
 reason, ``QOSGrpNodeLimit``, rather than a placement reason — being over quota is
 the truth about why it is waiting.
 
-``sacct`` records whether a completed run was borrowed, and a reclaimed run is
+``sacct --format=Borrowed`` records whether a completed run was borrowed, and a
+reclaimed run is
 reported as ``PREEMPTED`` with ``PreemptMode=Requeue`` and the job that reclaimed
 it. See :doc:`/user-guide/monitoring-jobs`.
