@@ -2624,7 +2624,7 @@ enum StepContainerPlan {
     /// priority — the step joins the parent's namespaces instead.
     None,
     /// No containerized parent to join: build a fresh rootfs for this step.
-    Fresh { image: String, mounts: Vec<String> },
+    Fresh(spur_proto::proto::ContainerSpec),
 }
 
 fn resolve_step_container_plan(
@@ -2637,10 +2637,7 @@ fn resolve_step_container_plan(
     if joins_parent_namespaces {
         return StepContainerPlan::None;
     }
-    StepContainerPlan::Fresh {
-        image: c.image.clone(),
-        mounts: c.mounts.clone(),
-    }
+    StepContainerPlan::Fresh(c.clone())
 }
 
 /// Everything needed to resolve an image and stage a fresh rootfs for a
@@ -2721,6 +2718,80 @@ fn build_container_launch(
         },
         rootfs_mode,
     ))
+}
+
+/// Per-caller inputs to [`stage_fresh_container_step`] that a supervised
+/// step and an interactive session resolve differently before converging on
+/// the shared build-and-stage path.
+struct FreshContainerContext {
+    gpu_devices: Vec<u32>,
+    device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+    uid: u32,
+    gid: u32,
+    username: String,
+    home_dir: String,
+    environment: HashMap<String, String>,
+    workdir_default: Option<String>,
+    rootfs_base: String,
+}
+
+/// Builds a `StepContainerPlan::Fresh` step's rootfs and stages its in-rootfs
+/// entry script. Shared by `run_command`'s supervised path and the
+/// interactive session's fresh-launch path, which only differ in how they
+/// resolve `FreshContainerContext` beforehand.
+fn stage_fresh_container_step(
+    cluster_id: &str,
+    allow_root_jobs: bool,
+    c: &spur_proto::proto::ContainerSpec,
+    ctx: FreshContainerContext,
+    job_id: u32,
+    step_script: &str,
+) -> Result<
+    (
+        executor::ContainerLaunchConfig,
+        crate::container::RootfsMode,
+    ),
+    Status,
+> {
+    let mut container_env = c.env.clone();
+    maybe_deny_gpu_env(&mut container_env, &ctx.gpu_devices);
+    let (launch, rootfs_mode) = build_container_launch(
+        cluster_id,
+        allow_root_jobs,
+        ContainerLaunchRequest {
+            image: c.image.clone(),
+            mounts: c.mounts.clone(),
+            workdir: (!c.workdir.is_empty())
+                .then(|| c.workdir.clone())
+                .or(ctx.workdir_default),
+            name: (!c.name.is_empty()).then(|| c.name.clone()),
+            readonly: c.readonly,
+            mount_home: c.mount_home,
+            remap_root: c.remap_root,
+            gpu_devices: ctx.gpu_devices,
+            environment: ctx.environment,
+            container_env,
+            entrypoint: (!c.entrypoint.is_empty()).then(|| c.entrypoint.clone()),
+            uid: ctx.uid,
+            gid: ctx.gid,
+            username: ctx.username,
+            home_dir: ctx.home_dir,
+            device_plan: ctx.device_plan,
+            resolve_user: None,
+            rootfs_base: ctx.rootfs_base,
+        },
+    )?;
+    // `executor::launch_job`'s container path execs this fixed in-container
+    // path unconditionally for every freshly-containerized step.
+    let container_script = format!("{}/tmp/spur_job_{job_id}.sh", launch.rootfs.display());
+    std::fs::write(&container_script, step_script)
+        .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&container_script, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok((launch, rootfs_mode))
 }
 
 /// The plan a step's supervisor hosts its PMIx server from. Re-keyed to the step
@@ -3796,6 +3867,33 @@ impl AgentService {
         }
 
         Ok((descriptor, waiter))
+    }
+
+    /// Tears down a `STEP_INTERACTIVE` stepd that launched successfully but
+    /// that this call cannot hand off to a client — otherwise it leaks as a
+    /// live supervisor and workload nobody ever attaches to.
+    async fn abandon_interactive_launch(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_key: (u32, u32),
+        descriptor: &crate::stepd::StepdDescriptor,
+    ) {
+        self.active_steps.lock().await.remove(&step_key);
+        self.step_completions
+            .deregister(job_id, run_attempt, spur_core::step::STEP_INTERACTIVE)
+            .await;
+        if let Err(error) = stop_stepd_process(descriptor).await {
+            warn!(job_id, %error, "failed to stop an abandoned terminal supervisor");
+        }
+        release_stepd_tracking(
+            &self.running,
+            &self.allocation,
+            &self.stepds,
+            descriptor,
+            "interactive session failed after launch",
+        )
+        .await;
     }
 
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
@@ -6628,65 +6726,29 @@ impl SlurmAgent for AgentService {
                     }
                     None
                 }
-                StepContainerPlan::Fresh { image, mounts } => {
+                StepContainerPlan::Fresh(c) => {
                     let home_dir = env
                         .get("HOME")
                         .cloned()
                         .unwrap_or_else(|| format!("/home/{username}"));
-                    let c = req
-                        .container
-                        .as_ref()
-                        .expect("Fresh implies a container spec");
-                    let (launch, rootfs_mode) = build_container_launch(
+                    let (launch, rootfs_mode) = stage_fresh_container_step(
                         &self.cluster_id,
                         self.allow_root_jobs,
-                        ContainerLaunchRequest {
-                            image,
-                            mounts,
-                            workdir: if !c.workdir.is_empty() {
-                                Some(c.workdir.clone())
-                            } else if !work_dir.is_empty() {
-                                Some(work_dir.clone())
-                            } else {
-                                None
-                            },
-                            name: (!c.name.is_empty()).then(|| c.name.clone()),
-                            readonly: c.readonly,
-                            mount_home: c.mount_home,
-                            remap_root: c.remap_root,
+                        &c,
+                        FreshContainerContext {
                             gpu_devices: gpu_devices.clone(),
-                            environment: env.clone(),
-                            container_env: {
-                                let mut ce = c.env.clone();
-                                maybe_deny_gpu_env(&mut ce, &gpu_devices);
-                                ce
-                            },
-                            entrypoint: (!c.entrypoint.is_empty()).then(|| c.entrypoint.clone()),
+                            device_plan: container_device_plan.clone(),
                             uid: req.uid,
                             gid: req.gid,
                             username,
                             home_dir,
-                            device_plan: container_device_plan.clone(),
-                            resolve_user: None,
+                            environment: env.clone(),
+                            workdir_default: (!work_dir.is_empty()).then(|| work_dir.clone()),
                             rootfs_base: crate::container::step_rootfs_base(job_id, step_id),
                         },
+                        job_id,
+                        &step_script,
                     )?;
-                    // `executor::launch_job`'s container path execs this fixed
-                    // in-container path unconditionally; nothing else writes it
-                    // for a step the way the batch path does for its own script.
-                    let container_script =
-                        format!("{}/tmp/spur_job_{job_id}.sh", launch.rootfs.display());
-                    std::fs::write(&container_script, &step_script).map_err(|e| {
-                        Status::internal(format!("failed to write container script: {e}"))
-                    })?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &container_script,
-                            std::fs::Permissions::from_mode(0o755),
-                        );
-                    }
                     supervised_rootfs_mode = Some(rootfs_mode);
                     Some(launch)
                 }
@@ -7565,6 +7627,12 @@ impl SlurmAgent for AgentService {
             step_id,
         );
 
+        // Held from before the decision through the fresh-launch path's own
+        // `live_ptys` insert below, so a second attach racing this one blocks
+        // instead of reading a stale "nothing live yet" and fencing what this
+        // call just started.
+        let _lifecycle = self.lifecycle.acquire(init.job_id).await;
+
         // Resume rather than open a new one: a terminal held for a job this
         // agent is not already bridging was either just launched (and just
         // deposited its own master, below) or was orphaned when its agent
@@ -7600,7 +7668,6 @@ impl SlurmAgent for AgentService {
                     (master, interactive_exit_future(waiter), pid)
                 }
                 None => {
-                    let _lifecycle = self.lifecycle.acquire(init.job_id).await;
                     let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
                     let mut container_rootfs_mode = None;
                     let container = match &container_plan {
@@ -7619,11 +7686,7 @@ impl SlurmAgent for AgentService {
                             }
                             None
                         }
-                        StepContainerPlan::Fresh { image, mounts } => {
-                            let c = init
-                                .container
-                                .as_ref()
-                                .expect("Fresh implies a container spec");
+                        StepContainerPlan::Fresh(c) => {
                             let (gpu_env, container_device_plan) = if gpu_devices.is_empty() {
                                 (HashMap::new(), None)
                             } else {
@@ -7661,60 +7724,28 @@ impl SlurmAgent for AgentService {
                             env.insert("HOME".to_string(), home_dir.clone());
                             env.insert("USER".to_string(), username.clone());
                             env.insert("LOGNAME".to_string(), username.clone());
-                            let mut container_env = c.env.clone();
-                            maybe_deny_gpu_env(&mut container_env, &gpu_devices);
-                            let (launch, rootfs_mode) = build_container_launch(
+                            let (launch, rootfs_mode) = stage_fresh_container_step(
                                 &self.cluster_id,
                                 self.allow_root_jobs,
-                                ContainerLaunchRequest {
-                                    image: image.clone(),
-                                    mounts: mounts.clone(),
-                                    workdir: (!c.workdir.is_empty())
-                                        .then(|| c.workdir.clone())
-                                        .or_else(|| {
-                                            (!entry.work_dir.is_empty())
-                                                .then(|| entry.work_dir.clone())
-                                        }),
-                                    name: (!c.name.is_empty()).then(|| c.name.clone()),
-                                    readonly: c.readonly,
-                                    mount_home: c.mount_home,
-                                    remap_root: c.remap_root,
+                                c,
+                                FreshContainerContext {
                                     gpu_devices: gpu_devices.clone(),
-                                    environment: env,
-                                    container_env,
-                                    entrypoint: (!c.entrypoint.is_empty())
-                                        .then(|| c.entrypoint.clone()),
+                                    device_plan: container_device_plan,
                                     uid: entry.uid,
                                     gid: entry.gid,
                                     username,
                                     home_dir,
-                                    device_plan: container_device_plan,
-                                    resolve_user: None,
+                                    environment: env,
+                                    workdir_default: (!entry.work_dir.is_empty())
+                                        .then(|| entry.work_dir.clone()),
                                     rootfs_base: crate::container::step_rootfs_base(
                                         init.job_id,
                                         step_id,
                                     ),
                                 },
+                                init.job_id,
+                                &script,
                             )?;
-                            // `executor::launch_job`'s container path execs this fixed
-                            // in-container path unconditionally, same as any other
-                            // freshly-containerized step.
-                            let container_script = format!(
-                                "{}/tmp/spur_job_{}.sh",
-                                launch.rootfs.display(),
-                                init.job_id
-                            );
-                            std::fs::write(&container_script, &script).map_err(|e| {
-                                Status::internal(format!("failed to write container script: {e}"))
-                            })?;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let _ = std::fs::set_permissions(
-                                    &container_script,
-                                    std::fs::Permissions::from_mode(0o755),
-                                );
-                            }
                             container_rootfs_mode = Some(rootfs_mode);
                             Some(launch)
                         }
@@ -7746,6 +7777,10 @@ impl SlurmAgent for AgentService {
                         gid: entry.gid,
                         container,
                         prolog_script: None,
+                        // This interactive session's teardown runs no TaskEpilog, so keep
+                        // both task hooks off rather than run an unpaired prolog.
+                        task_prolog_script: None,
+                        task_epilog_script: None,
                         partition,
                         nodelist,
                         mpi: String::new(),
@@ -7765,11 +7800,18 @@ impl SlurmAgent for AgentService {
                         )
                         .await?;
 
-                    let pid = supervised_step_workload_pid(&descriptor)
-                        .await
-                        .ok_or_else(|| {
-                            Status::internal("terminal workload did not report a pid in time")
-                        })?;
+                    let Some(pid) = supervised_step_workload_pid(&descriptor).await else {
+                        self.abandon_interactive_launch(
+                            init.job_id,
+                            run_attempt,
+                            (init.job_id, init.step_id),
+                            &descriptor,
+                        )
+                        .await;
+                        return Err(Status::internal(
+                            "terminal workload did not report a pid in time",
+                        ));
+                    };
                     self.active_steps.lock().await.insert(
                         (init.job_id, init.step_id),
                         ActiveStep {
@@ -7778,16 +7820,33 @@ impl SlurmAgent for AgentService {
                             ..Default::default()
                         },
                     );
-                    let master = crate::stepd::reclaim_pty_master(&custody_dir, pid)
-                        .await
-                        .map_err(|error| {
-                            Status::internal(format!(
+                    let master = match crate::stepd::reclaim_pty_master(&custody_dir, pid).await {
+                        Ok(Some(master)) => master,
+                        Ok(None) => {
+                            self.abandon_interactive_launch(
+                                init.job_id,
+                                run_attempt,
+                                (init.job_id, init.step_id),
+                                &descriptor,
+                            )
+                            .await;
+                            return Err(Status::internal(
+                                "terminal launched but deposited no pty master",
+                            ));
+                        }
+                        Err(error) => {
+                            self.abandon_interactive_launch(
+                                init.job_id,
+                                run_attempt,
+                                (init.job_id, init.step_id),
+                                &descriptor,
+                            )
+                            .await;
+                            return Err(Status::internal(format!(
                                 "failed to reclaim the terminal's own pty master: {error}"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            Status::internal("terminal launched but deposited no pty master")
-                        })?;
+                            )));
+                        }
+                    };
                     // The launch itself has no winsize to give the pty, so apply
                     // the client's requested size once the master is back.
                     if let Some(ws) = winsize.as_ref() {
@@ -7807,6 +7866,10 @@ impl SlurmAgent for AgentService {
             };
 
         self.live_ptys.lock().await.insert(init.job_id);
+        // Only past this point does `live_ptys` reflect this session, so hold
+        // the lock through the insert or a racing attach could still decide
+        // "nothing live" and fence what was just started.
+        drop(_lifecycle);
         let live_ptys = self.live_ptys.clone();
         let job_id = init.job_id;
         let stepds = self.stepds.clone();
@@ -9355,6 +9418,65 @@ mod tests {
         assert!(stop_stepd_process(&descriptor).await.is_ok());
     }
 
+    #[tokio::test]
+    async fn abandon_interactive_launch_releases_every_piece_of_tracked_state() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 5301;
+        let run_attempt = 1;
+        let step_id = spur_core::step::STEP_INTERACTIVE;
+        let step_key = (job_id, 0u32);
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        let start_ticks =
+            crate::stepd::process_start_ticks(pid).expect("read start ticks before it exits");
+        child.wait().expect("reap so the pid is stale");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            pid,
+            start_ticks,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        svc.stepds
+            .lock()
+            .await
+            .insert((job_id, step_id), descriptor.clone());
+        svc.active_steps.lock().await.insert(
+            step_key,
+            ActiveStep {
+                pid: Some(pid),
+                ..Default::default()
+            },
+        );
+        let _waiter = svc
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
+
+        svc.abandon_interactive_launch(job_id, run_attempt, step_key, &descriptor)
+            .await;
+
+        assert!(
+            !svc.active_steps.lock().await.contains_key(&step_key),
+            "a launch abandoned after failure must not leave a stale active_steps entry behind"
+        );
+        assert!(
+            !svc.stepds.lock().await.contains_key(&(job_id, step_id)),
+            "the abandoned stepd must no longer be tracked as live"
+        );
+    }
+
     #[test]
     fn unstarted_runtime_cleanup_removes_only_the_failed_attempt() {
         let state = tempfile::tempdir().expect("runtime state directory");
@@ -10645,7 +10767,7 @@ mod tests {
         };
         assert!(matches!(
             resolve_step_container_plan(Some(&container), false),
-            StepContainerPlan::Fresh { image, .. } if image == "docker://alpine"
+            StepContainerPlan::Fresh(c) if c.image == "docker://alpine"
         ));
     }
 

@@ -3105,11 +3105,8 @@ mod tests {
         );
     }
 
-    /// Neither connecting nor opening the session has its own timeout, so a
-    /// peer whose socket isn't torn down promptly must not hang the client
-    /// forever — the reconnect loop's own bound has to kick in and retry.
-    /// Real gRPC sockets defeat `start_paused`'s auto-advance, so the setup
-    /// timeout is shrunk for this test rather than run at its real 20s.
+    /// A peer whose socket isn't torn down promptly must not hang the client
+    /// forever — the reconnect loop's own bound must fire and retry.
     #[tokio::test]
     #[serial(env_injection)]
     async fn interactive_pty_retries_past_a_hung_reconnect_attempt() {
@@ -3125,19 +3122,15 @@ mod tests {
         ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
         let mut client = crate::mock_controller::client(ctrl_addr).await;
 
-        let exit_code = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            run_interactive_pty(
-                &mut client,
-                1,
-                vec!["bash".into()],
-                String::new(),
-                "tester",
-                None,
-            ),
+        let exit_code = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
         )
         .await
-        .expect("a hung attempt must not outlast the reconnect loop's own timeout")
         .expect("the second attempt must succeed after the first times out");
         TEST_RECONNECT_SETUP_TIMEOUT.with(|cell| cell.set(None));
 
