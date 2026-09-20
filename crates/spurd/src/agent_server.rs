@@ -2866,13 +2866,30 @@ fn supervised_step_script(
     job_entry: &crate::job_entry::JobEntry,
     uid: u32,
     gid: u32,
+    work_dir: &str,
     command: &[String],
 ) -> Result<String, Status> {
     if !(job_entry.has_namespaces() && job_entry.pid > 0) {
         return build_one_shot_command_script(command);
     }
     let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid);
-    let plan = build_launch_plan(job_entry, priv_drop.as_ref(), command);
+    // Enter the step's work_dir *inside* the container by cd-ing in a shell
+    // that runs after nsenter — a host-side chdir does not survive entering
+    // the container's pivoted mount namespace, and nsenter --wd is unreliable
+    // under a rootless user namespace. The cd is best-effort (`;`, not `&&`)
+    // so a work_dir absent inside the container still runs the command
+    // rather than failing it.
+    let inner = shlex::try_join(command.iter().map(String::as_str))
+        .map_err(|e| Status::invalid_argument(format!("step command is not shell-safe: {e}")))?;
+    let wd = shlex::try_quote(work_dir)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| work_dir.to_string());
+    let namespaced_command = [
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("cd {wd} 2>/dev/null; exec {inner}"),
+    ];
+    let plan = build_launch_plan(job_entry, priv_drop.as_ref(), &namespaced_command);
     let entering = shlex::try_join(
         std::iter::once(plan.program.as_str()).chain(plan.args.iter().map(String::as_str)),
     )
@@ -2897,7 +2914,7 @@ fn interactive_step_script(
     } else {
         argv
     };
-    supervised_step_script(job_entry, uid, gid, command)
+    supervised_step_script(job_entry, uid, gid, &job_entry.work_dir, command)
 }
 
 /// The same shape RunCommand would have returned, output included: a user
@@ -6811,7 +6828,8 @@ impl SlurmAgent for AgentService {
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
                 .collect();
-            let step_script = supervised_step_script(&job_entry, req.uid, req.gid, &command)?;
+            let step_script =
+                supervised_step_script(&job_entry, req.uid, req.gid, &work_dir, &command)?;
             let username = env
                 .get("USER")
                 .or_else(|| env.get("LOGNAME"))
@@ -11289,8 +11307,14 @@ mod tests {
 
     #[test]
     fn a_plain_steps_script_runs_the_command_directly() {
-        let script = supervised_step_script(&plain_job_entry(), 1000, 1000, &["true".to_string()])
-            .expect("script");
+        let script = supervised_step_script(
+            &plain_job_entry(),
+            1000,
+            1000,
+            "/tmp",
+            &["true".to_string()],
+        )
+        .expect("script");
 
         assert!(
             !script.contains("nsenter"),
@@ -11305,8 +11329,8 @@ mod tests {
         entry.has_mount_namespace = true;
         entry.pid = 4242;
 
-        let script =
-            supervised_step_script(&entry, 1000, 1000, &["true".to_string()]).expect("script");
+        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
+            .expect("script");
 
         // Inside the script, so the supervisor itself stays out of the job's
         // namespaces and outlives it.
@@ -11314,13 +11338,43 @@ mod tests {
         assert!(script.contains("4242"), "{script}");
     }
 
+    // A host-side chdir does not survive entering the container's pivoted
+    // mount namespace (nsenter --wd is unreliable under a rootless user
+    // namespace too), so the cd must run in a shell *inside* the namespace
+    // nsenter just entered — not before nsenter execs.
+    #[test]
+    fn a_namespaced_steps_script_cds_into_its_work_dir_after_entering() {
+        let mut entry = plain_job_entry();
+        entry.has_pid_namespace = true;
+        entry.has_mount_namespace = true;
+        entry.pid = 4242;
+
+        let script = supervised_step_script(
+            &entry,
+            1000,
+            1000,
+            "/srv/step-scratch",
+            &["true".to_string()],
+        )
+        .expect("script");
+
+        let nsenter_at = script.find("nsenter").expect("script enters the namespace");
+        let cd_at = script
+            .find("cd /srv/step-scratch")
+            .expect("script cds into the step's own work_dir");
+        assert!(
+            cd_at > nsenter_at,
+            "the cd must be part of what nsenter execs, not run before it on the host:\n{script}"
+        );
+    }
+
     #[test]
     fn a_namespaced_parent_with_no_live_pid_runs_the_command_directly() {
         let mut entry = plain_job_entry();
         entry.has_pid_namespace = true;
 
-        let script =
-            supervised_step_script(&entry, 1000, 1000, &["true".to_string()]).expect("script");
+        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
+            .expect("script");
 
         assert!(!script.contains("nsenter"), "{script}");
     }
