@@ -1508,11 +1508,15 @@ pub async fn recover_stepds(
 ) {
     let mut jobs = running.lock().await;
     for descriptor in descriptors {
+        let owns_lifetime = spur_core::step::owns_job_lifetime(descriptor.step_id);
         let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
             .then(|| descriptor.cgroup_path.clone());
         let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             job: executor::RunningJob::AllocationOnly,
-            cgroup_path,
+            // Only the job-owning step's cgroup is the job's own; a step
+            // arriving first in directory order must not seed this from its
+            // own per-step leaf.
+            cgroup_path: owns_lifetime.then(|| cgroup_path.clone()).flatten(),
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: String::new(),
             stderr_path: String::new(),
@@ -1534,9 +1538,10 @@ pub async fn recover_stepds(
         });
         // Sessions arrive in directory order, so only take these from the job's
         // own: a step's spool file and rootfs are the step's, not the job's.
-        if !spur_core::step::owns_job_lifetime(descriptor.step_id) {
+        if !owns_lifetime {
             continue;
         }
+        tracked.cgroup_path = cgroup_path;
         if !descriptor.stdout_path.is_empty() {
             tracked.stdout_path = descriptor.stdout_path.clone();
         }
@@ -2611,7 +2616,7 @@ fn interactive_exit_future(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>> {
     Box::pin(async move {
         match waiter.await {
-            Ok(outcome) => step_exit_status(outcome).code().unwrap_or(128),
+            Ok(outcome) => spur_core::process::shell_exit_code(&step_exit_status(outcome)),
             Err(_) => 128,
         }
     })
@@ -7735,12 +7740,15 @@ impl SlurmAgent for AgentService {
                     })
                 }
             };
-            if let Some((exit_code, _signal)) = settled {
+            if let Some((exit_code, signal)) = settled {
+                let shell_code = spur_core::process::shell_exit_code(&step_exit_status(
+                    crate::step_completion::StepOutcome { exit_code, signal },
+                ));
                 info!(
                     job_id = init.job_id,
-                    exit_code, "terminal already finished; reporting its recorded exit"
+                    shell_code, "terminal already finished; reporting its recorded exit"
                 );
-                return Ok(Response::new(settled_interactive_stream(exit_code)));
+                return Ok(Response::new(settled_interactive_stream(shell_code)));
             }
         }
 
@@ -11269,6 +11277,19 @@ mod tests {
         assert_eq!(interactive_exit_future(rx).await, 7);
     }
 
+    // A signal death has no exit code to report; the shell-style 128+signal
+    // encoding is what Slurm-compat scripts checking `$?` expect.
+    #[tokio::test]
+    async fn interactive_exit_future_reports_128_plus_signal_for_a_signal_death() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(crate::step_completion::StepOutcome {
+            exit_code: 0,
+            signal: nix::sys::signal::Signal::SIGKILL as i32,
+        })
+        .expect("send");
+        assert_eq!(interactive_exit_future(rx).await, 128 + 9);
+    }
+
     // A dropped waiter (e.g. the stepd vanished without reporting) must not
     // hang the pty bridge forever; it has to resolve to some exit code.
     #[tokio::test]
@@ -13077,6 +13098,51 @@ mod tests {
                 tracked.rootfs_mode,
                 crate::container::RootfsMode::Overlay,
                 "a step carries no rootfs mode and must not reset the job's (order {seen:?})"
+            );
+        }
+    }
+
+    // STEP_INTERACTIVE (a non-owning step, since this PR) sits between user
+    // steps and STEP_BATCH/STEP_EXTERN in id order; directory order is
+    // otherwise arbitrary, so the job's own cgroup must win regardless of
+    // which descriptor recovery processes first.
+    #[tokio::test]
+    async fn a_terminal_sessions_own_leaf_cgroup_never_becomes_the_jobs() {
+        let mut terminal = crate::stepd::StepdDescriptor::new(
+            55,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        terminal.cgroup_path = "/sys/fs/cgroup/spur/job_55_1/step_4294967292".into();
+        let mut batch = crate::stepd::StepdDescriptor::new(
+            55,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        batch.cgroup_path = "/sys/fs/cgroup/spur/job_55_1".into();
+
+        for order in [
+            vec![terminal.clone(), batch.clone()],
+            vec![batch.clone(), terminal.clone()],
+        ] {
+            let seen: Vec<_> = order.iter().map(|d| d.step_id).collect();
+            let running = new_running_jobs();
+            recover_stepds(&running, order).await;
+
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&55).expect("the adopted job is tracked");
+            assert_eq!(
+                tracked.cgroup_path,
+                Some(std::path::PathBuf::from("/sys/fs/cgroup/spur/job_55_1")),
+                "the terminal's own leaf cgroup must never become the job's (order {seen:?})"
             );
         }
     }
