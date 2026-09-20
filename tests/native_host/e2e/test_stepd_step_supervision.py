@@ -30,8 +30,20 @@ def _step_ids(sessions: list[str], job_id: int) -> set[int]:
 
 
 def _supervisor_pids(cluster, node_index: int = 0) -> set[str]:
+    """Supervisors under this cluster's own state dir. A node-wide pgrep also
+    counts a leftover from a previous test's cluster, which nothing here keeps
+    alive, and would otherwise fail a restart-survival assertion on a
+    supervisor the product was never asked to keep running."""
     node = cluster.nodes[node_index]
-    return set(node.exec_allow_fail("pgrep -x spurstepd || true").split())
+    out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
+    pids = set()
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[1].endswith("spurstepd"):
+            continue
+        if fields[2] == cluster.state_dir:
+            pids.add(fields[0])
+    return pids
 
 
 def _wait_for_numbered_step(cluster, job_id: int, timeout: int = 90) -> set[int]:
