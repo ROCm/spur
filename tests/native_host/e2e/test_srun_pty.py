@@ -7,6 +7,33 @@ The command must run through an interactive PTY session rather than the
 buffered RunStep path, and the step it creates must reach a terminal state.
 """
 
+import threading
+import time
+
+# Below this, a step id names a reserved (batch/extern/interactive) session
+# that every allocation already gets a supervisor for; a bare `pgrep
+# spurstepd` can't tell that apart from the one this test is actually about.
+_RESERVED_STEP_FLOOR = 0xFFFFFFF0
+
+
+def _user_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
+    node = cluster.nodes[node_index]
+    listing = node.exec_allow_fail(
+        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
+    )
+    prefix = f"{job_id}."
+    sessions = set()
+    for name in listing.split():
+        if not name.startswith(prefix):
+            continue
+        try:
+            step_id = int(name.rsplit(".", 1)[-1])
+        except ValueError:
+            continue
+        if step_id < _RESERVED_STEP_FLOOR:
+            sessions.add(name)
+    return sessions
+
 
 class TestSrunPtyStep:
     def test_pty_step_runs_on_a_tty(self, cluster):
@@ -122,3 +149,61 @@ class TestSrunPtyStepMultiNode:
         assert code == 0, out
         hosts = {ln.split("=", 1)[1].strip() for ln in out.splitlines() if ln.startswith("NODE=")}
         assert hosts == {target}, out
+
+
+class TestSrunPtyStepSupervision:
+    """A `--pty` step used to run as a bare child of spurd, with no supervisor
+    to outlive an agent restart. It now gets one, like any other step."""
+
+    def test_pty_step_survives_an_agent_restart(self, cluster):
+        result: dict[str, object] = {}
+        job_name = f"pty-restart-survival-{time.time_ns()}"
+
+        def run():
+            result["code"], result["out"] = cluster.salloc_run(
+                "srun --pty bash -c '"
+                "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
+                "echo SURVIVED'\n",
+                salloc_args=["-N", "1", "-t", "0:05", "-J", job_name],
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the allocation to appear before the restart"
+
+            before: set[str] = set()
+            while time.time() < deadline:
+                before = _user_step_sessions_for_job(cluster, job_id)
+                if before:
+                    break
+                time.sleep(1)
+            assert before, "expected a session for the pty step before the restart"
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            # Identity, not count: a supervisor killed with the agent and
+            # respawned afterwards would satisfy any "still one running" check.
+            after = _user_step_sessions_for_job(cluster, job_id)
+            assert before <= after, (
+                "the pty step's supervisor must outlive the agent that spawned it: "
+                f"{sorted(before)} before the restart, {sorted(after)} after"
+            )
+        finally:
+            thread.join(timeout=60)
+
+        assert result.get("code") == 0, result.get("out")
+        out = str(result.get("out"))
+        assert "SURVIVED" in out, out
+        # A shell relaunched from scratch after the restart would replay its
+        # ticks from the top instead of resuming the one already in progress.
+        assert out.count("tick 1\n") == 1, f"the shell must not have been restarted:\n{out}"

@@ -27,6 +27,7 @@ separately because they are reached by genuinely different setups:
 
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -863,3 +864,87 @@ class TestSrunPtyContainerStep:
                 )
         finally:
             cluster.scancel(job_id)
+
+
+# Below this, a step id names a reserved (batch/extern/interactive) session
+# that every allocation already gets a supervisor for; a bare `pgrep
+# spurstepd` can't tell that apart from the one this test is actually about.
+_RESERVED_STEP_FLOOR = 0xFFFFFFF0
+
+
+def _user_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set:
+    node = cluster.nodes[node_index]
+    listing = node.exec_allow_fail(
+        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
+    )
+    prefix = f"{job_id}."
+    sessions = set()
+    for name in listing.split():
+        if not name.startswith(prefix):
+            continue
+        try:
+            step_id = int(name.rsplit(".", 1)[-1])
+        except ValueError:
+            continue
+        if step_id < _RESERVED_STEP_FLOOR:
+            sessions.add(name)
+    return sessions
+
+
+class TestSrunContainerStepSupervision:
+    """A container step used to run as a bare fork of spurd (Case 2 in the
+    module docstring above), with no supervisor to outlive an agent restart.
+    It now gets one, like any other step."""
+
+    def test_new_container_step_survives_an_agent_restart(self, step_container_cluster):
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        job_name = f"container-restart-survival-{time.time_ns()}"
+        result: dict = {}
+
+        def run():
+            result["code"], result["out"] = cluster.srun_with_exit([
+                "-N", "1", "-t", "0:02", "-J", job_name,
+                f"--container-image={img}",
+                "bash", "-c",
+                "for i in $(seq 1 20); do echo tick $i; sleep 1; done; echo SURVIVED",
+            ])
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the step's job to appear before the restart"
+
+            before: set = set()
+            while time.time() < deadline:
+                before = _user_step_sessions_for_job(cluster, job_id)
+                if before:
+                    break
+                time.sleep(1)
+            assert before, "expected a supervisor for the container step before the restart"
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            # Identity, not count: a supervisor killed with the agent and
+            # respawned afterwards would satisfy any "still one running" check.
+            after = _user_step_sessions_for_job(cluster, job_id)
+            assert before <= after, (
+                "the container step's supervisor must outlive the agent that spawned it: "
+                f"{sorted(before)} before the restart, {sorted(after)} after"
+            )
+        finally:
+            thread.join(timeout=60)
+
+        assert result.get("code") == 0, result.get("out")
+        out = str(result.get("out"))
+        assert "SURVIVED" in out, out
+        assert out.count("tick 1\n") == 1, f"the step must not have been restarted:\n{out}"
