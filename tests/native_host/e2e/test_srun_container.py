@@ -1036,4 +1036,3 @@ class TestSrunContainerStepSupervision:
         out = str(result.get("out"))
         assert "SURVIVED" in out, out
         _assert_ticks_not_replayed(out)
-
