@@ -1728,7 +1728,12 @@ async fn run_interactive_pty(
 fn is_retryable_status(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
-        tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::Unavailable
+        tonic::Code::NotFound
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Unavailable
+            // The agent reports this when its own bridge hasn't yet noticed a
+            // prior attempt's connection died; retrying lets that unwind.
+            | tonic::Code::AlreadyExists
     )
 }
 
@@ -3139,6 +3144,41 @@ mod tests {
             agent_capture.session_count(),
             2,
             "a hung attempt must be abandoned and retried, not left open"
+        );
+    }
+
+    /// The agent reports `AlreadyExists` when its own bridge hasn't yet
+    /// noticed a prior attempt's connection died — this must be retried, not
+    /// treated as a fatal error.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_retries_past_an_already_exists_status() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![
+            crate::mock_agent::ScriptedSession::AlreadyExists,
+            crate::mock_agent::ScriptedSession::Exit(3),
+        ]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect("the second attempt must succeed after the first reports already_exists");
+
+        assert_eq!(exit_code, 3, "must return the successful retry's exit code");
+        assert_eq!(
+            agent_capture.session_count(),
+            2,
+            "an already_exists status must be retried, not treated as fatal"
         );
     }
 

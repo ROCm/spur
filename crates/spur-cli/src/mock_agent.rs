@@ -25,12 +25,15 @@ pub(crate) struct ScriptedStream {
 }
 
 /// A scripted reply to one `InteractiveSession` call: a mid-stream drop
-/// standing in for the agent restarting, a clean exit status, or a peer that
-/// never answers the call at all (a socket that isn't torn down promptly).
+/// standing in for the agent restarting, a clean exit status, a peer that
+/// never answers the call at all (a socket that isn't torn down promptly),
+/// or an immediate error standing in for the job's interactive slot still
+/// looking busy from a just-missed prior attempt.
 pub(crate) enum ScriptedSession {
     Disconnect,
     Exit(i32),
     Hang,
+    AlreadyExists,
 }
 
 /// What the mock agent received, shared with the test body.
@@ -160,13 +163,20 @@ mock_agent_impl! {
             if matches!(&attempt, Some(ScriptedSession::Hang)) {
                 std::future::pending::<()>().await;
             }
+            if matches!(&attempt, Some(ScriptedSession::AlreadyExists)) {
+                return Err(Status::already_exists("interactive session already active"));
+            }
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 match attempt {
                     // A dropped sender surfaces to the client as `Ok(None)`,
-                    // matching a stepd that vanished mid-session. Hang never
-                    // reaches here — it already parked forever above.
-                    None | Some(ScriptedSession::Disconnect) | Some(ScriptedSession::Hang) => {}
+                    // matching a stepd that vanished mid-session. Hang and
+                    // AlreadyExists never reach here — both already returned
+                    // above.
+                    None
+                    | Some(ScriptedSession::Disconnect)
+                    | Some(ScriptedSession::Hang)
+                    | Some(ScriptedSession::AlreadyExists) => {}
                     Some(ScriptedSession::Exit(code)) => {
                         let _ = tx
                             .send(Ok(proto::InteractiveOutput {
