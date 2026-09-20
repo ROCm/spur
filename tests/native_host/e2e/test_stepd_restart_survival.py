@@ -253,26 +253,30 @@ class TestSupervisedGpuReclaim:
             cluster.sbatch(["-J", "gpu-reclaim", "-N", "1", "-w", node, gres, hold])
         )
         assert job_id is not None
-        wait_job_state(cluster, job_id, "R")
+        try:
+            wait_job_state(cluster, job_id, "R")
 
-        new_pids = _supervisor_pids(cluster) - before
-        assert len(new_pids) == 1, (
-            f"expected exactly one new supervisor for job {job_id}, got {new_pids}"
-        )
-        supervisor_pid = next(iter(new_pids))
+            new_pids = _supervisor_pids(cluster) - before
+            assert len(new_pids) == 1, (
+                f"expected exactly one new supervisor for job {job_id}, got {new_pids}"
+            )
+            supervisor_pid = next(iter(new_pids))
 
-        # Simulate a supervisor killed before it can push completion or tear
-        # down its own tracking — the case a lost/failed report leaves behind.
-        prefix = cluster._sudo_prefix() if cluster.agent_as_root else ""
-        cluster.nodes[0].exec_allow_fail(f"{prefix}kill -9 {supervisor_pid}")
+            # Simulate a supervisor killed before it can push completion or
+            # tear down its own tracking — the case a lost/failed report
+            # leaves behind.
+            prefix = cluster._sudo_prefix() if cluster.agent_as_root else ""
+            cluster.nodes[0].exec_allow_fail(f"{prefix}kill -9 {supervisor_pid}")
 
-        deadline = time.time() + 30
-        while supervisor_pid in _supervisor_pids(cluster):
-            assert time.time() < deadline, f"supervisor {supervisor_pid} did not die"
-            time.sleep(1)
+            deadline = time.time() + 30
+            while supervisor_pid in _supervisor_pids(cluster):
+                assert time.time() < deadline, f"supervisor {supervisor_pid} did not die"
+                time.sleep(1)
 
-        cluster.scancel(str(job_id))
-        assert wait_job(cluster, job_id, timeout=60) in ("CA", "CD", "F", "GONE")
+            cluster.scancel(str(job_id))
+            assert wait_job(cluster, job_id, timeout=60) in ("CA", "CD", "F", "GONE")
+        finally:
+            cluster.cli_allow_fail(["scancel", str(job_id)])
 
         retry_id = parse_job_id(
             cluster.sbatch(["-J", "gpu-reclaim-retry", "-N", "1", "-w", node, gres, hold])

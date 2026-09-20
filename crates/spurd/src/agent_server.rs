@@ -5421,6 +5421,27 @@ impl SlurmAgent for AgentService {
         self.launch_acceptance
             .cancel_attempt(job_id, req.run_attempt);
 
+        // An attempt-less cancel names nothing to compare against below;
+        // snapshot whichever attempt is actually live right now, before the
+        // signal path can reap it out from under us, so a same-job_id
+        // redispatch racing in afterward has something other than job_id
+        // alone to be told apart from.
+        let doomed_attempt = match req.run_attempt {
+            0 => match self
+                .running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|t| t.run_attempt)
+            {
+                Some(attempt) => Some(attempt),
+                None => stepds_for_job(&*self.stepds.lock().await, job_id)
+                    .first()
+                    .map(|descriptor| descriptor.run_attempt),
+            },
+            named => Some(named),
+        };
+
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
@@ -5438,10 +5459,13 @@ impl SlurmAgent for AgentService {
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         if !jobs.contains_key(&job_id) {
             let mut alloc = self.allocation.lock().await;
-            if req.run_attempt == 0 {
-                alloc.release_job(job_id);
-            } else {
-                alloc.release_job_if(job_id, req.run_attempt);
+            match doomed_attempt {
+                Some(attempt) => {
+                    alloc.release_job_if(job_id, attempt);
+                }
+                None => {
+                    alloc.release_job(job_id);
+                }
             }
         }
         drop(jobs);
@@ -16736,6 +16760,66 @@ mod tests {
             svc.allocation.lock().await.allocated_memory_mb,
             128,
             "a job with a live sibling stepd must not have its allocation released"
+        );
+    }
+
+    // An attempt-less (reclaim-heartbeat) cancel resolves its doomed attempt
+    // from a still-registered dead stepd; a redispatch that already reserved
+    // a newer attempt for the same job_id by then must survive it.
+    #[tokio::test]
+    async fn cancel_with_no_named_attempt_spares_a_reused_job_ids_newer_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 970;
+        let dead_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            dead_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-reused-jobid-970.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "reused-jobid-no-attempt-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        // A redispatch already released the dead attempt and reserved a newer
+        // one, but hasn't (re)registered a stepd or a `running` entry yet —
+        // the exact window a reclaim-heartbeat cancel (run_attempt: 0) can
+        // land in, since it has no attempt of its own to compare against.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(job_id, dead_attempt, 1, 0, &[0])
+                .expect("reserve dead attempt");
+            alloc.release_job(job_id);
+            alloc
+                .allocate_for_job(job_id, 2, 1, 0, &[0])
+                .expect("reserve newer attempt");
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "an attempt-less cancel resolved only against a dead stepd must not \
+             release a reused job_id's newer reservation"
         );
     }
 
