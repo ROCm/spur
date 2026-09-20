@@ -2635,6 +2635,18 @@ fn settled_interactive_stream(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+/// A job's `STEP_INTERACTIVE` slot is shared by every `srun --pty` invocation,
+/// so a settled outcome recorded there belongs to this request only if the
+/// last launch to claim it was for the same numbered step — otherwise it is a
+/// different invocation and a stale exit must not be replayed onto it.
+/// `None` (nothing recorded, e.g. after a restart) still trusts the outcome.
+fn settled_outcome_belongs_to_this_invocation(
+    last_launched_step_id: Option<u32>,
+    requested_step_id: u32,
+) -> bool {
+    last_launched_step_id.is_none_or(|last| last == requested_step_id)
+}
+
 /// What a step's own `--container-image` resolves to once weighed against
 /// whether its parent job already provides one to join.
 enum StepContainerPlan {
@@ -3299,6 +3311,12 @@ pub struct AgentService {
     /// Jobs this agent is currently bridging a terminal for. A job absent here
     /// with a terminal in custody has been orphaned by a restart.
     live_ptys: Arc<Mutex<std::collections::HashSet<u32>>>,
+    /// The numbered step id (a distinct `CreateJobStep` per `srun --pty`
+    /// invocation) whose launch most recently claimed a job's single
+    /// `STEP_INTERACTIVE` slot — so a settled outcome from a *different*
+    /// invocation is never replayed onto a genuinely new one. Absent after a
+    /// restart, in which case a settled outcome is still trusted.
+    interactive_launch_steps: Arc<Mutex<HashMap<(u32, u32), u32>>>,
     /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<StepdMap>>,
@@ -3437,6 +3455,7 @@ impl AgentService {
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             step_completions: crate::step_completion::StepCompletions::new(),
             live_ptys: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            interactive_launch_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -7717,10 +7736,19 @@ impl SlurmAgent for AgentService {
             }
         };
 
+        let last_interactive_launch = self
+            .interactive_launch_steps
+            .lock()
+            .await
+            .get(&(init.job_id, run_attempt))
+            .copied();
+        let same_invocation =
+            settled_outcome_belongs_to_this_invocation(last_interactive_launch, init.step_id);
+
         // Nothing to reclaim can mean "never launched" or "already finished
         // and reaped" — the latter must return the recorded exit, not re-run
         // the command.
-        if reclaimed.is_none() {
+        if reclaimed.is_none() && same_invocation {
             let settled = match self
                 .step_completions
                 .settled(init.job_id, run_attempt, step_id)
@@ -7972,6 +8000,10 @@ impl SlurmAgent for AgentService {
             };
 
         self.live_ptys.lock().await.insert(init.job_id);
+        self.interactive_launch_steps
+            .lock()
+            .await
+            .insert((init.job_id, run_attempt), init.step_id);
         // Only past this point does `live_ptys` reflect this session, so hold
         // the lock through the insert or a racing attach could still decide
         // "nothing live" and fence what was just started.
@@ -11297,6 +11329,22 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(tx);
         assert_eq!(interactive_exit_future(rx).await, 128);
+    }
+
+    #[test]
+    fn a_settled_outcome_is_trusted_only_for_the_invocation_that_launched_it() {
+        assert!(
+            settled_outcome_belongs_to_this_invocation(None, 7),
+            "nothing recorded (e.g. after a restart) must still trust a settled outcome"
+        );
+        assert!(
+            settled_outcome_belongs_to_this_invocation(Some(7), 7),
+            "the same numbered step reconnecting must trust its own settled outcome"
+        );
+        assert!(
+            !settled_outcome_belongs_to_this_invocation(Some(7), 8),
+            "a different numbered step is a new invocation and must not replay the old exit"
+        );
     }
 
     #[test]
