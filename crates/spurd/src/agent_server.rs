@@ -1421,9 +1421,8 @@ async fn release_stepd_tracking(
         other.job_id == descriptor.job_id && other.run_attempt == descriptor.run_attempt
     });
 
-    // Hold `running` across the allocation release too — matching the
-    // lock order commit_job uses — so a redispatch racing this can't have
-    // its brand-new allocation torn down by this stale, job_id-keyed release.
+    // Attempt-checked on both maps: `running`'s own check guards its entry,
+    // and `release_job_if` below guards the allocation the same way.
     let removed_tracked = was_last_step && {
         let mut jobs = running.lock().await;
         if jobs
@@ -1431,7 +1430,10 @@ async fn release_stepd_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
-            allocation.lock().await.release_job(descriptor.job_id);
+            allocation
+                .lock()
+                .await
+                .release_job_if(descriptor.job_id, descriptor.run_attempt);
             true
         } else {
             false
@@ -5435,9 +5437,13 @@ impl SlurmAgent for AgentService {
                 .map(|t| t.run_attempt)
             {
                 Some(attempt) => Some(attempt),
-                None => stepds_for_job(&*self.stepds.lock().await, job_id)
+                None => match stepds_for_job(&*self.stepds.lock().await, job_id)
                     .first()
-                    .map(|descriptor| descriptor.run_attempt),
+                    .map(|descriptor| descriptor.run_attempt)
+                {
+                    Some(attempt) => Some(attempt),
+                    None => self.allocation.lock().await.owner_attempt(job_id),
+                },
             },
             named => Some(named),
         };
@@ -5458,14 +5464,10 @@ impl SlurmAgent for AgentService {
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         if !jobs.contains_key(&job_id) {
-            let mut alloc = self.allocation.lock().await;
-            match doomed_attempt {
-                Some(attempt) => {
-                    alloc.release_job_if(job_id, attempt);
-                }
-                None => {
-                    alloc.release_job(job_id);
-                }
+            // `doomed_attempt` already checked the ledger; `None` means
+            // anything found now landed during the signal call and is not ours.
+            if let Some(attempt) = doomed_attempt {
+                self.allocation.lock().await.release_job_if(job_id, attempt);
             }
         }
         drop(jobs);
@@ -9809,9 +9811,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -9870,9 +9872,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -9903,6 +9905,60 @@ mod tests {
             allocation.lock().await.allocated_memory_mb,
             0,
             "the last step out releases the allocation"
+        );
+    }
+
+    // A redispatch can reserve a newer attempt in the allocator before
+    // `running` catches up; a reap for the old attempt landing in that
+    // window must not release the newer reservation.
+    #[tokio::test]
+    async fn release_stepd_tracking_spares_a_newer_attempts_reservation() {
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve old attempt");
+        allocation.lock().await.release_job(42);
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 2, 1, 128, &[])
+            .expect("reserve newer attempt");
+
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        running.lock().await.insert(42, tracked);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        release_stepd_tracking(&running, &allocation, &sessions, &descriptor, "stale reap").await;
+
+        assert_eq!(
+            allocation.lock().await.allocated_memory_mb,
+            128,
+            "a same-job_id redispatch's newer reservation must survive a stale reap for the old attempt"
         );
     }
 
@@ -9997,9 +10053,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -16820,6 +16876,40 @@ mod tests {
             0,
             "an attempt-less cancel resolved only against a dead stepd must not \
              release a reused job_id's newer reservation"
+        );
+    }
+
+    // A launching reservation with neither a `running` entry nor a stepd has
+    // nothing but the allocation ledger itself to name its attempt; an
+    // attempt-less cancel must still find and release it through that.
+    #[tokio::test]
+    async fn cancel_with_no_named_attempt_and_no_tracking_releases_via_the_allocation_ledger() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 972;
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, 1, 1, 0, &[0])
+            .expect("reserve launching");
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a launching reservation with no running/stepd tracking must still \
+             be released by an attempt-less cancel via the allocation ledger"
         );
     }
 
