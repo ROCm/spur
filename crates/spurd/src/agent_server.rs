@@ -2617,6 +2617,19 @@ fn interactive_exit_future(
     })
 }
 
+/// A one-shot stream reporting an already-recorded exit, for a client that
+/// reconnects after its terminal finished and was reaped before it could
+/// attach — so it gets the real exit code instead of the command re-running.
+fn settled_interactive_stream(
+    exit_code: i32,
+) -> tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let _ = tx.try_send(Ok(InteractiveOutput {
+        msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
+    }));
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
 /// What a step's own `--container-image` resolves to once weighed against
 /// whether its parent job already provides one to join.
 enum StepContainerPlan {
@@ -5309,6 +5322,39 @@ impl SlurmAgent for AgentService {
 
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
+        // A pty job's own step is allocation-only like `salloc`'s STEP_EXTERN,
+        // so nothing inside its stepd creates the job's cgroup — set it up
+        // here, the same way RegisterAllocation does, or the STEP_INTERACTIVE
+        // step that later joins it finds nothing to join.
+        let pty_cgroup_path = if spec.pty {
+            let setup = executor::setup_cgroup(
+                executor::CgroupScope {
+                    job_id,
+                    run_attempt,
+                    step_id: launch_step,
+                },
+                &self.cgroup,
+                cpus,
+                memory_mb,
+                &cpu_ids,
+                &host_device_plan.device_paths,
+            );
+            match allocation_cgroup(setup, self.cgroup.required) {
+                AllocationCgroup::Record(path) => path,
+                AllocationCgroup::Degraded(reason) => {
+                    warn!(job_id, reason = %reason, "pty job registered without cgroup enforcement");
+                    None
+                }
+                AllocationCgroup::Refuse(reason) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "cgroup setup failed for pty job: {reason}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         // Guard rather than unwrap: these are always Some when the image is
         // set. An early return here releases the reservation via the guard.
         let container_launch = if !spec.container_image.is_empty() {
@@ -5414,7 +5460,19 @@ impl SlurmAgent for AgentService {
                 },
             )
             .await
-            .map(|(result, descriptor)| (result, Some(descriptor)))
+            .map(|(result, mut descriptor)| {
+                // Mirrors RegisterAllocation: the supervisor's own launch
+                // never created a cgroup for an allocation-only step, so the
+                // one set up above has to be stamped on after the fact.
+                if let Some(path) = pty_cgroup_path.as_ref() {
+                    descriptor.cgroup_path = path.clone();
+                    let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+                    if let Err(error) = store.publish(&descriptor) {
+                        warn!(job_id, %error, "failed to record pty job cgroup in the runtime descriptor");
+                    }
+                }
+                (result, Some(descriptor))
+            })
         } else {
             executor::launch_job(&launch_cfg, (*self.spank).as_ref())
                 .await
@@ -5544,7 +5602,7 @@ impl SlurmAgent for AgentService {
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
-                        cgroup_path: result.cgroup_path,
+                        cgroup_path: pty_cgroup_path.clone().or(result.cgroup_path),
                     },
                 );
                 drop(jobs);
@@ -7638,17 +7696,53 @@ impl SlurmAgent for AgentService {
         // deposited its own master, below) or was orphaned when its agent
         // went away, and either way the user wants it back.
         let already_bridging = self.live_ptys.lock().await.contains(&init.job_id);
-        let reclaimed = if already_bridging {
-            None
-        } else {
-            match crate::stepd::reclaim_orphaned_pty(&custody_dir).await {
-                Ok(found) => found,
-                Err(error) => {
-                    warn!(job_id = init.job_id, %error, "could not look for an orphaned terminal");
-                    None
-                }
+        if already_bridging {
+            // A live bridge already owns this job's one interactive slot.
+            // Silently fencing it to seat a second attach would kill a
+            // session that might still be in active use.
+            return Err(Status::already_exists(
+                "an interactive session for this job is already active on this node",
+            ));
+        }
+        let reclaimed = match crate::stepd::reclaim_orphaned_pty(&custody_dir).await {
+            Ok(found) => found,
+            Err(error) => {
+                warn!(job_id = init.job_id, %error, "could not look for an orphaned terminal");
+                None
             }
         };
+
+        // Nothing to reclaim can mean "never launched" or "already finished
+        // and reaped" — the latter must return the recorded exit, not re-run
+        // the command.
+        if reclaimed.is_none() {
+            let settled = match self
+                .step_completions
+                .settled(init.job_id, run_attempt, step_id)
+                .await
+            {
+                Some(outcome) => Some((outcome.exit_code, outcome.signal)),
+                None => {
+                    let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+                    let recorded = if run_attempt == 0 {
+                        store.recorded_step_exit(init.job_id, step_id)
+                    } else {
+                        store.observed_exit(init.job_id, run_attempt, step_id)
+                    };
+                    recorded.unwrap_or_else(|error| {
+                        warn!(job_id = init.job_id, %error, "failed to read a settled terminal's recorded exit");
+                        None
+                    })
+                }
+            };
+            if let Some((exit_code, _signal)) = settled {
+                info!(
+                    job_id = init.job_id,
+                    exit_code, "terminal already finished; reporting its recorded exit"
+                );
+                return Ok(Response::new(settled_interactive_stream(exit_code)));
+            }
+        }
 
         type ExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
         let (master_fd, wait_exit, child_pid): (std::os::fd::OwnedFd, ExitFuture, i32) =
@@ -7707,7 +7801,7 @@ impl SlurmAgent for AgentService {
                                     })?;
                                 (host_plan.env, Some(container_plan))
                             };
-                            let username = (entry.uid > 0)
+                            let passwd_entry = (entry.uid > 0)
                                 .then(|| {
                                     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(
                                         entry.uid,
@@ -7715,10 +7809,14 @@ impl SlurmAgent for AgentService {
                                     .ok()
                                     .flatten()
                                 })
-                                .flatten()
-                                .map(|u| u.name)
+                                .flatten();
+                            let username = passwd_entry
+                                .as_ref()
+                                .map(|u| u.name.clone())
                                 .unwrap_or_else(|| "spur".to_string());
-                            let home_dir = format!("/home/{username}");
+                            let home_dir = passwd_entry
+                                .map(|u| u.dir.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("/home/{username}"));
                             let mut env = HashMap::new();
                             env.extend(gpu_env.clone());
                             env.insert("HOME".to_string(), home_dir.clone());

@@ -877,6 +877,13 @@ async fn spawn_job_process(
         // Launch the process
         let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
         let mut cmd = Command::new(&launch_cmd);
+        if cfg.io_mode == LaunchIo::Pty {
+            // A PTY launch's caller (`session_environ`) documents that it already
+            // assembled a complete environment; without this, spurstepd's own
+            // inherited process environment — which may hold daemon secrets —
+            // would leak into the interactive shell.
+            cmd.env_clear();
+        }
         cmd.args(&launch_args).current_dir(work_dir).envs(&env);
         if cfg.io_mode != LaunchIo::Pty {
             // Always its own process group (run_command does the same for pmix step
@@ -3983,6 +3990,53 @@ mod tests {
             Ok(_) => {}
             Err(error) => panic!("a bare Pty launch must not fail with EPERM: {error}"),
         }
+    }
+
+    // spurstepd inherits spurd's full process environment, which may hold
+    // daemon secrets; a Pty launch must start from a clean slate rather than
+    // merely overlaying its own vars on top of it.
+    #[tokio::test]
+    async fn a_pty_launch_does_not_inherit_the_launching_processs_environment() {
+        let marker_key = "SPUR_TEST_ENV_LEAK_MARKER_PTY";
+        unsafe {
+            std::env::set_var(marker_key, "leaked");
+        }
+        let capture = tempfile::NamedTempFile::new().expect("capture file");
+        let capture_path = capture.path().to_path_buf();
+        let mut environment = HashMap::new();
+        environment.insert("SPUR_TEST_OWN_VAR".to_string(), "present".to_string());
+        let cfg = JobLaunchConfig {
+            io_mode: LaunchIo::Pty,
+            script: format!("env > {}", capture_path.display()),
+            environment,
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            ..launch_cfg_for_paths(90002, "pty-env-clear", "u", "node")
+        };
+
+        let mut result = match launch_job(&cfg, None).await {
+            Ok(result) => result,
+            Err(error) => panic!("pty launch: {error}"),
+        };
+        match result.job {
+            RunningJob::Managed { ref mut child } => {
+                child.wait().await.expect("wait for the script to finish");
+            }
+            _ => panic!("a non-container pty launch must produce a Managed child"),
+        }
+        unsafe {
+            std::env::remove_var(marker_key);
+        }
+
+        let captured = std::fs::read_to_string(&capture_path).expect("read captured env");
+        assert!(
+            !captured.contains(marker_key),
+            "the launching process's own environment must not reach the pty workload: {captured}"
+        );
+        assert!(
+            captured.contains("SPUR_TEST_OWN_VAR=present"),
+            "the launch's own assembled environment must still reach the workload: {captured}"
+        );
     }
 
     #[tokio::test]
