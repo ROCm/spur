@@ -288,3 +288,79 @@ class TestSupervisedGpuReclaim:
             wait_job_state(cluster, retry_id, "R", timeout=10)
         finally:
             cluster.scancel(str(retry_id))
+
+    def test_reconnected_agent_reporting_a_cancelled_job_gets_its_gpu_reclaimed(
+        self, gpu_cluster
+    ):
+        """The controller can give up on a job (cancel it) while its node's
+        agent is unreachable. When that agent comes back, it still reports
+        the job running — the controller's own reclaim-heartbeat, not any
+        fresh scancel, must notice the mismatch and free the GPU.
+        """
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        node_index = 0
+        node = cluster.node_names[node_index]
+        gpu_count = cluster.node_gpu_count(node)
+        assert gpu_count >= 1, f"{node} must expose at least one schedulable GPU"
+        gres = f"--gres=gpu:{gpu_count}"
+
+        before = _supervisor_pids(cluster, node_index)
+        hold = cluster.write_file(
+            "gpu-stale-hold.sh", "#!/bin/bash\nsleep 300\n", all_nodes=True
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "gpu-stale", "-N", "1", "-w", node, gres, hold])
+        )
+        assert job_id is not None
+        try:
+            wait_job_state(cluster, job_id, "R")
+            new_pids = _supervisor_pids(cluster, node_index) - before
+            assert len(new_pids) == 1, (
+                f"expected exactly one new supervisor for job {job_id}, got {new_pids}"
+            )
+            supervisor_pid = next(iter(new_pids))
+
+            # The agent goes dark before the controller gives up on the job,
+            # so the cancel below can only land at the controller.
+            prefix = cluster._sudo_prefix() if cluster.agent_as_root else ""
+            cluster.nodes[node_index].exec_allow_fail(
+                f"{prefix}pkill -9 -f '{cluster.bin_dir}/spurd'"
+            )
+            cluster.scancel(str(job_id))
+            assert wait_job(cluster, job_id, timeout=15) in ("CA", "GONE"), (
+                "the controller must record the cancel even though the node "
+                "agent is unreachable"
+            )
+
+            # The agent comes back and adopts its still-running supervisor
+            # from disk — its own state has no idea the job was cancelled.
+            cluster.nodes[node_index].exec(cluster._spurd_start_cmd(node_index))
+            cluster.wait_agent_serving(node_index, timeout=60)
+            assert supervisor_pid in _supervisor_pids(cluster, node_index), (
+                "the restarted agent must have adopted the surviving supervisor"
+            )
+
+            # Only the controller's reclaim-heartbeat can explain this dying
+            # now: nothing here issues a second cancel.
+            deadline = time.time() + 30
+            while supervisor_pid in _supervisor_pids(cluster, node_index):
+                assert time.time() < deadline, (
+                    f"reconnect-reported stale job {job_id}'s supervisor "
+                    f"{supervisor_pid} was never reclaimed"
+                )
+                time.sleep(1)
+        finally:
+            cluster.cli_allow_fail(["scancel", str(job_id)])
+
+        # The GPU ledger, not just the process, must be clear: a same-sized
+        # job on the same node must dispatch, not stay queued behind a
+        # phantom allocation.
+        retry_id = parse_job_id(
+            cluster.sbatch(["-J", "gpu-stale-retry", "-N", "1", "-w", node, gres, hold])
+        )
+        assert retry_id is not None
+        try:
+            wait_job_state(cluster, retry_id, "R", timeout=30)
+        finally:
+            cluster.scancel(str(retry_id))
