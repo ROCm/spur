@@ -1004,8 +1004,9 @@ async fn wait_for_exit_and_teardown(
 /// legacy and stepd-supervised graceful-cancel paths.
 const GRACEFUL_CANCEL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Polls until the job's `running` entry clears, via the supervisor's own
-/// completion push or this poll fencing a stepd stuck before `Start`.
+/// Polls until the job's `running` entry clears — via the supervisor's own
+/// completion push, this poll fencing a stepd stuck before `Start`, or (on
+/// deadline) arming the force-reclaim escalation for a wedged supervisor.
 async fn wait_for_stepd_release(
     job_id: u32,
     run_attempt: u32,
@@ -16015,12 +16016,10 @@ mod tests {
         );
     }
 
-    // Longer than CANCEL_REAP_TIMEOUT (3s): send_explicit_signal itself
-    // already takes that long to return, so the force deadline must sit
-    // past that return, or nothing is left to race the test's own action
-    // against — the force task would already be running by the time this
-    // test regains control.
-    const FORCE_RECLAIM_TEST_WINDOW: std::time::Duration = std::time::Duration::from_millis(4000);
+    // Well past CANCEL_REAP_TIMEOUT (3s), which send_explicit_signal itself
+    // blocks for before returning — the test's own action must land with
+    // real margin before this window closes, not race it by ~1s.
+    const FORCE_RECLAIM_TEST_WINDOW: std::time::Duration = std::time::Duration::from_millis(8000);
 
     #[tokio::test]
     async fn force_reclaim_spares_a_superseded_attempt() {
