@@ -9079,6 +9079,18 @@ impl AgentService {
         tokio::pin!(wait_exit);
 
         let master_raw = master.as_raw_fd();
+        // The stepd that opened this pty has no async I/O of its own to do
+        // with it, so it never had a reason to set this — without it, a read
+        // AsyncFd expects to fail with EAGAIN blocks the whole task instead.
+        if let Err(e) = nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        ) {
+            let _ = tx
+                .send(Err(Status::internal(format!("fcntl O_NONBLOCK: {e}"))))
+                .await;
+            return;
+        }
         let async_fd = match AsyncFd::new(master) {
             Ok(fd) => fd,
             Err(e) => {
@@ -18269,6 +18281,71 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    // A pty opened by a stepd (which does no async I/O of its own on it) is
+    // never put in non-blocking mode before spurd bridges it — `run_pty_bridge`
+    // itself has to do that, or a read `AsyncFd` expects to fail with EAGAIN
+    // blocks the whole bridging task instead of yielding.
+    #[tokio::test]
+    async fn run_pty_bridge_sets_the_master_non_blocking_before_use() {
+        use spur_proto::proto::InteractiveInput;
+
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        // A dup shares the same open file description, so its flags reflect
+        // whatever `run_pty_bridge` sets on `master` after this call.
+        let master_dup = nix::unistd::dup(&master).expect("dup master");
+
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new("cat");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let mut child = cmd.spawn().expect("spawn cat");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        let (_in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<InteractiveInput, tonic::Status>>(64);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<
+            Result<spur_proto::proto::InteractiveOutput, tonic::Status>,
+        >(64);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(128)
+        };
+        let bridge = tokio::spawn(AgentService::run_pty_bridge(
+            master, wait_exit, child_pid, true, inbound, out_tx,
+        ));
+
+        // The fcntl call under test happens before the select loop even
+        // starts, so a short, bounded wait is enough to run past it — no
+        // need to run the bridge to completion.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let flags = nix::fcntl::fcntl(&master_dup, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("fcntl F_GETFL on the surviving dup");
+        let flags = nix::fcntl::OFlag::from_bits_truncate(flags);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        bridge.abort();
+        assert!(
+            flags.contains(nix::fcntl::OFlag::O_NONBLOCK),
+            "run_pty_bridge must leave the master non-blocking, or its AsyncFd reads/writes can block the whole task"
+        );
     }
 
     // A non-interactive client (no TTY) closes its input stream on stdin-EOF while
