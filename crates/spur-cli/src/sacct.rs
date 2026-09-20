@@ -389,8 +389,10 @@ mod tests {
 
     #[test]
     fn borrowed_field_reports_whether_the_run_took_borrowed_capacity() {
-        let mut borrowed = JobInfo::default();
-        borrowed.idle_fill = true;
+        let borrowed = JobInfo {
+            idle_fill: true,
+            ..Default::default()
+        };
         assert_eq!(resolve_sacct_field(&borrowed, 'W'), "yes");
 
         let ordinary = JobInfo::default();

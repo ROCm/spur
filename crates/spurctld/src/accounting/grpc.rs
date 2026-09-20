@@ -772,6 +772,7 @@ impl SlurmAccounting for AccountingService {
             .map(canonicalize_qos_flags)
             .transpose()?;
         let update = db::QosUpdate {
+            idle_fill_preemptable: req.idle_fill_preemptable,
             description: req.description.as_deref(),
             priority: req.priority,
             preempt_mode: req.preempt_mode.as_deref(),
@@ -831,6 +832,7 @@ impl SlurmAccounting for AccountingService {
         let qos_list = records
             .into_iter()
             .map(|r| QosInfo {
+                idle_fill_preemptable: r.idle_fill_preemptable,
                 name: r.name,
                 description: r.description,
                 priority: r.priority,

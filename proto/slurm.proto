@@ -1704,6 +1704,9 @@ message CreateQosRequest {
   optional uint32 max_submit_jobs_per_account = 16;
   // Max submitted (pending + running) jobs across all users in this QOS.
   optional uint32 grp_submit_jobs = 17;
+  // Mark this QOS reclaimable by idle-fill even while inside quota. Absent = no
+  // change on update.
+  optional bool idle_fill_preemptable = 19;
   // Comma-separated QOS flags. Recognized: DenyOnLimit. Unset preserves the
   // stored flags; explicit empty clears them.
   optional string flags = 18;
@@ -1738,6 +1741,10 @@ message QosInfo {
   uint32 max_submit_jobs_per_account = 16;
   uint32 grp_submit_jobs = 17;
   string flags = 18;
+  // Jobs in this QOS are reclaimable by idle-fill even while inside their quota.
+  // Exists so an existing burst QOS, which carries no group cap to exceed and so is
+  // never stamped, can still be called back for a job holding a quota claim.
+  bool idle_fill_preemptable = 19;
 }
 
 // ============================================================

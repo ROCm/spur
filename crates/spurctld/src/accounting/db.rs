@@ -162,6 +162,7 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS idle_fill_preemptable BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
@@ -870,10 +871,12 @@ enum SqlVal<'a> {
     Int(i32),
     NullInt(Option<i32>),
     Real(f64),
+    Bool(bool),
 }
 
 fn push_bound(qb: &mut QueryBuilder<sqlx::Postgres>, val: SqlVal<'_>) {
     match val {
+        SqlVal::Bool(v) => qb.push_bind(v),
         SqlVal::Text(v) => qb.push_bind(v),
         SqlVal::NullText(v) => qb.push_bind(v),
         SqlVal::Int(v) => qb.push_bind(v),
@@ -1346,6 +1349,7 @@ pub struct QosUpdate<'a> {
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
     pub preempt_exempt_time: Option<Option<i32>>,
+    pub idle_fill_preemptable: Option<bool>,
     pub flags: Option<&'a str>,
 }
 
@@ -1396,6 +1400,9 @@ pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> a
     }
     if let Some(v) = u.preempt {
         updates.push(("preempt", SqlVal::Text(v)));
+    }
+    if let Some(v) = u.idle_fill_preemptable {
+        updates.push(("idle_fill_preemptable", SqlVal::Bool(v)));
     }
     if let Some(v) = u.preempt_exempt_time {
         updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
@@ -1448,7 +1455,7 @@ pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<St
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags, idle_fill_preemptable FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1471,6 +1478,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             grp_tres: r.get("grp_tres"),
             grp_wall_min: r.get("grp_wall_min"),
             preempt_exempt_time: r.get("preempt_exempt_time"),
+            idle_fill_preemptable: r.get("idle_fill_preemptable"),
             flags: r.get("flags"),
         })
         .collect())
@@ -1495,6 +1503,7 @@ pub struct QosRecord {
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
     pub preempt_exempt_time: Option<i32>,
+    pub idle_fill_preemptable: bool,
     pub flags: String,
 }
 
@@ -2478,6 +2487,7 @@ mod job_history_tests {
             &pool,
             &name,
             QosUpdate {
+                idle_fill_preemptable: Some(true),
                 description: Some("d"),
                 priority: Some(5),
                 preempt_mode: Some("cluster"),
@@ -2515,6 +2525,7 @@ mod job_history_tests {
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
         assert_eq!(got.grp_wall_min, Some(120));
         assert_eq!(got.flags, "DenyOnLimit");
+        assert!(got.idle_fill_preemptable);
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)

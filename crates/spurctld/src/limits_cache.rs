@@ -260,8 +260,7 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
         },
         usage_factor: r.usage_factor,
         deny_on_limit: parse_deny_on_limit(&r.flags),
-        // No stored column yet; surfacing lands with the accounting schema work.
-        idle_fill_preemptable: false,
+        idle_fill_preemptable: r.idle_fill_preemptable,
     }
 }
 
@@ -366,6 +365,7 @@ mod tests {
     #[test]
     fn test_qos_from_record_parses_limits() {
         let record = crate::accounting::db::QosRecord {
+            idle_fill_preemptable: true,
             name: "high".into(),
             description: "High priority QoS".into(),
             priority: 100,
@@ -417,6 +417,7 @@ mod tests {
             64
         );
         assert!(qos.limits.grp_tres.is_some());
+        assert!(qos.idle_fill_preemptable);
     }
 
     #[test]
@@ -424,6 +425,7 @@ mod tests {
         // Post sentinel-flip: a stored 0 is a real "block all" value; NULL and a
         // stray negative are "no limit" (unset).
         let record = crate::accounting::db::QosRecord {
+            idle_fill_preemptable: false,
             name: "minimal".into(),
             description: String::new(),
             priority: 0,
@@ -454,5 +456,6 @@ mod tests {
         assert!(qos.limits.grp_tres.is_none());
         assert_eq!(qos.limits.grp_wall_minutes, None);
         assert!(!qos.deny_on_limit);
+        assert!(!qos.idle_fill_preemptable);
     }
 }

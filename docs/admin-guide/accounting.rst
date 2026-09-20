@@ -992,9 +992,9 @@ With this setup:
 
    The two coexist. A burst job runs inside its own quota, so idle-fill does not
    stamp it and it keeps counting toward every limit as it does today. To move an
-   existing burst QOS onto idle-fill's reclaim path, mark it
-   ``idle_fill_preemptable``, which makes its jobs reclaimable even while inside
-   quota. That flag has no ``sacctmgr`` column yet, so it is not settable today.
+   existing burst QOS onto idle-fill's reclaim path, set
+   ``idlefillpreemptable=yes`` on it, which makes its jobs reclaimable even while
+   inside quota. It defaults to ``no`` on every QOS.
 
 How a job's QOS is resolved
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -141,6 +141,7 @@ const QOS_KEYS: &[&str] = &[
     "preempt",
     "preemptexempttime",
     "clearpreemptexempttime",
+    "idlefillpreemptable",
     "usagefactor",
     "maxjobsperuser",
     "maxjobspu",
@@ -270,6 +271,16 @@ fn parse_i32(key: &str, val: &str) -> Result<i32> {
 fn parse_u32(key: &str, val: &str) -> Result<u32> {
     val.parse()
         .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Parse an explicit on/off parameter. Unrecognised values are rejected rather
+/// than treated as off, so a typo cannot silently clear the setting.
+fn parse_bool(key: &str, val: &str) -> Result<bool> {
+    match val.to_lowercase().as_str() {
+        "1" | "yes" | "true" => Ok(true),
+        "0" | "no" | "false" => Ok(false),
+        _ => Err(anyhow::anyhow!("invalid value for {key}=: '{val}'")),
+    }
 }
 
 /// Return true when a key=value pair explicitly opts in to a boolean action
@@ -569,6 +580,10 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|v| parse_u32("preemptexempttime", v))
                         .transpose()?,
                     clear_preempt_exempt_time: false,
+                    idle_fill_preemptable: p
+                        .get("idlefillpreemptable")
+                        .map(|v| parse_bool("idlefillpreemptable", v))
+                        .transpose()?,
                     max_submit_jobs_per_account: Some(
                         find_alias(
                             &p,
@@ -756,6 +771,10 @@ fn build_modify_qos_request(
             .get("clearpreemptexempttime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
+        idle_fill_preemptable: p
+            .get("idlefillpreemptable")
+            .map(|v| parse_bool("idlefillpreemptable", v))
+            .transpose()?,
         max_submit_jobs_per_account: find_alias(
             p,
             &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
@@ -1267,8 +1286,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
 const QOS_DEFAULT_FORMAT: &str =
     "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
-const QOS_ALL_FORMAT: &str =
-    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-20T %-20V %-20G";
+const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -1278,6 +1296,7 @@ fn qos_header(spec: char) -> &'static str {
         'P' => "PreemptMode",
         'Q' => "Preempt",
         'E' => "PreemptExemptTime",
+        'I' => "IdleFillPreemptable",
         'U' => "UsageFactor",
         'G' => "GrpTRES",
         'T' => "MaxTRES",
@@ -1301,6 +1320,7 @@ fn qos_field_spec(name: &str) -> Option<char> {
         "preemptmode" => Some('P'),
         "preempt" => Some('Q'),
         "preemptexempttime" => Some('E'),
+        "idlefillpreemptable" => Some('I'),
         "usagefactor" => Some('U'),
         "grptres" => Some('G'),
         "maxtres" | "maxtrespj" | "maxtresperjob" => Some('T'),
@@ -1324,6 +1344,7 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'P' => q.preempt_mode.clone(),
         'Q' => q.preempt.clone(),
         'E' => q.preempt_exempt_time.map(blank_if_zero).unwrap_or_default(),
+        'I' => if q.idle_fill_preemptable { "yes" } else { "no" }.into(),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
@@ -1943,6 +1964,77 @@ mod tests {
         assert!(row.contains("node=4,cpu=256"), "GrpTRES missing: {row}");
         assert!(row.contains("node=2,cpu=64"), "MaxTRES missing: {row}");
         assert!(row.contains("cpu=128"), "MaxTRESPU missing: {row}");
+    }
+
+    #[test]
+    fn every_qos_format_letter_has_a_header_and_a_value() {
+        let q = stub_qos();
+        for fmt in [QOS_DEFAULT_FORMAT, QOS_ALL_FORMAT] {
+            for spec in fmt.chars().filter(|c| c.is_ascii_alphabetic()) {
+                assert_ne!(
+                    qos_header(spec),
+                    "?",
+                    "letter {spec} in {fmt} has no header"
+                );
+                assert_ne!(
+                    resolve_qos_field(&q, spec),
+                    "?",
+                    "letter {spec} in {fmt} has a header but no resolver"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_fill_preemptable_renders_as_yes_or_no() {
+        let fields = format_engine::parse_named_format(
+            "Name,IdleFillPreemptable",
+            &qos_field_spec,
+            &qos_header,
+        );
+        let on = QosInfo {
+            idle_fill_preemptable: true,
+            ..stub_qos()
+        };
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&on, spec));
+        assert!(row.contains("yes"), "expected yes: {row}");
+
+        let off = QosInfo {
+            idle_fill_preemptable: false,
+            ..stub_qos()
+        };
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&off, spec));
+        assert!(row.contains("no"), "expected no: {row}");
+    }
+
+    #[test]
+    fn add_qos_sets_idle_fill_preemptable() {
+        let p = parse_params(&["name=burst".into(), "idlefillpreemptable=yes".into()]);
+        assert_eq!(
+            p.get("idlefillpreemptable")
+                .map(|v| parse_bool("idlefillpreemptable", v))
+                .transpose()
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parse_bool_accepts_both_directions() {
+        for v in &["1", "yes", "TRUE"] {
+            assert!(parse_bool("idlefillpreemptable", v).unwrap(), "{v}");
+        }
+        for v in &["0", "no", "False"] {
+            assert!(!parse_bool("idlefillpreemptable", v).unwrap(), "{v}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_rejects_unrecognised_values() {
+        // A typo must not silently read as "off" and disable the burst tier.
+        for v in &["maybe", "", "2", "off"] {
+            assert!(parse_bool("idlefillpreemptable", v).is_err(), "{v}");
+        }
     }
 
     #[test]

@@ -176,11 +176,19 @@ reclaimable even while inside quota, so an existing burst QOS can be migrated on
 idle-fill's reclaim path. Jobs in such a QOS still count fully toward every quota,
 because they are running inside their own.
 
-.. note::
+Set it with ``sacctmgr``:
 
-   ``idle_fill_preemptable`` has no accounting schema column yet, so it cannot be
-   set through ``sacctmgr`` today. The reclaim path honours it; the means to
-   configure it is still to come.
+.. code-block:: console
+
+   $ sacctmgr -i modify qos burst set idlefillpreemptable=yes
+   $ sacctmgr show qos format=Name,IdleFillPreemptable
+   Name            IdleFillPreemptable
+   burst           yes
+   normal          no
+
+The flag accepts ``yes``/``no``, ``true``/``false``, and ``1``/``0``. It defaults to
+``no`` on every QOS, including those created before this release, so enabling
+idle-fill does not make any existing workload reclaimable until you say so.
 
 Observing borrowed runs
 -----------------------
