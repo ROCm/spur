@@ -601,6 +601,16 @@ fn build_srun_job_spec(
         .transpose()?
         .unwrap_or(0);
 
+    // A --pty job's own placeholder never runs the command — the interactive
+    // session does, via its own CreateJobStep + container spec — so giving the
+    // placeholder the same script and container image just runs it a second,
+    // unwatched time in a redundant container. Give it an inert placeholder.
+    let (script, container) = if args.pty {
+        ("#!/bin/bash\nsleep infinity\n".to_string(), None)
+    } else {
+        (build_command_script(&args.command)?, Some(args))
+    };
+
     Ok(JobSpec {
         name: args
             .job_name
@@ -621,7 +631,7 @@ fn build_srun_job_spec(
         gpus,
         gpus_per_node,
         gpus_per_task,
-        script: build_command_script(&args.command)?,
+        script,
         work_dir: work_dir.to_string(),
         stdout_path: io.stdout.clone(),
         stderr_path: io.stderr.clone(),
@@ -636,22 +646,35 @@ fn build_srun_job_spec(
         exclusive: args.exclusive,
         mpi: mpi.to_string(),
         licenses: args.licenses.clone(),
-        container_image: args.container_image.clone().unwrap_or_default(),
-        container_mounts: args.container_mounts.clone(),
-        container_workdir: args.container_workdir.clone().unwrap_or_default(),
-        container_name: args.container_name.clone().unwrap_or_default(),
-        container_readonly: args.container_readonly,
-        container_mount_home: args.container_mount_home,
-        container_env: args
-            .container_env
-            .iter()
-            .filter_map(|s| {
-                s.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+        container_image: container
+            .and_then(|a| a.container_image.clone())
+            .unwrap_or_default(),
+        container_mounts: container
+            .map(|a| a.container_mounts.clone())
+            .unwrap_or_default(),
+        container_workdir: container
+            .and_then(|a| a.container_workdir.clone())
+            .unwrap_or_default(),
+        container_name: container
+            .and_then(|a| a.container_name.clone())
+            .unwrap_or_default(),
+        container_readonly: container.is_some_and(|a| a.container_readonly),
+        container_mount_home: container.is_some_and(|a| a.container_mount_home),
+        container_env: container
+            .map(|a| {
+                a.container_env
+                    .iter()
+                    .filter_map(|s| {
+                        s.split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                    })
+                    .collect()
             })
-            .collect(),
-        container_entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
-        container_remap_root: args.container_remap_root,
+            .unwrap_or_default(),
+        container_entrypoint: container
+            .and_then(|a| a.container_entrypoint.clone())
+            .unwrap_or_default(),
+        container_remap_root: container.is_some_and(|a| a.container_remap_root),
         srun_job: true,
         pty: args.pty,
         ..Default::default()
@@ -1509,6 +1532,34 @@ async fn complete_interactive_step(
 
 /// Create an interactive PTY step on a running job and attach to it, reporting
 /// the step's exit code on every exit path once the step exists.
+// Wide enough to ride out a real agent restart (binary swap, not just a
+// network blip), at 500ms between attempts.
+const RECONNECT_ATTEMPTS: u32 = 20;
+/// Bounds connecting and opening the session for one reconnect attempt. A
+/// dead peer's socket isn't always torn down promptly, and neither of these
+/// calls has its own timeout — without this, one bad attempt hangs forever
+/// instead of being retried.
+const RECONNECT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+// Shrinks the timeout above for tests that need to actually hit it: real
+// gRPC sockets defeat `start_paused`'s auto-advance, so the alternative is a
+// real 20s sleep per test.
+#[cfg(test)]
+thread_local! {
+    static TEST_RECONNECT_SETUP_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn reconnect_setup_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = TEST_RECONNECT_SETUP_TIMEOUT.with(|cell| cell.get()) {
+            return d;
+        }
+    }
+    RECONNECT_SETUP_TIMEOUT
+}
+
 async fn run_interactive_pty(
     ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -1529,7 +1580,7 @@ async fn run_interactive_pty(
     let outcome: Result<i32> = 'session: {
         let mut last_err: Option<anyhow::Error> = None;
 
-        for attempt in 0..5 {
+        for attempt in 0..RECONNECT_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
@@ -1557,7 +1608,9 @@ async fn run_interactive_pty(
                     .await
                 {
                     Ok(resp) => resp.into_inner(),
-                    Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                    Err(status)
+                        if is_retryable_status(&status) && attempt < RECONNECT_ATTEMPTS - 1 =>
+                    {
                         last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
                         continue;
                     }
@@ -1586,37 +1639,78 @@ async fn run_interactive_pty(
                 pair
             };
 
-            let mut agent = match crate::interactive::connect_agent(&node_addr).await {
-                Ok(agent) => agent,
-                Err(e) => break 'session Err(e),
-            };
-
-            match crate::interactive::open_interactive_session(
-                &mut agent,
-                job_id,
-                step_id,
-                command.clone(),
-                winsize,
-                true,
-                user,
-                effective_container.clone(),
-                step_cred,
+            // The agent may still be mid-restart right after a dropped stream,
+            // so a failed reconnect is worth another attempt, not a hard stop.
+            // Bounded: a dead peer's socket isn't always torn down promptly.
+            let mut agent = match tokio::time::timeout(
+                reconnect_setup_timeout(),
+                crate::interactive::connect_agent(&node_addr),
             )
             .await
             {
-                Ok(handle) => {
-                    break 'session crate::interactive::drive_interactive_session(handle).await
+                Ok(Ok(agent)) => agent,
+                Ok(Err(e)) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                    last_err = Some(e);
+                    continue;
                 }
-                Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                Ok(Err(e)) => break 'session Err(e),
+                Err(_) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                    last_err = Some(anyhow::anyhow!("connecting to the agent timed out"));
+                    continue;
+                }
+                Err(_) => break 'session Err(anyhow::anyhow!("connecting to the agent timed out")),
+            };
+
+            let open_result = tokio::time::timeout(
+                reconnect_setup_timeout(),
+                crate::interactive::open_interactive_session(
+                    &mut agent,
+                    job_id,
+                    step_id,
+                    command.clone(),
+                    winsize,
+                    true,
+                    user,
+                    effective_container.clone(),
+                    step_cred,
+                ),
+            )
+            .await;
+
+            match open_result {
+                Ok(Ok(handle)) => {
+                    match crate::interactive::drive_interactive_session(handle).await {
+                        Ok(code) => break 'session Ok(code),
+                        // The step's supervisor outlives an agent restart, so a
+                        // dropped stream is worth reattaching to, not failing on.
+                        Err(err) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                            eprintln!(
+                                "srun: warning: session disconnected ({err}); reconnecting..."
+                            );
+                            last_err = Some(err);
+                            continue;
+                        }
+                        Err(err) => break 'session Err(err),
+                    }
+                }
+                Ok(Err(status))
+                    if is_retryable_status(&status) && attempt < RECONNECT_ATTEMPTS - 1 =>
+                {
                     last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
                     continue;
                 }
-                Err(status) => {
+                Ok(Err(status)) => {
                     break 'session Err(anyhow::anyhow!(
                         "InteractiveSession RPC failed: {}",
                         status.message()
                     ))
                 }
+                Err(_) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                    eprintln!("srun: warning: reconnect attempt timed out; retrying...");
+                    last_err = Some(anyhow::anyhow!("InteractiveSession RPC timed out"));
+                    continue;
+                }
+                Err(_) => break 'session Err(anyhow::anyhow!("InteractiveSession RPC timed out")),
             }
         }
 
@@ -2238,6 +2332,33 @@ mod tests {
         assert_eq!(spec.work_dir, "/tmp/work");
         assert!(spec.script.starts_with("#!/bin/bash\n"));
         assert!(spec.script.contains("hostname"));
+    }
+
+    // The interactive session runs the real command; giving the job's own
+    // placeholder the same script would run it a second, unwatched time.
+    #[test]
+    fn build_srun_job_spec_gives_a_pty_job_an_inert_placeholder() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "--pty",
+            "--container-image=img.sqsh",
+            "bash",
+            "-c",
+            "echo hi",
+        ])
+        .expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+        assert_eq!(spec.script, "#!/bin/bash\nsleep infinity\n");
+        assert!(
+            spec.container_image.is_empty(),
+            "the placeholder needs no container of its own"
+        );
     }
 
     /// Launchers like PRTE's `plm:slurm` always pass `--ntasks-per-node`, so
@@ -2900,6 +3021,131 @@ mod tests {
         assert!(
             capture.complete_step_calls().is_empty(),
             "no step exists, so nothing may be reported complete"
+        );
+    }
+
+    /// The step's supervisor outlives an agent restart, so a stream dropped
+    /// mid-session is worth reattaching to instead of reporting as an exit.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_reconnects_after_a_dropped_stream_without_recreating_the_step() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![
+            crate::mock_agent::ScriptedSession::Disconnect,
+            crate::mock_agent::ScriptedSession::Exit(3),
+        ]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect("the dropped stream must be retried, not reported as a failure");
+
+        assert_eq!(
+            exit_code, 3,
+            "must return the reconnect attempt's exit code"
+        );
+        assert_eq!(
+            agent_capture.session_count(),
+            2,
+            "a dropped stream must reopen InteractiveSession"
+        );
+        assert_eq!(
+            ctrl_capture.complete_step_calls(),
+            vec![(crate::mock_controller::MOCK_STEP_ID, 3)],
+            "the step must be created once and completed once, not per attempt"
+        );
+    }
+
+    /// A permanently dead stream must not retry forever, and the one step it
+    /// created must still be reported complete exactly once.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_gives_up_after_all_attempts_are_exhausted() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(
+            std::iter::repeat_with(|| crate::mock_agent::ScriptedSession::Disconnect)
+                .take(RECONNECT_ATTEMPTS as usize)
+                .collect(),
+        );
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect_err("a permanently dead stream must give up, not retry forever");
+
+        assert_eq!(
+            agent_capture.session_count(),
+            RECONNECT_ATTEMPTS,
+            "must stop after the last attempt"
+        );
+        assert_eq!(
+            ctrl_capture.complete_step_calls(),
+            vec![(crate::mock_controller::MOCK_STEP_ID, 1)],
+            "the one step created must still be reported complete exactly once"
+        );
+    }
+
+    /// Neither connecting nor opening the session has its own timeout, so a
+    /// peer whose socket isn't torn down promptly must not hang the client
+    /// forever — the reconnect loop's own bound has to kick in and retry.
+    /// Real gRPC sockets defeat `start_paused`'s auto-advance, so the setup
+    /// timeout is shrunk for this test rather than run at its real 20s.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_retries_past_a_hung_reconnect_attempt() {
+        let _env = EnvGuard::new();
+        TEST_RECONNECT_SETUP_TIMEOUT
+            .with(|cell| cell.set(Some(std::time::Duration::from_millis(200))));
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![
+            crate::mock_agent::ScriptedSession::Hang,
+            crate::mock_agent::ScriptedSession::Exit(3),
+        ]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_interactive_pty(
+                &mut client,
+                1,
+                vec!["bash".into()],
+                String::new(),
+                "tester",
+                None,
+            ),
+        )
+        .await
+        .expect("a hung attempt must not outlast the reconnect loop's own timeout")
+        .expect("the second attempt must succeed after the first times out");
+        TEST_RECONNECT_SETUP_TIMEOUT.with(|cell| cell.set(None));
+
+        assert_eq!(exit_code, 3, "must return the successful retry's exit code");
+        assert_eq!(
+            agent_capture.session_count(),
+            2,
+            "a hung attempt must be abandoned and retried, not left open"
         );
     }
 

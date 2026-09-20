@@ -52,6 +52,9 @@ pub(crate) struct StepCapture {
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
     submit_job_id: Arc<AtomicU32>,
     cancel_job_calls: Arc<AtomicU32>,
+    /// `node_addr` handed back from `CreateJobStep`, so a test can point an
+    /// interactive step at a mock agent instead of an empty address.
+    create_step_node_addr: Arc<Mutex<String>>,
 }
 
 impl StepCapture {
@@ -137,6 +140,10 @@ impl StepCapture {
     pub(crate) fn cancel_job_calls(&self) -> u32 {
         self.cancel_job_calls.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
+        *self.create_step_node_addr.lock().unwrap() = addr.into();
+    }
 }
 
 struct MockController {
@@ -186,7 +193,7 @@ mock_controller_impl! {
             }
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
-                node_addr: String::new(),
+                node_addr: self.capture.create_step_node_addr.lock().unwrap().clone(),
                 container: None,
                 execution_credential: String::new(),
             }))

@@ -382,10 +382,9 @@ impl ControllerService {
             ));
         }
 
-        // A numbered step may run on a subset of the job's nodes, so a job-wide
-        // cohort counts the non-participants as missing and requeues the whole job.
-        // Only the steps that span the allocation can be checked this way.
-        if spur_core::step::is_user_step(step_id) {
+        // Only the step that owns the job's lifetime spans the whole
+        // allocation; anything else may run on a node subset.
+        if !spur_core::step::owns_job_lifetime(step_id) {
             return Ok(StepdRecoveryProbe::Retained);
         }
 
@@ -2511,9 +2510,9 @@ impl SlurmController for ControllerService {
             .await?;
 
         if request.stale_descriptor {
-            // A numbered step losing its supervisor is that step's failure, not the
-            // job's; fencing here would requeue the batch script and every sibling.
-            if spur_core::step::is_user_step(request.step_id) {
+            // Fencing here would requeue the batch script and every sibling,
+            // so only the step that owns the job's lifetime may trigger it.
+            if !spur_core::step::owns_job_lifetime(request.step_id) {
                 self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
                     .await;
                 return Ok(Response::new(StepdRecoveryResponse {
@@ -5527,10 +5526,13 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
-/// A numbered step's supervisor speaks only for that step; finalizing the job on
-/// it would end the allocation while its siblings still run.
+/// Only the step that owns the job's lifetime may finalize it; a numbered
+/// step or the terminal placeholder speaks for itself, not the allocation.
 fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
-    step_id.is_none_or(|id| !spur_core::step::is_user_step(id))
+    match step_id {
+        Some(id) => spur_core::step::owns_job_lifetime(id),
+        None => true,
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -5615,7 +5617,9 @@ mod tests {
         assert!(reports_whole_job(None));
         assert!(reports_whole_job(Some(STEP_BATCH)));
         assert!(reports_whole_job(Some(STEP_EXTERN)));
-        assert!(reports_whole_job(Some(STEP_INTERACTIVE)));
+        // A terminal's custody placeholder runs no workload of its own — its
+        // retirement must not end a job whose real allocation is still alive.
+        assert!(!reports_whole_job(Some(STEP_INTERACTIVE)));
         assert!(!reports_whole_job(Some(0)));
         assert!(!reports_whole_job(Some(7)));
     }

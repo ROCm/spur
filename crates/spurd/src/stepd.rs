@@ -50,6 +50,8 @@ pub struct StepdLaunchSpec {
     pub nodelist: String,
     pub memlock: StepdMemlock,
     #[serde(default)]
+    pub io_mode: crate::executor::LaunchIo,
+    #[serde(default)]
     pub container: Option<crate::executor::ContainerLaunchConfig>,
     #[serde(default)]
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
@@ -198,6 +200,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             partition: config.partition.clone(),
             nodelist: config.nodelist.clone(),
             memlock: config.memlock.into(),
+            io_mode: config.io_mode,
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
             container_rootfs_mode: None,
@@ -266,7 +269,7 @@ impl StepdLaunchSpec {
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
-            io_mode: crate::executor::LaunchIo::File,
+            io_mode: self.io_mode,
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
@@ -1808,10 +1811,10 @@ async fn serve_supervisor_connection(
 /// A step's rootfs is kept out of the job's namespace so it can never resolve to
 /// (and later delete) a batch job's live rootfs.
 fn rootfs_base(job_id: u32, step_id: spur_core::step::StepId) -> String {
-    if spur_core::step::is_user_step(step_id) {
-        crate::container::step_rootfs_base(job_id, step_id)
-    } else {
+    if spur_core::step::owns_job_lifetime(step_id) {
         crate::container::job_rootfs_base(job_id)
+    } else {
+        crate::container::step_rootfs_base(job_id, step_id)
     }
 }
 
@@ -2048,10 +2051,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
             record_launch_failure(&session_dir, &stderr_path, &error);
-            if spur_core::step::is_user_step(step_id) {
-                crate::executor::cleanup_step_spool(job_id, step_id);
-            } else {
+            if spur_core::step::owns_job_lifetime(step_id) {
                 crate::executor::cleanup_job_spool(job_id);
+            } else {
+                crate::executor::cleanup_step_spool(job_id, step_id);
             }
             return Err(error);
         }
@@ -2063,10 +2066,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        if spur_core::step::is_user_step(step_id) {
-            crate::executor::cleanup_step_spool(job_id, step_id);
-        } else {
+        if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
+        } else {
+            crate::executor::cleanup_step_spool(job_id, step_id);
         }
     };
     // Before the workload execs: the ranks look the server up through the
@@ -2079,8 +2082,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output, task_environment) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None, None, HashMap::new())
+    let (job, launched_cgroup, launched_output, task_environment, pty_master) = if launch_spec
+        .allocation_only
+    {
+        (RunningJob::AllocationOnly, None, None, HashMap::new(), None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => (
@@ -2088,6 +2093,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
                 result.cgroup_path,
                 Some((result.stdout_path, result.stderr_path)),
                 result.task_environment,
+                result.pty_master,
             ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
@@ -2102,6 +2108,16 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
         descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);
+    }
+    // Self-deposit: the agent's interactive-session handler reclaims this by
+    // pid over the same custody protocol an agent restart already uses, so a
+    // fresh attach and a post-restart reattach both just reclaim a master.
+    if let Some(master) = pty_master.as_ref() {
+        if let Err(error) =
+            deposit_pty_master(&session_dir, workload_pid, std::os::fd::AsFd::as_fd(master)).await
+        {
+            tracing::warn!(job_id, %error, "failed to deposit this step's own pty master");
+        }
     }
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
@@ -2157,7 +2173,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // The agent reaps the job node once its last step releases; this
             // covers the case where teardown here runs and that never does.
             // Removing an absent directory is a no-op, so both trying is safe.
-            if !spur_core::step::is_user_step(step_id) {
+            if spur_core::step::owns_job_lifetime(step_id) {
                 if let Some(job_cgroup) = cgroup.parent() {
                     crate::executor::cleanup_cgroup(job_cgroup);
                 }
@@ -2166,9 +2182,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        // A user step's spool outlives teardown: this runs before the agent is
-        // notified, and the agent still has to read the step's output back.
-        if !spur_core::step::is_user_step(step_id) {
+        // A non-owning step's spool outlives teardown, since the agent still
+        // has to read its output back after this runs.
+        if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
         }
     };
@@ -2194,9 +2210,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // unbounded operator code, and a crash in them must not read as "never ran".
     obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
     teardown(cgroup).await;
-    // The node epilog and SPANK exit hooks are per-job-per-node, so only the step
-    // that owns the job's lifetime runs them — a numbered step would re-run them.
-    let owns_job_lifetime = !spur_core::step::is_user_step(step_id);
+    // Per-job-per-node hooks: only the step owning the job's lifetime runs them.
+    let owns_job_lifetime = spur_core::step::owns_job_lifetime(step_id);
     let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
         Some(epilog) => match spur_core::hooks::run_hook(epilog, &hook_context).await {
             Err(error) => {
@@ -2348,9 +2363,8 @@ impl StepdStore {
         if !matches!(stepd_liveness(descriptor), Ok(StepdLiveness::Stale)) {
             return Ok(false);
         }
-        // A numbered step's loss is that step's failure; only a job-level
-        // session speaks for the allocation the controller is holding.
-        if spur_core::step::is_user_step(descriptor.step_id) {
+        // Only the step owning the job's lifetime speaks for the allocation.
+        if !spur_core::step::owns_job_lifetime(descriptor.step_id) {
             return Ok(false);
         }
         if self
@@ -3154,6 +3168,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "node-a".into(),
             memlock: StepdMemlock::Inherit,
+            io_mode: crate::executor::LaunchIo::File,
             container: None,
             host_device_plan: None,
             container_rootfs_mode: None,
@@ -3177,6 +3192,26 @@ mod tests {
         let mut spec = launch_spec();
         spec.pmix_multi_task = true;
         assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    // A stepd relaunched from a persisted spec must honor Pty just as the
+    // original launch did, or a restart silently drops back to File.
+    #[test]
+    fn launch_spec_preserves_pty_io_mode() {
+        let mut spec = launch_spec();
+        spec.io_mode = crate::executor::LaunchIo::Pty;
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty
+        );
+    }
+
+    #[test]
+    fn job_launch_config_round_trip_preserves_pty_io_mode() {
+        let mut config = launch_spec().into_launch_config();
+        config.io_mode = crate::executor::LaunchIo::Pty;
+        let spec = StepdLaunchSpec::try_from(&config).expect("valid config");
+        assert_eq!(spec.io_mode, crate::executor::LaunchIo::Pty);
     }
 
     fn pmix_spec(step_id: spur_core::step::StepId, ranks: u32, plugin: &str) -> StepdPmix {
@@ -4868,6 +4903,18 @@ mod tests {
         assert!(
             epilog_failed,
             "the batch step must still run the node epilog"
+        );
+    }
+
+    // A terminal supervisor is reserved like the batch/extern steps but owns no
+    // workload; retiring it must not re-run a job-ending hook.
+    #[tokio::test]
+    async fn a_terminal_placeholder_does_not_run_the_node_epilog() {
+        let AgentNotification::StepdCompleted { epilog_failed, .. } =
+            supervised_completion_notice(spur_core::step::STEP_INTERACTIVE).await;
+        assert!(
+            !epilog_failed,
+            "a terminal placeholder must leave the node epilog to the step owning the job"
         );
     }
 

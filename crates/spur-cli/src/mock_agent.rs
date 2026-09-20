@@ -24,11 +24,22 @@ pub(crate) struct ScriptedStream {
     pub(crate) then_eof: bool,
 }
 
+/// A scripted reply to one `InteractiveSession` call: a mid-stream drop
+/// standing in for the agent restarting, a clean exit status, or a peer that
+/// never answers the call at all (a socket that isn't torn down promptly).
+pub(crate) enum ScriptedSession {
+    Disconnect,
+    Exit(i32),
+    Hang,
+}
+
 /// What the mock agent received, shared with the test body.
 #[derive(Clone, Default)]
 pub(crate) struct StreamCapture {
     start_offsets: Arc<Mutex<Vec<u64>>>,
     script: Arc<Mutex<Vec<ScriptedStream>>>,
+    session_script: Arc<Mutex<Vec<ScriptedSession>>>,
+    session_count: Arc<Mutex<u32>>,
 }
 
 impl StreamCapture {
@@ -45,6 +56,24 @@ impl StreamCapture {
 
     fn next_reply(&self) -> Option<ScriptedStream> {
         let mut script = self.script.lock().expect("capture lock");
+        if script.is_empty() {
+            return None;
+        }
+        Some(script.remove(0))
+    }
+
+    /// Queue the replies successive `InteractiveSession` calls get.
+    pub(crate) fn script_sessions(&self, attempts: Vec<ScriptedSession>) {
+        *self.session_script.lock().expect("capture lock") = attempts;
+    }
+
+    /// How many `InteractiveSession` calls the mock has served.
+    pub(crate) fn session_count(&self) -> u32 {
+        *self.session_count.lock().expect("capture lock")
+    }
+
+    fn next_session(&self) -> Option<ScriptedSession> {
+        let mut script = self.session_script.lock().expect("capture lock");
         if script.is_empty() {
             return None;
         }
@@ -124,7 +153,30 @@ mock_agent_impl! {
             &self,
             _request: Request<tonic::Streaming<proto::InteractiveInput>>,
         ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
-            Err(Status::unimplemented("interactive_session"))
+            *self.capture.session_count.lock().expect("capture lock") += 1;
+            let attempt = self.capture.next_session();
+            // Never returns: stands in for a peer whose socket isn't torn
+            // down promptly, so the caller's own timeout is what fires.
+            if matches!(&attempt, Some(ScriptedSession::Hang)) {
+                std::future::pending::<()>().await;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                match attempt {
+                    // A dropped sender surfaces to the client as `Ok(None)`,
+                    // matching a stepd that vanished mid-session. Hang never
+                    // reaches here — it already parked forever above.
+                    None | Some(ScriptedSession::Disconnect) | Some(ScriptedSession::Hang) => {}
+                    Some(ScriptedSession::Exit(code)) => {
+                        let _ = tx
+                            .send(Ok(proto::InteractiveOutput {
+                                msg: Some(proto::interactive_output::Msg::ExitStatus(code)),
+                            }))
+                            .await;
+                    }
+                }
+            });
+            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
         }
 
         async fn ping(

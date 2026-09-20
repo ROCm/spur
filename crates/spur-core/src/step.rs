@@ -33,6 +33,12 @@ pub fn is_user_step(step_id: StepId) -> bool {
     step_id < STEP_RESERVED_MIN
 }
 
+/// The batch or extern step — the job's own workload, unlike a user step or
+/// the interactive-terminal custody placeholder.
+pub fn owns_job_lifetime(step_id: StepId) -> bool {
+    !is_user_step(step_id) && step_id != STEP_INTERACTIVE
+}
+
 /// Default for a step id deserialized from a payload written before this
 /// field existed — the batch step, since that was the only kind in flight.
 pub fn default_step_id() -> StepId {

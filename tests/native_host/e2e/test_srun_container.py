@@ -891,6 +891,35 @@ def _user_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> se
     return sessions
 
 
+def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set:
+    node = cluster.nodes[node_index]
+    listing = node.exec_allow_fail(
+        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
+    )
+    prefix = f"{job_id}."
+    sessions = set()
+    for name in listing.split():
+        if not name.startswith(prefix):
+            continue
+        try:
+            step_id = int(name.rsplit(".", 1)[-1])
+        except ValueError:
+            continue
+        if step_id >= _RESERVED_STEP_FLOOR:
+            sessions.add(name)
+    return sessions
+
+
+def _assert_ticks_not_replayed(out: str, ticks: int = 20) -> None:
+    """A shell relaunched from scratch after a restart repeats its early
+    ticks; a reconnect racing the restart only drops a line or two of a
+    terminal it can't buffer while disconnected. Duplicates, not gaps,
+    are what distinguish a restart from a clean reconnect.
+    """
+    duplicated = [i for i in range(1, ticks + 1) if out.count(f"tick {i}\r\n") > 1]
+    assert not duplicated, f"tick(s) {duplicated} repeated — the step was restarted:\n{out}"
+
+
 class TestSrunContainerStepSupervision:
     """A container step used to run as a bare fork of spurd (Case 2 in the
     module docstring above), with no supervisor to outlive an agent restart.
@@ -900,14 +929,15 @@ class TestSrunContainerStepSupervision:
         cluster = step_container_cluster
         img = cluster.step_container_image
         job_name = f"container-restart-survival-{time.time_ns()}"
+        node = cluster.node_names[0]
         result: dict = {}
 
         def run():
             result["code"], result["out"] = cluster.srun_with_exit([
-                "-N", "1", "-t", "0:02", "-J", job_name,
+                "-N", "1", "-w", node, "-t", "0:02", "-J", job_name,
                 f"--container-image={img}",
                 "bash", "-c",
-                "for i in $(seq 1 20); do echo tick $i; sleep 1; done; echo SURVIVED",
+                "i=1; while [ $i -le 20 ]; do echo tick $i; sleep 1; i=$((i+1)); done; echo SURVIVED",
             ])
 
         thread = threading.Thread(target=run)
@@ -948,3 +978,62 @@ class TestSrunContainerStepSupervision:
         out = str(result.get("out"))
         assert "SURVIVED" in out, out
         assert out.count("tick 1\n") == 1, f"the step must not have been restarted:\n{out}"
+
+    def test_pty_container_step_survives_an_agent_restart(self, step_container_cluster):
+        # The combination of gaps 1 and 2: a fresh per-step container built
+        # for an interactive PTY session must be just as durable as either
+        # one alone.
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        job_name = f"pty-container-restart-{time.time_ns()}"
+        node = cluster.node_names[0]
+        result: dict = {}
+
+        def run():
+            result["code"], result["out"] = cluster.srun_with_exit([
+                "-N", "1", "-w", node, "-t", "0:02", "-J", job_name, "--pty",
+                f"--container-image={img}",
+                "bash", "-c",
+                "i=1; while [ $i -le 20 ]; do echo tick $i; sleep 1; i=$((i+1)); done; echo SURVIVED",
+            ])
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the pty+container job to appear before the restart"
+
+            before: set = set()
+            while time.time() < deadline:
+                # An interactive PTY session's own workload runs under the
+                # shared terminal placeholder, a reserved step id, not a
+                # numbered one of its own.
+                before = _reserved_step_sessions_for_job(cluster, job_id)
+                if before:
+                    break
+                time.sleep(1)
+            assert before, "expected a supervisor for the pty+container step before the restart"
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            after = _reserved_step_sessions_for_job(cluster, job_id)
+            assert before <= after, (
+                "the pty+container step's supervisor must outlive the agent that spawned it: "
+                f"{sorted(before)} before the restart, {sorted(after)} after"
+            )
+        finally:
+            thread.join(timeout=60)
+
+        assert result.get("code") == 0, result.get("out")
+        out = str(result.get("out"))
+        assert "SURVIVED" in out, out
+        _assert_ticks_not_replayed(out)
+
