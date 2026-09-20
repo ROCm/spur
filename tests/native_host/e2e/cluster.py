@@ -97,13 +97,21 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
 class SshNode:
     """SSH connection to a single test node."""
 
-    def __init__(self, host: str, user: str, password: str | None = None, key_path: str | None = None):
+    def __init__(self, host: str, user: str, password: str | None = None, key_path: str | None = None,
+                 ssh_host: str | None = None, ssh_port: int = 22):
+        """`host` is the cluster-internal address (what spurd/spurctld advertise
+        to each other). `ssh_host`/`ssh_port` default to `host`/22 — the normal
+        case, where the SSH target and the cluster address are the same machine.
+        Pass them explicitly when this test driver can only reach a node via a
+        forwarded port (e.g. a tunnel), while the nodes still reach each other
+        directly on `host`.
+        """
         self.host = host
         self.user = user
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        connect_kwargs = {"hostname": host, "username": user}
+        connect_kwargs = {"hostname": ssh_host or host, "port": ssh_port, "username": user}
         if key_path:
             connect_kwargs["key_filename"] = key_path
         elif password:

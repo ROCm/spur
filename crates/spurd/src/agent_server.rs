@@ -1026,22 +1026,163 @@ async fn wait_for_stepd_release(
             let sessions = context.stepds.lock().await;
             stepds_for_attempt(&sessions, job_id, run_attempt)
         };
+        let mut any_live = false;
         for descriptor in candidates {
             if descriptor.pid == 0 {
                 continue;
             }
-            if matches!(
-                crate::stepd::stepd_liveness(&descriptor),
-                Ok(crate::stepd::StepdLiveness::Stale)
-            ) {
-                fence_dead_stepd(context, descriptor).await;
+            match crate::stepd::stepd_liveness(&descriptor) {
+                Ok(crate::stepd::StepdLiveness::Stale) => {
+                    fence_dead_stepd(context, descriptor).await;
+                }
+                Ok(crate::stepd::StepdLiveness::Live) => any_live = true,
+                Err(_) => {}
             }
         }
         if tokio::time::Instant::now() >= deadline {
+            // Still alive past the active-fence window: not gone, just not
+            // observed to be gone yet by anything gated on stepd_liveness.
+            // Escalate on a wall clock instead of waiting on that oracle.
+            if any_live {
+                spawn_wedged_stepd_force_reclaim(job_id, run_attempt, deadline, context.clone());
+            }
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Backstop for a supervisor that's alive but wedged (frozen, deadlocked, or
+/// stuck in a hung hook) rather than exited — `stepd_liveness` reads a
+/// wedged process identically to a healthy one, so nothing gated on it ever
+/// fires here. Comfortably above the existing escalation stack (this
+/// function's own 3s bound, the 5s graceful-cancel grace period, the 10s
+/// stepd-request timeout), so it never fires during ordinary resolution.
+const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Purely to log confirmed-vs-unconfirmed after the force kill; the ledger
+/// releases either way once this elapses.
+const FORCE_KILL_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const FORCE_KILL_CONFIRM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_RECLAIM_TIMEOUT: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(STEPD_FORCE_RECLAIM_TIMEOUT) };
+}
+
+#[cfg(test)]
+fn force_reclaim_timeout() -> std::time::Duration {
+    FORCE_RECLAIM_TIMEOUT.with(|timeout| timeout.get())
+}
+
+#[cfg(not(test))]
+fn force_reclaim_timeout() -> std::time::Duration {
+    STEPD_FORCE_RECLAIM_TIMEOUT
+}
+
+/// Shortens the force-reclaim window on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct ShortenedForceReclaim(std::time::Duration);
+
+#[cfg(test)]
+impl ShortenedForceReclaim {
+    pub(crate) fn new(duration: std::time::Duration) -> Self {
+        Self(FORCE_RECLAIM_TIMEOUT.with(|timeout| timeout.replace(duration)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShortenedForceReclaim {
+    fn drop(&mut self) {
+        FORCE_RECLAIM_TIMEOUT.with(|timeout| timeout.set(self.0));
+    }
+}
+
+/// Best-effort: SIGKILLs the job's cgroup (reaches forked descendants that
+/// escaped the tracked pid) and the supervisor's own pid directly, since a
+/// wedged supervisor is not guaranteed to be a member of its own cgroup.
+fn force_kill_stepd(descriptor: &crate::stepd::StepdDescriptor) {
+    let cgroup_path = effective_cgroup_path(descriptor);
+    if let Err(error) = crate::executor::cgroup_kill(&cgroup_path) {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+            "force-reclaim: cgroup kill failed");
+    }
+    if let Err(error) = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(descriptor.pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    ) {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+            "force-reclaim: SIGKILL to the stepd pid failed");
+    }
+}
+
+/// Spawned once `wait_for_stepd_release`'s own bound elapses with a still-
+/// live descriptor. Waits out the wall-clock force window (from the
+/// original cancel, not from this spawn), then kills and fences
+/// unconditionally — attempt-scoped the same way the active-fence loop is,
+/// so a redispatch that already superseded this attempt is never touched.
+fn spawn_wedged_stepd_force_reclaim(
+    job_id: u32,
+    run_attempt: u32,
+    active_fence_deadline: tokio::time::Instant,
+    context: CompletionListenerContext,
+) {
+    let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_reclaim_timeout();
+    tokio::spawn(async move {
+        tokio::time::sleep_until(force_deadline).await;
+        let candidates = {
+            let running = context.running.lock().await;
+            if running
+                .get(&job_id)
+                .is_none_or(|tracked| tracked.run_attempt != run_attempt)
+            {
+                return;
+            }
+            let sessions = context.stepds.lock().await;
+            stepds_for_attempt(&sessions, job_id, run_attempt)
+        };
+        for descriptor in candidates {
+            if descriptor.pid == 0
+                || !matches!(
+                    crate::stepd::stepd_liveness(&descriptor),
+                    Ok(crate::stepd::StepdLiveness::Live)
+                )
+            {
+                continue;
+            }
+            warn!(
+                job_id,
+                run_attempt,
+                pid = descriptor.pid,
+                window_secs = force_reclaim_timeout().as_secs(),
+                "stepd still alive past the force-reclaim window; force-reclaiming"
+            );
+            force_kill_stepd(&descriptor);
+            let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
+            let mut confirmed_dead = false;
+            while tokio::time::Instant::now() < confirm_deadline {
+                if matches!(
+                    crate::stepd::stepd_liveness(&descriptor),
+                    Ok(crate::stepd::StepdLiveness::Stale)
+                ) {
+                    confirmed_dead = true;
+                    break;
+                }
+                tokio::time::sleep(FORCE_KILL_CONFIRM_POLL_INTERVAL).await;
+            }
+            if !confirmed_dead {
+                warn!(
+                    job_id,
+                    run_attempt,
+                    pid = descriptor.pid,
+                    "could not confirm the stepd was killed after force-reclaim; \
+                     releasing the ledger anyway"
+                );
+            }
+            fence_dead_stepd(&context, descriptor).await;
+        }
+    });
 }
 
 /// Enforced per-node budget: the controller's allocation wins, the spec is the
@@ -3459,6 +3600,31 @@ impl AgentService {
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
         }
+    }
+
+    /// Spawns the release wait (and force-reclaim escalation) for a
+    /// supervised job's cancel immediately, independent of the stepd-socket
+    /// round trip a caller may still attempt afterward. The controller's own
+    /// CancelJob RPC gives up after a few seconds — shorter than a stepd
+    /// control-socket request can legitimately take against a wedged
+    /// supervisor — and drops the in-flight call, which aborts this whole
+    /// handler on the agent. Anything that hasn't been spawned onto the
+    /// runtime by then simply never runs, so this can't be sequenced after
+    /// the signal attempt without risking never running at all.
+    fn spawn_stepd_release_wait(&self, job_id: u32) -> tokio::task::JoinHandle<()> {
+        let context = self.completion_listener_context();
+        tokio::spawn(async move {
+            let tracked_attempt = context
+                .running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|tracked| tracked.run_attempt);
+            if let Some(tracked_attempt) = tracked_attempt {
+                let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+                wait_for_stepd_release(job_id, tracked_attempt, deadline, &context).await;
+            }
+        })
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -7605,6 +7771,9 @@ impl AgentService {
         let lethal = signal_expected_to_terminate(
             nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM),
         );
+        // Spawned before the signal loop below, not after — see
+        // spawn_stepd_release_wait's doc for why.
+        let release_wait = (supervised && lethal).then(|| self.spawn_stepd_release_wait(job_id));
         for descriptor in &runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 descriptor,
@@ -7634,18 +7803,11 @@ impl AgentService {
         // a supervised sibling must not spare it.
         self.cancel_active_steps_for_job(job_id, signal).await;
         if supervised {
-            if lethal {
-                let tracked_attempt = self
-                    .running
-                    .lock()
-                    .await
-                    .get(&job_id)
-                    .map(|t| t.run_attempt);
-                if let Some(tracked_attempt) = tracked_attempt {
-                    let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-                    let context = self.completion_listener_context();
-                    wait_for_stepd_release(job_id, tracked_attempt, deadline, &context).await;
-                }
+            if let Some(handle) = release_wait {
+                // Best-effort observe: the spawned task itself keeps running
+                // to completion regardless of whether this await, or the RPC
+                // that called us, gets cut short.
+                let _ = handle.await;
             }
             return;
         }
@@ -7799,6 +7961,9 @@ impl AgentService {
         }
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
         let supervised = supervisor_owns_teardown(&runtimes);
+        // Spawned before the shutdown_allocation loop below, not after — see
+        // spawn_stepd_release_wait's doc for why.
+        let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id));
         for descriptor in runtimes {
             match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
                 .await
@@ -7862,18 +8027,11 @@ impl AgentService {
         self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
         if supervised {
-            // Job-level, not per-descriptor: one wait for the whole job's
-            // `running` entry to clear, regardless of how many steps it has.
-            let tracked_attempt = self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|t| t.run_attempt);
-            if let Some(tracked_attempt) = tracked_attempt {
-                let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-                let context = self.completion_listener_context();
-                wait_for_stepd_release(job_id, tracked_attempt, deadline, &context).await;
+            if let Some(handle) = release_wait {
+                // Best-effort observe: the spawned task itself keeps running
+                // to completion regardless of whether this await, or the RPC
+                // that called us, gets cut short.
+                let _ = handle.await;
             }
             return;
         }
@@ -15736,6 +15894,221 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "the GPU must be free immediately, not after the crash watchdog's next tick"
+        );
+    }
+
+    /// A real, separate long-lived process standing in for a wedged stepd:
+    /// genuinely alive (real pid, matching start ticks), so `stepd_liveness`
+    /// reports it `Live` exactly like a frozen or deadlocked supervisor would.
+    async fn spawn_wedged_stepd_stub(
+        job_id: u32,
+        run_attempt: u32,
+    ) -> (tokio::process::Child, crate::stepd::StepdDescriptor) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn wedged-stepd stand-in");
+        let pid = child.id().expect("child pid");
+        let start_ticks = crate::stepd::process_start_ticks(pid).expect("start ticks");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            start_ticks,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "wedged-stepd-test".into();
+        (child, descriptor)
+    }
+
+    /// `/proc`-based liveness can't tell a zombie from a running process, and
+    /// this test is the direct parent of its stand-in (production's stepd is
+    /// double-forked onto init, which reaps it) — so check via `try_wait`,
+    /// which actually reaps, instead of re-reading `/proc/<pid>/stat`.
+    async fn child_has_exited(child: &mut tokio::process::Child) -> bool {
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
+
+    #[tokio::test]
+    async fn force_reclaim_kills_a_stepd_that_never_reports_dead() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_millis(200));
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(920, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if !svc.running.lock().await.contains_key(&descriptor.job_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !svc.running.lock().await.contains_key(&descriptor.job_id),
+            "a wedged stepd's ledger entry must clear once the force-reclaim window elapses"
+        );
+        assert!(
+            child_has_exited(&mut child).await,
+            "the force-reclaim path must have SIGKILLed the wedged stepd"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reclaim_does_not_fire_before_the_hard_deadline() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(921, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+        // Lets a wrongly-immediate force-reclaim task (spawned right as
+        // send_explicit_signal returned) actually run once before checking —
+        // otherwise this assertion can win a race against it and pass for
+        // the wrong reason regardless of what the deadline math says.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&descriptor.job_id),
+            "the ledger must still be held well before the (real, un-shortened) \
+             force-reclaim window elapses"
+        );
+        assert!(
+            !child_has_exited(&mut child).await,
+            "the stepd must not be force-killed before its hard deadline"
+        );
+    }
+
+    // Longer than CANCEL_REAP_TIMEOUT (3s): send_explicit_signal itself
+    // already takes that long to return, so the force deadline must sit
+    // past that return, or nothing is left to race the test's own action
+    // against — the force task would already be running by the time this
+    // test regains control.
+    const FORCE_RECLAIM_TEST_WINDOW: std::time::Duration = std::time::Duration::from_millis(4000);
+
+    #[tokio::test]
+    async fn force_reclaim_spares_a_superseded_attempt() {
+        let _shortened = ShortenedForceReclaim::new(FORCE_RECLAIM_TEST_WINDOW);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(922, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        // A redispatch supersedes this attempt before the force window
+        // fires — the running job_id now points at a newer run_attempt.
+        let mut redispatched = TrackedJob::allocation_only(None);
+        redispatched.run_attempt = descriptor.run_attempt + 1;
+        svc.insert_test_job(descriptor.job_id, redispatched).await;
+
+        tokio::time::sleep(FORCE_RECLAIM_TEST_WINDOW).await;
+
+        assert_eq!(
+            svc.running
+                .lock()
+                .await
+                .get(&descriptor.job_id)
+                .map(|t| t.run_attempt),
+            Some(descriptor.run_attempt + 1),
+            "the redispatched attempt's tracking must be untouched"
+        );
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a superseded attempt's stepd must not be force-killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reclaim_is_a_noop_once_already_released_normally() {
+        let _shortened = ShortenedForceReclaim::new(FORCE_RECLAIM_TEST_WINDOW);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(923, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        // Simulates the job's tracking clearing by some other path (leaving
+        // the stepd session itself, still genuinely alive, sitting in the
+        // stepds map) before the force window elapses — a bare
+        // release_stepd_tracking would also clear the stepds entry
+        // atomically, which would make stepds_for_attempt return nothing
+        // regardless of the running-tracked check this test means to cover.
+        svc.running.lock().await.remove(&descriptor.job_id);
+
+        tokio::time::sleep(FORCE_RECLAIM_TEST_WINDOW).await;
+
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a stepd session whose job no longer appears in `running` must not \
+             be force-killed by a force-reclaim task spawned for that job"
         );
     }
 

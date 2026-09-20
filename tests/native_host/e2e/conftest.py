@@ -57,6 +57,19 @@ def _get_nodes_config() -> list[str]:
     return nodes
 
 
+def _parse_node_entry(entry: str) -> tuple[str, str | None, int]:
+    """Parse one `SPUR_TEST_NODES` entry: plain `host`, or `host/sshhost:port`
+    when this test driver can only reach the node through a forwarded port
+    (e.g. an SSH tunnel) while the nodes still reach each other directly on
+    `host`. Returns (host, ssh_host_or_None, ssh_port).
+    """
+    host, sep, ssh_part = entry.partition("/")
+    if not sep:
+        return host, None, 22
+    ssh_host, _, port_str = ssh_part.partition(":")
+    return host, ssh_host, int(port_str) if port_str else 22
+
+
 def _get_ssh_user() -> str:
     user = os.environ.get("SPUR_TEST_SSH_USER", "")
     if not user:
@@ -92,8 +105,12 @@ def ssh_nodes():
     ssh_key = _get_ssh_key()
 
     nodes = []
-    for host in nodes_config:
-        node = SshNode(host, ssh_user, password=ssh_password, key_path=ssh_key)
+    for entry in nodes_config:
+        host, ssh_host, ssh_port = _parse_node_entry(entry)
+        node = SshNode(
+            host, ssh_user, password=ssh_password, key_path=ssh_key,
+            ssh_host=ssh_host, ssh_port=ssh_port,
+        )
         nodes.append(node)
 
     yield nodes
