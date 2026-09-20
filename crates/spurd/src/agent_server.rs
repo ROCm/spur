@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -2937,25 +2937,52 @@ fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::proces
     }
 }
 
+/// Builds a fresh interactive step's process environment: the job's own
+/// session (so a `--pty` that joins a running container never leaks spurd's
+/// own environment — see `session_environ`) as the base, with a freshly
+/// built container's GPU visibility and identity vars layered on top when
+/// this step stages one. Neither the GPU grant nor the container identity
+/// exists anywhere the session env could have picked it up, since both are
+/// resolved fresh for this step's own launch.
+fn interactive_step_environment(
+    session_env: Vec<(String, String)>,
+    fresh_container_env: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut environment: HashMap<String, String> = session_env.into_iter().collect();
+    if let Some(fresh) = fresh_container_env {
+        environment.extend(fresh);
+    }
+    environment
+}
+
 /// The supervisor forks the workload after the gate opens, so its pid is not
-/// available the instant `start_job` returns.
+/// available the instant `start_job` returns. Its control socket does not
+/// start serving requests until that fork (openpty, container rootfs staging,
+/// priv drop for a fresh container) has finished, so an early query can race
+/// a supervisor that is not listening yet — that is a "not ready", not a
+/// "never will be", so it is retried like a bare `job_pid == 0` rather than
+/// aborting the whole poll on its first attempt.
 async fn supervised_step_workload_pid(descriptor: &crate::stepd::StepdDescriptor) -> Option<u32> {
     for _ in 0..WORKLOAD_PID_POLLS {
         match crate::stepd::query_state(descriptor, uuid::Uuid::new_v4().to_string()).await {
             Ok(snapshot) if snapshot.job_pid > 0 => return Some(snapshot.job_pid as u32),
             Ok(_) => {}
             Err(error) => {
-                warn!(
+                trace!(
                     job_id = descriptor.job_id,
                     step_id = descriptor.step_id,
                     %error,
-                    "could not read the supervised step's workload pid"
+                    "workload pid query did not answer yet; retrying"
                 );
-                return None;
             }
         }
         tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL).await;
     }
+    warn!(
+        job_id = descriptor.job_id,
+        step_id = descriptor.step_id,
+        "gave up waiting for the supervised step to report a workload pid"
+    );
     None
 }
 
@@ -7800,6 +7827,7 @@ impl SlurmAgent for AgentService {
                 None => {
                     let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
                     let mut container_rootfs_mode = None;
+                    let mut fresh_container_env: Option<HashMap<String, String>> = None;
                     let container = match &container_plan {
                         StepContainerPlan::None => {
                             if parent_has_namespaces {
@@ -7869,7 +7897,7 @@ impl SlurmAgent for AgentService {
                                     gid: entry.gid,
                                     username,
                                     home_dir,
-                                    environment: env,
+                                    environment: env.clone(),
                                     workdir_default: (!entry.work_dir.is_empty())
                                         .then(|| entry.work_dir.clone()),
                                     rootfs_base: crate::container::step_rootfs_base(
@@ -7881,6 +7909,7 @@ impl SlurmAgent for AgentService {
                                 &script,
                             )?;
                             container_rootfs_mode = Some(rootfs_mode);
+                            fresh_container_env = Some(env);
                             Some(launch)
                         }
                     };
@@ -7898,7 +7927,10 @@ impl SlurmAgent for AgentService {
                         node: self.reporter.hostname.clone(),
                         array_job_id: None,
                         array_task_id: None,
-                        environment: Self::session_environ(&entry).into_iter().collect(),
+                        environment: interactive_step_environment(
+                            Self::session_environ(&entry),
+                            fresh_container_env,
+                        ),
                         stdout_path: String::new(),
                         stderr_path: String::new(),
                         stdin_path: String::new(),
@@ -7942,9 +7974,19 @@ impl SlurmAgent for AgentService {
                             &descriptor,
                         )
                         .await;
-                        return Err(Status::internal(
-                            "terminal workload did not report a pid in time",
-                        ));
+                        // A supervisor that never reported a pid either never
+                        // finished launching (recorded no reason) or hit a real
+                        // failure it wrote down before giving up — surface that
+                        // instead of the generic message so a real bug isn't
+                        // misread as a timeout.
+                        let reason = crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                            .recorded_failure(init.job_id, run_attempt, step_id);
+                        return Err(Status::internal(match reason {
+                            Some(reason) => {
+                                format!("terminal workload failed to launch: {reason}")
+                            }
+                            None => "terminal workload did not report a pid in time".to_string(),
+                        }));
                     };
                     self.active_steps.lock().await.insert(
                         (init.job_id, init.step_id),
@@ -11928,6 +11970,141 @@ mod tests {
             Some(crate::stepd::AgentNotificationResponse::Deferred)
         );
         assert!(!running.lock().await.contains_key(&42));
+    }
+
+    // Reproduces the gap between the launch gate opening and `run_supervisor`
+    // actually starting to accept control connections: `launch_job` (openpty,
+    // container rootfs staging, priv drop) runs in between, and nothing serves
+    // `QueryState` on the socket until it returns.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_step_workload_pid_survives_a_supervisor_that_is_slow_to_start_serving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dummy workload");
+        let pid = child.id().expect("pid");
+        let job = executor::RunningJob::Managed { child };
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            job,
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        ));
+
+        let run_descriptor = descriptor.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            let _ = crate::stepd::run_supervisor(listener, run_descriptor, session).await;
+        });
+
+        let found = supervised_step_workload_pid(&descriptor).await;
+        assert_eq!(
+            found,
+            Some(pid),
+            "a supervisor that starts serving after the polling budget must still be found"
+        );
+    }
+
+    // A connection hiccup while the supervisor is mid-launch (e.g. a transient
+    // reset before it has bound and started accepting) must not burn the rest
+    // of the polling budget: only the second half of the queries below ever
+    // succeed, so a single failed attempt aborting early would never find it.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_step_workload_pid_retries_past_a_transient_query_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        // Nothing is listening at this path yet, so every connect attempt
+        // fails fast with a real `Err` from `query_state` — standing in for a
+        // supervisor that isn't reachable on its first few polls.
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            socket_path.clone(),
+            std::path::PathBuf::new(),
+        );
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dummy workload");
+        let pid = child.id().expect("pid");
+        let job = executor::RunningJob::Managed { child };
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            job,
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        ));
+
+        let run_descriptor = descriptor.clone();
+        tokio::spawn(async move {
+            // Bind well after polling has already started failing to connect.
+            tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL * (WORKLOAD_PID_POLLS / 2)).await;
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+            let _ = crate::stepd::run_supervisor(listener, run_descriptor, session).await;
+        });
+
+        let found = supervised_step_workload_pid(&descriptor).await;
+        assert_eq!(
+            found,
+            Some(pid),
+            "a transient early connect failure must not stop the rest of the poll budget"
+        );
+    }
+
+    // A fresh container step's own GPU grant only ever exists in the env this
+    // step just built for it — never in the parent job's own session — so it
+    // must survive being layered onto that session env, not get shadowed by it.
+    #[test]
+    fn interactive_step_environment_keeps_the_fresh_container_gpu_grant() {
+        let session_env = vec![
+            ("HOME".to_string(), "/root".to_string()),
+            ("SPUR_JOB_ID".to_string(), "42".to_string()),
+        ];
+        let mut fresh_container_env = HashMap::new();
+        fresh_container_env.insert("ROCR_VISIBLE_DEVICES".to_string(), "0,1".to_string());
+        fresh_container_env.insert("SPUR_JOB_GPUS".to_string(), "0,1".to_string());
+        fresh_container_env.insert("HOME".to_string(), "/home/spur".to_string());
+
+        let environment = interactive_step_environment(session_env, Some(fresh_container_env));
+
+        assert_eq!(
+            environment.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("0,1"),
+            "the step's own GPU grant must reach the process env"
+        );
+        assert_eq!(
+            environment.get("SPUR_JOB_GPUS").map(String::as_str),
+            Some("0,1")
+        );
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/home/spur"),
+            "the fresh container's own identity must win over the parent session's"
+        );
+        assert_eq!(
+            environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("42"),
+            "session vars the fresh container doesn't override must still pass through"
+        );
     }
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
