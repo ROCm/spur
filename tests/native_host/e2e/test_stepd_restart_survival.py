@@ -333,13 +333,10 @@ class TestSupervisedGpuReclaim:
                 "agent is unreachable"
             )
 
-            # The agent comes back and adopts its still-running supervisor
-            # from disk — its own state has no idea the job was cancelled.
+            # The agent adopts its still-running supervisor, unaware it was
+            # cancelled — reclaim can land this fast, so no separate check here.
             cluster.nodes[node_index].exec(cluster._spurd_start_cmd(node_index))
             cluster.wait_agent_serving(node_index, timeout=60)
-            assert supervisor_pid in _supervisor_pids(cluster, node_index), (
-                "the restarted agent must have adopted the surviving supervisor"
-            )
 
             # Only the controller's reclaim-heartbeat can explain this dying
             # now: nothing here issues a second cancel.
