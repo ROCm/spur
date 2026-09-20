@@ -1033,13 +1033,25 @@ async fn reclaim_for_unplaced(
     // exceeded their own quota, and jobs whose QOS is marked
     // `idle_fill_preemptable` — the migration path for the burst pattern, which
     // never exceeds a quota and so is never stamped.
+    // The became-legitimate question is asked once per QOS, not once per run. Asking it
+    // per run is wrong the moment a QOS has two or more borrowed runs: each measures
+    // itself against the same headroom, all of them read as legitimate, and the
+    // reclaimable set is empty while the team sits over its cap. Cached because several
+    // runs usually share a QOS and the answer walks every job.
+    let mut over_quota: HashMap<String, bool> = HashMap::new();
     let mut reclaimable: Vec<ReclaimableRun> = Vec::new();
     for job in &running {
         if job.allocated_nodes.is_empty() {
             continue;
         }
         let borrowed = if job.idle_fill {
-            cluster.borrowed_run_still_over_quota(job)
+            match job.spec.qos.as_deref() {
+                Some(qos) => *over_quota
+                    .entry(qos.to_string())
+                    .or_insert_with(|| cluster.qos_over_node_quota(qos)),
+                // No QOS means no cap to exceed, so nothing to reclaim.
+                None => false,
+            }
         } else {
             cluster.resolve_qos(job).idle_fill_preemptable
         };

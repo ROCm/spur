@@ -530,15 +530,22 @@ struct PendingJobClassification {
     idle_fill_candidates: Vec<Job>,
 }
 
-/// Whether a borrowed run still sits outside its QOS group node quota.
+/// Whether a QOS is holding more nodes than its group node cap allows, counting its
+/// legitimate and its borrowed runs together.
 ///
-/// Split from its caller so the rule is testable without standing up a cluster.
-/// `cap` of `None` or `0` means the dimension is unlimited, in which case there is
-/// no quota to be outside of and the run has a claim like any other.
-fn borrowed_run_over_quota(cap: Option<u64>, legitimate_nodes: u64, own_nodes: u64) -> bool {
+/// The question is deliberately asked of the **team**, not of an individual run. A
+/// per-run form of this test is wrong once a QOS has two or more borrowed runs: each
+/// borrower measures itself against the same slice of headroom, every one of them reads
+/// as "became legitimate", and the reclaimable set comes back empty while the team
+/// physically sits over its cap. A legitimate claim would then be blocked indefinitely
+/// by its own team's borrowed runs.
+///
+/// `cap` of `None` or `0` means the dimension is unlimited, so there is no quota to
+/// exceed and nothing is reclaimable.
+fn team_over_quota(cap: Option<u64>, legitimate_nodes: u64, borrowed_nodes: u64) -> bool {
     match cap {
         None | Some(0) => false,
-        Some(cap) => legitimate_nodes.saturating_add(own_nodes) > cap,
+        Some(cap) => legitimate_nodes.saturating_add(borrowed_nodes) > cap,
     }
 }
 
@@ -1737,31 +1744,31 @@ impl ClusterManager {
         self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, false)
     }
 
-    /// Whether a stamped running job is *still* outside its QOS group node quota.
+    /// Whether `qos_name` is holding more nodes than its group node cap allows, counting
+    /// its legitimate and borrowed runs together.
     ///
-    /// The stamp records what was true when the job started, and reclaim must not
-    /// trust it: raising the cap, or a sibling finishing, can leave a stamped job
-    /// comfortably inside the quota. Evicting it then would contradict the rule that
-    /// a job with a claim is never kicked out, so the question is re-asked live at
-    /// reclaim time (D13). The `idle_fill_preemptable` source needs no equivalent —
-    /// it is read from the QOS on every pass and so is never stale.
-    pub fn borrowed_run_still_over_quota(&self, job: &Job) -> bool {
-        let Some(qos_name) = job.spec.qos.as_deref() else {
-            return false;
-        };
-        let cap = self
-            .resolve_qos(job)
-            .limits
-            .grp_tres
-            .as_ref()
-            .map(|grp| grp.get(TresType::Node));
+    /// The stamp records what was true when a job started, and reclaim must not trust
+    /// it: raising the cap, or a sibling finishing, can leave stamped runs comfortably
+    /// inside the quota, and evicting one then would contradict the rule that a job with
+    /// a claim is never kicked out. So the question is re-asked live at reclaim time
+    /// (D13), but asked of the **team**: when a QOS is over its cap, every stamped run in
+    /// it becomes eligible and the satisfiable-victim-set logic evicts only the minimum
+    /// needed, which is what spares the borrowers that genuinely became legitimate.
+    ///
+    /// The `idle_fill_preemptable` source needs no equivalent, being read from the QOS on
+    /// every pass and so never stale.
+    pub fn qos_over_node_quota(&self, qos_name: &str) -> bool {
+        let cap = self.qos_cache.get(qos_name).and_then(|q| {
+            q.limits
+                .grp_tres
+                .as_ref()
+                .map(|grp| grp.get(TresType::Node))
+        });
         let jobs = self.jobs.read();
-        // Nodes held by jobs with a genuine claim, this job excluded by its stamp.
-        let legitimate = occupied_nodes(&jobs, |j| {
-            !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name)
-        })
-        .len() as u64;
-        borrowed_run_over_quota(cap, legitimate, job.allocated_nodes.len() as u64)
+        let in_qos = |j: &Job| j.spec.qos.as_deref() == Some(qos_name);
+        let legitimate = occupied_nodes(&jobs, |j| !j.idle_fill && in_qos(j)).len() as u64;
+        let borrowed = occupied_nodes(&jobs, |j| j.idle_fill && in_qos(j)).len() as u64;
+        team_over_quota(cap, legitimate, borrowed)
     }
 
     /// Start a job as *borrowed*: it exceeded its QOS group node cap and is running
@@ -27464,26 +27471,94 @@ mod idle_fill_aggregate_tests {
     }
 
     #[test]
-    fn a_stale_stamp_stops_being_reclaimable_once_the_run_fits_the_quota_again() {
-        // The stamp records what was true at start. Raising the cap, or a sibling
-        // finishing, can leave a stamped run comfortably inside quota, and evicting
-        // it then would break the rule that a job with a claim is never kicked out.
-        // Reclaim therefore re-asks rather than trusting the stamp (D13).
+    fn a_team_holding_more_nodes_than_its_cap_is_over_quota() {
+        // The full borrowers-by-legitimate-by-cap matrix. Expected values are derived
+        // from the rule ("a QOS may keep at most `cap` nodes"), never from what the
+        // implementation happens to return.
+        //
+        // The second row is the defect this replaces. A per-run form of this test asked
+        // `legitimate + own_nodes > cap`, so with two one-node borrowers on a cap of 1
+        // each read 0 + 1 = 1, "not over", and the reclaimable set came back empty while
+        // the team physically held two nodes. The team-level form sees 0 + 2 > 1.
+        //
+        // (cap, legitimate, borrowed, expected_over)
+        let cases: &[(Option<u64>, u64, u64, bool)] = &[
+            // Single borrower: the per-run and team-level forms agree here, which is
+            // exactly why single-borrower tests could not catch the defect.
+            (Some(1), 0, 1, false),
+            (Some(1), 1, 1, true),
+            // TWO borrowers on a cap of 1. The regression case.
+            (Some(1), 0, 2, true),
+            // Three borrowers, same cap.
+            (Some(1), 0, 3, true),
+            // Two borrowers with a legitimate sibling, cap 2.
+            (Some(2), 1, 2, true),
+            // Three borrowers, two legitimate, cap 4.
+            (Some(4), 2, 3, true),
+            // Within cap, so the became-legitimate protection must hold.
+            (Some(2), 1, 1, false),
+            (Some(2), 0, 2, false),
+            (Some(4), 2, 2, false),
+            // A multi-node borrower counts its nodes, not itself.
+            (Some(1), 0, 2, true),
+            // Unlimited means nothing is ever over.
+            (None, 99, 99, false),
+            (Some(0), 99, 99, false),
+        ];
+        for (cap, legit, borrowed, want) in cases {
+            assert_eq!(
+                team_over_quota(*cap, *legit, *borrowed),
+                *want,
+                "cap={cap:?} legitimate={legit} borrowed={borrowed}"
+            );
+        }
 
-        // One legitimate node held, this run holds one: over a cap of 1.
-        assert!(borrowed_run_over_quota(Some(1), 1, 1));
-        // Same run, cap raised to 2 — it now fits, so it must not be reclaimed.
-        assert!(!borrowed_run_over_quota(Some(2), 1, 1));
-        // Same cap of 1, but the legitimate sibling finished: it fits again.
-        assert!(!borrowed_run_over_quota(Some(1), 0, 1));
-        // Exactly at the cap counts as fitting, not as exceeding.
-        assert!(!borrowed_run_over_quota(Some(4), 2, 2));
-        assert!(borrowed_run_over_quota(Some(4), 2, 3));
-        // No cap, or an explicitly unlimited one, is never "over".
-        assert!(!borrowed_run_over_quota(None, 99, 99));
-        assert!(!borrowed_run_over_quota(Some(0), 99, 99));
-        // A pathological node count must saturate rather than wrap into "fits".
-        assert!(borrowed_run_over_quota(Some(1), u64::MAX, 1));
+        // A pathological count must saturate rather than wrap into "fits".
+        assert!(team_over_quota(Some(1), u64::MAX, 1));
+        assert!(team_over_quota(Some(1), 1, u64::MAX));
+    }
+
+    #[test]
+    fn two_borrowers_over_a_one_node_cap_are_reclaimable() {
+        // Shrey's reported failure, asserted end to end through the real accessor rather
+        // than the pure helper, so a future refactor cannot reintroduce the per-run form
+        // without failing here.
+        //
+        // Cap of 1, zero legitimate runs, two borrowed single-node runs. The team holds
+        // two nodes on a cap of one, so the QOS is over quota and its borrowed runs must
+        // be reclaimable. Previously this returned false for every run and a legitimate
+        // claim could never recover a node.
+        let qos = grp_node_qos("team", 1);
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        jobs.insert(2, running_in_qos(2, "bob", "team", &["n2"], true));
+        let legitimate = occupied_nodes(&jobs, |j| {
+            !j.idle_fill && j.spec.qos.as_deref() == Some("team")
+        })
+        .len() as u64;
+        let borrowed = occupied_nodes(&jobs, |j| {
+            j.idle_fill && j.spec.qos.as_deref() == Some("team")
+        })
+        .len() as u64;
+        assert_eq!((legitimate, borrowed), (0, 2), "fixture shape");
+        let cap = qos.limits.grp_tres.as_ref().map(|g| g.get(TresType::Node));
+        assert!(
+            team_over_quota(cap, legitimate, borrowed),
+            "two borrowers on a cap of 1 must leave the QOS over quota"
+        );
+
+        // Control: drop to one borrower and the team is within cap again, so the
+        // became-legitimate protection still applies and nothing is reclaimable.
+        let mut jobs = HashMap::new();
+        jobs.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        let borrowed = occupied_nodes(&jobs, |j| {
+            j.idle_fill && j.spec.qos.as_deref() == Some("team")
+        })
+        .len() as u64;
+        assert!(
+            !team_over_quota(cap, 0, borrowed),
+            "a single borrower on a cap of 1 is within quota and must be spared"
+        );
     }
 
     #[test]
