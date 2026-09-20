@@ -8,6 +8,7 @@ Handles SSH connections, binary deployment, cluster startup/teardown,
 and CLI wrappers for interacting with the running cluster.
 """
 
+import contextlib
 import os
 import re
 import shlex
@@ -71,6 +72,26 @@ def deep_merge(base: dict, overrides: dict) -> dict:
         else:
             base[key] = value
     return base
+
+
+@contextlib.contextmanager
+def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_PORT):
+    """Drop the controller's outbound traffic to one node's agent port.
+
+    Blocks on the controller's own OUTPUT chain rather than stopping the
+    target's spurd or dropping its inbound traffic, so the node keeps
+    heartbeating and stays schedulable — every dispatch to it genuinely
+    fails at the RPC layer instead of the node going administratively DOWN.
+    Always removes the rule on exit, including when the body raises.
+    """
+    controller = cluster.nodes[0]
+    target = cluster.nodes[node_index].host
+    rule_args = f"-d {target} -p tcp --dport {port} -j DROP"
+    controller.exec(f"sudo iptables -A OUTPUT {rule_args}")
+    try:
+        yield
+    finally:
+        controller.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
 
 
 class SshNode:

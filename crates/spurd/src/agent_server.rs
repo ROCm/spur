@@ -831,6 +831,219 @@ async fn teardown_completed_job(
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
 
+/// Shared by the periodic monitor tick and a cancel's active wait, so a job
+/// reaped early gets the same epilog/SPANK/completion-report treatment.
+async fn run_completion_hooks_and_report(
+    completed: &[CompletedJob],
+    hooks: &HooksConfig,
+    spank: &Option<SpankHost>,
+    controller_addr: &str,
+) {
+    let mut drain_jobs: HashMap<u32, String> = HashMap::new();
+
+    if let Some(ref epilog_script) = hooks.epilog {
+        for c in completed {
+            let ctx = spur_core::hooks::HookContext {
+                job_id: c.job_id,
+                work_dir: c.work_dir.clone(),
+                uid: c.uid,
+                gid: c.gid,
+                partition: c.partition.clone(),
+                nodelist: c.nodelist.clone(),
+                script_context: "epilog_slurmd".into(),
+                gpu_devices: c.gpu_devices.clone(),
+                cpus: c.cpus,
+                memory_mb: c.memory_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
+                error!(
+                    job_id = c.job_id,
+                    error = %e,
+                    "epilog hook failed — requesting node drain"
+                );
+                drain_jobs.insert(c.job_id, "epilog script failed".into());
+            }
+        }
+    }
+
+    if let Some(ref spank_host) = spank {
+        for c in completed {
+            let context = SpankContext {
+                job_id: c.job_id,
+                uid: c.uid,
+                gid: c.gid,
+                ..Default::default()
+            };
+            let mut handle = SpankHandle::new(context, HashMap::new());
+            if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
+                warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
+            }
+            if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
+                warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
+            }
+        }
+    }
+
+    let local_hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "localhost".into());
+
+    for c in completed {
+        let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
+            reason: reason.clone(),
+        });
+        report_completion(
+            controller_addr,
+            CompletionReport {
+                job_id: c.job_id,
+                exit_code: c.exit_code,
+                signal: c.signal,
+                run_attempt: c.run_attempt,
+                reporting_node: &local_hostname,
+                drain: drain.as_ref(),
+                step_id: None,
+            },
+        )
+        .await;
+    }
+}
+
+/// Bounded so a hung teardown can't stall the cancel RPC past the
+/// controller's own CancelJob timeout.
+const CANCEL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A cancel only warrants an active wait if the signal is expected to end
+/// the process — a non-terminal `scancel --signal` would poll for nothing.
+fn signal_expected_to_terminate(sig: nix::sys::signal::Signal) -> bool {
+    matches!(
+        sig,
+        nix::sys::signal::Signal::SIGKILL | nix::sys::signal::Signal::SIGTERM
+    )
+}
+
+/// Releases a just-signaled job's ledger entry as soon as it exits, closing
+/// the window where an immediate redispatch retry finds the GPU still held.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_exit_and_teardown(
+    job_id: u32,
+    run_attempt: u32,
+    running: &RunningJobs,
+    lifecycle: &crate::job_lifecycle::JobLifecycle,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    mpi_host: &MpiPluginHost,
+    hooks: Arc<HooksConfig>,
+    spank: Arc<Option<SpankHost>>,
+    controller_addr: String,
+) {
+    let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+    loop {
+        let completed = {
+            let mut jobs = running.lock().await;
+            let Some(tracked) = jobs.get_mut(&job_id) else {
+                return;
+            };
+            if tracked.run_attempt != run_attempt {
+                // Superseded by a redispatch while we were waiting; not ours to reap.
+                return;
+            }
+            match tracked.job.try_wait() {
+                Ok(Some((exit_code, mut signal))) => {
+                    let cgroup = tracked.take_cgroup();
+                    if let Some(ref cg) = cgroup {
+                        if crate::executor::cgroup_oom_killed(cg) {
+                            warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
+                            signal |= spur_core::job::OOM_SIGNAL_FLAG;
+                        }
+                    }
+                    info!(job_id, exit_code, signal, "job finished");
+                    let tracked = jobs.remove(&job_id).expect("checked present above");
+                    Some(CompletedJob {
+                        job_id,
+                        exit_code,
+                        signal,
+                        run_attempt: tracked.run_attempt,
+                        rootfs_mode: tracked.rootfs_mode,
+                        cgroup,
+                        work_dir: tracked.work_dir,
+                        uid: tracked.uid,
+                        gid: tracked.gid,
+                        partition: tracked.partition,
+                        gpu_devices: tracked.gpu_devices,
+                        cpus: tracked.cpus,
+                        memory_mb: tracked.memory_mb,
+                        nodelist: tracked.nodelist,
+                        mpi: tracked.mpi,
+                    })
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(job_id, error = %e, "failed to check job status during cancel wait");
+                    None
+                }
+            }
+        };
+        if let Some(c) = completed {
+            teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
+            tokio::spawn(async move {
+                run_completion_hooks_and_report(&[c], &hooks, &spank, &controller_addr).await;
+            });
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                job_id,
+                "job outlived cancel wait bound; monitor tick will reap it"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Grace between an immediate signal and its SIGKILL escalation, for both the
+/// legacy and stepd-supervised graceful-cancel paths.
+const GRACEFUL_CANCEL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Polls until the job's `running` entry clears, via the supervisor's own
+/// completion push or this poll fencing a stepd stuck before `Start`.
+async fn wait_for_stepd_release(
+    job_id: u32,
+    run_attempt: u32,
+    deadline: tokio::time::Instant,
+    context: &CompletionListenerContext,
+) {
+    loop {
+        let still_tracked = context
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt);
+        if !still_tracked {
+            return;
+        }
+        let candidates = {
+            let sessions = context.stepds.lock().await;
+            stepds_for_attempt(&sessions, job_id, run_attempt)
+        };
+        for descriptor in candidates {
+            if descriptor.pid == 0 {
+                continue;
+            }
+            if matches!(
+                crate::stepd::stepd_liveness(&descriptor),
+                Ok(crate::stepd::StepdLiveness::Stale)
+            ) {
+                fence_dead_stepd(context, descriptor).await;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Enforced per-node budget: the controller's allocation wins, the spec is the
 /// fallback (every task on this node, and `--mem-per-cpu` when `--mem` is unset).
 fn resolve_cgroup_budget(
@@ -3325,80 +3538,7 @@ impl AgentService {
                     reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
                 }
 
-                let local_hostname = hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into());
-
-                // job_id -> drain reason, piggybacked on each job's completion
-                // report so the node goes idle-and-drained in one message (no
-                // window where a bad node looks schedulable).
-                let mut drain_jobs: std::collections::HashMap<u32, String> =
-                    std::collections::HashMap::new();
-
-                // Run epilog hook for completed jobs
-                if let Some(ref epilog_script) = hooks.epilog {
-                    for c in &completed {
-                        let ctx = spur_core::hooks::HookContext {
-                            job_id: c.job_id,
-                            work_dir: c.work_dir.clone(),
-                            uid: c.uid,
-                            gid: c.gid,
-                            partition: c.partition.clone(),
-                            nodelist: c.nodelist.clone(),
-                            script_context: "epilog_slurmd".into(),
-                            gpu_devices: c.gpu_devices.clone(),
-                            cpus: c.cpus,
-                            memory_mb: c.memory_mb,
-                        };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
-                            error!(
-                                job_id = c.job_id,
-                                error = %e,
-                                "epilog hook failed — requesting node drain"
-                            );
-                            drain_jobs.insert(c.job_id, "epilog script failed".into());
-                        }
-                    }
-                }
-
-                // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
-                if let Some(ref spank_host) = *spank {
-                    for c in &completed {
-                        let context = SpankContext {
-                            job_id: c.job_id,
-                            uid: c.uid,
-                            gid: c.gid,
-                            ..Default::default()
-                        };
-                        let mut handle = SpankHandle::new(context, HashMap::new());
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
-                        }
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
-                        }
-                    }
-                }
-
-                for c in &completed {
-                    let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
-                        reason: reason.clone(),
-                    });
-                    report_completion(
-                        &controller_addr,
-                        CompletionReport {
-                            job_id: c.job_id,
-                            exit_code: c.exit_code,
-                            signal: c.signal,
-                            run_attempt: c.run_attempt,
-                            reporting_node: &local_hostname,
-                            drain: drain.as_ref(),
-                            // Unsupervised path: the report speaks for the job.
-                            step_id: None,
-                        },
-                    )
-                    .await;
-                }
+                run_completion_hooks_and_report(&completed, &hooks, &spank, &controller_addr).await;
             }
         });
     }
@@ -7462,9 +7602,12 @@ impl AgentService {
         // silently spare its siblings.
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
         let supervised = supervisor_owns_teardown(&runtimes);
-        for descriptor in runtimes {
+        let lethal = signal_expected_to_terminate(
+            nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM),
+        );
+        for descriptor in &runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
-                &descriptor,
+                descriptor,
                 uuid::Uuid::new_v4().to_string(),
                 signal,
             )
@@ -7472,12 +7615,38 @@ impl AgentService {
             {
                 warn!(job_id, step_id = descriptor.step_id, %error,
                     "runtime signal request failed");
+                // Pre-`Start`, a signal has nothing to reach and is rejected outright;
+                // a lethal signal must fall back to shutdown or the job sits out the gate.
+                if lethal {
+                    if let Err(error) = crate::stepd::shutdown_allocation(
+                        descriptor,
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .await
+                    {
+                        warn!(job_id, step_id = descriptor.step_id, %error,
+                            "runtime shutdown fallback failed");
+                    }
+                }
             }
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
         self.cancel_active_steps_for_job(job_id, signal).await;
         if supervised {
+            if lethal {
+                let tracked_attempt = self
+                    .running
+                    .lock()
+                    .await
+                    .get(&job_id)
+                    .map(|t| t.run_attempt);
+                if let Some(tracked_attempt) = tracked_attempt {
+                    let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+                    let context = self.completion_listener_context();
+                    wait_for_stepd_release(job_id, tracked_attempt, deadline, &context).await;
+                }
+            }
             return;
         }
         let allocation_only_attempt = {
@@ -7491,14 +7660,31 @@ impl AgentService {
             return;
         }
 
-        let jobs = self.running.lock().await;
-        let Some(tracked) = jobs.get(&job_id) else {
-            return;
+        let (tracked_attempt, sig) = {
+            let jobs = self.running.lock().await;
+            let Some(tracked) = jobs.get(&job_id) else {
+                return;
+            };
+            let sig = nix::sys::signal::Signal::try_from(signal)
+                .unwrap_or(nix::sys::signal::Signal::SIGTERM);
+            info!(job_id, signal, "sending explicit signal to job");
+            let _ = tracked.job.kill_signal(sig);
+            (tracked.run_attempt, sig)
         };
-        let sig =
-            nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
-        info!(job_id, signal, "sending explicit signal to job");
-        let _ = tracked.job.kill_signal(sig);
+        if signal_expected_to_terminate(sig) {
+            wait_for_exit_and_teardown(
+                job_id,
+                tracked_attempt,
+                &self.running,
+                &self.lifecycle,
+                &self.allocation,
+                &self.mpi_host,
+                self.hooks.clone(),
+                self.spank.clone(),
+                self.reporter.controller_addr.clone(),
+            )
+            .await;
+        }
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -7618,10 +7804,17 @@ impl AgentService {
                 .await
             {
                 Ok(()) => {
-                    let stepds = self.stepds.clone();
+                    // Timed from the signal, not after the job-level wait below, so a
+                    // slow (or bounded-out) wait can't push escalation past ~5s.
+                    let signaled_at = tokio::time::Instant::now();
+                    let context = self.completion_listener_context();
                     tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        let still_current = stepds
+                        tokio::time::sleep(
+                            GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()),
+                        )
+                        .await;
+                        let still_current = context
+                            .stepds
                             .lock()
                             .await
                             .get(&stepd_key(&descriptor))
@@ -7643,6 +7836,18 @@ impl AgentService {
                         {
                             warn!(job_id, run_attempt = descriptor.run_attempt, %error,
                                 "failed to SIGKILL stepd after grace period");
+                            return;
+                        }
+                        let tracked_attempt = context
+                            .running
+                            .lock()
+                            .await
+                            .get(&job_id)
+                            .map(|t| t.run_attempt);
+                        if let Some(tracked_attempt) = tracked_attempt {
+                            let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+                            wait_for_stepd_release(job_id, tracked_attempt, deadline, &context)
+                                .await;
                         }
                     });
                 }
@@ -7657,6 +7862,19 @@ impl AgentService {
         self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
         if supervised {
+            // Job-level, not per-descriptor: one wait for the whole job's
+            // `running` entry to clear, regardless of how many steps it has.
+            let tracked_attempt = self
+                .running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|t| t.run_attempt);
+            if let Some(tracked_attempt) = tracked_attempt {
+                let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+                let context = self.completion_listener_context();
+                wait_for_stepd_release(job_id, tracked_attempt, deadline, &context).await;
+            }
             return;
         }
         let allocation_only_attempt = {
@@ -7672,28 +7890,65 @@ impl AgentService {
 
         // Epoch of the run we're cancelling; the delayed SIGKILL below must not
         // touch a newer run that reused this job_id after a requeue.
-        let cancel_attempt = {
+        let (cancel_attempt, signaled_at) = {
             let jobs = self.running.lock().await;
             let Some(tracked) = jobs.get(&job_id) else {
                 return;
             };
             info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
             let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
-            tracked.run_attempt
+            (tracked.run_attempt, tokio::time::Instant::now())
         };
+        wait_for_exit_and_teardown(
+            job_id,
+            cancel_attempt,
+            &self.running,
+            &self.lifecycle,
+            &self.allocation,
+            &self.mpi_host,
+            self.hooks.clone(),
+            self.spank.clone(),
+            self.reporter.controller_addr.clone(),
+        )
+        .await;
 
         let running = self.running.clone();
+        let lifecycle = self.lifecycle.clone();
+        let allocation = self.allocation.clone();
+        let mpi_host = self.mpi_host.clone();
+        let hooks = self.hooks.clone();
+        let spank = self.spank.clone();
+        let controller_addr = self.reporter.controller_addr.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let jobs = running.lock().await;
-            if let Some(tracked) = jobs.get(&job_id) {
-                // Skip if job_id was reused by a newer run after requeue.
-                if tracked.run_attempt != cancel_attempt {
-                    return;
+            // Timed from the signal, not from after the immediate wait above,
+            // so a slow (or bounded-out) wait can't push escalation past ~5s.
+            tokio::time::sleep(GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()))
+                .await;
+            let sigkilled = {
+                let jobs = running.lock().await;
+                match jobs.get(&job_id) {
+                    // Skip if job_id was reused by a newer run after requeue.
+                    Some(tracked) if tracked.run_attempt == cancel_attempt => {
+                        info!(job_id, "grace period expired, sending SIGKILL");
+                        let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                        true
+                    }
+                    _ => false,
                 }
-                info!(job_id, "grace period expired, sending SIGKILL");
-                let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                // Job stays in `running` and monitor loop reaps it and does full cleanup.
+            };
+            if sigkilled {
+                wait_for_exit_and_teardown(
+                    job_id,
+                    cancel_attempt,
+                    &running,
+                    &lifecycle,
+                    &allocation,
+                    &mpi_host,
+                    hooks,
+                    spank,
+                    controller_addr,
+                )
+                .await;
             }
         });
     }
@@ -14766,6 +15021,97 @@ mod tests {
         );
     }
 
+    // spurctld's abort-then-retry redispatches to the same node right after
+    // CancelJob returns, so the GPU must already be free by then.
+    #[tokio::test]
+    async fn cancel_releases_running_jobs_gpu_before_returning() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // No start_monitor: the release must not depend on its tick.
+
+        let job_id = 99;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            assert!(
+                alloc.commit_job(job_id, 1),
+                "commit must find its own reservation"
+            );
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "GPU must be free immediately after CancelJob returns"
+        );
+    }
+
+    // A cancel wait left over from a run that's since been replaced by a
+    // redispatch must never act on the newer attempt sharing its job_id.
+    #[tokio::test]
+    async fn wait_for_exit_and_teardown_spares_a_newer_attempt() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 905;
+        // Short-lived on purpose: without the attempt check, the wait loop
+        // would poll long enough to see this exit and tear it down anyway.
+        let child = tokio::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn short-lived job");
+        let mut redispatch = TrackedJob::dummy(0);
+        redispatch.job = executor::RunningJob::Managed { child };
+        redispatch.run_attempt = 2;
+        svc.insert_test_job(job_id, redispatch).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 2, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 2);
+        }
+
+        // A cancel wait for the run this job_id replaced (attempt 1).
+        wait_for_exit_and_teardown(
+            job_id,
+            1,
+            &svc.running,
+            &svc.lifecycle,
+            &svc.allocation,
+            &svc.mpi_host,
+            svc.hooks.clone(),
+            svc.spank.clone(),
+            svc.reporter.controller_addr.clone(),
+        )
+        .await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a stale wait must not remove the newer attempt"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "a stale wait must not release the newer attempt's GPU"
+        );
+    }
+
     // A launch that aborts before entering `running` must tear down its PMI
     // server, since the monitor loop's completion cleanup never runs for it.
     #[tokio::test]
@@ -15244,6 +15590,153 @@ mod tests {
              crate::stepd::StepdRequest::SignalAllocation { signal }]
                 if *signal == nix::sys::signal::Signal::SIGKILL as i32
         ));
+    }
+
+    // Real time deliberately, not `start_paused`: paused time auto-advances
+    // through idle periods, letting the simulated push "complete" regardless.
+    #[tokio::test]
+    async fn send_explicit_signal_waits_for_stepd_release_before_returning() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let socket_path = state.path().join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            906,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "explicit-signal-wait-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        // The job-level `running` entry a stepd-supervised launch creates — what
+        // release_stepd_tracking clears and wait_for_stepd_release polls.
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        let server_descriptor = descriptor.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = crate::stepd::accept_hello(
+                &listener,
+                &server_descriptor,
+                &server_descriptor.capability,
+            )
+            .await
+            .expect("accept runtime hello");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read runtime request");
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                            .expect("encode acknowledgement")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("acknowledge runtime request");
+        });
+
+        // Simulates the supervisor's completion push clearing the job's `running`
+        // entry shortly after the signal, not instantly.
+        let running = svc.running.clone();
+        let job_id = descriptor.job_id;
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            running.lock().await.remove(&job_id);
+        });
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&descriptor.job_id),
+            "send_explicit_signal must not return before the job's running entry clears"
+        );
+        server.await.expect("runtime control server");
+    }
+
+    // A session cancelled before `Start` has nothing that pushes completion; left
+    // to the 15s crash watchdog, GPU release would lag well past the cancel RPC.
+    #[tokio::test]
+    async fn send_explicit_signal_fences_a_session_that_never_started() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            907,
+            1,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            state.path().join("never-bound.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "never-started-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(descriptor.job_id, descriptor.run_attempt, 1, 0, &[0])
+                .unwrap();
+            assert!(alloc.commit_job(descriptor.job_id, descriptor.run_attempt));
+        }
+
+        tokio::time::timeout(
+            CANCEL_REAP_TIMEOUT,
+            svc.send_explicit_signal(
+                descriptor.job_id,
+                0,
+                nix::sys::signal::Signal::SIGKILL as i32,
+            ),
+        )
+        .await
+        .expect("send_explicit_signal must resolve within the cancel-reap bound");
+
+        assert!(
+            !svc.running.lock().await.contains_key(&descriptor.job_id),
+            "a never-started session's ledger entry must clear without waiting on the crash watchdog"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "the GPU must be free immediately, not after the crash watchdog's next tick"
+        );
     }
 
     // The immediate shutdown needs the same epoch guard as the grace-period

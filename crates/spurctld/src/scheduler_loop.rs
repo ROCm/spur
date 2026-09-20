@@ -2269,9 +2269,8 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
     }
 }
 
-/// Force-finish a job stuck in Completing past `complete_wait_secs`, cancelling
-/// it on the unreported nodes first so their agents release the allocation
-/// before the controller frees those nodes. Best-effort; the agent reclaim backs it.
+/// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
+/// unreported nodes in the background so a slow cancel can't race this verdict.
 async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
     let missing: Vec<_> = job
         .allocated_nodes
@@ -2302,7 +2301,12 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
     }
 
     if !missing.is_empty() {
-        cancel_job_on_nodes(cluster, job.job_id, job.run_attempt, &missing, 9).await;
+        let cluster = cluster.clone();
+        let job_id = job.job_id;
+        let run_attempt = job.run_attempt;
+        tokio::spawn(async move {
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9).await;
+        });
     }
 
     info!(
@@ -3248,6 +3252,9 @@ mod tests {
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
             register_delay: Duration,
+            /// Sleeps inside `cancel_job` before acknowledging, standing in for a slow
+            /// agent — used to race a real completion report against force-finish.
+            cancel_delay: Duration,
             /// launch_job fails with this gRPC status instead of answering, for
             /// example ResourceExhausted from a node whose local allocation table
             /// already holds the GPUs, or NotFound from an operator with no SpurJob.
@@ -3359,6 +3366,9 @@ mod tests {
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
+                if !self.cancel_delay.is_zero() {
+                    tokio::time::sleep(self.cancel_delay).await;
+                }
                 self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
@@ -3536,8 +3546,14 @@ mod tests {
         async fn spawn_mock_agent_with_register_delay(
             delay: Duration,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
-            let (addr, cancel_calls, _, _) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, delay, false).await;
+            let (addr, cancel_calls, _, _) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                delay,
+                false,
+                Duration::ZERO,
+            )
+            .await;
             (addr, cancel_calls)
         }
 
@@ -3550,6 +3566,23 @@ mod tests {
                 launch_delay,
                 Duration::ZERO,
                 false,
+                Duration::ZERO,
+            )
+            .await;
+            (addr, cancel_calls)
+        }
+
+        /// Like [`spawn_mock_agent`], but `cancel_job` sleeps `delay` before
+        /// acknowledging, widening the window before the agent's release lands.
+        async fn spawn_mock_agent_with_cancel_delay(
+            delay: Duration,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let (addr, cancel_calls, _, _) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                delay,
             )
             .await;
             (addr, cancel_calls)
@@ -3565,6 +3598,7 @@ mod tests {
             launch_delay: Duration,
             register_delay: Duration,
             capture: bool,
+            cancel_delay: Duration,
         ) -> (
             std::net::SocketAddr,
             Arc<AtomicU32>,
@@ -3585,6 +3619,7 @@ mod tests {
                 reject_with_status: None,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
+                cancel_delay,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3612,6 +3647,7 @@ mod tests {
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
                 reject_start: false,
+                cancel_delay: Duration::ZERO,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3639,6 +3675,7 @@ mod tests {
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
                 reject_start: true,
+                cancel_delay: Duration::ZERO,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3899,8 +3936,8 @@ mod tests {
             );
         }
 
-        // Force-finish must cancel the job on the unreported node before freeing
-        // it, or the agent keeps the stale allocation and rejects the next dispatch.
+        // Force-finish cancels the unreported node in the background so a slow
+        // agent can't delay the Failed verdict long enough for a race to win instead.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn completing_timeout_cancels_only_the_unreported_node() {
             use spur_core::job::JobState;
@@ -3946,11 +3983,7 @@ mod tests {
             let job = cm.get_job(job_id).unwrap();
             force_finish_completing_job(&cm, &job).await;
 
-            assert_eq!(
-                cancel2.load(Ordering::SeqCst),
-                1,
-                "the unreported node n2 must be cancelled before its resources are freed"
-            );
+            wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
             assert_eq!(
                 cancel1.load(Ordering::SeqCst),
                 0,
@@ -4005,8 +4038,73 @@ mod tests {
 
             force_finish_completing_job(&cm, &job).await;
 
-            assert_eq!(cancel1.load(Ordering::SeqCst), 1, "n1 must be cancelled");
-            assert_eq!(cancel2.load(Ordering::SeqCst), 1, "n2 must be cancelled");
+            wait_for("n1 cancelled", || cancel1.load(Ordering::SeqCst) == 1);
+            wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
+        }
+
+        // A completion report for the unreported node landing mid-force-finish must
+        // not flip the Failed verdict to Completed via derived_completion.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_survives_a_completion_report_racing_the_cancel() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr1, _) = spawn_mock_agent().await;
+            // n2's mock agent holds its `CancelJob` ack open, standing in for a slow
+            // release — the window this test's racing report is timed to land inside.
+            let (addr2, _) = spawn_mock_agent_with_cancel_delay(Duration::from_millis(200)).await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let spec = JobSpec {
+                name: "completing-race".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes,
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs,
+                )
+                .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // n1 (the primary) reports a clean exit; n2 never does.
+            cm.node_complete(job_id, "n1", 0, 0, run_attempt).unwrap();
+            settle(&cm, job_id, JobState::Completing);
+
+            let job = cm.get_job(job_id).unwrap();
+            // Races force-finish (blocked on n2's slow cancel ack) against n2's own
+            // belated report, spawned so it lands mid-flight rather than after.
+            let finisher = tokio::spawn({
+                let cm = cm.clone();
+                async move { force_finish_completing_job(&cm, &job).await }
+            });
+            let racer = tokio::spawn({
+                let cm = cm.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = cm.node_complete(job_id, "n2", 0, 0, run_attempt);
+                }
+            });
+            let _ = tokio::join!(finisher, racer);
+
+            settle(&cm, job_id, JobState::Failed);
         }
 
         // Mock agents echo an offset-keyed path; the stored path must be the
@@ -4185,13 +4283,20 @@ mod tests {
             let cm = test_cluster(&dir).await;
 
             let (good_addr, cancel_calls, release_pmix_good, _) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, false)
-                    .await;
+                spawn_mock_agent_capturing_fanout(
+                    None,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    false,
+                    Duration::ZERO,
+                )
+                .await;
             let (bad_addr, _, release_pmix_bad, _) = spawn_mock_agent_capturing_fanout(
                 Some(spur_proto::proto::LaunchFailureKind::LaunchFailureUnspecified),
                 Duration::ZERO,
                 Duration::ZERO,
                 false,
+                Duration::ZERO,
             )
             .await;
             register_node_at(&cm, "n1", good_addr);
@@ -5074,8 +5179,14 @@ mod tests {
         async fn process_assignment_dispatches_a_plain_batch_job_with_task_fanout_false() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, _, fanout_calls) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, true).await;
+            let (addr, _, _, fanout_calls) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+                Duration::ZERO,
+            )
+            .await;
             register_node_at(&cm, "n1", addr);
 
             let mut spec = batch_spec("plain-batch-fanout", 1);
@@ -5095,8 +5206,14 @@ mod tests {
         async fn process_assignment_dispatches_srun_batch_fallback_with_task_fanout_true() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, _, fanout_calls) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, true).await;
+            let (addr, _, _, fanout_calls) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+                Duration::ZERO,
+            )
+            .await;
             register_k8s_node_at(&cm, "k1", addr);
 
             let mut spec = batch_spec("srun-fanout-with-script", 1);
