@@ -1061,8 +1061,8 @@ async fn wait_for_stepd_release(
 /// stepd-request timeout), so it never fires during ordinary resolution.
 const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Purely to log confirmed-vs-unconfirmed after the force kill; the ledger
-/// releases either way once this elapses.
+/// One poll window between kill retries; the ledger only releases once one
+/// of these confirms the stepd is actually gone, never on a bare timeout.
 const FORCE_KILL_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 const FORCE_KILL_CONFIRM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -1164,38 +1164,45 @@ fn spawn_wedged_stepd_force_reclaim(
                 window_secs = force_reclaim_timeout().as_secs(),
                 "stepd still alive past the force-reclaim window; force-reclaiming"
             );
-            // Never release on an unconfirmed kill: a cgroup that won't empty
-            // or a signal that didn't land means the workload may still hold
-            // its CPUs/GPUs, and advertising them free would double-allocate.
-            // Retry instead of giving up on a fixed window; re-checking
-            // liveness immediately before each kill also keeps the raw-pid
-            // signal from landing on an unrelated process that reused it.
-            loop {
-                force_kill_stepd(&descriptor);
-                let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
-                let mut confirmed_dead = false;
-                while tokio::time::Instant::now() < confirm_deadline {
-                    if matches!(
-                        crate::stepd::stepd_liveness(&descriptor),
-                        Ok(crate::stepd::StepdLiveness::Stale)
-                    ) {
-                        confirmed_dead = true;
+            // Spawned per descriptor: a sibling step that never confirms dead
+            // must not stall fencing of this one, or one wedged step
+            // withholds every other step's resources too.
+            let context = context.clone();
+            tokio::spawn(async move {
+                // Never release on an unconfirmed kill: a cgroup that won't
+                // empty or a signal that didn't land means the workload may
+                // still hold its CPUs/GPUs, and advertising them free would
+                // double-allocate. Retry instead of giving up on a fixed
+                // window; re-checking liveness immediately before each kill
+                // also keeps the raw-pid signal from landing on an unrelated
+                // process that reused it.
+                loop {
+                    force_kill_stepd(&descriptor);
+                    let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
+                    let mut confirmed_dead = false;
+                    while tokio::time::Instant::now() < confirm_deadline {
+                        if matches!(
+                            crate::stepd::stepd_liveness(&descriptor),
+                            Ok(crate::stepd::StepdLiveness::Stale)
+                        ) {
+                            confirmed_dead = true;
+                            break;
+                        }
+                        tokio::time::sleep(FORCE_KILL_CONFIRM_POLL_INTERVAL).await;
+                    }
+                    if confirmed_dead {
                         break;
                     }
-                    tokio::time::sleep(FORCE_KILL_CONFIRM_POLL_INTERVAL).await;
+                    warn!(
+                        job_id,
+                        run_attempt,
+                        pid = descriptor.pid,
+                        "could not confirm the stepd was killed after force-reclaim; \
+                         retaining the ledger and retrying rather than releasing it"
+                    );
                 }
-                if confirmed_dead {
-                    break;
-                }
-                warn!(
-                    job_id,
-                    run_attempt,
-                    pid = descriptor.pid,
-                    "could not confirm the stepd was killed after force-reclaim; \
-                     retaining the ledger and retrying rather than releasing it"
-                );
-            }
-            fence_dead_stepd(&context, descriptor).await;
+                fence_dead_stepd(&context, descriptor).await;
+            });
         }
     });
 }
@@ -7815,7 +7822,10 @@ impl AgentService {
             return;
         }
         let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
-            // Nothing tracked for this job at all; nothing to cancel.
+            // Neither stepds nor running names an attempt to scope to, but an
+            // orphaned unsupervised step can still outlive both maps — reach
+            // it via the wildcard rather than stranding it.
+            self.cancel_active_steps_for_job(job_id, 0, signal).await;
             return;
         };
         // A signal reaches every step the job holds; one failing must not
@@ -7956,6 +7966,11 @@ impl AgentService {
     /// grace period guarantees a container init dies.
     /// Steps with a supervisor are skipped: it runs its own ordered shutdown,
     /// and the escalation below would cut that short.
+    /// `run_attempt == 0` is a wildcard (matches any attempt of `job_id`),
+    /// the same convention `stepds_for_attempt` uses — reached only when
+    /// nothing in `stepds`/`running` named a concrete attempt to scope to,
+    /// so an orphaned unsupervised step (tracked only in `active_steps`,
+    /// independently of either map) is still reachable rather than stranded.
     async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
         let supervised: Vec<spur_core::step::StepId> =
             stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
@@ -7971,7 +7986,7 @@ impl AgentService {
             let mut targets = Vec::new();
             for (key, step) in steps.iter_mut() {
                 if key.0 == job_id
-                    && step.run_attempt == run_attempt
+                    && (run_attempt == 0 || step.run_attempt == run_attempt)
                     && !supervised.contains(&key.1)
                 {
                     step.cancel_requested = true;
@@ -8019,7 +8034,11 @@ impl AgentService {
             return;
         }
         let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
-            // Nothing tracked for this job at all; nothing to cancel.
+            // Neither stepds nor running names an attempt to scope to, but an
+            // orphaned unsupervised step can still outlive both maps — reach
+            // it via the wildcard rather than stranding it.
+            self.cancel_active_steps_for_job(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
+                .await;
             return;
         };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
@@ -13857,6 +13876,39 @@ mod tests {
         assert!(
             child.try_wait().expect("try_wait").is_none(),
             "the agent must not signal a step its supervisor is shutting down"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // An orphaned unsupervised step (its process still active_steps-tracked)
+    // can outlive both `running` and `stepds` for its job -- an attempt-less
+    // reclaim-heartbeat cancel must still reach it via the wildcard rather
+    // than resolve_cancel_attempt's `None` stranding it.
+    #[tokio::test]
+    async fn an_attempt_less_cancel_still_reaches_an_orphaned_unsupervised_step() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        // Neither insert_test_job nor track_test_stepds: this job has no
+        // running/stepds entry at all, only the orphaned active_steps one.
+        svc.register_test_step(85, 4, Some(child.id())).await;
+
+        svc.send_explicit_signal(85, 0, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+
+        assert!(
+            svc.step_cancel_requested(85, 4).await,
+            "an attempt-less cancel must still reach an orphaned unsupervised \
+             step even when neither running nor stepds names an attempt"
         );
         let _ = child.kill();
         let _ = child.wait();
