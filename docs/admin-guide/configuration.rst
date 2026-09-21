@@ -514,6 +514,25 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        repeated lend-and-reclaim converges instead of churning. Deliberately
        separate from ``preempt_exempt_time``, which is unbounded and which a user
        can raise for their own job by submitting to several partitions.
+   * - ``idle_fill_max_borrow_factor``
+     - float
+     - ``0.0``
+     - Live
+     - Ceiling on how many nodes one QOS may hold on loan at once, as a multiple
+       of that QOS's own group node cap: ``2.0`` lets a QOS capped at 4 nodes
+       borrow 8 more. ``0.0`` means no ceiling from this dimension. Bounds a
+       single team's blast radius. The ceiling only ever denies a *new* loan, so
+       lowering it never evicts a run that is already borrowing.
+   * - ``idle_fill_max_cluster_fraction``
+     - float
+     - ``0.0``
+     - Live
+     - Ceiling on how many nodes one QOS may hold on loan at once, as a fraction
+       of the cluster's registered nodes: ``0.25`` on a 100-node cluster allows 25.
+       ``0.0`` means no ceiling from this dimension. Needed alongside the factor
+       because a multiple of a large quota can still swallow the cluster. When
+       both are set the tighter one wins, and fractions floor, so a ceiling never
+       overshoots.
 
 .. note::
 

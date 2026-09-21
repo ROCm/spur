@@ -655,6 +655,17 @@ pub struct SchedulerConfig {
     /// so it is short and bounded.
     #[serde(default = "default_idle_fill_exempt_secs")]
     pub idle_fill_exempt_secs: u32,
+    /// Ceiling on how many nodes one QOS may hold on loan at once, as a multiple
+    /// of that QOS's own group node cap. `0.0` (default) means no ceiling from
+    /// this dimension. Bounds a single team's blast radius.
+    #[serde(default)]
+    pub idle_fill_max_borrow_factor: f64,
+    /// Ceiling on how many nodes one QOS may hold on loan at once, as a fraction
+    /// of the cluster's registered nodes. `0.0` (default) means no ceiling from
+    /// this dimension. Bounds one team against the whole cluster, which the
+    /// factor above cannot do because it scales with the team's own quota.
+    #[serde(default)]
+    pub idle_fill_max_cluster_fraction: f64,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -701,6 +712,8 @@ impl Default for SchedulerConfig {
             preempt_exempt_time: 0,
             idle_fill_enabled: false,
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
+            idle_fill_max_borrow_factor: 0.0,
+            idle_fill_max_cluster_fraction: 0.0,
         }
     }
 }
@@ -4012,6 +4025,28 @@ idle_fill_exempt_secs = 120
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert!(config.scheduler.idle_fill_enabled);
         assert_eq!(config.scheduler.idle_fill_exempt_secs, 120);
+    }
+
+    #[test]
+    fn idle_fill_borrow_ceilings_default_to_unbounded() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"").unwrap();
+        assert_eq!(config.scheduler.idle_fill_max_borrow_factor, 0.0);
+        assert_eq!(config.scheduler.idle_fill_max_cluster_fraction, 0.0);
+    }
+
+    #[test]
+    fn idle_fill_borrow_ceilings_parse() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+idle_fill_enabled = true
+idle_fill_max_borrow_factor = 2.0
+idle_fill_max_cluster_fraction = 0.25
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.scheduler.idle_fill_max_borrow_factor, 2.0);
+        assert_eq!(config.scheduler.idle_fill_max_cluster_fraction, 0.25);
     }
 
     #[test]

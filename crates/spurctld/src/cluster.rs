@@ -549,6 +549,36 @@ fn team_over_quota(cap: Option<u64>, legitimate_nodes: u64, borrowed_nodes: u64)
     }
 }
 
+/// The most nodes one QOS may hold on loan at once, or `None` when unbounded.
+///
+/// Two independent dimensions, both off by default, and the tighter one wins:
+/// `factor` scales with the QOS's own cap, bounding one team's blast radius, and
+/// `fraction` scales with the cluster, bounding a team whose own cap is large
+/// enough that a multiple of it would still swallow everything.
+///
+/// The ceiling is one-directional by construction: callers consult it only when
+/// admitting a *new* borrow, so lowering it never evicts a run that is already
+/// borrowing. A QOS with no cap has no quota to exceed, is never stamped, and so
+/// never reaches this test.
+fn borrow_ceiling(cap_nodes: u64, cluster_nodes: u64, factor: f64, fraction: f64) -> Option<u64> {
+    let from_factor = (factor > 0.0).then(|| (cap_nodes as f64 * factor).floor() as u64);
+    let from_fraction = (fraction > 0.0).then(|| (cluster_nodes as f64 * fraction).floor() as u64);
+    match (from_factor, from_fraction) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Whether lending `want` more nodes would push this QOS past its borrow ceiling.
+fn borrow_would_exceed_ceiling(ceiling: Option<u64>, borrowed_now: u64, want: u64) -> bool {
+    match ceiling {
+        None => false,
+        Some(limit) => borrowed_now.saturating_add(want) > limit,
+    }
+}
+
 /// Whether a job refused by its group node cap may be lent idle capacity at all.
 /// Separate from the sole-blocker test, which asks about quota; these are the
 /// structural exclusions, each because re-running the gate concerned is either
@@ -4055,7 +4085,29 @@ impl ClusterManager {
                     None => GateOutcome::Keep,
                 }
             });
-            let idle_fill_on = self.config.read().scheduler.idle_fill_enabled;
+            let (idle_fill_on, borrow_factor, borrow_fraction) = {
+                let cfg = self.config.read();
+                (
+                    cfg.scheduler.idle_fill_enabled,
+                    cfg.scheduler.idle_fill_max_borrow_factor,
+                    cfg.scheduler.idle_fill_max_cluster_fraction,
+                )
+            };
+            let cluster_nodes = nodes.len() as u64;
+            // The borrowed-node counter, per QOS and deliberately separate from the
+            // quota aggregates a borrowed run is outside of. Seeded from what is
+            // already running and then charged as this pass admits candidates, so a
+            // single cycle cannot admit a batch that collectively breaks the ceiling.
+            let mut borrowed_by_qos: HashMap<String, u64> = HashMap::new();
+            for job in jobs.values() {
+                if job.state != JobState::Running || !job.idle_fill {
+                    continue;
+                }
+                if let Some(qos) = job.spec.qos.as_deref() {
+                    *borrowed_by_qos.entry(qos.to_string()).or_insert(0) +=
+                        job.allocated_nodes.len() as u64;
+                }
+            }
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 let admitted = match account_block_with(
                     job,
@@ -4082,7 +4134,29 @@ impl ClusterManager {
                 ) {
                     Ok(charge) => charge,
                     Err(blocked) => {
+                        // The ceiling is consulted here, at the moment a new borrow
+                        // would be admitted, which is what keeps it one-directional:
+                        // lowering it denies the next loan without disturbing runs
+                        // that are already borrowing.
+                        let qos_name = job.spec.qos.as_deref().unwrap_or_default();
+                        let ceiling = borrow_ceiling(
+                            qos_by_job[&job.job_id]
+                                .limits
+                                .grp_tres
+                                .as_ref()
+                                .map(|grp| grp.get(TresType::Node))
+                                .unwrap_or(0),
+                            cluster_nodes,
+                            borrow_factor,
+                            borrow_fraction,
+                        );
+                        let within_ceiling = !borrow_would_exceed_ceiling(
+                            ceiling,
+                            borrowed_by_qos.get(qos_name).copied().unwrap_or(0),
+                            job.spec.num_nodes as u64,
+                        );
                         if idle_fill_on
+                            && within_ceiling
                             && blocked.grp_node_sole_blocker
                             && admitted.admits_without_credit
                             && idle_fill_collectible(job)
@@ -4098,6 +4172,8 @@ impl ClusterManager {
                             // dimension is deliberately 0 — that is the one aggregate
                             // a borrowed job is outside of (D1).
                             reserved.reserve(job, 0, job.spec.num_nodes as u64);
+                            *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
+                                job.spec.num_nodes as u64;
                             idle_fill_candidates.push(job.clone());
                         }
                         // Blocked either way: the job is over quota and that stays its
@@ -27559,6 +27635,95 @@ mod idle_fill_aggregate_tests {
             !team_over_quota(cap, 0, borrowed),
             "a single borrower on a cap of 1 is within quota and must be spared"
         );
+    }
+
+    #[test]
+    fn borrow_ceiling_is_off_until_a_dimension_is_configured() {
+        // Both dimensions default to 0.0, which must mean unbounded rather than
+        // "no borrowing at all" -- otherwise enabling idle-fill on a default config
+        // would lend nothing.
+        assert_eq!(borrow_ceiling(1, 100, 0.0, 0.0), None);
+        assert_eq!(borrow_ceiling(0, 0, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn borrow_ceiling_takes_the_tighter_of_the_two_dimensions() {
+        let cases: &[(u64, u64, f64, f64, Option<u64>)] = &[
+            // factor only: a multiple of the QOS's own cap.
+            (2, 100, 2.0, 0.0, Some(4)),
+            (1, 100, 3.0, 0.0, Some(3)),
+            // fraction only: a share of the cluster.
+            (2, 100, 0.0, 0.25, Some(25)),
+            (2, 10, 0.0, 0.5, Some(5)),
+            // both set: the tighter wins, from either side.
+            (2, 100, 2.0, 0.5, Some(4)),
+            (40, 10, 2.0, 0.2, Some(2)),
+            // fractions floor rather than round up, so a ceiling never overshoots.
+            (3, 10, 0.5, 0.0, Some(1)),
+            (2, 7, 0.0, 0.3, Some(2)),
+            // a factor below one can pin a team to less than its own cap.
+            (4, 100, 0.5, 0.0, Some(2)),
+        ];
+        for (cap, cluster, factor, fraction, want) in cases {
+            assert_eq!(
+                borrow_ceiling(*cap, *cluster, *factor, *fraction),
+                *want,
+                "cap={cap} cluster={cluster} factor={factor} fraction={fraction}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrow_ceiling_of_zero_denies_every_new_loan() {
+        // A configured-but-tiny ceiling must round down to a real refusal rather
+        // than silently behaving as unbounded.
+        let ceiling = borrow_ceiling(1, 4, 0.4, 0.0);
+        assert_eq!(ceiling, Some(0));
+        assert!(borrow_would_exceed_ceiling(ceiling, 0, 1));
+    }
+
+    #[test]
+    fn borrow_would_exceed_ceiling_admits_up_to_the_limit_and_no_further() {
+        // Unbounded admits anything.
+        assert!(!borrow_would_exceed_ceiling(None, u64::MAX, u64::MAX));
+
+        // Exactly at the limit is admitted; one node past it is not.
+        assert!(!borrow_would_exceed_ceiling(Some(4), 3, 1));
+        assert!(borrow_would_exceed_ceiling(Some(4), 4, 1));
+        assert!(!borrow_would_exceed_ceiling(Some(4), 0, 4));
+        assert!(borrow_would_exceed_ceiling(Some(4), 0, 5));
+
+        // A pathological want must saturate into a refusal, not wrap into a fit.
+        assert!(borrow_would_exceed_ceiling(Some(4), u64::MAX, 1));
+        assert!(borrow_would_exceed_ceiling(Some(4), 1, u64::MAX));
+    }
+
+    #[test]
+    fn the_borrow_counter_measures_nodes_not_runs() {
+        // The ceiling is a node budget, so one three-node borrower must consume as
+        // much of it as three single-node borrowers.
+        let mut wide = HashMap::new();
+        wide.insert(
+            1,
+            running_in_qos(1, "alice", "team", &["n1", "n2", "n3"], true),
+        );
+        let mut narrow = HashMap::new();
+        narrow.insert(1, running_in_qos(1, "alice", "team", &["n1"], true));
+        narrow.insert(2, running_in_qos(2, "bob", "team", &["n2"], true));
+        narrow.insert(3, running_in_qos(3, "carol", "team", &["n3"], true));
+
+        let count = |jobs: &HashMap<JobId, Job>| {
+            occupied_nodes(jobs, |j| {
+                j.idle_fill && j.spec.qos.as_deref() == Some("team")
+            })
+            .len() as u64
+        };
+        assert_eq!(count(&wide), 3);
+        assert_eq!(count(&narrow), 3);
+
+        // And a ceiling of 2 must refuse both shapes.
+        assert!(borrow_would_exceed_ceiling(Some(2), count(&wide), 1));
+        assert!(borrow_would_exceed_ceiling(Some(2), count(&narrow), 1));
     }
 
     #[test]
