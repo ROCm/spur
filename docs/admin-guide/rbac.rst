@@ -1,6 +1,8 @@
 Roles and operators
 ===================
 
+This page is the long form of ``[auth]`` roles in :doc:`configuration`.
+
 Spur binds a verified identity to one of four roles. Sites assign those roles;
 they cannot invent new ones. The role set is the same whichever
 authentication plugin is in use.

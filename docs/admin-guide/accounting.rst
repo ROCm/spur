@@ -259,16 +259,17 @@ else is rejected, so a level that would confer nothing cannot be stored.
 
 .. warning::
 
-   The admin level is a control-plane privilege, not just an accounting label: it
-   admits the user to the admin-gated controller mutations (partitions, node
-   labels, tokens, reservations), so grant it as carefully as root. See
-   :ref:`privileged-operations`.
+   ``adminlevel=Admin`` (or ``Administrator``) is a control-plane privilege, not
+   just an accounting label: it admits the user to partitions, node drain,
+   admission tokens, and reconfigure. Grant it as carefully as root. See the
+   note below and :ref:`privileged-operations`.
 
 .. note::
 
-   ``Operator`` is accepted and stored, but Spur does not yet act on it — unlike
-   Slurm, where it confers reservation management. Use the admin level for a user
-   who needs control-plane privileges today.
+   ``adminlevel=Operator`` grants Operator: manage anyone's jobs, reservations,
+   and accounting records, but not node drain, partitions, admission tokens, or
+   reconfigure. ``Admin`` / ``Administrator`` grants Administrator (full
+   control-plane). See :ref:`privileged-operations`.
 
 Set per-association limits
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

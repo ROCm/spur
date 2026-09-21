@@ -545,11 +545,103 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 ``[auth]``
 ----------
 
-How client requests are authenticated.
+Two settings decide how callers are authenticated. ``plugin`` picks the kind of
+credential the cluster accepts, and ``mode`` decides how strictly one is
+demanded. Who may drain a node or touch another user's job is configured in the
+same section, under `Roles and access control`_.
+
+Each plugin below is documented on its own: what it gives you, what it does not,
+every field it needs, and a complete example. Read only the one you intend to
+run.
+
+Choosing a plugin
+~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
-   :widths: 20 10 16 14 40
+   :widths: 14 29 28 29
+
+   * - Plugin
+     - What the caller presents
+     - What you get
+     - What it costs
+   * - ``"none"``
+     - Nothing. The username in the request is believed as sent.
+     - Nothing to install, nothing to distribute.
+     - No enforcement. Anyone who can reach the port can act as any user.
+   * - ``"jwt"`` (default)
+     - A bearer token minted by ``spur token user``, kept in ``~/.spur/token``
+       or ``$SPUR_AUTH_TOKEN``.
+     - Verified usernames from one shared secret held on the controller, and
+       node identity for token-based admission.
+     - Tokens are copyable files valid until they expire. Revoking one means
+       rotating the key and reissuing every token.
+   * - ``"spur"``
+     - A short-lived credential minted for that one call by a local
+       ``spurauthd``, which reads the caller's UID from the kernel.
+     - Identity that cannot be copied, forwarded, or handed to a colleague,
+       plus signed job and step launch credentials.
+     - ``spurauthd`` and key files must be installed on every host that makes
+       or verifies calls.
+
+Choose ``"none"`` only where the network is the real boundary: a laptop, a CI
+sandbox, a single-user test rig. Choose ``"jwt"`` when you need enforcement
+without running another daemon on every host, or when nodes join using
+admission tokens. Choose ``"spur"`` for a shared cluster where people log in to
+a submit host — the credential comes from their Unix session, so there is
+nothing for a user to leak and nothing for you to hand out per person.
+
+``"munge"`` is recognised but not implemented. It, and any unrecognised value,
+is rejected at startup rather than quietly ignored.
+
+Authentication modes
+~~~~~~~~~~~~~~~~~~~~
+
+``mode`` means the same thing whichever plugin is selected.
+
+``"disabled"``
+   Credentials are ignored, even valid ones. Every caller is anonymous and its
+   asserted username is trusted.
+
+``"permissive"`` (default)
+   A request carrying no credential is allowed, and its asserted username is
+   trusted. A request that does carry one must pass verification — an invalid,
+   expired, or malformed credential is refused in this mode too, so presenting
+   a forgery is never better than presenting nothing. An unauthenticated
+   caller is not pinned to their own jobs, so they can list and fetch every
+   job. This is the migration setting: start here, watch the logs name each
+   caller that is still unauthenticated, then tighten.
+
+``"required"``
+   Every request must carry a valid credential. Unauthenticated callers are
+   refused before any handler runs.
+
+Liveness checks are exempt in every mode: gRPC ``Ping`` and REST ``/ping``
+never need a credential.
+
+An unauthenticated gRPC ``CancelJob`` that sends an empty user is treated as
+the in-cluster daemon and can cancel any job. REST cancel still demands a
+bearer token. That applies to ``"disabled"`` and credential-less ``"permissive"``
+under every plugin, including default ``jwt``, not only ``"none"``.
+
+``plugin = "none"``
+~~~~~~~~~~~~~~~~~~~
+
+Use ``mode = "disabled"``. Then no caller is identified: job ownership,
+reservation management, and who may read another tenant's job all rest on the
+username the client chose to send.
+
+**You get:** a cluster that runs with zero authentication setup.
+
+**You do not get:** any enforcement. With no verified identity, role bindings
+such as ``cluster_admins`` have nothing to bind to, so every privileged
+operation is open to every caller that reaches the port. Leave this plugin on
+``"permissive"`` and a presented bearer token is still verified — including
+against a built-in key when no ``jwt_key`` is set (see the warning below).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
 
    * - Field
      - Type
@@ -560,128 +652,407 @@ How client requests are authenticated.
      - string
      - ``"jwt"``
      - Restart
-     - ``"jwt"`` (default) uses bearer tokens from ``spur token user`` /
-       ``$SPUR_AUTH_TOKEN``. ``"spur"`` is the native plugin: the CLI and
-       ``spurd`` mint a fresh credential from a local ``spurauthd`` Unix socket
-       on every user RPC, and ``spurctld`` / ``spurd`` verify HMAC, cluster,
-       kind, lifetime, audience, boot epoch, and nonce replay from
-       ``/etc/spur/auth.jwks`` (see :doc:`/developer/native-credential-mint`).
-       Controllers also load Ed25519 ``controller-signing.jwks``,
-       ``node-signing.jwks``, and ``cred-signing.jwks``; agents load
-       ``controller-verification.jwks`` and ``cred-verification.jwks``. Missing
-       required files fail startup. JWT user tokens are refused on this plugin. ``"munge"`` and any
-       unrecognised value are rejected rather than silently ignored, and
-       ``"none"`` with ``mode = "required"`` is refused as contradictory.
-       ``plugin = "none"`` does **not** turn verification off; ``mode`` still
-       decides whether a presented JWT is required. ``plugin = "spur"`` with
-       ``mode = "required"`` does not require ``jwt_key``.
+     - Set to ``"none"``.
    * - ``mode``
      - string
      - ``"permissive"``
      - Restart
-     - ``"disabled"`` ignores credentials entirely, even valid ones.
-       ``"permissive"`` verifies a credential that is presented — an invalid or
-       malformed one is always refused — but allows a request that carries none.
-       ``"required"`` refuses every request without a valid credential.
+     - Use ``"disabled"``. ``"required"`` is refused at startup, because no
+       credential exists to require.
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "none"
+   mode = "disabled"
+
+.. warning::
+
+   Restrict the controller port (6817) at the network layer — it is the only
+   boundary this configuration has. ``spurctld`` warns at startup whenever it
+   binds a non-loopback address without ``mode = "required"``. An
+   unauthenticated gRPC ``CancelJob`` that sends an empty user is treated as
+   the in-cluster daemon and can cancel any job; REST cancel still demands a
+   bearer token.
+
+   Prefer ``mode = "disabled"`` over ``"permissive"`` here. ``"none"`` does not
+   switch the verification path off: under ``"permissive"`` a request that
+   presents a bearer token is still checked, and with no ``jwt_key`` configured
+   that check falls back to a built-in key, so a token signed with that
+   well-known value verifies as a real identity — including an admin one.
+
+``plugin = "jwt"``
+~~~~~~~~~~~~~~~~~~
+
+Callers present a bearer token signed with one secret that the controller
+holds. The token carries a username, an expiry, and an optional admin claim.
+The controller re-resolves the UID from the username through NSS, so a UID
+inside a token cannot influence what a job runs as.
+
+**You get:** verified usernames with no extra daemon anywhere, plus attested
+node identity when ``[admission] mode = "token"`` is in use — the same key
+signs both.
+
+**You do not get:** containment of a leaked token. It is a file; whoever reads
+it is that user until it expires. There is no per-token revocation for user
+credentials — rotating the signing key invalidates all of them at once.
+
+Fields
+""""""
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``plugin``
+     - string
+     - ``"jwt"``
+     - Restart
+     - Already the default; set explicitly for clarity.
+   * - ``mode``
+     - string
+     - ``"permissive"``
+     - Restart
+     - ``"required"`` to enforce, ``"permissive"`` while rolling tokens out.
    * - ``jwt_key``
      - string
      - none
      - Restart
-     - Signing key for user credentials (``spur token user``) and node admission
-       tokens, given inline. The value is used literally as the secret — a path
-       here is the secret itself, not a file to read from. Deliberately not
-       reloadable: swapping it live would immediately invalidate every
-       outstanding token.
+     - The signing secret, inline. Used literally: a path written here is the
+       secret itself, not a file to read. Required only when
+       ``mode = "required"``.
    * - ``jwt_key_file``
      - string
      - none
      - Restart
-     - Path to a regular file whose contents are the signing key, for keeping the
-       secret out of ``spur.conf``. A single trailing line ending is ignored.
-       Mutually exclusive with ``jwt_key``: setting both is rejected at startup.
-   * - ``allow_root_jobs``
-     - bool
-     - ``false``
-     - Agent restart
-     - Permit jobs to run as UID 0. Consumed by ``spurd`` at its own startup.
-   * - ``cluster_admins``
-     - list of strings
-     - empty
-     - Restart
-     - Usernames bound to Administrator regardless of accounting.
-   * - ``admin_groups``
-     - list of strings
-     - empty
-     - Restart
-     - NSS groups bound to Administrator (case-insensitive).
-   * - ``operator_groups``
-     - list of strings
-     - empty
-     - Restart
-     - NSS groups bound to Operator (job/reservation/accounting management, not node drain).
-   * - ``allow_uid_zero_administrator``
-     - bool
-     - ``false``
-     - Restart
-     - When true, a verified native UID 0 identity is Administrator.
+     - Path to a regular file whose contents are the secret, to keep it out of
+       ``spur.conf``. One trailing line ending is ignored. Alternative to
+       ``jwt_key``; same ``mode = "required"`` rule.
 
-.. warning::
+Set at most one of ``jwt_key`` or ``jwt_key_file``; setting both is rejected at
+startup, and so is ``mode = "required"`` with neither. Neither is reloadable:
+``scontrol reconfigure`` keeps the key captured at startup, because adopting a
+new one live would invalidate every outstanding token at once.
 
-   Under the default ``mode = "permissive"``, a caller that presents no
-   credential is unauthenticated, and the username it asserts in the request is
-   taken at face value. Identity-dependent decisions — job ownership, reservation
-   management, and who may list or fetch another tenant's job — are then only as
-   trustworthy as the network. An unauthenticated gRPC ``CancelJob`` with an
-   empty ``user`` is treated as the in-cluster daemon and can cancel any job
-   (REST cancel still requires a Bearer token). Set ``mode = "required"`` (with
-   ``jwt_key`` or ``jwt_key_file``) to make these checks enforceable, and
-   restrict the controller port at the network layer either way.
-   ``spurctld`` warns at startup whenever it binds a non-loopback address without
-   ``required``.
+Under the default ``mode = "permissive"``, a missing key is allowed: the
+controller still verifies any bearer token that is presented, falling back to a
+built-in signing key. A token signed with that well-known value is accepted as
+a real identity, including an admin one. Set an explicit key before you issue
+tokens, even while still on ``"permissive"``.
+
+Example
+"""""""
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "jwt"
+   mode = "required"
+   jwt_key_file = "/etc/spur/jwt.key"
+
+Issuing user credentials
+""""""""""""""""""""""""
+
+Run this on a controller host — it signs locally from the configured key rather
+than calling the controller, so it still works under ``mode = "required"``:
+
+.. code-block:: console
+
+   $ spur token user --user alice --ttl 24h
+   $ spur token user --user erin --admin
+
+The token is printed on stdout; everything else goes to ``stderr``, so it can be
+redirected straight into a file. Users store it as ``~/.spur/token`` with mode
+``0600`` or export it as ``$SPUR_AUTH_TOKEN``. A token file readable by other
+users is ignored with a warning rather than used. The default lifetime is 24
+hours; ``--ttl`` accepts values like ``24h``, ``7d``, or ``3600s``.
+
+Rolling this out to a live cluster
+""""""""""""""""""""""""""""""""""
+
+Start with ``mode = "permissive"`` and a key configured, distribute tokens,
+then restart with ``mode = "required"`` once the logs no longer name
+unauthenticated callers.
 
 .. note::
 
-   Token admission needs a signing key to attest node identity. When neither
-   ``jwt_key`` nor ``jwt_key_file`` is set, ``[admission] mode = "token"`` still
-   gates which nodes may register — the join token is checked — but registered
-   agents are issued no node credential and none is demanded of them afterwards,
-   so a caller that reaches the controller port can act as any registered node.
-   ``spurctld`` warns at startup in this configuration; set an explicit key
-   before relying on token admission.
+   Token-based node admission is attested by this same key. With
+   ``[admission] mode = "token"`` but no key set, join tokens still gate which
+   nodes may register, yet registered agents are issued no node credential and
+   none is demanded afterwards — so a caller that reaches the controller port
+   can act as any registered node. ``spurctld`` warns at startup in that state.
+
+``plugin = "spur"``
+~~~~~~~~~~~~~~~~~~~
+
+Spur's native plugin. There is no token to hand out: on every call the CLI (or
+``spurd``) asks a local ``spurauthd`` over a Unix socket for a fresh
+credential, and ``spurauthd`` takes the caller's UID, GID, and PID straight
+from the kernel. The credential is bound to one verifier and one process
+lifetime, and its nonce is remembered until it expires, so it cannot be
+replayed elsewhere or twice.
+
+**You get:** an identity a user cannot copy, forward, or lend; automatic
+expiry with no distribution step; signed job and step launch credentials that
+agents verify before executing anything; and a separate controller identity
+for controller-to-agent calls.
+
+**You do not get:** JWT compatibility — ``spur token user`` refuses to mint
+against this plugin and JWT user tokens are rejected on the wire. Every host
+that makes calls needs ``spurauthd`` running and the caller must be resolvable
+by NSS on that host.
+
+Step 1 — generate the key sets
+""""""""""""""""""""""""""""""
+
+Run as root on one controller. Files are written mode ``0600``:
+
+.. code-block:: console
+
+   $ spur auth-keys hmac --kid auth-1 --out /etc/spur/auth.jwks
+   $ spur auth-keys ed25519 --kid ctrl-1 \
+       --signing /etc/spur/controller-signing.jwks \
+       --verify  /etc/spur/controller-verification.jwks
+   $ spur auth-keys ed25519 --kid cred-1 \
+       --signing /etc/spur/cred-signing.jwks \
+       --verify  /etc/spur/cred-verification.jwks
+   $ spur auth-keys ed25519 --kid node-1 \
+       --signing /etc/spur/node-signing.jwks \
+       --verify  /tmp/node-verification.jwks
+
+Step 2 — distribute them
+""""""""""""""""""""""""
+
+Copy only what each host needs. A host that is both controller and agent needs
+both sets. A missing required file stops the daemon at startup.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 12 12 12 30
+
+   * - File (under ``/etc/spur``)
+     - Controller
+     - Agent
+     - Login node
+     - Purpose
+   * - ``auth.jwks``
+     - yes
+     - yes
+     - yes
+     - Mints and verifies user credentials.
+   * - ``controller-signing.jwks``
+     - yes
+     - no
+     - no
+     - Signs controller-to-agent calls and forwarded identities.
+   * - ``controller-verification.jwks``
+     - no
+     - yes
+     - no
+     - Lets an agent verify the controller.
+   * - ``cred-signing.jwks``
+     - yes
+     - no
+     - no
+     - Signs job and step launch credentials.
+   * - ``cred-verification.jwks``
+     - no
+     - yes
+     - no
+     - Lets an agent verify a launch credential.
+   * - ``node-signing.jwks``
+     - yes
+     - no
+     - no
+     - Attests node identity at admission. The controller both signs and
+       verifies these, so the matching verification file is not distributed.
+
+Step 3 — run ``spurauthd`` on every host that makes calls
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+That means login nodes (for the CLI) and compute nodes (``spurd`` authenticates
+its own register, heartbeat, and completion calls). Controllers need it too if
+anyone runs the CLI there:
+
+.. code-block:: console
+
+   $ spurauthd --cluster mi300x-cluster --jwks /etc/spur/auth.jwks
+
+It listens on ``/run/spur/<cluster-name>/auth.sock``, mode ``0666`` so ordinary
+users can connect; the signing keys stay in ``/etc/spur`` and are never
+readable through the socket. Run it under systemd so it starts before
+``spurctld`` and ``spurd``. Without a reachable mint, ``mode = "required"``
+rejects those callers.
+
+Step 4 — configure the cluster
+""""""""""""""""""""""""""""""
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``plugin``
+     - string
+     - ``"jwt"``
+     - Restart
+     - Set to ``"spur"``.
+   * - ``mode``
+     - string
+     - ``"permissive"``
+     - Restart
+     - ``"required"`` to enforce. ``jwt_key`` is **not** needed for this plugin,
+       in any mode.
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "spur"
+   mode = "required"
+
+The same values go in ``spur.conf`` on controllers and agents. Where no config
+file is present, set ``$SPUR_AUTH_PLUGIN=spur`` and ``$SPUR_CLUSTER_NAME``
+instead; the cluster name is mandatory there and startup fails without it.
+
+.. warning::
+
+   With ``mode = "required"``, ``spurctld`` refuses to start when the REST API
+   is enabled on a non-loopback address, because REST has no mint handshake.
+   Bind ``controller.rest_addr`` to loopback, or set
+   ``[rest_api] allow_non_loopback = true`` if a trusted gateway sits in front
+   of it.
+
+.. note::
+
+   Each ``spurctld`` or ``spurd`` restart picks a new random boot epoch, and
+   credentials minted against the previous one stop verifying. Clients re-learn
+   the epoch on their next ``Ping`` and mint again, so this is invisible in
+   normal use — but it does mean an in-flight credential is never valid across
+   a restart.
+
+Roles and access control
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every authenticated caller resolves to exactly one of four fixed roles. Sites
+assign them; new roles cannot be defined. A caller with no verified identity is
+not a User: job listing is not pinned, so they see every job. That is the path
+``"disabled"`` and credential-less ``"permissive"`` take, including the default
+``jwt`` configuration until you set ``mode = "required"``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - Role
+     - May do
+   * - User
+     - Submit and manage their own jobs. Job listing is pinned to their own
+       jobs, and asking for another tenant's job id returns ``NOT_FOUND``.
+   * - Coordinator
+     - Reserved for a future grant hierarchy. Not assigned today.
+   * - Operator
+     - Everything a User may do, plus manage anyone's jobs and reservations and
+       change accounting records. May not drain or remove nodes, edit
+       partitions, mint admission tokens, or reconfigure the cluster.
+   * - Administrator
+     - Full control of the cluster, including every operation listed under
+       `Privileged operations`_.
+
+Spur checks each source below and grants the highest role any of them yields; a
+caller matching none is a User.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 10 14 50
+
+   * - Field
+     - Type
+     - Reload
+     - Grants
+   * - ``cluster_admins``
+     - list of strings
+     - Restart
+     - Administrator to these usernames, whatever accounting says.
+   * - ``admin_groups``
+     - list of strings
+     - Restart
+     - Administrator to members of these groups. Matched case-insensitively.
+   * - ``operator_groups``
+     - list of strings
+     - Restart
+     - Operator to members of these groups. Matched case-insensitively.
+   * - ``allow_uid_zero_administrator``
+     - bool
+     - Restart
+     - Administrator to a caller the native mint verified as UID 0. Applies to
+       ``plugin = "spur"`` only, and is off by default: root on a login node is
+       not automatically root on the cluster.
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "spur"
+   mode = "required"
+   cluster_admins = ["erin"]
+   admin_groups = ["gpu-admins"]
+   operator_groups = ["acct-ops"]
+   allow_uid_zero_administrator = false
+
+Two sources live outside this section. A user whose accounting record sets an
+admin level — ``sacctmgr modify user name=bob set adminlevel=Operator``, or
+``Admin`` for Administrator — gets that role as well. And under
+``plugin = "jwt"``, a token minted with ``spur token user --admin`` is
+Administrator on its own.
+
+Group membership is read through NSS on the host doing the verifying, so both
+the controller and every agent must be able to resolve the caller's groups
+(``/etc/group``, LDAP, SSSD — whatever is configured there). Agents have no
+accounting database, so on a node only the config lists and the plugin's own
+admin signal apply.
+
+.. note::
+
+   Accounting-derived roles are read from an in-memory cache. Until it has
+   loaded — the first moments after a restart, or while PostgreSQL is
+   unreachable — accounting is not consulted and the caller is treated as a
+   plain User. Spur denies rather than guesses, so a privileged command may be
+   refused briefly after a restart. Retry once the controller has finished
+   loading.
 
 .. _privileged-operations:
 
 Privileged operations
 ~~~~~~~~~~~~~~~~~~~~~
 
-The control-plane mutations that define cluster tenancy — partitions, node state
-and labels (``scontrol update NodeName=``, ``spur node drain``, ``spur node
-remove``), ``reconfigure``, admission tokens, and k0s — require
-**Administrator**. Operators may manage jobs, reservations, and
-accounting CRUD, but cannot drain or remove nodes.
+These control-plane mutations define cluster tenancy and require
+**Administrator**:
 
-A caller with a verified identity below the required role is refused with
-``PermissionDenied``. A caller with *no* verified identity is allowed, so that
-``disabled`` and credential-less ``permissive`` deployments keep working; under
+* partitions;
+* node state and labels — ``scontrol update NodeName=``, ``spur node drain``,
+  ``spur node remove``;
+* ``scontrol reconfigure``;
+* admission tokens;
+* the k0s cluster manager.
+
+Managing anyone's jobs and reservations, and writing accounting records,
+requires **Operator** or above. After a user, account, or QOS write, the
+association cache is refreshed immediately so a new role binding takes effect
+without waiting for the next poll.
+
+A caller whose verified role is below the bar is refused with
+``PermissionDenied``. A caller with *no* verified identity is allowed through,
+so that ``disabled`` and credential-less ``permissive`` deployments keep
+working — which is exactly why those modes are not a security boundary. Under
 ``mode = "required"`` every caller is authenticated, so the bar binds everyone.
-
-Roles (highest wins; sources that do not apply to the plugin are skipped):
-
-* **Administrator** — ``[auth] cluster_admins``; ``admin_groups``; accounting
-  level ``Administrator``/``Admin`` (cache loaded). Under ``plugin = "jwt"``,
-  also ``spur token user --admin``. Under ``plugin = "spur"``, also verified
-  UID 0 when ``allow_uid_zero_administrator`` is true (the native mint has no
-  admin claim; JWT user tokens are refused).
-* **Operator** — ``operator_groups``; accounting level ``Operator``.
-* **Coordinator** — reserved; grant table is not shipped yet.
-* **User** — everyone else.
-
-Accounting mutations use the same role resolution as the controller: Operator
-or Administrator (including ``cluster_admins``, groups, and accounting
-``admin_level``). After a user/account/QOS write, the association cache is
-kicked so role bindings refresh without waiting for the poll interval.
-
-See :doc:`rbac` and :doc:`/developer/native-credential-mint`.
 
 Reservations are the one exception, and are stricter in two ways. An
 unidentified caller is **not** waved through, and membership of ``sudo`` or
@@ -711,6 +1082,30 @@ update or delete any reservation, matching Slurm's operator semantics.
    asserted, so under ``permissive`` this stops an unprivileged client but not a
    deliberately crafted request. ``mode = "required"`` is what makes it a
    boundary, because there the name comes from the verified credential.
+
+Running jobs as root
+~~~~~~~~~~~~~~~~~~~~
+
+One field in this section is about what a job may run as, not about who the
+caller is. It is read by ``spurd``, so it applies whichever plugin is selected.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``allow_root_jobs``
+     - bool
+     - ``false``
+     - Agent restart
+     - Permit jobs to execute as UID 0.
+
+The UID arrives as part of the job spec, so enable this only on a cluster where
+everyone allowed to submit is already trusted with root on the compute nodes.
 
 ``[[partitions]]``
 ------------------
