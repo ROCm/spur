@@ -45,6 +45,9 @@ class TestStepdRestartSurvival:
             all_nodes=True,
         )
         node = cluster.node_names[0]
+        # Subtract any supervisor already on the shared node (leaked by an
+        # earlier test) so only this job's own supervisor is checked below.
+        baseline = _supervisor_pids(cluster)
         job_id = parse_job_id(
             cluster.sbatch(
                 ["-J", "stepd-survive", "-w", node, "-o", out_path, script]
@@ -54,7 +57,7 @@ class TestStepdRestartSurvival:
         wait_job_state(cluster, job_id, "R")
         # Identity, not count: a supervisor killed with the agent and respawned
         # afterwards would satisfy any "still one running" check.
-        before = _supervisor_pids(cluster)
+        before = _supervisor_pids(cluster) - baseline
         assert before, "a running job must have a supervisor"
 
         cluster.restart_agent(0)
@@ -148,6 +151,9 @@ class TestSupervisedGpuAdoption:
         hold = cluster.write_file(
             "gpu-adopt-hold.sh", "#!/bin/bash\nsleep 300\n", all_nodes=True
         )
+        # Subtract any supervisor already on the shared node (leaked by an
+        # earlier test) so only this job's own supervisor is checked below.
+        baseline = _supervisor_pids(cluster)
         job_id = parse_job_id(
             cluster.sbatch(
                 [
@@ -160,7 +166,7 @@ class TestSupervisedGpuAdoption:
         wait_job_state(cluster, job_id, "R")
         # Taken before the probe step so the set holds only the holder's own
         # supervisor; a step's supervisor exits and would leave the set itself.
-        before_pids = _supervisor_pids(cluster)
+        before_pids = _supervisor_pids(cluster) - baseline
         assert before_pids, "a running job must have a supervisor"
 
         try:
