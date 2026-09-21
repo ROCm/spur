@@ -129,6 +129,12 @@ partial run, not the work. ``--no-requeue`` does not prevent this; suspension is
 not used, because a suspended job keeps its node allocation and would never
 release the capacity.
 
+The fate is always requeue, whatever ``PreemptMode`` the job's QOS or partition
+sets. A QOS with ``preemptmode=cancel`` still has its borrowed runs requeued, not
+cancelled. The two other modes cannot serve reclaim: suspend never releases the
+allocation, which is the entire point of reclaiming, and cancel destroys work the
+job had no claim to lose when requeue preserves it at no cost to the reclaimer.
+
 Reclaim also does not charge the lost run to fairshare. Charging it would lower the
 borrower's priority for work it was not allowed to finish, which would make it the
 preferred next victim — the more capacity it lost, the more it would go on to lose.

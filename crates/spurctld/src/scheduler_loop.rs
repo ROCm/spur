@@ -1095,6 +1095,10 @@ async fn reclaim_for_unplaced(
 
         let mut freed = Vec::new();
         for victim in reclaimable.iter().filter(|r| victims.contains(&r.job_id)) {
+            // Always requeue, whatever PreemptMode the victim's QOS or partition
+            // configures. Suspend never releases the allocation, which is the one
+            // thing reclaim needs, and cancel destroys work the run had no claim to
+            // lose when requeue preserves it at no cost to the reclaimer.
             match cluster.preempt_job_with_provenance(
                 victim.job_id,
                 spur_core::partition::PreemptMode::Requeue,
