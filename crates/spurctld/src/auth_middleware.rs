@@ -101,6 +101,12 @@ where
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
         }
+        // Handlers forward by signing this path, so it must come from the wire
+        // rather than from the Rust request type, which `Empty` RPCs all share.
+        let path = req.uri().path().to_owned();
+        req.extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(path));
+
         let forwarded = req
             .headers()
             .get(spur_core::native_peer::FORWARDED_HEADER)
@@ -122,6 +128,17 @@ where
                 let now = spur_core::native_mint::unix_now().unwrap_or(0);
                 match peer.verify(&env, now) {
                     Ok((identity, binding)) => {
+                        // Stops a captured `Empty`-bodied read from being
+                        // replayed onto another RPC, such as Reconfigure.
+                        let path = req.uri().path().to_owned();
+                        if binding.action != path {
+                            let resp = tonic::Status::unauthenticated(format!(
+                                "forwarded identity is bound to {}, not {path}",
+                                binding.action
+                            ))
+                            .into_http();
+                            return Box::pin(async move { Ok(resp) });
+                        }
                         req.extensions_mut().insert(identity);
                         req.extensions_mut().insert(binding);
                         req.extensions_mut().insert(Verified);

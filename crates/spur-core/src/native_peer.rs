@@ -21,8 +21,13 @@ pub const FORWARD_LIFETIME_SECS: u64 = 30;
 pub const IDENTITY_HEADER: &str = "x-spur-identity";
 pub const FORWARDED_HEADER: &str = "x-spur-forwarded";
 
-/// Body binding extracted from a verified envelope. The HTTP auth layer cannot
-/// hash the decoded gRPC message; the leader handler must call [`Self::require`].
+/// The method path a request arrived on, carried in extensions so a handler can
+/// sign the path it forwards rather than the Rust request type.
+#[derive(Debug, Clone)]
+pub struct RpcPath(pub String);
+
+/// Body binding from a verified envelope; the handler must call [`Self::require`].
+/// `action` is the method path — every `Empty` RPC shares one type and digest.
 #[derive(Debug, Clone)]
 pub struct ForwardedBinding {
     pub action: String,

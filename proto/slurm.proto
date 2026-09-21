@@ -1485,7 +1485,9 @@ message TransactionRecord {
   int64 id = 1;
   google.protobuf.Timestamp timestamp = 2;
   string actor = 3;
-  uint32 actor_uid = 4;         // 0 when unknown (e.g. unauthenticated caller)
+  // Absent unless the kernel vouched for it; a JWT's uid is caller-asserted,
+  // and flattening that to 0 would read as root.
+  optional uint32 actor_uid = 4;
   bool verified = 5;            // true only when a JWT identity was verified
   string source = 6;            // "api" | "system"
   string action = 7;            // "create" | "update" | "delete"

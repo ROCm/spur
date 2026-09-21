@@ -1339,6 +1339,15 @@ capped at 10000 rows per query (larger requests are clamped). The default column
 match Slurm (``Time,Action,Actor,Where,Info``); additional ``format=`` fields are
 ``Outcome``, ``Verified``, ``Source``, ``Peer``, ``ID``, and ``ActorUID``.
 
+.. note::
+
+   ``ActorUID`` is recorded only when the kernel vouched for it, which means the
+   native ``spur`` plugin's peer-credential path. A JWT carries whatever UID the
+   token was minted with, so under ``plugin = "jwt"`` the column is blank and
+   ``Actor`` is the attribution — a blank UID never means the caller was root.
+   The same rule governs the ``reason_uid`` that ``sinfo -R`` renders for a
+   drained node, which shows ``Unknown`` in that case.
+
 ``Peer=`` matches on the ``host:port`` boundary, so a bare address finds every
 ephemeral port that host connected from, while ``10.0.0.4`` does not also match
 ``10.0.0.42``. Both plain and bracketed forms are matched, so a bare IPv6
@@ -1373,7 +1382,8 @@ reads included, set ``logging.audit_rpcs``:
    audit_rpcs = true
 
 Each request emits one line on the ``audit_rpc`` tracing target with the method,
-authenticated user and uid, peer address, and outcome. This is the equivalent of
+authenticated user and UID (under the same rule as above), peer address, and
+outcome. This is the equivalent of
 Slurm's ``DebugFlags=AuditRPCs`` and is off by default for the same reason: on a
 busy cluster it is the highest-volume log Spur produces, since it includes
 ``squeue``/``sinfo`` polling and node heartbeats. The dedicated target lets it be

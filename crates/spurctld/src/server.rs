@@ -303,22 +303,7 @@ impl ControllerService {
 
     #[allow(clippy::result_large_err)]
     fn enforce_forward_binding<T: prost::Message>(request: &Request<T>) -> Result<(), Status> {
-        let Some(binding) = request
-            .extensions()
-            .get::<spur_core::native_peer::ForwardedBinding>()
-        else {
-            return Ok(());
-        };
-        let mut buf = Vec::new();
-        request
-            .get_ref()
-            .encode(&mut buf)
-            .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
-        let digest = spur_core::native_peer::request_digest(&buf);
-        let action = std::any::type_name::<T>();
-        binding.require(action, &digest).map_err(|e| {
-            Status::unauthenticated(format!("forwarded identity does not match this RPC: {e}"))
-        })
+        enforce_forward_binding(request)
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -998,7 +983,19 @@ impl ControllerService {
     /// Native plugin: a signed identity envelope replaces the original user
     /// credential so the leader does not see a consumed nonce. JWT plugin:
     /// the Authorization header is preserved as before.
-    fn forward_request<T: prost::Message>(request: Request<T>) -> Request<T> {
+    #[allow(clippy::result_large_err)]
+    fn forward_request<T: prost::Message>(request: Request<T>) -> Result<Request<T>, Status> {
+        // Already forwarded once. Re-signing would mint a fresh envelope over
+        // whatever body we now hold, laundering a tampered one into a valid id.
+        if request
+            .extensions()
+            .get::<spur_core::native_peer::ForwardedBinding>()
+            .is_some()
+        {
+            return Err(Status::unauthenticated(
+                "refusing to re-forward an already-forwarded request",
+            ));
+        }
         let identity = request
             .extensions()
             .get::<spur_core::auth::Identity>()
@@ -1006,12 +1003,16 @@ impl ControllerService {
         let mut buf = Vec::new();
         let _ = prost::Message::encode(request.get_ref(), &mut buf);
         let digest = spur_core::native_peer::request_digest(&buf);
-        let action = std::any::type_name::<T>();
+        // Fail closed: without the wire path we would have to fall back to the
+        // request type, which cannot tell one `Empty` RPC from another.
+        let action = rpc_path(&request).ok_or_else(|| {
+            Status::internal("cannot forward a request with no recorded RPC path")
+        })?;
         let meta =
-            Self::forwarded_metadata_for(request.metadata(), identity.as_ref(), digest, action);
+            Self::forwarded_metadata_for(request.metadata(), identity.as_ref(), digest, &action);
         let mut fwd = Request::new(request.into_inner());
         *fwd.metadata_mut() = meta;
-        fwd
+        Ok(fwd)
     }
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
@@ -1249,7 +1250,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.submit_job(fwd).await;
                 }
                 Err(e) => {
@@ -1295,6 +1296,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let __identity = Self::verified_identity(&request).cloned();
@@ -1371,6 +1373,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         // Capture identity before the forward so the serving node (leader or read-allowed follower)
@@ -1407,7 +1410,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cancel_job(fwd).await;
                 }
                 Err(e) => {
@@ -1452,7 +1455,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.complete_job(fwd).await;
                 }
                 Err(e) => {
@@ -1515,7 +1518,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.job_keepalive(fwd).await;
                 }
                 Err(e) => {
@@ -1567,7 +1570,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.suspend_job(fwd).await;
                 }
                 Err(e) => {
@@ -1605,7 +1608,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.resume_job(fwd).await;
                 }
                 Err(e) => {
@@ -1644,7 +1647,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_job(fwd).await;
                 }
                 Err(e) => {
@@ -1727,7 +1730,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.requeue_job(fwd).await;
                 }
                 Err(e) => {
@@ -1765,6 +1768,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -1810,6 +1814,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -1854,7 +1859,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_node(fwd).await;
                 }
                 Err(e) => {
@@ -1887,7 +1892,7 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "update node")?;
 
-        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
         let node_state = match parsed {
             Some(None) => return Err(Status::invalid_argument("invalid node state")),
@@ -1914,7 +1919,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.drain_node(fwd).await;
                 }
                 Err(e) => {
@@ -1937,7 +1942,7 @@ impl SlurmController for ControllerService {
         // same bar as `update_node`, which reaches the identical state change.
         self.require_admin(&request, "drain node")?;
 
-        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
         let reason = if req.reason.is_empty() {
             None
@@ -1965,7 +1970,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.deregister_node(fwd).await;
                 }
                 Err(e) => {
@@ -2014,7 +2019,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.deregister_agent(fwd).await;
                 }
                 Err(e) => {
@@ -2056,6 +2061,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2103,6 +2109,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2129,6 +2136,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2156,7 +2164,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.get_rpc_stats(fwd).await;
             }
         }
@@ -2171,7 +2179,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.get_sched_stats(fwd).await;
             }
         }
@@ -2189,7 +2197,7 @@ impl SlurmController for ControllerService {
         if self.check_leader(&request).is_err() {
             let proxy = &self.leader_proxy;
             let mut client = proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.get_assoc_mgr_info(fwd).await;
         }
 
@@ -2219,7 +2227,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.reset_diag_stats(fwd).await;
             }
         }
@@ -2237,7 +2245,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.register_agent(fwd).await;
                 }
                 Err(e) => {
@@ -2316,7 +2324,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.report_job_status(fwd).await;
                 }
                 Err(e) => {
@@ -2445,7 +2453,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.heartbeat(fwd).await;
                 }
                 Err(e) => {
@@ -2500,7 +2508,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.report_stepd_recovery(fwd).await;
                 }
                 Err(error) => {
@@ -2676,7 +2684,7 @@ impl SlurmController for ControllerService {
                 Ok(mut client) => {
                     // Preserve the caller's credential (and set the forwarded marker) so the leader
                     // authorizes the ORIGINAL caller, not an anonymous forwarded request.
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_token(fwd).await;
                 }
                 Err(_) => return Err(status),
@@ -2703,6 +2711,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListTokensRequest>,
     ) -> Result<Response<ListTokensResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         use spur_proto::proto::TokenInfo;
 
         // Admission tokens are cluster secrets; only an admin may enumerate them.
@@ -2732,7 +2741,7 @@ impl SlurmController for ControllerService {
                 Ok(mut client) => {
                     // Preserve the caller's credential (and set the forwarded marker) so the leader
                     // authorizes the ORIGINAL caller, not an anonymous forwarded request.
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.revoke_token(fwd).await;
                 }
                 Err(_) => return Err(status),
@@ -2753,6 +2762,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2802,7 +2812,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_job_step(fwd).await;
                 }
                 Err(e) => {
@@ -2921,7 +2931,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.complete_job_step(fwd).await;
                 }
                 Err(e) => {
@@ -2984,7 +2994,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_partition(fwd).await;
                 }
                 Err(e) => {
@@ -3091,7 +3101,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_partition(fwd).await;
                 }
                 Err(e) => {
@@ -3202,7 +3212,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.delete_partition(fwd).await;
                 }
                 Err(e) => {
@@ -3227,7 +3237,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.reconfigure(fwd).await;
                 }
                 Err(e) => {
@@ -3254,7 +3264,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_reservation(fwd).await;
                 }
                 Err(e) => {
@@ -3297,7 +3307,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_reservation(fwd).await;
                 }
                 Err(e) => {
@@ -3352,7 +3362,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.delete_reservation(fwd).await;
                 }
                 Err(e) => {
@@ -3381,6 +3391,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -3428,7 +3439,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.exec_in_job(fwd).await;
             }
         }
@@ -3503,7 +3514,7 @@ impl SlurmController for ControllerService {
         if self.check_leader(&request).is_err() {
             let proxy = &self.leader_proxy;
             let mut client = proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.run_step(fwd).await;
         }
 
@@ -3893,7 +3904,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_up(fwd).await;
                 }
                 Err(e) => {
@@ -4020,7 +4031,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_add_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -4097,7 +4108,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_remove_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -4232,7 +4243,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_down(fwd).await;
                 }
                 Err(e) => {
@@ -4266,7 +4277,7 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         if self.check_leader(&request).is_err() {
             let mut client = self.leader_proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.cluster_status(fwd).await;
         }
         let state = self.cluster.k0s_state();
@@ -4286,7 +4297,7 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<ClusterKubeconfigResponse>, Status> {
         if self.check_leader(&request).is_err() {
             let mut client = self.leader_proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.cluster_kubeconfig(fwd).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
@@ -4433,6 +4444,47 @@ pub async fn serve(
     router.serve(addr).await?;
 
     Ok(())
+}
+
+/// A uid only when the kernel vouched for it. A JWT claims its own, possibly 0,
+/// so recording it would attribute an action to an unproven uid. Cf. `bind_job_spec`.
+pub(crate) fn trusted_uid(identity: Option<&spur_core::auth::Identity>) -> Option<u32> {
+    identity.filter(|id| id.trusted_unix).map(|id| id.uid)
+}
+
+/// The gRPC method path this request arrived on, as recorded by the auth layer.
+pub(crate) fn rpc_path<T>(request: &Request<T>) -> Option<String> {
+    request
+        .extensions()
+        .get::<spur_core::native_peer::RpcPath>()
+        .map(|p| p.0.clone())
+}
+
+/// Every handler reachable with a forwarded identity must call this: the auth
+/// layer verifies the envelope's signature but cannot hash a typed body.
+#[allow(clippy::result_large_err)]
+pub(crate) fn enforce_forward_binding<T: prost::Message>(
+    request: &Request<T>,
+) -> Result<(), Status> {
+    let Some(binding) = request
+        .extensions()
+        .get::<spur_core::native_peer::ForwardedBinding>()
+    else {
+        return Ok(());
+    };
+    let mut buf = Vec::new();
+    request
+        .get_ref()
+        .encode(&mut buf)
+        .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
+    let digest = spur_core::native_peer::request_digest(&buf);
+    // The auth layer already matched this against the wire path; re-checking it
+    // here keeps the digest and action verdicts in one place.
+    let action = rpc_path(request)
+        .ok_or_else(|| Status::internal("forwarded request has no recorded RPC path"))?;
+    binding.require(&action, &digest).map_err(|e| {
+        Status::unauthenticated(format!("forwarded identity does not match this RPC: {e}"))
+    })
 }
 
 /// Keeps an unrecognized value verbatim rather than dropping it, so the audit
@@ -6028,8 +6080,13 @@ mod tests {
         let mut request = Request::new(inner);
         request
             .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/SubmitJob".into(),
+            ));
+        request
+            .extensions_mut()
             .insert(spur_core::native_peer::ForwardedBinding {
-                action: std::any::type_name::<SubmitJobRequest>().into(),
+                action: "/slurm.SlurmController/SubmitJob".into(),
                 request_digest: [0u8; 32],
             });
         let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
@@ -6046,8 +6103,13 @@ mod tests {
         let mut request = Request::new(inner);
         request
             .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/SubmitJob".into(),
+            ));
+        request
+            .extensions_mut()
             .insert(spur_core::native_peer::ForwardedBinding {
-                action: std::any::type_name::<SubmitJobRequest>().into(),
+                action: "/slurm.SlurmController/SubmitJob".into(),
                 request_digest: digest,
             });
         ControllerService::enforce_forward_binding(&request).unwrap();
@@ -6059,8 +6121,13 @@ mod tests {
         let mut request = Request::new(inner);
         request
             .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/GetNodes".into(),
+            ));
+        request
+            .extensions_mut()
             .insert(spur_core::native_peer::ForwardedBinding {
-                action: std::any::type_name::<GetNodesRequest>().into(),
+                action: "/slurm.SlurmController/GetNodes".into(),
                 request_digest: [1u8; 32],
             });
         let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
@@ -9272,6 +9339,29 @@ mod tests {
         );
     }
 
+    /// A node's `reason_uid` and the audit log both attribute through this, so a
+    /// token claiming uid 0 must not leave a root fingerprint on either.
+    #[test]
+    fn only_a_kernel_vouched_uid_is_attributable() {
+        let native = spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        };
+        assert_eq!(super::trusted_uid(Some(&native)), Some(1000));
+
+        let jwt = spur_core::auth::Identity {
+            user: "mallory".into(),
+            uid: 0,
+            trusted_unix: false,
+            ..native.clone()
+        };
+        assert_eq!(super::trusted_uid(Some(&jwt)), None);
+        assert_eq!(super::trusted_uid(None), None);
+    }
+
     // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
     // (a) an admin whose username is not literally "root" is still treated as internal, and (b) an
     // unauthenticated caller cannot bypass ownership by claiming user = "root".
@@ -11913,6 +12003,105 @@ mod tests {
             assoc_mgr_scope_user(Some(&id), "alice", true).as_deref(),
             Some("alice")
         );
+    }
+
+    /// Every `Empty` RPC shares one type and one digest, so a type-bound
+    /// envelope for a read also validated as `Reconfigure`.
+    #[test]
+    fn an_empty_bodied_envelope_cannot_be_replayed_onto_another_rpc() {
+        let mut req = Request::new(());
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/Reconfigure".into(),
+        ));
+        let mut buf = Vec::new();
+        prost::Message::encode(req.get_ref(), &mut buf).unwrap();
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                // Signed for a read; the digest is identical to Reconfigure's.
+                action: "/slurm.SlurmController/GetRpcStats".into(),
+                request_digest: spur_core::native_peer::request_digest(&buf),
+            });
+
+        let err = enforce_forward_binding(&req)
+            .expect_err("an envelope bound to GetRpcStats must not authorize Reconfigure");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    /// The same envelope on the RPC it was actually signed for still works, so
+    /// the check above is not just rejecting everything.
+    #[test]
+    fn an_empty_bodied_envelope_validates_on_its_own_rpc() {
+        let mut req = Request::new(());
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/GetRpcStats".into(),
+        ));
+        let mut buf = Vec::new();
+        prost::Message::encode(req.get_ref(), &mut buf).unwrap();
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/GetRpcStats".into(),
+                request_digest: spur_core::native_peer::request_digest(&buf),
+            });
+
+        enforce_forward_binding(&req).expect("the bound RPC must still be accepted");
+    }
+
+    /// Re-signing would bind the victim's identity to whatever body we now hold,
+    /// laundering a tampered request into a validly signed one.
+    #[test]
+    fn an_already_forwarded_request_is_never_re_signed() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: true,
+            reason: "tampered".into(),
+        });
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/DeregisterNode".into(),
+                request_digest: [0u8; 32],
+            });
+
+        let err = ControllerService::forward_request(req)
+            .expect_err("a request carrying a binding must not be forwarded again");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    /// The same guard must not block ordinary client traffic, which carries no
+    /// binding and is exactly what forwarding exists for.
+    #[test]
+    fn a_first_hop_client_request_still_forwards() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: false,
+            reason: String::new(),
+        });
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/DeregisterNode".into(),
+        ));
+        let fwd = ControllerService::forward_request(req).expect("first hop must forward");
+        assert!(fwd.metadata().get(FORWARDED_HEADER).is_some());
+    }
+
+    /// A mismatched binding is rejected rather than being treated as "not
+    /// leader", which is what previously routed it into the forwarding path.
+    #[test]
+    fn a_mismatched_binding_is_rejected() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: false,
+            reason: String::new(),
+        });
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/DeregisterNode".into(),
+        ));
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/DeregisterNode".into(),
+                request_digest: [0u8; 32],
+            });
+
+        let err = enforce_forward_binding(&req).expect_err("digest mismatch must be rejected");
+        assert_eq!(err.code(), Code::Unauthenticated);
     }
 
     #[test]

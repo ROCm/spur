@@ -153,7 +153,7 @@ where
                     target: AUDIT_RPC_TARGET,
                     method = %method,
                     user = identity.as_ref().map_or("-", |i| i.user.as_str()),
-                    uid = identity.as_ref().map(|i| i.uid),
+                    uid = crate::server::trusted_uid(identity.as_ref()),
                     peer = peer.as_deref().unwrap_or("-"),
                     outcome = outcome.as_str(),
                     "rpc"
@@ -256,10 +256,8 @@ fn build_record(
     TxnRecord {
         ts: Utc::now(),
         actor,
-        // Gated on verification, not presence, so a recorded uid is always one
-        // a credential proved rather than one a host asserted.
         actor_uid: verified
-            .then(|| identity.map(|id| i64::from(id.uid)))
+            .then(|| crate::server::trusted_uid(identity).map(i64::from))
             .flatten(),
         verified,
         peer_addr: peer.unwrap_or_default(),
@@ -278,12 +276,22 @@ mod tests {
     use crate::accounting::{TxnAction, TxnEntity};
     use crate::audit::Annotation;
 
+    /// A natively minted caller: the kernel vouched for the uid.
     fn identity(user: &str, uid: u32) -> Identity {
         Identity {
             user: user.into(),
             uid,
             gid: uid,
             is_admin: false,
+            trusted_unix: true,
+        }
+    }
+
+    /// A JWT caller: the uid is whatever the token claimed.
+    fn jwt_identity(user: &str, uid: u32) -> Identity {
+        Identity {
+            trusted_unix: false,
+            ..identity(user, uid)
         }
     }
 
@@ -325,6 +333,33 @@ mod tests {
         assert_eq!(rec.action, TxnAction::Update);
         assert_eq!(rec.entity_name, "n1");
         assert_eq!(rec.source, TxnSource::Api);
+    }
+
+    /// A JWT can claim any uid, including 0. Recording it would let a verified
+    /// row read as a root action, so the actor name is kept and the uid dropped.
+    #[test]
+    fn jwt_uid_is_not_recorded() {
+        for claimed_uid in [0, 1000] {
+            let rec = build_record(
+                node_update(),
+                Caller {
+                    identity: Some(&jwt_identity("mallory", claimed_uid)),
+                    verified: true,
+                    peer: Some("10.11.99.42:51234".into()),
+                    forwarded: false,
+                },
+                Some(annotation("n1", None)),
+                TxnOutcome::Success,
+                None,
+            );
+
+            assert_eq!(rec.actor, "mallory");
+            assert!(rec.verified, "the identity itself was still verified");
+            assert_eq!(
+                rec.actor_uid, None,
+                "uid {claimed_uid} was asserted by the token, not proven"
+            );
+        }
     }
 
     #[test]

@@ -223,6 +223,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RecordJobStartRequest>,
     ) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -273,6 +274,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RecordJobEndRequest>,
     ) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -317,6 +319,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetJobHistoryRequest>,
     ) -> Result<Response<GetJobHistoryResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -453,6 +456,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetUsageRequest>,
     ) -> Result<Response<GetUsageResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -510,6 +514,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "create account")?;
         let pool = self.pool()?;
         let pool = &pool;
@@ -536,6 +541,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "delete account")?;
         let pool = self.pool()?;
         let pool = &pool;
@@ -549,8 +555,9 @@ impl SlurmAccounting for AccountingService {
 
     async fn list_accounts(
         &self,
-        _request: Request<ListAccountsRequest>,
+        request: Request<ListAccountsRequest>,
     ) -> Result<Response<ListAccountsResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let records = db::list_accounts(pool)
@@ -574,6 +581,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "add user")?;
         let pool = self.pool()?;
         let pool = &pool;
@@ -664,6 +672,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "remove user")?;
         let pool = self.pool()?;
         let pool = &pool;
@@ -687,6 +696,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -726,6 +736,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "create qos")?;
         let pool = self.pool()?;
         let pool = &pool;
@@ -803,6 +814,7 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "delete qos")?;
         let pool = self.pool()?;
         let pool = &pool;
@@ -816,8 +828,9 @@ impl SlurmAccounting for AccountingService {
 
     async fn list_qos(
         &self,
-        _request: Request<ListQosRequest>,
+        request: Request<ListQosRequest>,
     ) -> Result<Response<ListQosResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let records = db::list_qos(pool)
@@ -854,6 +867,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetFairshareFactorsRequest>,
     ) -> Result<Response<GetFairshareFactorsResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -898,6 +912,7 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsResponse>, Status> {
+        crate::server::enforce_forward_binding(&request)?;
         // Ungated, consistent with get_job_history and the rest of this service.
         // Confidentiality of the audit log requires auth.mode = required.
         let pool = self.pool()?;
@@ -929,7 +944,7 @@ impl SlurmAccounting for AccountingService {
                 id: r.id,
                 timestamp: Some(datetime_to_proto(r.ts)),
                 actor: r.actor,
-                actor_uid: r.actor_uid.and_then(|u| u32::try_from(u).ok()).unwrap_or(0),
+                actor_uid: r.actor_uid.and_then(|u| u32::try_from(u).ok()),
                 verified: r.verified,
                 source: r.source,
                 action: r.action,

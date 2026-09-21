@@ -250,8 +250,9 @@ mod tests {
     #[tokio::test]
     async fn a_forged_credential_never_reaches_the_inner_service() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key")
-            .layer(CountingInner(calls.clone()));
+        let mut svc =
+            AgentAuthLayer::from_bearer(BearerAuth::jwt(AuthMode::Required, b"cluster-key"))
+                .layer(CountingInner(calls.clone()));
         let req = Request::builder()
             .header(
                 http::header::AUTHORIZATION,

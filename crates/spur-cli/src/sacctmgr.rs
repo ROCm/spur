@@ -1132,15 +1132,8 @@ fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
         's' => t.source.clone(),
         'd' => t.id.to_string(),
         'p' => t.peer_addr.clone(),
-        // uid is recorded only for a verified identity; render blank otherwise so
-        // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
-        'u' => {
-            if t.verified {
-                t.actor_uid.to_string()
-            } else {
-                String::new()
-            }
-        }
+        // Absent whenever nothing vouched for the uid, so it cannot read as root.
+        'u' => t.actor_uid.map(|u| u.to_string()).unwrap_or_default(),
         _ => "?".to_string(),
     }
 }
@@ -2156,7 +2149,7 @@ mod tests {
             id: 7,
             timestamp: None,
             actor: "bob".into(),
-            actor_uid: 1000,
+            actor_uid: Some(1000),
             verified: true,
             source: "api".into(),
             action: "create".into(),
@@ -2175,17 +2168,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_txn_field_blanks_uid_when_unverified() {
-        // Unverified rows carry an unknown uid (stored NULL, 0 on the wire); it
-        // must render blank so it can't be mistaken for root (uid 0).
-        let t = TransactionRecord {
+    fn resolve_txn_field_blanks_an_unrecorded_uid() {
+        // No uid is stored unless the kernel vouched for it, so an absent one
+        // must render blank rather than as uid 0, which would read as root.
+        let unverified = TransactionRecord {
             actor: "vm".into(),
-            actor_uid: 0,
+            actor_uid: None,
             verified: false,
             ..Default::default()
         };
-        assert_eq!(resolve_txn_field(&t, 'u'), "");
-        assert_eq!(resolve_txn_field(&t, 'v'), "no");
+        assert_eq!(resolve_txn_field(&unverified, 'u'), "");
+        assert_eq!(resolve_txn_field(&unverified, 'v'), "no");
+
+        // A JWT caller is verified but its uid was never proven.
+        let jwt = TransactionRecord {
+            actor: "mallory".into(),
+            actor_uid: None,
+            verified: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&jwt, 'u'), "");
+        assert_eq!(resolve_txn_field(&jwt, 'A'), "mallory");
+
+        // A real root action is still distinguishable from the blank case.
+        let root = TransactionRecord {
+            actor_uid: Some(0),
+            verified: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&root, 'u'), "0");
     }
 
     #[test]
@@ -2616,7 +2627,7 @@ mod tests {
             id: 7,
             timestamp: None,
             actor: "bob".into(),
-            actor_uid: 1000,
+            actor_uid: Some(1000),
             verified: true,
             source: "api".into(),
             action: "create".into(),
