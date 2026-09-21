@@ -16756,6 +16756,60 @@ mod tests {
         );
     }
 
+    // A non-lethal signal never spawns spawn_stepd_release_wait (release_wait
+    // is None unless supervised && lethal), so reap_dead_supervised_stepds is
+    // the only thing that can notice an already-dead stepd on this path.
+    #[tokio::test]
+    async fn send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 965;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-965.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-non-lethal-signal-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGUSR1 as i32)
+            .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped even on a non-lethal signal"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released \
+             even when no release-wait task was ever spawned for it"
+        );
+    }
+
     // A multi-step job with one dead and one still-live stepd must not be
     // reaped at all: the live sibling may still need its allocation.
     #[tokio::test]
