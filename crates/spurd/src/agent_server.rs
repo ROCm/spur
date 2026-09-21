@@ -1132,14 +1132,19 @@ fn spawn_wedged_stepd_force_reclaim(
     let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_reclaim_timeout();
     tokio::spawn(async move {
         tokio::time::sleep_until(force_deadline).await;
+        // `running` and `stepds` are locked in separate statements, never
+        // nested, so this can't invert release_stepd_tracking's stepds ->
+        // running order and deadlock against it.
+        let superseded = context
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_none_or(|tracked| tracked.run_attempt != run_attempt);
+        if superseded {
+            return;
+        }
         let candidates = {
-            let running = context.running.lock().await;
-            if running
-                .get(&job_id)
-                .is_none_or(|tracked| tracked.run_attempt != run_attempt)
-            {
-                return;
-            }
             let sessions = context.stepds.lock().await;
             stepds_for_attempt(&sessions, job_id, run_attempt)
         };
