@@ -2825,7 +2825,15 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
     match process_start_ticks(descriptor.pid) {
-        Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
+        // A zombie's start ticks still match (the kernel keeps them until
+        // reaped), but it has already exited and released everything —
+        // `process_is_live` is the one check here that knows to exclude it.
+        Ok(start_ticks)
+            if start_ticks == descriptor.process_start_ticks
+                && process_is_live(descriptor.pid, descriptor.process_start_ticks) =>
+        {
+            Ok(StepdLiveness::Live)
+        }
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),

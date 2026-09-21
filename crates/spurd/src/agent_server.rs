@@ -1036,8 +1036,11 @@ async fn wait_for_stepd_release(
                 Ok(crate::stepd::StepdLiveness::Stale) => {
                     fence_dead_stepd(context, descriptor).await;
                 }
-                Ok(crate::stepd::StepdLiveness::Live) => any_live = true,
-                Err(_) => {}
+                // A liveness check that can't tell either way must not read
+                // as "gone" by default, or a run of unreadable /proc entries
+                // strands the ledger forever: never fenced (not confirmed
+                // dead) and never escalated (any_live never set).
+                Ok(crate::stepd::StepdLiveness::Live) | Err(_) => any_live = true,
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -13901,6 +13904,16 @@ mod tests {
         // Neither insert_test_job nor track_test_stepds: this job has no
         // running/stepds entry at all, only the orphaned active_steps one.
         svc.register_test_step(85, 4, Some(child.id())).await;
+        // A real orphan was registered under a real attempt before its job's
+        // other tracking cleared — stamp a non-zero one (register_test_step
+        // defaults to 0, same as the wildcard sentinel, which would let this
+        // test pass even with the wildcard match itself reverted).
+        svc.active_steps
+            .lock()
+            .await
+            .get_mut(&(85, 4))
+            .expect("step registered above")
+            .run_attempt = 3;
 
         svc.send_explicit_signal(85, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
