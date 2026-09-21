@@ -619,6 +619,10 @@ const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Bounds the pre-launch wait so an agent that dies mid-launch cannot strand
 /// the supervisor holding the job's resources.
 const START_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Once a connection decides the gate, how long to keep accepting siblings
+/// before finalizing — so a Start and Shutdown dispatched near-simultaneously
+/// both get seen instead of losing on pure delivery order.
+const GATE_DECISION_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
 
 // A Stepd supervises exactly one step's process tree; PTY/srun steps get
 // their own separate Stepd in follow-up work, not a slot in this one.
@@ -1555,20 +1559,56 @@ pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()
     }
 }
 
+/// How the pre-launch gate ended: released to run, or cancelled before
+/// running — the only way out besides the 120s `START_GATE_TIMEOUT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Released,
+    Cancelled,
+}
+
 /// Serves the control socket before the job exists, so spurd's handshake
-/// completes without waiting on the launch. Returns once Start arrives.
-async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> io::Result<()> {
+/// completes without waiting on the launch. Returns once Start arrives, or
+/// once a cancel arrives telling this session to give up before starting.
+async fn await_start(
+    listener: &UnixListener,
+    descriptor: &StepdDescriptor,
+) -> io::Result<GateOutcome> {
+    // Single authority for the gate's outcome, so a racing Start and
+    // Shutdown can't both be told they won. `Cancelled` always wins once
+    // seen (via `claim_decision`); `Released` only holds if nothing decided.
+    let decision: Arc<Mutex<Option<GateOutcome>>> = Arc::new(Mutex::new(None));
     // Connections are served concurrently: the agent's readiness probe and its
-    // later Start arrive on separate connections, and the first must not block
-    // the second.
-    let (released, mut is_released) = tokio::sync::mpsc::channel::<()>(1);
+    // later Start (or cancel) arrive on separate connections, and the first
+    // must not block the second.
+    let (decided, mut is_decided) = tokio::sync::mpsc::channel::<()>(1);
+    // Set once the first decisive connection notifies. Accepting keeps
+    // running until this elapses, so a near-simultaneous sibling still gets
+    // served (and can still flip `decision`) instead of going unaccepted.
+    let mut settle_deadline: Option<tokio::time::Instant> = None;
     loop {
+        let settle = async {
+            match settle_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
-            _ = is_released.recv() => return Ok(()),
+            Some(()) = is_decided.recv() => {
+                settle_deadline.get_or_insert_with(|| tokio::time::Instant::now() + GATE_DECISION_SETTLE);
+            }
+            () = settle => {
+                let outcome = decision
+                    .lock()
+                    .await
+                    .expect("decision is Some before this channel is ever signalled");
+                return Ok(outcome);
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let descriptor = descriptor.clone();
-                let released = released.clone();
+                let decided = decided.clone();
+                let decision = decision.clone();
                 tokio::spawn(async move {
                     let hello = tokio::time::timeout(
                         STEPD_HANDSHAKE_TIMEOUT,
@@ -1586,9 +1626,9 @@ async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> i
                             return;
                         }
                     };
-                    match serve_until_start(stream, &descriptor).await {
+                    match serve_until_start(stream, &descriptor, &decision).await {
                         Ok(true) => {
-                            let _ = released.send(()).await;
+                            let _ = decided.send(()).await;
                         }
                         Ok(false) => {}
                         Err(error) => {
@@ -1601,9 +1641,30 @@ async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> i
     }
 }
 
-/// Answers requests on one connection until Start. `Ok(true)` means the job
-/// was released; `Ok(false)` means the peer hung up without releasing it.
-async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> io::Result<bool> {
+/// Resolves one request against the gate's shared decision, returning the
+/// outcome to ack — which may not be what this connection asked for.
+/// `Cancelled` always overwrites; `Released` only holds from nothing decided.
+async fn claim_decision(
+    decision: &Mutex<Option<GateOutcome>>,
+    requested: GateOutcome,
+) -> GateOutcome {
+    let mut decided = decision.lock().await;
+    match (*decided, requested) {
+        (_, GateOutcome::Cancelled) => *decided = Some(GateOutcome::Cancelled),
+        (None, GateOutcome::Released) => *decided = Some(GateOutcome::Released),
+        _ => {}
+    }
+    decided.expect("one of the two arms above always sets this on first decision")
+}
+
+/// Answers requests on one connection until Start or a cancel decides the
+/// gate. Returns `true` once this connection has observed a decision (so
+/// `await_start` knows to stop waiting), `false` if the peer hung up first.
+async fn serve_until_start(
+    stream: UnixStream,
+    descriptor: &StepdDescriptor,
+    decision: &Mutex<Option<GateOutcome>>,
+) -> io::Result<bool> {
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -1624,12 +1685,40 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
                 format!("invalid runtime request: {error}"),
             )
         })?;
-        let started = matches!(request, StepdRequest::Start);
-        let response = match request {
-            StepdRequest::Start => StepdResponse::Acknowledged,
+        // A cancel arriving before Start has nothing to signal or tear down yet,
+        // so it decides the gate directly rather than waiting out the full timeout.
+        let requested = match request {
+            StepdRequest::Start => Some(GateOutcome::Released),
+            // A signal has no live workload to reach yet, so it's rejected like any
+            // other pre-launch request; only teardown/shutdown decides the gate here.
+            StepdRequest::BeginTeardown | StepdRequest::Shutdown => Some(GateOutcome::Cancelled),
+            _ => None,
+        };
+        let final_outcome = match requested {
+            Some(requested) => Some(claim_decision(decision, requested).await),
+            None => None,
+        };
+        let response = match (request, final_outcome) {
+            // This connection's own request is the one that stuck.
+            (StepdRequest::Start, Some(GateOutcome::Released)) => StepdResponse::Acknowledged,
+            (
+                StepdRequest::BeginTeardown | StepdRequest::Shutdown,
+                Some(GateOutcome::Cancelled),
+            ) => StepdResponse::Acknowledged,
+            // Start lost to a Shutdown/BeginTeardown decided on another
+            // connection: never claim success, or the caller launches a
+            // workload it was just told was cancelled.
+            (StepdRequest::Start, Some(GateOutcome::Cancelled)) => StepdResponse::Rejected {
+                message: "cancelled before start".into(),
+            },
+            // Unreachable given `claim_decision`'s rules (Shutdown/BeginTeardown
+            // always sets Cancelled), kept exhaustive rather than panicking.
+            (StepdRequest::BeginTeardown | StepdRequest::Shutdown, Some(GateOutcome::Released)) => {
+                StepdResponse::Acknowledged
+            }
             // The agent probes readiness with QueryState before releasing the
             // job, so refusing it here would deadlock the launch.
-            StepdRequest::QueryState => StepdResponse::State {
+            (StepdRequest::QueryState, _) => StepdResponse::State {
                 job_id: descriptor.job_id,
                 run_attempt: descriptor.run_attempt,
                 step_id: descriptor.step_id,
@@ -1651,7 +1740,7 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
         })?;
         reader.get_mut().write_all(&encoded).await?;
         reader.get_mut().write_all(b"\n").await?;
-        if started {
+        if final_outcome.is_some() {
             return Ok(true);
         }
     }
@@ -1947,7 +2036,14 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))
             .and_then(|result| result.map_err(anyhow::Error::from));
-        if let Err(error) = gate {
+        // A cancel arriving before Start (BeginTeardown/Shutdown) decides the gate
+        // directly, instead of sitting out the full START_GATE_TIMEOUT.
+        let error = match gate {
+            Ok(GateOutcome::Released) => None,
+            Ok(GateOutcome::Cancelled) => Some(anyhow::anyhow!("cancelled before start")),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error {
             // Nothing launched, so only the session's own artifacts need clearing
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
@@ -2755,7 +2851,15 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
     match process_start_ticks(descriptor.pid) {
-        Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
+        // A zombie's start ticks still match (the kernel keeps them until
+        // reaped), but it has already exited and released everything —
+        // `process_is_live` is the one check here that knows to exclude it.
+        Ok(start_ticks)
+            if start_ticks == descriptor.process_start_ticks
+                && process_is_live(descriptor.pid, descriptor.process_start_ticks) =>
+        {
+            Ok(StepdLiveness::Live)
+        }
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
@@ -4790,8 +4894,11 @@ mod tests {
     async fn the_gate_releases_the_job_on_start() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let descriptor = gate_descriptor();
-        let server =
-            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let decision = Arc::new(Mutex::new(None));
+        let server_decision = decision.clone();
+        let server = tokio::spawn(async move {
+            serve_until_start(server_stream, &descriptor, &server_decision).await
+        });
         let (reader, mut writer) = client_stream.into_split();
         send(&mut writer, StepdRequest::Start).await;
         let mut line = String::new();
@@ -4804,14 +4911,18 @@ mod tests {
             StepdResponse::Acknowledged
         ));
         assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(*decision.lock().await, Some(GateOutcome::Released));
     }
 
     #[tokio::test]
     async fn the_gate_refuses_work_until_the_job_is_released() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let descriptor = gate_descriptor();
-        let server =
-            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let decision = Arc::new(Mutex::new(None));
+        let server_decision = decision.clone();
+        let server = tokio::spawn(async move {
+            serve_until_start(server_stream, &descriptor, &server_decision).await
+        });
         let (reader, mut writer) = client_stream.into_split();
         send(&mut writer, StepdRequest::SignalAllocation { signal: 15 }).await;
         send(&mut writer, StepdRequest::Start).await;
@@ -4829,6 +4940,7 @@ mod tests {
             StepdResponse::Acknowledged
         ));
         assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(*decision.lock().await, Some(GateOutcome::Released));
     }
 
     // Start and the readiness probe arrive on separate connections, so the
@@ -4857,13 +4969,125 @@ mod tests {
         gate.await.expect("join").expect("gate released");
     }
 
+    // Start and Shutdown dispatched back-to-back, as spurd's launch and
+    // cancel paths racing each other would. Start's own connection may still
+    // ack, but the gate's authoritative outcome must still go to Shutdown.
+    #[tokio::test]
+    async fn a_shutdown_shortly_after_start_still_cancels_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        start_job(&descriptor, "launcher".into())
+            .await
+            .expect("start accepted on its own connection");
+        shutdown_allocation(&descriptor, "canceller".into())
+            .await
+            .expect("shutdown accepted");
+
+        assert_eq!(
+            gate.await.expect("join").expect("gate decided"),
+            GateOutcome::Cancelled,
+            "a Shutdown racing shortly behind Start must still cancel the gate, \
+             so the workload this Start acked never actually launches"
+        );
+    }
+
+    // The mirror ordering: Shutdown first, then Start racing shortly behind it.
+    // Cancelled must win regardless of which connection's request the gate
+    // happened to see first.
+    #[tokio::test]
+    async fn a_start_shortly_after_shutdown_does_not_undo_the_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        shutdown_allocation(&descriptor, "canceller".into())
+            .await
+            .expect("shutdown accepted");
+        let start_result = start_job(&descriptor, "launcher".into()).await;
+
+        assert!(
+            start_result.is_err(),
+            "Start must be rejected once Shutdown has already decided the gate"
+        );
+        assert_eq!(
+            gate.await.expect("join").expect("gate decided"),
+            GateOutcome::Cancelled,
+        );
+    }
+
+    // A cancel arriving before Start must decide the gate itself, not leave
+    // the session waiting out the full START_GATE_TIMEOUT.
+    #[tokio::test]
+    async fn the_gate_is_cancelled_by_a_shutdown_before_start() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let descriptor = gate_descriptor();
+        let decision = Arc::new(Mutex::new(None));
+        let server_decision = decision.clone();
+        let server = tokio::spawn(async move {
+            serve_until_start(server_stream, &descriptor, &server_decision).await
+        });
+        let (reader, mut writer) = client_stream.into_split();
+        send(&mut writer, StepdRequest::Shutdown).await;
+        let mut line = String::new();
+        BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .expect("read ack");
+        assert!(matches!(
+            serde_json::from_str::<StepdResponse>(&line).expect("decode"),
+            StepdResponse::Acknowledged
+        ));
+        assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(*decision.lock().await, Some(GateOutcome::Cancelled));
+    }
+
+    // Real time deliberately: paused time can race the client/server handshake
+    // in ways unrelated to what this test is actually checking.
+    #[tokio::test]
+    async fn await_start_resolves_promptly_on_shutdown_before_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        shutdown_allocation(&descriptor, "cancel".into())
+            .await
+            .expect("shutdown accepted");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), gate)
+            .await
+            .expect("await_start must resolve well within the 120s gate timeout")
+            .expect("join")
+            .expect("gate decided");
+        assert_eq!(outcome, GateOutcome::Cancelled);
+    }
+
     // An agent that dies mid-launch must not leave the job released.
     #[tokio::test]
     async fn the_gate_reports_a_peer_that_hung_up_without_starting() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let descriptor = gate_descriptor();
+        let decision: Arc<Mutex<Option<GateOutcome>>> = Arc::new(Mutex::new(None));
         let server =
-            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+            tokio::spawn(
+                async move { serve_until_start(server_stream, &descriptor, &decision).await },
+            );
         drop(client_stream);
         assert!(!server.await.expect("join").expect("serve"));
     }
