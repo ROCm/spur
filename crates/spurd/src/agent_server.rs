@@ -5423,28 +5423,33 @@ impl SlurmAgent for AgentService {
         self.launch_acceptance
             .cancel_attempt(job_id, req.run_attempt);
 
-        // An attempt-less cancel names nothing to compare against below;
-        // snapshot whichever attempt is actually live right now, before the
-        // signal path can reap it out from under us, so a same-job_id
-        // redispatch racing in afterward has something other than job_id
-        // alone to be told apart from.
+        // An attempt-less cancel has nothing to compare against below; snapshot
+        // whichever attempt is live now, before a same-job_id redispatch races in.
+        //
+        // Each lookup below is its own statement so its lock guard drops
+        // before the next is taken -- nesting as match/if scrutinees would
+        // invert against release_stepd_tracking's stepds -> running order.
         let doomed_attempt = match req.run_attempt {
-            0 => match self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|t| t.run_attempt)
-            {
-                Some(attempt) => Some(attempt),
-                None => match stepds_for_job(&*self.stepds.lock().await, job_id)
-                    .first()
-                    .map(|descriptor| descriptor.run_attempt)
-                {
-                    Some(attempt) => Some(attempt),
-                    None => self.allocation.lock().await.owner_attempt(job_id),
-                },
-            },
+            0 => {
+                let running_attempt = self
+                    .running
+                    .lock()
+                    .await
+                    .get(&job_id)
+                    .map(|t| t.run_attempt);
+                if running_attempt.is_some() {
+                    running_attempt
+                } else {
+                    let stepd_attempt = stepds_for_job(&*self.stepds.lock().await, job_id)
+                        .first()
+                        .map(|descriptor| descriptor.run_attempt);
+                    if stepd_attempt.is_some() {
+                        stepd_attempt
+                    } else {
+                        self.allocation.lock().await.owner_attempt(job_id)
+                    }
+                }
+            }
             named => Some(named),
         };
 
@@ -8290,15 +8295,9 @@ impl AgentService {
         if runtimes.is_empty() || !runtimes.iter().all(stepd_confirmed_dead) {
             return;
         }
+        let context = self.completion_listener_context();
         for descriptor in runtimes {
-            release_stepd_tracking(
-                &self.running,
-                &self.allocation,
-                &self.stepds,
-                descriptor,
-                "cancel found its stepd already dead",
-            )
-            .await;
+            fence_dead_stepd(&context, descriptor.clone()).await;
         }
     }
 
@@ -16848,10 +16847,8 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor);
 
-        // A redispatch already released the dead attempt and reserved a newer
-        // one, but hasn't (re)registered a stepd or a `running` entry yet —
-        // the exact window a reclaim-heartbeat cancel (run_attempt: 0) can
-        // land in, since it has no attempt of its own to compare against.
+        // A redispatch reserved a newer attempt but hasn't registered a stepd
+        // or `running` entry yet -- exactly the window a wildcard cancel lands in.
         {
             let mut alloc = svc.allocation.lock().await;
             alloc
