@@ -37,11 +37,12 @@ Accounting admin level
    accounting record says so — ``sacctmgr modify user name=bob set
    adminlevel=Operator`` (or ``Admin``); see :doc:`accounting`. ``spurctld``
    reads these records from PostgreSQL into an in-memory cache rather than
-   querying the database on every RPC. Until that cache has been populated —
-   the first moments after startup, or while the database is unreachable —
-   accounting is not consulted and the caller is treated as a plain User. Spur
-   denies rather than guesses, so a privileged command may be refused briefly
-   after a restart; retry once the controller has finished loading.
+   querying the database on every RPC. Until the first successful load — the
+   first moments after startup, or if the database never answers — accounting
+   is not consulted and the caller is treated as a plain User. Spur denies
+   rather than guesses, so a privileged command may be refused briefly after a
+   restart; retry once the controller has finished loading. After that first
+   load, a later database outage keeps the last snapshot.
 
 The remaining source depends on the plugin.
 

@@ -793,9 +793,9 @@ unauthenticated callers.
 Spur's native plugin. There is no token to hand out: on every call the CLI (or
 ``spurd``) asks a local ``spurauthd`` over a Unix socket for a fresh
 credential, and ``spurauthd`` takes the caller's UID, GID, and PID straight
-from the kernel. The credential is bound to one verifier and one process
-lifetime, and its nonce is remembered until it expires, so it cannot be
-replayed elsewhere or twice.
+from the kernel (PID is not on the wire). The credential is bound to one
+verifier: its audience and boot epoch. A nonce is remembered until it expires,
+so the same credential cannot be accepted twice at that audience.
 
 **You get:** an identity a user cannot copy, forward, or lend; automatic
 expiry with no distribution step; signed job and step launch credentials that
@@ -1021,12 +1021,14 @@ admin signal apply.
 
 .. note::
 
-   Accounting-derived roles are read from an in-memory cache. Until it has
-   loaded — the first moments after a restart, or while PostgreSQL is
-   unreachable — accounting is not consulted and the caller is treated as a
-   plain User. Spur denies rather than guesses, so a privileged command may be
+   Accounting-derived roles are read from an in-memory cache. Until the first
+   successful load — the first moments after a restart, or if PostgreSQL never
+   answers — accounting is not consulted and the caller is treated as a plain
+   User. Spur denies rather than guesses, so a privileged command may be
    refused briefly after a restart. Retry once the controller has finished
-   loading.
+   loading. After that first load, a later PostgreSQL outage keeps the last
+   snapshot: cached Operator and Administrator bindings still apply until a
+   refresh succeeds.
 
 .. _privileged-operations:
 
