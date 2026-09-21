@@ -617,11 +617,9 @@ const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Bounds the pre-launch wait so an agent that dies mid-launch cannot strand
 /// the supervisor holding the job's resources.
 const START_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// Once a connection decides the gate, how long to keep accepting sibling
-/// connections before finalizing — long enough for a Start and a Shutdown
-/// dispatched by spurd at nearly the same instant (its launch path racing its
-/// own cancel path) to both be seen, so a Shutdown a few milliseconds behind
-/// Start still wins instead of losing a pure delivery-order race.
+/// Once a connection decides the gate, how long to keep accepting siblings
+/// before finalizing — so a Start and Shutdown dispatched near-simultaneously
+/// both get seen instead of losing on pure delivery order.
 const GATE_DECISION_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
 
 // A Stepd supervises exactly one step's process tree; PTY/srun steps get
@@ -1574,21 +1572,17 @@ async fn await_start(
     listener: &UnixListener,
     descriptor: &StepdDescriptor,
 ) -> io::Result<GateOutcome> {
-    // The single authority for the gate's outcome: every connection reads and
-    // writes through this instead of deciding (and acking) unilaterally, so a
-    // Start and a Shutdown racing on separate connections can't both be told
-    // they won. `Cancelled` always wins once seen (set in `claim_decision`);
-    // `Released` only ever takes hold if nothing has decided yet.
+    // Single authority for the gate's outcome, so a racing Start and
+    // Shutdown can't both be told they won. `Cancelled` always wins once
+    // seen (via `claim_decision`); `Released` only holds if nothing decided.
     let decision: Arc<Mutex<Option<GateOutcome>>> = Arc::new(Mutex::new(None));
     // Connections are served concurrently: the agent's readiness probe and its
     // later Start (or cancel) arrive on separate connections, and the first
     // must not block the second.
     let (decided, mut is_decided) = tokio::sync::mpsc::channel::<()>(1);
     // Set once the first decisive connection notifies. Accepting keeps
-    // running until this elapses, so a sibling connection dispatched at
-    // nearly the same instant (spurd's launch path racing its own cancel
-    // path) still gets served — and can still flip `decision` — instead of
-    // the loop stopping to sleep and leaving it unaccepted.
+    // running until this elapses, so a near-simultaneous sibling still gets
+    // served (and can still flip `decision`) instead of going unaccepted.
     let mut settle_deadline: Option<tokio::time::Instant> = None;
     loop {
         let settle = async {
@@ -1645,11 +1639,9 @@ async fn await_start(
     }
 }
 
-/// Atomically resolves one connection's request against the gate's shared
-/// decision, returning the outcome this connection must ack against — which
-/// may not be the outcome it asked for. `Cancelled` always overwrites a
-/// pending or already-`Released` decision; `Released` only ever takes hold
-/// starting from nothing decided yet.
+/// Resolves one request against the gate's shared decision, returning the
+/// outcome to ack — which may not be what this connection asked for.
+/// `Cancelled` always overwrites; `Released` only holds from nothing decided.
 async fn claim_decision(
     decision: &Mutex<Option<GateOutcome>>,
     requested: GateOutcome,
@@ -4943,11 +4935,9 @@ mod tests {
         gate.await.expect("join").expect("gate released");
     }
 
-    // Start and Shutdown dispatched back-to-back on separate connections, as
-    // spurd's own launch path and cancel path racing each other would. Start's
-    // own connection may still be told "Acknowledged" (it asked first), but
-    // the gate's actual, authoritative outcome — what the launcher acts on to
-    // decide whether the workload runs at all — must still go to Shutdown.
+    // Start and Shutdown dispatched back-to-back, as spurd's launch and
+    // cancel paths racing each other would. Start's own connection may still
+    // ack, but the gate's authoritative outcome must still go to Shutdown.
     #[tokio::test]
     async fn a_shutdown_shortly_after_start_still_cancels_the_gate() {
         let dir = tempfile::tempdir().expect("tempdir");

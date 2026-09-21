@@ -1036,10 +1036,8 @@ async fn wait_for_stepd_release(
                 Ok(crate::stepd::StepdLiveness::Stale) => {
                     fence_dead_stepd(context, descriptor).await;
                 }
-                // A liveness check that can't tell either way must not read
-                // as "gone" by default, or a run of unreadable /proc entries
-                // strands the ledger forever: never fenced (not confirmed
-                // dead) and never escalated (any_live never set).
+                // An unreadable check must not default to "gone", or it
+                // strands the ledger: never fenced, never escalated either.
                 Ok(crate::stepd::StepdLiveness::Live) | Err(_) => any_live = true,
             }
         }
@@ -1172,13 +1170,9 @@ fn spawn_wedged_stepd_force_reclaim(
             // withholds every other step's resources too.
             let context = context.clone();
             tokio::spawn(async move {
-                // Never release on an unconfirmed kill: a cgroup that won't
-                // empty or a signal that didn't land means the workload may
-                // still hold its CPUs/GPUs, and advertising them free would
-                // double-allocate. Retry instead of giving up on a fixed
-                // window; re-checking liveness immediately before each kill
-                // also keeps the raw-pid signal from landing on an unrelated
-                // process that reused it.
+                // Never release on an unconfirmed kill — the workload may
+                // still hold its CPUs/GPUs. Retry instead of giving up; a
+                // fresh liveness check before each kill avoids a reused pid.
                 loop {
                     force_kill_stepd(&descriptor);
                     let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
@@ -3646,10 +3640,8 @@ impl AgentService {
     ) -> tokio::task::JoinHandle<()> {
         let context = self.completion_listener_context();
         tokio::spawn(async move {
-            // The caller already validated `run_attempt` against `stepds`/`running`
-            // (via `runs_attempt`) before spawning this; re-reading `running` here
-            // instead would pick up whatever attempt is current by the time this
-            // task actually runs, not the one this cancel targeted.
+            // The caller already validated run_attempt via runs_attempt; a
+            // fresh running read here could pick up a newer attempt instead.
             let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
             wait_for_stepd_release(job_id, run_attempt, deadline, &context).await;
         })
@@ -7788,13 +7780,8 @@ impl AgentService {
             .is_some_and(|tracked| tracked.run_attempt == run_attempt)
     }
 
-    /// Resolves a cancel's target attempt once, at the point the cancel is
-    /// accepted, so every descriptor, active step, release wait, and
-    /// escalation it goes on to touch acts on the same snapshot rather than
-    /// each re-deriving "whatever is current" independently and later.
-    /// `run_attempt == 0` is the reclaim-heartbeat's wildcard — resolved here
-    /// against whichever of `stepds`/`running` still has this job, the same
-    /// order `runs_attempt` itself checks, so the two never disagree.
+    /// Resolves a cancel's target attempt once for everything below to share.
+    /// `run_attempt == 0` (the reclaim wildcard) resolves via `stepds`/`running`.
     async fn resolve_cancel_attempt(&self, job_id: u32, run_attempt: u32) -> Option<u32> {
         if run_attempt != 0 {
             return Some(run_attempt);
@@ -7969,11 +7956,9 @@ impl AgentService {
     /// grace period guarantees a container init dies.
     /// Steps with a supervisor are skipped: it runs its own ordered shutdown,
     /// and the escalation below would cut that short.
-    /// `run_attempt == 0` is a wildcard (matches any attempt of `job_id`),
-    /// the same convention `stepds_for_attempt` uses — reached only when
-    /// nothing in `stepds`/`running` named a concrete attempt to scope to,
-    /// so an orphaned unsupervised step (tracked only in `active_steps`,
-    /// independently of either map) is still reachable rather than stranded.
+    /// `run_attempt == 0` is a wildcard (`stepds_for_attempt`'s own
+    /// convention), reached only when nothing named a concrete attempt —
+    /// so an orphaned unsupervised step stays reachable, not stranded.
     async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
         let supervised: Vec<spur_core::step::StepId> =
             stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
@@ -13884,10 +13869,9 @@ mod tests {
         let _ = child.wait();
     }
 
-    // An orphaned unsupervised step (its process still active_steps-tracked)
-    // can outlive both `running` and `stepds` for its job -- an attempt-less
-    // reclaim-heartbeat cancel must still reach it via the wildcard rather
-    // than resolve_cancel_attempt's `None` stranding it.
+    // An orphaned unsupervised step can outlive both `running` and `stepds`
+    // for its job -- an attempt-less cancel must still reach it, not strand
+    // it via resolve_cancel_attempt's `None`.
     #[tokio::test]
     async fn an_attempt_less_cancel_still_reaches_an_orphaned_unsupervised_step() {
         use std::os::unix::process::CommandExt;
@@ -13904,10 +13888,8 @@ mod tests {
         // Neither insert_test_job nor track_test_stepds: this job has no
         // running/stepds entry at all, only the orphaned active_steps one.
         svc.register_test_step(85, 4, Some(child.id())).await;
-        // A real orphan was registered under a real attempt before its job's
-        // other tracking cleared — stamp a non-zero one (register_test_step
-        // defaults to 0, same as the wildcard sentinel, which would let this
-        // test pass even with the wildcard match itself reverted).
+        // register_test_step defaults to 0, the same as the wildcard sentinel
+        // -- stamp a real non-zero attempt so the wildcard match is actually exercised.
         svc.active_steps
             .lock()
             .await
@@ -16088,12 +16070,9 @@ mod tests {
         tracked.run_attempt = descriptor.run_attempt;
         svc.insert_test_job(descriptor.job_id, tracked).await;
 
-        // Production's stepd is double-forked onto init, which reaps it the
-        // instant it exits, so its /proc entry (and the zombie's otherwise
-        // still-matching start ticks) disappears promptly. This test is the
-        // direct parent instead, so it has to reap the same way or the
-        // now-fail-closed force-reclaim path retries forever against a
-        // "live" zombie only its own parent can clear.
+        // Production double-forks stepd onto init, which reaps it promptly;
+        // this test is the direct parent, so it must reap the same way or
+        // force-reclaim retries forever against an unreaped zombie.
         let reaped = Arc::new(tokio::sync::Notify::new());
         let reaped_signal = reaped.clone();
         tokio::spawn(async move {
