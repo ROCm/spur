@@ -1164,26 +1164,35 @@ fn spawn_wedged_stepd_force_reclaim(
                 window_secs = force_reclaim_timeout().as_secs(),
                 "stepd still alive past the force-reclaim window; force-reclaiming"
             );
-            force_kill_stepd(&descriptor);
-            let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
-            let mut confirmed_dead = false;
-            while tokio::time::Instant::now() < confirm_deadline {
-                if matches!(
-                    crate::stepd::stepd_liveness(&descriptor),
-                    Ok(crate::stepd::StepdLiveness::Stale)
-                ) {
-                    confirmed_dead = true;
+            // Never release on an unconfirmed kill: a cgroup that won't empty
+            // or a signal that didn't land means the workload may still hold
+            // its CPUs/GPUs, and advertising them free would double-allocate.
+            // Retry instead of giving up on a fixed window; re-checking
+            // liveness immediately before each kill also keeps the raw-pid
+            // signal from landing on an unrelated process that reused it.
+            loop {
+                force_kill_stepd(&descriptor);
+                let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
+                let mut confirmed_dead = false;
+                while tokio::time::Instant::now() < confirm_deadline {
+                    if matches!(
+                        crate::stepd::stepd_liveness(&descriptor),
+                        Ok(crate::stepd::StepdLiveness::Stale)
+                    ) {
+                        confirmed_dead = true;
+                        break;
+                    }
+                    tokio::time::sleep(FORCE_KILL_CONFIRM_POLL_INTERVAL).await;
+                }
+                if confirmed_dead {
                     break;
                 }
-                tokio::time::sleep(FORCE_KILL_CONFIRM_POLL_INTERVAL).await;
-            }
-            if !confirmed_dead {
                 warn!(
                     job_id,
                     run_attempt,
                     pid = descriptor.pid,
                     "could not confirm the stepd was killed after force-reclaim; \
-                     releasing the ledger anyway"
+                     retaining the ledger and retrying rather than releasing it"
                 );
             }
             fence_dead_stepd(&context, descriptor).await;
@@ -2158,6 +2167,9 @@ struct ActiveStep {
     cancel_requested: bool,
     pid: Option<u32>,
     epoch: u64,
+    /// The step's own run_attempt, so a job-wide cancel for one attempt
+    /// can't reach an unsupervised step of a different, still-live one.
+    run_attempt: u32,
     /// Spool files the step's stdout/stderr are redirected to, so
     /// `stream_job_output` can tail them live keyed on (job_id, step_id).
     stdout_path: String,
@@ -3617,19 +3629,19 @@ impl AgentService {
     /// handler on the agent. Anything that hasn't been spawned onto the
     /// runtime by then simply never runs, so this can't be sequenced after
     /// the signal attempt without risking never running at all.
-    fn spawn_stepd_release_wait(&self, job_id: u32) -> tokio::task::JoinHandle<()> {
+    fn spawn_stepd_release_wait(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> tokio::task::JoinHandle<()> {
         let context = self.completion_listener_context();
         tokio::spawn(async move {
-            let tracked_attempt = context
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|tracked| tracked.run_attempt);
-            if let Some(tracked_attempt) = tracked_attempt {
-                let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-                wait_for_stepd_release(job_id, tracked_attempt, deadline, &context).await;
-            }
+            // The caller already validated `run_attempt` against `stepds`/`running`
+            // (via `runs_attempt`) before spawning this; re-reading `running` here
+            // instead would pick up whatever attempt is current by the time this
+            // task actually runs, not the one this cancel targeted.
+            let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+            wait_for_stepd_release(job_id, run_attempt, deadline, &context).await;
         })
     }
 
@@ -6005,11 +6017,19 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
         let step_key = (job_id, step_id);
+        let step_run_attempt = self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|tracked| tracked.run_attempt)
+            .unwrap_or_default();
         {
             self.active_steps.lock().await.insert(
                 step_key,
                 ActiveStep {
                     epoch: next_step_epoch(),
+                    run_attempt: step_run_attempt,
                     ..Default::default()
                 },
             );
@@ -7758,6 +7778,30 @@ impl AgentService {
             .is_some_and(|tracked| tracked.run_attempt == run_attempt)
     }
 
+    /// Resolves a cancel's target attempt once, at the point the cancel is
+    /// accepted, so every descriptor, active step, release wait, and
+    /// escalation it goes on to touch acts on the same snapshot rather than
+    /// each re-deriving "whatever is current" independently and later.
+    /// `run_attempt == 0` is the reclaim-heartbeat's wildcard — resolved here
+    /// against whichever of `stepds`/`running` still has this job, the same
+    /// order `runs_attempt` itself checks, so the two never disagree.
+    async fn resolve_cancel_attempt(&self, job_id: u32, run_attempt: u32) -> Option<u32> {
+        if run_attempt != 0 {
+            return Some(run_attempt);
+        }
+        if let Some(attempt) = stepds_for_job(&*self.stepds.lock().await, job_id)
+            .first()
+            .map(|descriptor| descriptor.run_attempt)
+        {
+            return Some(attempt);
+        }
+        self.running
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|tracked| tracked.run_attempt)
+    }
+
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, run_attempt: u32, signal: i32) {
         // A signal naming an epoch this node no longer runs belongs to a
@@ -7770,6 +7814,10 @@ impl AgentService {
             );
             return;
         }
+        let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
+            // Nothing tracked for this job at all; nothing to cancel.
+            return;
+        };
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
@@ -7779,7 +7827,8 @@ impl AgentService {
         );
         // Spawned before the signal loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
-        let release_wait = (supervised && lethal).then(|| self.spawn_stepd_release_wait(job_id));
+        let release_wait =
+            (supervised && lethal).then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
         for descriptor in &runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 descriptor,
@@ -7807,7 +7856,8 @@ impl AgentService {
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(job_id, signal).await;
+        self.cancel_active_steps_for_job(job_id, run_attempt, signal)
+            .await;
         if supervised {
             if let Some(handle) = release_wait {
                 // Best-effort observe: the spawned task itself keeps running
@@ -7906,9 +7956,9 @@ impl AgentService {
     /// grace period guarantees a container init dies.
     /// Steps with a supervisor are skipped: it runs its own ordered shutdown,
     /// and the escalation below would cut that short.
-    async fn cancel_active_steps_for_job(&self, job_id: u32, signal: i32) {
+    async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
         let supervised: Vec<spur_core::step::StepId> =
-            stepds_for_job(&*self.stepds.lock().await, job_id)
+            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
                 .iter()
                 .map(|descriptor| descriptor.step_id)
                 .collect();
@@ -7920,7 +7970,10 @@ impl AgentService {
             let mut steps = self.active_steps.lock().await;
             let mut targets = Vec::new();
             for (key, step) in steps.iter_mut() {
-                if key.0 == job_id && !supervised.contains(&key.1) {
+                if key.0 == job_id
+                    && step.run_attempt == run_attempt
+                    && !supervised.contains(&key.1)
+                {
                     step.cancel_requested = true;
                     if let Some(pid) = step.pid {
                         targets.push((*key, pid, step.epoch));
@@ -7965,11 +8018,15 @@ impl AgentService {
             );
             return;
         }
+        let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
+            // Nothing tracked for this job at all; nothing to cancel.
+            return;
+        };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
         let supervised = supervisor_owns_teardown(&runtimes);
         // Spawned before the shutdown_allocation loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
-        let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id));
+        let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
         for descriptor in runtimes {
             match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
                 .await
@@ -8009,17 +8066,11 @@ impl AgentService {
                                 "failed to SIGKILL stepd after grace period");
                             return;
                         }
-                        let tracked_attempt = context
-                            .running
-                            .lock()
-                            .await
-                            .get(&job_id)
-                            .map(|t| t.run_attempt);
-                        if let Some(tracked_attempt) = tracked_attempt {
-                            let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-                            wait_for_stepd_release(job_id, tracked_attempt, deadline, &context)
-                                .await;
-                        }
+                        // This descriptor's own attempt, not whatever `running`
+                        // shows now — a redispatch may already have moved it on.
+                        let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+                        wait_for_stepd_release(job_id, descriptor.run_attempt, deadline, &context)
+                            .await;
                     });
                 }
                 Err(error) => {
@@ -8030,8 +8081,12 @@ impl AgentService {
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
-            .await;
+        self.cancel_active_steps_for_job(
+            job_id,
+            run_attempt,
+            nix::sys::signal::Signal::SIGTERM as i32,
+        )
+        .await;
         if supervised {
             if let Some(handle) = release_wait {
                 // Best-effort observe: the spawned task itself keeps running
@@ -8465,7 +8520,7 @@ impl AgentService {
     ) -> Result<(std::os::fd::OwnedFd, i32, StepRootfsGuard), Status> {
         use std::os::fd::AsRawFd;
 
-        let (gpu_devices, partition, nodelist) = {
+        let (gpu_devices, partition, nodelist, step_run_attempt) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {job_id} not running on this node"))
@@ -8481,6 +8536,7 @@ impl AgentService {
                 tracked.gpu_devices.clone(),
                 tracked.partition.clone(),
                 nodelist,
+                tracked.run_attempt,
             )
         };
 
@@ -8677,6 +8733,7 @@ impl AgentService {
                     ActiveStep {
                         epoch: next_step_epoch(),
                         pid: Some(raw_pid as u32),
+                        run_attempt: step_run_attempt,
                         ..Default::default()
                     },
                 );
@@ -8895,11 +8952,21 @@ impl AgentService {
     }
 
     async fn register_test_step(&self, job_id: u32, step_id: u32, pid: Option<u32>) {
+        // Mirrors production: the step's attempt is whatever `running` tracks
+        // for this job, not a value the caller has to keep in sync by hand.
+        let run_attempt = self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|tracked| tracked.run_attempt)
+            .unwrap_or_default();
         self.active_steps.lock().await.insert(
             (job_id, step_id),
             ActiveStep {
                 cancel_requested: false,
                 pid,
+                run_attempt,
                 ..Default::default()
             },
         );
@@ -13780,7 +13847,7 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(79, 4, Some(child.id())).await;
 
-        svc.cancel_active_steps_for_job(79, nix::sys::signal::Signal::SIGTERM as i32)
+        svc.cancel_active_steps_for_job(79, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
 
         assert!(
@@ -15947,7 +16014,7 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let (mut child, descriptor) = spawn_wedged_stepd_stub(920, 1).await;
+        let (child, descriptor) = spawn_wedged_stepd_stub(920, 1).await;
         svc.stepds
             .lock()
             .await
@@ -15955,6 +16022,25 @@ mod tests {
         let mut tracked = TrackedJob::allocation_only(None);
         tracked.run_attempt = descriptor.run_attempt;
         svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        // Production's stepd is double-forked onto init, which reaps it the
+        // instant it exits, so its /proc entry (and the zombie's otherwise
+        // still-matching start ticks) disappears promptly. This test is the
+        // direct parent instead, so it has to reap the same way or the
+        // now-fail-closed force-reclaim path retries forever against a
+        // "live" zombie only its own parent can clear.
+        let reaped = Arc::new(tokio::sync::Notify::new());
+        let reaped_signal = reaped.clone();
+        tokio::spawn(async move {
+            let mut child = child;
+            loop {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped_signal.notify_one();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
 
         svc.send_explicit_signal(
             descriptor.job_id,
@@ -15976,7 +16062,9 @@ mod tests {
             "a wedged stepd's ledger entry must clear once the force-reclaim window elapses"
         );
         assert!(
-            child_has_exited(&mut child).await,
+            tokio::time::timeout(std::time::Duration::from_millis(500), reaped.notified())
+                .await
+                .is_ok(),
             "the force-reclaim path must have SIGKILLed the wedged stepd"
         );
     }
