@@ -5429,7 +5429,7 @@ impl SlurmAgent for AgentService {
         // Each lookup below is its own statement so its lock guard drops
         // before the next is taken -- nesting as match/if scrutinees would
         // invert against release_stepd_tracking's stepds -> running order.
-        let doomed_attempt = match req.run_attempt {
+        let pre_cancel_attempt = match req.run_attempt {
             0 => {
                 let running_attempt = self
                     .running
@@ -5469,9 +5469,9 @@ impl SlurmAgent for AgentService {
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         if !jobs.contains_key(&job_id) {
-            // `doomed_attempt` already checked the ledger; `None` means
+            // `pre_cancel_attempt` already checked the ledger; `None` means
             // anything found now landed during the signal call and is not ours.
-            if let Some(attempt) = doomed_attempt {
+            if let Some(attempt) = pre_cancel_attempt {
                 self.allocation.lock().await.release_job_if(job_id, attempt);
             }
         }
