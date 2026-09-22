@@ -349,6 +349,19 @@ fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::
     Ok((buf[..read].to_vec(), fds))
 }
 
+/// A reply's `sendmsg` is as raw and blocking as the request's `recvmsg`, so
+/// it gets the same blocking-pool treatment as `serve_pty_custody`'s read.
+async fn send_custody_reply(
+    raw: std::os::fd::RawFd,
+    payload: [u8; 5],
+    fds: Vec<std::os::fd::RawFd>,
+) -> nix::Result<()> {
+    match tokio::task::spawn_blocking(move || send_custody(raw, &payload, &fds)).await {
+        Ok(result) => result,
+        Err(_) => Ok(()), // task panicked or was cancelled; nothing left to report to
+    }
+}
+
 /// Runs one custody request/reply on the blocking pool, bounded like a stepd
 /// control request: `send_custody`/`recv_custody` are raw blocking syscalls, and
 /// an unresponsive peer must not strand a runtime worker thread forever.
@@ -1511,7 +1524,9 @@ async fn serve_pty_custody(listener: UnixListener) {
                         Some((id, raw_fd)) => (CUSTODY_FOUND, id, vec![raw_fd]),
                         None => (CUSTODY_ABSENT, 0, Vec::new()),
                     };
-                    if let Err(error) = send_custody(raw, &custody_payload(reply, id), &fds) {
+                    if let Err(error) =
+                        send_custody_reply(raw, custody_payload(reply, id), fds).await
+                    {
                         tracing::warn!(%error, "failed to hand back an orphaned pty");
                     }
                 }
@@ -1523,7 +1538,8 @@ async fn serve_pty_custody(listener: UnixListener) {
                         Some(master) => (CUSTODY_FOUND, vec![master.as_raw_fd()]),
                         None => (CUSTODY_ABSENT, Vec::new()),
                     };
-                    if let Err(error) = send_custody(raw, &custody_payload(reply, session_id), &fds)
+                    if let Err(error) =
+                        send_custody_reply(raw, custody_payload(reply, session_id), fds).await
                     {
                         tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
