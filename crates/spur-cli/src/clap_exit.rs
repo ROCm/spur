@@ -3,15 +3,18 @@
 
 //! Terminate argument parsing through clap instead of `anyhow`.
 //!
-//! Clap reports `--help` and `--version` as an `Err(clap::Error)`. Propagating
-//! that error with `?` turns it into an `anyhow::Error`, which `main` prints as
+//! Clap reports `--help` as an `Err(clap::Error)`. Propagating that error with
+//! `?` turns it into an `anyhow::Error`, which `main` prints as
 //! `Error: <help text>` on stderr and exits with code 1. Routing it through
-//! `clap::Error::exit` instead prints help/version to stdout with code 0, and
-//! genuine parse errors to stderr with code 2 — matching every standard CLI.
+//! `clap::Error::exit` instead prints help to stdout with code 0, and genuine
+//! parse errors to stderr with code 2 — matching every standard CLI.
+//!
+//! `--version` is not registered on the subcommand parsers, so it is not
+//! handled here; the top-level `spur --version` path lives in `main`.
 
 use clap::{ArgMatches, Command, FromArgMatches, Parser};
 
-/// Parse a clap `Parser`, exiting cleanly on help/version or parse errors.
+/// Parse a clap `Parser`, exiting cleanly on `--help` or parse errors.
 pub fn parse_or_exit<T: Parser>(args: &[String]) -> T {
     T::try_parse_from(args).unwrap_or_else(|e| e.exit())
 }
