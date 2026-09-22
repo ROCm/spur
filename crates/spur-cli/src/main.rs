@@ -295,7 +295,7 @@ fn main() -> anyhow::Result<()> {
             ))
         }
         "help" | "--help" | "-h" => {
-            print_usage();
+            let _ = write_usage(&mut std::io::stdout().lock());
             Ok(())
         }
         other => {
@@ -307,41 +307,48 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Print top-level usage to stderr — used on error paths (no command given, or
+/// an unknown command). Explicit `help`/`--help` writes [`write_usage`] to
+/// stdout instead.
 fn print_usage() {
-    eprintln!("spur — AI-native job scheduler");
-    eprintln!();
-    eprintln!("Usage: spur <command> [args...]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  net         Manage WireGuard mesh network (init/join/status)");
-    eprintln!("  k8s         Manage the SPUR-provisioned k0s cluster (up/down/status/kubeconfig)");
-    eprintln!("  image       Manage container images (import/list/remove)");
-    eprintln!("  exec        Execute a command inside a running container job");
-    eprintln!("  submit      Submit a batch job script");
-    eprintln!("  run         Run a parallel job (interactive)");
-    eprintln!("  alloc       Allocate resources for an interactive session");
-    eprintln!("  queue       View the job queue");
-    eprintln!("  cancel      Cancel pending or running jobs");
-    eprintln!("  nodes       View cluster node information");
-    eprintln!("  history     View job accounting history");
-    eprintln!("  accounts    Manage accounts, users, and QOS");
-    eprintln!("  show        Show detailed job/node/partition info");
-    eprintln!("  priority    View job priority breakdown");
-    eprintln!("  share       Show fair-share information");
-    eprintln!("  stat        Display running job statistics");
-    eprintln!("  diag        Show scheduler diagnostics");
-    eprintln!("  report      Generate usage reports");
-    eprintln!("  trigger     Manage event triggers");
-    eprintln!("  attach      Attach to a running job's I/O");
-    eprintln!("  crontab     Manage recurring cron-style jobs");
-    eprintln!("  health      Node health monitoring");
-    eprintln!("  auth-keys   Generate JWKS files for native authentication");
-    eprintln!("  version     Show version (--check to check for updates)");
-    eprintln!("  self-update Download and install the latest version (--nightly)");
-    eprintln!();
-    eprintln!("Slurm-compatible aliases (also work as symlinks):");
-    eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
-    eprintln!("  sprio sshare sstat sdiag sreport strigger sattach scrontab smd");
+    let _ = write_usage(&mut std::io::stderr().lock());
+}
+
+fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    writeln!(w, "spur — AI-native job scheduler")?;
+    writeln!(w)?;
+    writeln!(w, "Usage: spur <command> [args...]")?;
+    writeln!(w)?;
+    writeln!(w, "Commands:")?;
+    writeln!(w, "  net         Manage WireGuard mesh network (init/join/status)")?;
+    writeln!(w, "  k8s         Manage the SPUR-provisioned k0s cluster (up/down/status/kubeconfig)")?;
+    writeln!(w, "  image       Manage container images (import/list/remove)")?;
+    writeln!(w, "  exec        Execute a command inside a running container job")?;
+    writeln!(w, "  submit      Submit a batch job script")?;
+    writeln!(w, "  run         Run a parallel job (interactive)")?;
+    writeln!(w, "  alloc       Allocate resources for an interactive session")?;
+    writeln!(w, "  queue       View the job queue")?;
+    writeln!(w, "  cancel      Cancel pending or running jobs")?;
+    writeln!(w, "  nodes       View cluster node information")?;
+    writeln!(w, "  history     View job accounting history")?;
+    writeln!(w, "  accounts    Manage accounts, users, and QOS")?;
+    writeln!(w, "  show        Show detailed job/node/partition info")?;
+    writeln!(w, "  priority    View job priority breakdown")?;
+    writeln!(w, "  share       Show fair-share information")?;
+    writeln!(w, "  stat        Display running job statistics")?;
+    writeln!(w, "  diag        Show scheduler diagnostics")?;
+    writeln!(w, "  report      Generate usage reports")?;
+    writeln!(w, "  trigger     Manage event triggers")?;
+    writeln!(w, "  attach      Attach to a running job's I/O")?;
+    writeln!(w, "  crontab     Manage recurring cron-style jobs")?;
+    writeln!(w, "  health      Node health monitoring")?;
+    writeln!(w, "  auth-keys   Generate JWKS files for native authentication")?;
+    writeln!(w, "  version     Show version (--check to check for updates)")?;
+    writeln!(w, "  self-update Download and install the latest version (--nightly)")?;
+    writeln!(w)?;
+    writeln!(w, "Slurm-compatible aliases (also work as symlinks):")?;
+    writeln!(w, "  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol")?;
+    writeln!(w, "  sprio sshare sstat sdiag sreport strigger sattach scrontab smd")
 }
 
 #[cfg(test)]
@@ -379,5 +386,22 @@ mod tests {
         crate::strigger::StriggerArgs::command().debug_assert();
         crate::token::TokenArgs::command().debug_assert();
         crate::auth_keys::AuthKeysArgs::command().debug_assert();
+    }
+
+    #[test]
+    fn usage_lists_every_top_level_command() {
+        let mut buf = Vec::new();
+        super::write_usage(&mut buf).expect("write_usage should not fail on a Vec");
+        let text = String::from_utf8(buf).expect("usage is utf-8");
+
+        assert!(text.starts_with("spur — AI-native job scheduler"));
+        assert!(text.contains("Usage: spur <command> [args...]"));
+        for cmd in [
+            "net", "k8s", "image", "exec", "submit", "run", "alloc", "queue", "cancel", "nodes",
+            "history", "accounts", "show", "priority", "share", "stat", "diag", "report",
+            "trigger", "attach", "crontab", "health", "auth-keys", "version", "self-update",
+        ] {
+            assert!(text.contains(cmd), "usage is missing command `{cmd}`");
+        }
     }
 }
