@@ -258,6 +258,8 @@ jobs:
           target: runtime
           push: false
           tags: spur:ci
+          build-args: |
+            BUILD_MPI_PLUGIN=1
           outputs: type=docker,dest=/tmp/spur-image.tar
           cache-from: type=registry,ref=${{ steps.cacheref.outputs.ref }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0},mode=max,ignore-error=true', steps.cacheref.outputs.ref) || '' }}
@@ -277,6 +279,9 @@ jobs:
           for bin in spur spurctld spurd spurstepd spur-k8s-operator; do
             docker cp "$CID:/usr/local/bin/$bin" "/tmp/release-binaries/$bin"
           done
+          # spur_mpi_pmix.so ships only when BUILD_MPI_PLUGIN=1; the e2e MPI
+          # fixtures deploy it from release-binaries onto the nodes.
+          docker cp "$CID:/lib/spur/spur_mpi_pmix.so" "/tmp/release-binaries/libspur_mpi_pmix.so"
           docker rm "$CID"
 
       - name: Upload release binaries
