@@ -1072,6 +1072,45 @@ class SpurCluster:
                 pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
         return remote_bin
 
+    def rocm_paths(self, node_index: int = 0) -> dict[str, str]:
+        """Resolve hipcc, the RCCL header dir and the ROCm lib dir on a node.
+
+        ROCm installs vary: `hipcc` is not always on a non-login PATH, the header
+        moved to an `rccl/` subdirectory between versions, and the lib directory is
+        only in the loader cache when the packaging added an ld.so.conf entry. Probe
+        for each rather than assuming one layout, so a genuinely equipped node is not
+        skipped over a path difference. Env overrides mirror `SPUR_TEST_MPICC`.
+        """
+        node = self.nodes[node_index]
+        found = {}
+
+        hipcc = os.environ.get("SPUR_TEST_HIPCC", "").strip()
+        if not hipcc:
+            hipcc = node.exec_allow_fail(
+                'for c in hipcc "$ROCM_PATH/bin/hipcc" /opt/rocm/bin/hipcc; do '
+                'p=$(command -v "$c" 2>/dev/null) && { echo "$p"; break; }; done'
+            ).strip()
+        found["hipcc"] = hipcc
+
+        inc = os.environ.get("SPUR_TEST_RCCL_INCLUDE", "").strip()
+        if not inc:
+            inc = node.exec_allow_fail(
+                'for d in "$ROCM_PATH/include/rccl" /opt/rocm/include/rccl '
+                '"$ROCM_PATH/include" /opt/rocm/include; do '
+                '[ -f "$d/rccl.h" ] && { echo "$d"; break; }; done'
+            ).strip()
+        found["rccl_include"] = inc
+
+        lib = os.environ.get("SPUR_TEST_ROCM_LIB", "").strip()
+        if not lib:
+            lib = node.exec_allow_fail(
+                'ldconfig -p 2>/dev/null | grep -q librccl && { echo LDCACHE; exit 0; }; '
+                'for d in "$ROCM_PATH/lib" /opt/rocm/lib; do '
+                '[ -e "$d/librccl.so" ] && { echo "$d"; break; }; done'
+            ).strip()
+        found["rocm_lib"] = lib
+        return found
+
     def rccl_preflight(self, min_nodes: int = 1):
         """Skip unless every node can build and run an MPI+RCCL binary.
 
@@ -1084,20 +1123,15 @@ class SpurCluster:
         self.mpi_preflight(min_nodes)
 
         missing = []
-        for i, node in enumerate(self.nodes[:min_nodes]):
+        for i in range(min(min_nodes, len(self.nodes))):
             name = self.node_names[i]
-            if "OK" not in node.exec_allow_fail(
-                "command -v hipcc >/dev/null && echo OK || echo MISSING"
-            ):
-                missing.append(f"hipcc on {name}")
-            if "OK" not in node.exec_allow_fail(
-                "ldconfig -p 2>/dev/null | grep -q librccl && echo OK || echo MISSING"
-            ):
-                missing.append(f"librccl on {name}")
-            if "OK" not in node.exec_allow_fail(
-                "test -f /opt/rocm/include/rccl/rccl.h && echo OK || echo MISSING"
-            ):
-                missing.append(f"rccl.h on {name}")
+            paths = self.rocm_paths(i)
+            if not paths["hipcc"]:
+                missing.append(f"hipcc on {name} (set SPUR_TEST_HIPCC)")
+            if not paths["rccl_include"]:
+                missing.append(f"rccl.h on {name} (set SPUR_TEST_RCCL_INCLUDE)")
+            if not paths["rocm_lib"]:
+                missing.append(f"librccl on {name} (set SPUR_TEST_ROCM_LIB)")
 
         if missing:
             pytest.skip("RCCL preflight failed: " + "; ".join(missing))
@@ -1117,13 +1151,24 @@ class SpurCluster:
         # `mpicc -showme:incdirs` is Open MPI specific and absent on MPICH, so fall
         # back to the conventional path rather than failing the build outright.
         mpi_inc = os.environ.get("SPUR_TEST_MPI_INCLUDE", "").strip()
-        for node in self.nodes:
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        for i, node in enumerate(self.nodes):
+            paths = self.rocm_paths(i)
+            # Ask the local mpicc where its headers are. `-showme:incdirs` is Open MPI
+            # specific and absent on MPICH, so fall back to the conventional path.
             inc = mpi_inc or node.exec_allow_fail(
-                "mpicc -showme:incdirs 2>/dev/null | tr ' ' '\\n' | head -1"
+                f"{shlex.quote(mpicc)} -showme:incdirs 2>/dev/null | tr ' ' '\\n' | head -1"
             ).strip() or "/usr/lib/x86_64-linux-gnu/openmpi/include"
+            flags = [f"-I{shlex.quote(inc)}"]
+            if paths["rccl_include"]:
+                flags.append(f"-I{shlex.quote(paths['rccl_include'])}")
+            # LDCACHE means the loader already knows where librccl is, so -L would
+            # only risk pointing at a second copy.
+            if paths["rocm_lib"] and paths["rocm_lib"] != "LDCACHE":
+                flags.append(f"-L{shlex.quote(paths['rocm_lib'])}")
             node.exec(
-                f"hipcc -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)} "
-                f"-I{shlex.quote(inc)} -lrccl -lmpi"
+                f"{shlex.quote(paths['hipcc'])} -o {shlex.quote(remote_bin)} "
+                f"{shlex.quote(remote_src)} {' '.join(flags)} -lrccl -lmpi"
             )
             if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
                 pytest.skip(f"hipcc could not build {source_name} on {node.host}")
