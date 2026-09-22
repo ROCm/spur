@@ -1363,12 +1363,16 @@ address finds the ``[2001:db8::1]:6817`` form it is stored as.
 
 .. note::
 
-   Reads are **not** access-gated — the same as ``sacct`` job history and the
-   rest of the accounting service. Confidentiality of the audit log therefore
-   requires ``auth.mode = required``; under the default ``permissive`` mode any
-   caller that can reach the controller can read it. This matters more now that
-   the log covers node, job, credential, and cluster actions: an unprivileged
-   reader learns the cluster's full administrative history.
+   Reading the log requires the **Operator** or **Administrator** role, matching
+   Slurm's restriction on ``sacctmgr show transaction``. It is gated more tightly
+   than ``sacct`` job history because a reader learns the cluster's full
+   administrative history — every user's actions and the addresses they came
+   from.
+
+   As with the accounting mutations, an *unauthenticated* caller is still
+   admitted: ``auth.mode = permissive`` and ``disabled`` trust the client by
+   design. Confidentiality against untrusted callers therefore still requires
+   ``mode = required``, which is what makes the role check bind.
 
 Logging every RPC
 ~~~~~~~~~~~~~~~~~

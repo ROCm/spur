@@ -913,8 +913,9 @@ impl SlurmAccounting for AccountingService {
         request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsResponse>, Status> {
         crate::server::enforce_forward_binding(&request)?;
-        // Ungated, consistent with get_job_history and the rest of this service.
-        // Confidentiality of the audit log requires auth.mode = required.
+        // Gated above the rest of this service: the log carries every user's
+        // actions and peer addresses, so it is not ordinary accounting data.
+        self.require_admin(&request, "show transactions")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -1197,6 +1198,35 @@ mod tests {
         assert_admin_gated!(remove_user, RemoveUserRequest::default());
         assert_admin_gated!(create_qos, CreateQosRequest::default());
         assert_admin_gated!(delete_qos, DeleteQosRequest::default());
+        // A read, but gated with the mutations: it exposes every user's actions.
+        assert_admin_gated!(get_transactions, GetTransactionsRequest::default());
+    }
+
+    /// The audit read must not over-block. Reaching the query is what proves the
+    /// caller passed the gate: with no pool it can only fail `Unavailable`.
+    #[tokio::test]
+    async fn transactions_read_admits_operator_and_anonymous() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+        let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
+        cache.insert_admin_level("bob", "Operator");
+        service.attach_association_cache(cache);
+
+        let mut operator = Request::new(GetTransactionsRequest::default());
+        operator.extensions_mut().insert(identity("bob", false));
+
+        let anonymous = Request::new(GetTransactionsRequest::default());
+
+        for (who, request) in [("operator", operator), ("anonymous", anonymous)] {
+            let err = service
+                .get_transactions(request)
+                .await
+                .expect_err("no pool is installed");
+            assert_eq!(
+                err.code(),
+                tonic::Code::Unavailable,
+                "{who} must reach the query rather than be denied"
+            );
+        }
     }
 
     /// Every spelling Slurm accepts must survive, and the admin ones must converge: `sacctmgr show

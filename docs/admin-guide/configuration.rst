@@ -1046,9 +1046,11 @@ These control-plane mutations define cluster tenancy and require
 * the k0s cluster manager.
 
 Managing anyone's jobs and reservations, and writing accounting records,
-requires **Operator** or above. After a user, account, or QOS write, the
-association cache is refreshed immediately so a new role binding takes effect
-without waiting for the next poll.
+requires **Operator** or above — as does *reading* the ``txn`` audit log with
+``sacctmgr show txn``, which exposes every user's actions and the addresses they
+came from. After a user, account, or QOS write, the association cache is
+refreshed immediately so a new role binding takes effect without waiting for the
+next poll.
 
 A caller whose verified role is below the bar is refused with
 ``PermissionDenied``. A caller with *no* verified identity is allowed through,
