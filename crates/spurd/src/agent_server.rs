@@ -549,16 +549,6 @@ fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
         .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
 }
 
-/// Whether a supervisor is running the job's teardown, so the agent must not
-/// retire its tracking underneath one and strand its completion. `STEP_EXTERN`
-/// and `STEP_INTERACTIVE` run no workload of their own, so neither counts.
-fn supervisor_owns_teardown(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
-    descriptors.iter().any(|descriptor| {
-        descriptor.step_id != spur_core::step::STEP_EXTERN
-            && descriptor.step_id != spur_core::step::STEP_INTERACTIVE
-    })
-}
-
 /// Same pid/start-ticks check the crash watchdog uses. A pid of 0 means no
 /// pid was ever recorded, which reads as "not yet known" rather than dead.
 fn stepd_confirmed_dead(descriptor: &crate::stepd::StepdDescriptor) -> bool {
@@ -8599,7 +8589,10 @@ impl AgentService {
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = supervisor_owns_teardown(&runtimes);
+        // Any stepd — including a terminal placeholder or a container step,
+        // neither of which own the job's lifetime — can still wedge or die,
+        // so all of them need the active-fencing/force-reclaim safety net.
+        let supervised = !runtimes.is_empty();
         let lethal = signal_expected_to_terminate(
             nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM),
         );
@@ -8811,7 +8804,10 @@ impl AgentService {
             return;
         };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = supervisor_owns_teardown(&runtimes);
+        // Any stepd — including a terminal placeholder or a container step,
+        // neither of which own the job's lifetime — can still wedge or die,
+        // so all of them need the active-fencing/force-reclaim safety net.
+        let supervised = !runtimes.is_empty();
         // Spawned before the shutdown_allocation loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
         let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
@@ -10422,35 +10418,6 @@ mod tests {
         ]));
         assert!(owns_job_processes(&[
             descriptor(spur_core::step::STEP_BATCH),
-            descriptor(7),
-        ]));
-    }
-
-    #[test]
-    fn a_terminal_placeholder_does_not_own_teardown() {
-        let descriptor = |step_id| {
-            crate::stepd::StepdDescriptor::new(
-                42,
-                1,
-                step_id,
-                0,
-                0,
-                std::path::PathBuf::from("/tmp/runtime.sock"),
-                std::path::PathBuf::new(),
-            )
-        };
-        assert!(!supervisor_owns_teardown(&[descriptor(
-            spur_core::step::STEP_EXTERN
-        )]));
-        assert!(!supervisor_owns_teardown(&[descriptor(
-            spur_core::step::STEP_INTERACTIVE
-        )]));
-        assert!(!supervisor_owns_teardown(&[
-            descriptor(spur_core::step::STEP_EXTERN),
-            descriptor(spur_core::step::STEP_INTERACTIVE),
-        ]));
-        assert!(supervisor_owns_teardown(&[
-            descriptor(spur_core::step::STEP_INTERACTIVE),
             descriptor(7),
         ]));
     }
@@ -17316,6 +17283,60 @@ mod tests {
             svc.allocation.lock().await.allocated_memory_mb,
             128,
             "a live supervised job's allocation must not be released"
+        );
+    }
+
+    // A terminal placeholder or container step owns no workload of its own
+    // (excluded from `owns_job_lifetime`), but its stepd can still wedge — it
+    // must get the same active-fencing safety net as a batch supervisor, not
+    // the unconditional, liveness-blind release `drop_tracked_job` gives an
+    // allocation with no stepd at all.
+    #[tokio::test]
+    async fn graceful_cancel_does_not_reclaim_a_live_interactive_only_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 965;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_INTERACTIVE,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            std::path::PathBuf::from("/tmp/spur-test-live-interactive-965.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "live-interactive-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a live interactive-only job must not be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "a live interactive-only job's allocation must not be released"
         );
     }
 
