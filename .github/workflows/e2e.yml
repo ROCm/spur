@@ -290,6 +290,7 @@ jobs:
           export SPUR_TEST_SSH_USER=ci
           export SPUR_TEST_SSH_KEY=${{ env.RUN_DIR }}/ci-ssh-key
           export SPUR_TEST_BINARIES_DIR=${{ env.RUN_DIR }}/release-binaries
+          export SPUR_TEST_MPI_PLUGIN=${{ env.RUN_DIR }}/release-binaries/libspur_mpi_pmix.so
           export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin-${{ github.run_id }}
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
           chmod +x ${{ env.RUN_DIR }}/release-binaries/*

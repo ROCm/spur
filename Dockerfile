@@ -99,6 +99,8 @@ COPY --from=builder /build/target/release/spurctld /usr/local/bin/
 COPY --from=builder /build/target/release/spurd /usr/local/bin/
 COPY --from=builder /build/target/release/spurstepd /usr/local/bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /usr/local/bin/
+# spur_mpi_pmix.so only when BUILD_MPI_PLUGIN=1; empty dir otherwise (see builder stage).
+COPY --from=builder /dist/lib/spur/ /lib/spur/
 
 RUN groupadd --gid 1001 spur && useradd --uid 1001 --gid spur --no-create-home --shell /usr/sbin/nologin spur
 USER spur
