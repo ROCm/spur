@@ -76,44 +76,47 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         "UpdateReservation" => targeted(Update, TxnEntity::Reservation, LeaderOnly),
         "DeleteReservation" => targeted(Delete, TxnEntity::Reservation, LeaderOnly),
 
-        // --- Jobs. Annotated in a later phase; recorded meanwhile. ---
-        "SubmitJob" => untargeted(Create, TxnEntity::Job, LeaderOnly),
-        "CancelJob" => untargeted(Delete, TxnEntity::Job, LeaderOnly),
-        "UpdateJob" => untargeted(Update, TxnEntity::Job, LeaderOnly),
-        "RequeueJob" => untargeted(Update, TxnEntity::Job, LeaderOnly),
-        "SuspendJob" => untargeted(Update, TxnEntity::Job, LeaderOnly),
-        "ResumeJob" => untargeted(Update, TxnEntity::Job, LeaderOnly),
+        // --- Jobs. The target is the id, which only a submission assigns. ---
+        "SubmitJob" => targeted(Create, TxnEntity::Job, LeaderOnly),
+        "CancelJob" => targeted(Delete, TxnEntity::Job, LeaderOnly),
+        "UpdateJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
+        "RequeueJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
+        "SuspendJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
+        "ResumeJob" => targeted(Update, TxnEntity::Job, LeaderOnly),
         // Runs a command inside somebody's already-running job.
-        "ExecInJob" => untargeted(Create, TxnEntity::Job, LeaderOnly),
-        "RunStep" => untargeted(Create, TxnEntity::Job, LeaderOnly),
+        "ExecInJob" => targeted(Create, TxnEntity::Job, LeaderOnly),
+        "RunStep" => targeted(Create, TxnEntity::Job, LeaderOnly),
 
         // --- Partitions and configuration ---
-        "CreatePartition" => untargeted(Create, TxnEntity::Partition, LeaderOnly),
-        "UpdatePartition" => untargeted(Update, TxnEntity::Partition, LeaderOnly),
-        "DeletePartition" => untargeted(Delete, TxnEntity::Partition, LeaderOnly),
+        "CreatePartition" => targeted(Create, TxnEntity::Partition, LeaderOnly),
+        "UpdatePartition" => targeted(Update, TxnEntity::Partition, LeaderOnly),
+        "DeletePartition" => targeted(Delete, TxnEntity::Partition, LeaderOnly),
         // Cluster-wide, so there is no target to name.
         "Reconfigure" => untargeted(Update, TxnEntity::Config, LeaderOnly),
 
-        // --- Credentials ---
-        "CreateToken" => untargeted(Create, TxnEntity::Token, LeaderOnly),
-        "RevokeToken" => untargeted(Delete, TxnEntity::Token, LeaderOnly),
+        // --- Credentials. The id, never the secret it is paired with. ---
+        "CreateToken" => targeted(Create, TxnEntity::Token, LeaderOnly),
+        "RevokeToken" => targeted(Delete, TxnEntity::Token, LeaderOnly),
 
         // --- k0s cluster lifecycle ---
+        // Up and down act on the single embedded cluster, which has no name.
         "ClusterUp" => untargeted(Create, TxnEntity::Cluster, LeaderOnly),
         "ClusterDown" => untargeted(Delete, TxnEntity::Cluster, LeaderOnly),
-        "ClusterAddNodes" => untargeted(Update, TxnEntity::Cluster, LeaderOnly),
-        "ClusterRemoveNodes" => untargeted(Update, TxnEntity::Cluster, LeaderOnly),
+        "ClusterAddNodes" => targeted(Update, TxnEntity::Cluster, LeaderOnly),
+        "ClusterRemoveNodes" => targeted(Update, TxnEntity::Cluster, LeaderOnly),
         // `--user` mints a Kubernetes service-account token, and the layer
         // cannot tell that from a plain read, so record both.
-        "ClusterKubeconfig" => untargeted(Create, TxnEntity::Cluster, LeaderOnly),
+        "ClusterKubeconfig" => targeted(Create, TxnEntity::Cluster, LeaderOnly),
 
         // --- Accounting entities. Slurm's txn_table covers exactly these. ---
-        "CreateAccount" => untargeted(Create, TxnEntity::Account, Local),
-        "DeleteAccount" => untargeted(Delete, TxnEntity::Account, Local),
-        "AddUser" => untargeted(Create, TxnEntity::User, Local),
-        "RemoveUser" => untargeted(Delete, TxnEntity::User, Local),
-        "CreateQos" => untargeted(Create, TxnEntity::Qos, Local),
-        "DeleteQos" => untargeted(Delete, TxnEntity::Qos, Local),
+        // `sacctmgr modify` reaches the create RPCs as an upsert, so their
+        // handlers replace the action below with the verb the write performed.
+        "CreateAccount" => targeted(Create, TxnEntity::Account, Local),
+        "DeleteAccount" => targeted(Delete, TxnEntity::Account, Local),
+        "AddUser" => targeted(Create, TxnEntity::User, Local),
+        "RemoveUser" => targeted(Delete, TxnEntity::User, Local),
+        "CreateQos" => targeted(Create, TxnEntity::Qos, Local),
+        "DeleteQos" => targeted(Delete, TxnEntity::Qos, Local),
 
         // --- Reads ---
         "GetJobs"
@@ -230,6 +233,72 @@ mod tests {
     #[test]
     fn an_unknown_method_is_not_classified() {
         assert!(classify("NoSuchRpc").is_none());
+    }
+
+    /// Mutating RPCs that act on something with no name, so a blank `Where` is
+    /// the honest answer rather than a missing annotation.
+    const TARGETLESS: &[&str] = &[
+        // The controller's own configuration, cluster-wide.
+        "Reconfigure",
+        // The single embedded k0s cluster, which carries no name.
+        "ClusterUp",
+        "ClusterDown",
+    ];
+
+    /// Whether `method` would write a row that cannot say what it acted on.
+    fn records_no_target(method: &str, allowed: &[&str]) -> bool {
+        matches!(classify(method), Some(RpcClass::Mutating(m)) if !m.targeted)
+            && !allowed.contains(&method)
+    }
+
+    /// Classification alone leaves a row with a blank `Where`, which cannot say
+    /// *which* account was deleted. A new mutating RPC must annotate its target
+    /// or be justified in `TARGETLESS`.
+    #[test]
+    fn every_mutating_rpc_names_its_target() {
+        let unnamed: Vec<_> = audited_service_methods()
+            .into_iter()
+            .filter(|m| records_no_target(m, TARGETLESS))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "these mutating RPCs record no target, so the log cannot say which \
+             object they acted on: {unnamed:?}. Annotate the handler with \
+             `audit::annotate` and mark the registry entry `targeted`, or add it \
+             to TARGETLESS with a reason."
+        );
+    }
+
+    /// Without this the test above could pass by detecting nothing. Uses real
+    /// classifications with a narrowed allowlist rather than editing the table.
+    #[test]
+    fn the_target_check_detects_an_unannotated_rpc() {
+        // Genuinely untargeted, and not excused when the allowlist is empty.
+        assert!(
+            records_no_target("Reconfigure", &[]),
+            "an untargeted mutating RPC must be reported"
+        );
+        // ... and excused when it is listed, which is what TARGETLESS does.
+        assert!(!records_no_target("Reconfigure", TARGETLESS));
+
+        // An annotated mutation and a read must never be reported.
+        assert!(!records_no_target("DeleteQos", &[]));
+        assert!(!records_no_target("GetJobs", &[]));
+    }
+
+    /// A name left behind after its RPC gained a target would silently widen the
+    /// excuse list.
+    #[test]
+    fn the_targetless_allowlist_has_no_stale_entries() {
+        for method in TARGETLESS {
+            let Some(RpcClass::Mutating(m)) = classify(method) else {
+                panic!("{method} must still be a mutating RPC");
+            };
+            assert!(
+                !m.targeted,
+                "{method} now names a target, so drop it from TARGETLESS"
+            );
+        }
     }
 
     #[test]

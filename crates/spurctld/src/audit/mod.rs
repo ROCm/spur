@@ -22,6 +22,31 @@ pub(crate) struct Annotation {
     /// Used only when no verified identity exists (`permissive` with no token),
     /// where an asserted name still beats an empty actor.
     pub asserted_actor: Option<String>,
+    /// Replaces the registry's fixed action. Needed by the upsert RPCs, which
+    /// only learn from the write whether they created or modified the row.
+    pub action: Option<crate::accounting::TxnAction>,
+}
+
+impl Annotation {
+    pub(crate) fn new(target: &str, details: serde_json::Value) -> Self {
+        Self {
+            target: target.to_string(),
+            details,
+            asserted_actor: None,
+            action: None,
+        }
+    }
+
+    /// For the RPCs whose request carries the caller's own name.
+    pub(crate) fn asserted_actor(mut self, actor: &str) -> Self {
+        self.asserted_actor = Some(actor.to_string());
+        self
+    }
+
+    pub(crate) fn action(mut self, action: crate::accounting::TxnAction) -> Self {
+        self.action = Some(action);
+        self
+    }
 }
 
 /// One request's shared state, written by the handler and read by the layer.
@@ -81,32 +106,9 @@ pub(crate) fn slot<T>(request: &tonic::Request<T>) -> Option<Arc<AuditSlot>> {
 
 /// Record which object this request acted on. A no-op without a handle, so a
 /// handler need not know whether the layer is installed.
-pub(crate) fn annotate(handle: &Option<Arc<AuditSlot>>, target: &str, details: serde_json::Value) {
-    set(handle, target, details, None);
-}
-
-/// [`annotate`] for the RPCs whose request carries a caller name.
-pub(crate) fn annotate_as(
-    handle: &Option<Arc<AuditSlot>>,
-    actor: &str,
-    target: &str,
-    details: serde_json::Value,
-) {
-    set(handle, target, details, Some(actor.to_string()));
-}
-
-fn set(
-    handle: &Option<Arc<AuditSlot>>,
-    target: &str,
-    details: serde_json::Value,
-    asserted_actor: Option<String>,
-) {
+pub(crate) fn annotate(handle: &Option<Arc<AuditSlot>>, annotation: Annotation) {
     if let Some(slot) = handle {
-        slot.set(Annotation {
-            target: target.to_string(),
-            details,
-            asserted_actor,
-        });
+        slot.set(annotation);
     }
 }
 
@@ -117,7 +119,7 @@ mod tests {
     #[test]
     fn annotate_is_a_noop_without_a_slot() {
         // Handlers called directly in unit tests have no layer above them.
-        annotate(&None, "n1", serde_json::json!({}));
+        annotate(&None, Annotation::new("n1", serde_json::json!({})));
     }
 
     #[test]
@@ -125,7 +127,10 @@ mod tests {
         let slot = Arc::new(AuditSlot::default());
         let handle = Some(slot.clone());
 
-        annotate(&handle, "n1", serde_json::json!({ "state": "drain" }));
+        annotate(
+            &handle,
+            Annotation::new("n1", serde_json::json!({ "state": "drain" })),
+        );
 
         let got = slot
             .take()
@@ -139,26 +144,50 @@ mod tests {
         let slot = Arc::new(AuditSlot::default());
         let handle = Some(slot.clone());
 
-        annotate(&handle, "n1", serde_json::json!({}));
-        annotate(&handle, "n2", serde_json::json!({}));
+        annotate(&handle, Annotation::new("n1", serde_json::json!({})));
+        annotate(&handle, Annotation::new("n2", serde_json::json!({})));
 
         assert_eq!(slot.take().map(|a| a.target).as_deref(), Some("n2"));
     }
 
     #[test]
-    fn annotate_as_carries_the_asserted_actor() {
+    fn an_asserted_actor_is_carried_only_when_set() {
         let slot = Arc::new(AuditSlot::default());
         let handle = Some(slot.clone());
 
-        annotate_as(&handle, "alice", "daily", serde_json::json!({}));
+        annotate(
+            &handle,
+            Annotation::new("daily", serde_json::json!({})).asserted_actor("alice"),
+        );
 
         let got = slot.take().expect("annotation");
         assert_eq!(got.asserted_actor.as_deref(), Some("alice"));
 
-        // The plain form leaves it unset, so the layer has nothing to fall back
-        // to and records an empty actor rather than inventing one.
-        annotate(&handle, "n1", serde_json::json!({}));
+        // Left unset, the layer has nothing to fall back to and records an empty
+        // actor rather than inventing one.
+        annotate(&handle, Annotation::new("n1", serde_json::json!({})));
         assert!(slot.take().expect("annotation").asserted_actor.is_none());
+    }
+
+    /// An upsert only learns its verb from the write, so the handler may replace
+    /// the registry's fixed action.
+    #[test]
+    fn an_action_override_is_carried_when_set() {
+        let slot = Arc::new(AuditSlot::default());
+        let handle = Some(slot.clone());
+
+        annotate(&handle, Annotation::new("gpu", serde_json::json!({})));
+        assert_eq!(slot.take().expect("annotation").action, None);
+
+        annotate(
+            &handle,
+            Annotation::new("gpu", serde_json::json!({}))
+                .action(crate::accounting::TxnAction::Update),
+        );
+        assert_eq!(
+            slot.take().expect("annotation").action,
+            Some(crate::accounting::TxnAction::Update)
+        );
     }
 
     #[test]

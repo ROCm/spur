@@ -22,6 +22,7 @@ use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
 use crate::accounting::txn;
+use crate::audit::{annotate, Annotation};
 use crate::cluster::{CancelError, ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
@@ -1263,6 +1264,7 @@ impl SlurmController for ControllerService {
         // Bind to the authenticated caller BEFORE the spec reaches the cluster, so a stale or
         // hostile client cannot choose the user/uid the job runs as.
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let spec = request
             .into_inner()
             .spec
@@ -1279,10 +1281,23 @@ impl SlurmController for ControllerService {
             self.cluster.config().scheduler.max_user_priority,
         );
 
+        let submitted = txn::requested(&[
+            ("name", Some(core_spec.name.clone().into())),
+            ("partition", core_spec.partition.clone().map(Into::into)),
+            ("account", core_spec.account.clone().map(Into::into)),
+            ("qos", core_spec.qos.clone().map(Into::into)),
+            ("num_nodes", Some(core_spec.num_nodes.into())),
+            ("num_tasks", Some(core_spec.num_tasks.into())),
+        ]);
         let outcome = self
             .cluster
             .submit_job(core_spec)
             .map_err(submit_rpc_status)?;
+        // The id is the target, and only the submission assigns it.
+        annotate(
+            &audit,
+            Annotation::new(&outcome.job_id.to_string(), submitted),
+        );
 
         let mut warnings = outcome.warnings;
         warnings.extend(priority_warning);
@@ -1421,9 +1436,18 @@ impl SlurmController for ControllerService {
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                txn::requested(&[("signal", (req.signal != 0).then(|| req.signal.into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
 
         // Snapshot the job before cancelling so we have allocated_nodes
         let job = self.cluster.get_job(job_id);
@@ -1580,9 +1604,14 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
+        );
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Snapshot up-front for agent dispatch.
         let job = self
@@ -1618,9 +1647,14 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
+        );
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Allocation is retained across resume, so this
         // up-front snapshot's allocated_nodes is still valid for agent dispatch.
@@ -1659,8 +1693,22 @@ impl SlurmController for ControllerService {
 
         let __identity = Self::verified_identity(&request).cloned();
         let caller_is_privileged = self.caller_is_privileged(__identity.as_ref());
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.job_id.to_string(),
+                txn::requested(&[
+                    ("partition", req.partition.clone().map(Into::into)),
+                    ("account", req.account.clone().map(Into::into)),
+                    ("priority", req.priority.map(Into::into)),
+                    ("comment", req.comment.clone().map(Into::into)),
+                ]),
+            )
+            .asserted_actor(&req.user),
+        );
 
         // Reject a caller who does not own the target job before any mutation —
         // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
@@ -1742,8 +1790,17 @@ impl SlurmController for ControllerService {
 
         let __identity = Self::verified_identity(&request).cloned();
         let caller_is_admin = self.caller_is_operator(__identity.as_ref());
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.job_id.to_string(),
+                txn::requested(&[("hold", req.hold.then_some(true.into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
         let outcome = self
             .cluster
             .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
@@ -1878,14 +1935,16 @@ impl SlurmController for ControllerService {
             .map(spur_core::node::NodeState::from_proto_i32);
         {
             let r = request.get_ref();
-            crate::audit::annotate(
+            annotate(
                 &audit,
-                &r.name,
-                txn::node_update_details(
-                    requested_node_state(r.state, parsed.flatten()).as_deref(),
-                    r.reason.as_deref(),
-                    &r.labels,
-                    &r.remove_labels,
+                Annotation::new(
+                    &r.name,
+                    txn::node_update_details(
+                        requested_node_state(r.state, parsed.flatten()).as_deref(),
+                        r.reason.as_deref(),
+                        &r.labels,
+                        &r.remove_labels,
+                    ),
                 ),
             );
         }
@@ -1932,10 +1991,12 @@ impl SlurmController for ControllerService {
         // Annotate before the gate so a refused attempt still names the node it
         // targeted, which is the whole question the audit log answers.
         let audit = crate::audit::slot(&request);
-        crate::audit::annotate(
+        annotate(
             &audit,
-            &request.get_ref().name,
-            txn::node_drain_details(&request.get_ref().reason),
+            Annotation::new(
+                &request.get_ref().name,
+                txn::node_drain_details(&request.get_ref().reason),
+            ),
         );
 
         // Draining a node takes it out of service cluster-wide, so it needs the
@@ -1981,10 +2042,12 @@ impl SlurmController for ControllerService {
         }
 
         let audit = crate::audit::slot(&request);
-        crate::audit::annotate(
+        annotate(
             &audit,
-            &request.get_ref().name,
-            txn::node_remove_details(&request.get_ref().reason, request.get_ref().force),
+            Annotation::new(
+                &request.get_ref().name,
+                txn::node_remove_details(&request.get_ref().reason, request.get_ref().force),
+            ),
         );
 
         // Removing a node evicts its running jobs, so it needs the same bar as
@@ -2030,10 +2093,9 @@ impl SlurmController for ControllerService {
         }
         let audit = crate::audit::slot(&request);
         let req = request.into_inner();
-        crate::audit::annotate(
+        annotate(
             &audit,
-            &req.hostname,
-            txn::node_deregister_details(&req.reason),
+            Annotation::new(&req.hostname, txn::node_deregister_details(&req.reason)),
         );
 
         self.verify_node_identity(&req.hostname, &req.node_token)?;
@@ -2693,6 +2755,7 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "create token")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
         let ttl_secs = req.ttl_secs.filter(|&v| v > 0);
 
@@ -2700,6 +2763,14 @@ impl SlurmController for ControllerService {
             .cluster
             .create_token(ttl_secs)
             .map_err(|e| Status::internal(e.to_string()))?;
+        // The id only; `full_string` carries the secret and must never be logged.
+        annotate(
+            &audit,
+            Annotation::new(
+                &token.id,
+                txn::requested(&[("ttl_secs", ttl_secs.map(Into::into))]),
+            ),
+        );
 
         Ok(Response::new(CreateTokenResponse {
             token: full_string,
@@ -2750,7 +2821,12 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "revoke token")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(&req.token_id, txn::delete_details(None)),
+        );
         self.cluster
             .revoke_token(&req.token_id)
             .map_err(|e| Status::not_found(e.to_string()))?;
@@ -3006,7 +3082,28 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "create partition")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::requested(&[
+                    (
+                        "nodes",
+                        (!req.nodes.is_empty()).then(|| req.nodes.clone().into()),
+                    ),
+                    (
+                        "selector",
+                        (!req.selector.is_empty()).then(|| serde_json::json!(req.selector)),
+                    ),
+                    (
+                        "max_time",
+                        (!req.max_time.is_empty()).then(|| req.max_time.clone().into()),
+                    ),
+                ]),
+            ),
+        );
 
         if req.nodes.is_empty() && req.selector.is_empty() {
             return Err(Status::invalid_argument(
@@ -3113,7 +3210,19 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "update partition")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::requested(&[
+                    ("state", req.state.clone().map(Into::into)),
+                    ("nodes", req.nodes.clone().map(Into::into)),
+                    ("max_time", req.max_time.clone().map(Into::into)),
+                ]),
+            ),
+        );
 
         let state = req
             .state
@@ -3224,7 +3333,9 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "delete partition")?;
 
+        let audit = crate::audit::slot(&request);
         let name = request.into_inner().name;
+        annotate(&audit, Annotation::new(&name, txn::delete_details(None)));
         self.cluster
             .delete_partition(&name)
             .map_err(partition_rpc_status)?;
@@ -3279,18 +3390,20 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
 
-        crate::audit::annotate_as(
+        annotate(
             &audit,
-            &req.user,
-            &req.name,
-            txn::create_details(
-                &req.start_time,
-                req.duration_minutes,
-                &req.nodes,
-                &req.accounts,
-                &req.users,
-                &req.flags,
-            ),
+            Annotation::new(
+                &req.name,
+                txn::create_details(
+                    &req.start_time,
+                    req.duration_minutes,
+                    &req.nodes,
+                    &req.accounts,
+                    &req.users,
+                    &req.flags,
+                ),
+            )
+            .asserted_actor(&req.user),
         );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
@@ -3322,19 +3435,21 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
 
-        crate::audit::annotate_as(
+        annotate(
             &audit,
-            &req.user,
-            &req.name,
-            txn::update_details(
-                req.duration_minutes,
-                &req.add_nodes,
-                &req.remove_nodes,
-                &req.add_users,
-                &req.remove_users,
-                &req.add_accounts,
-                &req.remove_accounts,
-            ),
+            Annotation::new(
+                &req.name,
+                txn::update_details(
+                    req.duration_minutes,
+                    &req.add_nodes,
+                    &req.remove_nodes,
+                    &req.add_users,
+                    &req.remove_users,
+                    &req.add_accounts,
+                    &req.remove_accounts,
+                ),
+            )
+            .asserted_actor(&req.user),
         );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
@@ -3377,7 +3492,10 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
 
-        crate::audit::annotate_as(&audit, &req.user, &req.name, txn::delete_details(None));
+        annotate(
+            &audit,
+            Annotation::new(&req.name, txn::delete_details(None)).asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
@@ -3445,9 +3563,18 @@ impl SlurmController for ControllerService {
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                serde_json::json!({ "command": req.command.join(" ") }),
+            )
+            .asserted_actor(&req.user),
+        );
 
         let job = self
             .cluster
@@ -3519,10 +3646,19 @@ impl SlurmController for ControllerService {
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                serde_json::json!({ "command": req.command.join(" ") }),
+            )
+            .asserted_actor(&req.user),
+        );
 
         let job = self
             .cluster
@@ -4041,8 +4177,26 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.nodes,
+                txn::requested(&[
+                    (
+                        "partition",
+                        (!req.partition.is_empty()).then(|| req.partition.clone().into()),
+                    ),
+                    (
+                        "selector",
+                        (!req.selector.is_empty()).then(|| serde_json::json!(req.selector)),
+                    ),
+                ]),
+            )
+            .asserted_actor(&req.caller),
+        );
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster add-nodes")?;
 
         let state = self.cluster.k0s_state();
@@ -4118,8 +4272,17 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.nodes,
+                txn::requested(&[("drain_timeout_secs", req.drain_timeout_secs.map(Into::into))]),
+            )
+            .asserted_actor(&req.caller),
+        );
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster remove-nodes")?;
 
         let state = self.cluster.k0s_state();
@@ -4301,8 +4464,19 @@ impl SlurmController for ControllerService {
             return client.cluster_kubeconfig(fwd).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        // The subject the credential is minted for, which is what a reader needs
+        // to know; `--admin` mints the cluster-admin one instead of a user's.
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.user,
+                txn::requested(&[("admin", req.admin.then_some(true.into()))]),
+            )
+            .asserted_actor(&req.caller),
+        );
         let is_admin = self.k0s_caller_is_admin(__identity.as_ref(), &req.caller);
 
         if req.admin {

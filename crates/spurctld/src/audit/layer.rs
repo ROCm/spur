@@ -238,9 +238,9 @@ fn build_record(
         peer,
         forwarded,
     } = caller;
-    let (target, mut details, asserted) = match annotation {
-        Some(a) => (a.target, a.details, a.asserted_actor),
-        None => (String::new(), serde_json::json!({}), None),
+    let (target, mut details, asserted, action) = match annotation {
+        Some(a) => (a.target, a.details, a.asserted_actor, a.action),
+        None => (String::new(), serde_json::json!({}), None, None),
     };
     if forwarded {
         if let Some(obj) = details.as_object_mut() {
@@ -262,7 +262,9 @@ fn build_record(
         verified,
         peer_addr: peer.unwrap_or_default(),
         source: TxnSource::Api,
-        action: m.action,
+        // The handler's verb wins: only it can tell an upsert's insert from its
+        // update, which the registry's per-method action cannot express.
+        action: action.unwrap_or(m.action),
         entity_type: m.entity,
         entity_name: target,
         outcome,
@@ -303,10 +305,10 @@ mod tests {
     }
 
     fn annotation(target: &str, asserted: Option<&str>) -> Annotation {
-        Annotation {
-            target: target.into(),
-            details: serde_json::json!({ "state": "drain" }),
-            asserted_actor: asserted.map(str::to_owned),
+        let a = Annotation::new(target, serde_json::json!({ "state": "drain" }));
+        match asserted {
+            Some(actor) => a.asserted_actor(actor),
+            None => a,
         }
     }
 
@@ -605,7 +607,10 @@ mod tests {
                     .get::<Arc<AuditSlot>>()
                     .cloned()
                     .expect("a mutating RPC must receive an audit slot");
-                super::super::annotate(&Some(slot), target, serde_json::json!({ "k": "v" }));
+                super::super::annotate(
+                    &Some(slot),
+                    Annotation::new(target, serde_json::json!({ "k": "v" })),
+                );
             }
             let response = match self.status {
                 Some(code) => Status::new(code, "denied by stub").into_http(),

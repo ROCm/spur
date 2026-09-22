@@ -1230,7 +1230,8 @@ best-effort: a database outage never blocks the operation itself.
 Coverage is a property of the RPC pipeline, not of individual commands. A single
 layer in front of every controller and accounting RPC writes the row, so an
 action cannot be mutating and unrecorded; a newly added RPC fails the test suite
-until it is explicitly classified as mutating, read-only, or internal.
+until it is explicitly classified as mutating, read-only, or internal, and a
+mutating one fails until it also names the object it acts on.
 
 This goes well beyond stock Slurm. Slurm's ``txn_table`` records only
 ``slurmdbd``-side entities (accounts, users, associations, QOS, clusters, TRES);
@@ -1270,16 +1271,19 @@ Each record captures:
   **Verified** are unaffected. To recover the client address in that case,
   enable ``logging.audit_rpcs``: the controller the client actually reached logs
   the request with its real peer.
-- **Action** — ``create``, ``update``, or ``delete``.
+- **Action** — ``create``, ``update``, or ``delete``. ``sacctmgr add`` and
+  ``sacctmgr modify`` reach the same RPC as an upsert, so the verb recorded is
+  the one the write actually performed: adding an account that already exists is
+  logged as ``update``, not ``create``.
 - **Where** — the target, rendered ``entity_type:entity_name`` (e.g.
-  ``node:node07``).
+  ``node:node07``). Jobs are named by their id, and credentials by their token
+  id — never the secret.
 
-  The entity type is always present. The name is currently filled in for
-  ``node`` and ``reservation`` actions; for the other entities the action,
-  actor, peer, and outcome are recorded but the name is blank, so filter those
-  with ``Entity=`` rather than ``Name=``. It is also permanently blank for
-  cluster-wide actions that have no single target, such as
-  ``scontrol reconfigure``.
+  A mutating RPC records its target, and a test enforces that: a newly added one
+  cannot ship with a blank name. The exceptions are the actions that have no
+  single target, where the name is permanently blank — ``scontrol reconfigure``
+  and bringing the embedded k0s cluster up or down. Filter those with
+  ``Entity=`` rather than ``Name=``.
 - **Outcome** — ``success``, ``denied`` (permission/ownership rejected), or
   ``error`` (validation or other failure). Unlike Slurm, which logs only
   committed transactions, Spur also records denied and failed attempts.

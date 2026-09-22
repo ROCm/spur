@@ -218,6 +218,15 @@ pub fn delete_details(reason: Option<&str>) -> serde_json::Value {
     }
 }
 
+/// Details from the fields a request actually set. Unset ones are dropped so
+/// the log shows what was asked for rather than a wall of nulls.
+pub fn requested(fields: &[(&str, Option<serde_json::Value>)]) -> serde_json::Value {
+    let set = fields
+        .iter()
+        .filter_map(|(k, v)| v.clone().map(|v| ((*k).to_string(), v)));
+    serde_json::Value::Object(set.collect())
+}
+
 /// Serialize a details object to the stored string, attaching the error message
 /// for non-success outcomes.
 pub fn finalize_details(mut base: serde_json::Value, error: Option<&str>) -> String {

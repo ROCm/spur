@@ -877,6 +877,36 @@ fn push_bound(qb: &mut QueryBuilder<sqlx::Postgres>, val: SqlVal<'_>) {
     };
 }
 
+/// Which half of an upsert ran. `sacctmgr modify` reaches the same RPC as
+/// `add`, so only the write itself can tell the audit log which verb to record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upserted {
+    Created,
+    Updated,
+    /// The row existed and the request restated nothing, so `ON CONFLICT DO
+    /// NOTHING` matched without touching it.
+    Unchanged,
+}
+
+impl Upserted {
+    fn from_xmax(inserted: Option<bool>) -> Self {
+        match inserted {
+            Some(true) => Self::Created,
+            Some(false) => Self::Updated,
+            None => Self::Unchanged,
+        }
+    }
+
+    /// The verb to audit. An unchanged row still existed beforehand, so
+    /// recording `create` would claim something that did not happen.
+    pub fn action(self) -> super::TxnAction {
+        match self {
+            Self::Created => super::TxnAction::Create,
+            Self::Updated | Self::Unchanged => super::TxnAction::Update,
+        }
+    }
+}
+
 /// The tables `upsert_row` can target. A closed set of variants (not a free
 /// `&str`) so the table name and ON CONFLICT target spliced into the SQL text
 /// can only ever be known literals — no caller can route user input into a
@@ -911,7 +941,7 @@ async fn upsert_row(
     table: UpsertTable,
     keys: &[(&'static str, SqlVal<'_>)],
     updates: &[(&'static str, SqlVal<'_>)],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Upserted> {
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("INSERT INTO ");
     qb.push(table.name()).push(" (");
     let mut first = true;
@@ -947,8 +977,11 @@ async fn upsert_row(
             qb.push(*col).push(" = EXCLUDED.").push(*col);
         }
     }
-    qb.build().execute(pool).await?;
-    Ok(())
+    // `xmax` is zero only on a fresh insert, so this distinguishes the two
+    // halves of the upsert in the same statement — no pre-read, no race.
+    qb.push(" RETURNING (xmax = 0)");
+    let inserted = qb.build_query_scalar().fetch_optional(pool).await?;
+    Ok(Upserted::from_xmax(inserted))
 }
 
 /// Partial-patch fields for [`upsert_account`]. Outer `None` leaves the column
@@ -971,7 +1004,7 @@ pub async fn upsert_account<'a>(
     pool: &PgPool,
     name: &'a str,
     u: AccountUpdate<'a>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Upserted> {
     let keys = [("name", SqlVal::Text(name))];
     let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.description {
@@ -1107,7 +1140,7 @@ pub async fn add_user<'a>(
     user: &'a str,
     account: &'a str,
     u: UserUpdate<'a>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Upserted> {
     // Per-user advisory lock so concurrent modifies of two different accounts
     // for the same user serialize — otherwise both could win the demote race
     // below and end up default. Cheap: add_user is admin-path.
@@ -1133,7 +1166,7 @@ pub async fn add_user<'a>(
 
     // Partial-patch: COALESCE/CASE keep stored admin_level/default_account when
     // omitted ($3/$4 NULL); a brand-new user's first row still claims the default.
-    sqlx::query(
+    let inserted: bool = sqlx::query_scalar(
         r#"
         INSERT INTO users (name, account, admin_level, default_account)
         VALUES ($1, $2, COALESCE($3, 'none'), CASE
@@ -1149,14 +1182,16 @@ pub async fn add_user<'a>(
                 WHEN $4::bool THEN $2
                 ELSE NULL
             END
+        RETURNING (xmax = 0)
         "#,
     )
     .bind(user)
     .bind(account)
     .bind(u.admin_level)
     .bind(u.is_default)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    let outcome = Upserted::from_xmax(Some(inserted));
 
     let mut assoc: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.default_qos {
@@ -1189,7 +1224,7 @@ pub async fn add_user<'a>(
     }
 
     tx.commit().await?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Remove a user from one account, or every account when `account` is empty.
@@ -1347,7 +1382,11 @@ pub struct QosUpdate<'a> {
 /// Create or update a QOS, writing only the fields set in `u`. `modify` sends
 /// just the restated fields, so unset columns are preserved; `add` sets all of
 /// them.
-pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> anyhow::Result<()> {
+pub async fn upsert_qos<'a>(
+    pool: &PgPool,
+    name: &'a str,
+    u: QosUpdate<'a>,
+) -> anyhow::Result<Upserted> {
     let keys = [("name", SqlVal::Text(name))];
     let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.description {
@@ -2451,6 +2490,56 @@ mod job_history_tests {
         );
 
         tx.rollback().await?;
+        Ok(())
+    }
+
+    /// `sacctmgr modify` and `add` share one RPC, so the audit verb comes from
+    /// this mapping rather than the method.
+    #[test]
+    fn an_upsert_that_found_a_row_audits_as_an_update() {
+        assert_eq!(Upserted::Created.action(), super::super::TxnAction::Create);
+        assert_eq!(Upserted::Updated.action(), super::super::TxnAction::Update);
+        assert_eq!(
+            Upserted::Unchanged.action(),
+            super::super::TxnAction::Update
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn upsert_qos_reports_whether_it_created_or_updated() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let name = format!("spur_upsert_{}", std::process::id());
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+
+        let priced = |p: i32| QosUpdate {
+            priority: Some(p),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            upsert_qos(&pool, &name, priced(5)).await?,
+            Upserted::Created,
+            "first write inserts"
+        );
+        assert_eq!(
+            upsert_qos(&pool, &name, priced(7)).await?,
+            Upserted::Updated,
+            "restating a field updates the existing row"
+        );
+        // No fields restated, so the statement is ON CONFLICT DO NOTHING.
+        assert_eq!(
+            upsert_qos(&pool, &name, QosUpdate::default()).await?,
+            Upserted::Unchanged,
+        );
+
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 
