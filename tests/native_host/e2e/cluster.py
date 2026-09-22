@@ -1072,6 +1072,63 @@ class SpurCluster:
                 pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
         return remote_bin
 
+    def rccl_preflight(self, min_nodes: int = 1):
+        """Skip unless every node can build and run an MPI+RCCL binary.
+
+        Deliberately stricter than `gpu_preflight` plus `mpi_preflight`: RCCL needs
+        the library and headers present on each node, and the payload is built with
+        `hipcc` rather than `mpicc`, so a node with a GPU but no ROCm devel packages
+        would otherwise fail deep inside the build with an unhelpful error.
+        """
+        self.gpu_preflight(min_nodes)
+        self.mpi_preflight(min_nodes)
+
+        missing = []
+        for i, node in enumerate(self.nodes[:min_nodes]):
+            name = self.node_names[i]
+            if "OK" not in node.exec_allow_fail(
+                "command -v hipcc >/dev/null && echo OK || echo MISSING"
+            ):
+                missing.append(f"hipcc on {name}")
+            if "OK" not in node.exec_allow_fail(
+                "ldconfig -p 2>/dev/null | grep -q librccl && echo OK || echo MISSING"
+            ):
+                missing.append(f"librccl on {name}")
+            if "OK" not in node.exec_allow_fail(
+                "test -f /opt/rocm/include/rccl/rccl.h && echo OK || echo MISSING"
+            ):
+                missing.append(f"rccl.h on {name}")
+
+        if missing:
+            pytest.skip("RCCL preflight failed: " + "; ".join(missing))
+
+    def compile_rccl_fixture(self, source_name: str = "rccl_all_reduce.c") -> str:
+        """Ship and build the MPI+RCCL fixture on every node.
+
+        Built per node with that node's toolchain, matching the documented rule that
+        MPI binaries are compiled on the compute node rather than the controller.
+        """
+        self.rccl_preflight(1)
+        self.ship_fixture(source_name)
+        bin_name = source_name.rsplit(".", 1)[0]
+        remote_src = f"{self.remote_dir}/{source_name}"
+        remote_bin = f"{self.remote_dir}/{bin_name}"
+
+        # `mpicc -showme:incdirs` is Open MPI specific and absent on MPICH, so fall
+        # back to the conventional path rather than failing the build outright.
+        mpi_inc = os.environ.get("SPUR_TEST_MPI_INCLUDE", "").strip()
+        for node in self.nodes:
+            inc = mpi_inc or node.exec_allow_fail(
+                "mpicc -showme:incdirs 2>/dev/null | tr ' ' '\\n' | head -1"
+            ).strip() or "/usr/lib/x86_64-linux-gnu/openmpi/include"
+            node.exec(
+                f"hipcc -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)} "
+                f"-I{shlex.quote(inc)} -lrccl -lmpi"
+            )
+            if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
+                pytest.skip(f"hipcc could not build {source_name} on {node.host}")
+        return remote_bin
+
     def mpi_plugin_dir(self) -> str:
         return str(Path(self.bin_dir).parent / "lib" / "spur")
 
