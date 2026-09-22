@@ -33,7 +33,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SdiagArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SdiagArgs>(&args);
 
     let channel = crate::authclient::connect(&args.controller)
         .await

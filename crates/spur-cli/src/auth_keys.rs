@@ -45,7 +45,7 @@ pub fn main() -> Result<()> {
 }
 
 pub fn main_with_args(args: Vec<String>) -> Result<()> {
-    let parsed = AuthKeysArgs::try_parse_from(args)?;
+    let parsed = crate::clap_exit::parse_or_exit::<AuthKeysArgs>(&args);
     match parsed.command {
         AuthKeysCommand::Hmac { kid, out } => {
             let doc = spur_core::native_jwks::generate_hmac_jwks(&kid);

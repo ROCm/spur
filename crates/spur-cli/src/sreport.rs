@@ -64,7 +64,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SreportArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SreportArgs>(&args);
 
     let since = args
         .start

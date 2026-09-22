@@ -59,7 +59,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = StriggerArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<StriggerArgs>(&args);
 
     if args.set {
         set_trigger(&args)?;

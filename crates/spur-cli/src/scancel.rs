@@ -62,7 +62,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = ScancelArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<ScancelArgs>(&args);
 
     if !has_selection(&args) {
         bail!("scancel: no job IDs or filters specified");

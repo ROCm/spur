@@ -119,7 +119,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let parsed = K8sArgs::try_parse_from(args)?;
+    let parsed = crate::clap_exit::parse_or_exit::<K8sArgs>(&args);
     let controller = parsed.controller;
     match parsed.command {
         K8sCommand::Up {

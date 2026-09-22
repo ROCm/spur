@@ -44,7 +44,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SstatArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SstatArgs>(&args);
 
     // Parse job IDs (comma-separated)
     let job_ids: Vec<u32> = args

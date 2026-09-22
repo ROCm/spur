@@ -11,6 +11,7 @@ use spur_proto::proto::{CreateTokenRequest, ListTokensRequest, RevokeTokenReques
 #[derive(Parser, Debug)]
 #[command(name = "token", about = "Manage admission tokens")]
 pub struct TokenArgs {
+    /// Controller address
     #[arg(
         long,
         env = "SPUR_CONTROLLER_ADDR",
@@ -67,7 +68,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let parsed = TokenArgs::try_parse_from(args)?;
+    let parsed = crate::clap_exit::parse_or_exit::<TokenArgs>(&args);
     let controller = parsed.controller;
     match parsed.command {
         TokenCommand::Create { ttl } => cmd_create(&controller, ttl).await,

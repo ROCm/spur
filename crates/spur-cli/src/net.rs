@@ -152,7 +152,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = NetArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<NetArgs>(&args);
 
     match args.command {
         NetCommand::Init {

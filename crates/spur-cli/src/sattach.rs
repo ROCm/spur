@@ -36,7 +36,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SattachArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SattachArgs>(&args);
 
     // Parse job_id from "job_id" or "job_id.step_id"
     let job_id: u32 = args
