@@ -194,7 +194,7 @@ where
 
 /// Only the node that applied the action records it, per its own `check_leader`.
 /// Accounting bypasses Raft and records wherever it ran.
-fn should_record(scope: AuditScope, executed_locally: bool) -> bool {
+pub(super) fn should_record(scope: AuditScope, executed_locally: bool) -> bool {
     match scope {
         AuditScope::LeaderOnly => executed_locally,
         AuditScope::Local => true,
@@ -216,16 +216,16 @@ fn outcome_of(headers: &HeaderMap) -> (TxnOutcome, Option<String>) {
 }
 
 /// What the layer knows about a caller without decoding the request body.
-struct Caller<'a> {
-    identity: Option<&'a Identity>,
-    verified: bool,
-    peer: Option<String>,
-    forwarded: bool,
+pub(super) struct Caller<'a> {
+    pub identity: Option<&'a Identity>,
+    pub verified: bool,
+    pub peer: Option<String>,
+    pub forwarded: bool,
 }
 
 /// Assembles the layer's half (who, from where, how it ended) with the
 /// handler's half (which object, which parameters).
-fn build_record(
+pub(super) fn build_record(
     m: Mutating,
     caller: Caller<'_>,
     annotation: Option<super::Annotation>,

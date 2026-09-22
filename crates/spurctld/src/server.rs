@@ -115,6 +115,9 @@ fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
     !is_leader && !is_forwarded
 }
 
+/// Every field is an `Arc` or immutable config, so clones share state rather
+/// than fork it — the recovery fences below must be one map, not several.
+#[derive(Clone)]
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
@@ -134,7 +137,7 @@ pub struct ControllerService {
     /// Stepd agents need an explicit signing secret. The built-in
     /// compatibility fallback is public and cannot establish node identity.
     node_identity_key_configured: bool,
-    incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>,
+    incomplete_stepd_recoveries: Arc<Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>>,
     /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
     auth_audience: String,
     auth_epoch: u64,
@@ -147,10 +150,16 @@ enum StepdRecoveryCohortState {
     Fencing(std::time::Instant),
 }
 
+/// The leader's node id and an open client to it.
+type CachedLeader = Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>;
+
+/// The cache is shared rather than copied, or each clone would separately dial
+/// the leader it already has a connection to.
+#[derive(Clone)]
 struct LeaderProxy {
     raft: Arc<RaftHandle>,
     client_addrs: BTreeMap<u64, String>,
-    cached_client: Mutex<Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>>,
+    cached_client: Arc<Mutex<CachedLeader>>,
 }
 
 impl LeaderProxy {
@@ -158,7 +167,7 @@ impl LeaderProxy {
         Self {
             raft,
             client_addrs,
-            cached_client: Mutex::new(None),
+            cached_client: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4543,17 +4552,17 @@ impl SlurmController for ControllerService {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    addr: SocketAddr,
+/// Separate from [`serve`] so `main` can hand a clone to the REST server, which
+/// dispatches into these handlers instead of reaching past them into the cluster.
+pub fn build_service(
     cluster: Arc<ClusterManager>,
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
-    accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
     jwt_key: String,
-    bearer: spur_core::auth::BearerAuth,
-) -> anyhow::Result<()> {
+    bearer: &spur_core::auth::BearerAuth,
+) -> ControllerService {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
         .iter()
@@ -4573,25 +4582,32 @@ pub async fn serve(
         cluster.config().auth.has_jwt_key() || crate::native_keys::node_signer().is_some();
     let (auth_audience, auth_epoch) = bearer.advertised_handshake();
 
-    let audit_cluster = cluster.clone();
-    let audit_rpcs = cluster.config().logging.audit_rpcs;
-
-    let service = ControllerService {
+    ControllerService {
         cluster,
         client_addrs,
-        raft: raft_handle.clone(),
+        raft: raft_handle,
         leader_proxy,
-        rpc_stats: rpc_stats.clone(),
-        sched_stats: sched_stats.clone(),
+        rpc_stats,
+        sched_stats,
         control_plane_replicas,
         jwt_key,
         node_identity_key_configured,
-        incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+        incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
         auth_audience,
         auth_epoch,
-    };
+    }
+}
 
-    let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle.clone());
+pub async fn serve(
+    addr: SocketAddr,
+    service: ControllerService,
+    accounting_service: Option<crate::accounting::AccountingService>,
+    bearer: spur_core::auth::BearerAuth,
+) -> anyhow::Result<()> {
+    let audit_cluster = service.cluster.clone();
+    let audit_rpcs = service.cluster.config().logging.audit_rpcs;
+
+    let stats_layer = RpcStatsLayer::new(service.rpc_stats.clone(), service.raft.clone());
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
     let mut auth_layer = crate::auth_middleware::AuthLayer::from_bearer(bearer);
@@ -6359,7 +6375,7 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key: String::new(),
             node_identity_key_configured: false,
-            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
             auth_audience: String::new(),
             auth_epoch: 0,
         }
@@ -7058,7 +7074,7 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key,
             node_identity_key_configured,
-            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
             auth_audience: String::new(),
             auth_epoch: 0,
         }

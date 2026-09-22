@@ -10,7 +10,7 @@ mod registry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub(crate) use layer::{AuditLayer, ControllerAudit};
+pub(crate) use layer::{AuditContext, AuditLayer, ControllerAudit};
 
 /// What a handler adds to the record the layer is already building.
 #[derive(Clone, Debug)]
@@ -112,6 +112,58 @@ pub(crate) fn annotate(handle: &Option<Arc<AuditSlot>>, annotation: Annotation) 
     }
 }
 
+/// Write the row the Tower layer would have, for a handler it cannot see. REST
+/// dispatches into these handlers below the layer, so its mutations need this.
+pub(crate) async fn recorded<Req, Resp, F, Fut>(
+    context: &dyn AuditContext,
+    method: &str,
+    peer: Option<String>,
+    mut request: tonic::Request<Req>,
+    call: F,
+) -> Result<Resp, tonic::Status>
+where
+    F: FnOnce(tonic::Request<Req>) -> Fut,
+    Fut: std::future::Future<Output = Result<Resp, tonic::Status>>,
+{
+    let Some(registry::RpcClass::Mutating(m)) = registry::classify(method) else {
+        return call(request).await;
+    };
+
+    let slot = Arc::new(AuditSlot::default());
+    request.extensions_mut().insert(slot.clone());
+    let identity = request
+        .extensions()
+        .get::<spur_core::auth::Identity>()
+        .cloned();
+    let verified = request
+        .extensions()
+        .get::<crate::auth_middleware::Verified>()
+        .is_some();
+
+    let result = call(request).await;
+
+    // `check_leader` marks the slot when this node applied the action, so a
+    // request the handler forwarded is recorded by the leader, not here.
+    if layer::should_record(m.scope, slot.executed_locally()) {
+        let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        let outcome = crate::accounting::txn::outcome_from_status(&status);
+        let error = status.as_ref().err().map(|s| s.message().to_string());
+        context.record(layer::build_record(
+            m,
+            layer::Caller {
+                identity: identity.as_ref(),
+                verified,
+                peer,
+                forwarded: false,
+            },
+            slot.take(),
+            outcome,
+            error.as_deref(),
+        ));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +245,107 @@ mod tests {
     #[test]
     fn taking_an_unannotated_slot_yields_nothing() {
         assert!(AuditSlot::default().take().is_none());
+    }
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<crate::accounting::TxnRecord>>);
+
+    impl AuditContext for Recorder {
+        fn record(&self, record: crate::accounting::TxnRecord) {
+            self.0.lock().expect("recorder lock").push(record);
+        }
+    }
+
+    impl Recorder {
+        fn rows(&self) -> Vec<crate::accounting::TxnRecord> {
+            self.0.lock().expect("recorder lock").clone()
+        }
+    }
+
+    /// REST dispatches below the layer, so this is what keeps it audited.
+    #[tokio::test]
+    async fn recorded_writes_a_row_for_a_handler_the_layer_never_saw() {
+        let sink = Recorder::default();
+        let out = recorded(
+            &sink,
+            "CancelJob",
+            Some("10.0.0.7:4433".into()),
+            tonic::Request::new(()),
+            |req| async move {
+                // Stands in for the handler: names its target and, as
+                // `check_leader` would on the leader, claims the work.
+                mark_executed_locally(&req);
+                annotate(&slot(&req), Annotation::new("7", serde_json::json!({})));
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(out.is_ok());
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1, "one mutation, one row");
+        assert_eq!(rows[0].entity_name, "7");
+        assert_eq!(rows[0].peer_addr, "10.0.0.7:4433");
+        assert_eq!(rows[0].outcome, crate::accounting::TxnOutcome::Success);
+    }
+
+    /// A denial is the case an operator most needs recorded.
+    #[tokio::test]
+    async fn recorded_keeps_the_row_when_the_handler_refuses() {
+        let sink = Recorder::default();
+        let out: Result<(), _> = recorded(
+            &sink,
+            "CancelJob",
+            None,
+            tonic::Request::new(()),
+            |req| async move {
+                mark_executed_locally(&req);
+                annotate(&slot(&req), Annotation::new("7", serde_json::json!({})));
+                Err(tonic::Status::permission_denied("not your job"))
+            },
+        )
+        .await;
+
+        assert!(out.is_err());
+        let rows = sink.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, crate::accounting::TxnOutcome::Denied);
+        assert!(rows[0].details.contains("not your job"));
+    }
+
+    /// A request the handler forwarded is applied and recorded by the leader, so
+    /// recording it here too would double-count it.
+    #[tokio::test]
+    async fn recorded_writes_nothing_when_the_handler_forwarded() {
+        let sink = Recorder::default();
+        let out: Result<(), _> = recorded(
+            &sink,
+            "CancelJob",
+            None,
+            tonic::Request::new(()),
+            // No `mark_executed_locally`: this node forwarded instead.
+            |_req| async move { Ok(()) },
+        )
+        .await;
+
+        assert!(out.is_ok());
+        assert!(sink.rows().is_empty());
+    }
+
+    /// Reads must not be dragged into the txn log by the REST path either.
+    #[tokio::test]
+    async fn recorded_ignores_a_read() {
+        let sink = Recorder::default();
+        let out: Result<(), _> = recorded(
+            &sink,
+            "GetJobs",
+            None,
+            tonic::Request::new(()),
+            |_req| async move { Ok(()) },
+        )
+        .await;
+
+        assert!(out.is_ok());
+        assert!(sink.rows().is_empty());
     }
 }

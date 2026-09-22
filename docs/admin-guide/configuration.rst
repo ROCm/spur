@@ -2052,8 +2052,10 @@ OpenMetrics HTTP export from ``spurctld``.
      - Start the Slurm-compatible REST server (default port 6820). Off by
        default. REST uses the same ``[auth]`` plugin and mode as gRPC: list and
        cancel require a Bearer credential when ``mode = required``, and submit
-       binds the job to that identity. Enable it only where that policy is
-       acceptable.
+       binds the job to that identity. Submit and cancel dispatch into the same
+       controller handlers the gRPC surface uses, so they share its
+       authorization, validation, leader forwarding and ``txn`` audit row.
+       Enable it only where that policy is acceptable.
    * - ``allow_non_loopback``
      - bool
      - ``false``

@@ -92,58 +92,96 @@ fn rest_effective_ntasks(ntasks: Option<u32>, nodes: Option<u32>) -> u32 {
 
 pub async fn submit_job(
     State(state): State<Arc<RestState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     identity: Option<Extension<spur_core::auth::Identity>>,
     Json(body): Json<SubmitRequest>,
 ) -> Result<Json<ApiResponse<SubmitResponse>>, RestError> {
-    if !state.raft.is_leader() {
-        return Err(unavailable_response("not the Raft leader"));
-    }
-
-    let identity = identity.map(|Extension(id)| id);
-    let time_limit = body
-        .job
-        .time_limit
-        .as_ref()
-        .and_then(|t| spur_core::config::parse_time_minutes(t))
-        .map(|mins| chrono::Duration::minutes(mins as i64));
-
-    let mut spec = spur_core::job::JobSpec {
-        name: body.job.name.unwrap_or_default(),
-        user: body.job.user.unwrap_or_default(),
-        partition: body.job.partition,
-        account: body.job.account,
-        num_nodes: body.job.nodes.unwrap_or(1),
-        num_tasks: rest_effective_ntasks(body.job.ntasks, body.job.nodes),
-        cpus_per_task: body.job.cpus_per_task.unwrap_or(1),
-        time_limit,
-        script: body.job.script,
-        environment: body.job.environment,
-        gres: body.job.gres,
-        gpus: parse_rest_gpu(body.job.gpus.as_deref())?,
-        gpus_per_node: parse_rest_gpu(body.job.gpus_per_node.as_deref())?,
-        gpus_per_task: parse_rest_gpu(body.job.gpus_per_task.as_deref())?,
-        ..Default::default()
-    };
-    spur_core::auth::bind_job_spec(&mut spec, identity.as_ref()).map_err(|e| {
-        bad_request_response(&format!(
-            "cannot resolve UNIX credentials for authenticated user: {e}"
-        ))
-    })?;
-
-    if identity.is_none() && spec.uid == 0 {
+    // REST carries no uid, so an unauthenticated submission could only run as
+    // uid 0. Refused here rather than attributed to root.
+    let Some(Extension(identity)) = identity else {
         return Err(bad_request_response(
             "REST job submission requires an authenticated caller (Authorization: Bearer). \
              Submit via `sbatch`/`srun`, or pass a credential so the job can be attributed \
              to that user rather than uid 0.",
         ));
-    }
+    };
 
-    let outcome = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
+    let time_limit = body
+        .job
+        .time_limit
+        .as_ref()
+        .and_then(|t| spur_core::config::parse_time_minutes(t))
+        .map(|mins| prost_types::Duration {
+            seconds: mins as i64 * 60,
+            nanos: 0,
+        });
+
+    let spec = spur_proto::proto::JobSpec {
+        name: body.job.name.unwrap_or_default(),
+        user: body.job.user.unwrap_or_default(),
+        partition: body.job.partition.unwrap_or_default(),
+        account: body.job.account.unwrap_or_default(),
+        num_nodes: body.job.nodes.unwrap_or(1),
+        num_tasks: rest_effective_ntasks(body.job.ntasks, body.job.nodes),
+        cpus_per_task: body.job.cpus_per_task.unwrap_or(1),
+        time_limit,
+        script: body.job.script.unwrap_or_default(),
+        environment: body.job.environment,
+        gres: body.job.gres,
+        gpus: proto_gpu(body.job.gpus.as_deref())?,
+        gpus_per_node: proto_gpu(body.job.gpus_per_node.as_deref())?,
+        gpus_per_task: proto_gpu(body.job.gpus_per_task.as_deref())?,
+        ..Default::default()
+    };
+
+    let response = dispatch(
+        &state,
+        "SubmitJob",
+        peer,
+        identity,
+        spur_proto::proto::SubmitJobRequest { spec: Some(spec) },
+        |svc, req| async move {
+            spur_proto::proto::slurm_controller_server::SlurmController::submit_job(&svc, req).await
+        },
+    )
+    .await?
+    .into_inner();
 
     Ok(ApiResponse::ok(SubmitResponse {
-        job_id: outcome.job_id,
-        warnings: outcome.warnings,
+        job_id: response.job_id,
+        warnings: response.warnings,
     }))
+}
+
+/// Hand a request to the controller handler that owns this RPC, so REST shares
+/// its authorization, validation, leader forwarding and audit row.
+async fn dispatch<Req, Resp, F, Fut>(
+    state: &Arc<RestState>,
+    method: &str,
+    peer: std::net::SocketAddr,
+    identity: spur_core::auth::Identity,
+    message: Req,
+    call: F,
+) -> Result<tonic::Response<Resp>, RestError>
+where
+    F: FnOnce(crate::server::ControllerService, tonic::Request<Req>) -> Fut,
+    Fut: std::future::Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+{
+    let mut request = tonic::Request::new(message);
+    // `rest_auth` inserts an identity only after verifying the credential, so
+    // anything reaching here is verified.
+    request.extensions_mut().insert(identity);
+    request
+        .extensions_mut()
+        .insert(crate::auth_middleware::Verified);
+
+    let service = state.controller.clone();
+    let context = crate::audit::ControllerAudit::new(state.cluster.clone());
+    crate::audit::recorded(&context, method, Some(peer.to_string()), request, |req| {
+        call(service, req)
+    })
+    .await
+    .map_err(status_to_rest)
 }
 
 /// Parse a REST GPU field ("4" or "mi300x:4") into a core GPU request.
@@ -158,22 +196,32 @@ fn parse_rest_gpu(
     }
 }
 
-fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
-    match err {
-        crate::cluster::SubmitError::InvalidArgument(m) => bad_request_response(&m),
-        crate::cluster::SubmitError::Unavailable(m) => unavailable_response(&m),
-        crate::cluster::SubmitError::Internal(m) => error_response(&format!("submit failed: {m}")),
+/// Mutations run through the controller handlers, which speak gRPC codes.
+fn status_to_rest(status: tonic::Status) -> RestError {
+    let msg = status.message();
+    match status.code() {
+        tonic::Code::InvalidArgument => bad_request_response(msg),
+        tonic::Code::NotFound => not_found_response(msg),
+        tonic::Code::PermissionDenied => forbidden_response(msg),
+        tonic::Code::Unauthenticated => unauthorized_response(msg),
+        tonic::Code::Unavailable => unavailable_response(msg),
+        // A job already in a terminal state, and the like: the caller's view is
+        // stale rather than the request being malformed.
+        tonic::Code::FailedPrecondition | tonic::Code::Aborted => {
+            api_error_response(axum::http::StatusCode::CONFLICT, msg)
+        }
+        _ => error_response(msg),
     }
 }
 
-fn rest_cancel_map_err(err: crate::cluster::CancelError) -> RestError {
-    let msg = format!("cancel failed: {err}");
-    match err {
-        crate::cluster::CancelError::NotFound(_) => not_found_response(&msg),
-        crate::cluster::CancelError::NotOwner(_) => forbidden_response(&msg),
-        crate::cluster::CancelError::AlreadyTerminal { .. }
-        | crate::cluster::CancelError::Internal(_) => error_response(&msg),
-    }
+#[allow(clippy::result_large_err)]
+fn proto_gpu(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest>, RestError> {
+    Ok(
+        parse_rest_gpu(value)?.map(|g| spur_proto::proto::GpuRequest {
+            count: g.count,
+            gpu_type: g.gpu_type.unwrap_or_default(),
+        }),
+    )
 }
 
 fn rest_list_user(
@@ -214,36 +262,34 @@ fn rest_job_json(
 pub async fn cancel_job(
     State(state): State<Arc<RestState>>,
     Path(job_id): Path<u32>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     request: axum::extract::Request,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, RestError> {
-    if !state.raft.is_leader() {
-        return Err(unavailable_response("not the Raft leader"));
-    }
-
-    let Some(identity) = request.extensions().get::<spur_core::auth::Identity>() else {
+    let Some(identity) = request
+        .extensions()
+        .get::<spur_core::auth::Identity>()
+        .cloned()
+    else {
         return Err(unauthorized_response(
             "REST job cancel requires an authenticated caller (Authorization: Bearer).",
         ));
     };
-    let user = identity.user.as_str();
 
-    let job = state.cluster.get_job(job_id);
-
-    state
-        .cluster
-        .cancel_job_for(
+    // Ownership, agent fan-out and the audit row all live in the handler.
+    dispatch(
+        &state,
+        "CancelJob",
+        peer,
+        identity,
+        spur_proto::proto::CancelJobRequest {
             job_id,
-            user,
-            identity_operates_jobs(&state.cluster, Some(identity)),
-        )
-        .map_err(rest_cancel_map_err)?;
-
-    if let Some(job) = job {
-        let cluster = state.cluster.clone();
-        tokio::spawn(async move {
-            crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
-        });
-    }
+            ..Default::default()
+        },
+        |svc, req| async move {
+            spur_proto::proto::slurm_controller_server::SlurmController::cancel_job(&svc, req).await
+        },
+    )
+    .await?;
 
     Ok(ApiResponse::ok(serde_json::json!({})))
 }
@@ -346,23 +392,26 @@ mod tests {
         assert!(msg.contains("gres"));
     }
 
+    /// Mutations now come back as gRPC codes, so the HTTP status a client sees
+    /// is decided here. A denial must not surface as a server fault.
     #[test]
-    fn rest_cancel_not_owner_is_forbidden() {
-        let err = crate::cluster::CancelError::NotOwner(spur_core::auth::AuthError::NotJobOwner {
-            user: "bob".into(),
-            owner: "alice".into(),
-            action: "cancel".into(),
-        });
-        let (status, _) = rest_cancel_map_err(err);
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
-    }
+    fn status_to_rest_maps_handler_codes() {
+        use axum::http::StatusCode;
+        use tonic::{Code, Status};
 
-    #[test]
-    fn rest_cancel_other_errors_are_internal() {
-        let (status, _) = rest_cancel_map_err(crate::cluster::CancelError::Internal(
-            anyhow::anyhow!("raft propose failed"),
-        ));
-        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        for (code, want) in [
+            (Code::PermissionDenied, StatusCode::FORBIDDEN),
+            (Code::Unauthenticated, StatusCode::UNAUTHORIZED),
+            (Code::NotFound, StatusCode::NOT_FOUND),
+            (Code::InvalidArgument, StatusCode::BAD_REQUEST),
+            (Code::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+            // Cancelling an already-finished job: a stale client view.
+            (Code::FailedPrecondition, StatusCode::CONFLICT),
+            (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (status, _) = status_to_rest(Status::new(code, "x"));
+            assert_eq!(status, want, "{code:?}");
+        }
     }
 
     #[test]

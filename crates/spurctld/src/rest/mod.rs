@@ -21,6 +21,8 @@ use crate::raft::RaftHandle;
 pub struct RestState {
     pub cluster: Arc<ClusterManager>,
     pub raft: Arc<RaftHandle>,
+    /// Mutations dispatch through this rather than touching `cluster` directly.
+    pub controller: crate::server::ControllerService,
 }
 
 fn routes() -> Router<Arc<RestState>> {
@@ -79,8 +81,13 @@ pub async fn serve(
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
     auth: spur_core::auth::BearerAuth,
+    controller: crate::server::ControllerService,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(RestState { cluster, raft });
+    let state = Arc::new(RestState {
+        cluster,
+        raft,
+        controller,
+    });
 
     let app = Router::new()
         .nest("/api/v1", routes())
@@ -95,7 +102,12 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let bound = listener.local_addr()?;
     info!(%bound, "REST API server listening");
-    axum::serve(listener, app).await?;
+    // Connect info so an audited mutation records the caller's address.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

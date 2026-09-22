@@ -1233,6 +1233,11 @@ action cannot be mutating and unrecorded; a newly added RPC fails the test suite
 until it is explicitly classified as mutating, read-only, or internal, and a
 mutating one fails until it also names the object it acts on.
 
+The REST API is covered by the same rule rather than a parallel one: its submit
+and cancel endpoints dispatch into those controller handlers, so a REST mutation
+is recorded with the same actor, target and outcome as the equivalent
+``sbatch``/``scancel``, and shows ``api`` as its **Source**.
+
 This goes well beyond stock Slurm. Slurm's ``txn_table`` records only
 ``slurmdbd``-side entities (accounts, users, associations, QOS, clusters, TRES);
 ``scontrol`` node, partition, and reservation operations appear in no table at
