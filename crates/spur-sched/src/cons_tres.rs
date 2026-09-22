@@ -351,6 +351,12 @@ impl NodeAllocation {
         }
     }
 
+    /// The attempt currently owning `job_id`'s reservation, if any — lets a
+    /// caller resolve what a stale, attempt-less release would otherwise hit.
+    pub fn owner_attempt(&self, job_id: u32) -> Option<u32> {
+        self.owners.get(&job_id).map(|owned| owned.run_attempt)
+    }
+
     /// Release owned allocations whose job is neither live nor launching within
     /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
     /// or a dropped launch instead of stranding the node until spurd restart.

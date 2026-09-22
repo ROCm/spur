@@ -558,6 +558,16 @@ fn supervisor_owns_teardown(descriptors: &[crate::stepd::StepdDescriptor]) -> bo
         .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
 }
 
+/// Same pid/start-ticks check the crash watchdog uses. A pid of 0 means no
+/// pid was ever recorded, which reads as "not yet known" rather than dead.
+fn stepd_confirmed_dead(descriptor: &crate::stepd::StepdDescriptor) -> bool {
+    descriptor.pid != 0
+        && matches!(
+            crate::stepd::stepd_liveness(descriptor),
+            Ok(crate::stepd::StepdLiveness::Stale)
+        )
+}
+
 async fn fence_displaced_stepd(
     stepds: &Arc<Mutex<StepdMap>>,
     job_id: u32,
@@ -1411,9 +1421,8 @@ async fn release_stepd_tracking(
         other.job_id == descriptor.job_id && other.run_attempt == descriptor.run_attempt
     });
 
-    // Hold `running` across the allocation release too — matching the
-    // lock order commit_job uses — so a redispatch racing this can't have
-    // its brand-new allocation torn down by this stale, job_id-keyed release.
+    // Attempt-checked on both maps: `running`'s own check guards its entry,
+    // and `release_job_if` below guards the allocation the same way.
     let removed_tracked = was_last_step && {
         let mut jobs = running.lock().await;
         if jobs
@@ -1421,7 +1430,10 @@ async fn release_stepd_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
-            allocation.lock().await.release_job(descriptor.job_id);
+            allocation
+                .lock()
+                .await
+                .release_job_if(descriptor.job_id, descriptor.run_attempt);
             true
         } else {
             false
@@ -5411,6 +5423,36 @@ impl SlurmAgent for AgentService {
         self.launch_acceptance
             .cancel_attempt(job_id, req.run_attempt);
 
+        // An attempt-less cancel has nothing to compare against below; snapshot
+        // whichever attempt is live now, before a same-job_id redispatch races in.
+        //
+        // Each lookup below is its own statement so its lock guard drops
+        // before the next is taken -- nesting as match/if scrutinees would
+        // invert against release_stepd_tracking's stepds -> running order.
+        let pre_cancel_attempt = match req.run_attempt {
+            0 => {
+                let running_attempt = self
+                    .running
+                    .lock()
+                    .await
+                    .get(&job_id)
+                    .map(|t| t.run_attempt);
+                if running_attempt.is_some() {
+                    running_attempt
+                } else {
+                    let stepd_attempt = stepds_for_job(&*self.stepds.lock().await, job_id)
+                        .first()
+                        .map(|descriptor| descriptor.run_attempt);
+                    if stepd_attempt.is_some() {
+                        stepd_attempt
+                    } else {
+                        self.allocation.lock().await.owner_attempt(job_id)
+                    }
+                }
+            }
+            named => Some(named),
+        };
+
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
@@ -5427,11 +5469,10 @@ impl SlurmAgent for AgentService {
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         if !jobs.contains_key(&job_id) {
-            let mut alloc = self.allocation.lock().await;
-            if req.run_attempt == 0 {
-                alloc.release_job(job_id);
-            } else {
-                alloc.release_job_if(job_id, req.run_attempt);
+            // `pre_cancel_attempt` already checked the ledger; `None` means
+            // anything found now landed during the signal call and is not ours.
+            if let Some(attempt) = pre_cancel_attempt {
+                self.allocation.lock().await.release_job_if(job_id, attempt);
             }
         }
         drop(jobs);
@@ -7920,6 +7961,9 @@ impl AgentService {
         self.cancel_active_steps_for_job(job_id, run_attempt, signal)
             .await;
         if supervised {
+            // A stepd already confirmed dead has no teardown coming; fence it
+            // now instead of waiting out the release-wait bound below.
+            self.reap_dead_supervised_stepds(&runtimes).await;
             if let Some(handle) = release_wait {
                 // Best-effort observe: the spawned task itself keeps running
                 // to completion regardless of whether this await, or the RPC
@@ -8095,8 +8139,8 @@ impl AgentService {
         // Spawned before the shutdown_allocation loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
         let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
-        for descriptor in runtimes {
-            match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
+        for descriptor in &runtimes {
+            match crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
                 .await
             {
                 Ok(()) => {
@@ -8104,6 +8148,7 @@ impl AgentService {
                     // slow (or bounded-out) wait can't push escalation past ~5s.
                     let signaled_at = tokio::time::Instant::now();
                     let context = self.completion_listener_context();
+                    let descriptor = descriptor.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(
                             GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()),
@@ -8156,6 +8201,9 @@ impl AgentService {
         )
         .await;
         if supervised {
+            // A stepd already confirmed dead has no teardown coming; fence it
+            // now instead of waiting out the release-wait bound below.
+            self.reap_dead_supervised_stepds(&runtimes).await;
             if let Some(handle) = release_wait {
                 // Best-effort observe: the spawned task itself keeps running
                 // to completion regardless of whether this await, or the RPC
@@ -8238,6 +8286,19 @@ impl AgentService {
                 .await;
             }
         });
+    }
+
+    /// A cancel normally just signals a supervised job's stepd and waits for
+    /// its teardown. If every stepd for this attempt is already confirmed
+    /// dead, no teardown is coming — release the ledger ourselves.
+    async fn reap_dead_supervised_stepds(&self, runtimes: &[crate::stepd::StepdDescriptor]) {
+        if runtimes.is_empty() || !runtimes.iter().all(stepd_confirmed_dead) {
+            return;
+        }
+        let context = self.completion_listener_context();
+        for descriptor in runtimes {
+            fence_dead_stepd(&context, descriptor.clone()).await;
+        }
     }
 
     /// The verified identity for this request, if the auth layer authenticated one.
@@ -9749,9 +9810,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -9810,9 +9871,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -9843,6 +9904,60 @@ mod tests {
             allocation.lock().await.allocated_memory_mb,
             0,
             "the last step out releases the allocation"
+        );
+    }
+
+    // A redispatch can reserve a newer attempt in the allocator before
+    // `running` catches up; a reap for the old attempt landing in that
+    // window must not release the newer reservation.
+    #[tokio::test]
+    async fn release_stepd_tracking_spares_a_newer_attempts_reservation() {
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve old attempt");
+        allocation.lock().await.release_job(42);
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 2, 1, 128, &[])
+            .expect("reserve newer attempt");
+
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        running.lock().await.insert(42, tracked);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        release_stepd_tracking(&running, &allocation, &sessions, &descriptor, "stale reap").await;
+
+        assert_eq!(
+            allocation.lock().await.allocated_memory_mb,
+            128,
+            "a same-job_id redispatch's newer reservation must survive a stale reap for the old attempt"
         );
     }
 
@@ -9937,9 +10052,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -16430,6 +16545,423 @@ mod tests {
             );
         }
         svc.running.lock().await.remove(&job_id);
+    }
+
+    // If a supervised job's stepd pid is already confirmed gone, its teardown
+    // will never come, so the cancel must force the release itself.
+    #[tokio::test]
+    async fn graceful_cancel_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 960;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-960.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released"
+        );
+    }
+
+    // The mirror case: the stepd is still alive, so the ledger must stay put
+    // and wait for its own teardown, exactly as before this fix.
+    #[tokio::test]
+    async fn graceful_cancel_does_not_reclaim_a_live_supervised_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 961;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            std::path::PathBuf::from("/tmp/spur-test-live-stepd-961.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "live-stepd-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a live supervised job must not be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "a live supervised job's allocation must not be released"
+        );
+    }
+
+    // An older attempt's stepd can be confirmed dead while a newer attempt
+    // legitimately owns the job; naming the old one must spare the new one.
+    #[tokio::test]
+    async fn graceful_cancel_for_a_superseded_attempt_spares_the_newer_runs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 962;
+        let dead_attempt = 1;
+        let live_attempt = 2;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            dead_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-superseded-stepd-962.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "superseded-dead-stepd-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, live_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, live_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = live_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        // Names the older, now-dead attempt explicitly, as an eviction-style
+        // cancel targeting one stale run would.
+        svc.graceful_cancel(job_id, dead_attempt).await;
+
+        assert_eq!(
+            svc.running.lock().await.get(&job_id).map(|t| t.run_attempt),
+            Some(live_attempt),
+            "cancelling a dead older attempt must not evict the newer legitimate run"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "cancelling a dead older attempt must not release the newer run's allocation"
+        );
+    }
+
+    // send_explicit_signal has the identical gap as graceful_cancel for a
+    // supervised job; cover it through this entry point too.
+    #[tokio::test]
+    async fn send_explicit_signal_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 963;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-963.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-signal-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released"
+        );
+    }
+
+    // A non-lethal signal never spawns spawn_stepd_release_wait (release_wait
+    // is None unless supervised && lethal), so reap_dead_supervised_stepds is
+    // the only thing that can notice an already-dead stepd on this path.
+    #[tokio::test]
+    async fn send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 965;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-965.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-non-lethal-signal-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGUSR1 as i32)
+            .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped even on a non-lethal signal"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released \
+             even when no release-wait task was ever spawned for it"
+        );
+    }
+
+    // A multi-step job with one dead and one still-live stepd must not be
+    // reaped at all: the live sibling may still need its allocation.
+    #[tokio::test]
+    async fn graceful_cancel_spares_a_job_with_one_live_sibling_stepd() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 964;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut dead = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-sibling-964.sock"),
+            std::path::PathBuf::new(),
+        );
+        dead.capability = "dead-sibling-test".into();
+        let mut alive = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            5,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            std::path::PathBuf::from("/tmp/spur-test-live-sibling-964.sock"),
+            std::path::PathBuf::new(),
+        );
+        alive.capability = "live-sibling-test".into();
+        {
+            let mut sessions = svc.stepds.lock().await;
+            sessions.insert(stepd_key(&dead), dead.clone());
+            sessions.insert(stepd_key(&alive), alive.clone());
+        }
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a job with a live sibling stepd must not be dropped from running"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "a job with a live sibling stepd must not have its allocation released"
+        );
+    }
+
+    // An attempt-less (reclaim-heartbeat) cancel resolves its doomed attempt
+    // from a still-registered dead stepd; a redispatch that already reserved
+    // a newer attempt for the same job_id by then must survive it.
+    #[tokio::test]
+    async fn cancel_with_no_named_attempt_spares_a_reused_job_ids_newer_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 970;
+        let dead_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            dead_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-reused-jobid-970.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "reused-jobid-no-attempt-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        // A redispatch reserved a newer attempt but hasn't registered a stepd
+        // or `running` entry yet -- exactly the window a wildcard cancel lands in.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(job_id, dead_attempt, 1, 0, &[0])
+                .expect("reserve dead attempt");
+            alloc.release_job(job_id);
+            alloc
+                .allocate_for_job(job_id, 2, 1, 0, &[0])
+                .expect("reserve newer attempt");
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "an attempt-less cancel resolved only against a dead stepd must not \
+             release a reused job_id's newer reservation"
+        );
+    }
+
+    // A launching reservation with neither a `running` entry nor a stepd has
+    // nothing but the allocation ledger itself to name its attempt; an
+    // attempt-less cancel must still find and release it through that.
+    #[tokio::test]
+    async fn cancel_with_no_named_attempt_and_no_tracking_releases_via_the_allocation_ledger() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 972;
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, 1, 1, 0, &[0])
+            .expect("reserve launching");
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a launching reservation with no running/stepd tracking must still \
+             be released by an attempt-less cancel via the allocation ledger"
+        );
     }
 
     // A stale-epoch drop (peeked before a concurrent redispatch retracked the
