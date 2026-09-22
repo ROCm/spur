@@ -349,22 +349,32 @@ fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::
     Ok((buf[..read].to_vec(), fds))
 }
 
-/// A reply's `sendmsg` is as raw and blocking as the request's `recvmsg`, so
-/// it gets the same blocking-pool treatment as `serve_pty_custody`'s read.
-async fn send_custody_reply(
+/// A reply's `sendmsg` is as blocking as the request's `recvmsg`, so it gets
+/// the same blocking-pool-plus-timeout treatment (the caller drops its
+/// custody-map lock first, so this can't stall other terminals either).
+async fn bounded_custody_reply(
     raw: std::os::fd::RawFd,
     payload: [u8; 5],
-    fds: Vec<std::os::fd::RawFd>,
-) -> nix::Result<()> {
-    match tokio::task::spawn_blocking(move || send_custody(raw, &payload, &fds)).await {
-        Ok(result) => result,
-        Err(_) => Ok(()), // task panicked or was cancelled; nothing left to report to
-    }
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    let send = tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        let raw_fds: Vec<_> = fds.iter().map(std::os::fd::OwnedFd::as_raw_fd).collect();
+        send_custody(raw, &payload, &raw_fds)
+    });
+    let joined = match request_timeout() {
+        Some(bound) => tokio::time::timeout(bound, send)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custody peer did not read"))?,
+        None => send.await,
+    };
+    joined
+        .map_err(|error| io::Error::other(format!("custody reply task failed: {error}")))?
+        .map_err(|error| io::Error::other(format!("send custody reply: {error}")))
 }
 
 /// Runs one custody request/reply on the blocking pool, bounded like a stepd
-/// control request: `send_custody`/`recv_custody` are raw blocking syscalls, and
-/// an unresponsive peer must not strand a runtime worker thread forever.
+/// control request, so an unresponsive peer can't strand a worker thread.
 async fn custody_exchange(
     session_dir: &std::path::Path,
     payload: [u8; 5],
@@ -1484,10 +1494,8 @@ async fn serve_pty_custody(listener: UnixListener) {
             if stream.set_nonblocking(false).is_err() {
                 return;
             }
-            // Raw blocking recvmsg (fd-passing needs it): off the async
-            // workers and bounded, so a client that connects and goes silent
-            // strands a blocking-pool thread, not one this process needs to
-            // serve everyone else's custody requests.
+            // Raw blocking recvmsg (fd-passing needs it), so a silent client
+            // strands a blocking-pool thread, not a worker this process needs.
             let raw = stream.as_raw_fd();
             let received = match request_timeout() {
                 Some(bound) => tokio::time::timeout(
@@ -1519,13 +1527,21 @@ async fn serve_pty_custody(listener: UnixListener) {
                 },
                 CUSTODY_RECLAIM_ANY => {
                     tracing::debug!(held = custody.len(), "pty custody: reclaim-any");
-                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.as_raw_fd()));
+                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.try_clone()));
+                    // A duplicate, not the map's own fd: the deferred reply below
+                    // outlives this lock, and the map entry can be removed or
+                    // replaced (a concurrent release/deposit) before it runs.
                     let (reply, id, fds) = match claimed {
-                        Some((id, raw_fd)) => (CUSTODY_FOUND, id, vec![raw_fd]),
+                        Some((id, Ok(dup))) => (CUSTODY_FOUND, id, vec![dup]),
+                        Some((_, Err(error))) => {
+                            tracing::warn!(%error, "failed to duplicate an orphaned pty's fd");
+                            (CUSTODY_ABSENT, 0, Vec::new())
+                        }
                         None => (CUSTODY_ABSENT, 0, Vec::new()),
                     };
+                    drop(custody);
                     if let Err(error) =
-                        send_custody_reply(raw, custody_payload(reply, id), fds).await
+                        bounded_custody_reply(raw, custody_payload(reply, id), fds).await
                     {
                         tracing::warn!(%error, "failed to hand back an orphaned pty");
                     }
@@ -1534,12 +1550,20 @@ async fn serve_pty_custody(listener: UnixListener) {
                     custody.remove(&session_id);
                 }
                 CUSTODY_RECLAIM => {
-                    let (reply, fds) = match custody.get(&session_id) {
-                        Some(master) => (CUSTODY_FOUND, vec![master.as_raw_fd()]),
+                    let (reply, fds) = match custody
+                        .get(&session_id)
+                        .map(std::os::fd::OwnedFd::try_clone)
+                    {
+                        Some(Ok(dup)) => (CUSTODY_FOUND, vec![dup]),
+                        Some(Err(error)) => {
+                            tracing::warn!(session_id, %error, "failed to duplicate a pty master's fd");
+                            (CUSTODY_ABSENT, Vec::new())
+                        }
                         None => (CUSTODY_ABSENT, Vec::new()),
                     };
+                    drop(custody);
                     if let Err(error) =
-                        send_custody_reply(raw, custody_payload(reply, session_id), fds).await
+                        bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await
                     {
                         tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
@@ -5260,10 +5284,8 @@ mod tests {
         );
     }
 
-    // A single-threaded runtime, like the two tests above use for the control
-    // socket: if the custody exchange ever blocks that one thread directly
-    // instead of on the blocking pool, unrelated work queued on it starves
-    // for as long as the wedged peer stays silent.
+    // On a single-threaded runtime, a custody exchange blocking that one
+    // thread directly (instead of on the blocking pool) starves unrelated work.
     #[tokio::test]
     async fn a_wedged_custody_peer_does_not_starve_unrelated_work() {
         REQUEST_TIMEOUT.with(|timeout| timeout.set(Some(std::time::Duration::from_millis(200))));
