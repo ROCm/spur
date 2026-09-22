@@ -320,13 +320,28 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     writeln!(w, "Usage: spur <command> [args...]")?;
     writeln!(w)?;
     writeln!(w, "Commands:")?;
-    writeln!(w, "  net         Manage WireGuard mesh network (init/join/status)")?;
-    writeln!(w, "  k8s         Manage the SPUR-provisioned k0s cluster (up/down/status/kubeconfig)")?;
-    writeln!(w, "  image       Manage container images (import/list/remove)")?;
-    writeln!(w, "  exec        Execute a command inside a running container job")?;
+    writeln!(
+        w,
+        "  net         Manage WireGuard mesh network (init/join/status)"
+    )?;
+    writeln!(
+        w,
+        "  k8s         Manage the SPUR-provisioned k0s cluster (up/down/status/kubeconfig)"
+    )?;
+    writeln!(
+        w,
+        "  image       Manage container images (import/list/remove)"
+    )?;
+    writeln!(
+        w,
+        "  exec        Execute a command inside a running container job"
+    )?;
     writeln!(w, "  submit      Submit a batch job script")?;
     writeln!(w, "  run         Run a parallel job (interactive)")?;
-    writeln!(w, "  alloc       Allocate resources for an interactive session")?;
+    writeln!(
+        w,
+        "  alloc       Allocate resources for an interactive session"
+    )?;
     writeln!(w, "  queue       View the job queue")?;
     writeln!(w, "  cancel      Cancel pending or running jobs")?;
     writeln!(w, "  nodes       View cluster node information")?;
@@ -342,13 +357,28 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     writeln!(w, "  attach      Attach to a running job's I/O")?;
     writeln!(w, "  crontab     Manage recurring cron-style jobs")?;
     writeln!(w, "  health      Node health monitoring")?;
-    writeln!(w, "  auth-keys   Generate JWKS files for native authentication")?;
-    writeln!(w, "  version     Show version (--check to check for updates)")?;
-    writeln!(w, "  self-update Download and install the latest version (--nightly)")?;
+    writeln!(
+        w,
+        "  auth-keys   Generate JWKS files for native authentication"
+    )?;
+    writeln!(
+        w,
+        "  version     Show version (--check to check for updates)"
+    )?;
+    writeln!(
+        w,
+        "  self-update Download and install the latest version (--nightly)"
+    )?;
     writeln!(w)?;
     writeln!(w, "Slurm-compatible aliases (also work as symlinks):")?;
-    writeln!(w, "  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol")?;
-    writeln!(w, "  sprio sshare sstat sdiag sreport strigger sattach scrontab smd")
+    writeln!(
+        w,
+        "  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol"
+    )?;
+    writeln!(
+        w,
+        "  sprio sshare sstat sdiag sreport strigger sattach scrontab smd"
+    )
 }
 
 #[cfg(test)]
@@ -397,9 +427,31 @@ mod tests {
         assert!(text.starts_with("spur — AI-native job scheduler"));
         assert!(text.contains("Usage: spur <command> [args...]"));
         for cmd in [
-            "net", "k8s", "image", "exec", "submit", "run", "alloc", "queue", "cancel", "nodes",
-            "history", "accounts", "show", "priority", "share", "stat", "diag", "report",
-            "trigger", "attach", "crontab", "health", "auth-keys", "version", "self-update",
+            "net",
+            "k8s",
+            "image",
+            "exec",
+            "submit",
+            "run",
+            "alloc",
+            "queue",
+            "cancel",
+            "nodes",
+            "history",
+            "accounts",
+            "show",
+            "priority",
+            "share",
+            "stat",
+            "diag",
+            "report",
+            "trigger",
+            "attach",
+            "crontab",
+            "health",
+            "auth-keys",
+            "version",
+            "self-update",
         ] {
             assert!(text.contains(cmd), "usage is missing command `{cmd}`");
         }
