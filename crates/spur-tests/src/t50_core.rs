@@ -575,9 +575,9 @@ mod tests {
 
     #[test]
     fn t50_53_step_batch_constant() {
-        assert_eq!(spur_core::step::STEP_BATCH, 0xFFFF_FFFE);
-        assert_eq!(spur_core::step::STEP_EXTERN, 0xFFFF_FFFD);
-        assert_eq!(spur_core::step::STEP_INTERACTIVE, 0xFFFF_FFFC);
+        assert_eq!(spur_core::step::STEP_BATCH, 0xFFFF_FFFB);
+        assert_eq!(spur_core::step::STEP_EXTERN, 0xFFFF_FFFC);
+        assert_eq!(spur_core::step::STEP_INTERACTIVE, 0xFFFF_FFFA);
     }
 
     #[test]

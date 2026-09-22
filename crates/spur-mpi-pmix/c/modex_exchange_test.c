@@ -16,7 +16,8 @@
 
 static char g_peer_hosts[2][256];
 
-#define SPUR_TEST_STEP_ID 0xFFFFFFFEu
+/* spur STEP_BATCH / Slurm SLURM_BATCH_SCRIPT sentinel. */
+#define SPUR_TEST_STEP_ID 0xFFFFFFFBu
 #define SPUR_TEST_MAGIC 0x53505552u
 #define SPUR_TEST_VERSION 3u
 #define SPUR_TEST_FLAG_ABORT 0x00000001u
@@ -229,7 +230,7 @@ static int test_port_matches_rust_derivation(void) {
         {0, 0, 16819},
         {1, 0, 20580},
         {42, 0, 24381},
-        {42, 0xFFFFFFFEu, 24379},
+        {42, 0xFFFFFFFBu, 24376}, /* STEP_BATCH */
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint16_t got = spur_modex_port_for_step(cases[i].job_id, cases[i].step_id);

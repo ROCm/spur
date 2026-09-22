@@ -810,7 +810,7 @@ mod tests {
         host.active_namespaces
             .lock()
             .unwrap()
-            .insert((6, TEST_STEP), "spur.6.4294967294".into());
+            .insert((6, TEST_STEP), "spur.6.4294967291".into());
         let plan =
             PmixLaunchPlan::local_tasks(6, TEST_STEP, 1, 0, 1, "/tmp/pmix", 0, 0, 1, 0, vec![]);
 
@@ -931,7 +931,7 @@ mod tests {
         host.active_namespaces
             .lock()
             .unwrap()
-            .insert((3, TEST_STEP), "spur.3.4294967294".into());
+            .insert((3, TEST_STEP), "spur.3.4294967291".into());
 
         host.release_pmix_server(3, TEST_STEP).unwrap();
 
@@ -1017,7 +1017,7 @@ mod tests {
         host.active_namespaces
             .lock()
             .unwrap()
-            .insert((56, TEST_STEP), "spur.56.4294967294".into());
+            .insert((56, TEST_STEP), "spur.56.4294967291".into());
 
         host.stop_pmix_job(55).unwrap();
 

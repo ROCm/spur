@@ -3349,7 +3349,7 @@ mod tests {
         let pmix = restored
             .pmix
             .expect("the PMIx plan must survive launch.json");
-        assert_eq!(pmix.plan.namespace, "spur.42.4294967294");
+        assert_eq!(pmix.plan.namespace, "spur.42.4294967291");
         assert_eq!(pmix.plan.local_procs.len(), 2);
         assert_eq!(pmix.config.plugin_dir, "/opt/spur/lib");
         assert_eq!(pmix.user_script_path, "/tmp/.spur_user_42.sh");
