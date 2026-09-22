@@ -11,6 +11,7 @@ use spur_proto::proto::{CreateTokenRequest, ListTokensRequest, RevokeTokenReques
 #[derive(Parser, Debug)]
 #[command(name = "token", about = "Manage admission tokens")]
 pub struct TokenArgs {
+    /// Controller address
     #[arg(
         long,
         env = "SPUR_CONTROLLER_ADDR",
