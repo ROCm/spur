@@ -1013,7 +1013,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .map(parse_sbatch_directives)
         .unwrap_or_default();
 
-    let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
+    let mut args = resolve_sbatch_args(&directive_args, &cli_args).unwrap_or_else(|e| e.exit());
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     if args.mpi == "list" {

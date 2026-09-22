@@ -136,7 +136,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SacctArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SacctArgs>(&args);
 
     // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
     let fields = if let Some(ref f) = args.format {

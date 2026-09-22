@@ -135,7 +135,7 @@ fn plan_query(args: &SqueueArgs) -> Result<QueryPlan> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SqueueArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SqueueArgs>(&args);
 
     let QueryPlan {
         fmt,

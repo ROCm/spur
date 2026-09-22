@@ -3,6 +3,7 @@
 
 mod auth_keys;
 mod authclient;
+mod clap_exit;
 mod env_defaults;
 mod exec;
 mod exit_fmt;

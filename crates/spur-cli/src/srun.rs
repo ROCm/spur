@@ -5,7 +5,7 @@ use crate::env_defaults::{
     apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, was_cli_set,
 };
 use anyhow::{Context, Result};
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgMatches, CommandFactory, Parser};
 use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -222,8 +222,8 @@ pub async fn main() -> Result<()> {
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let submit_line = crate::submitline::render(&args);
-    let matches = SrunArgs::command().try_get_matches_from(&args)?;
-    let mut args = SrunArgs::from_arg_matches(&matches)?;
+    let matches = crate::clap_exit::matches_or_exit(SrunArgs::command(), &args);
+    let mut args = crate::clap_exit::from_matches_or_exit::<SrunArgs>(&matches);
 
     if args.jobid.is_some() && !args.overlap {
         anyhow::bail!("--jobid requires --overlap");
@@ -1847,6 +1847,7 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
 
     /// A --pty step now runs inside the requested container, so it no longer
     /// warns that container options are dropped.
