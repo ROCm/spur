@@ -89,7 +89,7 @@ class TestRcclIntraNode:
         if gpus < 2:
             pytest.skip(f"intra-node RCCL needs 2 visible GPUs, found {gpus}")
 
-        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "1", "-n", "2", binary])
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "1", "-n", "2", "--gres=gpu:2", binary])
         assert code == 0, f"srun failed (exit {code}):\n{out}"
 
         ranks, size, hosts = parse_ranks(out)
@@ -113,7 +113,7 @@ class TestRcclIntraNode:
         if gpus < 2:
             pytest.skip(f"device-distinctness needs 2 visible GPUs, found {gpus}")
 
-        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "1", "-n", "2", binary])
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "1", "-n", "2", "--gres=gpu:2", binary])
         assert code == 0, f"srun failed (exit {code}):\n{out}"
 
         devices = [int(m.group(4)) for m in map(RANK_RE.match, map(str.strip, out.splitlines())) if m]
@@ -134,7 +134,7 @@ class TestRcclInterNode:
         cluster.rccl_preflight(2)
         binary = cluster.compile_rccl_fixture()
 
-        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "2", binary])
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "2", "--gres=gpu:1", binary])
         assert code == 0, f"srun failed (exit {code}):\n{out}"
 
         ranks, size, hosts = parse_ranks(out)
@@ -157,7 +157,7 @@ class TestRcclInterNode:
         if gpus < 2:
             pytest.skip(f"2 ranks per node needs 2 visible GPUs, found {gpus}")
 
-        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "4", binary])
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "4", "--gres=gpu:2", binary])
         assert code == 0, f"srun failed (exit {code}):\n{out}"
 
         ranks, size, hosts = parse_ranks(out)
@@ -189,7 +189,7 @@ class TestRcclInterNode:
 
         for attempt in range(2):
             code, out = cluster.srun_with_exit(
-                ["--mpi=pmix", "-N", "2", "-n", "2", binary]
+                ["--mpi=pmix", "-N", "2", "-n", "2", "--gres=gpu:1", binary]
             )
             assert code == 0, f"attempt {attempt} failed (exit {code}):\n{out}"
             assert_allreduce_correct(out, 2)

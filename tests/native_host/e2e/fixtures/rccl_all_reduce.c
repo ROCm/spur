@@ -18,7 +18,10 @@
 //   hipcc -o rccl_all_reduce rccl_all_reduce.c -lrccl -lmpi -I<mpi_include>
 
 #include <mpi.h>
-#include <rccl/rccl.h>
+// Plain <rccl.h>, paired with a -I at whichever directory actually holds the
+// header. ROCm moved it into an rccl/ subdirectory between versions, so the
+// include path is resolved per node rather than assumed here.
+#include <rccl.h>
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>

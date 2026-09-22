@@ -104,6 +104,21 @@ class SshNode:
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         connect_kwargs = {"hostname": host, "username": user}
+        # Nodes reachable only through a bastion: paramiko does not read ssh_config,
+        # so a ProxyCommand there has no effect. Dial through a SOCKS5 proxy instead
+        # and hand paramiko the connected socket. The hostname is unchanged, which
+        # matters because the same string is what the cluster tells its own nodes to
+        # use for controller and agent addresses.
+        socks_proxy = os.environ.get("SPUR_TEST_SSH_SOCKS", "").strip()
+        if socks_proxy:
+            import socks  # PySocks; only needed on this path
+
+            proxy_host, _, proxy_port = socks_proxy.rpartition(":")
+            sock = socks.socksocket()
+            sock.set_proxy(socks.SOCKS5, proxy_host or "127.0.0.1", int(proxy_port))
+            sock.settimeout(60)
+            sock.connect((host, 22))
+            connect_kwargs["sock"] = sock
         if key_path:
             connect_kwargs["key_filename"] = key_path
         elif password:
@@ -422,6 +437,12 @@ class SpurCluster:
         parts = [
             f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            # Point the CLI at this cluster's own config. The daemons already get it
+            # via -f, but the CLI would otherwise fall back to /etc/spur/spur.conf and
+            # inherit whatever the host is configured for -- on a node set up for
+            # native auth it refuses to talk to a throwaway controller at all
+            # ("controller did not advertise a native auth audience").
+            f"SPUR_CONF={shlex.quote(self.etc_dir)}/spur.conf",
         ]
         for key, value in self.cli_env.items():
             parts.append(f"{key}={shlex.quote(str(value))}")
@@ -1101,6 +1122,17 @@ class SpurCluster:
             ).strip()
         found["rccl_include"] = inc
 
+        # hipcc compiles a .c file with `-x c` and does not add the HIP include
+        # path itself, but rccl.h includes <hip/hip_runtime.h>. Locate the include
+        # root that holds it rather than assuming /opt/rocm/include.
+        hip_inc = os.environ.get("SPUR_TEST_HIP_INCLUDE", "").strip()
+        if not hip_inc:
+            hip_inc = node.exec_allow_fail(
+                'for d in "$ROCM_PATH/include" /opt/rocm/include; do '
+                '[ -f "$d/hip/hip_runtime.h" ] && { echo "$d"; break; }; done'
+            ).strip()
+        found["hip_include"] = hip_inc
+
         lib = os.environ.get("SPUR_TEST_ROCM_LIB", "").strip()
         if not lib:
             lib = node.exec_allow_fail(
@@ -1130,6 +1162,8 @@ class SpurCluster:
                 missing.append(f"hipcc on {name} (set SPUR_TEST_HIPCC)")
             if not paths["rccl_include"]:
                 missing.append(f"rccl.h on {name} (set SPUR_TEST_RCCL_INCLUDE)")
+            if not paths["hip_include"]:
+                missing.append(f"hip/hip_runtime.h on {name} (set SPUR_TEST_HIP_INCLUDE)")
             if not paths["rocm_lib"]:
                 missing.append(f"librccl on {name} (set SPUR_TEST_ROCM_LIB)")
 
@@ -1159,9 +1193,22 @@ class SpurCluster:
             inc = mpi_inc or node.exec_allow_fail(
                 f"{shlex.quote(mpicc)} -showme:incdirs 2>/dev/null | tr ' ' '\\n' | head -1"
             ).strip() or "/usr/lib/x86_64-linux-gnu/openmpi/include"
-            flags = [f"-I{shlex.quote(inc)}"]
+            # hipcc only defines the platform macro when it is compiling HIP/C++.
+            # This payload is plain C -- it calls the RCCL host API and never launches
+            # a kernel -- so the HIP headers need it stated explicitly.
+            # hipcc is not the MPI compiler wrapper, so it inherits none of mpicc's
+            # search paths. Ask mpicc for its own lib dir the same way as its includes;
+            # a vendor MPI under a versioned prefix is not on the default link path.
+            mpi_lib = os.environ.get("SPUR_TEST_MPI_LIB", "").strip() or node.exec_allow_fail(
+                f"{shlex.quote(mpicc)} -showme:libdirs 2>/dev/null | tr ' ' '\\n' | head -1"
+            ).strip()
+            flags = ["-D__HIP_PLATFORM_AMD__", f"-I{shlex.quote(inc)}"]
+            if mpi_lib:
+                flags.append(f"-L{shlex.quote(mpi_lib)}")
             if paths["rccl_include"]:
                 flags.append(f"-I{shlex.quote(paths['rccl_include'])}")
+            if paths["hip_include"]:
+                flags.append(f"-I{shlex.quote(paths['hip_include'])}")
             # LDCACHE means the loader already knows where librccl is, so -L would
             # only risk pointing at a second copy.
             if paths["rocm_lib"] and paths["rocm_lib"] != "LDCACHE":
