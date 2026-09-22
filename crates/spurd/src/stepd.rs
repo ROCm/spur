@@ -349,6 +349,38 @@ fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::
     Ok((buf[..read].to_vec(), fds))
 }
 
+/// Runs one custody request/reply on the blocking pool, bounded like a stepd
+/// control request: `send_custody`/`recv_custody` are raw blocking syscalls, and
+/// an unresponsive peer must not strand a runtime worker thread forever.
+async fn custody_exchange(
+    session_dir: &std::path::Path,
+    payload: [u8; 5],
+    fds: Vec<std::os::fd::RawFd>,
+    expect_reply: bool,
+) -> io::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    let exchange = tokio::task::spawn_blocking(move || -> io::Result<_> {
+        use std::os::fd::AsRawFd;
+        let raw = stream.as_raw_fd();
+        send_custody(raw, &payload, &fds)
+            .map_err(|error| io::Error::other(format!("send custody request: {error}")))?;
+        if !expect_reply {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        recv_custody(raw)
+            .map_err(|error| io::Error::other(format!("recv custody response: {error}")))
+    });
+    let joined = match request_timeout() {
+        Some(bound) => tokio::time::timeout(bound, exchange)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custody peer did not answer"))?,
+        None => exchange.await,
+    };
+    joined.map_err(|error| io::Error::other(format!("custody exchange task failed: {error}")))?
+}
+
 /// Ask the supervisor to hold a dup of one shell's pty master, so that terminal
 /// does not hang up when the agent that created it goes away. Keyed per shell:
 /// one job can have several terminals open at once.
@@ -358,15 +390,14 @@ pub async fn deposit_pty_master(
     master: std::os::fd::BorrowedFd<'_>,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    send_custody(
-        stream.as_raw_fd(),
-        &custody_payload(CUSTODY_DEPOSIT, session_id),
-        &[master.as_raw_fd()],
+    custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_DEPOSIT, session_id),
+        vec![master.as_raw_fd()],
+        false,
     )
-    .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
+    .await?;
+    Ok(())
 }
 
 /// Claim a terminal the job has left orphaned, returning its shell id with the
@@ -375,33 +406,29 @@ pub async fn deposit_pty_master(
 pub async fn reclaim_orphaned_pty(
     session_dir: &std::path::Path,
 ) -> io::Result<Option<(u32, std::os::fd::OwnedFd)>> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    let raw = stream.as_raw_fd();
-    send_custody(raw, &custody_payload(CUSTODY_RECLAIM_ANY, 0), &[])
-        .map_err(|error| io::Error::other(format!("request orphaned pty: {error}")))?;
-    let (payload, fds) = recv_custody(raw)
-        .map_err(|error| io::Error::other(format!("reclaim orphaned pty: {error}")))?;
-    match parse_custody_payload(&payload) {
-        Some((CUSTODY_FOUND, session_id)) => Ok(fds.into_iter().next().map(|fd| (session_id, fd))),
-        _ => Ok(None),
-    }
+    let (payload, fds) = custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RECLAIM_ANY, 0),
+        Vec::new(),
+        true,
+    )
+    .await?;
+    Ok(match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, session_id)) => fds.into_iter().next().map(|fd| (session_id, fd)),
+        _ => None,
+    })
 }
 
 /// Stop holding a terminal that has closed.
 pub async fn release_pty_master(session_dir: &std::path::Path, session_id: u32) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    send_custody(
-        stream.as_raw_fd(),
-        &custody_payload(CUSTODY_RELEASE, session_id),
-        &[],
+    custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RELEASE, session_id),
+        Vec::new(),
+        false,
     )
-    .map_err(|error| io::Error::other(format!("release pty master: {error}")))
+    .await?;
+    Ok(())
 }
 
 /// Reclaim one shell's master, so a replacement agent resumes that terminal
@@ -410,19 +437,17 @@ pub async fn reclaim_pty_master(
     session_dir: &std::path::Path,
     session_id: u32,
 ) -> io::Result<Option<std::os::fd::OwnedFd>> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    let raw = stream.as_raw_fd();
-    send_custody(raw, &custody_payload(CUSTODY_RECLAIM, session_id), &[])
-        .map_err(|error| io::Error::other(format!("request pty master: {error}")))?;
-    let (payload, fds) = recv_custody(raw)
-        .map_err(|error| io::Error::other(format!("reclaim pty master: {error}")))?;
-    match parse_custody_payload(&payload) {
-        Some((CUSTODY_FOUND, _)) => Ok(fds.into_iter().next()),
-        _ => Ok(None),
-    }
+    let (payload, fds) = custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RECLAIM, session_id),
+        Vec::new(),
+        true,
+    )
+    .await?;
+    Ok(match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, _)) => fds.into_iter().next(),
+        _ => None,
+    })
 }
 
 const OBLIGATION_FILE: &str = "obligations.jsonl";
@@ -1446,8 +1471,24 @@ async fn serve_pty_custody(listener: UnixListener) {
             if stream.set_nonblocking(false).is_err() {
                 return;
             }
+            // Raw blocking recvmsg (fd-passing needs it): off the async
+            // workers and bounded, so a client that connects and goes silent
+            // strands a blocking-pool thread, not one this process needs to
+            // serve everyone else's custody requests.
             let raw = stream.as_raw_fd();
-            let Ok((payload, fds)) = recv_custody(raw) else {
+            let received = match request_timeout() {
+                Some(bound) => tokio::time::timeout(
+                    bound,
+                    tokio::task::spawn_blocking(move || recv_custody(raw)),
+                )
+                .await
+                .ok()
+                .and_then(|joined| joined.ok()),
+                None => tokio::task::spawn_blocking(move || recv_custody(raw))
+                    .await
+                    .ok(),
+            };
+            let Some(Ok((payload, fds))) = received else {
                 return;
             };
             let Some((opcode, session_id)) = parse_custody_payload(&payload) else {
@@ -5201,5 +5242,46 @@ mod tests {
             greeted.load(Ordering::Acquire),
             "the bound must cover the request, not just the handshake"
         );
+    }
+
+    // A single-threaded runtime, like the two tests above use for the control
+    // socket: if the custody exchange ever blocks that one thread directly
+    // instead of on the blocking pool, unrelated work queued on it starves
+    // for as long as the wedged peer stays silent.
+    #[tokio::test]
+    async fn a_wedged_custody_peer_does_not_starve_unrelated_work() {
+        REQUEST_TIMEOUT.with(|timeout| timeout.set(Some(std::time::Duration::from_millis(200))));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
+
+        // Accepts the connection, same as a live stepd, but never answers —
+        // the state an orphaned `<defunct>` child can leave its supervisor in.
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let session_dir = dir.path().to_path_buf();
+        let reclaim = tokio::spawn(async move { reclaim_orphaned_pty(&session_dir).await });
+
+        let unrelated = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            42
+        });
+        let unrelated_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), unrelated)
+                .await
+                .expect("unrelated work must not be starved by a stuck custody peer")
+                .expect("join");
+        assert_eq!(unrelated_result, 42);
+
+        let error = reclaim
+            .await
+            .expect("join")
+            .expect_err("a wedged custody peer must time out, not hang forever");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }
