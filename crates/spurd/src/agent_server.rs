@@ -8360,6 +8360,10 @@ impl AgentService {
         if !removed {
             return;
         }
+        self.interactive_launch_steps
+            .lock()
+            .await
+            .remove(&(job_id, run_attempt));
         let stale_sessions = {
             let mut sessions = self.stepds.lock().await;
             let stale: Vec<_> = stepds_for_job(&sessions, job_id)
@@ -17703,6 +17707,38 @@ mod tests {
                 .map(|job| job.run_attempt),
             Some(2),
             "a stale-epoch drop must not evict a newer, already-retracked job"
+        );
+    }
+
+    // interactive_launch_steps tracks which step a job's own interactive
+    // launch used, keyed the same as `running`/`stepds` — it must be pruned
+    // alongside them or it grows for the life of the process.
+    #[tokio::test]
+    async fn drop_tracked_job_prunes_interactive_launch_steps() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 966;
+        let run_attempt = 1;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+        svc.interactive_launch_steps
+            .lock()
+            .await
+            .insert((job_id, run_attempt), spur_core::step::STEP_INTERACTIVE);
+
+        svc.drop_tracked_job(job_id, run_attempt).await;
+
+        assert!(
+            !svc.interactive_launch_steps
+                .lock()
+                .await
+                .contains_key(&(job_id, run_attempt)),
+            "a dropped job must not leave its interactive-launch step entry behind"
         );
     }
 
