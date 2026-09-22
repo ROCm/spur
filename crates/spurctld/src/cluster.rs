@@ -1954,6 +1954,16 @@ impl ClusterManager {
                 return Ok(NodeCompleteResult::StaleReport);
             }
             if !job.allocated_nodes.iter().any(|n| n == node_name) {
+                // A requeue frees the nodes before the agent's report for the run it
+                // just killed can arrive, and it does not bump `run_attempt`, so the
+                // epoch check above cannot catch that report. For a job that is no
+                // longer running this is the expected race rather than a caller
+                // error: the run being described was already ended by the requeue.
+                // Returning InvalidArgument here made the agent give up (the error is
+                // classified non-retryable), leaving the run unfinalized.
+                if job.state != JobState::Running {
+                    return Ok(NodeCompleteResult::StaleReport);
+                }
                 return Err(NodeCompleteError::NodeNotAllocated {
                     job_id,
                     node: node_name.to_string(),
@@ -12259,6 +12269,99 @@ mod tests {
         let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::Completing);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_after_a_requeue_is_stale_not_an_error() {
+        // A preempt-requeue frees the nodes and returns the job to Pending without
+        // bumping run_attempt, so the agent's report for the run it just killed
+        // arrives against an empty allocation and the epoch check cannot catch it.
+        // Answering InvalidArgument made the agent give up -- the error is classified
+        // non-retryable -- and the run was never finalized, so reclaim could free a
+        // node that the reclaimer was then not given.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("requeued")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: true,
+        });
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: 1,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(2),
+            preempt_qos: None,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(
+            job.state,
+            JobState::Pending,
+            "requeue returns it to Pending"
+        );
+        assert!(job.allocated_nodes.is_empty(), "requeue frees the nodes");
+
+        // The in-flight report for the killed run.
+        let result = cm.node_complete(1, "n1", 0, 0, 0);
+        assert_eq!(
+            result.unwrap(),
+            NodeCompleteResult::StaleReport,
+            "a report for a run the requeue already ended must be ignored, not rejected"
+        );
+
+        // The requeued job must be left alone: still pending, still reclaimable.
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_for_an_unallocated_node_while_running_is_still_an_error() {
+        // The control for the test above: if the job really is running and the node
+        // was never part of its allocation, that is a genuine caller error and must
+        // not be softened into a stale report.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("running")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+            idle_fill: false,
+        });
+
+        let err = cm.node_complete(1, "n2", 0, 0, 0).unwrap_err();
+        assert!(
+            matches!(err, NodeCompleteError::NodeNotAllocated { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
