@@ -1499,8 +1499,8 @@ message GetUsageRequest {
 message UsageEntry {
   string user = 1;
   string account = 2;
-  double cpu_hours = 3;
-  double gpu_hours = 4;
+  double cpu_seconds = 3;
+  double gpu_seconds = 4;
   uint64 job_count = 5;
 }
 

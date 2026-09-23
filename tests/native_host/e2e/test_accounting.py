@@ -1128,3 +1128,48 @@ class TestReservationAudit:
             assert denied[0]["actor"] == submit_user, denied
         finally:
             c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+
+class TestSshareAndSreportUnits:
+    """Verify sshare and sreport display cpu-seconds, not cpu-hours."""
+
+    def test_sshare_shows_cpu_seconds(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+        c.sacctmgr(["add", "account", "name=unitchk", "fairshare=10"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=unitchk"])
+        time.sleep(15)
+
+        script = c.write_file("unit-check.sh", "#!/bin/bash\nsleep 10\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "unit-chk", "-N", "1", "-n", "1", "-c", "4",
+                      "--account=unitchk", script])
+        )
+        wait_job(c, job_id, timeout=60)
+        time.sleep(15)
+
+        out = c.sshare(["-l"])
+        assert "CPURawUsage" in out, f"expected CPURawUsage header: {out}"
+        for line in out.splitlines():
+            if "unitchk" not in line:
+                continue
+            # Account row has empty User column; split() collapses it,
+            # giving 7 tokens: [name, shares, norm, raw, norm, fair, cpuraw].
+            fields = line.split()
+            raw_usage = float(fields[3])
+            assert raw_usage >= 40, (
+                f"RawUsage {raw_usage} too small for a 4-CPU 10s job "
+                f"(expected >=40 cpu-seconds): {line}"
+            )
+            assert raw_usage < 40 * 3600, (
+                f"RawUsage {raw_usage} looks like cpu-hours, not "
+                f"cpu-seconds: {line}"
+            )
+            break
+        else:
+            pytest.fail(f"unitchk account not found in sshare output: {out}")
+
+    def test_sreport_shows_cpu_seconds(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.sreport(["cluster", "AccountUtilizationByUser"])
+        assert "CPU Seconds" in out, f"expected 'CPU Seconds' header: {out}"

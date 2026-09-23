@@ -741,6 +741,12 @@ class SpurCluster:
     def sacctmgr(self, args: list[str]) -> str:
         return self.cli(["sacctmgr"] + args)
 
+    def sshare(self, args: list[str]) -> str:
+        return self.cli(["sshare"] + args)
+
+    def sreport(self, args: list[str]) -> str:
+        return self.cli(["sreport"] + args)
+
     def write_file(self, name: str, body: str, *,
                    all_nodes: bool = False, executable: bool = True) -> str:
         """Write a file under remote_dir. Returns the absolute remote path.
