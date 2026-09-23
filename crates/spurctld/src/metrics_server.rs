@@ -12,9 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
-    encode_auth_metrics, encode_job_metrics, encode_jobs_users_accts_metrics, encode_k8s_metrics,
-    encode_nodes_metrics, encode_partitions_metrics, encode_rpc_metrics, encode_scheduler_metrics,
-    CONTENT_TYPE,
+    encode_audit_metrics, encode_auth_metrics, encode_job_metrics, encode_jobs_users_accts_metrics,
+    encode_k8s_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_rpc_metrics,
+    encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
 
@@ -55,6 +55,7 @@ pub async fn serve(
         .route("/metrics/k8s", get(metrics_k8s))
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
         .route("/metrics/auth", get(metrics_auth))
+        .route("/metrics/audit", get(metrics_audit))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -130,6 +131,12 @@ async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Res
 async fn metrics_auth(_state: State<Arc<MetricsState>>) -> Response {
     metrics_response(encode_auth_metrics(
         &spur_core::native_metrics::global().snapshot(),
+    ))
+}
+
+async fn metrics_audit(_state: State<Arc<MetricsState>>) -> Response {
+    metrics_response(encode_audit_metrics(
+        &spur_core::audit_metrics::global().snapshot(),
     ))
 }
 

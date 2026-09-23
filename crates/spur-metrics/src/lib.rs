@@ -12,6 +12,7 @@ pub mod rpc;
 pub mod scheduler;
 pub mod user_acct;
 
+pub use export::audit::encode_audit_metrics;
 pub use export::auth::encode_auth_metrics;
 pub use export::jobs::{encode_job_metrics, job_state_metric_suffix};
 pub use export::jobs_users_accts::encode_jobs_users_accts_metrics;

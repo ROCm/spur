@@ -390,6 +390,13 @@ async fn main() -> anyhow::Result<()> {
     server::serve(addr, controller, accounting_service, bearer).await?;
 
     sched_handle.abort();
+    // Audit rows are written off the request path; the runtime would drop them.
+    if !cluster
+        .drain_accounting(std::time::Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
+    }
     Ok(())
 }
 

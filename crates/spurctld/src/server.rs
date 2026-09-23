@@ -4631,9 +4631,35 @@ pub async fn serve(
         router = router.add_service(crate::accounting::accounting_server(service));
     }
 
-    router.serve(addr).await?;
+    router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
     Ok(())
+}
+
+/// Resolves on SIGTERM or Ctrl-C, so the caller can flush work that a dropped
+/// runtime would discard.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Without the handler this arm must never win the select.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown signal received, draining");
 }
 
 /// A uid only when the kernel vouched for it. A JWT claims its own, possibly 0,

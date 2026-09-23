@@ -1228,10 +1228,13 @@ command, **from where**, **when**, and the **outcome**. Recording is
 best-effort: a database outage never blocks the operation itself.
 
 Coverage is a property of the RPC pipeline, not of individual commands. A single
-layer in front of every controller and accounting RPC writes the row, so an
-action cannot be mutating and unrecorded; a newly added RPC fails the test suite
-until it is explicitly classified as mutating, read-only, or internal, and a
-mutating one fails until it also names the object it acts on.
+layer in front of every controller and accounting RPC writes the row, so no
+mutating action is left unaudited by omission; a newly added RPC fails the test
+suite until it is explicitly classified as mutating, read-only, or internal, and
+a mutating one fails until it also names the object it acts on.
+
+That is coverage, not durability. The write itself is best-effort, so an action
+can still be applied and its row lost — see `When a row is lost`_ below.
 
 The REST API is covered by the same rule rather than a parallel one: its submit
 and cancel endpoints dispatch into those controller handlers, so a REST mutation
@@ -1306,6 +1309,28 @@ Each record captures:
    ``auth.jwt_key`` without contacting the controller, so no server-side record
    of it can exist. Treat read access to ``auth.jwt_key`` as equivalent to the
    ability to mint an admin credential.
+
+When a row is lost
+~~~~~~~~~~~~~~~~~~
+
+The row is written outside the action's own commit, so a database outage never
+blocks the operation. The cost is that an action can succeed while its row does
+not: the write is retried three times over roughly half a second, and a failure
+past that is logged and abandoned. A controller that dies between applying the
+action and finishing the write loses the row with no log line at all, because
+the process is gone.
+
+Two counters on ``/metrics/audit`` make this visible rather than leaving it to
+whoever reads the controller log:
+
+.. code-block:: text
+
+   spur_audit_rows_written_total   rows persisted
+   spur_audit_rows_dropped_total   rows abandoned after retries
+
+Alert on ``spur_audit_rows_dropped_total`` increasing. Any increase means the
+log is incomplete for that window, and the controller log names the actor,
+action and entity of each row that was dropped.
 
 Who drained a node
 ~~~~~~~~~~~~~~~~~~
