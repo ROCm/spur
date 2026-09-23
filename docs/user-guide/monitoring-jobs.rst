@@ -131,8 +131,11 @@ SUSPENDED, COMPLETING**.
      - TIME_LEFT
    * - ``%b``
      - GRES
-     -
-     -
+     - ``%Q``
+     - PRIORITY
+
+``%p`` and ``%Q`` both render the integer priority. Slurm splits these (``%p``
+is a normalized float, ``%Q`` the integer); Spur exposes the integer under both.
 
 .. code-block:: bash
 
