@@ -130,7 +130,7 @@ fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &st
 fn parse_ttl(s: &str) -> Result<u32> {
     let s = s.trim();
     let (value, unit_secs) = if let Some(days) = s.strip_suffix('d') {
-        (days, 86_400u64)
+        (days, 86_400u128)
     } else if let Some(hours) = s.strip_suffix('h') {
         (hours, 3_600)
     } else if let Some(mins) = s.strip_suffix('m') {
@@ -140,12 +140,14 @@ fn parse_ttl(s: &str) -> Result<u32> {
     } else {
         (s, 1)
     };
-    // u64 can't overflow here (max is u32::MAX * 86_400), so the message reports seconds vs seconds.
-    let secs = value.parse::<u32>()? as u64 * unit_secs;
+    // Parsed at u64 and multiplied at u128 so any accepted count can be reported
+    // in seconds: u32 loses a large count to a bare integer-parse error, and a
+    // u64 multiply wraps one back into the accepted range.
+    let secs = value.parse::<u64>()? as u128 * unit_secs;
     if secs == 0 {
         anyhow::bail!("TTL {s} must be a positive duration");
     }
-    if secs > u32::MAX as u64 {
+    if secs > u32::MAX as u128 {
         anyhow::bail!(
             "TTL {s} is {secs} seconds, over the {} second maximum",
             u32::MAX
@@ -221,7 +223,8 @@ mod tests {
     /// to roughly 290 days and silently issued a shorter-lived token.
     #[test]
     fn parse_ttl_rejects_values_that_overflow() {
-        assert!(parse_ttl("50000d").is_err());
+        let err = parse_ttl("50000d").unwrap_err().to_string();
+        assert!(err.contains("4320000000 seconds"), "{err}");
         assert!(parse_ttl("2000000h").is_err());
         assert!(parse_ttl("100000000m").is_err());
         assert_eq!(
@@ -237,7 +240,20 @@ mod tests {
         assert!(parse_ttl("0").is_err());
         assert!(parse_ttl("0d").is_err());
         assert!(parse_ttl("0h").is_err());
+        assert!(parse_ttl("0m").is_err());
         assert!(parse_ttl("0s").is_err());
+    }
+
+    /// Counts no narrower arithmetic can report: 5000000000 overflows a u32
+    /// parse, and 94368760191893771 * 86_400 wraps to 128 in u64, which would
+    /// be accepted as a 128-second TTL.
+    #[test]
+    fn parse_ttl_reports_seconds_for_counts_past_u32_and_u64() {
+        let err = parse_ttl("5000000000d").unwrap_err().to_string();
+        assert!(err.contains("432000000000000 seconds"), "{err}");
+
+        let err = parse_ttl("94368760191893771d").unwrap_err().to_string();
+        assert!(err.contains("8153460880579621814400 seconds"), "{err}");
     }
 
     #[test]
