@@ -46,6 +46,14 @@ pub struct SqueueArgs {
     #[arg(short = 'w', long = "nodelist")]
     pub nodelist: Option<String>,
 
+    /// Show only jobs with this QOS (comma-separated list)
+    #[arg(short = 'q', long)]
+    pub qos: Option<String>,
+
+    /// Show only jobs in these reservations (comma-separated list)
+    #[arg(short = 'R', long)]
+    pub reservation: Option<String>,
+
     /// Output format string
     #[arg(short = 'o', long)]
     pub format: Option<String>,
@@ -172,6 +180,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             job_ids,
             name: args.name.unwrap_or_default(),
             nodes,
+            qos: args.qos.unwrap_or_default(),
+            reservation: args.reservation.unwrap_or_default(),
         })
         .await
         .context("failed to get jobs")?;
@@ -953,5 +963,18 @@ mod tests {
                 "spec %{spec} has a header but no render arm"
             );
         }
+    }
+
+    #[test]
+    fn qos_and_reservation_filters_parse() {
+        let args = SqueueArgs::try_parse_from(["squeue", "-q", "high,low", "-R", "maint"]).unwrap();
+        assert_eq!(args.qos.as_deref(), Some("high,low"));
+        assert_eq!(args.reservation.as_deref(), Some("maint"));
+
+        let long =
+            SqueueArgs::try_parse_from(["squeue", "--qos", "batch", "--reservation", "resv1"])
+                .unwrap();
+        assert_eq!(long.qos.as_deref(), Some("batch"));
+        assert_eq!(long.reservation.as_deref(), Some("resv1"));
     }
 }
