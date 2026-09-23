@@ -1,0 +1,93 @@
+# Concrete DI validation: 2-node sglang tensor-parallel over the RoCE fabric (Model A / hostNetwork).
+# TP=2 across 2 nodes (1 MI355X each) -> every forward pass does an inter-node RCCL all-reduce, which
+# RCCL routes over RoCEv2 (ionic_0..7), NOT over spur0. Ungated Qwen2.5-7B keeps the download small.
+# Rendezvous (--dist-init-addr) is TCP over the mesh; the collective DATA plane is RDMA over the rails.
+# Pinned to gpu-node-3/gpu-node-4 (adjust to your nodes; sglang image cached there). To scale to TP=16 (full 2x8 GPUs) see sglang-2node-tp.yaml.
+---
+apiVersion: v1
+kind: Service
+metadata: { name: sglang-di, namespace: sglang }
+spec:
+  clusterIP: None                       # headless: sglang-di-0.sglang-di is the leader's stable name
+  publishNotReadyAddresses: true        # resolve sglang-di-0.sglang-di BEFORE the leader is Ready (rendezvous needs it)
+  selector: { app: sglang-di }
+  ports:
+    - { name: dist, port: 5000 }
+    - { name: http, port: 30000 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: sglang-di, namespace: sglang }
+spec:
+  serviceName: sglang-di
+  replicas: 2                           # ordinal 0 = node-rank 0 (leader), 1 = node-rank 1
+  podManagementPolicy: Parallel         # BOTH pods start at once — OrderedReady deadlocks (pod-0 Ready needs pod-1's rendezvous)
+  selector: { matchLabels: { app: sglang-di } }
+  template:
+    metadata: { labels: { app: sglang-di } }
+    spec:
+      hostNetwork: true                 # Model A: direct backend NICs + /dev/infiniband
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: { spur.amd.com/compute: "true" }
+      affinity:
+        podAntiAffinity:                # one replica per node
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: sglang-di } }
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:                   # pin to nodes with the image cached (avoid a 70G re-pull)
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [gpu-node-3, gpu-node-4] }
+      securityContext:
+        seccompProfile: { type: Unconfined }
+        supplementalGroups: [44, 992]   # video, render (VERIFIED)
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:v0.5.14-rocm700-mi35x
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true            # RDMA verbs + memlock
+            capabilities: { add: ["IPC_LOCK"] }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - >
+              ulimit -l unlimited || true;
+              RANK=${POD_NAME##*-};
+              echo "node-rank=${RANK} pod=${POD_NAME} host=$(hostname) memlock=$(ulimit -l)";
+              python3 -m sglang.launch_server
+              --model-path Qwen/Qwen2.5-7B-Instruct
+              --tp 2 --nnodes 2 --node-rank ${RANK}
+              --dist-init-addr sglang-di-0.sglang-di:5000
+              --host 0.0.0.0 --port 30000 --mem-fraction-static 0.8 --trust-remote-code
+          env:
+            - name: POD_NAME                              # hostNetwork makes $HOSTNAME the NODE name; use the pod name for the rank
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: NCCL_IB_DISABLE, value: "0" }
+            - { name: NCCL_IB_HCA, value: "ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7" }
+            - { name: NCCL_IB_GID_INDEX, value: "1" }     # global IPv6 RoCEv2 GID (VERIFIED)
+            # dmabuf GPUDirect segfaults the TP worker even WITH iommu=pt (no GPU fault in dmesg — a dmabuf/RCCL
+            # bug, not IOMMU). Disable GDR so RCCL stages GPU<->host<->NIC; with iommu=pt now active, host-memory
+            # RDMA registration should work (it failed under the earlier translated IOMMU -> "unhandled system error").
+            - { name: NCCL_NET_GDR_LEVEL, value: "0" }
+            - { name: NCCL_IB_PCI_RELAXED_ORDERING, value: "0" }  # ionic ibv_reg_mr rejects the relaxed-ordering MR flag with EINVAL ("Invalid argument")
+            - { name: NCCL_SOCKET_IFNAME, value: "spur0" } # bootstrap over the mesh (hostNetwork pod IP = mesh IP)
+            - { name: GLOO_SOCKET_IFNAME, value: "spur0" }
+            - { name: NCCL_DEBUG, value: "INFO" }          # confirm RCCL selects the IB/ionic (RoCE) transport
+          ports:
+            - { containerPort: 30000 }
+          resources:
+            limits: { amd.com/gpu: 1 }                     # 1 MI355X per node (TP=2 total)
+          volumeMounts:
+            - { name: infiniband, mountPath: /dev/infiniband }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: hf, mountPath: /root/.cache/huggingface }
+          startupProbe:                                    # leader serves /health only after both nodes join
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 80
+      volumes:
+        - { name: infiniband, hostPath: { path: /dev/infiniband } }
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }
+        - { name: hf, hostPath: { path: /mnt/scratch/hf-cache-di, type: DirectoryOrCreate } }

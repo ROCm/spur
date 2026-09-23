@@ -1,0 +1,64 @@
+# EXAMPLE: 2-node sglang tensor-parallel (TP=16) over the RoCE fabric — illustrative, confirm at deploy.
+# Model A (whole-node, hostNetwork): each pod gets all 8 MI355X + all 8 ionic RoCE NICs + /dev/infiniband
+# directly; RCCL does inter-node collectives over RoCEv2 (NOT over spur0). A headless Service gives the
+# leader a stable name for --dist-init-addr (that rendezvous is TCP over the pod net; the data plane is RDMA).
+# For prefill/decode DISAGGREGATION (Mooncake KV-cache over RDMA) see the ROCm guide linked in README.md.
+---
+apiVersion: v1
+kind: Service
+metadata: { name: sglang-tp, namespace: sglang }
+spec:
+  clusterIP: None                       # headless: sglang-tp-0.sglang-tp is the leader's stable name
+  selector: { app: sglang-tp }
+  ports: [{ name: dist, port: 5000 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: sglang-tp, namespace: sglang }
+spec:
+  serviceName: sglang-tp
+  replicas: 2                           # ordinal 0 = node-rank 0 (leader), ordinal 1 = node-rank 1
+  selector: { matchLabels: { app: sglang-tp } }
+  template:
+    metadata: { labels: { app: sglang-tp } }
+    spec:
+      hostNetwork: true                 # model A: direct backend NICs + /dev/infiniband (no Multus)
+      dnsPolicy: ClusterFirstWithHostNet
+      # spread the two replicas onto different GPU workers:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: sglang-tp } }
+              topologyKey: kubernetes.io/hostname
+      nodeSelector: { spur.amd.com/compute: "true" }
+      securityContext:
+        seccompProfile: { type: Unconfined }
+        supplementalGroups: [44, 992]   # video=44, render=992 (VERIFIED on the MI355X hosts)
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:v0.5.14-rocm700-mi35x   # VERIFIED: ships RCCL + ionic RDMA provider; in-pod ibv_devinfo -> ionic_0..7 PORT_ACTIVE
+          command: ["/bin/bash", "-lc"]
+          args:
+            - >
+              RANK=${HOSTNAME##*-};
+              python3 -m sglang.launch_server
+              --model-path meta-llama/Llama-3.1-70B-Instruct
+              --tp 16 --nnodes 2 --node-rank ${RANK}
+              --dist-init-addr sglang-tp-0.sglang-tp:5000
+              --host 0.0.0.0 --port 30000
+          env:
+            - { name: NCCL_IB_DISABLE, value: "0" }
+            - { name: NCCL_IB_HCA, value: "ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7" }
+            - { name: NCCL_IB_GID_INDEX, value: "1" }   # VERIFIED via show_gids: index 1 = global IPv6 RoCEv2 GID (index 0 = fe80 link-local)
+            - { name: NCCL_SOCKET_IFNAME, value: "ens3" } # rendezvous over the frontend/pod net, not RoCE
+            - { name: NCCL_IB_PCI_RELAXED_ORDERING, value: "1" }
+          resources:
+            limits:
+              amd.com/gpu: 8
+              # amd.com/roce_ionic: 8        # uncomment for model B (Multus/SR-IOV) instead of hostNetwork
+          volumeMounts:
+            - { name: infiniband, mountPath: /dev/infiniband }   # RDMA verbs devices
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - { name: infiniband, hostPath: { path: /dev/infiniband } }   # model A; model B injects via device plugin
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 32Gi } }

@@ -1,0 +1,164 @@
+# sglang prefill/decode (PD) disaggregation with the MoRI RDMA transport over the ionic RoCEv2 fabric.
+# Ground-truth config = sglang's nightly-amd-mi355x-disagg CI (MI355X + AMD Pensando ionic): backend=mori,
+# env MORI_DISABLE_AUTO_XGMI=1 / NCCL_IB_HCA=ionic / NCCL_IB_GID_INDEX=1 / NCCL_CROSS_NIC=1, KV over 4 ionic NICs.
+# Networking (per the disaggregation conn code): prefill+decode MUST be hostNetwork (ionic verbs live only in
+# the host netns); the prefill<->decode bootstrap+KV plane is DIRECT node-IP:port (no ClusterIP in the datapath);
+# SGLANG_HOST_IP is pinned to the node's mesh IP (status.hostIP) so rank_ip/session-host/bootstrap_host are routable.
+# Ungated Qwen2.5-7B, tp 1 (1 GPU/role). Prefill pinned to gpu-node-3 (10.44.0.4), decode to gpu-node-4 (10.44.0.5) — both
+# have iommu=pt + the image cached. The router derives bootstrap_host from the --prefill URL host, so it must be
+# the prefill NODE IP. requires GPUDirect? No — MoRI over RoCE; iommu=pt already validated on these nodes.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: sglang-prefill, namespace: sglang }
+spec:
+  serviceName: sglang-prefill-hl
+  replicas: 1
+  selector: { matchLabels: { app: sglang-disagg, role: prefill } }
+  template:
+    metadata: { labels: { app: sglang-disagg, role: prefill } }
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: { kubernetes.io/hostname: gpu-node-3 }
+      securityContext:
+        seccompProfile: { type: Unconfined }
+        supplementalGroups: [44, 992]
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:v0.5.14-rocm700-mi35x
+          imagePullPolicy: IfNotPresent
+          securityContext: { privileged: true, capabilities: { add: ["IPC_LOCK"] } }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - >
+              ulimit -l unlimited || true;
+              echo "host_ip=$SGLANG_HOST_IP role=prefill $(date)";
+              exec python3 -m sglang.launch_server
+              --model-path Qwen/Qwen2.5-7B-Instruct --tp 1 --trust-remote-code --mem-fraction-static 0.8
+              --host 0.0.0.0 --port 30000
+              --disaggregation-mode prefill
+              --disaggregation-transfer-backend mori
+              --disaggregation-bootstrap-port 8998
+              --disaggregation-ib-device ionic_0,ionic_1,ionic_2,ionic_3
+          env:
+            - { name: SGLANG_HOST_IP, valueFrom: { fieldRef: { fieldPath: status.hostIP } } }
+            - { name: MORI_DISABLE_AUTO_XGMI, value: "1" }   # force RoCE/RDMA path (not auto-XGMI)
+            - { name: NCCL_IB_HCA, value: "ionic" }          # select the Pensando ionic HCAs
+            - { name: NCCL_IB_GID_INDEX, value: "1" }         # RoCEv2 GID (verified)
+            - { name: NCCL_CROSS_NIC, value: "1" }
+            # MoRI ionic RoCE lane, from the mori env_setup QoS recipe: no-drop priority 3,
+            # DSCP 26 -> TC 104 (tc = dscp*4). MORI_DEBUG_INFO surfaces the RDMA QP + transfer.
+            - { name: MORI_RDMA_SL, value: "3" }
+            - { name: MORI_RDMA_TC, value: "104" }
+            - { name: MORI_DEBUG_INFO, value: "1" }
+          resources: { limits: { amd.com/gpu: 1 } }
+          volumeMounts:
+            - { name: infiniband, mountPath: /dev/infiniband }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: hf, mountPath: /root/.cache/huggingface }
+          startupProbe:
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 80
+      volumes:
+        - { name: infiniband, hostPath: { path: /dev/infiniband } }
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }
+        - { name: hf, hostPath: { path: /mnt/scratch/hf-cache-di, type: DirectoryOrCreate } }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: sglang-decode, namespace: sglang }
+spec:
+  serviceName: sglang-decode-hl
+  replicas: 1
+  selector: { matchLabels: { app: sglang-disagg, role: decode } }
+  template:
+    metadata: { labels: { app: sglang-disagg, role: decode } }
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: { kubernetes.io/hostname: gpu-node-4 }
+      securityContext:
+        seccompProfile: { type: Unconfined }
+        supplementalGroups: [44, 992]
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:v0.5.14-rocm700-mi35x
+          imagePullPolicy: IfNotPresent
+          securityContext: { privileged: true, capabilities: { add: ["IPC_LOCK"] } }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - >
+              ulimit -l unlimited || true;
+              echo "host_ip=$SGLANG_HOST_IP role=decode $(date)";
+              exec python3 -m sglang.launch_server
+              --model-path Qwen/Qwen2.5-7B-Instruct --tp 1 --trust-remote-code --mem-fraction-static 0.8
+              --host 0.0.0.0 --port 30001
+              --disaggregation-mode decode
+              --disaggregation-transfer-backend mori
+              --disaggregation-bootstrap-port 9001
+              --disaggregation-ib-device ionic_0,ionic_1,ionic_2,ionic_3
+              --log-level debug
+          env:
+            - { name: SGLANG_HOST_IP, valueFrom: { fieldRef: { fieldPath: status.hostIP } } }
+            - { name: MORI_DISABLE_AUTO_XGMI, value: "1" }
+            - { name: NCCL_IB_HCA, value: "ionic" }
+            - { name: NCCL_IB_GID_INDEX, value: "1" }
+            - { name: NCCL_CROSS_NIC, value: "1" }
+            # KVReceiver caches the prefill's ephemeral ZMQ rank_port for the whole process
+            # lifetime; if the prefill ever restarts, the decode must be restarted too (it does
+            # not re-resolve). Longer waiting-timeout so a slow first-request rendezvous survives.
+            - { name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT, value: "600" }
+            - { name: MORI_RDMA_SL, value: "3" }
+            - { name: MORI_RDMA_TC, value: "104" }
+            - { name: MORI_DEBUG_INFO, value: "1" }
+          resources: { limits: { amd.com/gpu: 1 } }
+          volumeMounts:
+            - { name: infiniband, mountPath: /dev/infiniband }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: hf, mountPath: /root/.cache/huggingface }
+      volumes:
+        - { name: infiniband, hostPath: { path: /dev/infiniband } }
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }
+        - { name: hf, hostPath: { path: /mnt/scratch/hf-cache-di, type: DirectoryOrCreate } }
+---
+# Router / load balancer (pure HTTP, normal pod netns). Derives bootstrap_host from the --prefill URL host,
+# so --prefill / --decode MUST be the prefill/decode NODE mesh IPs (gpu-node-3=10.44.0.4, gpu-node-4=10.44.0.5), not ClusterIPs.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sglang-disagg-router, namespace: sglang }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: sglang-disagg, role: router } }
+  template:
+    metadata: { labels: { app: sglang-disagg, role: router } }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: gpu-node-3 }   # co-locate on a node that has the image cached
+      containers:
+        - name: router
+          image: lmsysorg/sglang:v0.5.14-rocm700-mi35x
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-m", "sglang_router.launch_router"]
+          args:
+            - "--pd-disaggregation"
+            - "--prefill"
+            - "http://10.44.0.4:30000"
+            - "8998"
+            - "--decode"
+            - "http://10.44.0.5:30001"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--disable-circuit-breaker"
+          ports: [{ containerPort: 8000 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: sglang-disagg-router, namespace: sglang }
+spec:
+  type: ClusterIP
+  selector: { app: sglang-disagg, role: router }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
