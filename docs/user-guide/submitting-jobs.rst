@@ -431,9 +431,13 @@ running job. The usual reason is to put a binary, dataset, or config on fast
 node-local storage (``/tmp``, ``/dev/shm``) at job start, so the ranks read it
 from local disk instead of all hitting a shared filesystem at once.
 
+The whole file travels in one message, so a broadcast is capped at just under
+8 MiB and is refused up front if the source is larger. Bigger artifacts still
+belong on a shared filesystem.
+
 .. code-block:: bash
 
-   sbcast ./model.bin /tmp/model.bin
+   sbcast ./tokenizer.json /tmp/tokenizer.json
 
 Run inside a job script, that stages the file on each allocated node before the
 work starts:
@@ -444,8 +448,8 @@ work starts:
    #SBATCH --nodes=4
    #SBATCH --gres=gpu:mi300x:8
 
-   sbcast --force ./model.bin /tmp/model.bin
-   srun ./train --model /tmp/model.bin
+   sbcast --force ./train.cfg /tmp/train.cfg
+   srun ./train --config /tmp/train.cfg
 
 Options:
 
@@ -481,8 +485,7 @@ when the node agent runs as root.
    ``--compress``/``-C`` and ``--preserve``/``-p`` are accepted for drop-in
    compatibility but do nothing: nothing is compressed on the wire, and the mode
    always comes from the source file. ``--exclude`` and ``--send-libs`` are not
-   supported yet. The file is sent in a single message, so its size is bounded
-   by the controller's maximum request size.
+   supported yet.
 
 See Also
 --------

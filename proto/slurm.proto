@@ -1356,8 +1356,7 @@ message RegisterJobAllocationResponse {}
 
 // sbcast: client -> controller. The controller verifies ownership and fans the
 // file out to every node in the job's allocation. The whole file rides in one
-// message, bounded by MAX_GRPC_REQUEST_SIZE (ponytail: no block streaming yet;
-// upgrade path is a client-streaming RPC for files larger than the cap).
+// message, so one broadcast is bounded by MAX_GRPC_REQUEST_SIZE.
 message SbcastRequest {
   uint32 job_id = 1;
   string dest = 2;    // Destination path on each node; relative resolves against the job work_dir
