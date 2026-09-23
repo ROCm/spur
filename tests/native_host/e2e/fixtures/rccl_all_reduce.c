@@ -69,7 +69,14 @@ int main(int argc, char **argv) {
     int device = rank % devices;
     HIP_CHECK(hipSetDevice(device));
 
-    printf("rank=%d size=%d host=%s device=%d\n", rank, size, host, device);
+    // The bus id, not the ordinal, is what distinguishes two ranks' GPUs. Spur
+    // hands each task its own narrowed and renumbered device list, so every rank
+    // legitimately reports ordinal 0 while sitting on a different physical GPU.
+    char bus[64] = {0};
+    HIP_CHECK(hipDeviceGetPCIBusId(bus, sizeof(bus), device));
+
+    printf("rank=%d size=%d host=%s device=%d bus=%s\n", rank, size, host, device,
+           bus);
     fflush(stdout);
 
     // Rank 0 mints the RCCL id and broadcasts it over MPI. This is the standard

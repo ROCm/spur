@@ -735,6 +735,12 @@ agents (``ip -br addr``). Unpinned ``btl=tcp`` may pick docker, overlay, or
 IPv6-only NICs; **several tasks per node across two nodes** then hangs in
 ``MPI_Init`` even though a single-node or 1-task-per-node run may succeed.
 
+GPU collectives need the same treatment one layer up. RCCL chooses its transport
+independently of Open MPI, so ``OMPI_MCA_btl_tcp_if_include`` does not constrain
+it, and ``NCCL_SOCKET_IFNAME`` must name the same NIC. Left unpinned, the symptom
+matches the Open MPI one: one rank per host works and several ranks per host
+across two hosts hangs.
+
 .. code-block:: bash
 
    mkdir -p "$HOME/spur/mpi"
@@ -744,7 +750,14 @@ IPv6-only NICs; **several tasks per node across two nodes** then hangs in
    export LD_LIBRARY_PATH="${OPAL_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
    export OMPI_MCA_btl_tcp_if_include=eth0           # fabric NIC that reaches peer agents
    export OMPI_MCA_oob_tcp_if_include=eth0
+   export NCCL_SOCKET_IFNAME=eth0                    # RCCL sockets; the same NIC
    EOF
+
+Where the host has RDMA devices that are not usable end to end, RCCL still
+prefers them and ``ncclCommInitRank`` fails with ``unhandled system error``
+rather than falling back on its own. ``NCCL_IB_DISABLE=1`` forces sockets. Set it
+only after confirming RDMA is genuinely unavailable, since it gives up the fast
+path for every collective on the node.
 
 Build the application **on each agent** with that prefix's ``mpicc`` (the
 controller often has no MPI compiler). The binary path in the batch script

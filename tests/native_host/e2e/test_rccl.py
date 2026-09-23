@@ -29,7 +29,7 @@ import pytest
 
 # A wrong result means the collective ran but moved the wrong data, which is a
 # different failure from a hang. Parsed separately from the rank map for that reason.
-RANK_RE = re.compile(r"rank=(\d+) size=(\d+) host=(\S+) device=(\d+)")
+RANK_RE = re.compile(r"rank=(\d+) size=(\d+) host=(\S+) device=(\d+) bus=(\S+)")
 ALLREDUCE_RE = re.compile(
     r"allreduce rank=(\d+) expected=(\S+) actual=(\S+) status=(OK|MISMATCH)"
 )
@@ -101,11 +101,13 @@ class TestRcclIntraNode:
         assert_allreduce_correct(out, 2)
 
     def test_each_rank_gets_a_distinct_device(self, mpi_cluster):
-        """Ranks on one host must land on different GPUs.
+        """Ranks on one host must land on different physical GPUs.
 
         Two ranks on the same device would still produce the right sum, so the
-        arithmetic assertion alone cannot catch it. This is the check that would
-        fail if device assignment regressed to always selecting device 0.
+        arithmetic assertion alone cannot catch it. Compared on PCI bus id rather
+        than device ordinal: Spur narrows each task's visible set to the GPU it was
+        granted and ROCr renumbers what is left, so both ranks report ordinal 0 even
+        when they are correctly on different hardware.
         """
         cluster = mpi_cluster
         binary = cluster.compile_rccl_fixture()
@@ -116,9 +118,9 @@ class TestRcclIntraNode:
         code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "1", "-n", "2", "--gres=gpu:2", binary])
         assert code == 0, f"srun failed (exit {code}):\n{out}"
 
-        devices = [int(m.group(4)) for m in map(RANK_RE.match, map(str.strip, out.splitlines())) if m]
-        assert len(devices) == 2, f"expected 2 rank lines, got {devices}:\n{out}"
-        assert len(set(devices)) == 2, f"ranks shared a device: {devices}\n{out}"
+        buses = [m.group(5) for m in map(RANK_RE.match, map(str.strip, out.splitlines())) if m]
+        assert len(buses) == 2, f"expected 2 rank lines, got {buses}:\n{out}"
+        assert len(set(buses)) == 2, f"ranks shared a GPU: {buses}\n{out}"
 
 
 @pytest.mark.mpi
