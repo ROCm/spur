@@ -127,7 +127,7 @@ pub struct ContainerLaunchConfig {
 /// Groups the resolved execution parameters that come from multiple sources
 /// (JobSpec, scheduler allocation, agent config) into a single value.
 /// How the job's I/O is connected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LaunchIo {
     /// Traditional file-based stdout/stderr capture.
     #[default]
@@ -877,13 +877,23 @@ async fn spawn_job_process(
         // Launch the process
         let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
         let mut cmd = Command::new(&launch_cmd);
-        // Always its own process group (run_command does the same for pmix step
-        // launches) so signal()/kill_signal's group-kill reaches the whole job
-        // regardless of PMIx — only namespace isolation is pmix-conditional above.
-        cmd.args(&launch_args)
-            .current_dir(work_dir)
-            .envs(&env)
-            .process_group(0);
+        if cfg.io_mode == LaunchIo::Pty {
+            // A PTY launch's caller (`session_environ`) documents that it already
+            // assembled a complete environment; without this, spurstepd's own
+            // inherited process environment — which may hold daemon secrets —
+            // would leak into the interactive shell.
+            cmd.env_clear();
+        }
+        cmd.args(&launch_args).current_dir(work_dir).envs(&env);
+        if cfg.io_mode != LaunchIo::Pty {
+            // Always its own process group (run_command does the same for pmix step
+            // launches) so signal()/kill_signal's group-kill reaches the whole job
+            // regardless of PMIx — only namespace isolation is pmix-conditional above.
+            // A PTY launch already gets this from wire()'s setsid(), which also
+            // makes it a session leader; setsid() fails EPERM on a process that is
+            // already its own process group leader, so the two are mutually exclusive.
+            cmd.process_group(0);
+        }
         if piped_mpi_stdio {
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -1161,21 +1171,21 @@ pub fn expected_step_cgroup_path(
 }
 
 /// Where a dead session may be reaped when its descriptor recorded no cgroup.
-/// Reaping recurses and SIGKILLs, so a user step resolves to its own leaf.
+/// Reaping recurses and SIGKILLs, so only the job's own workload reaps the job cgroup.
 pub fn reapable_cgroup_path(
     job_id: JobId,
     run_attempt: u32,
     step_id: spur_core::step::StepId,
 ) -> PathBuf {
-    if spur_core::step::is_user_step(step_id) {
-        expected_step_cgroup_path(job_id, run_attempt, step_id)
-    } else {
+    if spur_core::step::owns_job_lifetime(step_id) {
         expected_cgroup_path(job_id, run_attempt)
+    } else {
+        expected_step_cgroup_path(job_id, run_attempt, step_id)
     }
 }
 
-/// Place a user step in its own leaf beneath an already-configured job cgroup.
-/// The leaf inherits the job's limits and device filter, so neither is rewritten.
+/// Place a step that doesn't own the job's lifetime in its own leaf, inheriting
+/// the already-configured job cgroup's limits and device filter unchanged.
 fn join_job_cgroup(
     cgroup_root: &Path,
     scope: CgroupScope,
@@ -1243,9 +1253,9 @@ pub(crate) fn setup_cgroup(
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_path_for(&cgroup_root, job_id, run_attempt);
 
-    // A user step joins the job's cgroup rather than configuring it: the limits and
-    // the device filter there describe the job, not the step that happens to enter.
-    if spur_core::step::is_user_step(step_id) {
+    // Anything but the job's own workload joins the job's cgroup rather than
+    // configuring it: the limits/device filter there describe the job.
+    if !spur_core::step::owns_job_lifetime(step_id) {
         return join_job_cgroup(&cgroup_root, scope, cgroup, &cgroup_path);
     }
 
@@ -2210,16 +2220,16 @@ pub(crate) fn would_use_namespaces(cfg: &JobLaunchConfig, is_root: bool) -> bool
 }
 
 pub(crate) fn launch_script_name(step_id: spur_core::step::StepId) -> String {
-    match spur_core::step::is_user_step(step_id) {
-        true => format!("spur_step{step_id}.sh"),
-        false => "spur_job.sh".to_string(),
+    match spur_core::step::owns_job_lifetime(step_id) {
+        true => "spur_job.sh".to_string(),
+        false => format!("spur_step{step_id}.sh"),
     }
 }
 
 pub(crate) fn namespace_wrapper_name(step_id: spur_core::step::StepId) -> String {
-    match spur_core::step::is_user_step(step_id) {
-        true => format!("spur_ns_step{step_id}.sh"),
-        false => "spur_ns.sh".to_string(),
+    match spur_core::step::owns_job_lifetime(step_id) {
+        true => "spur_ns.sh".to_string(),
+        false => format!("spur_ns_step{step_id}.sh"),
     }
 }
 
@@ -2634,6 +2644,25 @@ mod cgroup_join_tests {
         // Degraded, not fatal: a non-root agent creates no cgroup, and the
         // child still has to run.
         assert!(CgroupJoin::for_cgroup(None).is_none());
+    }
+
+    // Reaping recurses and SIGKILLs, so a terminal placeholder must resolve
+    // to its own leaf, never the shared job cgroup.
+    #[test]
+    fn a_terminal_placeholder_reaps_its_own_leaf_not_the_job() {
+        use super::{expected_step_cgroup_path, reapable_cgroup_path};
+        let path = reapable_cgroup_path(7, 1, spur_core::step::STEP_INTERACTIVE);
+        assert_eq!(
+            path,
+            expected_step_cgroup_path(7, 1, spur_core::step::STEP_INTERACTIVE)
+        );
+    }
+
+    #[test]
+    fn the_batch_step_reaps_the_whole_job_cgroup() {
+        use super::{expected_cgroup_path, reapable_cgroup_path};
+        let path = reapable_cgroup_path(7, 1, spur_core::step::STEP_BATCH);
+        assert_eq!(path, expected_cgroup_path(7, 1));
     }
 }
 
@@ -3469,14 +3498,19 @@ mod tests {
 
     #[test]
     fn a_jobs_own_steps_keep_the_original_script_names() {
-        for owning in [
-            spur_core::step::STEP_BATCH,
-            spur_core::step::STEP_EXTERN,
-            spur_core::step::STEP_INTERACTIVE,
-        ] {
+        for owning in [spur_core::step::STEP_BATCH, spur_core::step::STEP_EXTERN] {
             assert_eq!(launch_script_name(owning), "spur_job.sh");
             assert_eq!(namespace_wrapper_name(owning), "spur_ns.sh");
         }
+    }
+
+    // A terminal placeholder owns no workload of its own, so it must not
+    // collide with the batch step's script the way it used to.
+    #[test]
+    fn a_terminal_placeholder_gets_its_own_script_name() {
+        let interactive = spur_core::step::STEP_INTERACTIVE;
+        assert_ne!(launch_script_name(interactive), "spur_job.sh");
+        assert_ne!(namespace_wrapper_name(interactive), "spur_ns.sh");
     }
 
     #[test]
@@ -3937,6 +3971,72 @@ mod tests {
         let mut got = Vec::new();
         backing.read_to_end(&mut got).expect("read back");
         assert_eq!(got, payload);
+    }
+
+    // setsid() (in wire()'s Pty branch) fails EPERM on a process that is already
+    // its own process group leader, so a real Pty launch must not also carry
+    // process_group(0) — drives launch_job itself, not a reimplementation.
+    #[tokio::test]
+    async fn a_pty_launch_does_not_collide_with_its_own_process_group() {
+        let cfg = JobLaunchConfig {
+            io_mode: LaunchIo::Pty,
+            script: "true".to_string(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            ..launch_cfg_for_paths(90001, "pty-launch", "u", "node")
+        };
+
+        match launch_job(&cfg, None).await {
+            Ok(_) => {}
+            Err(error) => panic!("a bare Pty launch must not fail with EPERM: {error}"),
+        }
+    }
+
+    // spurstepd inherits spurd's full process environment, which may hold
+    // daemon secrets; a Pty launch must start from a clean slate rather than
+    // merely overlaying its own vars on top of it.
+    #[tokio::test]
+    async fn a_pty_launch_does_not_inherit_the_launching_processs_environment() {
+        let marker_key = "SPUR_TEST_ENV_LEAK_MARKER_PTY";
+        unsafe {
+            std::env::set_var(marker_key, "leaked");
+        }
+        let capture = tempfile::NamedTempFile::new().expect("capture file");
+        let capture_path = capture.path().to_path_buf();
+        let mut environment = HashMap::new();
+        environment.insert("SPUR_TEST_OWN_VAR".to_string(), "present".to_string());
+        let cfg = JobLaunchConfig {
+            io_mode: LaunchIo::Pty,
+            script: format!("env > {}", capture_path.display()),
+            environment,
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            ..launch_cfg_for_paths(90002, "pty-env-clear", "u", "node")
+        };
+
+        let mut result = match launch_job(&cfg, None).await {
+            Ok(result) => result,
+            Err(error) => panic!("pty launch: {error}"),
+        };
+        match result.job {
+            RunningJob::Managed { ref mut child } => {
+                child.wait().await.expect("wait for the script to finish");
+            }
+            _ => panic!("a non-container pty launch must produce a Managed child"),
+        }
+        unsafe {
+            std::env::remove_var(marker_key);
+        }
+
+        let captured = std::fs::read_to_string(&capture_path).expect("read captured env");
+        assert!(
+            !captured.contains(marker_key),
+            "the launching process's own environment must not reach the pty workload: {captured}"
+        );
+        assert!(
+            captured.contains("SPUR_TEST_OWN_VAR=present"),
+            "the launch's own assembled environment must still reach the workload: {captured}"
+        );
     }
 
     #[tokio::test]

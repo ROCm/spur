@@ -320,11 +320,12 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
                             None => {}
                         }
                     }
-                    Ok(None) => break 1,
-                    Err(e) => {
-                        eprintln!("\r\nstream error: {e}");
-                        break 1;
+                    // No real exit status here, so faking one would look like
+                    // the workload itself failed — let the caller retry instead.
+                    Ok(None) => {
+                        anyhow::bail!("interactive session stream closed without an exit status")
                     }
+                    Err(e) => anyhow::bail!("interactive session stream error: {e}"),
                 }
             }
 

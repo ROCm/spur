@@ -16,6 +16,7 @@ instead of relying on an actual deadlock, and asserts the node is usable
 again within the force-reclaim window instead of never.
 """
 
+import threading
 import time
 
 from cluster import parse_job_id, wait_job_state
@@ -122,3 +123,64 @@ class TestWedgedStepdReclaim:
                 cluster.nodes[0].exec_allow_fail(f"sudo kill -9 {frozen_pid}")
             for job_id in submitted_jobs:
                 cluster.scancel(job_id)
+
+
+class TestWedgedInteractiveStepdReclaim:
+    """A standalone `srun --pty` job's only stepd is a terminal placeholder,
+    excluded from the old `owns_job_lifetime`-based fencing gate. Same wedge,
+    same force-reclaim path, but on the job shape that gate used to skip.
+    """
+
+    def test_a_cancelled_interactive_only_jobs_ledger_reclaims_even_if_its_supervisor_is_frozen(
+        self, cluster
+    ):
+        node = cluster.node_names[0]
+        job_name = f"wedge-interactive-{time.time_ns()}"
+        result: dict[str, object] = {}
+
+        def run():
+            result["code"], result["out"] = cluster.srun_with_exit([
+                "-N", "1", "-w", node, "-t", "0:02", "-J", job_name, "--pty",
+                "bash", "-c", "sleep 120",
+            ])
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        submitted_jobs: list[int] = []
+        frozen_pid = None
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the standalone --pty job to appear"
+            submitted_jobs.append(job_id)
+
+            pids = _supervisor_pids(cluster)
+            assert pids, "a running interactive job must have a supervisor"
+            frozen_pid = next(iter(pids))
+            cluster.nodes[0].exec(f"sudo kill -STOP {frozen_pid}")
+
+            cluster.scancel(job_id)
+
+            probe_script = cluster.write_file(
+                "wedge-interactive-probe.sh", "#!/bin/bash\nsleep 5\n"
+            )
+            probe_job = parse_job_id(
+                cluster.sbatch(["-J", "wedge-interactive-probe", "-w", node, "--exclusive", probe_script])
+            )
+            assert probe_job is not None
+            submitted_jobs.append(probe_job)
+
+            wait_job_state(cluster, probe_job, "R", timeout=PROBE_RUNNING_BOUND)
+        finally:
+            if frozen_pid is not None:
+                cluster.nodes[0].exec_allow_fail(f"sudo kill -CONT {frozen_pid}")
+                cluster.nodes[0].exec_allow_fail(f"sudo kill -9 {frozen_pid}")
+            for job_id in submitted_jobs:
+                cluster.scancel(job_id)
+            thread.join(timeout=60)

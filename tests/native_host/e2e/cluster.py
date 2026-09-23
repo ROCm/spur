@@ -1085,9 +1085,23 @@ class SpurCluster:
         """Restart spurd on one node without touching the controller."""
         node = self.nodes[node_index]
         self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=self.agent_as_root)
-        time.sleep(1)
+        self._wait_port_free(node, AGENT_PORT)
         node.exec(self._spurd_start_cmd(node_index))
         time.sleep(5)
+
+    def _wait_port_free(self, node: SshNode, port: int, timeout: int = 10):
+        """A killed spurd holding a live stepd across the restart still has to
+        tear down its listener; starting the replacement before the kernel
+        releases the port binds nothing and fails with EADDRINUSE.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            busy = node.exec_allow_fail(
+                f"ss -ltn 'sport = :{port}' 2>/dev/null | grep -q LISTEN && echo busy || true"
+            ).strip()
+            if busy != "busy":
+                return
+            time.sleep(0.2)
 
     def wait_agent_serving(self, node_index: int = 0, timeout: int = 60):
         """Block until a restarted spurd is answering RPCs again.
