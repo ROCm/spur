@@ -150,9 +150,9 @@ async fn report_account_utilization_by_user(
             delimiter,
             "User",
             delimiter,
-            "CPU Hours",
+            "CPU Seconds",
             delimiter,
-            "GPU Hours",
+            "GPU Seconds",
             delimiter,
             "Jobs"
         );
@@ -169,12 +169,12 @@ async fn report_account_utilization_by_user(
         std::collections::HashMap::new();
     for e in &usage.entries {
         let a = acct_agg.entry(&e.account).or_default();
-        a.0 += e.cpu_hours;
-        a.1 += e.gpu_hours;
+        a.0 += e.cpu_seconds;
+        a.1 += e.gpu_seconds;
         a.2 += e.job_count;
         user_agg.insert(
             (&e.user, &e.account),
-            (e.cpu_hours, e.gpu_hours, e.job_count),
+            (e.cpu_seconds, e.gpu_seconds, e.job_count),
         );
     }
 
@@ -184,7 +184,7 @@ async fn report_account_utilization_by_user(
             .unwrap_or(&(0.0, 0.0, 0));
 
         println!(
-            "{:<20}{}{:<15}{}{:>12.1}{}{:>12.1}{}{:>10}",
+            "{:<20}{}{:<15}{}{:>12.0}{}{:>12.0}{}{:>10}",
             account.name,
             delimiter,
             "",
@@ -203,7 +203,7 @@ async fn report_account_utilization_by_user(
                 .unwrap_or(&(0.0, 0.0, 0));
 
             println!(
-                " {:<19}{}{:<15}{}{:>12.1}{}{:>12.1}{}{:>10}",
+                " {:<19}{}{:<15}{}{:>12.0}{}{:>12.0}{}{:>10}",
                 "",
                 delimiter,
                 user.name,
@@ -253,9 +253,9 @@ async fn report_user_utilization_by_account(
             delimiter,
             "Account",
             delimiter,
-            "CPU Hours",
+            "CPU Seconds",
             delimiter,
-            "GPU Hours",
+            "GPU Seconds",
             delimiter,
             "Jobs"
         );
@@ -269,7 +269,7 @@ async fn report_user_utilization_by_account(
     for e in &usage.entries {
         user_agg.insert(
             (&e.user, &e.account),
-            (e.cpu_hours, e.gpu_hours, e.job_count),
+            (e.cpu_seconds, e.gpu_seconds, e.job_count),
         );
     }
 
@@ -279,7 +279,7 @@ async fn report_user_utilization_by_account(
             .unwrap_or(&(0.0, 0.0, 0));
 
         println!(
-            "{:<15}{}{:<20}{}{:>12.1}{}{:>12.1}{}{:>10}",
+            "{:<15}{}{:<20}{}{:>12.0}{}{:>12.0}{}{:>10}",
             user.name, delimiter, user.account, delimiter, cpu, delimiter, gpu, delimiter, jobs
         );
     }
@@ -312,7 +312,7 @@ async fn report_job_sizes_by_account(
         std::collections::HashMap::new();
     for e in &usage.entries {
         let a = acct_agg.entry(&e.account).or_default();
-        a.0 += e.cpu_hours;
+        a.0 += e.cpu_seconds;
         a.1 += e.job_count;
     }
     let total_cpu: f64 = acct_agg.values().map(|v| v.0).sum();
@@ -323,7 +323,7 @@ async fn report_job_sizes_by_account(
     if !args.noheader {
         println!(
             "{:<20}{}{:>10}{}{:>12}{}{:>8}",
-            "Account", delimiter, "Jobs", delimiter, "CPU Hours", delimiter, "% of Tot"
+            "Account", delimiter, "Jobs", delimiter, "CPU Seconds", delimiter, "% of Tot"
         );
         if !args.parsable {
             println!("{}", "-".repeat(56));
@@ -339,7 +339,7 @@ async fn report_job_sizes_by_account(
         };
 
         println!(
-            "{:<20}{}{:>10}{}{:>12.1}{}{:>7.1}%",
+            "{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
             account.name, delimiter, jobs, delimiter, cpu, delimiter, pct
         );
     }
@@ -347,7 +347,7 @@ async fn report_job_sizes_by_account(
     if !args.parsable {
         println!("{}", "-".repeat(56));
         println!(
-            "{:<20}{}{:>10}{}{:>12.1}{}{:>7.1}%",
+            "{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
             "TOTAL", delimiter, total_jobs, delimiter, total_cpu, delimiter, 100.0
         );
     }
@@ -383,7 +383,7 @@ async fn report_job_sizes_by_user(
         std::collections::HashMap::new();
     for e in &usage.entries {
         let u = user_agg.entry((&e.user, &e.account)).or_default();
-        u.0 += e.cpu_hours;
+        u.0 += e.cpu_seconds;
         u.1 += e.job_count;
     }
     let total_cpu: f64 = user_agg.values().map(|v| v.0).sum();
@@ -400,7 +400,7 @@ async fn report_job_sizes_by_user(
             delimiter,
             "Jobs",
             delimiter,
-            "CPU Hours",
+            "CPU Seconds",
             delimiter,
             "% of Tot"
         );
@@ -420,7 +420,7 @@ async fn report_job_sizes_by_user(
         };
 
         println!(
-            "{:<15}{}{:<20}{}{:>10}{}{:>12.1}{}{:>7.1}%",
+            "{:<15}{}{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
             user.name, delimiter, user.account, delimiter, jobs, delimiter, cpu, delimiter, pct
         );
     }
@@ -428,7 +428,7 @@ async fn report_job_sizes_by_user(
     if !args.parsable {
         println!("{}", "-".repeat(71));
         println!(
-            "{:<15}{}{:<20}{}{:>10}{}{:>12.1}{}{:>7.1}%",
+            "{:<15}{}{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
             "TOTAL", delimiter, "", delimiter, total_jobs, delimiter, total_cpu, delimiter, 100.0
         );
     }

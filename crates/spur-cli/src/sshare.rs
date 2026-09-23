@@ -97,17 +97,17 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     };
 
     // Build lookup maps from entries (server guarantees one entry per user+account)
-    let mut account_cpu_hours: std::collections::HashMap<&str, f64> =
+    let mut account_cpu_secs: std::collections::HashMap<&str, f64> =
         std::collections::HashMap::new();
-    let mut user_account_cpu_hours: std::collections::HashMap<(&str, &str), f64> =
+    let mut user_account_cpu_secs: std::collections::HashMap<(&str, &str), f64> =
         std::collections::HashMap::new();
     for entry in &usage.entries {
-        *account_cpu_hours.entry(&entry.account).or_default() += entry.cpu_hours;
-        user_account_cpu_hours.insert((&entry.user, &entry.account), entry.cpu_hours);
+        *account_cpu_secs.entry(&entry.account).or_default() += entry.cpu_seconds;
+        user_account_cpu_secs.insert((&entry.user, &entry.account), entry.cpu_seconds);
     }
 
     // Compute total usage for normalization
-    let total_cpu_usage: f64 = account_cpu_hours.values().sum();
+    let total_cpu_usage: f64 = account_cpu_secs.values().sum();
     let total_cpu_usage = if total_cpu_usage <= 0.0 {
         1.0
     } else {
@@ -125,7 +125,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 "RawUsage",
                 "NormUsage",
                 "FairShare",
-                "GrpCPUHrs"
+                "CPURawUsage"
             );
             println!("{}", "-".repeat(101));
         }
@@ -147,7 +147,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
         let raw_shares = account.fairshare_weight;
         let norm_shares = raw_shares / total_shares;
-        let raw_usage = account_cpu_hours
+        let raw_usage = account_cpu_secs
             .get(account.name.as_str())
             .copied()
             .unwrap_or(0.0);
@@ -163,7 +163,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         // Account-level row
         if args.long {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6} {:>12.1}",
+                "{:<15} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6} {:>12.0}",
                 account.name,
                 "",
                 raw_shares as u32,
@@ -175,7 +175,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             );
         } else {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6}",
+                "{:<15} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6}",
                 account.name, "", raw_shares as u32, norm_shares, raw_usage, norm_usage, fair_share,
             );
         }
@@ -190,7 +190,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 }
             }
 
-            let user_usage = user_account_cpu_hours
+            let user_usage = user_account_cpu_secs
                 .get(&(user.name.as_str(), account.name.as_str()))
                 .copied()
                 .unwrap_or(0.0);
@@ -207,7 +207,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
             if args.long {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6} {:>12.1}",
+                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6} {:>12.0}",
                     "",
                     user.name,
                     raw_shares as u32,
@@ -219,7 +219,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 );
             } else {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6}",
+                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6}",
                     "",
                     user.name,
                     raw_shares as u32,

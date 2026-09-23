@@ -483,8 +483,8 @@ impl SlurmAccounting for AccountingService {
             let e = agg
                 .entry((r.user_name.clone(), r.account.clone()))
                 .or_default();
-            e.0 += r.cpu_seconds as f64 / 3600.0;
-            e.1 += r.gpu_seconds as f64 / 3600.0;
+            e.0 += r.cpu_seconds as f64;
+            e.1 += r.gpu_seconds as f64;
             e.2 += r.job_count;
         }
 
@@ -493,8 +493,8 @@ impl SlurmAccounting for AccountingService {
             .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
                 user,
                 account,
-                cpu_hours: cpu,
-                gpu_hours: gpu,
+                cpu_seconds: cpu,
+                gpu_seconds: gpu,
                 job_count: jobs,
             })
             .collect();
@@ -1340,5 +1340,123 @@ mod tests {
             timestamp_to_utc(Some(ts)).unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn usage_entry_returns_cpu_seconds_not_hours() {
+        let now = chrono::Utc::now();
+        let records = vec![
+            db::UsageRecord {
+                user_name: "alice".into(),
+                account: "research".into(),
+                cpu_seconds: 240,
+                gpu_seconds: 0,
+                job_count: 1,
+                period_start: now,
+            },
+            db::UsageRecord {
+                user_name: "alice".into(),
+                account: "research".into(),
+                cpu_seconds: 480,
+                gpu_seconds: 100,
+                job_count: 2,
+                period_start: now,
+            },
+        ];
+
+        let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
+            std::collections::HashMap::new();
+        for r in &records {
+            let e = agg
+                .entry((r.user_name.clone(), r.account.clone()))
+                .or_default();
+            e.0 += r.cpu_seconds as f64;
+            e.1 += r.gpu_seconds as f64;
+            e.2 += r.job_count;
+        }
+
+        let entries: Vec<UsageEntry> = agg
+            .into_iter()
+            .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
+                user,
+                account,
+                cpu_seconds: cpu,
+                gpu_seconds: gpu,
+                job_count: jobs,
+            })
+            .collect();
+
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(
+            e.cpu_seconds, 720.0,
+            "must be raw seconds (240+480), not hours"
+        );
+        assert_eq!(e.gpu_seconds, 100.0);
+        assert_eq!(e.job_count, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn get_usage_handler_returns_cpu_seconds_not_hours() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+            .expect("DB connect");
+        db::migrate(&pool).await.expect("migrate");
+
+        let pid = std::process::id();
+        let user = format!("spur_unit_{pid}");
+        let acct = format!("spur_unitacct_{pid}");
+
+        let now = chrono::Utc::now();
+        let num_tasks: i32 = 1;
+        let cpus_per_task: i32 = 8;
+        let wall_secs: i64 = 30;
+
+        sqlx::query(
+            "INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count) \
+             VALUES ($1, $2, $3, $4, $5, 0, 1) \
+             ON CONFLICT (user_name, account, period_start) DO UPDATE SET \
+               cpu_seconds = usage.cpu_seconds + $5, job_count = usage.job_count + 1",
+        )
+        .bind(&user)
+        .bind(&acct)
+        .bind(now)
+        .bind(now + chrono::Duration::hours(1))
+        .bind(wall_secs * num_tasks as i64 * cpus_per_task as i64)
+        .execute(&pool)
+        .await
+        .expect("insert usage");
+
+        let service = AccountingService::unavailable("test");
+        service.install_pool(pool.clone());
+
+        let resp = service
+            .get_usage(tonic::Request::new(GetUsageRequest {
+                user: user.clone(),
+                account: acct.clone(),
+                since: None,
+            }))
+            .await
+            .expect("get_usage");
+
+        let entries = &resp.into_inner().entries;
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(
+            e.cpu_seconds,
+            (wall_secs * num_tasks as i64 * cpus_per_task as i64) as f64,
+            "handler must return raw cpu_seconds (240), not cpu_hours (0.067)"
+        );
+
+        sqlx::query("DELETE FROM usage WHERE user_name = $1 AND account = $2")
+            .bind(&user)
+            .bind(&acct)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }
