@@ -169,6 +169,71 @@ pub fn parse_named_format(
     tokens
 }
 
+/// Parse Slurm's `-O`/`--Format` grammar: a comma-separated list of fields, each
+/// `type[:[.][size][suffix]]`. `size` is a minimum width (default 20), a leading
+/// `.` right-justifies (default is left), and any trailing text is a literal
+/// suffix appended after the field. Unlike the `%`-form, `size` never truncates.
+///
+/// Unlike [`parse_named_format`] (sacct's `Name%width` form), fields are not
+/// separated by an implicit space — Slurm relies on width padding — so callers
+/// add separators via the suffix if they want them. An unrecognized field name
+/// is an error rather than being silently dropped.
+pub fn parse_format2(
+    fmt: &str,
+    name_to_spec: &dyn Fn(&str) -> Option<char>,
+    header_map: &dyn Fn(char) -> &'static str,
+) -> anyhow::Result<Vec<FormatToken>> {
+    let mut tokens = Vec::new();
+    for item in fmt.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+
+        let (name, spec_part) = match item.split_once(':') {
+            Some((n, rest)) => (n.trim(), Some(rest)),
+            None => (item, None),
+        };
+
+        let Some(spec) = name_to_spec(name) else {
+            anyhow::bail!("Invalid field requested: {name}");
+        };
+
+        let mut right_align = false;
+        let mut width = 20usize;
+        let mut suffix = String::new();
+        if let Some(rest) = spec_part {
+            let mut chars = rest.chars().peekable();
+            if chars.peek() == Some(&'.') {
+                right_align = true;
+                chars.next();
+            }
+            let digits: String =
+                std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_digit())).collect();
+            if !digits.is_empty() {
+                width = digits.parse().unwrap_or(20);
+            }
+            suffix = chars.collect();
+        }
+
+        tokens.push(FormatToken::Field(FormatField {
+            spec,
+            width,
+            right_align,
+            truncate: None,
+            header: header_map(spec).to_string(),
+        }));
+        if !suffix.is_empty() {
+            tokens.push(FormatToken::Literal(suffix));
+        }
+    }
+
+    if !tokens.iter().any(|t| matches!(t, FormatToken::Field(_))) {
+        anyhow::bail!("no recognized fields in Format='{fmt}'");
+    }
+    Ok(tokens)
+}
+
 /// Format a single row using parsed tokens and a value resolver.
 pub fn format_row(tokens: &[FormatToken], resolver: &dyn Fn(char) -> String) -> String {
     let mut out = String::new();
@@ -613,6 +678,62 @@ mod tests {
             .filter(|t| matches!(t, FormatToken::Field(_)))
             .count();
         assert_eq!(field_count, 2);
+    }
+
+    fn only_fields(tokens: &[FormatToken]) -> Vec<&FormatField> {
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                FormatToken::Field(f) => Some(f),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_format2_defaults_width_20_and_left_aligns() {
+        let tokens = parse_format2("JobID", &test_name_to_spec, &squeue_header).unwrap();
+        let fields = only_fields(&tokens);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].spec, 'i');
+        assert_eq!(fields[0].width, 20);
+        assert!(!fields[0].right_align);
+        assert_eq!(fields[0].truncate, None);
+    }
+
+    #[test]
+    fn parse_format2_colon_size_and_dot_right_justifies() {
+        let tokens =
+            parse_format2("JobID:.10,Partition:8", &test_name_to_spec, &squeue_header).unwrap();
+        let fields = only_fields(&tokens);
+        assert_eq!(fields[0].spec, 'i');
+        assert_eq!(fields[0].width, 10);
+        assert!(fields[0].right_align, "leading dot must right-justify");
+        assert_eq!(fields[1].spec, 'P');
+        assert_eq!(fields[1].width, 8);
+        assert!(!fields[1].right_align);
+    }
+
+    #[test]
+    fn parse_format2_emits_suffix_as_literal() {
+        let tokens = parse_format2("JobID:10|", &test_name_to_spec, &squeue_header).unwrap();
+        assert!(matches!(&tokens[0], FormatToken::Field(f) if f.spec == 'i' && f.width == 10));
+        assert!(matches!(&tokens[1], FormatToken::Literal(s) if s == "|"));
+    }
+
+    #[test]
+    fn parse_format2_is_case_insensitive_and_has_no_implicit_spacing() {
+        let tokens =
+            parse_format2("jobid:3,partition:3", &test_name_to_spec, &squeue_header).unwrap();
+        // No literal tokens between fields (unlike parse_named_format).
+        assert_eq!(only_fields(&tokens).len(), 2);
+        assert!(!tokens.iter().any(|t| matches!(t, FormatToken::Literal(_))));
+    }
+
+    #[test]
+    fn parse_format2_rejects_unknown_field() {
+        let err = parse_format2("JobID,NotAField", &test_name_to_spec, &squeue_header).unwrap_err();
+        assert!(err.to_string().contains("NotAField"));
     }
 
     /// Two padded columns, `JOBID` then `NAME`, with a literal space between them.

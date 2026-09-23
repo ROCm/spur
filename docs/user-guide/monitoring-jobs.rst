@@ -153,6 +153,40 @@ is a normalized float, ``%Q`` the integer); Spur exposes the integer under both.
    squeue -p gpu -o "%.18i %.9P %.8T %.10M %R"
    squeue --states=PD,R --noheader
 
+Verbose field names — ``squeue -O``/``--Format``
+------------------------------------------------
+
+``-O``/``--Format`` selects columns by field name instead of ``%``-letter.
+Fields are comma-separated, each ``type[:[.][size][suffix]]``:
+
+- ``size`` is a minimum width (default ``20``); unlike ``-o``'s ``.``, it never
+  truncates.
+- A leading ``.`` right-justifies the column. The default is left-justified,
+  the opposite of ``-o``.
+- ``suffix`` is arbitrary text appended after the field, e.g. a separator.
+
+Field names are case-insensitive and render the same data as their ``%``-letter
+equivalents. ``-O`` takes precedence over ``-o`` when both are given.
+
+.. code-block:: bash
+
+   squeue -O "JobID:10,Partition,State,QOS"
+   squeue -O "JobID:.18,Priority,Reason"
+
+Supported field names: ``Account``, ``ArrayJobID``, ``Command``, ``Comment``,
+``EndTime``, ``GRES``, ``JobID``, ``Name``, ``NodeList``, ``NumCPUs``,
+``NumNodes``, ``Partition``, ``Priority``, ``PriorityLong``, ``QOS``,
+``Reason``, ``ReasonList``, ``Reservation``, ``SchedNodes``, ``StartTime``,
+``State``, ``StateCompact``, ``SubmitTime``, ``TimeLeft``, ``TimeLimit``,
+``TimeUsed``, ``UserName``, ``WorkDir``.
+
+Slurm exposes many more ``-O`` fields that Spur has no backing data for
+(``Licenses``, ``Dependency``, ``Nice``, ``Reboot``, the ``tres-*`` family,
+federation fields, job-step fields, and others). Requesting an unsupported name
+is an error rather than a blank column. ``Priority`` renders Spur's integer
+priority (same as ``PriorityLong``); Spur does not compute Slurm's normalized
+0.0-1.0 float.
+
 Projected Start Times — ``squeue --start``
 -------------------------------------------
 

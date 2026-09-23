@@ -58,6 +58,11 @@ pub struct SqueueArgs {
     #[arg(short = 'o', long)]
     pub format: Option<String>,
 
+    /// Output format using field names, comma-separated: type[:[.][size][suffix]].
+    /// Takes precedence over -o/--format.
+    #[arg(short = 'O', long = "Format")]
+    pub format2: Option<String>,
+
     /// Long format (more columns)
     #[arg(short = 'l', long)]
     pub long: bool,
@@ -150,7 +155,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         states,
         sort_keys,
     } = plan_query(&args)?;
-    let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
+    // -O/--Format overrides -o/--format and the --long/--start default layouts.
+    let fields = match args.format2.as_deref() {
+        Some(f2) => {
+            format_engine::parse_format2(f2, &squeue_field_spec, &format_engine::squeue_header)
+                .context("invalid --Format specification")?
+        }
+        None => format_engine::parse_format(&fmt, &format_engine::squeue_header),
+    };
 
     let job_ids = args
         .jobs
@@ -505,6 +517,45 @@ fn format_duration_hms(total_seconds: i64) -> String {
     } else {
         format!("{}:{:02}", minutes, seconds)
     }
+}
+
+/// Map a Slurm `-O`/`--Format` field name to the specifier used by
+/// [`resolve_job_field`]. Case-insensitive. Only names Spur can render map to a
+/// spec; anything else is rejected by the caller. Names resolve to the same
+/// fields as their `%`-form equivalents.
+fn squeue_field_spec(name: &str) -> Option<char> {
+    let spec = match name.to_lowercase().as_str() {
+        "account" => 'a',
+        "arrayjobid" | "jobarrayid" => 'A',
+        "command" => 'o',
+        "comment" => 'k',
+        "endtime" => 'e',
+        "gres" | "trespernode" | "tres-per-node" => 'b',
+        "jobid" => 'i',
+        "name" => 'j',
+        "nodelist" | "nodes" => 'N',
+        "numcpus" => 'C',
+        "numnodes" => 'D',
+        "partition" => 'P',
+        // Spur exposes only the integer priority, so both map to it (see %Q/%p).
+        "priority" | "prioritylong" => 'p',
+        "qos" => 'q',
+        "reason" => 'r',
+        "reasonlist" => 'R',
+        "reservation" => 'v',
+        "schednodes" => 'Y',
+        "starttime" => 'S',
+        "state" => 'T',
+        "statecompact" => 't',
+        "submittime" => 'V',
+        "timeleft" => 'L',
+        "timelimit" => 'l',
+        "timeused" => 'M',
+        "username" => 'u',
+        "workdir" => 'Z',
+        _ => return None,
+    };
+    Some(spec)
 }
 
 #[cfg(test)]
@@ -997,5 +1048,96 @@ mod tests {
                 .unwrap();
         assert_eq!(long.qos.as_deref(), Some("batch"));
         assert_eq!(long.reservation.as_deref(), Some("resv1"));
+    }
+
+    #[test]
+    fn squeue_field_spec_maps_names_case_insensitively() {
+        assert_eq!(squeue_field_spec("JobID"), Some('i'));
+        assert_eq!(squeue_field_spec("jobid"), Some('i'));
+        assert_eq!(squeue_field_spec("Partition"), Some('P'));
+        assert_eq!(squeue_field_spec("StateCompact"), Some('t'));
+        assert_eq!(squeue_field_spec("state"), Some('T'));
+        assert_eq!(squeue_field_spec("QOS"), Some('q'));
+        assert_eq!(squeue_field_spec("reservation"), Some('v'));
+        // Spur has no normalized-float priority, so both map to the integer spec.
+        assert_eq!(squeue_field_spec("Priority"), Some('p'));
+        assert_eq!(squeue_field_spec("PriorityLong"), Some('p'));
+    }
+
+    #[test]
+    fn squeue_field_spec_rejects_unsupported_names() {
+        assert_eq!(squeue_field_spec("Licenses"), None);
+        assert_eq!(squeue_field_spec("Dependency"), None);
+    }
+
+    #[test]
+    fn every_squeue_field_spec_has_a_render_arm() {
+        let j = spur_proto::proto::JobInfo::default();
+        for name in [
+            "account",
+            "command",
+            "comment",
+            "endtime",
+            "gres",
+            "jobid",
+            "arrayjobid",
+            "name",
+            "nodelist",
+            "numcpus",
+            "numnodes",
+            "partition",
+            "priority",
+            "qos",
+            "reason",
+            "reasonlist",
+            "reservation",
+            "schednodes",
+            "starttime",
+            "state",
+            "statecompact",
+            "submittime",
+            "timeleft",
+            "timelimit",
+            "timeused",
+            "username",
+            "workdir",
+        ] {
+            let spec = squeue_field_spec(name)
+                .unwrap_or_else(|| panic!("name {name} should map to a spec"));
+            assert_ne!(
+                format_engine::squeue_header(spec),
+                "?",
+                "name {name} (spec {spec}) has no header"
+            );
+            assert_ne!(
+                resolve_job_field(&j, spec),
+                "?",
+                "name {name} (spec {spec}) has no render arm"
+            );
+        }
+    }
+
+    #[test]
+    fn format2_arg_parses_and_takes_precedence_over_format() {
+        let args =
+            SqueueArgs::try_parse_from(["squeue", "-o", "%i", "-O", "JobID:10,Partition,QOS"])
+                .unwrap();
+        assert_eq!(args.format.as_deref(), Some("%i"));
+        assert_eq!(args.format2.as_deref(), Some("JobID:10,Partition,QOS"));
+
+        let tokens = format_engine::parse_format2(
+            args.format2.as_deref().unwrap(),
+            &squeue_field_spec,
+            &format_engine::squeue_header,
+        )
+        .unwrap();
+        let specs: Vec<char> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                format_engine::FormatToken::Field(f) => Some(f.spec),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(specs, vec!['i', 'P', 'q']);
     }
 }
