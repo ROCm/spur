@@ -452,10 +452,10 @@ QOS keys
    * - ``preemptmode``
      - unset
      - What happens to a job in this QOS when an eligible pending job kicks it
-       out. A value other than unset or ``off`` overrides whatever the victim's
-       partitions say, for that job only. Unset (the default) and ``off``
-       both mean "no QOS override"; they resolve identically and differ only in
-       that ``sacctmgr show qos`` leaves the column blank when unset.
+       out. Any explicit value overrides whatever the victim's partitions say,
+       for that job only. Unset defers to the partition's ``preempt_mode``;
+       ``sacctmgr show qos`` leaves the column blank when unset and prints the
+       value once one is set.
 
        ``cancel`` — the job is stopped and removed from the queue. Its final
        state is ``CANCELLED`` (``PREEMPTED`` in accounting records).
@@ -463,20 +463,22 @@ QOS keys
        start again automatically once a slot is free.
        ``suspend`` — the job is paused, keeping its node allocation. It
        resumes automatically once the higher-priority job finishes.
-       ``off`` (default) — no QOS override; the partition's ``preempt_mode``
-       decides what happens. It does **not** protect the job from being
-       preempted.
+       ``off`` — a real protection: the job is never preempted, regardless of
+       what its partitions are configured to do. This governs **preemption**
+       only; it has no bearing on idle-fill reclaim (see
+       :doc:`idle-fill-scheduling`), which evicts a QOS's borrowed jobs
+       whenever that QOS is also ``idle_fill_preemptable``, independent of
+       ``preemptmode``.
 
        **Example of the override:** a partition is set to ``cancel`` but a
        specific QOS is set to ``preemptmode=requeue``. When a job in that QOS
        is kicked out, it goes back to the queue instead of being cancelled.
 
-       **How to actually protect a QOS from preemption:** simply do not add it
-       to any other QOS's ``preempt`` allow-list. When
-       ``preempt_type = "qos_priority"`` is enabled (see :doc:`configuration`),
-       a QOS that nobody has permission to preempt will never lose its running
-       jobs. ``preemptmode=off`` does not do this — it only defers the action
-       to the partition, which may itself be set to ``cancel``.
+       **Alternative: keep it out of every allow-list.** Instead of (or in
+       addition to) ``preemptmode=off``, a QOS that nobody's ``preempt``
+       allow-list names is never selected as a victim in the first place,
+       once ``preempt_type = "qos_priority"`` is enabled (see
+       :doc:`configuration`).
    * - ``preempt``
      - ``""`` (preempt nothing)
      - Comma-separated list of QOS names that jobs in this QOS are allowed to
@@ -787,7 +789,7 @@ allow-list. An empty allow-list means the QOS may not preempt anything.
      AND resolved_action != off
 
    resolved_action =
-     victim_qos.preemptmode                            if it is not off
+     victim_qos.preemptmode                            if set (including off)
      else most aggressive preempt_mode among the victim's partitions
           (cancel > requeue > suspend > off)
      else off
@@ -805,30 +807,37 @@ below, which compares partition tiers.
      - Victim QOS ``preemptmode``
      - Resolved action
    * - unset (default) or ``off``
-     - unset (default) or ``off``
+     - unset (default)
      - None — the victim is skipped
+   * - any
+     - ``off``
+     - None — the QOS action overrides the partition's, including to protect
    * - unset or ``off``
      - ``cancel`` / ``requeue`` / ``suspend``
      - The QOS action. A QOS action overrides a partition ``off``.
    * - ``cancel`` / ``requeue`` / ``suspend``
-     - unset or ``off``
+     - unset
      - The partition action
    * - ``cancel``
      - ``requeue``
      - ``requeue`` — the QOS action overrides the partition's
    * - Several partitions, e.g. ``suspend`` and ``cancel``
-     - unset or ``off``
+     - unset
      - ``cancel`` — the most aggressive matched partition action wins
 
 The table assumes the allow-list, rank, node-overlap, reservation, and exempt-time
 guards have all passed; any of those failing skips the victim regardless of the
 action configured.
 
-``preemptmode=off`` on a QOS is **not** a protection — it means "no override,
-use the partition's action". Equally, ``preempt_mode = "off"`` on a partition
-is not absolute, because a QOS action overrides it. The only way to keep a
-QOS's jobs from ever being selected is to keep its name out of every other
-QOS's ``preempt`` allow-list.
+A QOS's ``preemptmode`` always outranks its partitions': unset defers to the
+partition action, but any explicit value — including ``off`` — wins outright.
+``preemptmode=off`` on a QOS is therefore a real protection: it keeps that
+QOS's jobs from being preempted no matter what its partitions are configured
+to do. The other way to keep a QOS's jobs from ever being selected is to keep
+its name out of every other QOS's ``preempt`` allow-list. Neither guards
+against idle-fill reclaim (see :doc:`idle-fill-scheduling`), a separate
+mechanism that evicts borrowed jobs under an ``idle_fill_preemptable`` QOS
+regardless of ``preemptmode``.
 
 ``suspend`` is a fully selectable action: the victim is paused with SIGSTOP and
 keeps its node allocation. Nothing resumes it automatically — that needs an

@@ -473,14 +473,23 @@ it should displace:
    sacctmgr modify qos name=normal set priority=10000 preempt=burst
 
 Both are live: ``preempt_type`` applies on ``scontrol reconfigure``, and QOS
-changes take effect without a restart. Each victim still needs a non-``off``
-action from its QOS ``preemptmode`` or one of its partitions' ``preempt_mode``,
-as before. See :doc:`/admin-guide/accounting` for the full decision table.
+changes take effect without a restart. A victim still needs a resolved action
+that is not ``off``: its QOS ``preemptmode`` if set, else the most aggressive
+of its partitions' ``preempt_mode``. See :doc:`/admin-guide/accounting` for
+the full decision table.
 
 A pending job's own partition ``preempt_mode`` no longer gates whether it may
 preempt. Previously a job sitting in an ``off`` partition could never trigger
 preemption; now only the victim's scope decides. Partitions used to hold
 pending work away from preemption need their *victims* protected instead.
+
+**QOS ``preemptmode=off`` is now a real protection, not a no-op.** It used to
+mean "no QOS override, defer to the partition"; it now always wins over the
+partition, including to protect a job the partition would otherwise let
+through. Every pre-upgrade row holding the literal ``off`` behaved as unset
+under the old resolution rule, so a one-time migration resets those rows back
+to unset — they keep deferring to their partition exactly as before. Only a
+QOS an admin sets to ``off`` *after* upgrading gains the new protection.
 
 Leaving ``preempt_type`` at its ``"none"`` default is safe but silent: nothing
 logs that preemption was skipped, so verify with a test job rather than

@@ -382,20 +382,25 @@ mod tests {
             grp_tres: None,
             grp_wall_min: None,
             preempt_exempt_time: None,
+            idle_fill_preemptable: false,
             flags: String::new(),
         }
     }
 
-    // Rows written before preempt_mode became optional hold the literal 'off'
-    // the CLI injected when the field was omitted; it must keep resolving the
-    // same as unset or preemption dies silently on an upgraded cluster.
+    // A stored 'off' now resolves as a hard stop (see qos_preempt_override); the
+    // one-time migration in accounting/db.rs is what keeps rows written by the
+    // old CLI default (before preempt_mode was optional) from inheriting that
+    // meaning — this only covers rows that reach here still holding 'off'.
     #[test]
-    fn legacy_off_qos_row_resolves_like_unset() {
+    fn off_qos_row_is_hard_stop_unset_row_falls_back() {
         use spur_core::qos::qos_preempt_override;
 
-        let legacy = qos_from_record(qos_record_with_preempt_mode("off"));
-        assert_eq!(legacy.preempt_mode, Some(QosPreemptMode::Off));
-        assert_eq!(qos_preempt_override(&legacy), None);
+        let explicit_off = qos_from_record(qos_record_with_preempt_mode("off"));
+        assert_eq!(explicit_off.preempt_mode, Some(QosPreemptMode::Off));
+        assert_eq!(
+            qos_preempt_override(&explicit_off),
+            Some(spur_core::partition::PreemptMode::Off)
+        );
 
         let unset = qos_from_record(qos_record_with_preempt_mode(""));
         assert_eq!(unset.preempt_mode, None);

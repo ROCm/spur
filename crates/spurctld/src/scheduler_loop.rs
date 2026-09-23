@@ -809,8 +809,9 @@ fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<Stri
     busy_until
 }
 
-/// Resolve the effective PreemptMode for a job: QOS override wins if set
-/// (see `qos_preempt_override`), else the most aggressive matched partition.
+/// Resolve the effective PreemptMode for a job: an explicit QOS mode (including
+/// `Off`) wins outright; unset falls back to the most aggressive matched
+/// partition. See `qos_preempt_override`.
 fn job_preempt_mode(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
@@ -880,7 +881,7 @@ pub(crate) async fn try_preempt(
 ) {
     use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
-    use spur_core::partition::{Partition, PreemptMode};
+    use spur_core::partition::{Partition, PreemptMode, PreemptType};
     use spur_core::reservation::job_runs_in_active_reservation;
 
     if !qos_priority_preemption_enabled(sched) {
@@ -3453,7 +3454,7 @@ mod tests {
     }
 
     fn no_qos_override() -> spur_core::accounting::Qos {
-        qos_with_mode(spur_core::accounting::QosPreemptMode::Off)
+        spur_core::accounting::Qos::default()
     }
 
     fn sched_config_default() -> spur_core::config::SchedulerConfig {
@@ -6610,12 +6611,24 @@ mod tests {
     }
 
     #[test]
-    fn job_preempt_mode_qos_off_falls_back_to_partition() {
+    fn job_preempt_mode_qos_unset_falls_back_to_partition() {
         use spur_core::partition::PreemptMode;
         let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
         assert_eq!(
             job_preempt_mode(&job_in_partitions("gpu"), &parts, &no_qos_override()),
             PreemptMode::Cancel
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_qos_explicit_off_is_hard_stop() {
+        use spur_core::accounting::QosPreemptMode;
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
+        let qos = qos_with_mode(QosPreemptMode::Off);
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu"), &parts, &qos),
+            PreemptMode::Off
         );
     }
 }
