@@ -293,6 +293,41 @@ impl ResourceSet {
     }
 }
 
+/// Parse a Slurm-style `--mem` size into MiB. Optional `K`/`M`/`G`/`T` suffix
+/// (case-insensitive); no suffix means MiB.
+///
+/// Sizes round *up* to a whole MiB, as Slurm does. Rounding down would be
+/// worse than imprecise: a zero reaches the controller as "no limit", so
+/// `--mem=512K` would silently hand the job every byte on the node. Every
+/// multiplier is a power of two, so integer inputs convert exactly and only a
+/// genuinely fractional request is ever rounded. A bare `0` keeps Slurm's
+/// meaning of "all the node's memory" and stays 0.
+pub fn parse_memory_mb(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("invalid memory value ''");
+    }
+    let (num, mib_per_unit): (&str, f64) = match s.as_bytes()[s.len() - 1] {
+        b'K' | b'k' => (&s[..s.len() - 1], 1.0 / 1024.0),
+        b'M' | b'm' => (&s[..s.len() - 1], 1.0),
+        b'G' | b'g' => (&s[..s.len() - 1], 1024.0),
+        b'T' | b't' => (&s[..s.len() - 1], 1024.0 * 1024.0),
+        _ => (s, 1.0),
+    };
+    let val: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid memory value '{s}'"))?;
+    if !val.is_finite() || val < 0.0 {
+        anyhow::bail!("invalid memory value '{s}'");
+    }
+    let mib = (val * mib_per_unit).ceil();
+    if mib >= u64::MAX as f64 {
+        anyhow::bail!("memory value '{s}' is out of range");
+    }
+    Ok(mib as u64)
+}
+
 /// Parse a GRES string like "gpu:mi300x:4" or "gpu:2".
 ///
 /// The input is trimmed and empty strings are rejected, so callers that split a
@@ -807,5 +842,76 @@ mod accounting_tests {
         assert_eq!(inv.total_gpus(), 3);
         assert_eq!(inv.gpu_counts().get("mi300x"), Some(&2));
         assert_eq!(ResourceSet::default().total_gpus(), 0);
+    }
+}
+
+#[cfg(test)]
+mod parse_memory_tests {
+    use super::parse_memory_mb;
+
+    #[test]
+    fn default_unit_is_mib() {
+        assert_eq!(parse_memory_mb("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn all_suffixes_supported_case_insensitive() {
+        assert_eq!(parse_memory_mb("1024K").unwrap(), 1);
+        assert_eq!(parse_memory_mb("1024k").unwrap(), 1);
+        assert_eq!(parse_memory_mb("4096M").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("4096m").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("4G").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("4g").unwrap(), 4096);
+        assert_eq!(parse_memory_mb("1T").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_mb("1t").unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn sub_mib_sizes_round_up_instead_of_vanishing() {
+        // 0 reaches the controller as "no limit", so no non-zero request may
+        // round down to it.
+        assert_eq!(parse_memory_mb("1K").unwrap(), 1);
+        assert_eq!(parse_memory_mb("512K").unwrap(), 1);
+        assert_eq!(parse_memory_mb("1023K").unwrap(), 1);
+        assert_eq!(parse_memory_mb("1025K").unwrap(), 2);
+        assert_eq!(parse_memory_mb("2048K").unwrap(), 2);
+        assert_eq!(parse_memory_mb("0.5M").unwrap(), 1);
+    }
+
+    #[test]
+    fn fractional_sizes_round_up_to_whole_mib() {
+        assert_eq!(parse_memory_mb("1.5G").unwrap(), 1536);
+        assert_eq!(parse_memory_mb("1.5M").unwrap(), 2);
+        assert_eq!(parse_memory_mb("0.25T").unwrap(), 256 * 1024);
+    }
+
+    #[test]
+    fn zero_means_the_whole_node() {
+        assert_eq!(parse_memory_mb("0").unwrap(), 0);
+        assert_eq!(parse_memory_mb("0G").unwrap(), 0);
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(parse_memory_mb("  2G  ").unwrap(), 2048);
+    }
+
+    /// `u64::MAX as f64` rounds up to 2^64, so the ceiling compare has to be
+    /// inclusive: a float-to-int cast saturates rather than failing, which
+    /// would turn an over-range size into a `u64::MAX` MiB request.
+    #[test]
+    fn rejects_sizes_that_do_not_fit_u64() {
+        assert!(parse_memory_mb("18446744073709551616").is_err());
+        assert!(parse_memory_mb("18446744073709551615").is_err());
+        assert!(parse_memory_mb("17592186044416T").is_err());
+        assert_eq!(parse_memory_mb("1048576T").unwrap(), 1 << 40);
+    }
+
+    #[test]
+    fn rejects_garbage_and_empty() {
+        assert!(parse_memory_mb("").is_err());
+        assert!(parse_memory_mb("abc").is_err());
+        assert!(parse_memory_mb("G").is_err());
+        assert!(parse_memory_mb("-5G").is_err());
     }
 }
