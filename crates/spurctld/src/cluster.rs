@@ -687,6 +687,15 @@ impl ClusterManager {
             }
         }
 
+        // A cold association cache may hide the default account and its QOS policy.
+        if spec.time_limit.is_none()
+            && config.accounting.enabled()
+            && !self.association_cache.is_loaded()
+        {
+            return Err(SubmitError::unavailable(
+                "wall-time defaults are temporarily unavailable; retry after the accounting association cache loads",
+            ));
+        }
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache, &config.accounting)?;
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
@@ -758,13 +767,11 @@ impl ClusterManager {
         // Every input to wall-time defaulting — partition, account, QOS — is a field
         // the hook may rewrite, so defaulting follows the hook and reads the scope
         // that actually governs the job. A limit the hook set is left alone.
-        let wall_caps = self.wall_caps(&spec);
-        apply_default_time_limit(
+        self.apply_submission_time_default(
             &mut spec,
             &partitions,
             config.scheduler.default_time_limit_minutes,
-            wall_caps,
-        );
+        )?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -5339,6 +5346,57 @@ impl ClusterManager {
         }
     }
 
+    fn apply_submission_time_default(
+        &self,
+        spec: &mut JobSpec,
+        partitions: &[Partition],
+        cluster_default_minutes: u32,
+    ) -> Result<(), SubmitError> {
+        if spec.time_limit.is_some() {
+            return Ok(());
+        }
+        let qos = spec
+            .qos
+            .as_deref()
+            .and_then(|name| self.qos_cache.get(name));
+        if let Some(qos) = qos.filter(|qos| qos.default_time_unlimited) {
+            // An unread account cache may hide a hard cap or an unresolved default account.
+            if !self.association_limits_readable() {
+                return Err(SubmitError::unavailable(
+                    "DefaultTimeUnlimited requires account limits that are temporarily unavailable; retry after the accounting cache loads",
+                ));
+            }
+            let caps = self.wall_caps(spec);
+            for (policy, minutes) in [
+                ("QOS MaxWall", qos.limits.max_wall_minutes),
+                ("association/account MaxWall", caps.account_minutes),
+            ] {
+                if let Some(minutes) = minutes {
+                    return Err(SubmitError::invalid(format!(
+                        "DefaultTimeUnlimited for QOS '{}' conflicts with {policy}={minutes} minutes; request a finite time or remove the hard cap",
+                        qos.name
+                    )));
+                }
+            }
+            for part in partitions_for_defaulting(spec, partitions) {
+                if let Some(minutes) = part.max_time_minutes {
+                    return Err(SubmitError::invalid(format!(
+                        "DefaultTimeUnlimited for QOS '{}' conflicts with partition '{}' MaxTime={minutes} minutes; every requested partition must have unlimited MaxTime",
+                        qos.name, part.name
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        apply_default_time_limit(
+            spec,
+            partitions,
+            cluster_default_minutes,
+            self.wall_caps(spec),
+        );
+        Ok(())
+    }
+
     /// The wall-clock ceilings that already govern this submission, for defaulting.
     /// An unloaded cache reports nothing rather than holding the job, matching how
     /// `enforce_submit_limits` treats limits it cannot read yet.
@@ -8515,6 +8573,16 @@ fn apply_default_qos(
     // concurrent cache refresh can't validate one against the other's
     // stale snapshot.
     let (account, default_qos, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
+    if accounting.enabled()
+        && !qos_cache.is_loaded()
+        && (spec.qos.as_deref().is_some_and(|q| !q.is_empty())
+            || default_qos.is_some()
+            || !accounting.default_qos.trim().is_empty())
+    {
+        return Err(SubmitError::unavailable(
+            "QOS policy is temporarily unavailable; retry after the accounting cache loads",
+        ));
+    }
     // A stale pinned default (removed from qos_cache since it was set) is
     // treated as unset for authorization, matching how the fallback chain
     // below already ignores it rather than letting it block every explicit
@@ -12396,7 +12464,9 @@ mod tests {
         let cm = test_cluster_with_config(&dir, cfg).await;
         register_node(&cm, "n1", 64, 128000);
         cm.qos_cache().insert(capped_qos("cnt", Default::default()));
+        cm.association_cache().set_loaded_without_associations();
         run_qos_job_for(&cm, "alice", "cnt", "n1");
+        cm.association_cache().reset();
 
         assert!(!cm.association_cache().is_loaded());
         let info = cm.assoc_mgr_info(None);
@@ -15001,6 +15071,205 @@ mod tests {
 
         let spec = basic_spec("defaultacct");
         assert!(cm.submit_job(spec).is_ok());
+    }
+
+    fn unlimited_default_qos() -> Qos {
+        Qos {
+            name: "unlimited".into(),
+            default_time_unlimited: true,
+            ..Default::default()
+        }
+    }
+
+    fn unlimited_default_spec() -> JobSpec {
+        JobSpec {
+            qos: Some("unlimited".into()),
+            time_limit: None,
+            ..basic_spec("unlimited-default")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_default_overrides_defaults_and_leaves_existing_jobs_unchanged() {
+        for partition_default in [None, Some("00:20:00".into())] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = test_config();
+            cfg.scheduler.default_time_limit_minutes = 90;
+            cfg.partitions[0].default_time = partition_default.clone();
+            let cm = test_cluster_with_config(&dir, cfg).await;
+            cm.qos_cache().insert(Qos {
+                default_time_unlimited: false,
+                ..unlimited_default_qos()
+            });
+            let old = submit_and_wait(&cm, unlimited_default_spec());
+            let finite_default = Some(chrono::Duration::minutes(if partition_default.is_some() {
+                20
+            } else {
+                90
+            }));
+            assert_eq!(cm.get_job(old).unwrap().spec.time_limit, finite_default);
+
+            cm.qos_cache().insert(unlimited_default_qos());
+            for interactive in [false, true] {
+                let mut spec = unlimited_default_spec();
+                spec.interactive = interactive;
+                spec.script = (!interactive).then(|| "#!/bin/sh\ntrue\n".into());
+                let id = submit_and_wait(&cm, spec);
+                assert_eq!(cm.get_job(id).unwrap().spec.time_limit, None);
+            }
+            let mut explicit = unlimited_default_spec();
+            explicit.time_limit = Some(chrono::Duration::minutes(7));
+            let id = submit_and_wait(&cm, explicit);
+            assert_eq!(
+                cm.get_job(id).unwrap().spec.time_limit,
+                Some(chrono::Duration::minutes(7))
+            );
+            assert_eq!(cm.get_job(old).unwrap().spec.time_limit, finite_default);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_default_rejects_every_hard_wall_cap_including_zero() {
+        for minutes in [0, 30] {
+            for policy in ["QOS MaxWall", "association/account MaxWall", "MaxTime"] {
+                let dir = TempDir::new().unwrap();
+                let mut cfg = test_config();
+                if policy == "MaxTime" {
+                    let mut capped = cfg.partitions[0].clone();
+                    capped.name = "capped".into();
+                    capped.default = false;
+                    capped.max_time = Some(format!("00:{minutes:02}:00"));
+                    cfg.partitions.push(capped);
+                }
+                let cm = test_cluster_with_config(&dir, cfg).await;
+                let mut qos = unlimited_default_qos();
+                if policy == "QOS MaxWall" {
+                    qos.limits.max_wall_minutes = Some(minutes);
+                }
+                cm.qos_cache().insert(qos);
+                let mut spec = unlimited_default_spec();
+                if policy == "association/account MaxWall" {
+                    cm.association_cache().insert_limits(
+                        "testuser",
+                        "research",
+                        AccountLimits {
+                            max_wall_minutes: Some(minutes),
+                            ..Default::default()
+                        },
+                    );
+                    spec.account = Some("research".into());
+                }
+                if policy == "MaxTime" {
+                    spec.partition = Some("default,capped".into());
+                }
+                let err = cm.submit_job(spec).unwrap_err();
+                assert!(matches!(err, SubmitError::InvalidArgument(_)), "{err:?}");
+                assert!(
+                    err.to_string().contains("DefaultTimeUnlimited")
+                        && err.to_string().contains(policy),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_default_uses_final_hook_policy_and_preserves_hook_time() {
+        for (patch, expected) in [
+            (
+                r#"{"qos":"unlimited","account":"research","partition":"roomy"}"#,
+                None,
+            ),
+            (
+                r#"{"qos":"unlimited","account":"research","partition":"roomy","time_limit_minutes":7}"#,
+                Some(7),
+            ),
+            (
+                r#"{"qos":"normal","account":"research","partition":"roomy"}"#,
+                Some(20),
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = test_config();
+            cfg.partitions[0].max_time = Some("01:00:00".into());
+            let mut roomy = cfg.partitions[0].clone();
+            roomy.name = "roomy".into();
+            roomy.default = false;
+            roomy.max_time = None;
+            roomy.default_time = Some("00:20:00".into());
+            cfg.partitions.push(roomy);
+            cfg.hooks.job_submit = Some(write_hook_script(&dir, &format!("echo '{patch}'")));
+            let cm = test_cluster_with_config(&dir, cfg).await;
+            cm.qos_cache().insert(unlimited_default_qos());
+            cm.qos_cache().insert(Qos {
+                name: "normal".into(),
+                ..Default::default()
+            });
+            cm.association_cache()
+                .insert_association("testuser", "research");
+            let id = submit_and_wait(&cm, unlimited_default_spec());
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.spec.partition.as_deref(), Some("roomy"));
+            assert_eq!(job.spec.account.as_deref(), Some("research"));
+            assert_eq!(job.spec.time_limit, expected.map(chrono::Duration::minutes));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_default_unavailable_initial_accounting_is_retryable() {
+        for source in ["explicit", "association", "cluster", "cold-association"] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = test_config();
+            cfg.accounting.database_url = "postgres://unused-in-test".into();
+            if source == "cluster" {
+                cfg.accounting.default_qos = "unlimited".into();
+            }
+            let cm = test_cluster_with_config(&dir, cfg).await;
+            let mut spec = unlimited_default_spec();
+            if source != "explicit" {
+                spec.qos = None;
+            }
+            if source == "cold-association" {
+                cm.qos_cache().insert(unlimited_default_qos());
+            } else {
+                cm.association_cache()
+                    .insert_default_account("testuser", "research");
+                if source == "association" {
+                    cm.association_cache()
+                        .insert_default_qos("testuser", "research", "unlimited");
+                }
+            }
+            let err = cm.submit_job(spec).unwrap_err();
+            assert!(
+                matches!(err, SubmitError::Unavailable(_)),
+                "{source}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_default_rechecks_account_cache_before_defaulting() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.accounting.database_url = "postgres://unused-in-test".into();
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.qos_cache().insert(unlimited_default_qos());
+        let mut spec = unlimited_default_spec();
+
+        let err = cm
+            .apply_submission_time_default(&mut spec, &cm.partitions.read(), 60)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SubmitError::Unavailable(ref message)
+                if message.contains("DefaultTimeUnlimited requires account limits")
+        ));
+        assert_eq!(spec.time_limit, None);
+
+        cm.association_cache().set_loaded_without_associations();
+        cm.apply_submission_time_default(&mut spec, &[], 60)
+            .unwrap();
+        assert_eq!(spec.time_limit, None);
     }
 
     fn qos_with_limits(name: &str, limits: spur_core::accounting::QosLimits, deny: bool) -> Qos {
@@ -19643,7 +19912,9 @@ mod tests {
     async fn accounting_cluster(dir: &TempDir) -> Arc<ClusterManager> {
         let mut cfg = test_config();
         cfg.accounting.database_url = "postgres://unused-in-test".into();
-        test_cluster_with_config(dir, cfg).await
+        let cm = test_cluster_with_config(dir, cfg).await;
+        cm.association_cache().set_loaded_without_associations();
+        cm
     }
 
     /// Three jobs from one user under a QOS capped at two, returned in submit order.
@@ -19861,6 +20132,7 @@ mod tests {
         // what a conjoined loaded-only check gets wrong.
         let dir = TempDir::new().unwrap();
         let cm = accounting_cluster(&dir).await;
+        cm.association_cache().reset();
         assert!(!cm.qos_limits_readable());
         assert!(!cm.association_limits_readable());
 

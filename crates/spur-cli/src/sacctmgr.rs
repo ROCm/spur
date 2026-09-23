@@ -1932,6 +1932,37 @@ mod tests {
     }
 
     #[test]
+    fn unlimited_default_qos_flags_patch_and_display() {
+        let p = parse_params(&[
+            "name=amd-oss-qos".into(),
+            "maxwall=-1".into(),
+            "flags=DenyOnLimit,DefaultTimeUnlimited".into(),
+        ]);
+        let req = build_modify_qos_request(&p).unwrap();
+        assert_eq!(req.max_wall_minutes, Some(spur_core::accounting::INFINITE));
+        assert_eq!(
+            req.flags.as_deref(),
+            Some("DenyOnLimit,DefaultTimeUnlimited")
+        );
+        assert_eq!(req.priority, None);
+        assert_eq!(req.max_tres_per_job, None);
+        assert_eq!(req.max_jobs_per_user, None);
+        let q = QosInfo {
+            flags: req.flags.unwrap(),
+            ..stub_qos()
+        };
+        assert_eq!(
+            resolve_qos_field(&q, qos_field_spec("Flags").unwrap()),
+            "DenyOnLimit,DefaultTimeUnlimited"
+        );
+        let omitted = build_modify_qos_request(&parse_params(&["name=q".into()])).unwrap();
+        assert_eq!(omitted.flags, None);
+        let cleared =
+            build_modify_qos_request(&parse_params(&["name=q".into(), "flags=".into()])).unwrap();
+        assert_eq!(cleared.flags, Some(String::new()));
+    }
+
+    #[test]
     fn qos_named_format_renders_tres_fields() {
         let fields = format_engine::parse_named_format(
             "Name,GrpTRES,MaxTRES,MaxTRESPU",
