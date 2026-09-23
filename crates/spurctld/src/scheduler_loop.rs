@@ -111,6 +111,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
+    // Nodes freed by reclaim are held out of dispatch for the agent's kill grace, so
+    // the next pass cannot see them and would conclude the reclaimer still needs
+    // capacity -- taking a second victim for a shortfall already closed. That extra
+    // eviction is not just churn: it defeats the priority order, because the cheapest
+    // victim goes first and the dearer one follows a second later anyway. Remember
+    // which reclaimer has capacity in flight and leave it alone until it lands.
+    let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -270,9 +277,21 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // `try_preempt` this cycle.
                 let sched_cfg = cluster.config().scheduler.clone();
                 if sched_cfg.idle_fill_enabled {
-                    let freed = reclaim_for_unplaced(
+                    let now = Utc::now();
+                    reclaim_in_flight.retain(|_, until| *until > now);
+                    // Reclaim considers borrow candidates too, unlike `try_preempt`
+                    // and federation: rule (B) lets a higher-priority idle-fill job
+                    // displace strictly-lower-priority opportunistic work. The
+                    // ceiling inside keeps it from touching anything with a claim.
+                    let reclaimers: Vec<_> = pending
+                        .iter()
+                        .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+                        .filter(|j| !reclaim_in_flight.contains_key(&j.job_id))
+                        .collect();
+                    let (freed, freed_for) = reclaim_for_unplaced(
                         &cluster,
-                        &unscheduled,
+                        &reclaimers,
+                        &borrow_ids,
                         &cluster_state,
                         sched_cfg.idle_fill_exempt_secs,
                     )
@@ -288,6 +307,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                             std::time::Duration::from_secs(5);
                         for node in &freed {
                             cluster.cool_down_node_for(node, AGENT_KILL_GRACE);
+                        }
+                        // Give the reclaimer the whole grace period plus a cycle to be
+                        // dispatched onto what it was just given.
+                        if let Some(job_id) = freed_for {
+                            let settle = chrono::Duration::seconds(
+                                AGENT_KILL_GRACE.as_secs() as i64 + interval_secs as i64 + 1,
+                            );
+                            reclaim_in_flight.insert(job_id, Utc::now() + settle);
                         }
                         continue;
                     }
@@ -977,6 +1004,13 @@ struct ReclaimableRun {
     job_id: spur_core::job::JobId,
     run_attempt: u32,
     nodes: Vec<String>,
+    /// The QOS priority, which is what the design means by standing within the
+    /// opportunistic tier. Deliberately not `Job::priority`: that is
+    /// `base * fair_share * age_factor * partition_tier`, so a long-waiting burst
+    /// job would outrank a high-priority borrowed run purely for having queued
+    /// longer. A burst QOS sits at a large negative delta by construction, so QOS
+    /// priority sorts it ahead of stamped idle-fill without special-casing.
+    priority: i32,
 }
 
 /// The minimum time a borrowed job runs before it may be reclaimed.
@@ -1020,9 +1054,13 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
 async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
+    // Pending jobs that are themselves opportunistic: the stamped borrow candidates.
+    // A job whose QOS is `idle_fill_preemptable` is opportunistic too, and is
+    // recognised from its QOS rather than needing to be listed here.
+    opportunistic: &HashSet<spur_core::job::JobId>,
     cluster_state: &ClusterState<'_>,
     exempt_secs: u32,
-) -> Vec<String> {
+) -> (Vec<String>, Option<spur_core::job::JobId>) {
     let now = Utc::now();
     let running = cluster.get_jobs(&JobFilter {
         states: &[spur_core::job::JobState::Running],
@@ -1066,13 +1104,14 @@ async fn reclaim_for_unplaced(
             continue;
         }
         reclaimable.push(ReclaimableRun {
+            priority: cluster.resolve_qos(job).priority,
             job_id: job.job_id,
             run_attempt: job.run_attempt,
             nodes: job.allocated_nodes.clone(),
         });
     }
     if reclaimable.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     // Which running jobs sit on each node, so a node is only counted as freed when
@@ -1085,11 +1124,26 @@ async fn reclaim_for_unplaced(
     }
     let reclaimable_ids: HashSet<spur_core::job::JobId> =
         reclaimable.iter().map(|r| r.job_id).collect();
+    let victim_priority: HashMap<spur_core::job::JobId, i32> =
+        reclaimable.iter().map(|r| (r.job_id, r.priority)).collect();
 
     for reclaimer in unplaced {
-        let Some(victims) =
-            satisfiable_victim_set(reclaimer, &reclaimable_ids, &occupants, cluster_state, now)
-        else {
+        // An opportunistic reclaimer displaces only opportunistic work strictly
+        // below it. A job with a genuine quota claim has no such ceiling: borrowed
+        // capacity is a loan and anyone with a claim can call it in.
+        let reclaimer_is_opportunistic = opportunistic.contains(&reclaimer.job_id)
+            || cluster.resolve_qos(reclaimer).idle_fill_preemptable;
+        let ceiling = reclaimer_is_opportunistic.then(|| cluster.resolve_qos(reclaimer).priority);
+
+        let Some(victims) = satisfiable_victim_set(
+            reclaimer,
+            &reclaimable_ids,
+            &occupants,
+            &victim_priority,
+            ceiling,
+            cluster_state,
+            now,
+        ) else {
             continue;
         };
 
@@ -1137,10 +1191,10 @@ async fn reclaim_for_unplaced(
         if !freed.is_empty() {
             // One reclaim per cycle: the next pass re-derives everything from the
             // committed state rather than reasoning about a half-applied plan.
-            return freed;
+            return (freed, Some(reclaimer.job_id));
         }
     }
-    Vec::new()
+    (Vec::new(), None)
 }
 
 /// The set of borrowed jobs whose eviction would let `reclaimer` actually run, or
@@ -1155,6 +1209,12 @@ fn satisfiable_victim_set(
     reclaimer: &spur_core::job::Job,
     reclaimable_ids: &HashSet<spur_core::job::JobId>,
     occupants: &HashMap<&str, Vec<spur_core::job::JobId>>,
+    victim_priority: &HashMap<spur_core::job::JobId, i32>,
+    // Set for an opportunistic reclaimer: it may only displace opportunistic work of
+    // strictly lower priority, so a low-priority burst job cannot evict a
+    // higher-priority borrowed run. `None` for a job holding a real quota claim,
+    // which may reclaim any borrowed capacity.
+    max_victim_priority: Option<i32>,
     cluster_state: &ClusterState<'_>,
     now: DateTime<Utc>,
 ) -> Option<HashSet<spur_core::job::JobId>> {
@@ -1182,12 +1242,33 @@ fn satisfiable_victim_set(
             // Already empty and suitable, yet the pass still could not place the
             // job — so these alone are never enough, but they count toward the total.
             None => have += 1,
-            Some(on_node) if on_node.iter().all(|id| reclaimable_ids.contains(id)) => {
+            Some(on_node)
+                if on_node.iter().all(|id| {
+                    reclaimable_ids.contains(id)
+                        && max_victim_priority.is_none_or(|bound| {
+                            victim_priority.get(id).copied().unwrap_or(0) < bound
+                        })
+                }) =>
+            {
                 evacuable.push((node.name.as_str(), on_node));
             }
             Some(_) => {}
         }
     }
+
+    // Spend the cheapest opportunistic work first, and only climb to a more
+    // valuable victim if that is still not enough. A node's cost is the highest
+    // priority it carries, since evacuating it forfeits every run on it, and
+    // ties break on node name so the choice is deterministic rather than
+    // dependent on registration order.
+    evacuable.sort_by_key(|(name, on_node)| {
+        let cost = on_node
+            .iter()
+            .map(|id| victim_priority.get(id).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        (cost, *name)
+    });
 
     for (_, on_node) in evacuable {
         if have >= needed {
@@ -3541,6 +3622,10 @@ mod tests {
     mod idle_fill_reclaim_tests {
         use super::*;
 
+        fn no_priorities() -> HashMap<spur_core::job::JobId, i32> {
+            HashMap::new()
+        }
+
         fn node(name: &str, cpus: u32) -> Node {
             let mut n = Node::new(
                 name.into(),
@@ -3595,6 +3680,8 @@ mod tests {
                     &greedy,
                     &reclaimable,
                     &occupants,
+                    &no_priorities(),
+                    None,
                     &state(&nodes, &busy),
                     Utc::now()
                 )
@@ -3610,6 +3697,8 @@ mod tests {
                     &fits,
                     &reclaimable,
                     &occupants,
+                    &no_priorities(),
+                    None,
                     &state(&nodes, &busy),
                     Utc::now()
                 ),
@@ -3633,6 +3722,8 @@ mod tests {
                     &reclaimer(2, 1),
                     &reclaimable,
                     &occupants,
+                    &no_priorities(),
+                    None,
                     &state(&nodes, &busy),
                     Utc::now()
                 )
@@ -3649,11 +3740,198 @@ mod tests {
                 &reclaimer(2, 1),
                 &reclaimable,
                 &occupants,
+                &no_priorities(),
+                None,
                 &state(&nodes, &busy),
                 Utc::now(),
             )
             .expect("both nodes recoverable");
             assert_eq!(victims, [7, 8].into_iter().collect());
+        }
+
+        #[test]
+        fn reclaim_spends_the_lowest_priority_opportunistic_run_first() {
+            // The design's eviction order: "lowest-priority opportunistic jobs first
+            // (typically burst), then higher-priority idle-fill if still insufficient."
+            // Previously victims were taken in node-iteration order, so a legitimate
+            // claim could evict a high-priority borrowed run while a low-priority burst
+            // job on another node kept running.
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]); // high-priority idle-fill
+            occupants.insert("n2", vec![9]); // low-priority burst
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 5000), (9, 10)].into_iter().collect();
+
+            // One node needed, so exactly one victim: the cheaper one.
+            let victims = satisfiable_victim_set(
+                &reclaimer(1, 1),
+                &reclaimable,
+                &occupants,
+                &priorities,
+                None,
+                &state(&nodes, &busy),
+                Utc::now(),
+            )
+            .expect("one evacuable node is enough");
+            assert_eq!(
+                victims,
+                [9].into_iter().collect(),
+                "the low-priority burst run must be evicted, not the high-priority borrower"
+            );
+
+            // n1 is listed first, so a node-order implementation would have picked 7.
+            assert!(
+                !victims.contains(&7),
+                "high-priority borrower must be spared"
+            );
+        }
+
+        #[test]
+        fn reclaim_climbs_to_a_costlier_victim_only_when_it_must() {
+            // Two nodes needed and only two available, so both go regardless of
+            // priority -- the ordering decides *which first*, never whether enough is
+            // taken to satisfy the claim.
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![9]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 5000), (9, 10)].into_iter().collect();
+
+            let victims = satisfiable_victim_set(
+                &reclaimer(2, 1),
+                &reclaimable,
+                &occupants,
+                &priorities,
+                None,
+                &state(&nodes, &busy),
+                Utc::now(),
+            )
+            .expect("both nodes recoverable");
+            assert_eq!(victims, [7, 9].into_iter().collect());
+        }
+
+        #[test]
+        fn an_opportunistic_reclaimer_cannot_displace_dearer_opportunistic_work() {
+            // Rule (B): "A burst job (low priority, idle_fill_preemptable = true)
+            // cannot displace a higher-priority idle-fill job." The ceiling is the
+            // reclaimer's own priority, so a cheap opportunistic job finds no victim
+            // set at all when the only candidate outranks it.
+            let nodes = vec![node("n1", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]); // dear borrowed run
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> = [(7, 6000)].into_iter().collect();
+
+            let cheap = reclaimer(1, 1); // priority 0 in the fixture
+            assert!(
+                satisfiable_victim_set(
+                    &cheap,
+                    &reclaimable,
+                    &occupants,
+                    &priorities,
+                    Some(1001), // an opportunistic reclaimer at burst priority
+                    &state(&nodes, &busy),
+                    Utc::now()
+                )
+                .is_none(),
+                "a low-priority opportunistic job must not evict a dearer one"
+            );
+
+            // Control: with no ceiling -- a job holding a real quota claim -- the same
+            // victim is fair game, so the refusal above is the ceiling and not the
+            // fixture being unsatisfiable.
+            assert_eq!(
+                satisfiable_victim_set(
+                    &cheap,
+                    &reclaimable,
+                    &occupants,
+                    &priorities,
+                    None,
+                    &state(&nodes, &busy),
+                    Utc::now()
+                ),
+                Some([7].into_iter().collect()),
+                "a legitimate claim may reclaim any borrowed capacity"
+            );
+        }
+
+        #[test]
+        fn an_opportunistic_reclaimer_may_displace_strictly_cheaper_work() {
+            // The other half of rule (B): a higher-priority idle-fill job does outrank
+            // a lower-priority burst job. Strictly lower, so an equal-priority victim
+            // is still protected.
+            let nodes = vec![node("n1", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![9]); // cheap burst victim
+            let reclaimable: HashSet<spur_core::job::JobId> = [9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> = [(9, 1001)].into_iter().collect();
+
+            let dear = reclaimer(1, 1);
+            assert_eq!(
+                satisfiable_victim_set(
+                    &dear,
+                    &reclaimable,
+                    &occupants,
+                    &priorities,
+                    Some(6000),
+                    &state(&nodes, &busy),
+                    Utc::now()
+                ),
+                Some([9].into_iter().collect()),
+                "a dearer opportunistic job displaces a strictly cheaper one"
+            );
+
+            // Equal priority is not "strictly lower", so nothing moves.
+            assert!(
+                satisfiable_victim_set(
+                    &dear,
+                    &reclaimable,
+                    &occupants,
+                    &priorities,
+                    Some(1001),
+                    &state(&nodes, &busy),
+                    Utc::now()
+                )
+                .is_none(),
+                "equal priority must not be displaced"
+            );
+        }
+
+        #[test]
+        fn victim_order_is_deterministic_when_priorities_tie() {
+            // Equal priority must not leave the choice to node registration order.
+            let nodes = vec![node("n2", 4), node("n1", 4)];
+            let busy = HashMap::new();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![9]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 100), (9, 100)].into_iter().collect();
+
+            let victims = satisfiable_victim_set(
+                &reclaimer(1, 1),
+                &reclaimable,
+                &occupants,
+                &priorities,
+                None,
+                &state(&nodes, &busy),
+                Utc::now(),
+            )
+            .expect("one evacuable node is enough");
+            assert_eq!(
+                victims,
+                [7].into_iter().collect(),
+                "ties break on node name, so n1's occupant goes even though n2 is listed first"
+            );
         }
 
         #[test]
@@ -3670,6 +3948,8 @@ mod tests {
                 &reclaimer(1, 1),
                 &reclaimable,
                 &occupants,
+                &no_priorities(),
+                None,
                 &state(&nodes, &busy),
                 Utc::now()
             )
