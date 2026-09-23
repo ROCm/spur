@@ -72,9 +72,9 @@ fn write_direct(dest: &Path, data: &[u8], mode: u32) -> Result<(), String> {
 /// Write via a `setpriv`-dropped `sh` child so the file is created with the job
 /// user's credentials.
 ///
-/// ponytail: the redirect is not atomic (no temp+rename) and the `!force` check
-/// happens in the caller (a small TOCTOU window) — acceptable for staging a
-/// file, upgrade path is an O_NOFOLLOW temp-file + rename done in the child.
+/// The write is not atomic and the `!force` check runs in the caller, so two
+/// concurrent broadcasts to one path can interleave; staging a file tolerates
+/// that, and the child's credentials are what bound where it may land.
 fn write_as_user(pd: &PrivDrop, dest: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     let dest_s = dest
         .to_str()
@@ -153,6 +153,26 @@ mod tests {
     fn resolve_dest_relative_without_work_dir_errors() {
         assert!(resolve_dest("x", "").is_err());
         assert!(resolve_dest("", "/home/u").is_err());
+    }
+
+    #[test]
+    fn a_zero_mode_falls_back_to_0644() {
+        // 0 is the proto default for an unset mode; taken literally it would
+        // create a file with no permission bits at all.
+        let dir = scratch_dir();
+        let dest = dir.join("defaulted");
+        write_file(
+            &dest,
+            b"x",
+            0,
+            false,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .unwrap();
+        let got = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(got, 0o644);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

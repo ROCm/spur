@@ -6933,6 +6933,12 @@ mod tests {
             Ok(tonic::Response::new(()))
         }
 
+        async fn receive_file(
+            &self,
+            _request: Request<spur_proto::proto::ReceiveFileRequest>,
+        ) -> Result<Response<spur_proto::proto::ReceiveFileResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
         async fn await_step(
             &self,
             _request: Request<spur_proto::proto::AwaitStepRequest>,
@@ -8617,6 +8623,78 @@ mod tests {
             }))
             .await
             .expect_err("a still-Pending job must not accept a new step");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    // Everything sbcast checks before a byte leaves the controller: the job
+    // must exist, belong to the caller, and be running. Only the fan-out past
+    // these needs live agents, so the gates are pinned here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sbcast_rejects_an_unknown_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let err = svc
+            .sbcast(Request::new(SbcastRequest {
+                job_id: 999_999,
+                dest: "/tmp/x".into(),
+                data: b"x".to_vec(),
+                mode: 0o644,
+                force: false,
+                user: "u".into(),
+            }))
+            .await
+            .expect_err("a job that does not exist has no allocation to stage onto");
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sbcast_rejects_a_caller_who_does_not_own_the_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "owner").await;
+
+        let err = svc
+            .sbcast(Request::new(SbcastRequest {
+                job_id,
+                dest: "/tmp/x".into(),
+                data: b"x".to_vec(),
+                mode: 0o644,
+                force: false,
+                user: "intruder".into(),
+            }))
+            .await
+            .expect_err("sbcast writes files into the allocation, so it is owner-only");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sbcast_rejects_a_job_that_is_not_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let spec = spur_core::job::JobSpec {
+            name: "pending-sbcast".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+
+        let err = svc
+            .sbcast(Request::new(SbcastRequest {
+                job_id,
+                dest: "/tmp/x".into(),
+                data: b"x".to_vec(),
+                mode: 0o644,
+                force: false,
+                user: "u".into(),
+            }))
+            .await
+            .expect_err("a pending job has no nodes to stage onto yet");
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
