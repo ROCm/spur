@@ -2840,12 +2840,9 @@ mod tests {
         nodes
             .iter()
             .filter_map(|name| {
-                totals.get(name).map(|inv| {
-                    (
-                        name.clone(),
-                        build_node_allocation(inv, &ResourceAllocations::default(), request),
-                    )
-                })
+                let inv = totals.get(name)?;
+                let alloc = build_node_allocation(inv, &ResourceAllocations::default(), request)?;
+                Some((name.clone(), alloc))
             })
             .collect()
     }

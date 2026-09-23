@@ -59,7 +59,7 @@ impl AllocatedDevice {
 
 impl ResourceAllocations {
     pub fn is_empty(&self) -> bool {
-        self.cpus == 0 && self.memory_mb == 0 && self.devices.is_empty()
+        self.cpus == 0 && self.memory_mb == 0 && !self.has_devices()
     }
 
     pub fn has_devices(&self) -> bool {
@@ -361,11 +361,15 @@ pub fn aggregate_allocations(
 }
 
 /// Build per-node allocation with real device IDs from inventory.
+///
+/// `None` when the free devices cannot cover the request in full. A partial
+/// booking would hold fewer devices than the job asked for and leave the rest
+/// of its window open for another job to claim.
 pub fn build_node_allocation(
     inventory: &ResourceSet,
     current_alloc: &ResourceAllocations,
     request: &ResourceSet,
-) -> ResourceAllocations {
+) -> Option<ResourceAllocations> {
     let mut alloc = ResourceAllocations::with_scalar(request.cpus, request.memory_mb);
 
     let req_gpus = request.gpu_counts();
@@ -378,6 +382,9 @@ pub fn build_node_allocation(
         let mut effective_alloc = current_alloc.clone();
         effective_alloc.add(&alloc);
         let picked = inventory.pick_devices(&effective_alloc, "gpu", dtype, count);
+        if picked.len() as u32 != count {
+            return None;
+        }
         alloc
             .devices
             .entry("gpu".into())
@@ -398,7 +405,7 @@ pub fn build_node_allocation(
         }
     }
 
-    alloc
+    Some(alloc)
 }
 
 #[cfg(test)]
@@ -531,7 +538,8 @@ mod tests {
             }],
             generic: HashMap::new(),
         };
-        let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
+        let alloc =
+            build_node_allocation(&inventory, &ResourceAllocations::default(), &request).unwrap();
         assert_eq!(alloc.cpus, 8);
         assert_eq!(alloc.device_ids("gpu"), vec![0]);
     }
@@ -594,7 +602,8 @@ mod tests {
             ],
             generic: HashMap::new(),
         };
-        let alloc = build_node_allocation(&inventory, &ResourceAllocations::default(), &request);
+        let alloc =
+            build_node_allocation(&inventory, &ResourceAllocations::default(), &request).unwrap();
         let mut ids = alloc.device_ids("gpu");
         ids.sort();
         assert_eq!(ids, vec![0, 2]);
@@ -728,16 +737,16 @@ mod accounting_tests {
         assert_eq!(alloc.generic_count("absent"), 0);
     }
 
-    /// `is_empty` inspects the map while `has_devices` inspects inside it, so a
-    /// leftover empty vector reads as non-empty yet holds nothing.
+    /// Both predicates answer the same question — whether anything is actually
+    /// held — so a key mapped to an empty list must read as holding nothing.
     #[test]
-    fn is_empty_and_has_devices_disagree_on_empty_device_vec() {
+    fn is_empty_agrees_with_has_devices_on_empty_device_vec() {
         let mut alloc = ResourceAllocations::default();
         assert!(alloc.is_empty());
         assert!(!alloc.has_devices());
 
         alloc.devices.insert("gpu".into(), Vec::new());
-        assert!(!alloc.is_empty());
+        assert!(alloc.is_empty());
         assert!(!alloc.has_devices());
 
         alloc
@@ -745,6 +754,64 @@ mod accounting_tests {
             .insert("gpu".into(), vec![AllocatedDevice::injectable(3)]);
         assert!(alloc.has_devices());
         assert_eq!(alloc.total_device_count("gpu"), 1);
+    }
+
+    fn mi300x(device_id: u32) -> GpuResource {
+        GpuResource {
+            device_id,
+            gpu_type: "mi300x".into(),
+            memory_mb: 192_000,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+        }
+    }
+
+    /// A request for `want` GPUs against a node of `total` where `held` are
+    /// already handed out.
+    fn allocate_gpus(total: u32, held: u32, want: u32) -> Option<ResourceAllocations> {
+        let inventory = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: (0..total).map(mi300x).collect(),
+            ..Default::default()
+        };
+        let mut current = ResourceAllocations::default();
+        if held > 0 {
+            current.devices.insert(
+                "gpu".into(),
+                (0..held).map(AllocatedDevice::injectable).collect(),
+            );
+        }
+        let request = ResourceSet {
+            cpus: 1,
+            memory_mb: 512,
+            gpus: (0..want).map(mi300x).collect(),
+            ..Default::default()
+        };
+        build_node_allocation(&inventory, &current, &request)
+    }
+
+    #[test]
+    fn build_node_allocation_declines_when_no_gpu_is_free() {
+        assert!(
+            allocate_gpus(1, 1, 1).is_none(),
+            "a request that cannot be met must not yield an allocation"
+        );
+    }
+
+    /// A short pick is the dangerous case: the allocation looks well-formed to
+    /// every predicate while holding fewer GPUs than the job needs, so the
+    /// remainder of its window stays open for another job.
+    #[test]
+    fn build_node_allocation_declines_a_partial_gpu_pick() {
+        assert!(allocate_gpus(8, 5, 8).is_none());
+    }
+
+    #[test]
+    fn build_node_allocation_books_every_requested_gpu() {
+        let alloc = allocate_gpus(8, 5, 3).expect("three free GPUs cover a request for three");
+        assert_eq!(alloc.total_device_count("gpu"), 3);
+        assert_eq!(alloc.device_ids("gpu"), vec![5, 6, 7]);
     }
 
     #[test]
