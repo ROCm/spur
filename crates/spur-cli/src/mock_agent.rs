@@ -135,6 +135,7 @@ mock_agent_impl! {
         }
     }
     unimplemented {
+        receive_file(proto::ReceiveFileRequest) -> proto::ReceiveFileResponse;
         launch_job(proto::LaunchJobRequest) -> proto::LaunchJobResponse;
         prepare_pmix(proto::PreparePmixRequest) -> proto::PreparePmixResponse;
         release_pmix(proto::ReleasePmixRequest) -> proto::ReleasePmixResponse;

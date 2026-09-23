@@ -15838,6 +15838,7 @@ mod tests {
     }
 
     mock_controller_impl! {
+            sbcast(spur_proto::proto::SbcastRequest) -> spur_proto::proto::SbcastResponse;
             submit_job(spur_proto::proto::SubmitJobRequest) -> spur_proto::proto::SubmitJobResponse;
             get_jobs(spur_proto::proto::GetJobsRequest) -> spur_proto::proto::GetJobsResponse;
             get_job(spur_proto::proto::GetJobRequest) -> spur_proto::proto::JobInfo;

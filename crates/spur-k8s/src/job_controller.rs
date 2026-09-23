@@ -1723,6 +1723,7 @@ mod tests {
     }
 
     stub_controller! {
+        sbcast(pb::SbcastRequest) -> pb::SbcastResponse;
         submit_job(pb::SubmitJobRequest) -> pb::SubmitJobResponse;
         get_jobs(pb::GetJobsRequest) -> pb::GetJobsResponse;
         get_job(pb::GetJobRequest) -> pb::JobInfo;
