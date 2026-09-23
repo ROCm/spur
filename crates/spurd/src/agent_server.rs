@@ -2944,18 +2944,24 @@ fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::proces
     }
 }
 
-/// Builds a fresh interactive step's process environment: the job's own
-/// session (so a `--pty` that joins a running container never leaks spurd's
-/// own environment — see `session_environ`) as the base, with a freshly
-/// built container's GPU visibility and identity vars layered on top when
-/// this step stages one. Neither the GPU grant nor the container identity
-/// exists anywhere the session env could have picked it up, since both are
-/// resolved fresh for this step's own launch.
+/// Builds a fresh interactive step's process environment, in the same
+/// precedence the old direct-fork paths used: a `TERM` default, the job's own
+/// session, its `SPUR_JOB_ID`/`SLURM_JOB_ID`, then host or fresh-container
+/// identity vars — later layers win so a fresh container's own GPU/identity
+/// vars are never shadowed by the parent session's.
 fn interactive_step_environment(
     session_env: Vec<(String, String)>,
+    job_env_vars: Vec<(String, String)>,
+    host_identity_env: Option<HashMap<String, String>>,
     fresh_container_env: Option<HashMap<String, String>>,
 ) -> HashMap<String, String> {
-    let mut environment: HashMap<String, String> = session_env.into_iter().collect();
+    let mut environment: HashMap<String, String> =
+        [("TERM".to_string(), "xterm-256color".to_string())].into();
+    environment.extend(session_env);
+    environment.extend(job_env_vars);
+    if let Some(host_identity) = host_identity_env {
+        environment.extend(host_identity);
+    }
     if let Some(fresh) = fresh_container_env {
         environment.extend(fresh);
     }
@@ -7836,6 +7842,7 @@ impl SlurmAgent for AgentService {
                     let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
+                    let mut host_identity_env: Option<HashMap<String, String>> = None;
                     let container = match &container_plan {
                         StepContainerPlan::None => {
                             if parent_has_namespaces {
@@ -7848,6 +7855,27 @@ impl SlurmAgent for AgentService {
                                         "step --container-image ignored: joining the parent job's \
                                          running container instead of building a new one"
                                     );
+                                }
+                            }
+                            if entry.uid > 0 {
+                                if let Some(user) = nix::unistd::User::from_uid(
+                                    nix::unistd::Uid::from_raw(entry.uid),
+                                )
+                                .ok()
+                                .flatten()
+                                {
+                                    host_identity_env = Some(HashMap::from([
+                                        (
+                                            "HOME".to_string(),
+                                            user.dir.to_string_lossy().into_owned(),
+                                        ),
+                                        ("USER".to_string(), user.name.clone()),
+                                        ("LOGNAME".to_string(), user.name),
+                                        (
+                                            "SHELL".to_string(),
+                                            user.shell.to_string_lossy().into_owned(),
+                                        ),
+                                    ]));
                                 }
                             }
                             None
@@ -7937,6 +7965,8 @@ impl SlurmAgent for AgentService {
                         array_task_id: None,
                         environment: interactive_step_environment(
                             Self::session_environ(&entry),
+                            entry.env_vars(init.job_id),
+                            host_identity_env,
                             fresh_container_env,
                         ),
                         stdout_path: String::new(),
@@ -12109,7 +12139,8 @@ mod tests {
         fresh_container_env.insert("SPUR_JOB_GPUS".to_string(), "0,1".to_string());
         fresh_container_env.insert("HOME".to_string(), "/home/spur".to_string());
 
-        let environment = interactive_step_environment(session_env, Some(fresh_container_env));
+        let environment =
+            interactive_step_environment(session_env, Vec::new(), None, Some(fresh_container_env));
 
         assert_eq!(
             environment.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
@@ -12129,6 +12160,51 @@ mod tests {
             environment.get("SPUR_JOB_ID").map(String::as_str),
             Some("42"),
             "session vars the fresh container doesn't override must still pass through"
+        );
+    }
+
+    // An allocation-only pty job has no batch process, so session_env is
+    // empty; TERM, job identity, and host identity must not depend on it.
+    #[test]
+    fn interactive_step_environment_fills_in_term_job_identity_and_host_identity() {
+        let job_env_vars = vec![
+            ("SPUR_JOB_ID".to_string(), "7".to_string()),
+            ("SLURM_JOB_ID".to_string(), "7".to_string()),
+        ];
+        let host_identity_env = Some(HashMap::from([
+            ("HOME".to_string(), "/home/alice".to_string()),
+            ("USER".to_string(), "alice".to_string()),
+            ("LOGNAME".to_string(), "alice".to_string()),
+            ("SHELL".to_string(), "/bin/bash".to_string()),
+        ]));
+
+        let environment =
+            interactive_step_environment(Vec::new(), job_env_vars, host_identity_env, None);
+
+        assert_eq!(
+            environment.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            environment.get("SLURM_JOB_ID").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/home/alice")
+        );
+        assert_eq!(environment.get("USER").map(String::as_str), Some("alice"));
+        assert_eq!(
+            environment.get("LOGNAME").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            environment.get("SHELL").map(String::as_str),
+            Some("/bin/bash")
         );
     }
 
