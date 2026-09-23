@@ -293,6 +293,12 @@ Each task sees its array identity through these variables (each with a
    * - ``SPUR_ARRAY_TASK_ID``
      - This task's array index.
 
+An array holds at most 100,000 tasks. Ranges may overlap, and duplicate indices
+are removed before that limit applies, so ``--array=0-99999,0-99999`` is
+accepted as 100,000 distinct tasks. A spec that names more than 200,000 indices
+before duplicates are removed is rejected however far they would collapse,
+which keeps the cost of parsing a spec bounded.
+
 .. _submit-dependencies:
 
 Dependencies
