@@ -3788,6 +3788,7 @@ impl AgentService {
                 self.step_completions
                     .deregister(job_id, run_attempt, step_id)
                     .await;
+                self.drain_on_node_fault(&error, job_id);
                 return Err(Status::internal(format!(
                     "step supervisor failed to start: {error}"
                 )));
@@ -3916,6 +3917,7 @@ impl AgentService {
                 self.step_completions
                     .deregister(job_id, run_attempt, step_id)
                     .await;
+                self.drain_on_node_fault(&error, job_id);
                 return Err(Status::internal(format!(
                     "terminal supervisor failed to start: {error}"
                 )));
@@ -16495,7 +16497,16 @@ mod tests {
     /// fails loudly.
     struct MockController {
         reports: Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>,
-        drains: Arc<std::sync::Mutex<Vec<spur_proto::proto::DrainNodeRequest>>>,
+        drains: DrainRequests,
+    }
+
+    /// Notify-backed so a positive-case test can await the drain instead of
+    /// polling; the mutex alone is enough for a negative-case test, which
+    /// only needs a synchronous read once its own RPC call has resolved.
+    #[derive(Default)]
+    struct DrainLog {
+        requests: std::sync::Mutex<Vec<spur_proto::proto::DrainNodeRequest>>,
+        notify: tokio::sync::Notify,
     }
 
     /// The `async_trait` attribute has to be applied by the macro: it rewrites
@@ -16519,9 +16530,11 @@ mod tests {
                     request: tonic::Request<spur_proto::proto::DrainNodeRequest>,
                 ) -> Result<tonic::Response<spur_proto::proto::DrainNodeResponse>, tonic::Status> {
                     self.drains
+                        .requests
                         .lock()
                         .expect("drain requests")
                         .push(request.into_inner());
+                    self.drains.notify.notify_one();
                     Ok(tonic::Response::new(spur_proto::proto::DrainNodeResponse::default()))
                 }
                 $(
@@ -16589,7 +16602,7 @@ mod tests {
     }
 
     type CompletionReports = Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>;
-    type DrainRequests = Arc<std::sync::Mutex<Vec<spur_proto::proto::DrainNodeRequest>>>;
+    type DrainRequests = Arc<DrainLog>;
 
     fn spawn_mock_controller() -> (String, CompletionReports, DrainRequests) {
         let incoming = tonic::transport::server::TcpIncoming::bind(
@@ -16598,7 +16611,7 @@ mod tests {
         .expect("bind mock controller");
         let addr = incoming.local_addr().expect("mock controller address");
         let reports: CompletionReports = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let drains: DrainRequests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drains: DrainRequests = Arc::new(DrainLog::default());
         let service = MockController {
             reports: reports.clone(),
             drains: drains.clone(),
@@ -16635,18 +16648,18 @@ mod tests {
         ))
     }
 
-    async fn wait_for_drains(
+    /// Registers interest before checking, per `Notify`'s documented pattern,
+    /// so a drain landing between the check and the await is never missed.
+    async fn expect_drain(
         drains: &DrainRequests,
         timeout_ms: u64,
     ) -> Vec<spur_proto::proto::DrainNodeRequest> {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-        loop {
-            let captured = drains.lock().expect("drain requests").clone();
-            if !captured.is_empty() || tokio::time::Instant::now() >= deadline {
-                return captured;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let notified = drains.notify.notified();
+        if drains.requests.lock().expect("drain requests").is_empty() {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), notified)
+                .await;
         }
+        drains.requests.lock().expect("drain requests").clone()
     }
 
     fn test_agent_service(reporter: Arc<NodeReporter>) -> AgentService {
@@ -16671,7 +16684,7 @@ mod tests {
         ));
         svc.drain_on_node_fault(&fault, 55);
 
-        let drained = wait_for_drains(&drains, 5_000).await;
+        let drained = expect_drain(&drains, 5_000).await;
         assert_eq!(drained.len(), 1, "exactly one drain request expected");
         assert_eq!(drained[0].name, "test-node");
         assert!(
@@ -16693,8 +16706,9 @@ mod tests {
         let prolog = executor::LaunchError::PrologFailed(anyhow::anyhow!("exit status 1"));
         svc.drain_on_node_fault(&prolog, 57);
 
+        // No spawn happens for a non-`NodeFault` error, so this is deterministic.
         assert!(
-            wait_for_drains(&drains, 300).await.is_empty(),
+            drains.requests.lock().expect("drain requests").is_empty(),
             "neither a job-specific nor a prolog failure should self-drain"
         );
     }
@@ -16726,8 +16740,8 @@ mod tests {
             "{}",
             status.message()
         );
-        // A tempdir failure is job-specific, so it must not drain the node.
-        assert!(wait_for_drains(&drains, 300).await.is_empty());
+        // Job-specific (no spawn happens), so this is deterministic, not a race.
+        assert!(drains.requests.lock().expect("drain requests").is_empty());
     }
 
     #[test]
