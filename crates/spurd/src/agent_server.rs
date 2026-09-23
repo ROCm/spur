@@ -245,7 +245,8 @@ async fn launch_stepd(
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
     crate::stepd::write_private(&launch_path, &launch_json).map_err(|error| {
-        executor::LaunchError::Other(
+        executor::classify_spool_error(
+            &launch_path,
             anyhow::Error::from(error).context("write runtime launch specification"),
         )
     })?;
