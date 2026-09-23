@@ -359,7 +359,10 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     writeln!(w, "  report      Generate usage reports")?;
     writeln!(w, "  trigger     Manage event triggers")?;
     writeln!(w, "  attach      Attach to a running job's I/O")?;
-    writeln!(w, "  bcast       Broadcast a file to a job's allocated nodes")?;
+    writeln!(
+        w,
+        "  bcast       Broadcast a file to a job's allocated nodes"
+    )?;
     writeln!(w, "  crontab     Manage recurring cron-style jobs")?;
     writeln!(w, "  health      Node health monitoring")?;
     writeln!(
