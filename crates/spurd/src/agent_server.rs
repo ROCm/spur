@@ -174,6 +174,19 @@ fn execv_reported_failure(pipe_r: &std::os::fd::OwnedFd) -> bool {
     matches!(nix::unistd::read(pipe_r, &mut byte), Ok(1))
 }
 
+/// The session directory lives under the same node-owned spool root as the
+/// rest of a job's spool files, so a failure to create it condemns the node
+/// exactly like the unsupervised launch path already does.
+fn session_dir_prepare_error(
+    dir: &std::path::Path,
+    error: std::io::Error,
+) -> executor::LaunchError {
+    executor::classify_spool_error(
+        dir,
+        anyhow::Error::from(error).context("prepare stepd directory"),
+    )
+}
+
 async fn launch_stepd(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
@@ -197,13 +210,10 @@ async fn launch_stepd(
     launch_spec.cred_kid = options.cred_kid;
     launch_spec.cred_digest = options.cred_digest;
     let store = crate::stepd::StepdStore::new(state_dir);
+    let intended_session_dir = store.session_dir(config.job_id, run_attempt, launch_spec.step_id);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt, launch_spec.step_id)
-        .map_err(|error| {
-            executor::LaunchError::Other(
-                anyhow::Error::from(error).context("prepare stepd directory"),
-            )
-        })?;
+        .map_err(|error| session_dir_prepare_error(&intended_session_dir, error))?;
     let mut descriptor = crate::stepd::StepdDescriptor::new(
         config.job_id,
         run_attempt,
@@ -5699,7 +5709,6 @@ impl SlurmAgent for AgentService {
             }
             Err(e) => {
                 // reservation_guard releases the allocation and PMI on this return.
-                let drain_reason = e.drain_reason();
                 let failure_kind = match e {
                     executor::LaunchError::PrologFailed(_) => {
                         LaunchFailureKind::LaunchFailureProlog
@@ -5708,14 +5717,7 @@ impl SlurmAgent for AgentService {
                 };
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
-
-                if let Some(drain_reason) = drain_reason {
-                    let controller = self.reporter.controller_addr.clone();
-                    let node_name = self.reporter.hostname.clone();
-                    tokio::spawn(async move {
-                        request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
-                    });
-                }
+                self.drain_on_node_fault(&e, job_id);
 
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
@@ -6281,6 +6283,7 @@ impl SlurmAgent for AgentService {
             )
             .await
             .map_err(|error| {
+                self.drain_on_node_fault(&error, req.job_id);
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
 
@@ -8363,6 +8366,18 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Self-drains this node in the background when `error` condemns it,
+    /// without blocking the caller's own failure response on the RPC.
+    fn drain_on_node_fault(&self, error: &executor::LaunchError, job_id: u32) {
+        if let Some(drain_reason) = error.drain_reason() {
+            let controller = self.reporter.controller_addr.clone();
+            let node_name = self.reporter.hostname.clone();
+            tokio::spawn(async move {
+                request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
+            });
+        }
+    }
+
     /// Drops the tracked entry for `job_id` only if it's still `run_attempt` —
     /// a concurrent redispatch can retrack the same job_id under a newer
     /// attempt between the caller's peek and this call, and that entry must
@@ -10735,7 +10750,7 @@ mod tests {
     // holds its allocation forever.
     #[tokio::test]
     async fn fencing_a_dead_stepd_reports_the_death_to_the_controller() {
-        let (controller_addr, reports) = spawn_mock_controller();
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
         let state = tempfile::tempdir().expect("runtime state directory");
         let store = crate::stepd::StepdStore::new(state.path());
 
@@ -16474,10 +16489,12 @@ mod tests {
         );
     }
 
-    /// Records the completion reports it receives. Every other RPC reports
-    /// unimplemented, so drifting onto an unmocked call fails loudly.
+    /// Records the completion reports and drain requests it receives. Every
+    /// other RPC reports unimplemented, so drifting onto an unmocked call
+    /// fails loudly.
     struct MockController {
         reports: Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>,
+        drains: Arc<std::sync::Mutex<Vec<spur_proto::proto::DrainNodeRequest>>>,
     }
 
     /// The `async_trait` attribute has to be applied by the macro: it rewrites
@@ -16495,6 +16512,16 @@ mod tests {
                         .expect("completion reports")
                         .push(request.into_inner());
                     Ok(tonic::Response::new(()))
+                }
+                async fn drain_node(
+                    &self,
+                    request: tonic::Request<spur_proto::proto::DrainNodeRequest>,
+                ) -> Result<tonic::Response<spur_proto::proto::DrainNodeResponse>, tonic::Status> {
+                    self.drains
+                        .lock()
+                        .expect("drain requests")
+                        .push(request.into_inner());
+                    Ok(tonic::Response::new(spur_proto::proto::DrainNodeResponse::default()))
                 }
                 $(
                     async fn $method(
@@ -16522,7 +16549,6 @@ mod tests {
             get_nodes(spur_proto::proto::GetNodesRequest) -> spur_proto::proto::GetNodesResponse;
             get_node(spur_proto::proto::GetNodeRequest) -> spur_proto::proto::NodeInfo;
             update_node(spur_proto::proto::UpdateNodeRequest) -> ();
-            drain_node(spur_proto::proto::DrainNodeRequest) -> spur_proto::proto::DrainNodeResponse;
             deregister_node(spur_proto::proto::DeregisterNodeRequest) -> spur_proto::proto::DeregisterNodeResponse;
             deregister_agent(spur_proto::proto::DeregisterAgentRequest) -> ();
             get_partitions(spur_proto::proto::GetPartitionsRequest) -> spur_proto::proto::GetPartitionsResponse;
@@ -16562,16 +16588,19 @@ mod tests {
     }
 
     type CompletionReports = Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>;
+    type DrainRequests = Arc<std::sync::Mutex<Vec<spur_proto::proto::DrainNodeRequest>>>;
 
-    fn spawn_mock_controller() -> (String, CompletionReports) {
+    fn spawn_mock_controller() -> (String, CompletionReports, DrainRequests) {
         let incoming = tonic::transport::server::TcpIncoming::bind(
             "127.0.0.1:0".parse().expect("loopback address"),
         )
         .expect("bind mock controller");
         let addr = incoming.local_addr().expect("mock controller address");
         let reports: CompletionReports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drains: DrainRequests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service = MockController {
             reports: reports.clone(),
+            drains: drains.clone(),
         };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -16579,7 +16608,142 @@ mod tests {
                 .serve_with_incoming(incoming)
                 .await;
         });
-        (format!("http://{addr}"), reports)
+        (format!("http://{addr}"), reports, drains)
+    }
+
+    fn test_reporter_with_controller(controller_addr: &str) -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            controller_addr.into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+        ))
+    }
+
+    async fn wait_for_drains(
+        drains: &DrainRequests,
+        timeout_ms: u64,
+    ) -> Vec<spur_proto::proto::DrainNodeRequest> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+        loop {
+            let captured = drains.lock().expect("drain requests").clone();
+            if !captured.is_empty() || tokio::time::Instant::now() >= deadline {
+                return captured;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn test_agent_service(reporter: Arc<NodeReporter>) -> AgentService {
+        AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    // A disk-full launch failure must self-drain the node exactly once,
+    // whichever RPC surfaced it — this is what both `launch_job`'s NodeFault
+    // arm and `register_job_allocation`'s stepd failure now share.
+    #[tokio::test]
+    async fn node_fault_self_drains_the_node() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr));
+
+        let fault = executor::LaunchError::NodeFault(anyhow::anyhow!(
+            "prepare stepd directory: No space left on device (os error 28)"
+        ));
+        svc.drain_on_node_fault(&fault, 55);
+
+        let drained = wait_for_drains(&drains, 5_000).await;
+        assert_eq!(drained.len(), 1, "exactly one drain request expected");
+        assert_eq!(drained[0].name, "test-node");
+        assert!(
+            drained[0].reason.contains("No space left on device"),
+            "drain reason must carry the underlying errno: {}",
+            drained[0].reason
+        );
+    }
+
+    // A failure specific to this job (bad image, prolog script, etc.) must
+    // never take a healthy node out of rotation.
+    #[tokio::test]
+    async fn a_job_specific_launch_failure_does_not_drain_the_node() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr));
+
+        let other = executor::LaunchError::Other(anyhow::anyhow!("container image not found"));
+        svc.drain_on_node_fault(&other, 56);
+        let prolog = executor::LaunchError::PrologFailed(anyhow::anyhow!("exit status 1"));
+        svc.drain_on_node_fault(&prolog, 57);
+
+        assert!(
+            wait_for_drains(&drains, 300).await.is_empty(),
+            "neither a job-specific nor a prolog failure should self-drain"
+        );
+    }
+
+    // Drives the real RPC into launch_stepd's failure arm (no spurstepd binary
+    // in test env), pinning that the drain check is reached from this call site.
+    #[tokio::test]
+    async fn register_job_allocation_reaches_the_drain_check_on_a_stepd_launch_failure() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let state_dir = tempfile::tempdir().expect("runtime state dir");
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr))
+            .with_runtime_state_dir(state_dir.path().to_path_buf())
+            .with_supervised_launch();
+
+        let status = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 4242,
+                cpus: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no spurstepd binary in test env; the stepd spawn must fail");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            status
+                .message()
+                .contains("failed to start allocation stepd"),
+            "{}",
+            status.message()
+        );
+        // A tempdir failure is job-specific, so it must not drain the node.
+        assert!(wait_for_drains(&drains, 300).await.is_empty());
+    }
+
+    #[test]
+    fn stepd_session_dir_enospc_under_the_owned_root_is_a_node_fault() {
+        let dir = std::path::PathBuf::from("/var/spool/spur/runtime/1.1.0");
+        let err = session_dir_prepare_error(&dir, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(matches!(err, executor::LaunchError::NodeFault(_)));
+        let reason = err.drain_reason().expect("node fault must drain");
+        assert!(reason.contains("No space left on device"), "{reason}");
+    }
+
+    #[test]
+    fn stepd_session_dir_error_outside_the_owned_root_does_not_drain() {
+        let dir = std::env::temp_dir().join("spur-test").join("runtime/1.1.0");
+        let err = session_dir_prepare_error(&dir, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(matches!(err, executor::LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
     }
 
     fn fence_context(

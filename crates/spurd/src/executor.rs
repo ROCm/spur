@@ -98,7 +98,7 @@ fn is_node_owned_spool(dir: &Path) -> bool {
 /// Only spool writes may reach this. Writes to the job's `work_dir` must not use
 /// it: that path is user-controlled and frequently a shared mount, where one user
 /// filling their quota would otherwise drain every node in turn.
-fn classify_spool_error(dir: &Path, err: anyhow::Error) -> LaunchError {
+pub(crate) fn classify_spool_error(dir: &Path, err: anyhow::Error) -> LaunchError {
     if is_node_owned_spool(dir) && is_node_fault_io_error(&err) {
         LaunchError::NodeFault(err)
     } else {
