@@ -393,6 +393,7 @@ pub fn squeue_header(spec: char) -> &'static str {
         'C' => "CPUS",
         'a' => "ACCOUNT",
         'p' => "PRIORITY",
+        'Q' => "PRIORITY",
         'S' => "START_TIME",
         'V' => "SUBMIT_TIME",
         'e' => "END_TIME",

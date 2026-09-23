@@ -223,6 +223,7 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'N' => job.nodelist.clone(),
         'a' => job.account.clone(),
         'p' => job.priority.to_string(),
+        'Q' => job.priority.to_string(),
         'q' => job.qos.clone(),
         'r' => crate::exit_fmt::render_reason(&job.state_reason, job.exit_signal),
         'Z' => job.work_dir.clone(),
@@ -329,7 +330,7 @@ fn compare_field(
 ) -> std::cmp::Ordering {
     match spec {
         'i' | 'A' => a.job_id.cmp(&b.job_id),
-        'p' => a.priority.cmp(&b.priority),
+        'p' | 'Q' => a.priority.cmp(&b.priority),
         'D' => a.num_nodes.cmp(&b.num_nodes),
         'C' => a.cpus_per_task.cmp(&b.cpus_per_task),
         't' | 'T' => state_sort_rank(a.state).cmp(&state_sort_rank(b.state)),
@@ -799,6 +800,23 @@ mod tests {
             job(72, "default", P::JobPending, 300),
         ];
         sort_jobs(&mut jobs, &parse_sort_arg("-p,i").unwrap());
+        assert_eq!(ids(&jobs), vec![71, 72, 70]);
+    }
+
+    #[test]
+    fn q_specifier_renders_integer_priority() {
+        let j = job(1, "default", P::JobPending, 4200);
+        assert_eq!(resolve_job_field(&j, 'Q'), "4200");
+    }
+
+    #[test]
+    fn sort_by_q_orders_by_priority() {
+        let mut jobs = vec![
+            job(70, "default", P::JobPending, 100),
+            job(71, "default", P::JobPending, 300),
+            job(72, "default", P::JobPending, 200),
+        ];
+        sort_jobs(&mut jobs, &parse_sort_arg("-Q").unwrap());
         assert_eq!(ids(&jobs), vec![71, 72, 70]);
     }
 
