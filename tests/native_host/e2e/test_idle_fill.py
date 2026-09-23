@@ -37,7 +37,14 @@ _WAIT_RECLAIM = 180
 _GUARD_SECS = 20
 
 
-def _config(*, enabled: bool = True, default_time: str | None = "10:00") -> dict:
+def _config(
+    *,
+    enabled: bool = True,
+    default_time: str | None = "10:00",
+    exempt_secs: int = _EXEMPT_SECS,
+    borrow_factor: float | None = None,
+    cluster_fraction: float | None = None,
+) -> dict:
     partition = {
         "name": "default",
         "state": "UP",
@@ -48,17 +55,22 @@ def _config(*, enabled: bool = True, default_time: str | None = "10:00") -> dict
     }
     if default_time is not None:
         partition["default_time"] = default_time
-    return {
+    cfg = {
         "partitions": [partition],
         "scheduler": {
             "idle_fill_enabled": enabled,
-            "idle_fill_exempt_secs": _EXEMPT_SECS,
+            "idle_fill_exempt_secs": exempt_secs,
             # 0 means "no cluster-wide default", so a job submitted without -t has
             # no effective time limit. test_no_time_limit depends on this.
             "default_time_limit_minutes": 0,
         },
         "auth": {"plugin": "none", "allow_root_jobs": True},
     }
+    if borrow_factor is not None:
+        cfg["scheduler"]["idle_fill_max_borrow_factor"] = borrow_factor
+    if cluster_fraction is not None:
+        cfg["scheduler"]["idle_fill_max_cluster_fraction"] = cluster_fraction
+    return cfg
 
 
 def _require_nodes(cluster, count: int) -> list[str]:
@@ -501,5 +513,253 @@ class TestNoTimeLimitIsRefusedIdleFill:
                 f"it stays blocked by the group node cap:\n{show}"
             )
             assert _borrowed(c, unbounded) == "no", "and it is not flagged borrowed"
+        finally:
+            _cancel_all(c, ids)
+
+
+class TestReclaimEvictsLowestPriorityFirst:
+    """A legitimate claim must spend the cheapest opportunistic run first.
+
+    The design's eviction order is "lowest-priority opportunistic jobs first
+    (typically burst), then higher-priority idle-fill if still insufficient". With
+    one node needed and two candidates available -- a low-priority burst job and a
+    high-priority borrowed run -- the burst job is the one that must go.
+
+    Node-order selection passes or fails this by luck depending on which node the
+    scheduler happens to walk first, so the burst job is deliberately placed on the
+    node the in-quota run did *not* take.
+    """
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config()
+
+    def test_a_low_priority_burst_job_is_evicted_before_a_borrowed_run(
+        self, accounting_cluster
+    ):
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        # teamcap: cap 1, so its second run borrows. Priority well above burst.
+        c.sacctmgr(["add", "qos", "name=pteam", "grptres=node=1", "priority=5000"])
+        # burst: inside its own quota, reclaimable only via the flag, lowest priority.
+        c.sacctmgr(["add", "qos", "name=pburst", "grptres=node=8",
+                    "priority=1", "idlefillpreemptable=yes"])
+        c.sacctmgr(["add", "qos", "name=pclaim", "grptres=node=8", "priority=100"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "p-legit", "pteam", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            borrowed = _submit(c, "p-borrow", "pteam", "-t", "30")
+            ids.append(borrowed)
+            wait_job_state(c, borrowed, "R", timeout=60)
+            assert _borrowed(c, borrowed) == "yes", "fixture needs a borrowed run"
+
+            burst = _submit(c, "p-burst", "pburst", "-t", "30")
+            ids.append(burst)
+            wait_job_state(c, burst, "R", timeout=60)
+            assert _borrowed(c, burst) == "no", (
+                "a burst job runs inside its quota and is not stamped"
+            )
+
+            assert _idle_nodes(c) == 0, "cluster must be full before the claim"
+            time.sleep(_EXEMPT_SECS + 3)
+
+            claim = _submit(c, "p-claim", "pclaim", "-t", "30")
+            ids.append(claim)
+            _await_running(c, claim)
+
+            # The cheap victim went; the expensive borrowed run kept its node.
+            sq = c.squeue_all()
+            assert job_state(sq, burst) == "PD", (
+                "the low-priority burst job is the cheapest victim and must be evicted"
+            )
+            assert job_state(sq, borrowed) == "R", (
+                "a higher-priority borrowed run must be spared while a cheaper "
+                "opportunistic victim is available"
+            )
+            assert job_state(sq, legit) == "R", "the in-quota run is never a victim"
+        finally:
+            _cancel_all(c, ids)
+
+
+class TestBorrowFactorCeiling:
+    """`idle_fill_max_borrow_factor` caps borrowing at a multiple of the QOS's own
+    group node cap. At 1.0 against a cap of one node, the first loan is allowed and
+    the second is refused even though capacity is free."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config(borrow_factor=1.0)
+
+    def test_a_second_loan_is_refused_at_the_ceiling(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        c.sacctmgr(["add", "qos", "name=bfteam", "grptres=node=1"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "bf-legit", "bfteam", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            first = _submit(c, "bf-borrow1", "bfteam", "-t", "30")
+            ids.append(first)
+            wait_job_state(c, first, "R", timeout=60)
+            assert _borrowed(c, first) == "yes", "the first loan is within the ceiling"
+
+            second = _submit(c, "bf-borrow2", "bfteam", "-t", "30")
+            ids.append(second)
+            wait_job_state(c, second, "PD", timeout=60)
+
+            # A node is genuinely free, so only the ceiling is holding this job.
+            assert _idle_nodes(c) > 0, "fixture needs spare capacity to be meaningful"
+            time.sleep(_GUARD_SECS)
+
+            assert job_state(c.squeue_all(), second) == "PD", (
+                "a second loan must be refused at a ceiling of 1x the node cap"
+            )
+            assert _borrowed(c, second) == "no", "a refused loan is not stamped"
+            show = c.scontrol("show", "job", str(second))
+            assert "QOSGrpNodeLimit" in show, (
+                f"it stays blocked by its group node cap:\n{show}"
+            )
+        finally:
+            _cancel_all(c, ids)
+
+
+class TestBorrowFactorAdmitsBelowTheCeiling:
+    """The control for the test above: the same second loan is admitted when the
+    ceiling allows two. Without this, a bug that refused *all* borrowing would pass
+    the refusal test."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config(borrow_factor=2.0)
+
+    def test_a_second_loan_is_admitted_below_the_ceiling(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        c.sacctmgr(["add", "qos", "name=b2team", "grptres=node=1"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "b2-legit", "b2team", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            for i in (1, 2):
+                job_id = _submit(c, f"b2-borrow{i}", "b2team", "-t", "30")
+                ids.append(job_id)
+                wait_job_state(c, job_id, "R", timeout=60)
+                assert _borrowed(c, job_id) == "yes", (
+                    f"loan {i} is within a ceiling of 2x the node cap"
+                )
+        finally:
+            _cancel_all(c, ids)
+
+
+class TestClusterFractionCeiling:
+    """`idle_fill_max_cluster_fraction` caps borrowing as a share of the cluster,
+    which the factor cannot do because it scales with the team's own quota. A
+    fraction small enough to floor to one node must refuse the second loan even
+    though the factor alone would allow four."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        # 0.34 of a 3-node cluster floors to 1; the factor would allow 4. The
+        # tighter of the two must win.
+        return _config(borrow_factor=4.0, cluster_fraction=0.34)
+
+    def test_the_tighter_of_the_two_ceilings_wins(self, accounting_cluster):
+        c = accounting_cluster
+        nodes = _require_nodes(c, 3)
+        if len(nodes) != 3:
+            pytest.skip(
+                f"fraction arithmetic in this test assumes exactly 3 nodes, got {len(nodes)}"
+            )
+        c.sacctmgr(["add", "qos", "name=cfteam", "grptres=node=1"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "cf-legit", "cfteam", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            first = _submit(c, "cf-borrow1", "cfteam", "-t", "30")
+            ids.append(first)
+            wait_job_state(c, first, "R", timeout=60)
+            assert _borrowed(c, first) == "yes", "one node is within the fraction"
+
+            second = _submit(c, "cf-borrow2", "cfteam", "-t", "30")
+            ids.append(second)
+            wait_job_state(c, second, "PD", timeout=60)
+            assert _idle_nodes(c) > 0, "fixture needs spare capacity to be meaningful"
+            time.sleep(_GUARD_SECS)
+
+            assert job_state(c.squeue_all(), second) == "PD", (
+                "the cluster fraction is the tighter ceiling and must refuse the loan, "
+                "even though the factor alone would admit it"
+            )
+        finally:
+            _cancel_all(c, ids)
+
+
+class TestExemptWindowProtectsAFreshBorrow:
+    """`idle_fill_exempt_secs` protects a borrowed run for its first seconds. The
+    existing tests only wait it out; this one asserts the protection itself, which is
+    the half that could silently regress to zero."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        # Long enough to observe the protection without making the test slow.
+        return _config(exempt_secs=45)
+
+    def test_a_borrowed_run_is_not_reclaimed_inside_the_window(self, accounting_cluster):
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        c.sacctmgr(["add", "qos", "name=exteam", "grptres=node=1"])
+        c.sacctmgr(["add", "qos", "name=exclaim", "grptres=node=8"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "ex-legit", "exteam", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            borrowed = _submit(c, "ex-borrow", "exteam", "-t", "30")
+            ids.append(borrowed)
+            wait_job_state(c, borrowed, "R", timeout=60)
+            assert _borrowed(c, borrowed) == "yes", "fixture needs a borrowed run"
+
+            ids.extend(_fill_remaining(c, "exclaim", "ex-fill"))
+
+            # Claim immediately, well inside the 45s window.
+            claim = _submit(c, "ex-claim", "exclaim", "-t", "30")
+            ids.append(claim)
+            time.sleep(_GUARD_SECS)
+
+            sq = c.squeue_all()
+            assert job_state(sq, borrowed) == "R", (
+                "a borrowed run must be protected for its exempt window, so the claim "
+                "waits rather than evicting a run that just started"
+            )
+            assert job_state(sq, claim) == "PD", (
+                "the claim waits while the window protects the borrowed run"
+            )
+
+            # And once the window passes, the reclaim does happen -- otherwise this
+            # test would also pass if reclaim were broken entirely.
+            _await_running(c, claim)
+            assert job_state(c.squeue_all(), borrowed) == "PD", (
+                "after the window the borrowed run is reclaimed"
+            )
         finally:
             _cancel_all(c, ids)
