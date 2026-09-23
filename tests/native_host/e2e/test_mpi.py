@@ -199,6 +199,46 @@ class TestMpiMultiNode:
                 assert int(match.group(2)) == 2
         assert ranks == {0, 1}, f"expected ranks 0-1, got {ranks}:\n{out}"
 
+    def test_a_lone_rank_sources_the_agent_mpi_environment(self, mpi_multi_node_cluster):
+        """One rank per node must source ``$HOME/spur/mpi/env.sh`` like a shared node.
+
+        Nothing else applies that file, and a rank that misses it cannot find the MPI
+        it was linked against. Asserted on a sentinel rather than on a real MPI run,
+        which stays silent wherever the site MPI happens to sit on the default loader
+        path.
+        """
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        sentinel = "SPUR_E2E_ENV_SH_SENTINEL"
+        # Reported by the payload rather than by a bare `echo`, so the step is a real
+        # MPI step and its exit status still means something.
+        payload = cluster.write_file(
+            "lone-rank-env.sh",
+            f'#!/bin/bash\necho "seen=${sentinel}"\nexec "{hello_mpi}"\n',
+            all_nodes=True,
+        )
+        touched = []
+        try:
+            for node in cluster.nodes:
+                node.exec('mkdir -p "$HOME/spur/mpi"')
+                node.exec(
+                    f'printf "export {sentinel}=applied\\n" >> "$HOME/spur/mpi/env.sh"'
+                )
+                touched.append(node)
+            code, out = cluster.srun_with_exit(
+                ["--mpi=pmix", "-N", "2", "-n", "2", payload]
+            )
+            assert code == 0, f"srun failed (exit {code}):\n{out}"
+            assert out.count("seen=applied") == 2, (
+                f"both ranks must see env.sh, got:\n{out}"
+            )
+            assert_mpi_ranks(out, {0, 1}, 2)
+        finally:
+            for node in touched:
+                node.exec_allow_fail(
+                    f"sed -i '/{sentinel}/d' \"$HOME/spur/mpi/env.sh\""
+                )
+
     def test_hello_mpi_two_nodes_multi_rank(self, mpi_multi_node_cluster):
         cluster = mpi_multi_node_cluster
         hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
