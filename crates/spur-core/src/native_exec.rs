@@ -46,11 +46,11 @@ pub fn container_digest(image: &str) -> Option<[u8; DIGEST_LEN]> {
 /// [`ExecutionCredential::require_slice`] expects.
 pub fn proto_slice_devices(
     alloc: &Option<spur_proto::proto::ResourceAllocations>,
-) -> (u32, u64, Vec<(String, u32, u64)>) {
+) -> (u32, u64, Vec<(String, u64, u64)>) {
     let Some(a) = alloc else {
         return (0, 0, Vec::new());
     };
-    let mut devices: Vec<(String, u32, u64)> = a
+    let mut devices: Vec<(String, u64, u64)> = a
         .devices
         .iter()
         .flat_map(|(name, list)| {
@@ -447,6 +447,7 @@ mod tests {
                 },
             )]
             .into(),
+            generation: 0,
         };
         let (cpus, mem, devices) = proto_slice_devices(&Some(alloc));
         assert_eq!(cpus, 4);

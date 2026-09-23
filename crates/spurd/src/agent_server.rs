@@ -38,7 +38,7 @@ use crate::reporter::NodeReporter;
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
 /// devices" so they cannot inherit the runtime's all-visible default.
-fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u32]) {
+fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u64]) {
     if allocated_device_ids.is_empty() {
         spur_core::task_launch::gpu_deny_visibility(env);
     }
@@ -433,7 +433,7 @@ fn map_exec_err(err: spur_core::native_cred::CredentialError) -> Status {
     execution_status(err)
 }
 
-fn proto_slice_devices(alloc: &Option<ResourceAllocations>) -> (u32, u64, Vec<(String, u32, u64)>) {
+fn proto_slice_devices(alloc: &Option<ResourceAllocations>) -> (u32, u64, Vec<(String, u64, u64)>) {
     spur_core::native_exec::proto_slice_devices(alloc)
 }
 
@@ -497,6 +497,71 @@ fn replayable_allocations(
     let mut chosen: Vec<&crate::stepd::StepdDescriptor> = best.into_values().collect();
     chosen.sort_by_key(|d| (d.resources.cpu_ids.is_empty(), d.job_id));
     chosen
+}
+
+/// Map a legacy descriptor's positional GPU ids onto the live inventory's
+/// stable_ids so an upgrade-restart re-adopts the job's real GPUs. Returns
+/// `None` when no translation is warranted or the recording is ambiguous, so
+/// the caller keeps the ids verbatim and the strict `restore_for_job` path
+/// under-adopts safely rather than guessing.
+///
+/// A pre-stable_id `spurd` recorded `gpu_devices` as positional indices; the
+/// scheme this build uses records stable_ids. `current_gpus` is the registry's
+/// BDF-sorted device list, and on AMD KFD nodes the kernel assigns render_minor
+/// (and hence the old build's positional ids) in PCI/BDF enumeration order, so
+/// those two orders coincide and positional `i` maps to `current_gpus[i]` — the
+/// sole real-world legacy case. The render_minor stable_id scheme only ever
+/// existed unreleased on this branch, so a render_minor-looking id (not a valid
+/// index, not a current stable_id) is left untranslated; not a supported upgrade.
+fn translate_legacy_gpu_ids(
+    recorded: &[u64],
+    current_gpus: &[spur_core::resource::GpuResource],
+) -> Option<Vec<u64>> {
+    if recorded.is_empty() {
+        return None;
+    }
+    let is_current = |id: u64| current_gpus.iter().any(|g| g.stable_id == id);
+    // Already stable_ids (all match live inventory): nothing to translate.
+    if recorded.iter().all(|&id| is_current(id)) {
+        return None;
+    }
+    // Legacy positional only when every id is a distinct in-range index AND
+    // none already matches a stable_id; any mix or out-of-range is ambiguous.
+    let mut seen = std::collections::HashSet::with_capacity(recorded.len());
+    for &id in recorded {
+        if is_current(id) || (id as usize) >= current_gpus.len() || !seen.insert(id) {
+            return None;
+        }
+    }
+    Some(
+        recorded
+            .iter()
+            .map(|&i| current_gpus[i as usize].stable_id)
+            .collect(),
+    )
+}
+
+/// Persist the translated stable_ids back into the on-disk descriptor so the
+/// translation runs once, not on every restart. Best-effort: a failure only
+/// means the next restart re-translates, which is correct, so it warns and
+/// moves on rather than failing the recovery.
+fn rewrite_descriptor_gpu_ids(
+    state_dir: &std::path::Path,
+    descriptor: &crate::stepd::StepdDescriptor,
+    stable_ids: Vec<u64>,
+) {
+    let mut rewritten = descriptor.clone();
+    rewritten.resources.gpu_devices = stable_ids;
+    let store = crate::stepd::StepdStore::new(state_dir);
+    if let Err(error) = store.publish(&rewritten) {
+        warn!(
+            job_id = descriptor.job_id,
+            run_attempt = descriptor.run_attempt,
+            ?error,
+            "could not rewrite adopted descriptor to stable gpu ids; \
+             translation re-runs next restart"
+        );
+    }
 }
 
 /// A descriptor with no recorded cores — a step, or one written before they
@@ -725,7 +790,7 @@ mod gpu_deny_tests {
     #[test]
     fn nonempty_allocation_leaves_gpu_env_untouched() {
         let mut env = HashMap::new();
-        super::maybe_deny_gpu_env(&mut env, &[0u32, 1]);
+        super::maybe_deny_gpu_env(&mut env, &[0u64, 1]);
         assert!(!env.contains_key("ROCR_VISIBLE_DEVICES"));
     }
 }
@@ -746,7 +811,7 @@ pub struct TrackedJob {
     /// at the agent without passing through the controller.
     user: String,
     partition: String,
-    gpu_devices: Vec<u32>,
+    gpu_devices: Vec<u64>,
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
@@ -777,7 +842,7 @@ struct CompletedJob {
     uid: u32,
     gid: u32,
     partition: String,
-    gpu_devices: Vec<u32>,
+    gpu_devices: Vec<u64>,
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
@@ -2670,7 +2735,7 @@ struct ContainerLaunchRequest {
     readonly: bool,
     mount_home: bool,
     remap_root: bool,
-    gpu_devices: Vec<u32>,
+    gpu_devices: Vec<u64>,
     environment: HashMap<String, String>,
     container_env: HashMap<String, String>,
     entrypoint: Option<String>,
@@ -2744,7 +2809,7 @@ fn build_container_launch(
 /// step and an interactive session resolve differently before converging on
 /// the shared build-and-stage path.
 struct FreshContainerContext {
-    gpu_devices: Vec<u32>,
+    gpu_devices: Vec<u64>,
     device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
     uid: u32,
     gid: u32,
@@ -3433,7 +3498,7 @@ impl AgentService {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "unknown".into()),
-            &reporter.resources,
+            &reporter.snapshot_resources(),
         );
 
         // Load SPANK plugins from plugstack.conf if available
@@ -3612,20 +3677,43 @@ impl AgentService {
                      under-counted until it ends"
                 );
             }
+            // A legacy descriptor holds positional ids that no longer match the
+            // BDF-anchored stable_ids; translate through the live inventory so
+            // the adopt succeeds instead of leaving the job's GPUs reading free.
+            let translated = translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus);
+            let gpu_ids: Vec<u64> = match &translated {
+                Some(stable_ids) => {
+                    info!(
+                        job_id = descriptor.job_id,
+                        recorded = ?resources.gpu_devices,
+                        stable_ids = ?stable_ids,
+                        "translated a legacy positional gpu recording to stable_ids on adopt"
+                    );
+                    stable_ids.clone()
+                }
+                None => resources.gpu_devices.clone(),
+            };
             match allocation.restore_for_job(
                 descriptor.job_id,
                 descriptor.run_attempt,
                 &cpu_ids,
                 resources.memory_mb,
-                &resources.gpu_devices,
+                &gpu_ids,
             ) {
-                Ok(_) => info!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    cpus = cpu_ids.len(),
-                    gpus = resources.gpu_devices.len(),
-                    "restored an adopted job's allocation"
-                ),
+                Ok(_) => {
+                    // Rewrite the descriptor forward so the translation is
+                    // one-time; harmless if it fails — restore re-translates.
+                    if let Some(stable_ids) = translated {
+                        rewrite_descriptor_gpu_ids(&self.stepd_state_dir, descriptor, stable_ids);
+                    }
+                    info!(
+                        job_id = descriptor.job_id,
+                        run_attempt = descriptor.run_attempt,
+                        cpus = cpu_ids.len(),
+                        gpus = gpu_ids.len(),
+                        "restored an adopted job's allocation"
+                    )
+                }
                 // Refusing to serve would strand the adopted job with no agent to
                 // report it, and nothing reconciles a job the ledger never saw.
                 Err(error) => warn!(
@@ -3701,6 +3789,12 @@ impl AgentService {
     /// this process exiting.
     pub fn stepds_handle(&self) -> Arc<Mutex<StepdMap>> {
         self.stepds.clone()
+    }
+
+    /// The live per-node allocation, for the periodic inventory-refresh task to
+    /// read held stable ids and apply fresh capacity without an RPC round-trip.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
     }
 
     /// The job's own process, asked of its supervisor over the control socket —
@@ -4851,6 +4945,20 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
     }
 }
 
+/// Reject a dispatch whose stamped inventory generation no longer matches this
+/// node's live generation, so an out-of-band GPU repartition between schedule
+/// and launch cannot bind a job to devices that have since been renumbered.
+/// A zero on either side is unset/legacy and skips the check for compatibility
+/// with controllers and Raft entries predating the generation field.
+fn check_dispatch_generation(dispatch: u64, live: u64) -> Result<(), Status> {
+    if dispatch != 0 && live != 0 && dispatch != live {
+        return Err(Status::failed_precondition(format!(
+            "dispatch made against stale node inventory generation {dispatch} != {live}"
+        )));
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
@@ -5302,6 +5410,9 @@ impl SlurmAgent for AgentService {
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
 
+        // The generation check is performed inside `allocate_local_resources`
+        // under the same allocation lock as the allocate, so a refresh publish
+        // cannot slip a newer topology between the check and the bind.
         let (alloc_result, allocated_device_ids) = self
             .allocate_local_resources(
                 job_id,
@@ -5963,9 +6074,9 @@ impl SlurmAgent for AgentService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<NodeResourcesResponse>, Status> {
-        let resources = &self.reporter.resources;
+        let resources = self.reporter.snapshot_resources();
         Ok(Response::new(NodeResourcesResponse {
-            total: Some(crate::reporter::resource_to_proto(resources)),
+            total: Some(crate::reporter::resource_to_proto(&resources)),
             used: Some(crate::reporter::allocations_to_proto(
                 &spur_core::resource::ResourceAllocations::default(),
             )),
@@ -6087,7 +6198,9 @@ impl SlurmAgent for AgentService {
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
 
         let allocated = req.allocated.as_ref();
-        let mut controller_gpu_ids: Vec<u32> = allocated
+        // The generation check is performed under the allocation lock below, so a
+        // refresh publish cannot slip a newer topology between it and the bind.
+        let mut controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
             .unwrap_or_default();
@@ -6137,6 +6250,15 @@ impl SlurmAgent for AgentService {
         }
         let alloc_result = {
             let mut alloc = self.allocation.lock().await;
+            // Atomic with the bind: the refresh task publishes inventory via
+            // update_capacity under this same lock, so no newer generation can
+            // land between this check and allocate_for_job.
+            if let Some(a) = allocated {
+                check_dispatch_generation(
+                    a.generation,
+                    self.reporter.snapshot_resources().generation,
+                )?;
+            }
             let result = alloc
                 .allocate_for_job(
                     req.job_id,
@@ -8380,6 +8502,9 @@ impl AgentService {
                 .is_some_and(|current| current.run_attempt == run_attempt)
             {
                 let (tracked, cgroup) = remove_tracked_job(&mut jobs, job_id);
+                // Once released the GPU leaves `allocated_gpu_ids`, so the next
+                // inventory tick classifies its real hardware as a free-pool
+                // change and converges — no explicit reconcile hook needed here.
                 self.allocation.lock().await.release_job(job_id);
                 (tracked.is_some(), cgroup)
             } else {
@@ -8425,8 +8550,8 @@ impl AgentService {
         allocated: Option<&ResourceAllocations>,
         cpus: u32,
         memory_mb: u64,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
-        let controller_gpu_ids: Vec<u32> = allocated
+    ) -> Result<(AllocationResult, Vec<u64>), Status> {
+        let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
             .unwrap_or_default();
@@ -8447,6 +8572,13 @@ impl AgentService {
         let live: std::collections::HashSet<u32> = running.keys().copied().collect();
 
         let mut alloc = self.allocation.lock().await;
+
+        // Generation check under the allocation lock: the refresh task mutates
+        // inventory via update_capacity under this same lock, so checking here
+        // is atomic with the bind below — no publish can interleave.
+        if let Some(a) = allocated {
+            check_dispatch_generation(a.generation, self.reporter.snapshot_resources().generation)?;
+        }
 
         let result = match alloc.allocate_for_job(
             job_id,
@@ -8543,7 +8675,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u64>), Status> {
         let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
         self.allocate_local_resources(job_id, 1, spec, allocated, cpus, memory_mb)
             .await
@@ -15215,6 +15347,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: device_id as u64,
             })
             .collect();
         Arc::new(NodeReporter::new(
@@ -15281,6 +15414,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices,
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -15295,6 +15429,164 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "GPU allocation must be released after a post-record launch failure"
+        );
+    }
+
+    /// The generation guard rejects only a genuine mismatch; a zero on either
+    /// side is unset/legacy and passes so pre-generation controllers still work.
+    #[test]
+    fn dispatch_generation_guard_matrix() {
+        assert!(check_dispatch_generation(7, 7).is_ok(), "equal passes");
+        assert!(
+            check_dispatch_generation(0, 7).is_ok(),
+            "unset dispatch skips"
+        );
+        assert!(check_dispatch_generation(7, 0).is_ok(), "unset live skips");
+        assert!(check_dispatch_generation(0, 0).is_ok(), "both unset skips");
+        let err = check_dispatch_generation(5, 7).expect_err("mismatch rejects");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("5 != 7"), "names both generations");
+    }
+
+    fn test_reporter_with_generation(generation: u64) -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                generation,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+        ))
+    }
+
+    /// A dispatch stamped under a superseded inventory generation is refused
+    /// before any resource is committed, so a repartition between schedule and
+    /// launch cannot bind the job to devices that have since been renumbered.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_stale_generation() {
+        let svc = AgentService::new(
+            test_reporter_with_generation(7),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 51,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                generation: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a dispatch under a stale generation must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused dispatch must not leave a tracked job"
+        );
+    }
+
+    /// launch_job runs the generation check inside allocate_local_resources under
+    /// the allocation lock; a stale-generation dispatch is refused before any
+    /// resource is bound, leaving no tracked job and no GPU held.
+    #[tokio::test]
+    async fn launch_job_rejects_stale_generation_before_binding() {
+        let reporter = Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                gpus: vec![spur_core::resource::GpuResource {
+                    device_id: 0,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::XGMI,
+                    stable_id: 128,
+                }],
+                generic: Default::default(),
+                generation: 7,
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+        ));
+        let svc = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 128,
+                    count: 1,
+                }],
+            },
+        );
+        let req = Request::new(LaunchJobRequest {
+            job_id: 52,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                gres: vec!["gpu:1".into()],
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+                generation: 5,
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .launch_job(req)
+            .await
+            .expect_err("a launch under a stale generation must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused launch must not leave a tracked job"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a refused launch must not hold the GPU"
         );
     }
 
@@ -15325,6 +15617,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -15435,6 +15728,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             // Default (false): a genuine sbatch batch script, not an
             // explicit srun task fan-out.
@@ -15491,6 +15785,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             task_fanout: true,
             ..Default::default()
@@ -15537,6 +15832,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             // Default (false): a genuine sbatch job, not a routed srun
             // request — no pmix_plan is supplied either, so if this reached
@@ -15585,6 +15881,7 @@ mod tests {
                 cpus: 2,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -15751,6 +16048,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -15800,6 +16098,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -15845,6 +16144,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -15861,7 +16161,7 @@ mod tests {
         );
     }
 
-    fn gpu_alloc_request(device_ids: &[u32]) -> ResourceAllocations {
+    fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {
         let devices = device_ids
             .iter()
             .map(|id| AllocatedDevice {
@@ -15875,6 +16175,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: map,
+            generation: 0,
         }
     }
 
@@ -15975,6 +16276,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices,
+                generation: 0,
             }),
             ..Default::default()
         }))
@@ -16102,6 +16404,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         }))
@@ -18338,7 +18641,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         let state = tempfile::tempdir().expect("runtime state directory");
-        let descriptor = |job_id: u32, cpu_ids: Vec<u32>, gpu: u32| {
+        let descriptor = |job_id: u32, cpu_ids: Vec<u32>, gpu: u64| {
             let mut descriptor = crate::stepd::StepdDescriptor::new(
                 job_id,
                 1,
@@ -18376,6 +18679,132 @@ mod tests {
         alloc.release_job(911);
         assert!(alloc.allocated_cpus[2]);
         assert!(!alloc.allocated_cpus[3]);
+    }
+
+    fn gpu_with_stable_id(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
+        spur_core::resource::GpuResource {
+            device_id,
+            gpu_type: "mi300x".into(),
+            memory_mb: 192_000,
+            peer_gpus: vec![],
+            link_type: spur_core::resource::GpuLinkType::XGMI,
+            stable_id,
+        }
+    }
+
+    #[test]
+    fn legacy_positional_ids_translate_to_current_stable_ids() {
+        // Two BDF-anchored stable_ids; a pre-stable_id descriptor recorded the
+        // GPUs positionally as [0, 1], which must map to [A, B] by index.
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(
+            translate_legacy_gpu_ids(&[0, 1], &gpus),
+            Some(vec![0x0063_0000, 0x0083_0000])
+        );
+    }
+
+    #[test]
+    fn already_current_stable_ids_are_not_translated() {
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(
+            translate_legacy_gpu_ids(&[0x0063_0000, 0x0083_0000], &gpus),
+            None
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_positional_id_is_not_translated() {
+        // Index 5 exceeds a 2-GPU inventory: ambiguous, so under-adopt rather
+        // than guess.
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(translate_legacy_gpu_ids(&[0, 5], &gpus), None);
+    }
+
+    #[test]
+    fn duplicate_positional_ids_are_not_translated() {
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(translate_legacy_gpu_ids(&[0, 0], &gpus), None);
+    }
+
+    #[test]
+    fn a_render_minor_looking_id_is_not_translated() {
+        // 128 is neither a valid index nor a current stable_id — the unreleased
+        // render_minor scheme is out of scope, so it under-adopts.
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(translate_legacy_gpu_ids(&[128, 129], &gpus), None);
+    }
+
+    // A rolling upgrade adopts a running GPU job whose descriptor still holds
+    // pre-stable_id positional ids [0, 1]; driven through the real replay path,
+    // restore must succeed holding the current BDF stable_ids (no double-book)
+    // and the descriptor must be rewritten forward so the next restart is clean.
+    #[tokio::test]
+    async fn a_legacy_positional_descriptor_adopts_onto_current_stable_ids() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0x0063_0000, 0x0083_0000]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            920,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("runtime/920.1.batch.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices: vec![0, 1],
+            cpu_ids: vec![0, 1],
+            ..Default::default()
+        };
+        store
+            .publish(&descriptor)
+            .expect("publish legacy descriptor");
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+
+        // The job holds the real current stable_ids, so a later dispatch sees
+        // zero free GPUs — no double-book.
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_gpus(None), 0);
+        assert_eq!(alloc.allocated_gpu_ids(), vec![0x0063_0000, 0x0083_0000]);
+        drop(alloc);
+
+        // The descriptor was rewritten forward to stable_ids, so a second
+        // restart needs no translation.
+        let session_dir = store.session_dir(920, 1, spur_core::step::STEP_BATCH);
+        let reloaded = store
+            .load_descriptor(&session_dir)
+            .expect("reload rewritten descriptor");
+        assert_eq!(
+            reloaded.resources.gpu_devices,
+            vec![0x0063_0000, 0x0083_0000]
+        );
     }
 
     // An empty ledger was only correct while a restart killed every job: it now

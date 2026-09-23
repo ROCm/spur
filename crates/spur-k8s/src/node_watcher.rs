@@ -290,6 +290,9 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
             memory_mb: gpu_memory_mb,
             peer_gpus: (0..gpu_count).filter(|&j| j != i).collect(),
             link_type,
+            // No KFD render_minor is available from k8s labels; the positional
+            // index is the only stable identity this synthetic inventory has.
+            stable_id: i as u64,
         })
         .collect();
 
@@ -298,6 +301,7 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
         memory_mb,
         gpus,
         generic: Default::default(),
+        generation: 0,
     }
 }
 
@@ -719,6 +723,7 @@ mod tests {
                 memory_mb: 196608,
                 peer_gpus: vec![],
                 link_type: 1,
+                stable_id: i as u64,
             })
             .collect();
         ResourceSet {
@@ -726,6 +731,7 @@ mod tests {
             memory_mb: mem,
             gpus,
             generic: Default::default(),
+            generation: 0,
         }
     }
 

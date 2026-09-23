@@ -322,6 +322,9 @@ Apptainer
 tmpfs
 uncontained
 cgroup's
+CPX
+KFD
+SPX
 CNIs
 ENI
 IPIP

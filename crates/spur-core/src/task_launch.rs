@@ -209,7 +209,7 @@ pub fn build_step_task_plan(
 pub fn apply_gpu_bind_env(
     target: &mut HashMap<String, String>,
     source: &HashMap<String, String>,
-    allocated: &[u32],
+    allocated: &[u64],
 ) {
     let Some(bind_str) = source
         .get("SPUR_GPU_BIND")

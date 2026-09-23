@@ -1265,6 +1265,17 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
     }
 }
 
+/// Jobs a heartbeat reported with a non-empty translated GPU set, for the
+/// used-view reconcile. A job with no GPUs (or an old agent that never sets the
+/// field) is omitted, leaving that job's slice untouched.
+fn reported_held_gpu_ids(reported: &[RunningJobStatus]) -> Vec<(u32, Vec<u64>)> {
+    reported
+        .iter()
+        .filter(|r| !r.gpu_stable_ids.is_empty())
+        .map(|r| (r.job_id, r.gpu_stable_ids.clone()))
+        .collect()
+}
+
 /// Reported ids `node` may release; ids still allocated here, not yet started,
 /// and never issued by this controller are spared.
 fn stale_reported_jobs(
@@ -2464,6 +2475,14 @@ impl SlurmController for ControllerService {
                 .update_node_wg_pubkey(&req.hostname, &req.wg_pubkey)
             {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
+            }
+            // Converge the used-view to the agent's translated held GPU set
+            // before the stale-job scan, so an upgraded node's live GPUs stop
+            // reading free. Only jobs that reported a set participate.
+            let reported_gpu_ids = reported_held_gpu_ids(&req.running_jobs);
+            if !reported_gpu_ids.is_empty() {
+                self.cluster
+                    .reconcile_node_gpu_allocations(&req.hostname, &reported_gpu_ids);
             }
             self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             if let Some(k0s) = &req.k0s_status {
@@ -4826,7 +4845,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
 }
 
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
-    spur_core::resource::ResourceSet {
+    // Backfill so no stable_id==0 from a legacy/mixed-version agent reaches accounting.
+    let mut rs = spur_core::resource::ResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
         gpus: r
@@ -4842,10 +4862,14 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
                     2 => spur_core::resource::GpuLinkType::NVLink,
                     _ => spur_core::resource::GpuLinkType::PCIe,
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic,
-    }
+        generation: r.generation,
+    };
+    rs.backfill_stable_ids();
+    rs
 }
 
 pub(crate) fn identity_role(
@@ -5300,6 +5324,7 @@ pub(crate) fn allocations_to_proto(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -5327,6 +5352,7 @@ pub(crate) fn proto_to_allocations(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -5355,9 +5381,11 @@ pub(crate) fn resource_to_proto(
                         spur_proto::proto::GpuLinkType::GpuLinkPcie as i32
                     }
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic.clone(),
+        generation: r.generation,
     }
 }
 
@@ -5631,6 +5659,29 @@ mod tests {
 
     fn job_state(cluster: &crate::cluster::ClusterManager, job_id: u32) -> Option<JobState> {
         cluster.get_job(job_id).map(|j| j.state)
+    }
+
+    #[test]
+    fn resource_set_proto_round_trip_preserves_stable_id_and_generation() {
+        use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+        let rs = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: vec![GpuResource {
+                device_id: 1,
+                gpu_type: "mi300x".into(),
+                memory_mb: 196_608,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                stable_id: 129,
+            }],
+            generic: Default::default(),
+            generation: 42,
+        };
+        let back = proto_to_resource_set(resource_to_proto(&rs));
+        assert_eq!(back.generation, 42);
+        assert_eq!(back.gpus[0].stable_id, 129);
+        assert_eq!(back.gpus[0].device_id, 1);
     }
 
     #[test]
@@ -6209,6 +6260,26 @@ mod tests {
         assert!(spur_proto::controller_rpc_retryable(&status));
     }
 
+    #[test]
+    fn reported_held_gpu_ids_keeps_only_jobs_with_a_reported_set() {
+        let reported = vec![
+            RunningJobStatus {
+                job_id: 1,
+                gpu_stable_ids: vec![0x63_0000, 0x83_0000],
+                ..Default::default()
+            },
+            // No GPUs, or an old agent that never set the field: skipped.
+            RunningJobStatus {
+                job_id: 2,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            reported_held_gpu_ids(&reported),
+            vec![(1u32, vec![0x63_0000u64, 0x83_0000u64])]
+        );
+    }
+
     /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
     /// and unknown ids are all spared.
     #[tokio::test]
@@ -6251,6 +6322,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -6441,6 +6513,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n2".to_string(), res.clone());
@@ -6588,6 +6661,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());

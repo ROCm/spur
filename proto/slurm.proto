@@ -18,10 +18,11 @@ message ResourceSet {
   uint64 memory_mb = 2;
   repeated GpuResource gpus = 3;
   map<string, uint64> generic = 4;  // licenses, etc.
+  uint64 generation = 5;  // bumped by the agent on each topology rebuild
 }
 
 message AllocatedDevice {
-  uint32 device_id = 1;
+  uint64 device_id = 1;
   uint64 count = 2;
 }
 
@@ -33,6 +34,7 @@ message ResourceAllocations {
   uint32 cpus = 1;
   uint64 memory_mb = 2;
   map<string, DeviceAllocations> devices = 3;
+  uint64 generation = 4;  // node inventory generation this allocation was made under
 }
 
 message GpuResource {
@@ -41,6 +43,7 @@ message GpuResource {
   uint64 memory_mb = 3;
   repeated uint32 peer_gpus = 4;
   GpuLinkType link_type = 5;
+  uint64 stable_id = 6;   // BDF(domain:bus:dev.func) + partition rank; stable per-logical-device identity
 }
 
 enum GpuLinkType {
@@ -898,6 +901,11 @@ message RunningJobStatus {
   uint32 job_id = 1;
   JobState state = 2;
   int32 exit_code = 3;
+  // The stable_ids this job currently holds on this node, after any legacy
+  // positional->stable_id translation the agent applied at restore. Lets the
+  // controller converge its per-node used-view to the ids the job actually
+  // occupies. Empty from an old agent or a job with no GPUs.
+  repeated uint64 gpu_stable_ids = 4;
 }
 
 message HeartbeatResponse {}

@@ -307,7 +307,7 @@ pub struct NodeResourceSlice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceSlice {
     pub name: String,
-    pub device_id: u32,
+    pub device_id: u64,
     pub count: u64,
 }
 
@@ -708,7 +708,7 @@ impl ExecutionCredential {
             );
             for dev in &node.devices {
                 w.str(&dev.name)?;
-                w.u32(dev.device_id);
+                w.u64(dev.device_id);
                 w.u64(dev.count);
             }
         }
@@ -778,7 +778,7 @@ impl ExecutionCredential {
             for _ in 0..dev_n {
                 devices.push(DeviceSlice {
                     name: r.str()?,
-                    device_id: r.u32()?,
+                    device_id: r.u64()?,
                     count: r.u64()?,
                 });
             }
@@ -877,7 +877,7 @@ impl ExecutionCredential {
         hostname: &str,
         cpus: u32,
         memory_mb: u64,
-        devices: &[(String, u32, u64)],
+        devices: &[(String, u64, u64)],
     ) -> Result<(), CredentialError> {
         let slice = self.require_node(hostname)?;
         if slice.cpus != cpus || slice.memory_mb != memory_mb {

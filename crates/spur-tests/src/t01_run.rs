@@ -91,6 +91,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: i as u64,
             })
             .collect();
 

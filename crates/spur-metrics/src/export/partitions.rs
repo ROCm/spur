@@ -161,6 +161,7 @@ mod tests {
                 memory_mb: 16384,
                 gpus: Vec::new(),
                 generic: Default::default(),
+                generation: 0,
             },
         );
         node.partitions = vec!["default".into()];

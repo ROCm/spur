@@ -272,6 +272,10 @@ class SpurCluster:
         self.config_overrides: dict = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
+        # Extra environment variables injected into spurd's own launch env (e.g.
+        # SPUR_INVENTORY_REFRESH_SECS to drive the inventory-refresh loop fast in
+        # tests). Applied by _spurd_start_cmd for both fresh start and restart.
+        self.agent_env: dict[str, str] = {}
         self.agent_token: str | None = None
         self.accounting_enabled: bool = False
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
@@ -279,7 +283,6 @@ class SpurCluster:
         self.cli_env: dict[str, str] = {}
         self.daemon_env: dict[str, str] = {}
         self.controller_env: dict[str, str] = {}
-        self.agent_env: dict[str, str] = {}
 
     @property
     def _db_url(self) -> str:
@@ -1477,7 +1480,8 @@ tar -C "$R" -czf '{local_tar}' .
         address = node.host
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
         # `env VAR=val` runs under any sudo prefix, so the canary lands in spurd's
-        # own environment in both the rootless and rootful launch shapes.
+        # own environment in both the rootless and rootful launch shapes. Any
+        # test-supplied agent_env vars are appended to the same `env` invocation.
         daemon_env = (
             f"env SPUR_DAEMON_ENV_CANARY={DAEMON_ENV_CANARY} {self._daemon_env_assignments(self.agent_env)}"
         )
