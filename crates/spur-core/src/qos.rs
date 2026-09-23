@@ -20,12 +20,11 @@ impl From<QosPreemptMode> for PreemptMode {
     }
 }
 
-/// A QOS-level preempt mode override. Unset and explicit `Off` both mean
-/// "no override"; the partition action applies.
+/// A QOS-level preempt mode override. Unset falls back to the partition
+/// action; an explicit `Off` is a hard stop the partition action cannot
+/// override — QOS config always outranks partition config.
 pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
-    qos.preempt_mode
-        .filter(|mode| *mode != QosPreemptMode::Off)
-        .map(Into::into)
+    qos.preempt_mode.map(Into::into)
 }
 
 /// Result of QOS limit check.
@@ -1159,9 +1158,18 @@ mod tests {
     }
 
     #[test]
-    fn test_qos_preempt_override_off_is_none() {
+    fn test_qos_preempt_override_off_is_hard_stop() {
         let qos = Qos {
             preempt_mode: Some(QosPreemptMode::Off),
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&qos), Some(PreemptMode::Off));
+    }
+
+    #[test]
+    fn test_qos_preempt_override_unset_is_none() {
+        let qos = Qos {
+            preempt_mode: None,
             ..Default::default()
         };
         assert_eq!(qos_preempt_override(&qos), None);

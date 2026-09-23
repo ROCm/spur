@@ -248,6 +248,26 @@ CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
 CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
 -- Added after the table shipped, so it must follow the CREATE above.
 ALTER TABLE txn ADD COLUMN IF NOT EXISTS peer_addr TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    id         TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- QOS 'off' used to mean "no override, defer to partition" (same as unset);
+-- it now means a hard stop. Rows written by the old CLI default (before
+-- preempt_mode was optional) hold the literal 'off' without ever being
+-- explicitly configured, so reset them to unset once. Gated by
+-- schema_migrations so it never touches an admin's later explicit 'off'.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE id = 'qos_preempt_off_defaults_to_unset'
+    ) THEN
+        UPDATE qos SET preempt_mode = '' WHERE preempt_mode = 'off';
+        INSERT INTO schema_migrations (id) VALUES ('qos_preempt_off_defaults_to_unset');
+    END IF;
+END $$;
 "#;
 
 /// What accounting persists when a job starts. Named fields rather than positional
@@ -3297,6 +3317,69 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_resets_legacy_off_qos_but_not_a_later_explicit_off() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let name = format!("spur_qos_off_migration_{}", std::process::id());
+
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                priority: Some(0),
+                preempt_mode: Some("off"),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Undo the one-time marker so this row is treated as a pre-upgrade row
+        // migrate() has never reset.
+        sqlx::query("DELETE FROM schema_migrations WHERE id = 'qos_preempt_off_defaults_to_unset'")
+            .execute(&pool)
+            .await?;
+        migrate(&pool).await?;
+        let mode: String = sqlx::query_scalar("SELECT preempt_mode FROM qos WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            mode, "",
+            "a pre-existing literal 'off' row must reset to unset once"
+        );
+
+        // An explicit off set after the one-time reset must survive later runs.
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                preempt_mode: Some("off"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        migrate(&pool).await?;
+        let mode: String = sqlx::query_scalar("SELECT preempt_mode FROM qos WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            mode, "off",
+            "an explicit off set after the one-time migration must not be reverted"
+        );
+
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 

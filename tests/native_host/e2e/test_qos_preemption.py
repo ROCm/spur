@@ -219,14 +219,12 @@ class TestQosPreemptModeOverride:
 
 
 class TestQosPreemptModeOff:
-    """QOS preempt_mode=off means 'no override — defer to the partition mode'.
-    It is NOT a preemption shield. A victim job whose QOS has preempt_mode=off
-    must still be preempted according to the partition's policy.
+    """QOS preempt_mode=off is a hard stop: it always outranks the partition
+    action, including to protect a job the partition would otherwise let
+    through. Unset is what defers to the partition; explicit off does not.
 
-    This matches Slurm's documented behaviour: PreemptMode=OFF on a QOS is
-    equivalent to leaving it unset; the cluster-wide / partition preempt_mode
-    takes effect. To prevent a QOS's jobs from being preempted, the QOS must
-    simply not appear in any preemptor QOS's allow-list."""
+    A QOS's jobs can also be protected by simply not appearing in any
+    preemptor QOS's allow-list — this test covers the explicit-off path."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -248,14 +246,14 @@ class TestQosPreemptModeOff:
             **_AUTH_ROOT,
         }
 
-    def test_qos_preempt_mode_off_defers_to_partition_cancel(self, accounting_cluster):
-        """A victim whose QOS has preempt_mode=off must be cancelled when the
-        partition says cancel — off means 'use partition default', not 'shield'."""
+    def test_qos_preempt_mode_off_overrides_partition_cancel(self, accounting_cluster):
+        """A victim whose QOS has preempt_mode=off must survive even though the
+        partition says cancel — explicit QOS off always wins."""
         c = accounting_cluster
         node = c.node_names[0]
 
-        c.sacctmgr(["add", "qos", "name=defer-off", "priority=-500", "preemptmode=off"])
-        c.sacctmgr(["add", "qos", "name=hunter", "priority=100000", "preempt=defer-off"])
+        c.sacctmgr(["add", "qos", "name=hard-off", "priority=-500", "preemptmode=off"])
+        c.sacctmgr(["add", "qos", "name=hunter", "priority=100000", "preempt=hard-off"])
         time.sleep(_CACHE_WARMUP_SECS)
 
         victim_id = None
@@ -263,7 +261,7 @@ class TestQosPreemptModeOff:
         try:
             victim_script = c.write_file("qos-off-victim.sh", "#!/bin/bash\nsleep 600\n")
             victim_id = parse_job_id(
-                c.sbatch(["-N1", "--exclusive", f"--nodelist={node}", "-q", "defer-off", victim_script])
+                c.sbatch(["-N1", "--exclusive", f"--nodelist={node}", "-q", "hard-off", victim_script])
             )
             assert victim_id is not None, "victim submit failed"
             wait_job_state(c, victim_id, "R", timeout=30)
@@ -275,23 +273,13 @@ class TestQosPreemptModeOff:
             )
             assert aggressor_id is not None, "aggressor submit failed"
             wait_job_state(c, aggressor_id, "PD", timeout=30)
-            _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor before preemption")
+            _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor before guard")
 
-            # preempt_mode=off on the victim QOS means "defer to partition".
-            # Partition says cancel → victim must be cancelled, not shielded.
-            terminal = wait_job(c, victim_id, timeout=30)
-            assert terminal in ("CA", "GONE"), (
-                f"victim with QOS preempt_mode=off must be cancelled per the partition policy; "
-                f"got {terminal!r}"
-            )
-            if terminal != "GONE":
-                _assert_scontrol_state(c, victim_id, "CANCELLED", "victim after preemption")
-
-            wait_job_state(c, aggressor_id, "R", timeout=30)
-            _assert_scontrol_state(c, aggressor_id, "RUNNING", "aggressor after preemption")
-
-            final = wait_job(c, aggressor_id, timeout=30)
-            assert final == "CD", f"aggressor must complete; got {final!r}"
+            # preempt_mode=off on the victim QOS is a hard stop: partition
+            # cancel must not reach the victim.
+            time.sleep(_GUARD_SECS)
+            _assert_scontrol_state(c, victim_id, "RUNNING", "victim after guard")
+            _assert_scontrol_state(c, aggressor_id, "PENDING", "aggressor after guard")
         finally:
             for jid in (victim_id, aggressor_id):
                 if jid is not None:
