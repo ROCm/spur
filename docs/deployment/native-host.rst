@@ -1042,7 +1042,9 @@ Spur restricts a job to its allocated GPUs in two layers:
 
 - **Visibility.** The allocated device ordinals are exported into the standard GPU
   runtime variables — ``ROCR_VISIBLE_DEVICES``, ``CUDA_VISIBLE_DEVICES``, and
-  ``GPU_DEVICE_ORDINAL``. This layer is advisory: a job that overwrites them sees
+  ``GPU_DEVICE_ORDINAL``, plus ``HIP_VISIBLE_DEVICES`` counting from zero because
+  ROCr renumbers what it leaves visible. This layer is advisory: a job that
+  overwrites them sees
   every GPU on the node again. A root ``spurd`` additionally runs the batch payload
   in a mount namespace where ``/dev/dri`` is replaced by a tmpfs carrying only the
   job's own render nodes, so a job allocated no GPUs finds that directory empty.

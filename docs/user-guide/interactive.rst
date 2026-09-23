@@ -231,6 +231,10 @@ the allocated device ordinals so GPU runtimes find the right devices:
      - Allocated GPU ordinals.
    * - ``GPU_DEVICE_ORDINAL``
      - Allocated GPU ordinals.
+   * - ``HIP_VISIBLE_DEVICES``
+     - ``0``, ``0,1``, and so on. ROCr has already narrowed and renumbered the
+       devices by the time HIP reads this, so it counts from zero rather than
+       repeating the ordinals above.
    * - ``SPUR_JOB_GPUS``
      - Allocated GPU ordinals (Spur-native).
 
