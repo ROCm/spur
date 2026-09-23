@@ -156,7 +156,7 @@ pub struct JobLaunchConfig {
     pub stdin_path: String,
     pub cpus: u32,
     pub memory_mb: u64,
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     pub cpu_ids: Vec<u32>,
     pub open_mode: Option<String>,
     pub uid: u32,

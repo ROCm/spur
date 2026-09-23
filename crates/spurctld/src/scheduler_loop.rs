@@ -2804,6 +2804,7 @@ mod tests {
             memory_mb,
             gpus,
             generic: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -2814,6 +2815,7 @@ mod tests {
             memory_mb: 192_000,
             peer_gpus: vec![],
             link_type: GpuLinkType::PCIe,
+            stable_id: device_id as u64,
         }
     }
 
@@ -2961,6 +2963,7 @@ mod tests {
             memory_mb: 256_000,
             gpus: vec![],
             generic: gen_a,
+            generation: 0,
         };
 
         let mut gen_b = HashMap::new();
@@ -2970,6 +2973,7 @@ mod tests {
             memory_mb: 256_000,
             gpus: vec![],
             generic: gen_b,
+            generation: 0,
         };
 
         let nodes = vec!["n1".to_string(), "n2".to_string()];

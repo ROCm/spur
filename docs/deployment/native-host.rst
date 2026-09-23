@@ -159,7 +159,8 @@ The two daemons are configured with command-line flags. The most common are belo
    ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cgroup]``,
    ``[cluster]``, and ``[mpi]``. If the file is absent, the agent logs a warning and
    falls back to defaults for those sections, which is fine when none of them are
-   in use.
+   in use. ``[devices]`` inventory is also re-discovered periodically after
+   startup; see :doc:`../admin-guide/configuration`.
 
 Quick Start: Two-Node Cluster
 -----------------------------

@@ -137,6 +137,7 @@ mod tests {
                 memory_mb,
                 gpus: Vec::new(),
                 generic: Default::default(),
+                generation: 0,
             },
         );
         node.partitions = partitions.iter().map(|p| p.to_string()).collect();

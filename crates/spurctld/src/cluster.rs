@@ -31,7 +31,7 @@ use spur_core::qos::{
     QosCheckResult,
 };
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
-use spur_core::resource::{ResourceAllocations, ResourceSet};
+use spur_core::resource::{AllocatedDevice, ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
@@ -508,6 +508,15 @@ fn health_job_target_node(name: &str) -> Option<&str> {
     name.strip_prefix(HEALTH_JOB_PREFIX)
         .and_then(|rest| rest.split_once('.'))
         .map(|(_, node)| node)
+}
+
+/// Whether two GPU stable_id lists hold the same set, ignoring order and
+/// duplicates. Used to skip a heartbeat reconcile whose reported set already
+/// matches the recorded slice.
+fn gpu_ids_match(a: &[u64], b: &[u64]) -> bool {
+    let sa: HashSet<u64> = a.iter().copied().collect();
+    let sb: HashSet<u64> = b.iter().copied().collect();
+    sa == sb
 }
 
 struct PendingJobClassification {
@@ -2785,6 +2794,84 @@ impl ClusterManager {
             }
         }
         false
+    }
+
+    /// Converge each reported running job's GPU footprint in this node's
+    /// used-view to the translated stable_ids the agent says the job now holds.
+    ///
+    /// After a non-disruptive spurd upgrade the agent re-registers inventory
+    /// under new stable_ids and translates a running job's positional GPU ids
+    /// locally, but the controller's `alloc_resources` was rebuilt from the
+    /// JobStart WAL, which still carries the old positional ids. Those match no
+    /// live stable_id, so availability matching reads the held GPUs as free and
+    /// churns dispatches for the job's lifetime. Correcting the per-job slice
+    /// (not the aggregate blindly) keeps `alloc_resources` the exact sum of the
+    /// jobs' slices, so a later JobNodeComplete still balances.
+    ///
+    /// Live-view convergence only: the WAL keeps the legacy ids, but every
+    /// heartbeat re-applies the reported set, so it self-heals with no persisted
+    /// migration. Idempotent — a job whose slice already equals the reported set
+    /// is skipped. Callers pass only jobs with a non-empty reported set, so an
+    /// old agent (or a momentarily unreadable allocation) leaves state untouched.
+    pub fn reconcile_node_gpu_allocations(
+        &self,
+        node_name: &str,
+        reported_gpu_ids: &[(JobId, Vec<u64>)],
+    ) {
+        if reported_gpu_ids.is_empty() {
+            return;
+        }
+        // jobs before nodes, matching apply_operation's lock order.
+        let mut jobs = self.jobs.write();
+        let mut nodes = self.nodes.write();
+        let Some(node) = nodes.get_mut(node_name) else {
+            return;
+        };
+        for (job_id, reported) in reported_gpu_ids {
+            let Some(job) = jobs.get_mut(job_id) else {
+                continue;
+            };
+            let Some(slice) = job.per_node_alloc.get_mut(node_name) else {
+                continue;
+            };
+            let current = slice.device_ids("gpu");
+            if gpu_ids_match(&current, reported) {
+                continue;
+            }
+            // stable_ids are unique per physical GPU held by one job, so the
+            // aggregate add/subtract by id is exact and cannot double-count.
+            let current_set: HashSet<u64> = current.iter().copied().collect();
+            let reported_set: HashSet<u64> = reported.iter().copied().collect();
+            let to_remove: Vec<u64> = current
+                .iter()
+                .copied()
+                .filter(|id| !reported_set.contains(id))
+                .collect();
+            let to_add: Vec<u64> = reported
+                .iter()
+                .copied()
+                .filter(|id| !current_set.contains(id))
+                .collect();
+            if !to_remove.is_empty() {
+                node.alloc_resources
+                    .subtract(&ResourceAllocations::from_device_ids("gpu", &to_remove));
+            }
+            if !to_add.is_empty() {
+                node.alloc_resources
+                    .add(&ResourceAllocations::from_device_ids("gpu", &to_add));
+            }
+            // Rewrite the job's slice so a later JobNodeComplete subtracts the
+            // ids the job actually held, keeping the aggregate balanced.
+            slice.devices.insert(
+                "gpu".to_string(),
+                reported
+                    .iter()
+                    .copied()
+                    .map(AllocatedDevice::injectable)
+                    .collect(),
+            );
+            node.update_state_from_alloc();
+        }
     }
 
     /// Create an admission token and persist via Raft.
@@ -6471,7 +6558,10 @@ impl ClusterManager {
                 labels,
                 source,
             } => {
-                let mut node = Node::new(name.clone(), resources.clone());
+                // Normalize legacy Raft entries so replay can't collide on stable_id==0.
+                let mut resources = resources.clone();
+                resources.backfill_stable_ids();
+                let mut node = Node::new(name.clone(), resources);
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -6529,7 +6619,10 @@ impl ClusterManager {
                 source,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
-                    node.total_resources = resources.clone();
+                    // Normalize legacy Raft entries so replay can't collide on stable_id==0.
+                    let mut resources = resources.clone();
+                    resources.backfill_stable_ids();
+                    node.total_resources = resources;
                     if !hostname.is_empty() {
                         node.hostname = hostname.clone();
                     }
@@ -10058,6 +10151,167 @@ mod tests {
         let node = cm.get_node("node1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 4);
         assert_eq!(node.alloc_resources.memory_mb, 8000);
+    }
+
+    fn gpu_resource(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
+        spur_core::resource::GpuResource {
+            device_id,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: spur_core::resource::GpuLinkType::XGMI,
+            stable_id,
+        }
+    }
+
+    fn register_gpu_node(
+        cm: &ClusterManager,
+        name: &str,
+        gpus: Vec<spur_core::resource::GpuResource>,
+    ) {
+        cm.register_node(
+            name.into(),
+            name.into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                gpus,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        let n = name.to_string();
+        wait_for(&format!("node '{n}' registered"), || {
+            cm.get_node(&n).is_some()
+        });
+    }
+
+    // The upgrade-divergence proof: alloc_resources holds a running job's stale
+    // positional gpu ids [0,1]; the re-registered inventory uses stable_ids
+    // [A,B]; the job actually holds [A,B]. Before the heartbeat reconcile the
+    // controller reads both busy GPUs as free (the bug); after it, they are
+    // correctly busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_reconcile_converges_stale_positional_gpu_ids() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let sid_a: u64 = 0x63_0000;
+        let sid_b: u64 = 0x83_0000;
+        register_gpu_node(
+            &cm,
+            "n1",
+            vec![gpu_resource(0, sid_a), gpu_resource(1, sid_b)],
+        );
+
+        // A running job whose per-node slice carries the pre-upgrade positional
+        // ids [0,1], exactly what a JobStart WAL replay leaves behind.
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("held")),
+        });
+        let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0, 1]);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: stale_slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], stale_slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+
+        // Bug reproduction: the stale positional ids match no live stable_id, so
+        // both real GPUs read free.
+        let want_two_gpus = ResourceSet {
+            cpus: 0,
+            memory_mb: 0,
+            gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
+            generic: Default::default(),
+            generation: 0,
+        };
+        {
+            let node = cm.get_node("n1").unwrap();
+            assert!(
+                node.total_resources
+                    .can_satisfy_with_allocated(&node.alloc_resources, &want_two_gpus),
+                "before reconcile the held GPUs wrongly read as free"
+            );
+            assert!(node
+                .total_resources
+                .available_device_ids(&node.alloc_resources, "gpu", None)
+                .contains(&sid_a));
+        }
+
+        // The upgraded agent heartbeats its translated held set.
+        cm.reconcile_node_gpu_allocations("n1", &[(1, vec![sid_a, sid_b])]);
+
+        {
+            let node = cm.get_node("n1").unwrap();
+            assert!(
+                !node
+                    .total_resources
+                    .can_satisfy_with_allocated(&node.alloc_resources, &want_two_gpus),
+                "after reconcile the held GPUs are correctly busy"
+            );
+            let free =
+                node.total_resources
+                    .available_device_ids(&node.alloc_resources, "gpu", None);
+            assert!(free.is_empty(), "no GPU is free: got {free:?}");
+            // The job's slice now carries the stable_ids, so a later completion
+            // subtracts what it actually held.
+            let slice = cm
+                .get_job(1)
+                .unwrap()
+                .per_node_alloc
+                .get("n1")
+                .cloned()
+                .unwrap();
+            let mut ids = slice.device_ids("gpu");
+            ids.sort_unstable();
+            assert_eq!(ids, vec![sid_a, sid_b]);
+        }
+
+        // Idempotent: the same reported set again is a no-op.
+        cm.reconcile_node_gpu_allocations("n1", &[(1, vec![sid_a, sid_b])]);
+        let node = cm.get_node("n1").unwrap();
+        let mut ids = node.alloc_resources.device_ids("gpu");
+        ids.sort_unstable();
+        assert_eq!(ids, vec![sid_a, sid_b]);
+    }
+
+    // An empty reported set (old agent, or a job with no GPUs) leaves the node's
+    // used-view untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_reconcile_ignores_empty_reported_set() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let sid_a: u64 = 0x63_0000;
+        register_gpu_node(&cm, "n1", vec![gpu_resource(0, sid_a)]);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("held")),
+        });
+        let stale_slice = ResourceAllocations::from_device_ids("gpu", &[0]);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: stale_slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], stale_slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+
+        let before = cm.get_node("n1").unwrap().alloc_resources.clone();
+        cm.reconcile_node_gpu_allocations("n1", &[]);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources, before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

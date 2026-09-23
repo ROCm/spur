@@ -146,7 +146,7 @@ pub struct ContainerConfig {
     pub readonly: bool,
     pub mount_home: bool,
     pub remap_root: bool,
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     pub environment: HashMap<String, String>,
     pub container_env: HashMap<String, String>,
     pub entrypoint: Option<String>,

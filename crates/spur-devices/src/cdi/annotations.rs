@@ -29,6 +29,10 @@ pub const MEMORY_PARTITION: &str = "spur.amd.com/memory-partition";
 
 pub const UNIQUE_ID: &str = "spur.amd.com/unique-id";
 
+pub const RENDER_MINOR: &str = "spur.amd.com/render-minor";
+
+pub const STABLE_ID: &str = "spur.amd.com/stable-id";
+
 pub fn parse_link_type(s: &str) -> Option<LinkType> {
     match s.trim().to_lowercase().as_str() {
         "pcie" => Some(LinkType::Pcie),
@@ -85,6 +89,8 @@ pub struct DeviceMetadata {
     pub compute_partition: Option<String>,
     pub memory_partition: Option<String>,
     pub unique_id: Option<String>,
+    pub render_minor: Option<u32>,
+    pub stable_id: Option<u64>,
 }
 
 impl DeviceMetadata {
@@ -107,6 +113,8 @@ impl DeviceMetadata {
             compute_partition: annotations.get(COMPUTE_PARTITION).cloned(),
             memory_partition: annotations.get(MEMORY_PARTITION).cloned(),
             unique_id: annotations.get(UNIQUE_ID).cloned(),
+            render_minor: annotations.get(RENDER_MINOR).and_then(|s| s.parse().ok()),
+            stable_id: annotations.get(STABLE_ID).and_then(|s| s.parse().ok()),
         }
     }
 
@@ -150,6 +158,12 @@ impl DeviceMetadata {
         }
         if let Some(ref uid) = self.unique_id {
             ann.insert(UNIQUE_ID.into(), uid.clone());
+        }
+        if let Some(rm) = self.render_minor {
+            ann.insert(RENDER_MINOR.into(), rm.to_string());
+        }
+        if let Some(sid) = self.stable_id {
+            ann.insert(STABLE_ID.into(), sid.to_string());
         }
         ann
     }
@@ -271,6 +285,8 @@ mod tests {
             compute_partition: Some("CPX".into()),
             memory_partition: Some("NPS4".into()),
             unique_id: Some("0123456789abcdef".into()),
+            render_minor: Some(129),
+            stable_id: Some(0x0500_0001),
         };
 
         let annotations = meta.to_annotations();
@@ -287,6 +303,8 @@ mod tests {
         assert_eq!(parsed.compute_partition.as_deref(), Some("CPX"));
         assert_eq!(parsed.memory_partition.as_deref(), Some("NPS4"));
         assert_eq!(parsed.unique_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(parsed.render_minor, Some(129));
+        assert_eq!(parsed.stable_id, Some(0x0500_0001));
     }
 
     #[test]
@@ -298,5 +316,27 @@ mod tests {
         assert_eq!(meta.compute_partition, None);
         assert_eq!(meta.memory_partition, None);
         assert_eq!(meta.unique_id, None);
+    }
+
+    #[test]
+    fn render_minor_round_trips_through_annotations() {
+        let meta = DeviceMetadata {
+            gpu_type: None,
+            memory_mb: 0,
+            numa_node: None,
+            cores: None,
+            links: None,
+            link_type: None,
+            pci_bdf: None,
+            auto_detected: false,
+            compute_partition: None,
+            memory_partition: None,
+            unique_id: None,
+            render_minor: Some(129),
+            stable_id: None,
+        };
+        let ann = meta.to_annotations();
+        let back = DeviceMetadata::from_annotations(&ann);
+        assert_eq!(back.render_minor, Some(129));
     }
 }

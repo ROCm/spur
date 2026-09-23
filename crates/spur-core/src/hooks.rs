@@ -26,7 +26,7 @@ pub struct HookContext {
     /// `prolog_slurmd`, `epilog_slurmd`, `prolog_slurmctld`, `epilog_slurmctld`,
     /// `prolog_task`, `epilog_task`, `prolog_srun`, `epilog_srun`.
     pub script_context: String,
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     pub cpus: u32,
     pub memory_mb: u64,
 }

@@ -42,7 +42,7 @@ pub struct StepdLaunchSpec {
     pub memory_mb: u64,
     pub cpu_ids: Vec<u32>,
     #[serde(default)]
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     pub open_mode: Option<String>,
     pub uid: u32,
     pub gid: u32,
@@ -157,7 +157,7 @@ pub struct StepdJobResources {
     #[serde(default)]
     pub memory_mb: u64,
     #[serde(default)]
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     /// The exact cores, so a restart replays the binding the job is pinned to
     /// instead of re-deriving one that overlaps it.
     #[serde(default)]

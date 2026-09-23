@@ -153,7 +153,9 @@ mod tests {
         if gpu_count > 0 {
             alloc.devices.insert(
                 "gpu".into(),
-                (0..gpu_count).map(AllocatedDevice::injectable).collect(),
+                (0..gpu_count as u64)
+                    .map(AllocatedDevice::injectable)
+                    .collect(),
             );
         }
         alloc
@@ -168,6 +170,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: i as u64,
             });
         }
         ResourceSet {
@@ -175,6 +178,7 @@ mod tests {
             memory_mb,
             gpus,
             generic: Default::default(),
+            generation: 0,
         }
     }
 

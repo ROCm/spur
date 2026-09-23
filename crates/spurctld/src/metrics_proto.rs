@@ -170,6 +170,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: i as u64,
             });
         }
         ResourceSet {
@@ -177,6 +178,7 @@ mod tests {
             memory_mb,
             gpus,
             generic: Default::default(),
+            generation: 0,
         }
     }
 

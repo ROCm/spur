@@ -55,11 +55,11 @@ impl DeviceRegistry {
         }
     }
 
-    pub fn resolve_by_ids(&self, name: &str, device_ids: &[u32]) -> Result<Vec<&DeviceEntry>> {
+    pub fn resolve_by_ids(&self, name: &str, device_ids: &[u64]) -> Result<Vec<&DeviceEntry>> {
         let mut resolved = Vec::new();
         for &id in device_ids {
             let found = self.devices.iter().find(|e| {
-                e.is_injectable() && entry_matches_gres_name(e, name) && e.device_id == id
+                e.is_injectable() && entry_matches_gres_name(e, name) && e.stable_id == id
             });
             match found {
                 Some(entry) => resolved.push(entry),
@@ -89,7 +89,7 @@ impl DeviceRegistry {
     pub fn build_job_injection_plans(
         &self,
         gres_name: &str,
-        allocated_ids: &[u32],
+        allocated_ids: &[u64],
         job_uid: u32,
         job_gid: u32,
     ) -> Result<(HostInjectionPlan, ContainerInjectionPlan)> {
@@ -147,6 +147,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         device_edits: expanded.device_edits.clone(),
         shared_edits: expanded.shared_edits.clone(),
         device_paths: expanded.device_paths.clone(),
+        stable_id: 0,
     }
 }
 
@@ -171,6 +172,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         device_edits: Default::default(),
         shared_edits: Default::default(),
         device_paths: Vec::new(),
+        stable_id: 0,
     }
 }
 
@@ -183,6 +185,12 @@ fn assign_device_ids(devices: &mut [DeviceEntry]) {
         let counter = next.entry(entry.gres_name.clone()).or_insert(0);
         entry.device_id = *counter;
         *counter += 1;
+        // Paths without a render-minor annotation (annotation-less CDI, GRES,
+        // countable/expanded) leave stable_id at 0; back it with the positional
+        // id so every injectable device has a distinct, nonzero-collision id.
+        if entry.stable_id == 0 {
+            entry.stable_id = entry.device_id as u64;
+        }
     }
 }
 
@@ -401,6 +409,127 @@ mod tests {
 
         assert_eq!(reg.injectable_count(), 0);
         assert_eq!(reg.countable_count(), 1);
+    }
+
+    /// On real KFD nodes the allocation ids the agent hands us are stable_ids
+    /// (render_minor 128..), while the driver's positional visible index is
+    /// `device_id` (0..). Resolution must key on stable_id, and the resolved
+    /// entry must still carry its positional device_id for visibility emission.
+    fn make_amd_cache_with_render_minors() -> CdiCache {
+        let mut spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: Vec::new(),
+            container_edits: None,
+        };
+        for (name, render_path, minor) in [
+            ("0", "/dev/dri/renderD128", "128"),
+            ("1", "/dev/dri/renderD129", "129"),
+        ] {
+            spec.devices.push(CdiDevice {
+                name: name.into(),
+                annotations: [
+                    (annotations::RENDER_MINOR.into(), minor.into()),
+                    (annotations::STABLE_ID.into(), minor.into()),
+                ]
+                .into(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![DeviceNode {
+                        path: render_path.into(),
+                        host_path: None,
+                        r#type: None,
+                        major: None,
+                        minor: None,
+                        file_mode: None,
+                        permissions: None,
+                        uid: None,
+                        gid: None,
+                    }],
+                    ..Default::default()
+                }),
+            });
+        }
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        cache
+    }
+
+    #[test]
+    fn resolve_by_ids_keys_on_stable_id_not_positional_device_id() {
+        let cache = make_amd_cache_with_render_minors();
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &[]);
+
+        // Positional device_id 0 carries stable_id 128; resolve by stable_id.
+        let resolved = reg.resolve_by_ids("gpu", &[128]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].stable_id, 128);
+        assert_eq!(
+            resolved[0].device_id, 0,
+            "resolved entry keeps its positional device_id for visibility"
+        );
+
+        // The positional index is no longer a valid allocation id.
+        assert!(
+            reg.resolve_by_ids("gpu", &[0]).is_err(),
+            "resolution must not match on positional device_id"
+        );
+
+        // Emitted visibility ids are the positional device_ids, not stable_ids.
+        let (host_plan, _) = build_injection_plans(&resolved, 1000, 1000);
+        assert_eq!(host_plan.env.get("ROCR_VISIBLE_DEVICES").unwrap(), "0");
+        assert_eq!(host_plan.env.get("SPUR_JOB_GPUS").unwrap(), "0");
+    }
+
+    /// Annotation-less CDI devices arrive with stable_id 0. Without a backfill
+    /// both GPUs would share id 0, so available_device_ids returns [0,0] and a
+    /// 2-GPU allocation collides on the same index. assign_device_ids must give
+    /// each injectable entry a distinct stable_id (here matching device_id).
+    #[test]
+    fn assign_backfills_distinct_stable_ids_for_annotationless_devices() {
+        // make_amd_cache carries no render-minor annotation, so stable_id would
+        // stay 0 on both devices without the backfill.
+        let cache = make_amd_cache();
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &[]);
+
+        let stable_ids: Vec<u64> = reg
+            .list()
+            .iter()
+            .filter(|e| e.is_injectable())
+            .map(|e| e.stable_id)
+            .collect();
+
+        assert_eq!(stable_ids.len(), 2);
+        assert_eq!(
+            stable_ids,
+            vec![0, 1],
+            "stable_ids are distinct, not both 0"
+        );
+        assert_eq!(
+            stable_ids.iter().collect::<HashSet<_>>().len(),
+            2,
+            "a 2-GPU allocation would not collide"
+        );
+    }
+
+    /// The KFD path annotates render_minor (nonzero); the backfill guard
+    /// (`if stable_id == 0`) must leave those real identities untouched.
+    #[test]
+    fn assign_preserves_nonzero_kfd_render_minor_stable_ids() {
+        let cache = make_amd_cache_with_render_minors();
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &[]);
+
+        let mut stable_ids: Vec<u64> = reg
+            .list()
+            .iter()
+            .filter(|e| e.is_injectable())
+            .map(|e| e.stable_id)
+            .collect();
+        stable_ids.sort_unstable();
+        assert_eq!(stable_ids, vec![128, 129], "render-minor stable_ids kept");
     }
 
     #[test]
