@@ -322,7 +322,7 @@ pub fn parse_memory_mb(s: &str) -> anyhow::Result<u64> {
         anyhow::bail!("invalid memory value '{s}'");
     }
     let mib = (val * mib_per_unit).ceil();
-    if mib > u64::MAX as f64 {
+    if mib >= u64::MAX as f64 {
         anyhow::bail!("memory value '{s}' is out of range");
     }
     Ok(mib as u64)
@@ -894,6 +894,17 @@ mod parse_memory_tests {
     #[test]
     fn whitespace_trimmed() {
         assert_eq!(parse_memory_mb("  2G  ").unwrap(), 2048);
+    }
+
+    /// `u64::MAX as f64` rounds up to 2^64, so the ceiling compare has to be
+    /// inclusive: a float-to-int cast saturates rather than failing, which
+    /// would turn an over-range size into a `u64::MAX` MiB request.
+    #[test]
+    fn rejects_sizes_that_do_not_fit_u64() {
+        assert!(parse_memory_mb("18446744073709551616").is_err());
+        assert!(parse_memory_mb("18446744073709551615").is_err());
+        assert!(parse_memory_mb("17592186044416T").is_err());
+        assert_eq!(parse_memory_mb("1048576T").unwrap(), 1 << 40);
     }
 
     #[test]
