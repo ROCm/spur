@@ -58,6 +58,7 @@ impl HeartbeatManager {
                 Ok(mut client) => {
                     for name in &names {
                         let req = HeartbeatRequest {
+                            gpu_holds: Default::default(),
                             hostname: name.clone(),
                             cpu_load: 0,
                             free_memory_mb: 0,
