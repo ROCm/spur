@@ -5,18 +5,12 @@
 // collective over RCCL.
 //
 // Output contract, parsed by test_rccl.py:
-//   rank=<r> size=<n> host=<h> device=<d>
+//   rank=<r> size=<n> host=<h> device=<d> bus=<pci>
 //   allreduce rank=<r> expected=<e> actual=<a> status=<OK|MISMATCH>
 //   comm_size=<n>
-//
-// Build on each compute node (the controller may have no ROCm):
-//   hipcc -o rccl_all_reduce rccl_all_reduce.c -lrccl -lmpi -I<mpi_include>
 
 #include <mpi.h>
-// Plain <rccl.h>, paired with a -I at whichever directory actually holds the
-// header. ROCm moved it into an rccl/ subdirectory between versions, so the
-// include path is resolved per node rather than assumed here.
-#include <rccl.h>
+#include <rccl/rccl.h>
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,9 +46,7 @@ int main(int argc, char **argv) {
     char host[256] = {0};
     gethostname(host, sizeof(host) - 1);
 
-    // One GPU per rank, round-robin over the devices this rank can see. Spur's
-    // cgroup device isolation already narrows that set per job, so rank-modulo
-    // is correct rather than a guess about global device ids.
+    // Spur narrows the visible set per task, so rank-modulo is right here.
     int devices = 0;
     HIP_CHECK(hipGetDeviceCount(&devices));
     if (devices < 1) {
@@ -64,9 +56,7 @@ int main(int argc, char **argv) {
     int device = rank % devices;
     HIP_CHECK(hipSetDevice(device));
 
-    // The bus id, not the ordinal, is what distinguishes two ranks' GPUs. Spur
-    // hands each task its own narrowed and renumbered device list, so every rank
-    // legitimately reports ordinal 0 while sitting on a different physical GPU.
+    // Ordinals are all 0 after narrowing; the bus id is what differs.
     char bus[64] = {0};
     HIP_CHECK(hipDeviceGetPCIBusId(bus, sizeof(bus), device));
 
@@ -74,9 +64,7 @@ int main(int argc, char **argv) {
            bus);
     fflush(stdout);
 
-    // Rank 0 mints the RCCL id and broadcasts it over MPI. This is the standard
-    // bootstrap, and it is the part that fails if the PMIx-provided rank map is
-    // wrong: a duplicate or missing rank hangs ncclCommInitRank.
+    // A wrong rank map from PMIx hangs ncclCommInitRank right here.
     ncclUniqueId id;
     if (rank == 0) {
         RCCL_CHECK(ncclGetUniqueId(&id));
@@ -89,9 +77,6 @@ int main(int argc, char **argv) {
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
 
-    // Each rank contributes (rank + 1), so the sum is n(n+1)/2. A wrong result
-    // means the collective ran but moved the wrong data, which is a different
-    // failure from a hang and worth distinguishing.
     const int count = 1024;
     float *sendbuf = NULL, *recvbuf = NULL;
     HIP_CHECK(hipMalloc((void **)&sendbuf, count * sizeof(float)));
@@ -124,8 +109,6 @@ int main(int argc, char **argv) {
     printf("allreduce rank=%d expected=%.1f actual=%.1f status=%s\n",
            rank, expected, host_recv[0], mismatched ? "MISMATCH" : "OK");
 
-    // Reported once, after the collective, so the test can assert every rank
-    // joined the same communicator rather than inferring it from stdout ordering.
     if (rank == 0) {
         printf("comm_size=%d\n", size);
     }
