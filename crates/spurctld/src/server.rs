@@ -2496,7 +2496,9 @@ impl SlurmController for ControllerService {
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
-            Ok(Response::new(HeartbeatResponse {}))
+            Ok(Response::new(HeartbeatResponse {
+                gpu_sharing: Default::default(),
+            }))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -5239,6 +5241,8 @@ fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec
 
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     NodeInfo {
+        gpu_holds: Default::default(),
+        gpu_sharing: Default::default(),
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
         state_reason: node.state_reason.clone().unwrap_or_default(),

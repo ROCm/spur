@@ -255,6 +255,7 @@ impl NodeReporter {
                 Ok(mut client) => {
                     match client
                         .heartbeat(spur_proto::proto::HeartbeatRequest {
+                            gpu_holds: Default::default(),
                             hostname: self.hostname.clone(),
                             cpu_load: load,
                             free_memory_mb: free_mem,

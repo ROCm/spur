@@ -344,6 +344,12 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  // The node shares its GPUs with Kubernetes pods (GPU-level sharing, not the
+  // whole-node k0s reservation).
+  bool gpu_sharing = 59;
+  // Latest per-GPU owner report from the node's agent; absent when not shared or not yet reported.
+  optional GpuHoldReport gpu_holds = 60;
 }
 
 message PartitionInfo {
@@ -677,6 +683,8 @@ message UpdateNodeRequest {
   optional string reason = 3;
   map<string, string> labels = 4;
   repeated string remove_labels = 5;
+  // Toggle GPU sharing with Kubernetes on a k0s-enrolled node.
+  optional bool gpu_sharing = 6;
 }
 
 message DrainNodeRequest {
@@ -896,6 +904,35 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  // Per-GPU owners on a node shared with Kubernetes; present only on such a node. Full state every time.
+  optional GpuHoldReport gpu_holds = 8;
+}
+
+enum GpuHoldState {
+  GPU_HOLD_FREE = 0;
+  GPU_HOLD_SPUR_JOB = 1;     // a Spur job's placeholder holds it in Kubernetes
+  GPU_HOLD_K8S = 2;          // an allocated ResourceClaim of a non-placeholder pod names it
+  GPU_HOLD_CONFLICT = 3;     // a Spur job uses it but its placeholder lost it to a pod
+  GPU_HOLD_UNSHAREABLE = 4;  // not in the Kubernetes ledger (see reason); Spur must not place on it
+}
+
+message GpuHold {
+  uint64 stable_id = 1;
+  GpuHoldState state = 2;
+  uint32 job_id = 3;          // SPUR_JOB and CONFLICT
+  string pod_namespace = 4;   // K8S and CONFLICT
+  string pod_name = 5;
+  string claim_name = 6;
+  string reason = 7;          // UNSHAREABLE, e.g. "no DRM card for renderD130"
+  string dra_device = 8;      // DRA device name, gpu-<card>-<renderD>
+}
+
+message GpuHoldReport {
+  // Inventory generation the report was built against; the controller drops a mismatch.
+  uint64 generation = 1;
+  repeated GpuHold gpus = 2;
+  // Non-empty when the whole node cannot share yet, e.g. no ResourceSlice from gpu.amd.com.
+  string unshareable_reason = 3;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
@@ -917,7 +954,10 @@ message RunningJobStatus {
   repeated uint64 gpu_stable_ids = 4;
 }
 
-message HeartbeatResponse {}
+message HeartbeatResponse {
+  // Controller's persisted GPU-sharing flag for this node; the agent converges to it.
+  bool gpu_sharing = 1;
+}
 
 message StepdRecoveryRequest {
   string hostname = 1;
@@ -1029,6 +1069,9 @@ message LaunchJobResponse {
   string stdout_path = 3;  // absolute resolved output path on the launching node
   string stderr_path = 4;
   LaunchFailureKind failure_kind = 5;
+  // Devices actually bound on a shared node, set only when Kubernetes picked
+  // different sibling partitions than requested.
+  optional ResourceAllocations substituted_alloc = 6;
 }
 
 message AgentStartJobRequest {
@@ -1140,6 +1183,8 @@ message ClusterUpRequest {
   string nodes = 6;
   string partition = 7;
   map<string, string> selector = 8;
+  // Hostlist of enrolled worker nodes that share their GPUs with Kubernetes. Empty = none.
+  string gpu_sharing_nodes = 9;
 }
 message ClusterUpResponse {
   bool accepted = 1;
@@ -1185,6 +1230,8 @@ message ClusterAddNodesRequest {
   string partition = 2;
   map<string, string> selector = 3;
   string caller = 4;   // For authorization (cluster admin required).
+  // Mark the added nodes as sharing their GPUs with Kubernetes.
+  bool gpu_sharing = 5;
 }
 message ClusterAddNodesResponse {
   bool accepted = 1;
