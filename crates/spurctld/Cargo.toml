@@ -43,6 +43,7 @@ tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["net"] }
+serde_urlencoded = "0.7"
 
 [lints]
 workspace = true

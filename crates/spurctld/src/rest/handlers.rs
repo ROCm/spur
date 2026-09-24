@@ -45,6 +45,8 @@ pub async fn get_jobs(
     let partition = query.partition.as_deref();
     let account = query.account.as_deref();
     let name = query.name.as_deref();
+    let qos = empty_to_none(&query.qos);
+    let reservation = empty_to_none(&query.reservation);
 
     let jobs = state.cluster.get_jobs(&crate::cluster::JobFilter {
         states: &states,
@@ -52,6 +54,8 @@ pub async fn get_jobs(
         partition,
         account,
         name,
+        qos: qos.as_deref(),
+        reservation: reservation.as_deref(),
         ..Default::default()
     });
     let json_jobs: Vec<serde_json::Value> = jobs.iter().map(job_to_json).collect();
@@ -71,6 +75,15 @@ pub async fn get_job(
     Ok(ApiResponse::ok(JobsData {
         jobs: vec![job_to_json(&job)],
     }))
+}
+
+/// Treat an empty query value the same as an absent one, so `?qos=` does not
+/// filter on the empty QOS. Mirrors the gRPC handler's empty-string normalization.
+fn empty_to_none(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
 }
 
 /// Default an absent or zero REST `ntasks` to one task per requested node
@@ -271,6 +284,26 @@ mod tests {
     fn parse_rest_gpu_invalid_returns_error() {
         let err = parse_rest_gpu(Some("::bad"));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn empty_to_none_treats_blank_query_as_absent() {
+        assert_eq!(empty_to_none(&None), None);
+        // `?qos=` must not filter on the empty QOS.
+        assert_eq!(empty_to_none(&Some(String::new())), None);
+        // A comma-separated list is passed through verbatim for the matcher to split.
+        assert_eq!(
+            empty_to_none(&Some("high,low".to_string())),
+            Some("high,low".to_string())
+        );
+    }
+
+    #[test]
+    fn jobs_query_deserializes_qos_and_reservation() {
+        let q: JobsQuery =
+            serde_urlencoded::from_str("qos=high,low&reservation=maint").expect("valid query");
+        assert_eq!(q.qos.as_deref(), Some("high,low"));
+        assert_eq!(q.reservation.as_deref(), Some("maint"));
     }
 
     #[test]

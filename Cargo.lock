@@ -3904,6 +3904,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "spur-core",
  "spur-metrics",
  "spur-net",

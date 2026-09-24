@@ -122,6 +122,8 @@ pub struct JobsQuery {
     pub state: Option<String>,
     pub account: Option<String>,
     pub name: Option<String>,
+    pub qos: Option<String>,
+    pub reservation: Option<String>,
 }
 
 #[derive(Serialize)]
