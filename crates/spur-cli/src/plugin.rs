@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// A plugin found on `PATH`.
 pub struct Plugin {
-    /// Command name as the user types it, e.g. `silo` or `silo-debug`.
+    /// Command name as the user types it, e.g. `aims` or `aims-debug`.
     pub name: String,
     pub path: PathBuf,
 }
@@ -160,24 +160,24 @@ mod tests {
     #[test]
     fn longest_match_wins() {
         let dir = tempfile::tempdir().unwrap();
-        touch_exec(dir.path(), "spur-silo");
-        touch_exec(dir.path(), "spur-silo-debug");
+        touch_exec(dir.path(), "spur-aims");
+        touch_exec(dir.path(), "spur-aims-debug");
         let dirs = vec![dir.path().to_path_buf()];
 
-        let (plugin, rest) = resolve(&dirs, &args(&["silo", "debug", "x"])).unwrap();
-        assert_eq!(plugin.name, "silo-debug");
+        let (plugin, rest) = resolve(&dirs, &args(&["aims", "debug", "x"])).unwrap();
+        assert_eq!(plugin.name, "aims-debug");
         assert_eq!(rest, args(&["x"]));
     }
 
     #[test]
     fn shorter_match_when_no_longer_one_exists() {
         let dir = tempfile::tempdir().unwrap();
-        touch_exec(dir.path(), "spur-silo");
+        touch_exec(dir.path(), "spur-aims");
         let dirs = vec![dir.path().to_path_buf()];
 
-        let (plugin, rest) = resolve(&dirs, &args(&["silo", "install", "aiwb-demo"])).unwrap();
-        assert_eq!(plugin.name, "silo");
-        assert_eq!(rest, args(&["install", "aiwb-demo"]));
+        let (plugin, rest) = resolve(&dirs, &args(&["aims", "install", "demo"])).unwrap();
+        assert_eq!(plugin.name, "aims");
+        assert_eq!(rest, args(&["install", "demo"]));
     }
 
     #[test]
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn no_match_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        touch_exec(dir.path(), "spur-silo");
+        touch_exec(dir.path(), "spur-aims");
         let dirs = vec![dir.path().to_path_buf()];
 
         assert!(resolve(&dirs, &args(&["nosuch"])).is_none());
@@ -203,10 +203,10 @@ mod tests {
     #[test]
     fn a_file_without_the_executable_bit_is_not_a_plugin() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("spur-silo"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("spur-aims"), "#!/bin/sh\n").unwrap();
         let dirs = vec![dir.path().to_path_buf()];
 
-        assert!(resolve(&dirs, &args(&["silo"])).is_none());
+        assert!(resolve(&dirs, &args(&["aims"])).is_none());
         assert!(list(&dirs).is_empty());
     }
 
@@ -214,25 +214,25 @@ mod tests {
     fn the_first_path_entry_wins() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        touch_exec(first.path(), "spur-silo");
-        touch_exec(second.path(), "spur-silo");
+        touch_exec(first.path(), "spur-aims");
+        touch_exec(second.path(), "spur-aims");
         let dirs = vec![first.path().to_path_buf(), second.path().to_path_buf()];
 
-        let (plugin, _) = resolve(&dirs, &args(&["silo"])).unwrap();
-        assert_eq!(plugin.path, first.path().join("spur-silo"));
+        let (plugin, _) = resolve(&dirs, &args(&["aims"])).unwrap();
+        assert_eq!(plugin.path, first.path().join("spur-aims"));
         assert_eq!(list(&dirs).len(), 1);
     }
 
     #[test]
     fn list_reports_every_plugin_by_command_name() {
         let dir = tempfile::tempdir().unwrap();
-        touch_exec(dir.path(), "spur-silo");
+        touch_exec(dir.path(), "spur-aims");
         touch_exec(dir.path(), "spur-my_tool");
         touch_exec(dir.path(), "spurious");
         touch_exec(dir.path(), "spur-");
         let dirs = vec![dir.path().to_path_buf()];
 
         let names: Vec<String> = list(&dirs).into_iter().map(|p| p.name).collect();
-        assert_eq!(names, args(&["my-tool", "silo"]));
+        assert_eq!(names, args(&["aims", "my-tool"]));
     }
 }
