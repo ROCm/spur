@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.13.0](https://github.com/ROCm/spur/compare/v0.12.0...v0.13.0) (2026-09-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurctld:** add idle-fill scheduling ([#881](https://github.com/ROCm/spur/issues/881))
+* **spur-core:** use Slurm's exact reserved step-id sentinels ([#909](https://github.com/ROCm/spur/issues/909))
+
+### Features
+
+* **auth:** add native spur credentials, mint, and RBAC ([#893](https://github.com/ROCm/spur/issues/893)) ([dfa4b5d](https://github.com/ROCm/spur/commit/dfa4b5d1e11c88df3db046f86c235024bb9f50dc))
+* **spur-cli:** add squeue -q/--qos and -R/--reservation filters ([#913](https://github.com/ROCm/spur/issues/913)) ([57bb077](https://github.com/ROCm/spur/commit/57bb0772f0fa8f1a5c255757fbfc856ac5523af1))
+* **spur-cli:** add squeue %Q priority specifier ([#912](https://github.com/ROCm/spur/issues/912)) ([eb02dd0](https://github.com/ROCm/spur/commit/eb02dd0a630174488eeb862627b4d12cdf12e446))
+* **spur-cli:** implement sbatch --wait ([#886](https://github.com/ROCm/spur/issues/886)) ([f126939](https://github.com/ROCm/spur/commit/f126939577280123cbc0318e41e7c35c295d6652))
+* **spurctld:** add idle-fill scheduling ([#881](https://github.com/ROCm/spur/issues/881)) ([5093fc1](https://github.com/ROCm/spur/commit/5093fc1c9313f731ba398e45df4b82c12fc2ac3e))
+* **spurctld:** audit every mutating RPC at the middleware level ([#870](https://github.com/ROCm/spur/issues/870)) ([71b3d30](https://github.com/ROCm/spur/commit/71b3d3079f8be4a9e98969d709d993ac616fd47f))
+* **spurd:** converge node device inventory on out-of-band changes ([#898](https://github.com/ROCm/spur/issues/898)) ([0b19a99](https://github.com/ROCm/spur/commit/0b19a99ea3c26706ab790a7e98b0d2d06beafbd2))
+* **spurd:** name step cgroups like Slurm and contain task hooks ([#885](https://github.com/ROCm/spur/issues/885)) ([d480a0e](https://github.com/ROCm/spur/commit/d480a0ed06903a19a7abcd3380e24958575c4dea))
+* **spurd:** supervise interactive, container, and batch-fallback job launches ([#901](https://github.com/ROCm/spur/issues/901)) ([bd91e7f](https://github.com/ROCm/spur/commit/bd91e7f62de3643a4111f1cf8bf042ef946bb1e6))
+
+
+### Bug Fixes
+
+* **accounting:** display cpu-seconds in sshare/sreport to match Slurm ([#906](https://github.com/ROCm/spur/issues/906)) ([2901036](https://github.com/ROCm/spur/commit/2901036874c8f297470cae56a2d06437c6398d20))
+* **deploy:** mount spur.conf from a Secret ([#851](https://github.com/ROCm/spur/issues/851)) ([9ea65a8](https://github.com/ROCm/spur/commit/9ea65a8fe84ea8e55eb8c80ff38a43d9b8149b04))
+* **deploy:** ship spurauthd in release tarballs, images, and install.sh ([#919](https://github.com/ROCm/spur/issues/919)) ([1d17654](https://github.com/ROCm/spur/commit/1d17654849c78b1062443f9fbd028743dd002d07))
+* **k8s:** keep the cancel of a deleted SpurJob ([#808](https://github.com/ROCm/spur/issues/808)) ([9db3a59](https://github.com/ROCm/spur/commit/9db3a59b76cd2ef7ce9169aea0d84b264ce1ea68))
+* **k8s:** recover a node the controller has forgotten ([#809](https://github.com/ROCm/spur/issues/809)) ([1688248](https://github.com/ROCm/spur/commit/16882487b82be097a97bd3f944e700cb31fab05e))
+* **spur-cli:** accept --noconvert on accounting commands ([#859](https://github.com/ROCm/spur/issues/859)) ([467d521](https://github.com/ROCm/spur/commit/467d5215373795bbb4e29a0c090a96f341682817))
+* **spur-cli:** make --help print to stdout with exit 0 ([#911](https://github.com/ROCm/spur/issues/911)) ([3fcd089](https://github.com/ROCm/spur/commit/3fcd08973e1442797f44fc85616006e54e620665))
+* **spur-core:** use Slurm's exact reserved step-id sentinels ([#909](https://github.com/ROCm/spur/issues/909)) ([732f46f](https://github.com/ROCm/spur/commit/732f46fcf89f52a4ae6ddba5bbf2cbcb4d2aa833))
+* **spur-k8s:** fail fast on a controller that does not answer ([#854](https://github.com/ROCm/spur/issues/854)) ([6609192](https://github.com/ROCm/spur/commit/66091921d9aa92363617f27b64346950eb560822))
+* **spur-k8s:** give SPUR_PEER_NODES resolvable pod names ([#807](https://github.com/ROCm/spur/issues/807)) ([e62e387](https://github.com/ROCm/spur/commit/e62e3871b73241a7dba74081512f2a824e536ba4))
+* **spur-net:** persist WireGuard peer mutations to the interface config ([#792](https://github.com/ROCm/spur/issues/792)) ([8d32f80](https://github.com/ROCm/spur/commit/8d32f80def9df098cb586bfed018ab79a6054899))
+* **spurctld:** enforce configured node CPU/memory limits as caps ([#926](https://github.com/ROCm/spur/issues/926)) ([cb388fc](https://github.com/ROCm/spur/commit/cb388fc5370d81e5d3a344dfec24f5b113e54518))
+* **spurctld:** keep the node record when its agent shuts down ([#784](https://github.com/ROCm/spur/issues/784)) ([65c703b](https://github.com/ROCm/spur/commit/65c703b96069fb39f9d32d56f8c6db5009303e5d))
+* **spurctld:** run kube-router in full overlay and pin its CIDRs ([#861](https://github.com/ROCm/spur/issues/861)) ([6469094](https://github.com/ROCm/spur/commit/646909496de313bacb7df77d3b032dbe6b78e44d))
+* **spurctld:** stop charging QOS/account grp-node quota for unplaceable jobs ([#883](https://github.com/ROCm/spur/issues/883)) ([2d7b78a](https://github.com/ROCm/spur/commit/2d7b78ab6066592f80a2050b1da68e1250fb9388))
+* **spurd:** drain node on stepd launch enospc across dispatch paths ([#918](https://github.com/ROCm/spur/issues/918)) ([2df7963](https://github.com/ROCm/spur/commit/2df7963ceb09a4598ae4973fe80cfb9fde22abb5))
+* **spurd:** reclaim a supervised job's ledger on cancel when its stepd is confirmed dead ([#900](https://github.com/ROCm/spur/issues/900)) ([5e1b5e7](https://github.com/ROCm/spur/commit/5e1b5e79af74299e60c8f49934791aa97910beed))
+* **spurd:** release stepd-supervised jobs promptly on cancel ([#899](https://github.com/ROCm/spur/issues/899)) ([ee766f8](https://github.com/ROCm/spur/commit/ee766f8daa25968f52d8f464fa157bbb424a6927))
+
 ## [0.12.0](https://github.com/ROCm/spur/compare/v0.11.0...v0.12.0) (2026-09-15)
 
 
