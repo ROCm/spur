@@ -134,6 +134,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
             scheduler.clear_outcomes();
+            cluster.clear_gpu_holds();
             continue;
         }
 
@@ -210,12 +211,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
+        let held_gpus = cluster.held_gpus(&nodes);
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
             topology: topology.as_ref(),
             busy_until: &busy_until,
+            held_gpus: &held_gpus,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
