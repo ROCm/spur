@@ -893,6 +893,9 @@ impl K0sAgent {
         // Take the supervisor out under the lock, then do the (blocking) stop OUTSIDE it so
         // concurrent status/start RPCs aren't serialized behind the seconds-long systemctl/k0s IO.
         let taken = self.active.lock().await.take();
+        if reset {
+            crate::gpu_sharing::remove_kubelet_links();
+        }
         let stopped = match &taken {
             Some(sup) => sup.stop(reset).await,
             None => self.stop_untracked(reset).await,
