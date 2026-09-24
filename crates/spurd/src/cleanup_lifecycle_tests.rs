@@ -101,6 +101,7 @@ cleanup_controller_impl! {
         cluster_remove_nodes(spur_proto::proto::ClusterRemoveNodesRequest) -> spur_proto::proto::ClusterRemoveNodesResponse;
         get_fabric_topology(()) -> spur_proto::proto::GetFabricTopologyResponse;
         validate_block_file(spur_proto::proto::ValidateBlockFileRequest) -> spur_proto::proto::GetFabricTopologyResponse;
+        get_gpu_sharing_kubeconfig(spur_proto::proto::GetGpuSharingKubeconfigRequest) -> spur_proto::proto::GetGpuSharingKubeconfigResponse;
 
 }
 
