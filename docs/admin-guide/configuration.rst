@@ -1602,7 +1602,9 @@ converges to hardware changes without an agent restart — see
      - [string]
      - ``[]``
      - Extra directories to scan for CDI specs, beyond ``/etc/cdi`` and
-       ``/var/run/cdi``.
+       ``/var/run/cdi``. Spur ignores each CDI kind whose vendor starts
+       with ``k8s.``. A Kubernetes DRA driver writes such specs for the
+       devices of its allocated claims, and those devices belong to a pod.
    * - ``gres``
      - [table]
      - ``[]``
