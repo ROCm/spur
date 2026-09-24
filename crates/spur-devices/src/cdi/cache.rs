@@ -197,6 +197,12 @@ impl CdiCache {
     }
 
     fn index_spec(&mut self, spec: &CdiSpec, source_path: &str, priority: i32) {
+        // DRA drivers write one spec per allocated claim under the vendor
+        // `k8s.<driver>`. Those devices belong to a pod, not to the inventory.
+        if spec.kind.starts_with("k8s.") {
+            debug!(kind = %spec.kind, "CDI spec of a DRA driver, skipping");
+            return;
+        }
         for device in &spec.devices {
             let qname = spec.qualified_name(&device.name);
 
@@ -371,6 +377,63 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         assert!(cache.get_device("amd.com/gpu=0").is_some());
+    }
+
+    /// Specs the AMD DRA driver v1.0.1 writes to `/var/run/cdi`, captured on
+    /// an MI325X node: one for all claims and one for an allocated claim.
+    const DRA_DRIVER_SPECS: [(&str, &str); 2] = [
+        (
+            "k8s.gpu.amd.com-gpu_common.yaml",
+            "---
+cdiVersion: 0.3.0
+kind: k8s.gpu.amd.com/gpu
+devices:
+    - name: common
+      containerEdits:
+        env:
+            - KUBERNETES_NODE_NAME=gpu-node-1
+            - DRA_RESOURCE_DRIVER_NAME=gpu.amd.com
+",
+        ),
+        (
+            "k8s.gpu.amd.com-gpu_e199550c.yaml",
+            "---
+cdiVersion: 0.5.0
+kind: k8s.gpu.amd.com/gpu
+devices:
+    - name: e199550c-a316-45ef-b741-147c2fa45509-gpu-1-129
+      containerEdits:
+        deviceNodes:
+            - path: /dev/kfd
+              hostPath: /dev/kfd
+              type: c
+              major: 237
+              permissions: rwm
+            - path: /dev/dri/renderD129
+              hostPath: /dev/dri/renderD129
+              type: c
+              major: 226
+              minor: 129
+              permissions: rwm
+",
+        ),
+    ];
+
+    #[test]
+    fn dra_driver_specs_are_not_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in DRA_DRIVER_SPECS {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        make_amd_spec(&["1"])
+            .write_json(&dir.path().join("amd.json"))
+            .unwrap();
+
+        let mut cache = CdiCache::new();
+        cache.load_from_dirs(&[dir.path().to_path_buf()]);
+
+        assert!(cache.get_errors().is_empty());
+        assert_eq!(cache.list_devices(), vec!["amd.com/gpu=1"]);
     }
 
     #[test]
