@@ -1804,6 +1804,13 @@ pub(crate) fn existing_step_output_path(
 /// child via stdio redirection, so the child writes even after dropping to its
 /// uid; the files stay agent-readable so `stream_job_output` can tail them.
 /// Lives under the job spool tree so `cleanup_job_spool` reclaims it at job end.
+fn step_output_open_error(path: &Path, error: std::io::Error) -> LaunchError {
+    classify_spool_error(
+        path,
+        anyhow::Error::new(error).context(format!("open step output file {}", path.display())),
+    )
+}
+
 pub(crate) fn open_step_output_files(
     job_id: JobId,
     step_id: u32,
@@ -1814,11 +1821,8 @@ pub(crate) fn open_step_output_files(
     let stdout_path = spool_dir.join(format!("step{step_id}.out"));
     let stderr_path = spool_dir.join(format!("step{step_id}.err"));
     let open = |path: &Path| -> Result<std::fs::File, LaunchError> {
-        let file = open_output_file(&path.to_string_lossy(), false).map_err(|e| {
-            LaunchError::NodeFault(
-                anyhow::Error::new(e).context(format!("open step output file {}", path.display())),
-            )
-        })?;
+        let file = open_output_file(&path.to_string_lossy(), false)
+            .map_err(|e| step_output_open_error(path, e))?;
         // These files hold arbitrary user output, so keep them private (0600) —
         // they can otherwise become world-readable under a typical umask. The
         // child inherits the write fd, so it writes regardless of ownership; hand
@@ -2816,6 +2820,31 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_output_enospc_under_the_owned_root_is_a_node_fault() {
+        let path = Path::new("/var/spool/spur/job9/step0.out");
+        let err = step_output_open_error(path, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+        let reason = err.drain_reason().expect("node fault must drain");
+        assert!(reason.contains("No space left on device"), "{reason}");
+    }
+
+    #[test]
+    fn step_output_error_outside_the_owned_root_does_not_drain() {
+        let path = std::env::temp_dir().join("spur-test").join("step0.out");
+        let err = step_output_open_error(&path, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
+
+    #[test]
+    fn step_output_edquot_never_drains_even_under_the_owned_root() {
+        let path = Path::new("/var/spool/spur/job9/step0.out");
+        let err = step_output_open_error(path, std::io::Error::from_raw_os_error(libc::EDQUOT));
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
 
     #[test]
     fn purging_one_step_leaves_its_siblings_output() {

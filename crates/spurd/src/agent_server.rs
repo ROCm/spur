@@ -6812,8 +6812,13 @@ impl SlurmAgent for AgentService {
         // stream_job_output can tail them live and output stays bounded on this
         // node. Paths are recorded in active_steps so the tail can find them.
         let mut step_files =
-            crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
-                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+            match crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid) {
+                Ok(files) => files,
+                Err(error) => {
+                    self.drain_on_node_fault(&error, job_id);
+                    return Err(Status::internal(format!("step output files: {error}")));
+                }
+            };
         let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
         let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
         {
@@ -14963,6 +14968,47 @@ mod tests {
         })
         .expect("step stdout spool file should exist on disk");
         assert_eq!(contents.trim(), "spooled-marker");
+    }
+
+    // Blocks the temp-fallback spool root with a regular file so
+    // create_job_spool_dir fails on both candidates (this test runs as a
+    // non-root user, so `/var/spool/spur` always fails first anyway) and
+    // returns the owned-root failure, proving RunCommand reaches the drain
+    // check on a real NodeFault instead of only the job-specific case.
+    #[tokio::test]
+    async fn run_command_drains_the_node_when_its_spool_root_is_unwritable() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr));
+        let job_id = 9001;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+
+        let blocked_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}"));
+        let _ = std::fs::remove_dir_all(&blocked_dir);
+        std::fs::write(&blocked_dir, b"blocking the spool dir").expect("block temp spool root");
+
+        let status = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["echo".into(), "unreachable".into()],
+                uid: 0,
+                gid: 0,
+                job_id,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("spool dir blocked on both candidates; launch must fail");
+        assert!(
+            status.message().contains("step output files"),
+            "{}",
+            status.message()
+        );
+
+        let drained = expect_drain(&drains, 5_000).await;
+        assert_eq!(drained.len(), 1, "exactly one drain request expected");
+        assert_eq!(drained[0].name, "test-node");
+
+        let _ = std::fs::remove_file(&blocked_dir);
     }
 
     #[tokio::test]
