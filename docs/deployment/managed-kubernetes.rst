@@ -395,6 +395,10 @@ requires ``[cluster] allow_admin_kubeconfig = true`` in ``spur.conf`` — it is
 authenticated identity. With it off, get the cluster-admin kubeconfig directly
 on the control-plane node instead: ``k0s kubeconfig admin``.
 
+``spurd`` on a GPU worker gets its own kubeconfig for GPU sharing through the
+controller. That kubeconfig has only the rights that GPU sharing needs (see
+:ref:`gpu-sharing-credential`).
+
 Run a workload
 ~~~~~~~~~~~~~~~
 

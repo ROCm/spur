@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -630,6 +631,11 @@ impl K0sAgent {
         }
     }
 
+    /// Role of the k0s component this spurd started or adopted; `None` when there is none.
+    pub async fn role(&self) -> Option<ClusterRole> {
+        self.active.lock().await.as_ref().map(|s| s.role())
+    }
+
     /// Shared node-status handle the reporter reads for `spur_k8s_node_*` heartbeat fields.
     pub fn node_state(&self) -> Arc<K0sNodeState> {
         self.status.clone()
@@ -931,7 +937,59 @@ impl K0sAgent {
                 );
             }
         }
-        // Mint a bound (rotatable) token for the ServiceAccount.
+        let kubeconfig = self
+            .bound_token_kubeconfig(service_account, namespace, "8760h")
+            .await?;
+        info!(user, namespace, service_account, "minted scoped kubeconfig");
+        Ok(kubeconfig)
+    }
+
+    /// Mint a kubeconfig for the GPU sharing of k0s worker `node` on this (control-plane)
+    /// node: apply the namespace, ServiceAccount and RBAC of
+    /// [`crate::gpu_sharing::credential::rbac_manifest`], then mint a bound token. Token never
+    /// logged.
+    pub async fn gpu_sharing_kubeconfig(&self, node: &str) -> anyhow::Result<String> {
+        // The name goes into object names and RBAC resourceNames, so reject anything else.
+        if !spur_core::k0s::is_dns1123_label(node) {
+            anyhow::bail!("GPU sharing node name {node:?} is not a DNS-1123 label");
+        }
+        let manifest = crate::gpu_sharing::credential::rbac_manifest(node);
+        let mut apply = Command::new(&self.k0s_binary)
+            .args(["kubectl", "apply", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = apply.stdin.take().context("kubectl apply has no stdin")?;
+        stdin.write_all(manifest.to_string().as_bytes()).await?;
+        drop(stdin);
+        let out = apply.wait_with_output().await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "apply GPU sharing RBAC for {node} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let service_account = crate::gpu_sharing::credential::service_account_name(node);
+        let kubeconfig = self
+            .bound_token_kubeconfig(
+                &service_account,
+                crate::gpu_sharing::placeholder::NAMESPACE,
+                crate::gpu_sharing::credential::TOKEN_DURATION,
+            )
+            .await?;
+        info!(node, "minted GPU sharing kubeconfig");
+        Ok(kubeconfig)
+    }
+
+    /// A kubeconfig with a bound token of `duration` for `service_account` in `namespace`, and
+    /// the admin cluster CA + server.
+    async fn bound_token_kubeconfig(
+        &self,
+        service_account: &str,
+        namespace: &str,
+        duration: &str,
+    ) -> anyhow::Result<String> {
         let tok = Command::new(&self.k0s_binary)
             .args([
                 "kubectl",
@@ -940,7 +998,7 @@ impl K0sAgent {
                 service_account,
                 "-n",
                 namespace,
-                "--duration=8760h",
+                &format!("--duration={duration}"),
             ])
             .output()
             .await?;
@@ -954,9 +1012,7 @@ impl K0sAgent {
         if token.is_empty() {
             anyhow::bail!("k0s kubectl create token returned empty output");
         }
-        // Reuse the admin kubeconfig for the cluster CA + server URL.
         let (ca, server) = parse_cluster_ca_server(&self.admin_kubeconfig().await?)?;
-        info!(user, namespace, service_account, "minted scoped kubeconfig");
         Ok(build_scoped_kubeconfig(
             &ca,
             &server,
@@ -1369,6 +1425,24 @@ mod tests {
             !active,
             "stop() must clear unit_active so heartbeats stop reporting node_up=1"
         );
+    }
+
+    #[tokio::test]
+    async fn gpu_sharing_kubeconfig_rejects_a_non_dns1123_node_before_kubectl() {
+        let agent = K0sAgent::from_config(&spur_core::config::ClusterConfig {
+            k0s_binary: "/nonexistent/k0s".into(),
+            ..Default::default()
+        });
+        for node in ["", "Node-1", "a.b", "x\ny"] {
+            let err = agent
+                .gpu_sharing_kubeconfig(node)
+                .await
+                .expect_err("invalid node name must fail closed");
+            assert!(
+                err.to_string().contains("DNS-1123"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[tokio::test]

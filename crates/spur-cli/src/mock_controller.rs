@@ -378,6 +378,7 @@ mock_controller_impl! {
         revoke_token(proto::RevokeTokenRequest) -> proto::RevokeTokenResponse;
         report_job_status(proto::ReportJobStatusRequest) -> ();
         report_stepd_recovery(proto::StepdRecoveryRequest) -> proto::StepdRecoveryResponse;
+        get_gpu_sharing_kubeconfig(proto::GetGpuSharingKubeconfigRequest) -> proto::GetGpuSharingKubeconfigResponse;
         create_reservation(proto::CreateReservationRequest) -> ();
         update_reservation(proto::UpdateReservationRequest) -> ();
         delete_reservation(proto::DeleteReservationRequest) -> ();

@@ -844,9 +844,27 @@ pub async fn fetch_user_kubeconfig(
             user: user.to_string(),
             namespace: namespace.to_string(),
             service_account: service_account.to_string(),
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::anyhow!("get_kubeconfig (scoped) RPC failed: {e}"))?;
+    Ok(resp.into_inner().kubeconfig)
+}
+
+/// Mint the GPU sharing kubeconfig of k0s Node `node` on a control-plane agent, which applies the
+/// node's ServiceAccount and RBAC first.
+pub async fn fetch_gpu_sharing_kubeconfig(
+    cluster: &ClusterManager,
+    node: &str,
+) -> anyhow::Result<String> {
+    let mut client = connect_control_plane(cluster).await?;
+    let resp = client
+        .get_kubeconfig(GetKubeconfigRequest {
+            gpu_sharing_node: node.to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("get_kubeconfig (GPU sharing) RPC failed: {e}"))?;
     Ok(resp.into_inner().kubeconfig)
 }
 

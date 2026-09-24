@@ -113,8 +113,9 @@ Spur does not stop a pod or a job at opt-out.
 The node label
 ~~~~~~~~~~~~~~
 
-``spurd`` sets the label ``spur.amd.com/gpu-sharing`` on each node that k0s
-enrolls:
+``spurd`` sets the label ``spur.amd.com/gpu-sharing`` on each GPU node that k0s
+enrolls with the role ``worker`` or ``single``. A node that is not shared gets
+the label too, but ``spurd`` does not watch its claims or make placeholders:
 
 .. list-table::
    :header-rows: 1
@@ -145,6 +146,60 @@ always has a value, because the node selectors of the AMD gpu-operator 1.5.x
    This applies only when the gpu-operator installs the driver. The Helm chart
    of the driver uses a usual ``nodeSelector``, and Kubernetes applies a label
    change to it automatically.
+
+.. _gpu-sharing-credential:
+
+The Kubernetes credential
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``spurd`` uses the Kubernetes API to set the label, to watch claims and
+``ResourceSlice`` objects, and to make placeholders. The credential depends on
+the k0s role of the node:
+
+- On a node with the role ``single``, ``spurd`` uses the local admin
+  kubeconfig (``k0s kubeconfig admin``).
+- A node with the role ``worker`` has no admin kubeconfig. ``spurd`` sends the
+  controller RPC ``GetGpuSharingKubeconfig`` with its hostname and node token.
+
+The controller authenticates this RPC in the same way as a heartbeat. It gives
+the credential only to a registered node with the k0s role ``worker`` or
+``single`` that has GPUs. The node does not have to be shared, because a node
+that is not shared also sets its label. The controller refuses a node whose
+Kubernetes node name (the lowercase hostname) is not a DNS-1123 label.
+
+The controller then sends ``GetKubeconfig`` with ``gpu_sharing_node`` to a
+control-plane ``spurd``. That ``spurd`` applies these objects and then makes a
+bound token of 24 hours for the ServiceAccount:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Object
+     - Contents
+   * - Namespace ``spur-system``
+     - Label ``pod-security.kubernetes.io/enforce=baseline``. Thus a pod in it
+       cannot be privileged and cannot mount a host path.
+   * - ServiceAccount ``spur-system/spurd-gpu-sharing-<node>``
+     - The identity of the worker.
+   * - ClusterRole and ClusterRoleBinding ``spurd-gpu-sharing-<node>``
+     - ``get``, ``list`` and ``watch`` on ``resourceclaims`` and
+       ``resourceslices`` (``resource.k8s.io``). ``get`` and ``patch`` on the
+       ``Node`` of this node only. ``get`` on the namespace ``spur-system``
+       only.
+   * - Role and RoleBinding ``spur-system/spurd-gpu-sharing-<node>``
+     - ``create``, ``get``, ``list``, ``watch``, ``delete`` and ``patch`` on
+       ``resourceclaims`` and ``pods`` in ``spur-system``.
+
+``spurd`` does not log the token or the kubeconfig. It makes a new client
+every 12 hours, and immediately when the API server answers HTTP 401.
+
+.. warning::
+
+   With ``admission.mode = "open"`` the controller does not authenticate
+   nodes. Then each client that can connect to the controller can get the
+   credential of a GPU worker. Use ``admission.mode = "token"`` with a
+   signing key on a cluster that has shared nodes.
 
 The kubelet links
 ~~~~~~~~~~~~~~~~~
@@ -504,6 +559,10 @@ Failure cases
      - ``spurd`` refuses new launches on the node. The last report becomes old,
        and after the heartbeat timeout the controller gives no GPU of the node
        to a job.
+   * - A worker cannot get its credential, for example because no
+       control-plane ``spurd`` answers.
+     - The same as when ``spurd`` cannot connect to the API server. On a
+       node that is not shared, the label stays unset until the next try.
    * - ``spurd`` restarts.
      - ``spurd`` gets the holds again from the claim watch, then sends a
        report.
