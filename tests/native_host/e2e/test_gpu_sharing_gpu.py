@@ -40,7 +40,11 @@ def gpu_sharing_node(ssh_nodes, remote_bin_dir):
     c = SpurCluster([node], make_remote_dir(), remote_bin_dir)
     c.provision()
     c.root_agent_preflight()
-    c.start(config_overrides={"cluster": {"enabled": True}}, agent_as_root=True)
+    overrides = {"cluster": {"enabled": True}}
+    # The harness submits jobs as the SSH user. Only a host reached as root needs root jobs.
+    if node.exec("id -u").strip() == "0":
+        overrides["auth"] = {"allow_root_jobs": True}
+    c.start(config_overrides=overrides, agent_as_root=True)
     name = c.node_names[0]
     try:
         c.k8s_up(["--gpu-sharing-nodes", name])
