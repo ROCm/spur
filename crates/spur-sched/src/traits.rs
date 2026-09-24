@@ -45,6 +45,9 @@ pub struct ClusterState<'a> {
     /// What each partition's running jobs hold per node, charged against the
     /// partition's `max_tres_per_node` until each charge's own `until`.
     pub partition_node_usage: &'a PartitionNodeUsage,
+    /// Node name -> GPU stable_ids that Kubernetes holds on a node shared with it.
+    /// A pod has no end time, so a held GPU is busy for the whole planning horizon.
+    pub held_gpus: &'a HashMap<String, Vec<u64>>,
 }
 
 impl ClusterState<'_> {

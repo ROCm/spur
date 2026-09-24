@@ -173,6 +173,7 @@ pub(crate) fn relinquish_leadership(
     cluster.set_planned_reservations(HashMap::new());
     cluster.set_planned_job_starts(HashMap::new());
     scheduler.clear_outcomes();
+    cluster.clear_gpu_holds();
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -379,6 +380,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             .as_ref()
             .and_then(|config| config.build(&cluster.get_nodes(), &view));
         let fabric = Some(spur_sched::traits::FabricSchedulingContext { view });
+        let held_gpus = cluster.held_gpus(&nodes);
         let cluster_state = ClusterState {
             fabric: fabric.as_ref(),
             nodes: &nodes,
@@ -388,6 +390,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
             partition_node_usage: &partition_node_usage,
+            held_gpus: &held_gpus,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -1055,6 +1058,7 @@ pub(crate) fn trial_placement(
         .and_then(|config| config.build(&cluster.get_nodes(), &view));
     let fabric = spur_sched::traits::FabricSchedulingContext { view };
     let handoffs = cluster.preemption_handoffs(&classification.jobs, &nodes, &reservations);
+    let held_gpus = cluster.held_gpus(&nodes);
     let state = ClusterState {
         fabric: Some(&fabric),
         nodes: &nodes,
@@ -1064,6 +1068,7 @@ pub(crate) fn trial_placement(
         busy_until: &busy_until,
         preemption_handoffs: &handoffs,
         partition_node_usage: &partition_node_usage,
+        held_gpus: &held_gpus,
     };
     let mut list = classification.jobs.clone();
     list.extend(
@@ -1490,6 +1495,7 @@ pub(crate) async fn try_preempt_beside(
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
+        held_gpus: &Default::default(),
     };
     try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched).await;
 }
@@ -1536,6 +1542,7 @@ pub(crate) async fn reclaim_for(
         busy_until: &HashMap::new(),
         preemption_handoffs: &HashMap::new(),
         partition_node_usage: &usage,
+        held_gpus: &Default::default(),
     };
     reclaim_for_unplaced(cluster, unplaced, &HashSet::new(), &state, &[], 0)
         .await
@@ -5993,6 +6000,7 @@ mod tests {
                 busy_until: &HashMap::new(),
                 preemption_handoffs: handoffs,
                 partition_node_usage: &Default::default(),
+                held_gpus: &Default::default(),
             };
             satisfiable_victim_set(reclaimer, pool, &state, Utc::now())
         }
@@ -6013,6 +6021,7 @@ mod tests {
                 busy_until: &HashMap::new(),
                 preemption_handoffs: &HashMap::new(),
                 partition_node_usage: &Default::default(),
+                held_gpus: &Default::default(),
             };
             satisfiable_victim_set(reclaimer, pool, &state, now)
         }
@@ -10590,6 +10599,7 @@ mod tests {
                     busy_until: &busy_until,
                     preemption_handoffs: &HashMap::new(),
                     partition_node_usage: &partition_node_usage,
+                    held_gpus: &Default::default(),
                 };
 
                 let (freed, freed_for) =

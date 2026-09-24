@@ -48,6 +48,10 @@ pub struct BackfillScheduler {
     cap_blocks: HashMap<JobId, PartitionCapBlock>,
 }
 
+/// How long a Kubernetes-held GPU counts as busy: a pod has no end time, so past
+/// every planning horizon the scheduler searches.
+const HELD_GPU_HORIZON: Duration = Duration::days(3650);
+
 /// Scheduler's future-slot plan: job -> (nodes held, projected start).
 pub type PlannedJobStarts = HashMap<JobId, (Vec<String>, chrono::DateTime<Utc>)>;
 
@@ -682,6 +686,7 @@ impl BackfillScheduler {
                     busy_until: cluster.busy_until,
                     preemption_handoffs: cluster.preemption_handoffs,
                     partition_node_usage: cluster.partition_node_usage,
+                    held_gpus: cluster.held_gpus,
                 };
                 let mut floor = now;
                 loop {
@@ -890,13 +895,25 @@ impl BackfillScheduler {
             // Add current allocations to timelines. Real per-node end times (from
             // busy_until) replace the flat placeholder wherever known.
             for (i, node) in cluster.nodes.iter().enumerate() {
-                if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
+                let held = cluster
+                    .held_gpus
+                    .get(&node.name)
+                    .map(|ids| ResourceAllocations::from_device_ids("gpu", ids))
+                    .unwrap_or_default();
+                // A GPU both held and allocated (a conflict) must count once and
+                // stay busy after the Spur job ends.
+                let mut running = node.alloc_resources.clone();
+                running.subtract(&held);
+                if running.cpus > 0 || running.has_devices() {
                     let free_at = cluster
                         .busy_until
                         .get(&node.name)
                         .copied()
                         .unwrap_or(now + Duration::hours(24));
-                    self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
+                    self.timelines[i].reserve(now, free_at, running);
+                }
+                if held.has_devices() {
+                    self.timelines[i].reserve(now, now + HELD_GPU_HORIZON, held);
                 }
                 debug!(
                     node = %node.name,
@@ -1850,6 +1867,7 @@ mod tests {
             busy_until: &HashMap::new(),
             preemption_handoffs: &handoffs,
             partition_node_usage: &Default::default(),
+            held_gpus: &Default::default(),
         };
         let mut scheduler = BackfillScheduler::new(100);
         assert!(!state.handoff_allows(&competitor, "node001"));
@@ -1873,6 +1891,7 @@ mod tests {
             busy_until: &HashMap::new(),
             preemption_handoffs: &owned(&[("node001", 1)]),
             partition_node_usage: &Default::default(),
+            held_gpus: &Default::default(),
         };
         let mut scheduler = BackfillScheduler::new(100);
         assert!(state.listed_node_handed_off(&competitor, &NodePlacement::new(&competitor)));
@@ -1894,6 +1913,8 @@ mod tests {
     ) -> ClusterState<'a> {
         static NO_USAGE: std::sync::LazyLock<crate::partition_cap::PartitionNodeUsage> =
             std::sync::LazyLock::new(Default::default);
+        static NO_HOLDS: std::sync::LazyLock<HashMap<String, Vec<u64>>> =
+            std::sync::LazyLock::new(Default::default);
         ClusterState {
             fabric: None,
             nodes,
@@ -1903,6 +1924,7 @@ mod tests {
             busy_until,
             preemption_handoffs: handoffs,
             partition_node_usage: &NO_USAGE,
+            held_gpus: &NO_HOLDS,
         }
     }
 
@@ -2150,6 +2172,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2176,6 +2199,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2202,6 +2226,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2342,6 +2367,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2378,6 +2404,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2405,6 +2432,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2445,6 +2473,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2496,6 +2525,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2557,6 +2587,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2602,6 +2633,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2681,6 +2713,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2697,6 +2730,80 @@ mod tests {
         assert!(
             ids_a.is_disjoint(&ids_b),
             "GPU IDs overlap: {ids_a:?} vs {ids_b:?}"
+        );
+    }
+
+    fn schedule_with_holds(
+        pending: &[Job],
+        nodes: &[Node],
+        held_gpus: &HashMap<String, Vec<u64>>,
+    ) -> Vec<Assignment> {
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let cluster = ClusterState {
+            busy_until: &HashMap::new(),
+            fabric: None,
+            preemption_handoffs: &Default::default(),
+            partition_node_usage: &Default::default(),
+            held_gpus,
+            nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+        BackfillScheduler::new(100).schedule(pending, &cluster)
+    }
+
+    #[test]
+    fn held_gpus_are_never_picked() {
+        let nodes = vec![make_gpu_node(8)];
+        let held = HashMap::from([("gpu-node".to_string(), vec![0, 1, 2, 3, 4])]);
+
+        let assignments = schedule_with_holds(&[make_gpu_job(1, 3)], &nodes, &held);
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            gpu_ids_from_assignment(&assignments[0]),
+            HashSet::from([5, 6, 7])
+        );
+    }
+
+    #[test]
+    fn a_gpu_job_waits_while_held_and_runs_after_release() {
+        let nodes = vec![make_gpu_node(8)];
+        let held = HashMap::from([("gpu-node".to_string(), (0..6).collect::<Vec<u64>>())]);
+        let pending = [make_gpu_job(1, 4)];
+
+        assert!(schedule_with_holds(&pending, &nodes, &held).is_empty());
+
+        let released = HashMap::from([("gpu-node".to_string(), vec![0, 1])]);
+        assert_eq!(schedule_with_holds(&pending, &nodes, &released).len(), 1);
+    }
+
+    #[test]
+    fn a_cpu_only_job_lands_on_a_node_with_every_gpu_held() {
+        let nodes = vec![make_gpu_node(8)];
+        let held = HashMap::from([("gpu-node".to_string(), (0..8).collect::<Vec<u64>>())]);
+
+        let assignments = schedule_with_holds(&[make_job(1, 1, 4)], &nodes, &held);
+
+        assert_eq!(assignments.len(), 1);
+    }
+
+    #[test]
+    fn a_gpu_both_held_and_allocated_stays_busy_once() {
+        let mut nodes = vec![make_gpu_node(8)];
+        nodes[0].alloc_resources = ResourceAllocations::from_device_ids("gpu", &[0, 1]);
+        let held = HashMap::from([("gpu-node".to_string(), vec![1, 2])]);
+
+        let assignments = schedule_with_holds(&[make_gpu_job(1, 5)], &nodes, &held);
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            gpu_ids_from_assignment(&assignments[0]),
+            HashSet::from([3, 4, 5, 6, 7])
         );
     }
 
@@ -2754,6 +2861,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2781,6 +2889,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2812,6 +2921,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2838,6 +2948,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2878,6 +2989,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2924,6 +3036,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2953,6 +3066,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -2986,6 +3100,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3023,6 +3138,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3070,6 +3186,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3109,6 +3226,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3159,6 +3277,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3210,6 +3329,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3270,6 +3390,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[reservation],
@@ -3309,6 +3430,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3351,6 +3473,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3385,6 +3508,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3420,6 +3544,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3482,6 +3607,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3508,6 +3634,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3536,6 +3663,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3568,6 +3696,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3599,6 +3728,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3644,6 +3774,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3674,6 +3805,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3700,6 +3832,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3731,6 +3864,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3765,6 +3899,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3799,6 +3934,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -3839,6 +3975,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -3865,6 +4002,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3891,6 +4029,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3927,6 +4066,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3958,6 +4098,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -3988,6 +4129,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4014,6 +4156,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4039,6 +4182,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4067,6 +4211,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4113,6 +4258,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4151,6 +4297,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4201,6 +4348,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4238,6 +4386,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4279,6 +4428,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4307,6 +4457,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4346,6 +4497,7 @@ mod tests {
                 preemption_handoffs: &std::collections::HashMap::new(),
                 busy_until: &std::collections::HashMap::new(),
                 partition_node_usage: &Default::default(),
+                held_gpus: &std::collections::HashMap::new(),
                 nodes: &nodes,
                 partitions: &partitions,
                 reservations: &[],
@@ -4390,6 +4542,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -4441,6 +4594,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -4479,6 +4633,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -4517,6 +4672,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -4557,6 +4713,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
@@ -4599,6 +4756,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
@@ -4649,6 +4807,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[reservation],
@@ -4708,6 +4867,7 @@ mod tests {
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[reservation],

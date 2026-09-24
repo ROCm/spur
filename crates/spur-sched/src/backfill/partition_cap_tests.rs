@@ -146,6 +146,7 @@ impl Fixture {
             busy_until: &self.busy_until,
             preemption_handoffs: &Default::default(),
             partition_node_usage: &self.usage,
+            held_gpus: &Default::default(),
         };
         sched.schedule_jobs(jobs, &cluster, now(), true)
     }

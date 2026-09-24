@@ -326,8 +326,27 @@ mod tests {
     #[test]
     fn new_fields_use_their_assigned_tags() {
         use prost::Message;
-        let reregister = crate::proto::HeartbeatResponse { reregister: true };
+        let reregister = crate::proto::HeartbeatResponse {
+            reregister: true,
+            ..Default::default()
+        };
         assert_eq!(reregister.encode_to_vec(), [0x08, 0x01]);
+
+        let sharing = crate::proto::HeartbeatResponse {
+            gpu_sharing: true,
+            ..Default::default()
+        };
+        assert_eq!(sharing.encode_to_vec(), [0x10, 0x01]);
+        let holds = crate::proto::HeartbeatRequest {
+            gpu_holds: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(holds.encode_to_vec(), [0x52, 0x00]);
+        let node = crate::proto::NodeInfo {
+            gpu_sharing: true,
+            ..Default::default()
+        };
+        assert_eq!(node.encode_to_vec(), [0x80, 0x04, 0x01]);
 
         let topology = crate::proto::RegisterAgentRequest {
             topology: Some(Default::default()),

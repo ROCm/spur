@@ -1063,6 +1063,7 @@ fn run_pass(cm: &ClusterManager) -> Vec<JobId> {
         busy_until: &busy_until,
         preemption_handoffs: &handoffs,
         partition_node_usage: &usage,
+        held_gpus: &Default::default(),
     };
     let mut scheduler = BackfillScheduler::new(100);
     let assignments =

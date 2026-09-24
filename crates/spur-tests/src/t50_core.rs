@@ -1175,6 +1175,7 @@ address = "http://peer-a:6817"
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             partition_node_usage: &Default::default(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],

@@ -193,12 +193,12 @@ pub fn build_claim(spec: &PlaceholderSpec) -> ResourceClaim {
         .collect();
     ResourceClaim {
         metadata: metadata(spec),
-        spec: ResourceClaimSpec {
+        spec: Some(ResourceClaimSpec {
             devices: Some(DeviceClaim {
                 requests: Some(requests),
                 ..Default::default()
             }),
-        },
+        }),
         status: None,
     }
 }
@@ -1162,6 +1162,7 @@ mod tests {
             memory_mb: 1024,
             devices: [("gpu".to_string(), DeviceAllocations { devices })].into(),
             generation: 7,
+            ..Default::default()
         }
     }
 
