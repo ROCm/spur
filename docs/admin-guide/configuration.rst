@@ -16,9 +16,11 @@ and meaning.
    but only for local agent settings (``[hooks]``, ``[devices]``, ``rlimits.memlock``,
    ``[cgroup]``, ``[cluster]``, and ``[mpi]``); its identity and networking come from
    CLI flags.
-   Node CPU, memory, and GRES are reported by each agent when it registers, not
-   declared here — ``[[nodes]]`` only overlays scheduling policy onto nodes that
-   have already registered.
+   Node CPU, memory, and GRES are reported by each agent when it registers;
+   ``[[nodes]]`` overlays scheduling policy onto nodes that have already registered.
+   The exception is ``cpus`` / ``memory_mb`` / ``reserved_memory_mb``, which cap the
+   agent-reported CPU and memory (see the ``[[nodes]]`` table below); GRES is always
+   agent-reported.
 
 Minimal configuration
 ----------------------
@@ -110,9 +112,19 @@ swaps only that controller's in-memory config; no Raft log entry carries the new
 file, so followers keep the config they loaded at startup until they restart (in
 Kubernetes they re-read the same Secret). ``[[partitions]]`` is the exception —
 partition changes replicate through the write-ahead log — but a follower re-derives
-node features and weight from its own pre-reconfigure ``[[nodes]]`` blocks. Do not
-rely on reconfigured non-partition state surviving an immediate failover; roll the
-controllers to converge them.
+node features, weight, and resource caps (``cpus`` / ``memory_mb`` /
+``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks. In
+particular, a cap you *lower* via ``reconfigure`` is not enforced by a follower that
+has not restarted, so after an immediate failover the new leader may briefly admit
+against the old (higher) cap. Do not rely on reconfigured non-partition state
+surviving an immediate failover; roll the controllers to converge them.
+
+Resource caps are applied by the controller when it stores a node's inventory, so a
+controller that predates cap support stores the raw agent-reported inventory
+uncapped. During a rolling upgrade, caps are only guaranteed once **every**
+controller runs a cap-aware build; until then a failover to an old controller can
+admit against the uncapped inventory. Finish the controller upgrade before relying
+on caps for oversubscription/OOM protection.
 
 .. warning::
 
@@ -1333,13 +1345,27 @@ matches, and the first matching entry wins.
    * - ``cpus``
      - integer
      - ``0``
-     - Not implemented
-     - CPU count. Reported by the agent at registration; this value is ignored.
+     - Live
+     - Cap on schedulable CPUs. The agent autodetects the host; a configured value
+       below the detected count wins, a value above it is ignored (config cannot
+       invent hardware). ``0`` means unset (use detected). Set this to the core
+       count you want to schedule regardless of the host's BIOS SMT setting — it
+       is the equivalent of Slurm's ``CPUs=``.
    * - ``memory_mb``
      - integer
      - ``0``
-     - Not implemented
-     - Memory in MB. Reported by the agent at registration; this value is ignored.
+     - Live
+     - Cap on schedulable memory in MB. Applied like ``cpus``: a value below
+       detected wins, above is ignored. ``0`` means unset. Equivalent of Slurm's
+       ``RealMemory=``. See also ``reserved_memory_mb``.
+   * - ``reserved_memory_mb``
+     - integer
+     - ``0``
+     - Live
+     - Memory in MB held back from the detected total for the OS and runtime
+       (e.g. ROCm), so jobs cannot be packed into headroom the host needs. Applied
+       together with ``memory_mb``; the smaller resulting value wins. Must be less
+       than ``memory_mb`` when both are set (rejected at config load otherwise).
    * - ``gres``
      - [string]
      - ``[]``
@@ -1369,8 +1395,9 @@ matches, and the first matching entry wins.
 
    ``[[nodes]]`` is not a node roster. A node joins the cluster when ``spurd``
    registers with the controller, so adding a block here does not create a node,
-   and removing one does not remove a node — it only clears that node's features
-   and weight. Remove a node with ``spur node remove <node>``, which takes a
+   and removing one does not remove a node — it only clears that node's features,
+   weight, and resource caps (reverting to the agent-detected inventory). Remove a
+   node with ``spur node remove <node>``, which takes a
    :ref:`cluster admin <privileged-operations>`. When ``spurd`` stops, the node
    stays in the inventory as ``down`` with the reason ``agent shutdown``. It
    returns to service when the agent registers and sends heartbeats again. An

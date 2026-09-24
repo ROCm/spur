@@ -911,10 +911,16 @@ pub struct NodeConfig {
     /// Label selector: apply this config to nodes matching ALL key-value pairs.
     #[serde(default)]
     pub selector: HashMap<String, String>,
+    /// Cap on schedulable CPUs. 0 = unset (use detected). Never exceeds detected.
     #[serde(default)]
     pub cpus: u32,
+    /// Cap on schedulable memory (MiB). 0 = unset (use detected). Never exceeds detected.
     #[serde(default)]
     pub memory_mb: u64,
+    /// Memory (MiB) reserved for the OS/runtime, subtracted from detected memory
+    /// so jobs cannot be packed into headroom the host needs. 0 = none.
+    #[serde(default)]
+    pub reserved_memory_mb: u64,
     #[serde(default)]
     pub gres: Vec<String>,
     #[serde(default)]
@@ -2242,6 +2248,19 @@ impl SlurmConfig {
                 ),
             });
         }
+        // A reservation at or above the memory cap would advertise zero schedulable
+        // memory, silently making the node unschedulable. Reject at load instead.
+        for nc in &self.nodes {
+            if nc.memory_mb > 0 && nc.reserved_memory_mb >= nc.memory_mb {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("nodes.{}.reserved_memory_mb", nc.names),
+                    value: format!(
+                        "{} (must be less than memory_mb {})",
+                        nc.reserved_memory_mb, nc.memory_mb
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2498,6 +2517,40 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn node_config_parses_reserved_memory_mb() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 480000\nreserved_memory_mb = 32000\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].memory_mb, 480_000);
+        assert_eq!(config.nodes[0].reserved_memory_mb, 32_000);
+    }
+
+    #[test]
+    fn node_config_defaults_reserved_memory_mb_to_zero() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 480000\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes[0].reserved_memory_mb, 0);
+    }
+
+    #[test]
+    fn node_config_rejects_reserved_memory_at_or_above_cap() {
+        // reserved >= memory_mb cap would advertise 0 schedulable memory — an
+        // unschedulable node. Must fail at load, not silently.
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 32000\nreserved_memory_mb = 32000\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::InvalidValue { ref field, .. } if field.contains("reserved_memory_mb")),
+            "unexpected error: {error:?}"
+        );
+    }
 
     #[test]
     fn auth_config_reads_an_explicit_jwt_key_file() {

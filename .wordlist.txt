@@ -52,6 +52,7 @@ PMI
 PMIX
 PostgreSQL
 Pyxis
+oversubscription
 preempt
 preemption
 preemptable

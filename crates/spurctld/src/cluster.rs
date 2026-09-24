@@ -2777,7 +2777,10 @@ impl ClusterManager {
                         self.propose(WalOperation::NodeUpdate {
                             name: name.clone(),
                             hostname: hostname.clone(),
-                            resources: existing.total_resources.clone(),
+                            // Resend the raw detected report: NodeUpdate apply stores
+                            // this into detected_resources, so sending the clamped
+                            // total here would corrupt the raw inventory.
+                            resources: existing.detected_resources.clone(),
                             address,
                             port,
                             wg_pubkey,
@@ -6867,7 +6870,7 @@ impl ClusterManager {
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                     let mut resources = resources.clone();
                     resources.backfill_stable_ids();
-                    node.total_resources = resources;
+                    node.detected_resources = resources;
                     if !hostname.is_empty() {
                         node.hostname = hostname.clone();
                     }
@@ -6884,6 +6887,9 @@ impl ClusterManager {
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.last_heartbeat = Some(Utc::now());
+                    // Re-clamp against config: NodeUpdate carries a fresh detected
+                    // report and must honor caps just like NodeRegister does.
+                    self.apply_node_config_policy(node);
                 }
             }
             WalOperation::NodeStateChange {
@@ -7330,6 +7336,20 @@ impl ClusterManager {
             if node_config_matches(nc, &node.name, &node.labels) {
                 node.features = nc.features.clone();
                 node.weight = nc.weight;
+                node.total_resources =
+                    node.detected_resources
+                        .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
+                // reserved_memory_mb >= detected floors schedulable memory to 0,
+                // making the node unschedulable. When memory_mb is unset this can't
+                // be caught at config load, so surface it rather than let it read as
+                // an unexplained scheduling stall.
+                if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
+                    warn!(
+                        node = %node.name, detected_mb = node.detected_resources.memory_mb,
+                        cap_mb = nc.memory_mb, reserved_mb = nc.reserved_memory_mb,
+                        "node schedulable memory clamped to 0 by [[nodes]] config; node cannot run jobs"
+                    );
+                }
                 if node.address.is_none() {
                     if let Some(ref cfg_addr) = nc.address {
                         node.address = Some(cfg_addr.clone());
@@ -7338,6 +7358,8 @@ impl ClusterManager {
                 return;
             }
         }
+        // No matching config: schedulable inventory is the detected inventory.
+        node.total_resources = node.detected_resources.clone();
         node.reset_config_policy();
     }
 
@@ -7404,7 +7426,12 @@ impl StateMachineApply for ClusterManager {
 
         let mut nodes = self.nodes.write();
         nodes.clear();
-        for node in snap.nodes {
+        for mut node in snap.nodes {
+            // Legacy snapshots lack detected_resources; seed it from total_resources
+            // so reconcile_partitions doesn't clamp a zero inventory into scheduling.
+            if node.detected_resources == ResourceSet::default() {
+                node.detected_resources = node.total_resources.clone();
+            }
             nodes.insert(node.name.clone(), node);
         }
         self.k0s_role_counts
@@ -8525,7 +8552,10 @@ pub(crate) fn evaluate_registration(
 ) -> RegistrationAction {
     match existing {
         None => RegistrationAction::Register,
-        Some(node) if node.total_resources != *incoming_resources => RegistrationAction::Update,
+        // Compare against the raw detected report, not the clamped total_resources,
+        // or a detected change that happens to equal the current clamped value is
+        // wrongly skipped and the node never re-clamps.
+        Some(node) if node.detected_resources != *incoming_resources => RegistrationAction::Update,
         Some(_) => RegistrationAction::Skip,
     }
 }
@@ -9580,6 +9610,115 @@ mod tests {
             ..Default::default()
         };
         cfg
+    }
+
+    fn config_with_nodes(nodes: Vec<spur_core::config::NodeConfig>) -> SlurmConfig {
+        let mut cfg = test_config();
+        cfg.nodes = nodes;
+        cfg
+    }
+
+    fn node_cfg(
+        names: &str,
+        cpus: u32,
+        memory_mb: u64,
+        reserved_memory_mb: u64,
+    ) -> spur_core::config::NodeConfig {
+        spur_core::config::NodeConfig {
+            names: names.into(),
+            selector: HashMap::new(),
+            cpus,
+            memory_mb,
+            reserved_memory_mb,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: None,
+            weight: 1,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_node_clamps_resources_to_config_and_retains_detected() {
+        let dir = TempDir::new().unwrap();
+        let cm =
+            test_cluster_with_config(&dir, config_with_nodes(vec![node_cfg("n1", 96, 0, 32_000)]))
+                .await;
+        // Agent reports SMT-inclusive 192 CPUs and full 256 GB.
+        register_node(&cm, "n1", 192, 256_000);
+
+        let node = cm.get_node("n1").unwrap();
+        // CPUs capped to the configured physical-core count.
+        assert_eq!(
+            node.total_resources.cpus, 96,
+            "cpus clamped to configured cap"
+        );
+        // Memory reduced by the reserved headroom.
+        assert_eq!(
+            node.total_resources.memory_mb, 224_000,
+            "memory reduced by reserved_memory_mb"
+        );
+        // Raw detected report preserved for observability.
+        assert_eq!(node.detected_resources.cpus, 192, "detected cpus retained");
+        assert_eq!(
+            node.detected_resources.memory_mb, 256_000,
+            "detected memory retained"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregistration_reapplies_clamp() {
+        let dir = TempDir::new().unwrap();
+        let cm =
+            test_cluster_with_config(&dir, config_with_nodes(vec![node_cfg("n1", 96, 0, 0)])).await;
+        register_node(&cm, "n1", 192, 256_000);
+        // Re-register (agent restart / inventory refresh) reports detected again.
+        register_node(&cm, "n1", 192, 256_000);
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.total_resources.cpus, 96,
+            "clamp re-applies on NodeUpdate, not just first NodeRegister"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregistration_reclamps_when_detected_shrinks_to_prior_total() {
+        // reserved=1000: detected 8000 -> total 7000. If the agent later reports
+        // detected 7000 (equal to the prior clamped total), registration must still
+        // re-clamp to 6000 — not Skip because incoming == total_resources.
+        let dir = TempDir::new().unwrap();
+        let cm =
+            test_cluster_with_config(&dir, config_with_nodes(vec![node_cfg("n1", 0, 0, 1000)]))
+                .await;
+        register_node(&cm, "n1", 8, 8000);
+        assert_eq!(cm.get_node("n1").unwrap().total_resources.memory_mb, 7000);
+
+        // Detected memory drops to exactly the previous clamped total.
+        register_node(&cm, "n1", 8, 7000);
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.detected_resources.memory_mb, 7000,
+            "raw detected report must update to the new smaller value"
+        );
+        assert_eq!(
+            node.total_resources.memory_mb, 6000,
+            "total must re-clamp (7000 detected - 1000 reserved), not stay at 7000"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_node_without_matching_config_is_unclamped() {
+        let dir = TempDir::new().unwrap();
+        let cm =
+            test_cluster_with_config(&dir, config_with_nodes(vec![node_cfg("other", 8, 0, 0)]))
+                .await;
+        register_node(&cm, "n1", 192, 256_000);
+
+        let node = cm.get_node("n1").unwrap();
+        // No matching [[nodes]] entry -> detected values used verbatim (today's behavior).
+        assert_eq!(node.total_resources.cpus, 192);
+        assert_eq!(node.total_resources.memory_mb, 256_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21179,6 +21318,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_legacy_snapshot_without_detected_resources_keeps_total() {
+        // Strip detected_resources to mimic a pre-upgrade snapshot; restore must keep
+        // total_resources, not clamp the serde-default empty inventory to zero.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 32, 128_000);
+
+        let snap = cm.snapshot_state().unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&snap).unwrap();
+        for node in json["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("detected_resources");
+        }
+        let legacy = serde_json::to_vec(&json).unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&legacy).unwrap();
+
+        let n1 = cm2.get_node("n1").expect("node restored");
+        assert_eq!(
+            n1.total_resources.cpus, 32,
+            "legacy node's total_resources.cpus must survive restore, not be zeroed"
+        );
+        assert_eq!(
+            n1.total_resources.memory_mb, 128_000,
+            "legacy node's total_resources.memory_mb must survive restore"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn k0s_state_survives_snapshot() {
         use spur_core::k0s::{K0sPhase, K0sRole};
         let dir = TempDir::new().unwrap();
@@ -23662,6 +23831,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registration_compares_detected_not_clamped_total() {
+        // A clamped node has detected_resources != total_resources. A fresh detected
+        // report equal to the clamped total must still be an Update (the raw report
+        // changed), or the node never re-clamps. Comparing against total_resources
+        // would wrongly Skip it.
+        let detected = ResourceSet {
+            cpus: 8,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+        let mut node = Node::new("n1".into(), detected);
+        // Simulate a cap: total_resources clamped below detected.
+        node.total_resources = ResourceSet {
+            cpus: 8,
+            memory_mb: 7000,
+            ..Default::default()
+        };
+        let incoming = ResourceSet {
+            cpus: 8,
+            memory_mb: 7000, // equals the clamped total, but detected was 8000
+            ..Default::default()
+        };
+        assert_eq!(
+            super::evaluate_registration(Some(&node), &incoming),
+            super::RegistrationAction::Update,
+            "detected shrank 8000->7000; must Update even though it equals clamped total"
+        );
+    }
+
     // --- expand_job_specs tests ---
 
     #[test]
@@ -25304,6 +25503,7 @@ mod tests {
             selector: HashMap::from([("gpu".into(), "mi300x".into())]),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: Vec::new(),
             address: None,
@@ -25484,6 +25684,7 @@ mod tests {
             selector: HashMap::new(),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: vec!["common".into()],
             address: None,
@@ -25607,6 +25808,7 @@ mod tests {
             selector: HashMap::new(),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
@@ -25654,6 +25856,7 @@ mod tests {
             selector: HashMap::new(),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
@@ -25692,6 +25895,7 @@ mod tests {
             selector: HashMap::from([("gpu".into(), "mi300x".into())]),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
@@ -25740,6 +25944,7 @@ mod tests {
             selector: HashMap::from([("gpu".into(), "mi300x".into())]),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
@@ -25787,6 +25992,7 @@ mod tests {
             selector: HashMap::from([("gpu".into(), "mi300x".into())]),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
@@ -25824,6 +26030,7 @@ mod tests {
             selector: HashMap::from([("gpu".into(), "mi300x".into())]),
             cpus: 0,
             memory_mb: 0,
+            reserved_memory_mb: 0,
             gres: Vec::new(),
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
