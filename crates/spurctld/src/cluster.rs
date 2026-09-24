@@ -5272,6 +5272,35 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record the devices the agents bound instead of the reserved ones, on each node where
+    /// they differ, so the node charge and the job's release follow what actually runs.
+    pub(crate) fn substitute_job_allocs(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        launched: &HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<()> {
+        let reserved = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?
+            .per_node_alloc;
+        for (node, alloc) in launched {
+            if reserved.get(node) == Some(alloc) {
+                continue;
+            }
+            let resp = self.propose(WalOperation::JobAllocSubstitute {
+                job_id,
+                run_attempt,
+                node: node.clone(),
+                alloc: alloc.clone(),
+            })?;
+            if !resp.alloc_substitute_applied {
+                anyhow::bail!("job {job_id} substitution on {node} was refused");
+            }
+        }
+        Ok(())
+    }
+
     /// set the cluster-wide k0s phase. A `None`/empty control-plane or `member_nodes` leaves the
     /// persisted value untouched; the `Down` phase clears the member scope + control-plane set.
     pub fn set_k0s_phase(
@@ -10074,6 +10103,41 @@ impl ClusterManager {
                 if let Some(node) = nodes.get_mut(name) {
                     node.gpu_sharing = *enabled;
                 }
+            }
+            WalOperation::JobAllocSubstitute {
+                job_id,
+                run_attempt,
+                node: node_name,
+                alloc,
+            } => {
+                let Some(job) = jobs
+                    .get_mut(job_id)
+                    .filter(|j| j.run_attempt == *run_attempt && j.holds_a_placement())
+                else {
+                    return ClientResponse::default();
+                };
+                let (Some(old), Some(node)) = (
+                    job.per_node_alloc.get(node_name).cloned(),
+                    nodes.get_mut(node_name),
+                ) else {
+                    return ClientResponse::default();
+                };
+                let mut others = node.alloc_resources.clone();
+                others.subtract(&old);
+                let taken = others.device_ids("gpu");
+                if let Some(id) = alloc.device_ids("gpu").iter().find(|id| taken.contains(id)) {
+                    warn!(job_id = *job_id, node = %node_name, gpu = id, "refusing a substitution onto a GPU another job holds");
+                    return ClientResponse::default();
+                }
+                others.add(alloc);
+                node.alloc_resources = others;
+                node.update_state_from_alloc();
+                if let Some(total) = job.allocated_resources.as_mut() {
+                    total.subtract(&old);
+                    total.add(alloc);
+                }
+                job.per_node_alloc.insert(node_name.clone(), alloc.clone());
+                response.alloc_substitute_applied = true;
             }
             WalOperation::NodeK0sSetError { name, error } => {
                 if let Some(node) = nodes.get_mut(name) {
@@ -32198,6 +32262,63 @@ state = "UP"
 
         cm.apply_operation(&WalOperation::NodeK0sClear { name: "n1".into() });
         assert!(!cm.get_node("n1").unwrap().gpu_sharing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_substitution_recharges_the_node_unless_another_job_holds_the_gpu() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let gpus = |ids: &[u64]| {
+            let mut alloc = scalar_alloc(1, 1000);
+            alloc.add(&ResourceAllocations::from_device_ids("gpu", ids));
+            alloc
+        };
+        for (job_id, gpu) in [(1, 10), (2, 20)] {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(basic_spec("j")),
+            });
+            cm.apply_operation(&WalOperation::JobStart {
+                preemption_observation: None,
+                job_id,
+                nodes: vec!["n1".into()],
+                resources: gpus(&[gpu]),
+                per_node_alloc: per_node_for(&["n1"], gpus(&[gpu])),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                idle_fill: false,
+                effective_partition: None,
+                memory_adjustment: None,
+                at: None,
+            });
+        }
+        let substitute = |run_attempt, ids: &[u64]| WalOperation::JobAllocSubstitute {
+            job_id: 1,
+            run_attempt,
+            node: "n1".into(),
+            alloc: gpus(ids),
+        };
+
+        assert!(
+            !cm.apply_operation(&substitute(1, &[20]))
+                .alloc_substitute_applied
+        );
+        assert!(
+            !cm.apply_operation(&substitute(0, &[30]))
+                .alloc_substitute_applied
+        );
+        assert!(
+            cm.apply_operation(&substitute(1, &[30]))
+                .alloc_substitute_applied
+        );
+
+        let mut busy = cm.get_node("n1").unwrap().alloc_resources.device_ids("gpu");
+        busy.sort_unstable();
+        assert_eq!(busy, vec![20, 30]);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.per_node_alloc["n1"].device_ids("gpu"), vec![30]);
+        assert_eq!(job.allocated_resources.unwrap().device_ids("gpu"), vec![30]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

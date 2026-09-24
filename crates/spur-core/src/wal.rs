@@ -516,6 +516,15 @@ pub enum WalOperation {
         name: String,
         enabled: bool,
     },
+    /// Replace a placed job's slice on one node with the devices its agent bound instead,
+    /// re-charging the node. Applied only at `run_attempt` while the job holds a placement
+    /// and no other job holds an added device.
+    JobAllocSubstitute {
+        job_id: JobId,
+        run_attempt: u32,
+        node: String,
+        alloc: ResourceAllocations,
+    },
 }
 
 impl WalOperation {
@@ -717,7 +726,8 @@ impl WalOperation {
             | Self::NodeK0sSetError { .. }
             | Self::K0sMemberNodesAdd { .. }
             | Self::K0sMemberNodesRemove { .. }
-            | Self::NodeGpuSharingSet { .. } => None,
+            | Self::NodeGpuSharingSet { .. }
+            | Self::JobAllocSubstitute { .. } => None,
         }
     }
 
@@ -768,7 +778,8 @@ impl WalOperation {
             | Self::NodeK0sSetError { .. }
             | Self::K0sMemberNodesAdd { .. }
             | Self::K0sMemberNodesRemove { .. }
-            | Self::NodeGpuSharingSet { .. } => return,
+            | Self::NodeGpuSharingSet { .. }
+            | Self::JobAllocSubstitute { .. } => return,
         };
         slot.get_or_insert(now);
     }

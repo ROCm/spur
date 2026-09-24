@@ -162,6 +162,10 @@ pub struct ClientResponse {
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
     pub time_limit_applied: bool,
+    /// False when a `JobAllocSubstitute` found the run stale, unplaced on that node, or an
+    /// added device held by another job, and left the allocation unchanged.
+    #[serde(default)]
+    pub alloc_substitute_applied: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.
