@@ -225,6 +225,7 @@ async fn cmd_up(
     let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
+            gpu_sharing_nodes: Default::default(),
             control_plane_node,
             control_plane_replicas: replicas,
             control_plane_nodes,
@@ -256,6 +257,7 @@ async fn cmd_add_nodes(
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
         .cluster_add_nodes(ClusterAddNodesRequest {
+            gpu_sharing: Default::default(),
             nodes: nodes.unwrap_or_default(),
             partition: partition.unwrap_or_default(),
             selector,
