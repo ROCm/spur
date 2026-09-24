@@ -139,6 +139,10 @@ SUSPENDED, COMPLETING**.
      - GRES
      - ``%Q``
      - PRIORITY
+   * - ``%W``
+     - BORROWED
+     -
+     -
 
 ``%p`` and ``%Q`` both render the integer priority. Slurm splits these (``%p``
 is a normalized float, ``%Q`` the integer); Spur exposes the integer under both.
@@ -365,14 +369,25 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``%`` letters. Available fields include ``JobID``, ``JobName``, ``User``,
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
-``NCPUS``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, and ``PreemptQOS``. Set a
-per-field width with ``Field%N``, e.g. ``JobName%20``.
+``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
+and ``Borrowed``. Set a per-field width with ``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
 ``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS name that
 authorized the preemption under ``preempt_type = qos_priority``; ``N/A`` for
 plain priority-based preemption. All three appear in the long format (``-l``).
+
+``Borrowed`` is ``yes`` when the run took borrowed capacity under
+:doc:`/admin-guide/idle-fill-scheduling`, and ``no`` otherwise. It is the same
+question ``squeue``'s ``%W`` answers for a running job:
+
+.. code-block:: console
+
+   $ sacct --format=JobID,User,State,Borrowed
+   JobID  User     State      Borrowed
+   19     ifbob    PREEMPTED  yes
+   21     ifalice  COMPLETED  no
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.
@@ -539,6 +554,31 @@ fields:
 * ``PreemptMode=Requeue|Cancel|Suspend`` — how the preemption was carried out.
 * ``PreemptQOS=<name>`` — the QOS that authorized the preemption under
   ``preempt_type = qos_priority``; ``N/A`` for plain priority-based preemption.
+
+Borrowed runs and reclaim
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When :doc:`/admin-guide/idle-fill-scheduling` is enabled, a job that exceeded its
+QOS group node quota may still run, on capacity no job with a quota claim wanted.
+Such a run is *borrowed*, and ``squeue``'s ``%W`` field reports it:
+
+.. code-block:: console
+
+   $ squeue -o "%i %j %u %t %N %W"
+   JOBID NAME         USER     ST NODELIST BORROWED
+   18    alice-legit  ifalice  R  node-3   no
+   19    bob-borrow   ifbob    R  node-4   yes
+
+A borrowed job can be reclaimed when a job that does hold a quota claim needs its
+nodes. Reclaim **requeues**: the job returns to the queue with its spec intact and
+starts again once capacity allows, so the partial run is lost but the work is not.
+It appears as an ordinary preemption, with ``PreemptMode=Requeue`` and
+``PreemptedBy`` naming the job that reclaimed it, and ``sacct`` records that the run
+was borrowed.
+
+Note that ``--no-requeue`` does not prevent reclaim, and that an over-quota job
+which has *not* been lent capacity keeps reporting ``QOSGrpNodeLimit`` rather than a
+placement reason — being over quota is the true reason it is waiting.
 
 **Quick reference — one command for any preempted job:**
 

@@ -702,6 +702,13 @@ impl Scheduler for BackfillScheduler {
                     nodes: node_names,
                     per_node_alloc,
                 });
+            } else if job.idle_fill {
+                // A borrowed job that cannot start now should simply not start. It has
+                // no claim on the capacity, so holding a future slot would publish a
+                // StartTime and SchedNodeList for a job that simultaneously reports
+                // being over quota — contradictory, and it buys nothing, since the only
+                // jobs behind a borrow candidate are other borrow candidates (D15).
+                note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
             } else {
                 for (ni, _) in &assigned_nodes {
                     let node_alloc = per_node_alloc

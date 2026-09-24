@@ -162,9 +162,11 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS idle_fill_preemptable BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS idle_fill BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -264,6 +266,11 @@ pub struct JobStartRecord {
     pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
     pub reservation: Option<String>,
+    /// True when this run was borrowed: the job exceeded its QOS group node cap and
+    /// ran on capacity nobody with a claim wanted. Reported by `sacct` so operators
+    /// can tell which runs were opportunistic, and read back when the run ends to
+    /// decide whether fairshare should be charged for it.
+    pub idle_fill: bool,
 }
 
 /// Record a job start in the database.
@@ -277,8 +284,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation, idle_fill)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13, $14)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -295,7 +302,15 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             exit_code = 0,
             exit_signal = 0,
             derived_exit_code = 0,
-            end_time = NULL
+            end_time = NULL,
+            idle_fill = EXCLUDED.idle_fill,
+            -- A requeued job starts again on the same row, so provenance from the
+            -- run that was evicted must be cleared or the job reads as
+            -- `COMPLETED, PreemptMode=Requeue` forever once it finally succeeds.
+            -- Reclaim makes this routine rather than rare (D12).
+            preempted_by = NULL,
+            preempt_mode = '',
+            preempt_qos = ''
         "#,
     )
     .bind(rec.job_id as i64)
@@ -311,13 +326,14 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.submit_time)
     .bind(rec.start_time)
     .bind(rec.reservation.as_deref().unwrap_or_default())
+    .bind(rec.idle_fill)
     .execute(&mut *conn)
     .await?;
 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -361,7 +377,7 @@ pub async fn record_job_end(
             preempted_by = $7,
             preempt_mode = $8,
             preempt_qos = $9
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, state, idle_fill
         "#,
     )
     .bind(job_id as i64)
@@ -436,6 +452,20 @@ async fn update_usage(
         // End arrived before start; usage will be computed when start lands.
         return Ok(());
     };
+    // A borrowed run that was reclaimed is not charged to fairshare. Charging it
+    // creates a self-reinforcing loop: the borrower is billed for a run it did not
+    // get to finish, its priority drops, and a lower priority makes it the preferred
+    // next victim — so the more capacity it loses, the more it loses (D9).
+    //
+    // Keyed on the stamp, so a burst-pattern victim (reclaimable only because its
+    // QOS is marked preemptable, while running inside its own quota) keeps today's
+    // treatment and is charged as before.
+    let state: String = row.get("state");
+    let idle_fill: bool = row.get("idle_fill");
+    if idle_fill && state == "PREEMPTED" {
+        return Ok(());
+    }
+
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
 
@@ -492,6 +522,8 @@ pub struct JobRecord {
     pub preempted_by: Option<JobId>,
     pub preempt_mode: String,
     pub preempt_qos: String,
+    /// True when the run took borrowed capacity rather than the job's own quota.
+    pub idle_fill: bool,
 }
 
 /// Filters for [`get_job_history`]. A `None` or empty-slice field is an
@@ -516,7 +548,7 @@ pub async fn get_job_history(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
-         preempted_by, preempt_mode, preempt_qos \
+         preempted_by, preempt_mode, preempt_qos, idle_fill \
          FROM jobs WHERE 1=1",
     );
 
@@ -578,6 +610,7 @@ pub async fn get_job_history(
                 .map(|id| id as JobId),
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
+            idle_fill: row.get("idle_fill"),
         })
         .collect();
 
@@ -865,10 +898,12 @@ enum SqlVal<'a> {
     Int(i32),
     NullInt(Option<i32>),
     Real(f64),
+    Bool(bool),
 }
 
 fn push_bound(qb: &mut QueryBuilder<sqlx::Postgres>, val: SqlVal<'_>) {
     match val {
+        SqlVal::Bool(v) => qb.push_bind(v),
         SqlVal::Text(v) => qb.push_bind(v),
         SqlVal::NullText(v) => qb.push_bind(v),
         SqlVal::Int(v) => qb.push_bind(v),
@@ -1437,6 +1472,7 @@ pub struct QosUpdate<'a> {
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
     pub preempt_exempt_time: Option<Option<i32>>,
+    pub idle_fill_preemptable: Option<bool>,
     pub flags: Option<&'a str>,
 }
 
@@ -1492,6 +1528,9 @@ pub async fn upsert_qos<'a>(
     if let Some(v) = u.preempt {
         updates.push(("preempt", SqlVal::Text(v)));
     }
+    if let Some(v) = u.idle_fill_preemptable {
+        updates.push(("idle_fill_preemptable", SqlVal::Bool(v)));
+    }
     if let Some(v) = u.preempt_exempt_time {
         updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
     }
@@ -1543,7 +1582,7 @@ pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<St
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags, idle_fill_preemptable FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1566,6 +1605,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             grp_tres: r.get("grp_tres"),
             grp_wall_min: r.get("grp_wall_min"),
             preempt_exempt_time: r.get("preempt_exempt_time"),
+            idle_fill_preemptable: r.get("idle_fill_preemptable"),
             flags: r.get("flags"),
         })
         .collect())
@@ -1590,6 +1630,7 @@ pub struct QosRecord {
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
     pub preempt_exempt_time: Option<i32>,
+    pub idle_fill_preemptable: bool,
     pub flags: String,
 }
 
@@ -1695,6 +1736,7 @@ mod job_history_tests {
                 submit_time,
                 start_time,
                 reservation: Some(reservation.to_string()),
+                idle_fill: false,
             },
         )
         .await
@@ -1751,6 +1793,7 @@ mod job_history_tests {
                 submit_time: start_time,
                 start_time,
                 reservation: Some(String::new()),
+                idle_fill: false,
             },
         )
         .await?;
@@ -2665,6 +2708,7 @@ mod job_history_tests {
             &mut *pool.acquire().await?,
             &name,
             QosUpdate {
+                idle_fill_preemptable: Some(true),
                 description: Some("d"),
                 priority: Some(5),
                 preempt_mode: Some("cluster"),
@@ -2702,6 +2746,7 @@ mod job_history_tests {
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
         assert_eq!(got.grp_wall_min, Some(120));
         assert_eq!(got.flags, "DenyOnLimit");
+        assert!(got.idle_fill_preemptable);
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)

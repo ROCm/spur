@@ -280,6 +280,9 @@ impl SlurmAccounting for AccountingService {
                 submit_time,
                 start_time,
                 reservation: Some(req.reservation),
+                // The external accounting RPC carries no idle-fill notion; a run
+                // recorded through it is treated as an ordinary one.
+                idle_fill: false,
             },
         )
         .await
@@ -442,6 +445,7 @@ impl SlurmAccounting for AccountingService {
                 preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
+                idle_fill: r.idle_fill,
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),
@@ -870,6 +874,7 @@ impl SlurmAccounting for AccountingService {
             .map(canonicalize_qos_flags)
             .transpose()?;
         let update = db::QosUpdate {
+            idle_fill_preemptable: req.idle_fill_preemptable,
             description: req.description.as_deref(),
             priority: req.priority,
             preempt_mode: req.preempt_mode.as_deref(),
@@ -962,6 +967,7 @@ impl SlurmAccounting for AccountingService {
         let qos_list = records
             .into_iter()
             .map(|r| QosInfo {
+                idle_fill_preemptable: r.idle_fill_preemptable,
                 name: r.name,
                 description: r.description,
                 priority: r.priority,
