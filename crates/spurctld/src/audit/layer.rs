@@ -162,7 +162,8 @@ where
 
             if let Some(m) = mutating {
                 let slot = slot.expect("a mutating RPC is always given a slot");
-                if should_record(m.scope, slot.executed_locally()) {
+                // A handler that recorded in band already accounted for this.
+                if should_record(m.scope, slot.executed_locally()) && !slot.recorded_in_band() {
                     let annotation = slot.take();
                     if m.targeted && annotation.is_none() {
                         warn!(

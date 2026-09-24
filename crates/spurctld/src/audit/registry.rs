@@ -286,6 +286,81 @@ mod tests {
         assert!(!records_no_target("GetJobs", &[]));
     }
 
+    /// The handler sources, so the check below can see whether a handler
+    /// actually annotates rather than only that the registry says it should.
+    const CONTROLLER_SRC: &str = include_str!("../server.rs");
+    const ACCOUNTING_SRC: &str = include_str!("../accounting/grpc.rs");
+
+    fn snake_case(method: &str) -> String {
+        let mut out = String::with_capacity(method.len() + 4);
+        for (i, c) in method.char_indices() {
+            if c.is_uppercase() && i != 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        }
+        out
+    }
+
+    /// The handler's body: from its signature to the next one at the same level.
+    fn handler_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let start = src.find(&format!("async fn {name}("))?;
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .map_or(rest.len(), |i| i + 1);
+        Some(&rest[..end])
+    }
+
+    /// Whether a handler records what it acted on, by either route: the layer's
+    /// slot, or the in-band write that carries the row in its own transaction.
+    fn annotates(body: &str) -> bool {
+        body.contains("annotate(") || body.contains("write_txn_in_band(")
+    }
+
+    /// The registry forces only a *classification*: a `targeted` handler whose
+    /// author forgot the call still ships blank rows, and CI cannot fail on a warning.
+    #[test]
+    fn every_targeted_handler_annotates() {
+        let unannotated: Vec<_> = audited_service_methods()
+            .into_iter()
+            .filter(|m| matches!(classify(m), Some(RpcClass::Mutating(x)) if x.targeted))
+            .filter(|m| {
+                let f = snake_case(m);
+                handler_body(CONTROLLER_SRC, &f)
+                    .or_else(|| handler_body(ACCOUNTING_SRC, &f))
+                    .is_none_or(|body| !annotates(body))
+            })
+            .collect();
+        assert!(
+            unannotated.is_empty(),
+            "these handlers are marked `targeted` but never record their target, \
+             so their rows ship with a blank Where: {unannotated:?}. Add an \
+             `audit::annotate` call (or `write_txn_in_band` for the accounting \
+             entities), or mark the registry entry untargeted."
+        );
+    }
+
+    /// Guards the check above: if the body extraction silently found nothing,
+    /// the assertion would pass for the wrong reason.
+    #[test]
+    fn the_handler_scan_reads_real_bodies() {
+        assert_eq!(snake_case("ClusterAddNodes"), "cluster_add_nodes");
+        assert_eq!(snake_case("CreateQos"), "create_qos");
+
+        let drain = handler_body(CONTROLLER_SRC, "drain_node").expect("drain_node exists");
+        assert!(annotates(drain), "drain_node does annotate");
+        assert!(
+            !drain.contains("async fn get_jobs("),
+            "the body must stop at the next handler, not run to end of file"
+        );
+
+        // A read has no reason to annotate, so a scan that matched everything
+        // would show up here.
+        let read = handler_body(CONTROLLER_SRC, "get_nodes").expect("get_nodes exists");
+        assert!(!annotates(read));
+    }
+
     /// A name left behind after its RPC gained a target would silently widen the
     /// excuse list.
     #[test]

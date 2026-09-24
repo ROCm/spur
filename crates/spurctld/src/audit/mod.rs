@@ -55,6 +55,7 @@ pub(crate) struct AuditSlot {
     /// A `Mutex` not a `OnceLock`: a handler may refine it after parsing.
     annotation: Mutex<Option<Annotation>>,
     executed_locally: AtomicBool,
+    recorded_in_band: AtomicBool,
 }
 
 impl AuditSlot {
@@ -81,6 +82,14 @@ impl AuditSlot {
     fn mark_executed_locally(&self) {
         self.executed_locally.store(true, Ordering::Relaxed);
     }
+
+    pub(crate) fn recorded_in_band(&self) -> bool {
+        self.recorded_in_band.load(Ordering::Relaxed)
+    }
+
+    fn mark_recorded_in_band(&self) {
+        self.recorded_in_band.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Set by `check_leader` when this controller applies the action itself, so the
@@ -88,6 +97,14 @@ impl AuditSlot {
 pub(crate) fn mark_executed_locally<T>(request: &tonic::Request<T>) {
     if let Some(slot) = request.extensions().get::<Arc<AuditSlot>>() {
         slot.mark_executed_locally();
+    }
+}
+
+/// Claim the row the handler committed, so the layer writes no second one. Set
+/// only after commit: a forgotten flag duplicates, a premature one loses.
+pub(crate) fn mark_recorded_in_band(handle: &Option<Arc<AuditSlot>>) {
+    if let Some(slot) = handle {
+        slot.mark_recorded_in_band();
     }
 }
 
@@ -109,6 +126,61 @@ pub(crate) fn slot<T>(request: &tonic::Request<T>) -> Option<Arc<AuditSlot>> {
 pub(crate) fn annotate(handle: &Option<Arc<AuditSlot>>, annotation: Annotation) {
     if let Some(slot) = handle {
         slot.set(annotation);
+    }
+}
+
+/// Caller facts captured before the handler consumes the request, so it can write
+/// the row in the entity's transaction — only possible when they share a database.
+pub(crate) struct InBand {
+    slot: Option<Arc<AuditSlot>>,
+    method: &'static str,
+    identity: Option<spur_core::auth::Identity>,
+    verified: bool,
+    peer: Option<String>,
+    forwarded: bool,
+}
+
+impl InBand {
+    pub(crate) fn capture<T>(request: &tonic::Request<T>, method: &'static str) -> Self {
+        Self {
+            slot: slot(request),
+            method,
+            identity: request
+                .extensions()
+                .get::<spur_core::auth::Identity>()
+                .cloned(),
+            verified: request
+                .extensions()
+                .get::<crate::auth_middleware::Verified>()
+                .is_some(),
+            peer: crate::rpc_middleware::peer_addr(request.extensions()),
+            forwarded: request.metadata().contains_key("x-spur-forwarded"),
+        }
+    }
+
+    /// The row for a change that is about to commit. `None` only if the method
+    /// is not a classified mutation, which the registry test makes impossible.
+    pub(crate) fn row(&self, annotation: Annotation) -> Option<crate::accounting::TxnRecord> {
+        let Some(registry::RpcClass::Mutating(m)) = registry::classify(self.method) else {
+            return None;
+        };
+        Some(layer::build_record(
+            m,
+            layer::Caller {
+                identity: self.identity.as_ref(),
+                verified: self.verified,
+                peer: self.peer.clone(),
+                forwarded: self.forwarded,
+            },
+            Some(annotation),
+            crate::accounting::TxnOutcome::Success,
+            None,
+        ))
+    }
+
+    /// Call only after the transaction carrying the row has committed.
+    pub(crate) fn mark_written(&self) {
+        mark_recorded_in_band(&self.slot);
     }
 }
 
@@ -144,7 +216,7 @@ where
 
     // `check_leader` marks the slot when this node applied the action, so a
     // request the handler forwarded is recorded by the leader, not here.
-    if layer::should_record(m.scope, slot.executed_locally()) {
+    if layer::should_record(m.scope, slot.executed_locally()) && !slot.recorded_in_band() {
         let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
         let outcome = crate::accounting::txn::outcome_from_status(&status);
         let error = status.as_ref().err().map(|s| s.message().to_string());
@@ -287,6 +359,33 @@ mod tests {
         assert_eq!(rows[0].entity_name, "7");
         assert_eq!(rows[0].peer_addr, "10.0.0.7:4433");
         assert_eq!(rows[0].outcome, crate::accounting::TxnOutcome::Success);
+    }
+
+    /// The handler committed the row in its own transaction, so a second write
+    /// here would double-count every accounting mutation.
+    #[tokio::test]
+    async fn a_row_written_in_band_is_not_written_again() {
+        let sink = Recorder::default();
+        let out: Result<(), _> = recorded(
+            &sink,
+            "CancelJob",
+            None,
+            tonic::Request::new(()),
+            |req| async move {
+                mark_executed_locally(&req);
+                let handle = slot(&req);
+                annotate(&handle, Annotation::new("7", serde_json::json!({})));
+                mark_recorded_in_band(&handle);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(out.is_ok());
+        assert!(
+            sink.rows().is_empty(),
+            "the handler already committed this row"
+        );
     }
 
     /// A denial is the case an operator most needs recorded.

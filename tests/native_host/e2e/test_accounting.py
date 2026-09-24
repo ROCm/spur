@@ -1132,6 +1132,7 @@ class TestReservationAudit:
         finally:
             c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
 
+
 class TestSshareAndSreportUnits:
     """Verify sshare and sreport display cpu-seconds, not cpu-hours."""
 
@@ -1175,6 +1176,7 @@ class TestSshareAndSreportUnits:
         c = accounting_cluster
         out = c.sreport(["cluster", "AccountUtilizationByUser"])
         assert "CPU Seconds" in out, f"expected 'CPU Seconds' header: {out}"
+
 
 def _wait_entity_rows(c, entity: str, name: str, fields: str, predicate,
                       timeout: int = 60) -> list[list[str]]:
@@ -1279,9 +1281,15 @@ class TestAccountingEntityAudit:
             assert set(by_action) == {"create", "update", "delete"}, rows
             for action, row in by_action.items():
                 assert row[1] == f"qos:{qos}", f"{action} must name the qos: {row}"
-            assert "120" in by_action["update"][3], (
-                f"the modify must record what it set, as an update: {by_action['update']}"
+
+            # The modify is a real SQL UPDATE, so the row carries both sides —
+            # this is what answers "what was the wall time before?".
+            info = by_action["update"][3]
+            assert '"max_wall_min":{"from":60,"to":120}' in info.replace(" ", ""), (
+                f"the update must record old and new: {info}"
             )
+            # An insert has no prior value, so it carries no diff.
+            assert "changed" not in by_action["create"][3], by_action["create"]
         finally:
             c.cli_allow_fail(["sacctmgr", "-i", "delete", "qos", f"name={qos}"])
 

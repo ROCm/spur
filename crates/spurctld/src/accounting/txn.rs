@@ -227,6 +227,21 @@ pub fn requested(fields: &[(&str, Option<serde_json::Value>)]) -> serde_json::Va
     serde_json::Value::Object(set.collect())
 }
 
+/// Attach an old→new column diff to the requested parameters. Omitted when
+/// nothing changed, so an insert or a no-op does not carry an empty key.
+pub fn with_changes(
+    mut details: serde_json::Value,
+    changed: serde_json::Value,
+) -> serde_json::Value {
+    if changed.as_object().is_none_or(serde_json::Map::is_empty) {
+        return details;
+    }
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert("changed".to_string(), changed);
+    }
+    details
+}
+
 /// Serialize a details object to the stored string, attaching the error message
 /// for non-success outcomes.
 pub fn finalize_details(mut base: serde_json::Value, error: Option<&str>) -> String {

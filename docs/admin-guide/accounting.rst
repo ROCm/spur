@@ -1297,6 +1297,12 @@ Each record captures:
   committed transactions, Spur also records denied and failed attempts.
 - **Info** — a JSON payload of the requested parameters (and the error message on
   failure). These are the values as requested, before server-side normalization.
+
+  For the accounting entities, a modification also carries a ``changed`` object
+  of ``{column: {from, to}}`` for the columns the write actually moved, read
+  under lock in the same transaction. This is what answers "what was the QOS
+  wall time before?". The Raft-backed entities record the request only; their
+  prior state is not available to the handler.
   Job scripts, environments, and credential material are deliberately excluded,
   so the log can be read by anyone who can read the rest of the accounting data
   without leaking job contents or secrets. Populated alongside **Where**.
@@ -1313,12 +1319,24 @@ Each record captures:
 When a row is lost
 ~~~~~~~~~~~~~~~~~~
 
-The row is written outside the action's own commit, so a database outage never
-blocks the operation. The cost is that an action can succeed while its row does
-not: the write is retried three times over roughly half a second, and a failure
-past that is logged and abandoned. A controller that dies between applying the
-action and finishing the write loses the row with no log line at all, because
-the process is gone.
+This depends on where the changed object lives, and the two halves differ.
+
+**Accounting entities (account, user, QOS) cannot be applied unrecorded.** Their
+rows live in the same database as the ``txn`` table, so the audit row is written
+inside the very transaction that changes them: both commit or neither does. If
+the row cannot be written the command fails, which is deliberate — a cluster
+whose audit backend is unreachable should stop accepting administrative changes,
+not make them silently. This adds no outage exposure that was not already there,
+since those commands already fail when PostgreSQL is down.
+
+**Everything else is still best-effort.** Node, job, partition, reservation,
+token and cluster state lives in the Raft log, not PostgreSQL, so there is no
+shared transaction to join. Those rows are written after the fact: the write is
+retried three times over roughly half a second, and a failure past that is
+logged and abandoned. A controller that dies between applying the action and
+finishing the write loses the row with no log line at all, because the process
+is gone. Denied and failed attempts are recorded this way for every entity,
+since nothing changed and no transaction was opened.
 
 Two counters on ``/metrics/audit`` make this visible rather than leaving it to
 whoever reads the controller log:

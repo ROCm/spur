@@ -888,6 +888,36 @@ pub enum Upserted {
     Unchanged,
 }
 
+/// What an upsert did, and to which columns.
+pub struct Upsert {
+    pub outcome: Upserted,
+    /// `{column: {"from": .., "to": ..}}` for the columns the write actually
+    /// changed. Empty on an insert, where there is no prior value.
+    pub changed: serde_json::Value,
+}
+
+impl Upsert {
+    fn unchanged() -> Self {
+        Self {
+            outcome: Upserted::Unchanged,
+            changed: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
+/// Columns whose value differs between the two row snapshots. Both sides come
+/// from `to_jsonb` on the same table, so like is compared with like.
+fn changed_columns(before: &serde_json::Value, after: &serde_json::Value) -> serde_json::Value {
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let diff = after.iter().filter_map(|(col, new)| {
+        let old = before.get(col)?;
+        (old != new).then(|| (col.clone(), serde_json::json!({ "from": old, "to": new })))
+    });
+    serde_json::Value::Object(diff.collect())
+}
+
 impl Upserted {
     fn from_xmax(inserted: Option<bool>) -> Self {
         match inserted {
@@ -937,11 +967,28 @@ impl UpsertTable {
 /// take the schema default on insert — the partial-patch contract). No `updates`
 /// = create-if-absent. Table is a closed enum, columns `&'static str` — injection-safe.
 async fn upsert_row(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     table: UpsertTable,
     keys: &[(&'static str, SqlVal<'_>)],
     updates: &[(&'static str, SqlVal<'_>)],
-) -> anyhow::Result<Upserted> {
+) -> anyhow::Result<Upsert> {
+    // Locked so the prior row cannot change before the write lands. Not a CTE:
+    // Postgres does not evaluate one referenced only from RETURNING.
+    let mut pq: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("SELECT to_jsonb(p) FROM ");
+    pq.push(table.name()).push(" p WHERE ");
+    let mut first = true;
+    for (col, val) in keys {
+        if !first {
+            pq.push(" AND ");
+        }
+        first = false;
+        pq.push("p.").push(*col).push(" = ");
+        push_bound(&mut pq, *val);
+    }
+    pq.push(" FOR UPDATE");
+    let before: Option<serde_json::Value> =
+        pq.build_query_scalar().fetch_optional(&mut *conn).await?;
+
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("INSERT INTO ");
     qb.push(table.name()).push(" (");
     let mut first = true;
@@ -979,9 +1026,22 @@ async fn upsert_row(
     }
     // `xmax` is zero only on a fresh insert, so this distinguishes the two
     // halves of the upsert in the same statement — no pre-read, no race.
-    qb.push(" RETURNING (xmax = 0)");
-    let inserted = qb.build_query_scalar().fetch_optional(pool).await?;
-    Ok(Upserted::from_xmax(inserted))
+    qb.push(" RETURNING (xmax = 0), to_jsonb(");
+    qb.push(table.name()).push(".*)");
+    let row: Option<(bool, serde_json::Value)> =
+        qb.build_query_as().fetch_optional(&mut *conn).await?;
+
+    let Some((inserted, after)) = row else {
+        // `DO NOTHING` matched an existing row and returned none.
+        return Ok(Upsert::unchanged());
+    };
+    Ok(Upsert {
+        outcome: Upserted::from_xmax(Some(inserted)),
+        changed: match before {
+            Some(before) => changed_columns(&before, &after),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        },
+    })
 }
 
 /// Partial-patch fields for [`upsert_account`]. Outer `None` leaves the column
@@ -1001,10 +1061,10 @@ pub struct AccountUpdate<'a> {
 /// sends just the restated fields, so unset columns are preserved; `add` sets
 /// all of them.
 pub async fn upsert_account<'a>(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     name: &'a str,
     u: AccountUpdate<'a>,
-) -> anyhow::Result<Upserted> {
+) -> anyhow::Result<Upsert> {
     let keys = [("name", SqlVal::Text(name))];
     let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.description {
@@ -1025,14 +1085,14 @@ pub async fn upsert_account<'a>(
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
     }
-    upsert_row(pool, UpsertTable::Accounts, &keys, &updates).await
+    upsert_row(conn, UpsertTable::Accounts, &keys, &updates).await
 }
 
 /// Delete an account.
-pub async fn delete_account(pool: &PgPool, name: &str) -> anyhow::Result<()> {
+pub async fn delete_account(conn: &mut PgConnection, name: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM accounts WHERE name = $1")
         .bind(name)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -1136,18 +1196,18 @@ pub struct UserUpdate<'a> {
 /// user's others), `Some(false)` clears it, `None` preserves it but still defaults a
 /// brand-new user's first account. Limits/QOS live in a separate association row.
 pub async fn add_user<'a>(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     user: &'a str,
     account: &'a str,
     u: UserUpdate<'a>,
 ) -> anyhow::Result<Upserted> {
     // Per-user advisory lock so concurrent modifies of two different accounts
     // for the same user serialize — otherwise both could win the demote race
-    // below and end up default. Cheap: add_user is admin-path.
-    let mut tx = pool.begin().await?;
+    // below and end up default. Cheap: add_user is admin-path. The lock is
+    // transaction-scoped, so it needs the caller's transaction to hold it.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(user)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     // Clear the default on the user's other rows *before* the upsert sets it
@@ -1160,7 +1220,7 @@ pub async fn add_user<'a>(
         )
         .bind(user)
         .bind(account)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
@@ -1189,7 +1249,7 @@ pub async fn add_user<'a>(
     .bind(account)
     .bind(u.admin_level)
     .bind(u.is_default)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
     let outcome = Upserted::from_xmax(Some(inserted));
 
@@ -1220,28 +1280,29 @@ pub async fn add_user<'a>(
     }
     // Touch the association row (limits/QOS) only when a field was restated.
     if !assoc.is_empty() {
-        upsert_association(&mut tx, user, account, &assoc).await?;
+        upsert_association(&mut *conn, user, account, &assoc).await?;
     }
 
-    tx.commit().await?;
     Ok(outcome)
 }
 
 /// Remove a user from one account, or every account when `account` is empty.
-pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Result<u64> {
-    let mut tx = pool.begin().await?;
+pub async fn remove_user(
+    conn: &mut PgConnection,
+    user: &str,
+    account: &str,
+) -> anyhow::Result<u64> {
     let associations =
         sqlx::query("DELETE FROM associations WHERE user_name = $1 AND ($2 = '' OR account = $2)")
             .bind(user)
             .bind(account)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     let users = sqlx::query("DELETE FROM users WHERE name = $1 AND ($2 = '' OR account = $2)")
         .bind(user)
         .bind(account)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(associations.rows_affected() + users.rows_affected())
 }
 
@@ -1383,10 +1444,10 @@ pub struct QosUpdate<'a> {
 /// just the restated fields, so unset columns are preserved; `add` sets all of
 /// them.
 pub async fn upsert_qos<'a>(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     name: &'a str,
     u: QosUpdate<'a>,
-) -> anyhow::Result<Upserted> {
+) -> anyhow::Result<Upsert> {
     let keys = [("name", SqlVal::Text(name))];
     let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.description {
@@ -1437,14 +1498,14 @@ pub async fn upsert_qos<'a>(
     if let Some(v) = u.flags {
         updates.push(("flags", SqlVal::Text(v)));
     }
-    upsert_row(pool, UpsertTable::Qos, &keys, &updates).await
+    upsert_row(conn, UpsertTable::Qos, &keys, &updates).await
 }
 
 /// Delete a QOS.
-pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
+pub async fn delete_qos(conn: &mut PgConnection, name: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM qos WHERE name = $1")
         .bind(name)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -2493,6 +2554,38 @@ mod job_history_tests {
         Ok(())
     }
 
+    /// The before/after pair a reader needs. Both snapshots come from `to_jsonb`
+    /// on the same table, so unchanged columns compare equal and drop out.
+    #[test]
+    fn changed_columns_reports_only_what_moved() {
+        let before = serde_json::json!({
+            "name": "normal", "max_wall_min": 60, "priority": 5, "grp_tres": null
+        });
+        let after = serde_json::json!({
+            "name": "normal", "max_wall_min": 120, "priority": 5, "grp_tres": "cpu=4"
+        });
+
+        assert_eq!(
+            changed_columns(&before, &after),
+            serde_json::json!({
+                "max_wall_min": { "from": 60, "to": 120 },
+                "grp_tres": { "from": null, "to": "cpu=4" },
+            }),
+            "unchanged columns must not appear"
+        );
+    }
+
+    #[test]
+    fn changed_columns_is_empty_when_nothing_moved() {
+        let row = serde_json::json!({ "name": "normal", "max_wall_min": 60 });
+        assert_eq!(changed_columns(&row, &row), serde_json::json!({}));
+        // An insert has no prior snapshot at all.
+        assert_eq!(
+            changed_columns(&serde_json::Value::Null, &row),
+            serde_json::json!({})
+        );
+    }
+
     /// `sacctmgr modify` and `add` share one RPC, so the audit verb comes from
     /// this mapping rather than the method.
     #[test]
@@ -2509,36 +2602,48 @@ mod job_history_tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn upsert_qos_reports_whether_it_created_or_updated() -> anyhow::Result<()> {
         let pool = test_pool().await?;
+        let mut conn = pool.acquire().await?;
         let name = format!("spur_upsert_{}", std::process::id());
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)
-            .execute(&pool)
+            .execute(&mut *conn)
             .await?;
 
-        let priced = |p: i32| QosUpdate {
-            priority: Some(p),
+        let wall = |m: i32| QosUpdate {
+            max_wall_min: Some(Some(m)),
             ..Default::default()
         };
 
+        let created = upsert_qos(&mut conn, &name, wall(60)).await?;
+        assert_eq!(created.outcome, Upserted::Created, "first write inserts");
         assert_eq!(
-            upsert_qos(&pool, &name, priced(5)).await?,
-            Upserted::Created,
-            "first write inserts"
+            created.changed,
+            serde_json::json!({}),
+            "an insert has no prior value to diff against"
         );
+
+        // The `sacctmgr modify qos ... set maxwall=120` case: a real UPDATE,
+        // and the pair a reader needs to answer "what did it used to be".
+        let updated = upsert_qos(&mut conn, &name, wall(120)).await?;
+        assert_eq!(updated.outcome, Upserted::Updated);
         assert_eq!(
-            upsert_qos(&pool, &name, priced(7)).await?,
-            Upserted::Updated,
-            "restating a field updates the existing row"
+            updated.changed,
+            serde_json::json!({ "max_wall_min": { "from": 60, "to": 120 } }),
+            "only the column that moved, with both sides"
         );
+
+        // Restating the same value touches the row but changes nothing.
+        let same = upsert_qos(&mut conn, &name, wall(120)).await?;
+        assert_eq!(same.outcome, Upserted::Updated);
+        assert_eq!(same.changed, serde_json::json!({}), "no column moved");
+
         // No fields restated, so the statement is ON CONFLICT DO NOTHING.
-        assert_eq!(
-            upsert_qos(&pool, &name, QosUpdate::default()).await?,
-            Upserted::Unchanged,
-        );
+        let untouched = upsert_qos(&mut conn, &name, QosUpdate::default()).await?;
+        assert_eq!(untouched.outcome, Upserted::Unchanged);
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)
-            .execute(&pool)
+            .execute(&mut *conn)
             .await?;
         Ok(())
     }
@@ -2557,7 +2662,7 @@ mod job_history_tests {
             .await?;
 
         upsert_qos(
-            &pool,
+            &mut *pool.acquire().await?,
             &name,
             QosUpdate {
                 description: Some("d"),
@@ -2632,7 +2737,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -2642,7 +2747,7 @@ mod job_history_tests {
         )
         .await?;
         upsert_qos(
-            &pool,
+            &mut *pool.acquire().await?,
             &qos_name,
             QosUpdate {
                 description: Some("d"),
@@ -2652,7 +2757,7 @@ mod job_history_tests {
         .await?;
 
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2673,7 +2778,7 @@ mod job_history_tests {
         // An unrestated default_qos must be preserved while the restated field
         // is still applied.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2691,7 +2796,7 @@ mod job_history_tests {
 
         // An explicit empty default_qos clears it.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2749,7 +2854,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -2770,7 +2875,7 @@ mod job_history_tests {
 
         // add with is_default=true records this account as the user's default.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2788,7 +2893,7 @@ mod job_history_tests {
 
         // An unrestated is_default must leave default_account untouched.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2807,7 +2912,7 @@ mod job_history_tests {
 
         // Restating is_default=false clears default_account.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2823,7 +2928,7 @@ mod job_history_tests {
 
         // Restating is_default=true sets it back.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2877,7 +2982,7 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
             upsert_account(
-                &pool,
+                &mut *pool.acquire().await?,
                 a,
                 AccountUpdate {
                     description: Some("d"),
@@ -2889,7 +2994,7 @@ mod job_history_tests {
 
         // alice's default starts as account A, then B is made the default.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &acct_a,
             UserUpdate {
@@ -2899,7 +3004,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &acct_b,
             UserUpdate {
@@ -2965,7 +3070,7 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
             upsert_account(
-                &pool,
+                &mut *pool.acquire().await?,
                 a,
                 AccountUpdate {
                     description: Some("d"),
@@ -2976,9 +3081,21 @@ mod job_history_tests {
         }
 
         // A plain add (is_default = None) makes a user's first account the default.
-        add_user(&pool, &user, &acct_a, UserUpdate::default()).await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &acct_a,
+            UserUpdate::default(),
+        )
+        .await?;
         // A later plain add to another account must not demote that default.
-        add_user(&pool, &user, &acct_b, UserUpdate::default()).await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &acct_b,
+            UserUpdate::default(),
+        )
+        .await?;
 
         let users = list_users(&pool, None, Some(&user)).await?;
         let a_row = users
@@ -3040,7 +3157,7 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
             upsert_account(
-                &pool,
+                &mut *pool.acquire().await?,
                 a,
                 AccountUpdate {
                     description: Some("d"),
@@ -3166,7 +3283,7 @@ mod job_history_tests {
         }
         for q in [&present_a, &present_b] {
             upsert_qos(
-                &pool,
+                &mut *pool.acquire().await?,
                 q,
                 QosUpdate {
                     description: Some("d"),
@@ -3226,7 +3343,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3237,7 +3354,7 @@ mod job_history_tests {
         .await?;
 
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3267,7 +3384,7 @@ mod job_history_tests {
         // A partial update that restates only max_running_jobs must overwrite
         // that one limit while preserving every limit it didn't restate.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3289,7 +3406,7 @@ mod job_history_tests {
 
         // Explicitly clearing each limit (inner None) sets it back to no-limit.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3353,7 +3470,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3363,7 +3480,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &matching_user,
             &account,
             UserUpdate {
@@ -3374,7 +3491,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &other_user,
             &account,
             UserUpdate {
@@ -3437,7 +3554,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3453,10 +3570,10 @@ mod job_history_tests {
             max_running_jobs: Some(Some(1)),
             ..Default::default()
         };
-        add_user(&pool, &user, &account, base()).await?;
-        add_user(&pool, &user, &account, base()).await?;
+        add_user(&mut *pool.acquire().await?, &user, &account, base()).await?;
+        add_user(&mut *pool.acquire().await?, &user, &account, base()).await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3522,10 +3639,10 @@ mod job_history_tests {
             fairshare: Some(1),
             ..Default::default()
         };
-        upsert_account(&pool, &account_one, acct_update()).await?;
-        upsert_account(&pool, &account_two, acct_update()).await?;
+        upsert_account(&mut *pool.acquire().await?, &account_one, acct_update()).await?;
+        upsert_account(&mut *pool.acquire().await?, &account_two, acct_update()).await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account_one,
             UserUpdate {
@@ -3537,7 +3654,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account_two,
             UserUpdate {
@@ -3549,7 +3666,7 @@ mod job_history_tests {
         )
         .await?;
 
-        let deleted = remove_user(&pool, &user, &account_one).await?;
+        let deleted = remove_user(&mut *pool.acquire().await?, &user, &account_one).await?;
         assert_eq!(deleted, 2);
         let remaining = list_users(&pool, None, None).await?;
         assert!(!remaining
@@ -3559,7 +3676,7 @@ mod job_history_tests {
             .iter()
             .any(|record| record.name == user && record.account == account_two));
 
-        let deleted = remove_user(&pool, &user, "").await?;
+        let deleted = remove_user(&mut *pool.acquire().await?, &user, "").await?;
         assert_eq!(deleted, 2);
         let remaining = list_users(&pool, None, None).await?;
         assert!(!remaining.iter().any(|record| record.name == user));
@@ -3570,7 +3687,7 @@ mod job_history_tests {
                 .await?;
         assert_eq!(association_count, 0);
 
-        let deleted = remove_user(&pool, &user, "").await?;
+        let deleted = remove_user(&mut *pool.acquire().await?, &user, "").await?;
         assert_eq!(deleted, 0);
 
         sqlx::query("DELETE FROM accounts WHERE name IN ($1, $2)")
@@ -3606,7 +3723,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3669,7 +3786,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3721,7 +3838,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3741,7 +3858,7 @@ mod job_history_tests {
         // An unrestated grp_tres must be preserved while the restated field is
         // still applied.
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 fairshare: Some(5),
@@ -3759,7 +3876,7 @@ mod job_history_tests {
 
         // An explicit empty grp_tres (inner None) clears it.
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 grp_tres: Some(None),

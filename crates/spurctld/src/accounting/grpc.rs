@@ -10,7 +10,24 @@ use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountin
 use spur_proto::proto::*;
 
 use super::{db, fairshare, txn};
-use crate::audit::{annotate, Annotation};
+use crate::audit::Annotation;
+
+fn internal(e: impl std::fmt::Display) -> Status {
+    Status::internal(e.to_string())
+}
+
+/// On the caller's transaction, so the row commits with the change or not at
+/// all. A failure fails the mutation, rather than applying it unaudited.
+async fn write_txn_in_band(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    audit: &crate::audit::InBand,
+    annotation: Annotation,
+) -> Result<(), Status> {
+    let Some(record) = audit.row(annotation) else {
+        return Ok(());
+    };
+    db::record_txn(tx, &record).await.map_err(internal)
+}
 
 /// Reject a TRES string (e.g. `grptres=`/`maxtresperjob=`/`maxtresperuser=`)
 /// that doesn't parse, instead of letting it silently become a no-op limit.
@@ -517,7 +534,7 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<()>, Status> {
         crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "create account")?;
-        let audit = crate::audit::slot(&request);
+        let audit = crate::audit::InBand::capture(&request, "CreateAccount");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -532,24 +549,28 @@ impl SlurmAccounting for AccountingService {
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
         };
-        let outcome = db::upsert_account(pool, &req.name, update)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let result = db::upsert_account(&mut tx, &req.name, update)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        annotate(
+            .map_err(internal)?;
+        let details = txn::requested(&[
+            ("description", req.description.map(Into::into)),
+            ("organization", req.organization.map(Into::into)),
+            ("parent_account", req.parent_account.map(Into::into)),
+            ("fairshare_weight", req.fairshare_weight.map(Into::into)),
+            ("max_running_jobs", req.max_running_jobs.map(Into::into)),
+            ("grp_tres", req.grp_tres.map(Into::into)),
+        ]);
+        write_txn_in_band(
+            &mut tx,
             &audit,
-            Annotation::new(
-                &req.name,
-                txn::requested(&[
-                    ("description", req.description.map(Into::into)),
-                    ("organization", req.organization.map(Into::into)),
-                    ("parent_account", req.parent_account.map(Into::into)),
-                    ("fairshare_weight", req.fairshare_weight.map(Into::into)),
-                    ("max_running_jobs", req.max_running_jobs.map(Into::into)),
-                    ("grp_tres", req.grp_tres.map(Into::into)),
-                ]),
-            )
-            .action(outcome.action()),
-        );
+            Annotation::new(&req.name, txn::with_changes(details, result.changed))
+                .action(result.outcome.action()),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+
         self.kick_assoc();
         Ok(Response::new(()))
     }
@@ -560,17 +581,22 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<()>, Status> {
         crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "delete account")?;
-        let audit = crate::audit::slot(&request);
+        let audit = crate::audit::InBand::capture(&request, "DeleteAccount");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
-        annotate(
+        let mut tx = pool.begin().await.map_err(internal)?;
+        db::delete_account(&mut tx, &req.name)
+            .await
+            .map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
             &audit,
             Annotation::new(&req.name, txn::delete_details(None)),
-        );
-        db::delete_account(pool, &req.name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
         self.kick_assoc();
         Ok(Response::new(()))
     }
@@ -605,7 +631,7 @@ impl SlurmAccounting for AccountingService {
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "add user")?;
-        let audit = crate::audit::slot(&request);
+        let audit = crate::audit::InBand::capture(&request, "AddUser");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -684,10 +710,12 @@ impl SlurmAccounting for AccountingService {
             grp_tres: nullable_str(&req.grp_tres),
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
         };
-        let outcome = db::add_user(pool, &req.user, &req.account, update)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let outcome = db::add_user(&mut tx, &req.user, &req.account, update)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        annotate(
+            .map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
             &audit,
             Annotation::new(
                 &req.user,
@@ -702,7 +730,10 @@ impl SlurmAccounting for AccountingService {
                 ]),
             )
             .action(outcome.action()),
-        );
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
         self.kick_assoc();
         Ok(Response::new(()))
     }
@@ -713,13 +744,28 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<()>, Status> {
         crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "remove user")?;
-        let audit = crate::audit::slot(&request);
+        let audit = crate::audit::InBand::capture(&request, "RemoveUser");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let deleted = db::remove_user(&mut tx, &req.user, &req.account)
+            .await
+            .map_err(internal)?;
+        if deleted == 0 {
+            // Dropping the transaction rolls back; nothing happened, so the
+            // layer records the NOT_FOUND attempt rather than this path.
+            let target = if req.account.is_empty() {
+                format!("user '{}'", req.user)
+            } else {
+                format!("user '{}' in account '{}'", req.user, req.account)
+            };
+            return Err(Status::not_found(format!("{target} does not exist")));
+        }
         // An empty account removes the user from every one of them, so record
         // the scope only when the request narrowed it.
-        annotate(
+        write_txn_in_band(
+            &mut tx,
             &audit,
             Annotation::new(
                 &req.user,
@@ -728,18 +774,10 @@ impl SlurmAccounting for AccountingService {
                     (!req.account.is_empty()).then(|| req.account.clone().into()),
                 )]),
             ),
-        );
-        let deleted = db::remove_user(pool, &req.user, &req.account)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        if deleted == 0 {
-            let target = if req.account.is_empty() {
-                format!("user '{}'", req.user)
-            } else {
-                format!("user '{}' in account '{}'", req.user, req.account)
-            };
-            return Err(Status::not_found(format!("{target} does not exist")));
-        }
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
         self.kick_assoc();
         Ok(Response::new(()))
     }
@@ -790,7 +828,7 @@ impl SlurmAccounting for AccountingService {
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "create qos")?;
-        let audit = crate::audit::slot(&request);
+        let audit = crate::audit::InBand::capture(&request, "CreateQos");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -859,29 +897,32 @@ impl SlurmAccounting for AccountingService {
             },
             flags: flags.as_deref(),
         };
-        let outcome = db::upsert_qos(pool, &req.name, update)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let result = db::upsert_qos(&mut tx, &req.name, update)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        annotate(
+            .map_err(internal)?;
+        let details = txn::requested(&[
+            ("description", req.description.map(Into::into)),
+            ("priority", req.priority.map(Into::into)),
+            ("preempt_mode", req.preempt_mode.map(Into::into)),
+            ("preempt", preempt_normalized.map(Into::into)),
+            ("usage_factor", req.usage_factor.map(Into::into)),
+            ("max_jobs_per_user", req.max_jobs_per_user.map(Into::into)),
+            ("max_wall_minutes", req.max_wall_minutes.map(Into::into)),
+            ("grp_wall_minutes", req.grp_wall_minutes.map(Into::into)),
+            ("max_tres_per_job", req.max_tres_per_job.map(Into::into)),
+            ("grp_tres", req.grp_tres.map(Into::into)),
+            ("flags", flags.map(Into::into)),
+        ]);
+        write_txn_in_band(
+            &mut tx,
             &audit,
-            Annotation::new(
-                &req.name,
-                txn::requested(&[
-                    ("description", req.description.map(Into::into)),
-                    ("priority", req.priority.map(Into::into)),
-                    ("preempt_mode", req.preempt_mode.map(Into::into)),
-                    ("preempt", preempt_normalized.map(Into::into)),
-                    ("usage_factor", req.usage_factor.map(Into::into)),
-                    ("max_jobs_per_user", req.max_jobs_per_user.map(Into::into)),
-                    ("max_wall_minutes", req.max_wall_minutes.map(Into::into)),
-                    ("grp_wall_minutes", req.grp_wall_minutes.map(Into::into)),
-                    ("max_tres_per_job", req.max_tres_per_job.map(Into::into)),
-                    ("grp_tres", req.grp_tres.map(Into::into)),
-                    ("flags", flags.map(Into::into)),
-                ]),
-            )
-            .action(outcome.action()),
-        );
+            Annotation::new(&req.name, txn::with_changes(details, result.changed))
+                .action(result.outcome.action()),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
         self.kick_assoc();
         Ok(Response::new(()))
     }
@@ -889,17 +930,20 @@ impl SlurmAccounting for AccountingService {
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
         crate::server::enforce_forward_binding(&request)?;
         self.require_admin(&request, "delete qos")?;
-        let audit = crate::audit::slot(&request);
+        let audit = crate::audit::InBand::capture(&request, "DeleteQos");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
-        annotate(
+        let mut tx = pool.begin().await.map_err(internal)?;
+        db::delete_qos(&mut tx, &req.name).await.map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
             &audit,
             Annotation::new(&req.name, txn::delete_details(None)),
-        );
-        db::delete_qos(pool, &req.name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
         self.kick_assoc();
         Ok(Response::new(()))
     }
