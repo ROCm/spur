@@ -752,6 +752,18 @@ impl ControllerService {
     }
 
     /// Feed a node's heartbeat-reported k0s status into the metric accumulator.
+    /// Mark enrolment's GPU-sharing nodes, already validated as (future) workers. The flag is set
+    /// before the reconciler assigns the role and takes effect once the node is enrolled.
+    #[allow(clippy::result_large_err)]
+    fn enable_gpu_sharing(&self, nodes: &[String]) -> Result<(), Status> {
+        for name in nodes {
+            self.cluster
+                .propose_node_gpu_sharing(name, true)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn record_k0s_node_status(&self, node: &str, status: &spur_proto::proto::K0sNodeStatus) {
         let cluster = self.cluster.config().cluster_name.clone();
         let metrics = self.cluster.k8s_metrics();
@@ -1912,7 +1924,10 @@ impl SlurmController for ControllerService {
         let mut proto_nodes: Vec<NodeInfo> = nodes
             .iter()
             .filter(|n| node_matches_filter(n, allowed_names.as_ref(), &req.partition))
-            .map(node_to_proto)
+            .map(|n| NodeInfo {
+                gpu_holds: self.cluster.gpu_hold_report(n),
+                ..node_to_proto(n)
+            })
             .filter(|n| req.states.is_empty() || req.states.contains(&n.state))
             .collect();
 
@@ -1943,7 +1958,10 @@ impl SlurmController for ControllerService {
             .cluster
             .get_node(&name)
             .ok_or_else(|| Status::not_found(format!("node {} not found", name)))?;
-        let mut proto_node = node_to_proto(&node);
+        let mut proto_node = NodeInfo {
+            gpu_holds: self.cluster.gpu_hold_report(&node),
+            ..node_to_proto(&node)
+        };
         let reservations = self.cluster.get_reservations();
         annotate_nodes_with_reservations(
             std::slice::from_mut(&mut proto_node),
@@ -2005,6 +2023,14 @@ impl SlurmController for ControllerService {
             self.cluster
                 .update_node_labels(&req.name, req.labels, &req.remove_labels)
                 .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        if let Some(enabled) = req.gpu_sharing {
+            if self.cluster.get_node(&req.name).is_none() {
+                return Err(Status::not_found(format!("node {} not found", req.name)));
+            }
+            self.cluster
+                .set_node_gpu_sharing(&req.name, enabled)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
         }
         Ok(Response::new(()))
     }
@@ -2496,9 +2522,17 @@ impl SlurmController for ControllerService {
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
-            Ok(Response::new(HeartbeatResponse {
-                gpu_sharing: Default::default(),
-            }))
+            if let Some(holds) = req.gpu_holds {
+                let generation = holds.generation;
+                if !self.cluster.record_gpu_holds(&req.hostname, holds) {
+                    tracing::debug!(node = %req.hostname, generation, "dropped GPU hold report for another inventory generation");
+                }
+            }
+            let gpu_sharing = self
+                .cluster
+                .get_node(&req.hostname)
+                .is_some_and(|n| n.shares_gpus());
+            Ok(Response::new(HeartbeatResponse { gpu_sharing }))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -3902,13 +3936,20 @@ impl SlurmController for ControllerService {
             state.controllers()
         } else {
             crate::cluster_k8s::resolve_control_plane_set(
-                candidates,
+                candidates.clone(),
                 &req.control_plane_nodes,
                 pinned.as_deref(),
                 replicas,
             )
             .map_err(Status::invalid_argument)?
         };
+        let gpu_sharing_nodes = crate::cluster_k8s::resolve_gpu_sharing_nodes(
+            &nodes,
+            &req.gpu_sharing_nodes,
+            &candidates,
+            &cp_set,
+        )
+        .map_err(Status::invalid_argument)?;
 
         // A control-plane change after roles are assigned would leave an inconsistent topology
         // (provisioning skips assigned nodes); require `spur k8s down --reset` to re-elect.
@@ -3933,6 +3974,7 @@ impl SlurmController for ControllerService {
             }
             // Neither the control plane nor the scope changed: a bare or identically-scoped re-up
             // is a true no-op, so skip writing a redundant WAL entry.
+            self.enable_gpu_sharing(&gpu_sharing_nodes)?;
             return Ok(Response::new(ClusterUpResponse {
                 accepted: true,
                 message: "k0s cluster already up with this control plane and scope".to_string(),
@@ -3950,6 +3992,7 @@ impl SlurmController for ControllerService {
                 false,
             )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        self.enable_gpu_sharing(&gpu_sharing_nodes)?;
         Ok(Response::new(ClusterUpResponse {
             accepted: true,
             message: "k0s cluster provisioning requested".to_string(),
@@ -4036,6 +4079,9 @@ impl SlurmController for ControllerService {
         self.cluster
             .add_k0s_member_nodes(requested.clone())
             .map_err(|e| Status::internal(format!("add k0s member nodes: {e}")))?;
+        if req.gpu_sharing {
+            self.enable_gpu_sharing(&requested)?;
+        }
         Ok(Response::new(ClusterAddNodesResponse {
             accepted: true,
             message: format!("added {} node(s) to the cluster", requested.len()),
@@ -5241,8 +5287,8 @@ fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec
 
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     NodeInfo {
-        gpu_holds: Default::default(),
-        gpu_sharing: Default::default(),
+        gpu_holds: None,
+        gpu_sharing: node.gpu_sharing,
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
         state_reason: node.state_reason.clone().unwrap_or_default(),
@@ -5329,7 +5375,6 @@ pub(crate) fn allocations_to_proto(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn proto_to_allocations(
     r: spur_proto::proto::ResourceAllocations,
 ) -> spur_core::resource::ResourceAllocations {
@@ -9806,6 +9851,113 @@ mod tests {
             svc.cluster.k0s_state().member_nodes,
             vec!["node-a", "node-b"]
         );
+    }
+
+    fn gpu_sharing_of(svc: &ControllerService, node: &str) -> bool {
+        svc.cluster.get_node(node).is_some_and(|n| n.gpu_sharing)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_marks_gpu_sharing_workers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (i, n) in ["node-a", "node-b", "node-c"].iter().enumerate() {
+            register_plain_node(&svc, n, 6818 + i as u16).await;
+        }
+        let up = |gpu_sharing_nodes: &str| ClusterUpRequest {
+            caller: "root".into(),
+            nodes: "node-a,node-b".into(),
+            control_plane_nodes: vec!["node-a".into()],
+            gpu_sharing_nodes: gpu_sharing_nodes.into(),
+            ..Default::default()
+        };
+
+        for refused in ["node-a", "node-c", "node-z"] {
+            let err = svc
+                .cluster_up(Request::new(up(refused)))
+                .await
+                .expect_err("only an in-scope worker may share its GPUs");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{refused}: {err}");
+        }
+        svc.cluster_up(Request::new(up("node-b")))
+            .await
+            .expect("up with a sharing worker accepted");
+
+        assert!(gpu_sharing_of(&svc, "node-b"));
+        assert!(!gpu_sharing_of(&svc, "node-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opted_in_worker_is_told_to_share_and_its_holds_are_kept() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "n1", 6818).await;
+        svc.cluster
+            .assign_node_k0s(
+                "n1",
+                spur_core::k0s::K0sRole::Worker,
+                "10.44.0.2",
+                "10.42.2.0/24",
+            )
+            .unwrap();
+        let opt_in = UpdateNodeRequest {
+            name: "n1".into(),
+            gpu_sharing: Some(true),
+            ..Default::default()
+        };
+        svc.update_node(admin_request(opt_in)).await.unwrap();
+
+        let heartbeat = |generation: u64| HeartbeatRequest {
+            hostname: "n1".into(),
+            gpu_holds: Some(spur_proto::proto::GpuHoldReport {
+                generation,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let generation = svc
+            .cluster
+            .get_node("n1")
+            .unwrap()
+            .total_resources
+            .generation;
+        let stale = svc.heartbeat(Request::new(heartbeat(generation + 1))).await;
+        assert!(stale.unwrap().into_inner().gpu_sharing);
+        let get = || GetNodeRequest { name: "n1".into() };
+        let info = svc
+            .get_node(Request::new(get()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(info.gpu_sharing);
+        assert_eq!(info.gpu_holds, None, "a stale generation must be dropped");
+
+        svc.heartbeat(Request::new(heartbeat(generation)))
+            .await
+            .unwrap();
+        let info = svc
+            .get_node(Request::new(get()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.gpu_holds.map(|h| h.generation), Some(generation));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_add_nodes_can_mark_gpu_sharing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        svc.cluster_add_nodes(Request::new(ClusterAddNodesRequest {
+            nodes: "node-c".into(),
+            caller: "root".into(),
+            gpu_sharing: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("add-nodes accepted");
+
+        assert!(gpu_sharing_of(&svc, "node-c"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

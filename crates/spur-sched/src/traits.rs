@@ -30,6 +30,9 @@ pub struct ClusterState<'a> {
     /// Node name -> real time its last currently-running job is expected to
     /// end. Absent entries fall back to a conservative placeholder.
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
+    /// Node name -> GPU stable_ids that Kubernetes holds on a node shared with it.
+    /// A pod has no end time, so a held GPU is busy for the whole planning horizon.
+    pub held_gpus: &'a HashMap<String, Vec<u64>>,
 }
 
 /// Trait for pluggable scheduler implementations.

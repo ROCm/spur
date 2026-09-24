@@ -28,6 +28,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -53,6 +54,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -77,6 +79,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -97,6 +100,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -120,6 +124,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -146,6 +151,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -176,6 +182,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -320,6 +327,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -347,6 +355,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -372,6 +381,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -398,6 +408,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -428,6 +439,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -493,6 +505,7 @@ mod tests {
         let job = make_job_with_resources("train", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -514,6 +527,7 @@ mod tests {
         let job = make_job_with_resources("train", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -574,6 +588,7 @@ mod tests {
         let job = make_job_with_resources("regular-job", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
@@ -612,6 +627,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
@@ -634,6 +650,7 @@ mod tests {
         let job = make_job_with_resources("free-job", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -657,6 +674,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -679,6 +697,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -705,6 +724,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -732,6 +752,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -760,6 +781,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -790,6 +812,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -840,6 +863,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -904,6 +928,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -947,6 +972,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -990,6 +1016,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1042,6 +1069,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1068,6 +1096,7 @@ mod tests {
 
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
