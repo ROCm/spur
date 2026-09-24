@@ -174,15 +174,16 @@ fn execv_reported_failure(pipe_r: &std::os::fd::OwnedFd) -> bool {
     matches!(nix::unistd::read(pipe_r, &mut byte), Ok(1))
 }
 
-/// The session directory lives under the same node-owned spool root as the
-/// rest of a job's spool files, so a failure to create it condemns the node
-/// exactly like the unsupervised launch path already does.
+/// The session directory lives under this agent's configured state dir, which
+/// spurd owns exclusively, so a failure to create it condemns the node.
 fn session_dir_prepare_error(
     dir: &std::path::Path,
+    state_dir: &std::path::Path,
     error: std::io::Error,
 ) -> executor::LaunchError {
     executor::classify_spool_error(
         dir,
+        state_dir,
         anyhow::Error::from(error).context("prepare stepd directory"),
     )
 }
@@ -213,7 +214,7 @@ async fn launch_stepd(
     let intended_session_dir = store.session_dir(config.job_id, run_attempt, launch_spec.step_id);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt, launch_spec.step_id)
-        .map_err(|error| session_dir_prepare_error(&intended_session_dir, error))?;
+        .map_err(|error| session_dir_prepare_error(&intended_session_dir, state_dir, error))?;
     let mut descriptor = crate::stepd::StepdDescriptor::new(
         config.job_id,
         run_attempt,
@@ -247,6 +248,7 @@ async fn launch_stepd(
     crate::stepd::write_private(&launch_path, &launch_json).map_err(|error| {
         executor::classify_spool_error(
             &launch_path,
+            state_dir,
             anyhow::Error::from(error).context("write runtime launch specification"),
         )
     })?;
@@ -3372,6 +3374,8 @@ pub struct AgentService {
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<StepdMap>>,
     stepd_state_dir: std::path::PathBuf,
+    /// Candidate roots `RunCommand`'s job spool is created under, in order.
+    job_spool_roots: Vec<std::path::PathBuf>,
     /// Unit tests exercise launch mechanics without a built `spurstepd`, so they
     /// keep the legacy path. Production always supervises.
     #[cfg(test)]
@@ -3514,6 +3518,7 @@ impl AgentService {
             stepd_state_dir: std::env::var("SPUR_STEPD_STATE_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
+            job_spool_roots: executor::default_job_spool_candidates(),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
             auth_audience: String::new(),
@@ -3564,6 +3569,14 @@ impl AgentService {
 
     pub fn with_runtime_state_dir(mut self, state_dir: impl Into<std::path::PathBuf>) -> Self {
         self.stepd_state_dir = state_dir.into();
+        self
+    }
+
+    /// Overrides `RunCommand`'s job-spool candidates so a test can force a
+    /// deterministic failure without depending on the runner's uid.
+    #[cfg(test)]
+    fn with_job_spool_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.job_spool_roots = roots;
         self
     }
 
@@ -6811,14 +6824,19 @@ impl SlurmAgent for AgentService {
         // Redirect the step's stdout/stderr to per-step spool files so
         // stream_job_output can tail them live and output stays bounded on this
         // node. Paths are recorded in active_steps so the tail can find them.
-        let mut step_files =
-            match crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid) {
-                Ok(files) => files,
-                Err(error) => {
-                    self.drain_on_node_fault(&error, job_id);
-                    return Err(Status::internal(format!("step output files: {error}")));
-                }
-            };
+        let mut step_files = match crate::executor::open_step_output_files_under(
+            &self.job_spool_roots,
+            job_id,
+            step_id,
+            req.uid,
+            req.gid,
+        ) {
+            Ok(files) => files,
+            Err(error) => {
+                self.drain_on_node_fault(&error, job_id);
+                return Err(Status::internal(format!("step output files: {error}")));
+            }
+        };
         let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
         let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
         {
@@ -14970,23 +14988,31 @@ mod tests {
         assert_eq!(contents.trim(), "spooled-marker");
     }
 
-    // Blocks the temp-fallback spool root with a regular file so
-    // create_job_spool_dir fails on both candidates (this test runs as a
-    // non-root user, so `/var/spool/spur` always fails first anyway) and
-    // returns the owned-root failure, proving RunCommand reaches the drain
-    // check on a real NodeFault instead of only the job-specific case.
+    // Isolated candidate roots make both failures deterministic regardless of
+    // the runner's uid, unlike relying on /var/spool/spur's real permissions.
     #[tokio::test]
     async fn run_command_drains_the_node_when_its_spool_root_is_unwritable() {
         let (controller_addr, _reports, drains) = spawn_mock_controller();
-        let svc = test_agent_service(test_reporter_with_controller(&controller_addr));
+        let owned_root = tempfile::tempdir().expect("isolated owned root");
+        let fallback_root = tempfile::tempdir().expect("isolated fallback root");
         let job_id = 9001;
-        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        std::fs::write(
+            owned_root.path().join(format!("job{job_id}")),
+            b"blocking the owned root",
+        )
+        .expect("block owned root");
+        std::fs::write(
+            fallback_root.path().join(format!("job{job_id}")),
+            b"blocking the fallback root",
+        )
+        .expect("block fallback root");
 
-        let blocked_dir = std::env::temp_dir()
-            .join("spur")
-            .join(format!("job{job_id}"));
-        let _ = std::fs::remove_dir_all(&blocked_dir);
-        std::fs::write(&blocked_dir, b"blocking the spool dir").expect("block temp spool root");
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr))
+            .with_job_spool_roots(vec![
+                owned_root.path().to_path_buf(),
+                fallback_root.path().to_path_buf(),
+            ]);
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
 
         let status = svc
             .run_command(Request::new(RunCommandRequest {
@@ -15007,8 +15033,6 @@ mod tests {
         let drained = expect_drain(&drains, 5_000).await;
         assert_eq!(drained.len(), 1, "exactly one drain request expected");
         assert_eq!(drained[0].name, "test-node");
-
-        let _ = std::fs::remove_file(&blocked_dir);
     }
 
     #[tokio::test]
@@ -16792,17 +16816,42 @@ mod tests {
 
     #[test]
     fn stepd_session_dir_enospc_under_the_owned_root_is_a_node_fault() {
-        let dir = std::path::PathBuf::from("/var/spool/spur/runtime/1.1.0");
-        let err = session_dir_prepare_error(&dir, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        let state_dir = std::path::PathBuf::from("/var/spool/spur");
+        let dir = state_dir.join("runtime/1.1.0");
+        let err = session_dir_prepare_error(
+            &dir,
+            &state_dir,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
         assert!(matches!(err, executor::LaunchError::NodeFault(_)));
         let reason = err.drain_reason().expect("node fault must drain");
         assert!(reason.contains("No space left on device"), "{reason}");
     }
 
+    // The owned root is whatever this agent is configured with, not the
+    // hardcoded job-spool default.
+    #[test]
+    fn stepd_session_dir_enospc_under_a_relocated_state_dir_is_a_node_fault() {
+        let state_dir = std::path::PathBuf::from("/data/spur");
+        let dir = state_dir.join("runtime/1.1.0");
+        let err = session_dir_prepare_error(
+            &dir,
+            &state_dir,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert!(matches!(err, executor::LaunchError::NodeFault(_)));
+        assert!(err.drain_reason().is_some());
+    }
+
     #[test]
     fn stepd_session_dir_error_outside_the_owned_root_does_not_drain() {
+        let state_dir = std::path::PathBuf::from("/var/spool/spur");
         let dir = std::env::temp_dir().join("spur-test").join("runtime/1.1.0");
-        let err = session_dir_prepare_error(&dir, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        let err = session_dir_prepare_error(
+            &dir,
+            &state_dir,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
         assert!(matches!(err, executor::LaunchError::Other(_)));
         assert!(err.drain_reason().is_none());
     }
