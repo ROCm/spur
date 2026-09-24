@@ -43,6 +43,9 @@ tokio-stream = "0.1"
 shlex = "2"
 subtle = { workspace = true }
 uuid = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
