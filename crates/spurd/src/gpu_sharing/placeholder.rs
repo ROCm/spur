@@ -285,6 +285,9 @@ where
     }
 }
 
+/// A worker may not create namespaces; for it the control-plane node made
+/// `spur-system` when it minted the worker's credential, so a denied create
+/// falls back to a read.
 pub async fn ensure_namespace(client: &Client) -> Result<(), kube::Error> {
     let ns = Namespace {
         metadata: ObjectMeta {
@@ -297,11 +300,11 @@ pub async fn ensure_namespace(client: &Client) -> Result<(), kube::Error> {
         },
         ..Default::default()
     };
-    exists_ok(
-        Api::<Namespace>::all(client.clone())
-            .create(&PostParams::default(), &ns)
-            .await,
-    )
+    let api = Api::<Namespace>::all(client.clone());
+    match api.create(&PostParams::default(), &ns).await {
+        Err(e) if is_code(&e, 403) => api.get(NAMESPACE).await.map(|_| ()),
+        r => exists_ok(r),
+    }
 }
 
 fn pod_condition(pod: &Pod, kind: &str) -> Option<(String, Option<String>, Option<String>)> {
@@ -992,6 +995,26 @@ mod tests {
         assert!(matches!(err, AcquireError::Rejected(_)), "{err:?}");
         assert_eq!(api.calls(Method::POST, CLAIMS).len(), 1);
         assert_eq!(api.calls(Method::DELETE, CLAIM).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_without_namespace_create_reads_the_namespace() {
+        let api = ScriptedApi::new(|s| match (s.method.as_str(), s.path.as_str()) {
+            ("POST", NS_PATH) => api_error(403, "Forbidden"),
+            ("GET", "/api/v1/namespaces/spur-system") => ok(json!({"apiVersion": "v1",
+                "kind": "Namespace", "metadata": {"name": NAMESPACE}})),
+            _ => api_error(500, "unexpected"),
+        });
+
+        ensure_namespace(&api.client())
+            .await
+            .expect("namespace exists");
+
+        assert_eq!(
+            api.calls(Method::GET, "/api/v1/namespaces/spur-system")
+                .len(),
+            1
+        );
     }
 
     #[test]
