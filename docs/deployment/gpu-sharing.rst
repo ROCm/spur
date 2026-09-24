@@ -183,19 +183,19 @@ follow. In each procedure, the driver must run only on shared nodes.
 With the Helm chart of the driver
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The chart is in the directory ``helm-charts-k8s`` of
+The chart is a release asset of
 `ROCm/k8s-gpu-dra-driver <https://github.com/ROCm/k8s-gpu-dra-driver>`_,
 release ``v1.0.1``. The chart makes the DeviceClass ``gpu.amd.com``.
 
 .. code-block:: bash
 
-   git clone --branch v1.0.1 https://github.com/ROCm/k8s-gpu-dra-driver.git
-   helm install amd-gpu-dra k8s-gpu-dra-driver/helm-charts-k8s \
+   helm install amd-gpu-dra \
+       https://github.com/ROCm/k8s-gpu-dra-driver/releases/download/v1.0.1/k8s-gpu-dra-driver-v1.0.1.tgz \
        --namespace kube-amd-gpu --create-namespace \
        --set image.tag=v1.0.1 \
        --set-string 'kubeletPlugin.nodeSelector.spur\.amd\.com/gpu-sharing=true'
 
-Always set ``image.tag``. The default tag of the chart is ``v0.1.0``.
+Set ``image.tag`` to pin the image. The release chart uses its ``appVersion`` when the tag is empty.
 
 With the kubelet links, the default kubelet paths of the chart are correct. If
 you do not want to use the links, set the k0s paths. These values are
