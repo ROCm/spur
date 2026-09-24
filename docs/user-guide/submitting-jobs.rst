@@ -421,6 +421,72 @@ variables in your batch script, or let ``torchrun`` compute them:
    export WORLD_SIZE="${WORLD_SIZE:-$SPUR_NTASKS}"
    export RANK="${RANK:-$SPUR_PROCID}"
 
+.. _submit-sbcast:
+
+Staging Files onto Allocated Nodes — ``sbcast``
+------------------------------------------------
+
+``sbcast`` copies a file from the submit host to every node allocated to a
+running job. The usual reason is to put a binary, dataset, or config on fast
+node-local storage (``/tmp``, ``/dev/shm``) at job start, so the ranks read it
+from local disk instead of all hitting a shared filesystem at once.
+
+The whole file travels in one message, so a broadcast is capped at just under
+8 MiB and is refused up front if the source is larger. Bigger artifacts still
+belong on a shared filesystem.
+
+.. code-block:: bash
+
+   sbcast ./tokenizer.json /tmp/tokenizer.json
+
+Run inside a job script, that stages the file on each allocated node before the
+work starts:
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH --nodes=4
+   #SBATCH --gres=gpu:mi300x:8
+
+   sbcast --force ./train.cfg /tmp/train.cfg
+   srun ./train --config /tmp/train.cfg
+
+Options:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 12 66
+
+   * - Option
+     - Short
+     - Description
+   * - ``--force``
+     - ``-f``
+     - Overwrite the destination if it already exists. Without it, an existing
+       file is an error.
+   * - ``--jobid``
+     - ``-j``
+     - Job to broadcast to. Defaults to ``$SPUR_JOB_ID``, then ``$SLURM_JOB_ID``,
+       so it can be omitted inside an allocation.
+
+A relative ``DEST`` resolves against the job's working directory; an absolute
+path is used as given. The destination file takes the mode of the source file.
+
+The job must be running and owned by the caller. If some nodes fail — a
+read-only path, a full disk — the broadcast continues to the rest and reports
+the per-node failures rather than stopping at the first one.
+
+Writes land as the job's user, so the destination must be a path that user can
+write. Staging into a root-owned directory fails with a permission error even
+when the node agent runs as root.
+
+.. note::
+
+   ``--compress``/``-C`` and ``--preserve``/``-p`` are accepted for drop-in
+   compatibility but do nothing: nothing is compressed on the wire, and the mode
+   always comes from the source file. ``--exclude`` and ``--send-libs`` are not
+   supported yet.
+
 See Also
 --------
 
