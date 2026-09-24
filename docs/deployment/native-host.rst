@@ -753,12 +753,6 @@ across two hosts hangs.
    export NCCL_SOCKET_IFNAME=eth0                    # RCCL sockets; the same NIC
    EOF
 
-Where the host has RDMA devices that are not usable end to end, RCCL still
-prefers them and ``ncclCommInitRank`` fails with ``unhandled system error``
-rather than falling back on its own. ``NCCL_IB_DISABLE=1`` forces sockets. Set it
-only after confirming RDMA is genuinely unavailable, since it gives up the fast
-path for every collective on the node.
-
 Build the application **on each agent** with that prefix's ``mpicc`` (the
 controller often has no MPI compiler). The binary path in the batch script
 must exist on every allocated node.

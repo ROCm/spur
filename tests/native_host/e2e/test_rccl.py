@@ -73,7 +73,6 @@ def assert_allreduce_correct(out: str, expected_size: int) -> None:
     )
 
 
-@pytest.mark.mpi
 @pytest.mark.gpu
 class TestRcclIntraNode:
     def test_rccl_all_reduce_two_ranks_one_node(self, mpi_cluster):
@@ -123,7 +122,6 @@ class TestRcclIntraNode:
         assert len(set(buses)) == 2, f"ranks shared a GPU: {buses}\n{out}"
 
 
-@pytest.mark.mpi
 @pytest.mark.gpu
 class TestRcclInterNode:
     def test_rccl_all_reduce_two_nodes_one_rank_each(self, mpi_multi_node_cluster):

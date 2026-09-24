@@ -136,31 +136,11 @@ def _ensure_bins(ssh_nodes, remote_bin_dir):
     ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir)
 
 
-# The deployment guide requires hash GDS on the spurd side on Ubuntu's
-# libpmix2t64, as well as in the rank environment. Getting it wrong hangs MPI_Init
-# and the ranks are killed, surfacing only as exit 137.
-#
-# SPUR_TEST_PMIX_LIB_DIR handles a site with two PMIx installs. The plugin must load
-# the same OpenPMIx the ranks do; where a vendor MPI bundles its own (say Open MPI
-# under /usr/mpi/... with PMIx 3.x) while the distro ships PMIx 5, the server picks
-# the distro one and the ranks fail at MPI_Init with
-# "OPAL ERROR: Error in file pmix3x_client.c". Point this at the vendor lib dir.
-def _pmix_server_env() -> dict[str, str]:
-    env = {"PMIX_MCA_gds": "hash"}
-    lib_dir = os.environ.get("SPUR_TEST_PMIX_LIB_DIR", "").strip()
-    if lib_dir:
-        env["LD_LIBRARY_PATH"] = f"{lib_dir}:$LD_LIBRARY_PATH"
-    return env
-
-
 def _deploy_cluster(ssh_nodes, remote_bin_dir, *, agent_as_root: bool = False,
                     config_overrides: dict | None = None,
-                    agent_labels: dict[int, dict[str, str]] | None = None,
-                    agent_env: dict[str, str] | None = None):
+                    agent_labels: dict[int, dict[str, str]] | None = None):
     """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure."""
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
-    if agent_env:
-        c.agent_env.update(agent_env)
     try:
         c.deploy(config_overrides=config_overrides, agent_as_root=agent_as_root,
                  agent_labels=agent_labels)
@@ -443,8 +423,7 @@ def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     overrides = cluster_config_overrides or {}
     merged = deep_merge(dict(overrides), mpi_cfg) if isinstance(overrides, dict) else mpi_cfg
 
-    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged,
-                        agent_env=_pmix_server_env())
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged)
     c.mpi_preflight(2)
     yield c
     c.teardown()
@@ -475,8 +454,7 @@ def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     overrides = cluster_config_overrides or {}
     merged = deep_merge(dict(overrides), mpi_cfg) if isinstance(overrides, dict) else mpi_cfg
 
-    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged,
-                        agent_env=_pmix_server_env())
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged)
     c.mpi_preflight(1)
     yield c
     c.teardown()

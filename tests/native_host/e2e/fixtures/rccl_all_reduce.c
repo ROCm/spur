@@ -1,13 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// MPI + RCCL all-reduce. Exercises the one combination Spur's e2e never covered:
-// ranks bootstrapped by Spur's PMIx plugin, then a GPU collective over RCCL.
-//
-// The existing distributed_test.py drives RCCL through PyTorch on a single node,
-// and hello_mpi.c drives PMIx with no GPU. Neither proves that a rank map handed
-// out by `srun --mpi=pmix` can bring up an RCCL communicator, which is what every
-// real MPI-launched RCCL workload depends on.
+// MPI + RCCL all-reduce: ranks bootstrapped by Spur's PMIx plugin, then a GPU
+// collective over RCCL.
 //
 // Output contract, parsed by test_rccl.py:
 //   rank=<r> size=<n> host=<h> device=<d>

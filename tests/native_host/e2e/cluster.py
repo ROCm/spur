@@ -104,21 +104,6 @@ class SshNode:
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         connect_kwargs = {"hostname": host, "username": user}
-        # Nodes reachable only through a bastion: paramiko does not read ssh_config,
-        # so a ProxyCommand there has no effect. Dial through a SOCKS5 proxy instead
-        # and hand paramiko the connected socket. The hostname is unchanged, which
-        # matters because the same string is what the cluster tells its own nodes to
-        # use for controller and agent addresses.
-        socks_proxy = os.environ.get("SPUR_TEST_SSH_SOCKS", "").strip()
-        if socks_proxy:
-            import socks  # PySocks; only needed on this path
-
-            proxy_host, _, proxy_port = socks_proxy.rpartition(":")
-            sock = socks.socksocket()
-            sock.set_proxy(socks.SOCKS5, proxy_host or "127.0.0.1", int(proxy_port))
-            sock.settimeout(60)
-            sock.connect((host, 22))
-            connect_kwargs["sock"] = sock
         if key_path:
             connect_kwargs["key_filename"] = key_path
         elif password:
@@ -437,11 +422,8 @@ class SpurCluster:
         parts = [
             f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            # Point the CLI at this cluster's own config. The daemons already get it
-            # via -f, but the CLI would otherwise fall back to /etc/spur/spur.conf and
-            # inherit whatever the host is configured for -- on a node set up for
-            # native auth it refuses to talk to a throwaway controller at all
-            # ("controller did not advertise a native auth audience").
+            # Without this the CLI falls back to /etc/spur/spur.conf and inherits
+            # whatever the host is configured for, rather than this cluster.
             f"SPUR_CONF={shlex.quote(self.etc_dir)}/spur.conf",
         ]
         for key, value in self.cli_env.items():
