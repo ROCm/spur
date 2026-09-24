@@ -262,7 +262,16 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
             }
         }
         'k' => job.comment.clone(),
-        'A' => job.job_id.to_string(),
+        // Parent array job id for array tasks; the job's own id otherwise
+        // (array_job_id is 0 for non-array jobs).
+        'A' => {
+            let id = if job.array_job_id != 0 {
+                job.array_job_id
+            } else {
+                job.job_id
+            };
+            id.to_string()
+        }
         // Generic resources (GRES) requested, e.g. "gpu:8" or "gpu:mi300x:4/node".
         'b' => {
             if job.req_gpus_detail.is_empty() {
@@ -530,7 +539,7 @@ fn squeue_field_spec(name: &str) -> Option<char> {
         "command" => 'o',
         "comment" => 'k',
         "endtime" => 'e',
-        "gres" | "trespernode" | "tres-per-node" => 'b',
+        "gres" => 'b',
         "jobid" => 'i',
         "name" => 'j',
         "nodelist" | "nodes" => 'N',
@@ -1068,6 +1077,26 @@ mod tests {
     fn squeue_field_spec_rejects_unsupported_names() {
         assert_eq!(squeue_field_spec("Licenses"), None);
         assert_eq!(squeue_field_spec("Dependency"), None);
+        // TRES-per-node is distinct from GRES and has no backing data.
+        assert_eq!(squeue_field_spec("TRESPerNode"), None);
+        assert_eq!(squeue_field_spec("tres-per-node"), None);
+    }
+
+    #[test]
+    fn array_job_id_renders_parent_for_array_tasks_and_own_id_otherwise() {
+        let spec = squeue_field_spec("ArrayJobID").unwrap();
+        let task = spur_proto::proto::JobInfo {
+            job_id: 57,
+            array_job_id: 42,
+            ..Default::default()
+        };
+        assert_eq!(resolve_job_field(&task, spec), "42");
+        let plain = spur_proto::proto::JobInfo {
+            job_id: 57,
+            array_job_id: 0,
+            ..Default::default()
+        };
+        assert_eq!(resolve_job_field(&plain, spec), "57");
     }
 
     #[test]

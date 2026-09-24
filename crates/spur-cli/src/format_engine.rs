@@ -185,14 +185,15 @@ pub fn parse_format2(
 ) -> anyhow::Result<Vec<FormatToken>> {
     let mut tokens = Vec::new();
     for item in fmt.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
+        if item.trim().is_empty() {
             continue;
         }
 
+        // Trim only the field name; the suffix (text after size) is preserved
+        // verbatim, including a trailing space used purely as a separator.
         let (name, spec_part) = match item.split_once(':') {
             Some((n, rest)) => (n.trim(), Some(rest)),
-            None => (item, None),
+            None => (item.trim(), None),
         };
 
         let Some(spec) = name_to_spec(name) else {
@@ -719,6 +720,16 @@ mod tests {
         let tokens = parse_format2("JobID:10|", &test_name_to_spec, &squeue_header).unwrap();
         assert!(matches!(&tokens[0], FormatToken::Field(f) if f.spec == 'i' && f.width == 10));
         assert!(matches!(&tokens[1], FormatToken::Literal(s) if s == "|"));
+    }
+
+    #[test]
+    fn parse_format2_preserves_whitespace_suffix() {
+        // A trailing space is a valid separator suffix and must survive parsing.
+        let tokens =
+            parse_format2("JobID:10 ,Partition", &test_name_to_spec, &squeue_header).unwrap();
+        assert!(matches!(&tokens[0], FormatToken::Field(f) if f.spec == 'i' && f.width == 10));
+        assert!(matches!(&tokens[1], FormatToken::Literal(s) if s == " "));
+        assert!(matches!(&tokens[2], FormatToken::Field(f) if f.spec == 'P'));
     }
 
     #[test]
