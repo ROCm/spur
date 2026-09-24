@@ -14,6 +14,7 @@ pub mod container;
 pub mod controller_auth;
 pub(crate) mod device_cgroup;
 pub mod executor;
+pub mod gpu_sharing;
 pub mod job_entry;
 pub(crate) mod job_lifecycle;
 pub mod landlock;
