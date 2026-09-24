@@ -1,0 +1,364 @@
+{
+  "apiVersion": "resource.k8s.io/v1",
+  "kind": "ResourceSlice",
+  "metadata": {
+    "generateName": "00000-gpu.amd.com-gpu-node-1-",
+    "generation": 1,
+    "name": "00000-gpu.amd.com-gpu-node-1-bmztw"
+  },
+  "spec": {
+    "devices": [
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 0
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:07"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-1-128"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 0
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:2f:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:25"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-9-136"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 0
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:46:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:3c"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-17-144"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 0
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:5d:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:53"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-25-152"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 1
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:8b:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:81"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-33-160"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 1
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:aa:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:a0"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-41-168"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 1
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:c2:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:b8"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-49-176"
+      },
+      {
+        "attributes": {
+          "deviceID": {
+            "string": "0x74a1"
+          },
+          "driverVersion": {
+            "version": "6.19.14"
+          },
+          "driverVersionFull": {
+            "string": "6.19.14.31400000"
+          },
+          "numaNode": {
+            "int": 1
+          },
+          "partitionProfile": {
+            "string": "spx_nps1"
+          },
+          "productName": {
+            "string": "AMD_Instinct_MI300X_OAM"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:da:00.0"
+          },
+          "resource.kubernetes.io/pcieRoot": {
+            "string": "pci0000:d0"
+          },
+          "type": {
+            "string": "amdgpu"
+          }
+        },
+        "capacity": {
+          "computeUnits": {
+            "value": "304"
+          },
+          "memory": {
+            "value": "196592Mi"
+          },
+          "simdUnits": {
+            "value": "1216"
+          }
+        },
+        "name": "gpu-57-184"
+      }
+    ],
+    "driver": "gpu.amd.com",
+    "nodeName": "gpu-node-1",
+    "pool": {
+      "generation": 1,
+      "name": "gpu-node-1",
+      "resourceSliceCount": 1
+    }
+  }
+}
