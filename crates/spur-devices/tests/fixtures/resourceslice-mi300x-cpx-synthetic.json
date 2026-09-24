@@ -1,0 +1,183 @@
+{
+  "apiVersion": "resource.k8s.io/v1",
+  "kind": "ResourceSlice",
+  "metadata": {
+    "name": "gpu-node-1-gpu.amd.com-synthetic"
+  },
+  "spec": {
+    "driver": "gpu.amd.com",
+    "nodeName": "gpu-node-1",
+    "pool": {
+      "name": "gpu-node-1",
+      "generation": 1,
+      "resourceSliceCount": 1
+    },
+    "devices": [
+      {
+        "name": "gpu-1-128",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-2-129",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-3-130",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-4-131",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-5-132",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-6-133",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-7-134",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-8-135",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:11:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-9-136",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:2f:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-17-144",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:46:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-25-152",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:5d:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-33-160",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:8b:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-41-168",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:aa:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-49-176",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:c2:00.0"
+          }
+        }
+      },
+      {
+        "name": "gpu-57-184",
+        "attributes": {
+          "type": {
+            "string": "amdgpu"
+          },
+          "resource.kubernetes.io/pciBusID": {
+            "string": "0000:e1:00.0"
+          }
+        }
+      }
+    ]
+  }
+}
