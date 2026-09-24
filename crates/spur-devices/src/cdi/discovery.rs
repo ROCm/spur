@@ -16,6 +16,7 @@ use crate::types::LinkType;
 
 const AMD_CDI_KIND: &str = "amd.com/gpu";
 const KFD_TOPOLOGY_ROOT: &str = "/sys/class/kfd/kfd/topology/nodes";
+const DRM_CLASS_ROOT: &str = "/sys/class/drm";
 const KFD_AMD_VENDOR_ID: u32 = 4098; // 0x1002
 const VRAM_HEAP_TYPE: u64 = 1;
 const IO_LINK_XGMI: u32 = 2;
@@ -304,6 +305,73 @@ fn partition_indices_by_bdf(nodes: &[KfdGpuNode]) -> HashMap<u32, u32> {
     map
 }
 
+/// How the AMD DRA driver (`gpu.amd.com`) identifies one KFD device, so a
+/// shared node can join its inventory with the driver's `ResourceSlice`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharingIdentity {
+    /// Same value discovery reports as the device's `stable_id`.
+    pub stable_id: u64,
+    pub render_minor: u32,
+    pub card_id: Option<u32>,
+    /// The `resource.kubernetes.io/pciBusID` a claim selects this device by.
+    pub selector_bdf: String,
+}
+
+impl SharingIdentity {
+    /// DRA device name `gpu-<card>-<renderD>`; `None` when the device is unshareable.
+    pub fn dra_device_name(&self) -> Option<String> {
+        self.card_id
+            .map(|card| format!("gpu-{card}-{}", self.render_minor))
+    }
+
+    pub fn unshareable_reason(&self) -> Option<String> {
+        match self.card_id {
+            Some(_) => None,
+            None => Some(format!("no DRM card for renderD{}", self.render_minor)),
+        }
+    }
+}
+
+/// Sharing identities of the KFD devices on this host.
+pub fn discover_sharing_identities() -> Vec<SharingIdentity> {
+    sharing_identities_from(Path::new(KFD_TOPOLOGY_ROOT), Path::new(DRM_CLASS_ROOT))
+}
+
+/// [`discover_sharing_identities`] over explicit sysfs roots
+/// (`/sys/class/kfd/kfd/topology/nodes` and `/sys/class/drm`).
+pub fn sharing_identities_from(kfd_root: &Path, drm_root: &Path) -> Vec<SharingIdentity> {
+    let nodes = discover_kfd_gpus_from_root(kfd_root);
+    let ranks = partition_indices_by_bdf(&nodes);
+    nodes
+        .iter()
+        .map(|node| SharingIdentity {
+            stable_id: encode_stable_id(
+                node.location_id,
+                node.domain,
+                ranks.get(&node.render_minor).copied().unwrap_or(0),
+            ),
+            render_minor: node.render_minor,
+            card_id: find_card_in(drm_root, node.render_minor),
+            selector_bdf: selector_bdf(node, &nodes),
+        })
+        .collect()
+}
+
+/// The BDF a `ResourceClaim` selects a device by. The kernel ORs a partition's
+/// KFD node id into the PCI function bits of `location_id`, so a partitioned
+/// device gets function 0, the parent GPU's address the DRA driver publishes.
+// ponytail: collapses to `bdf_from_location_id` once the kernel decode is fixed upstream.
+fn selector_bdf(node: &KfdGpuNode, nodes: &[KfdGpuNode]) -> String {
+    let parent = |n: &KfdGpuNode| (n.domain, n.location_id >> 3);
+    let siblings = nodes.iter().filter(|n| parent(n) == parent(node)).count();
+    let location_id = if siblings > 1 {
+        node.location_id & !0x07
+    } else {
+        node.location_id
+    };
+    bdf_from_location_id(location_id, node.domain)
+}
+
 fn format_unique_id(unique_id: u64) -> String {
     format!("{:016x}", unique_id)
 }
@@ -558,8 +626,11 @@ fn build_link_weights(
 }
 
 fn find_card_for_render_minor(render_minor: u32) -> Option<u32> {
+    find_card_in(Path::new(DRM_CLASS_ROOT), render_minor)
+}
+
+fn find_card_in(drm_dir: &Path, render_minor: u32) -> Option<u32> {
     let render_name = format!("renderD{render_minor}");
-    let drm_dir = Path::new("/sys/class/drm");
     let entries = std::fs::read_dir(drm_dir).ok()?;
 
     for entry in entries.flatten() {
@@ -1160,5 +1231,89 @@ mod tests {
             bdf_from_location_id(kfd_nodes[0].location_id, kfd_nodes[0].domain),
             "0000:05:00.0"
         );
+    }
+
+    fn make_drm_card(drm_root: &Path, card: u32, render_minor: u32) {
+        let drm = drm_root.join(format!("card{card}/device/drm"));
+        fs::create_dir_all(drm.join(format!("card{card}"))).unwrap();
+        fs::create_dir_all(drm.join(format!("renderD{render_minor}"))).unwrap();
+    }
+
+    const MI300X_BUSES: [u64; 8] = [0x11, 0x2f, 0x46, 0x5d, 0x8b, 0xaa, 0xc2, 0xe1];
+
+    /// MI300X in SPX: the amdgpu_xcp platform devices add card/renderD pairs
+    /// that are not KFD devices, so the KFD GPU at renderD136 lives on card9.
+    #[test]
+    fn sharing_identity_spx_names_card_and_render_minor() {
+        let kfd = tempfile::tempdir().unwrap();
+        let drm = tempfile::tempdir().unwrap();
+        for (i, bus) in MI300X_BUSES.iter().enumerate() {
+            let render = 128 + 8 * i as u32;
+            make_kfd_gpu(kfd.path(), 2 + i as u32, render, bus << 8);
+            make_drm_card(drm.path(), render - 127, render);
+        }
+        make_drm_card(drm.path(), 2, 129);
+        fs::create_dir_all(drm.path().join("card9-DP-1")).unwrap();
+
+        let ids = sharing_identities_from(kfd.path(), drm.path());
+
+        assert_eq!(ids.len(), 8);
+        let gpu = ids.iter().find(|g| g.render_minor == 136).unwrap();
+        assert_eq!(gpu.card_id, Some(9));
+        assert_eq!(gpu.dra_device_name().as_deref(), Some("gpu-9-136"));
+        assert_eq!(gpu.selector_bdf, "0000:2f:00.0");
+        assert_eq!(gpu.stable_id, encode_stable_id(0x2f00, 0, 0));
+        assert_eq!(gpu.unshareable_reason(), None);
+        let names: Vec<String> = ids.iter().filter_map(|g| g.dra_device_name()).collect();
+        assert_eq!(names[0], "gpu-1-128");
+        assert_eq!(names[7], "gpu-57-184");
+    }
+
+    #[test]
+    fn sharing_identity_without_card_is_unshareable() {
+        let kfd = tempfile::tempdir().unwrap();
+        let drm = tempfile::tempdir().unwrap();
+        make_kfd_gpu(kfd.path(), 2, 130, 0x1100);
+
+        let ids = sharing_identities_from(kfd.path(), drm.path());
+
+        assert_eq!(ids[0].dra_device_name(), None);
+        assert_eq!(
+            ids[0].unshareable_reason().as_deref(),
+            Some("no DRM card for renderD130")
+        );
+    }
+
+    /// Values measured on an MI300X at 0000:11:00.0 in CPX: the kernel ORs the
+    /// partition node id into location_id (0x1100..0x1107) while lspci lists
+    /// function 0 only. The SPX GPU at 0000:2f:00.0 is the control.
+    #[test]
+    fn sharing_identity_cpx_selects_parent_bdf_with_function_zero() {
+        let kfd = tempfile::tempdir().unwrap();
+        let drm = tempfile::tempdir().unwrap();
+        for i in 0u32..8 {
+            make_kfd_gpu(kfd.path(), 9 + i, 128 + i, 0x1100 | u64::from(i));
+            make_drm_card(drm.path(), 1 + i, 128 + i);
+        }
+        make_kfd_gpu(kfd.path(), 2, 136, 0x2f00);
+        make_drm_card(drm.path(), 9, 136);
+
+        let ids = sharing_identities_from(kfd.path(), drm.path());
+
+        assert_eq!(ids.len(), 9);
+        for (i, gpu) in ids.iter().take(8).enumerate() {
+            assert_eq!(
+                gpu.selector_bdf, "0000:11:00.0",
+                "renderD{}",
+                gpu.render_minor
+            );
+            assert_eq!(
+                gpu.dra_device_name(),
+                Some(format!("gpu-{}-{}", 1 + i, 128 + i))
+            );
+        }
+        assert_eq!(ids[8].selector_bdf, "0000:2f:00.0");
+        let sids: std::collections::HashSet<u64> = ids.iter().map(|g| g.stable_id).collect();
+        assert_eq!(sids.len(), 9);
     }
 }
