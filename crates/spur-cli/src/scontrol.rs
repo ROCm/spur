@@ -52,6 +52,7 @@ pub enum ScontrolCommand {
     ///   scontrol update PartitionName=gpu MaxTime=48:00:00 State=DOWN
     ///   scontrol update JobId=42 Priority=100
     ///   scontrol update NodeName=n1 State=drain Reason=maintenance
+    ///   scontrol update NodeName=n1 GpuSharing=yes
     Update {
         /// key=value pairs
         #[arg(trailing_var_arg = true)]
@@ -637,6 +638,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .collect();
                     println!("   Gres={}", gpu_types.join(","));
                 }
+                for line in gpu_sharing_lines(&node) {
+                    println!("   {line}");
+                }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
                     let mut label_str: Vec<String> = node
@@ -1084,6 +1088,41 @@ fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String
     ))
 }
 
+/// `GpuSharing=` plus, on a shared node, the node-level reason and one line per GPU owner.
+fn gpu_sharing_lines(node: &spur_proto::proto::NodeInfo) -> Vec<String> {
+    if !node.gpu_sharing {
+        return vec!["GpuSharing=no".into()];
+    }
+    let mut lines = vec!["GpuSharing=yes".to_string()];
+    let Some(report) = node.gpu_holds.as_ref() else {
+        lines.push("GpuHolds=(no report)".into());
+        return lines;
+    };
+    if !report.unshareable_reason.is_empty() {
+        lines.push(format!("GpuUnshareable={}", report.unshareable_reason));
+    }
+    lines.extend(report.gpus.iter().map(gpu_hold_line));
+    lines
+}
+
+fn gpu_hold_line(hold: &spur_proto::proto::GpuHold) -> String {
+    use spur_proto::proto::GpuHoldState;
+    let pod = format!("{}/{}", hold.pod_namespace, hold.pod_name);
+    let state = match hold.state() {
+        GpuHoldState::GpuHoldFree => "free".to_string(),
+        GpuHoldState::GpuHoldSpurJob => format!("job {}", hold.job_id),
+        GpuHoldState::GpuHoldK8s => format!("held {pod} (claim {})", hold.claim_name),
+        GpuHoldState::GpuHoldConflict => format!("conflict job {} vs {pod}", hold.job_id),
+        GpuHoldState::GpuHoldUnshareable => format!("unshareable ({})", hold.reason),
+    };
+    let device = if hold.dra_device.is_empty() {
+        "-"
+    } else {
+        &hold.dra_device
+    };
+    format!("Gpu={:#x} Device={device} State={state}", hold.stable_id)
+}
+
 async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
@@ -1379,6 +1418,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     let mut node_name: Option<String> = None;
     let mut node_state: Option<String> = None;
     let mut node_reason: Option<String> = None;
+    let mut gpu_sharing: Option<String> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1393,6 +1433,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
                 "nodename" | "node" => node_name = Some(value.into()),
                 "state" => node_state = Some(value.into()),
                 "reason" => node_reason = Some(value.into()),
+                "gpusharing" => gpu_sharing = Some(value.into()),
                 other => eprintln!("scontrol: unknown update key '{}'", other),
             }
         }
@@ -1401,6 +1442,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     // Node update takes priority if NodeName is specified
     if let Some(node_pattern) = node_name {
         let proto_state = node_state.as_deref().map(parse_node_state).transpose()?;
+        let gpu_sharing = gpu_sharing.as_deref().map(parse_yes_no).transpose()?;
 
         let channel = crate::authclient::connect(controller)
             .await
@@ -1410,7 +1452,14 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         let names = resolve_node_names(&mut client, &node_pattern).await?;
         let mut failed: Vec<String> = Vec::new();
         for name in &names {
-            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
+            let req = spur_proto::proto::UpdateNodeRequest {
+                name: name.clone(),
+                state: proto_state,
+                reason: node_reason.clone(),
+                gpu_sharing,
+                ..Default::default()
+            };
+            if let Err(e) = update_node(&mut client, req).await {
                 eprintln!("error: {name}: {e}");
                 failed.push(name.clone());
             }
@@ -1486,6 +1535,14 @@ pub(crate) async fn resolve_node_names(
         return Ok(names);
     }
     spur_core::hostlist::expand(pattern).context("invalid node name pattern")
+}
+
+fn parse_yes_no(value: &str) -> Result<bool> {
+    match value.to_lowercase().as_str() {
+        "yes" | "true" | "on" | "1" => Ok(true),
+        "no" | "false" | "off" | "0" => Ok(false),
+        _ => bail!("scontrol: invalid GpuSharing value '{value}'. Valid values: YES, NO"),
+    }
 }
 
 /// Parse a Slurm node state name into its proto representation.
@@ -1610,22 +1667,13 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     update_partition(controller, req).await
 }
 
-/// Update a node's state via the controller.
 async fn update_node(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
-    name: &str,
-    state: Option<i32>,
-    reason: Option<String>,
+    req: spur_proto::proto::UpdateNodeRequest,
 ) -> Result<()> {
+    let name = req.name.clone();
     client
-        .update_node(spur_proto::proto::UpdateNodeRequest {
-            gpu_sharing: Default::default(),
-            name: name.to_string(),
-            state,
-            reason,
-            labels: HashMap::new(),
-            remove_labels: Vec::new(),
-        })
+        .update_node(req)
         .await
         .context("node update failed")?;
 
@@ -2440,6 +2488,104 @@ mod tests {
         );
     }
 
+    fn hold(
+        stable_id: u64,
+        dra_device: &str,
+        state: spur_proto::proto::GpuHoldState,
+    ) -> spur_proto::proto::GpuHold {
+        spur_proto::proto::GpuHold {
+            stable_id,
+            dra_device: dra_device.into(),
+            state: state as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gpu_sharing_lines_not_shared() {
+        let node = spur_proto::proto::NodeInfo::default();
+        assert_eq!(gpu_sharing_lines(&node), vec!["GpuSharing=no"]);
+    }
+
+    #[test]
+    fn gpu_sharing_lines_shared_without_report() {
+        let node = spur_proto::proto::NodeInfo {
+            gpu_sharing: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            gpu_sharing_lines(&node),
+            vec!["GpuSharing=yes", "GpuHolds=(no report)"]
+        );
+    }
+
+    #[test]
+    fn gpu_sharing_lines_list_every_gpu_state() {
+        use spur_proto::proto::{GpuHold, GpuHoldReport, GpuHoldState};
+        let node = spur_proto::proto::NodeInfo {
+            gpu_sharing: true,
+            gpu_holds: Some(GpuHoldReport {
+                generation: 3,
+                unshareable_reason: String::new(),
+                gpus: vec![
+                    hold(0x19_0000, "gpu-1-128", GpuHoldState::GpuHoldFree),
+                    GpuHold {
+                        job_id: 42,
+                        ..hold(0x1a_0000, "gpu-2-129", GpuHoldState::GpuHoldSpurJob)
+                    },
+                    GpuHold {
+                        pod_namespace: "aim".into(),
+                        pod_name: "llama-0".into(),
+                        claim_name: "llama-0-gpu".into(),
+                        ..hold(0x1b_0000, "gpu-3-130", GpuHoldState::GpuHoldK8s)
+                    },
+                    GpuHold {
+                        job_id: 7,
+                        pod_namespace: "aim".into(),
+                        pod_name: "llama-1".into(),
+                        claim_name: "llama-1-gpu".into(),
+                        ..hold(0x1c_0000, "gpu-4-131", GpuHoldState::GpuHoldConflict)
+                    },
+                    GpuHold {
+                        reason: "no DRM card for renderD132".into(),
+                        ..hold(0x1d_0000, "", GpuHoldState::GpuHoldUnshareable)
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            gpu_sharing_lines(&node),
+            vec![
+                "GpuSharing=yes",
+                "Gpu=0x190000 Device=gpu-1-128 State=free",
+                "Gpu=0x1a0000 Device=gpu-2-129 State=job 42",
+                "Gpu=0x1b0000 Device=gpu-3-130 State=held aim/llama-0 (claim llama-0-gpu)",
+                "Gpu=0x1c0000 Device=gpu-4-131 State=conflict job 7 vs aim/llama-1",
+                "Gpu=0x1d0000 Device=- State=unshareable (no DRM card for renderD132)",
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_sharing_lines_show_node_level_reason() {
+        let node = spur_proto::proto::NodeInfo {
+            gpu_sharing: true,
+            gpu_holds: Some(spur_proto::proto::GpuHoldReport {
+                unshareable_reason: "no ResourceSlice from gpu.amd.com".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            gpu_sharing_lines(&node),
+            vec![
+                "GpuSharing=yes",
+                "GpuUnshareable=no ResourceSlice from gpu.amd.com"
+            ]
+        );
+    }
+
     fn idle_node() -> spur_proto::proto::NodeInfo {
         spur_proto::proto::NodeInfo {
             state: spur_proto::proto::NodeState::NodeIdle as i32,
@@ -2605,6 +2751,56 @@ mod tests {
             "error should mention failed node: {msg}"
         );
         assert!(msg.contains("1 of 3"), "error should report counts: {msg}");
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_sets_gpu_sharing() {
+        for (value, want) in [("yes", Some(true)), ("NO", Some(false))] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            main_with_args(vec![
+                "scontrol".into(),
+                "--controller".into(),
+                format!("http://{addr}"),
+                "update".into(),
+                "NodeName=n[1-2]".into(),
+                format!("GpuSharing={value}"),
+            ])
+            .await
+            .unwrap();
+            assert_eq!(capture.update_node_gpu_sharing(), vec![want; 2]);
+        }
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_state_leaves_gpu_sharing_unset() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n1".into(),
+            "State=DRAIN".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(capture.update_node_gpu_sharing(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_invalid_gpu_sharing_sends_no_rpcs() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let result = main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n1".into(),
+            "GpuSharing=maybe".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        assert!(capture.update_node_gpu_sharing().is_empty());
     }
 
     #[tokio::test]
