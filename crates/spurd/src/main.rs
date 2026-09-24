@@ -680,6 +680,10 @@ async fn main() -> anyhow::Result<()> {
     // deployments don't emit spur_k8s_node_* series.
     if cluster_config.enabled {
         reporter.set_k0s_status(k0s.node_state());
+        // Stays inactive, with no Kubernetes client, until the controller marks the node shared.
+        let gpu_sharing = spurd::gpu_sharing::GpuSharing::new(&hostname, k0s.clone());
+        reporter.set_gpu_sharing(gpu_sharing.clone());
+        tokio::spawn(gpu_sharing.converge_loop());
     }
     k0s.adopt_running_unit().await;
     tokio::spawn(k0s.supervise());
