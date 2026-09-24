@@ -30,6 +30,7 @@ subtrees:
               - file: deployment/wireguard
               - file: deployment/kubernetes
               - file: deployment/managed-kubernetes
+              - file: deployment/gpu-sharing
               - file: deployment/partitioning
               - file: deployment/upgrading
               - file: deployment/uninstalling
