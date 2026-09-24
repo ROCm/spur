@@ -125,6 +125,7 @@ fn run_with_view(
         topology: topology.as_ref(),
         fabric: enforce.then_some(&context),
         busy_until: &busy,
+        held_gpus: &HashMap::new(),
     };
     let mut scheduler = BackfillScheduler::new(100);
     let jobs: Vec<_> = jobs
@@ -610,6 +611,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
         topology: Some(&topology),
         fabric: Some(&context),
         busy_until: &busy,
+        held_gpus: &HashMap::new(),
     };
     let plain = job(1, 4, 6);
     let mut scheduler = BackfillScheduler::new(100);
@@ -696,6 +698,7 @@ fn property_run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignm
         topology: None,
         fabric: Some(&context),
         busy_until: &busy,
+        held_gpus: &HashMap::new(),
     };
     let mut scheduler = BackfillScheduler::new(100);
     let assignments = scheduler.schedule_jobs(jobs, &cluster, now(), true);

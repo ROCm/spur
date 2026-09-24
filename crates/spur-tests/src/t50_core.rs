@@ -1173,6 +1173,7 @@ address = "http://peer-a:6817"
         let cluster = spur_sched::traits::ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],

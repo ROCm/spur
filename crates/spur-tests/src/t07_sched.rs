@@ -29,6 +29,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -55,6 +56,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -80,6 +82,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -101,6 +104,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -125,6 +129,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -152,6 +157,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -183,6 +189,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -328,6 +335,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -356,6 +364,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -382,6 +391,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -409,6 +419,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -440,6 +451,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -506,6 +518,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -528,6 +541,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -589,6 +603,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
@@ -628,6 +643,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
@@ -651,6 +667,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -675,6 +692,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -698,6 +716,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -725,6 +744,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -753,6 +773,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -782,6 +803,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -813,6 +835,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -864,6 +887,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -929,6 +953,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -973,6 +998,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1017,6 +1043,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1070,6 +1097,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -1097,6 +1125,7 @@ mod tests {
         let cluster = ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],

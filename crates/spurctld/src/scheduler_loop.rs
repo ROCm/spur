@@ -169,6 +169,7 @@ pub(crate) fn relinquish_leadership(
     cluster.set_planned_reservations(HashMap::new());
     cluster.set_planned_job_starts(HashMap::new());
     scheduler.clear_outcomes();
+    cluster.clear_gpu_holds();
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -367,6 +368,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             .as_ref()
             .and_then(|config| config.build(&cluster.get_nodes(), &view));
         let fabric = Some(spur_sched::traits::FabricSchedulingContext { view });
+        let held_gpus = cluster.held_gpus(&nodes);
         let cluster_state = ClusterState {
             fabric: fabric.as_ref(),
             nodes: &nodes,
@@ -374,6 +376,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             reservations: &reservations,
             topology: topology.as_ref(),
             busy_until: &busy_until,
+            held_gpus: &held_gpus,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -994,6 +997,7 @@ pub(crate) fn trial_placement(
         .as_ref()
         .and_then(|config| config.build(&cluster.get_nodes(), &view));
     let fabric = spur_sched::traits::FabricSchedulingContext { view };
+    let held_gpus = cluster.held_gpus(&nodes);
     let state = ClusterState {
         fabric: Some(&fabric),
         nodes: &nodes,
@@ -1001,6 +1005,7 @@ pub(crate) fn trial_placement(
         reservations: &reservations,
         topology: topology.as_ref(),
         busy_until: &busy_until,
+        held_gpus: &held_gpus,
     };
     let mut list = classification.jobs.clone();
     list.extend(
@@ -9837,6 +9842,7 @@ mod tests {
                     topology: None,
                     fabric: None,
                     busy_until: &busy_until,
+                    held_gpus: &HashMap::new(),
                 };
 
                 let (freed, freed_for) =
