@@ -1239,7 +1239,7 @@ mod tests {
         fs::create_dir_all(drm.join(format!("renderD{render_minor}"))).unwrap();
     }
 
-    const MI300X_BUSES: [u64; 8] = [0x11, 0x2f, 0x46, 0x5d, 0x8b, 0xaa, 0xc2, 0xe1];
+    const MI300X_BUSES: [u64; 8] = [0x11, 0x2f, 0x46, 0x5d, 0x8b, 0xaa, 0xc2, 0xda];
 
     /// MI300X in SPX: the amdgpu_xcp platform devices add card/renderD pairs
     /// that are not KFD devices, so the KFD GPU at renderD136 lives on card9.

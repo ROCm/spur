@@ -174,7 +174,7 @@
             "string": "amdgpu"
           },
           "resource.kubernetes.io/pciBusID": {
-            "string": "0000:e1:00.0"
+            "string": "0000:da:00.0"
           }
         }
       }
