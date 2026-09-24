@@ -245,8 +245,10 @@ fn is_code(e: &kube::Error, code: u16) -> bool {
 }
 
 /// Bad Request and Invalid do not change on retry; everything else can.
+/// Unauthorized does not change with the same client, so the caller must
+/// build a new client before it tries again.
 fn is_permanent(e: &kube::Error) -> bool {
-    is_code(e, 400) || is_code(e, 422)
+    is_code(e, 400) || is_code(e, 401) || is_code(e, 422)
 }
 
 fn exists_ok(r: Result<impl Sized, kube::Error>) -> Result<(), kube::Error> {
@@ -979,21 +981,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn invalid_placeholder_is_rejected_without_retry() {
-        let api = ScriptedApi::new(|s| match (s.method.as_str(), s.path.as_str()) {
-            ("POST", CLAIMS) => api_error(422, "Invalid"),
-            ("POST", _) => api_error(409, "AlreadyExists"),
-            ("DELETE", _) => api_error(404, "NotFound"),
-            _ => api_error(500, "unexpected"),
-        });
+    async fn invalid_or_unauthorized_placeholder_is_rejected_without_retry() {
+        for (code, reason) in [(422, "Invalid"), (401, "Unauthorized")] {
+            let api = ScriptedApi::new(move |s| match (s.method.as_str(), s.path.as_str()) {
+                ("POST", CLAIMS) => api_error(code, reason),
+                ("POST", _) => api_error(409, "AlreadyExists"),
+                ("DELETE", _) => api_error(404, "NotFound"),
+                _ => api_error(500, "unexpected"),
+            });
 
-        let err = acquire(&api.client(), &spec(vec![spx_a()]), deadline(300))
-            .await
-            .expect_err("rejected");
+            let err = acquire(&api.client(), &spec(vec![spx_a()]), deadline(300))
+                .await
+                .expect_err("rejected");
 
-        assert!(matches!(err, AcquireError::Rejected(_)), "{err:?}");
-        assert_eq!(api.calls(Method::POST, CLAIMS).len(), 1);
-        assert_eq!(api.calls(Method::DELETE, CLAIM).len(), 1);
+            assert!(matches!(err, AcquireError::Rejected(_)), "{err:?}");
+            assert_eq!(api.calls(Method::POST, CLAIMS).len(), 1);
+            assert_eq!(api.calls(Method::DELETE, CLAIM).len(), 1);
+        }
     }
 
     #[test]
