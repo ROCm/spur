@@ -22,9 +22,10 @@ to ``~/.local/bin`` (no sudo required):
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
    export PATH="$HOME/.local/bin:$PATH"
 
-This installs the four binaries — ``spur``, ``spurctld``, ``spurd``, and the per-job
-supervisor ``spurstepd`` — and makes the
-CLI reachable under its Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
+This installs ``spur``, ``spurctld``, ``spurd``, the per-job supervisor ``spurstepd``,
+and the credential mint ``spurauthd`` (needed only for
+:ref:`native credentials <native-auth-plugin>`), and makes the CLI reachable under its
+Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
 
 For ``--mpi=pmix``, use a **nightly** tarball (includes ``spur_mpi_pmix.so``);
 see :ref:`mpi-pmix-install`.
@@ -37,7 +38,7 @@ build the binaries:
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
 
 The binaries land in ``target/release/``. For a fuller build walkthrough see
 :doc:`/developer/building`.
@@ -657,7 +658,8 @@ below).
    * - Path
      - Contents
    * - ``~/spur/bin/``
-     - ``spur``, ``spurctld``, ``spurd``, Slurm-compat symlinks
+     - ``spur``, ``spurctld``, ``spurd``, ``spurstepd``, ``spurauthd``, Slurm-compat
+       symlinks
    * - ``~/spur/lib/spur/``
      - ``spur_mpi_pmix.so`` (when shipped in the tarball)
 

@@ -55,6 +55,7 @@ Stop and disable the daemons
    sudo systemctl disable --now spurctld spurd
    sudo pkill -x spurctld
    sudo pkill -x spurd
+   sudo pkill -x spurauthd
 
 Remove binaries and symlinks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -72,15 +73,16 @@ To uninstall from a custom directory, set ``INSTALL_DIR``:
 
    INSTALL_DIR=/opt/spur/bin curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- uninstall
 
-The ``install.sh`` uninstaller removes only the binaries ``spur spurctld spurd`` and the
-symlinks ``sbatch srun squeue scancel sinfo sacct scontrol``. It does **not** remove the
+The ``install.sh`` uninstaller removes only the binaries
+``spur spurctld spurd spurstepd spurauthd`` and the symlinks
+``sbatch srun squeue scancel sinfo sacct scontrol``. It does **not** remove the
 extra symlinks the Ansible installer adds. If Ansible installed Spur, remove the full set
 by hand:
 
 .. code-block:: bash
 
    cd /root/.local/bin
-   rm -f spur spurctld spurd \
+   rm -f spur spurctld spurd spurstepd spurauthd \
      sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun \
      sattach scrontab sdiag smd sprio sreport sshare sstat strigger
 

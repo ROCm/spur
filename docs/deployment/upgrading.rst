@@ -17,9 +17,9 @@ Single-Host: ``spur self-update``
 ---------------------------------
 
 ``spur self-update`` downloads the latest release and replaces the ``spur``, ``spurctld``,
-and ``spurd`` binaries on the current host. It is a single-host convenience: it does not
-restart daemons and gives no drain or quorum protection, so it is not a substitute for the
-cluster playbooks below.
+``spurd``, ``spurstepd``, and ``spurauthd`` binaries on the current host. It is a
+single-host convenience: it does not restart daemons and gives no drain or quorum
+protection, so it is not a substitute for the cluster playbooks below.
 
 Check whether an update is available:
 
@@ -56,7 +56,7 @@ After a successful update the CLI prints:
 .. code-block:: text
 
    Updated spur to v0.3.1
-   Note: Restart running daemons (spurctld, spurd) to use the new version.
+   Note: Restart running daemons (spurctld, spurd, spurauthd) to use the new version.
 
 .. warning::
 
@@ -66,6 +66,8 @@ After a successful update the CLI prints:
    .. code-block:: bash
 
       sudo systemctl restart spurctld spurd
+
+   If you run ``spurauthd``, restart it too.
 
 The ``[update]`` config block
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
