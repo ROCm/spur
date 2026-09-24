@@ -5375,7 +5375,6 @@ pub(crate) fn allocations_to_proto(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn proto_to_allocations(
     r: spur_proto::proto::ResourceAllocations,
 ) -> spur_core::resource::ResourceAllocations {

@@ -383,8 +383,6 @@ async fn process_assignment(
         None => return false,
     };
 
-    let resources = compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
-
     let job_id = assignment.job_id;
     let spec = job.spec.clone();
     let all_nodes = assignment.nodes.clone();
@@ -539,6 +537,7 @@ async fn process_assignment(
     };
 
     let dispatched = dispatch_spec.is_some();
+    let mut per_node_alloc = assignment.per_node_alloc.clone();
     if let Some(dspec) = dispatch_spec {
         // The run epoch start_job_impl is about to persist for this
         // dispatch. Safe to read ahead of that call: this iteration is
@@ -560,9 +559,10 @@ async fn process_assignment(
         .await
         {
             DispatchConfirmOutcome::Aborted => return false,
-            DispatchConfirmOutcome::Confirmed => {}
+            DispatchConfirmOutcome::Confirmed(launched) => per_node_alloc = launched,
         }
     }
+    let resources = compute_job_allocation(&job, &assignment.nodes, &per_node_alloc);
 
     // Transition job to Running. Reached only once every assigned node
     // has confirmed (LaunchJob for batch dispatch above, or
@@ -572,7 +572,7 @@ async fn process_assignment(
             job_id,
             assignment.nodes.clone(),
             resources,
-            assignment.per_node_alloc.clone(),
+            per_node_alloc,
             true,
             borrowed,
         )
@@ -584,12 +584,7 @@ async fn process_assignment(
             assignment.per_node_alloc.clone(),
         )
     } else {
-        cluster.start_job(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-        )
+        cluster.start_job(job_id, assignment.nodes.clone(), resources, per_node_alloc)
     };
     if let Err(e) = start_result {
         // Confirmation above already registered the allocation or
@@ -1505,6 +1500,8 @@ struct AgentDispatchParams<'a> {
 struct LaunchOutcome {
     stdout_path: String,
     stderr_path: String,
+    /// Devices the agent bound instead of the requested ones on a node shared with Kubernetes.
+    substituted_alloc: Option<spur_core::resource::ResourceAllocations>,
 }
 
 /// A failed dispatch, keeping the agent's classification of the failure so the
@@ -1765,7 +1762,60 @@ async fn dispatch_to_agent(
     Ok(LaunchOutcome {
         stdout_path: inner.stdout_path,
         stderr_path: inner.stderr_path,
+        substituted_alloc: inner
+            .substituted_alloc
+            .map(crate::server::proto_to_allocations),
     })
+}
+
+/// Validate the devices an agent bound instead of the requested ones, returning the
+/// allocation to record. Kubernetes may pick other sibling partitions of the same
+/// physical GPUs, so each requested parent GPU must keep its count, every device
+/// must be in the node's inventory, and none may belong to another job.
+fn accept_substituted_alloc(
+    node: &spur_core::node::Node,
+    requested: &spur_core::resource::ResourceAllocations,
+    substituted: &spur_core::resource::ResourceAllocations,
+) -> Result<spur_core::resource::ResourceAllocations, String> {
+    use spur_core::resource::{gpu_parent_key, ResourceAllocations};
+
+    let requested_ids = requested.device_ids("gpu");
+    let mut substituted_ids = substituted.device_ids("gpu");
+    let parents = |ids: &[u64]| {
+        let mut keys: Vec<u64> = ids.iter().map(|&id| gpu_parent_key(id)).collect();
+        keys.sort_unstable();
+        keys
+    };
+    if parents(&requested_ids) != parents(&substituted_ids) {
+        return Err(format!(
+            "substituted GPUs {substituted_ids:?} do not match the physical GPUs of {requested_ids:?}"
+        ));
+    }
+    substituted_ids.sort_unstable();
+    if substituted_ids.windows(2).any(|w| w[0] == w[1]) {
+        return Err(format!(
+            "substituted GPUs {substituted_ids:?} repeat a device"
+        ));
+    }
+    let taken = node.alloc_resources.device_ids("gpu");
+    for id in &substituted_ids {
+        if !node.total_resources.gpus.iter().any(|g| g.stable_id == *id) {
+            return Err(format!(
+                "substituted GPU {id} is not in the inventory of {}",
+                node.name
+            ));
+        }
+        if !requested_ids.contains(id) && taken.contains(id) {
+            return Err(format!("substituted GPU {id} is allocated to another job"));
+        }
+    }
+    let mut accepted = requested.clone();
+    accepted.devices.remove("gpu");
+    accepted.add(&ResourceAllocations::from_device_ids(
+        "gpu",
+        &substituted_ids,
+    ));
+    Ok(accepted)
 }
 
 fn build_pmix_plan_proto(
@@ -2001,7 +2051,8 @@ pub async fn release_srun_allocation_on_agents(
 /// admission was aborted and the job — which never left Pending — has
 /// already been settled (requeued, held, or cancelled as appropriate).
 enum DispatchConfirmOutcome {
-    Confirmed,
+    /// Carries the per-node allocations the agents launched with.
+    Confirmed(std::collections::HashMap<String, spur_core::resource::ResourceAllocations>),
     Aborted,
 }
 
@@ -2300,7 +2351,24 @@ async fn confirm_dispatch_on_nodes(
         });
     }
 
+    let mut launched_allocs = per_node_allocs.clone();
     while let Some(result) = set.join_next().await {
+        let result = result.map(|(node_name, is_primary, dispatched)| {
+            let dispatched = dispatched.and_then(|outcome| {
+                let Some(substituted) = &outcome.substituted_alloc else {
+                    return Ok(outcome);
+                };
+                let node = cluster.get_node(&node_name).ok_or_else(|| {
+                    DispatchError::AgentRejected(format!("node {node_name} is gone"))
+                })?;
+                let requested = per_node_allocs.get(&node_name).cloned().unwrap_or_default();
+                let accepted = accept_substituted_alloc(&node, &requested, substituted)
+                    .map_err(DispatchError::AgentRejected)?;
+                launched_allocs.insert(node_name.clone(), accepted);
+                Ok(outcome)
+            });
+            (node_name, is_primary, dispatched)
+        });
         match result {
             Ok((_node_name, is_primary, Ok(outcome))) => {
                 successes += 1;
@@ -2342,7 +2410,7 @@ async fn confirm_dispatch_on_nodes(
         if let Some(outcome) = primary_outcome {
             cluster.set_job_output_paths(job_id, outcome.stdout_path, outcome.stderr_path);
         }
-        return DispatchConfirmOutcome::Confirmed;
+        return DispatchConfirmOutcome::Confirmed(launched_allocs);
     }
 
     warn!(
@@ -3972,6 +4040,75 @@ mod tests {
         }
     }
 
+    /// Stable ids of CPX partitions: the parent GPU is `id >> 11`, the partition the low bits.
+    const CPX_A: u64 = 0x19 << 11;
+    const CPX_B: u64 = 0x39 << 11;
+
+    fn partition_gpu(stable_id: u64) -> spur_core::resource::GpuResource {
+        spur_core::resource::GpuResource {
+            device_id: (stable_id & 0x7ff) as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: spur_core::resource::GpuLinkType::XGMI,
+            stable_id,
+        }
+    }
+
+    fn cpx_node(stable_ids: &[u64]) -> spur_core::node::Node {
+        spur_core::node::Node::new(
+            "n1".into(),
+            ResourceSet {
+                gpus: stable_ids.iter().map(|&id| partition_gpu(id)).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn requested_gpus(ids: &[u64]) -> ResourceAllocations {
+        let mut alloc = ResourceAllocations::from_device_ids("gpu", ids);
+        alloc.cpus = 4;
+        alloc.memory_mb = 1000;
+        alloc.generation = 3;
+        alloc
+    }
+
+    #[test]
+    fn a_substitution_among_sibling_partitions_keeps_the_rest_of_the_request() {
+        let node = cpx_node(&[CPX_A, CPX_A + 1, CPX_A + 2, CPX_B]);
+        let requested = requested_gpus(&[CPX_A, CPX_B]);
+        let substituted = ResourceAllocations::from_device_ids("gpu", &[CPX_B, CPX_A + 2]);
+
+        let accepted = accept_substituted_alloc(&node, &requested, &substituted).unwrap();
+
+        assert_eq!(accepted.device_ids("gpu"), vec![CPX_A + 2, CPX_B]);
+        assert_eq!(
+            (accepted.cpus, accepted.memory_mb, accepted.generation),
+            (4, 1000, 3)
+        );
+    }
+
+    #[test]
+    fn a_substitution_is_refused_unless_it_keeps_each_physical_gpu() {
+        let mut node = cpx_node(&[CPX_A, CPX_A + 1, CPX_A + 2, CPX_B, CPX_B + 1]);
+        node.alloc_resources = ResourceAllocations::from_device_ids("gpu", &[CPX_A + 2]);
+        let requested = requested_gpus(&[CPX_A, CPX_A + 1]);
+
+        for bad in [
+            vec![CPX_A],
+            vec![CPX_A, CPX_B],
+            vec![CPX_A, CPX_A],
+            vec![CPX_A, CPX_A + 5],
+            vec![CPX_A, CPX_A + 2],
+        ] {
+            let substituted = ResourceAllocations::from_device_ids("gpu", &bad);
+            assert!(
+                accept_substituted_alloc(&node, &requested, &substituted).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
     mod dispatch_trigger_tests {
         use super::*;
         use spur_core::config::SlurmConfig;
@@ -4008,6 +4145,8 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            /// GPUs a successful launch reports as bound instead of the requested ones.
+            substitute_gpus: Option<Vec<u64>>,
         }
 
         #[tonic::async_trait]
@@ -4077,6 +4216,11 @@ mod tests {
                     error: String::new(),
                     stdout_path: path.clone(),
                     stderr_path: path,
+                    substituted_alloc: self.substitute_gpus.as_ref().map(|ids| {
+                        crate::server::allocations_to_proto(&ResourceAllocations::from_device_ids(
+                            "gpu", ids,
+                        ))
+                    }),
                     ..Default::default()
                 }))
             }
@@ -4363,6 +4507,7 @@ mod tests {
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
                 cancel_delay,
+                substitute_gpus: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4391,6 +4536,7 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                substitute_gpus: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4419,6 +4565,7 @@ mod tests {
                 fanout_calls: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
+                substitute_gpus: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4546,6 +4693,62 @@ mod tests {
                 ResourceSet {
                     cpus: 4,
                     memory_mb: 8000,
+                    ..Default::default()
+                },
+                addr.ip().to_string(),
+                addr.port(),
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+            let n = name.to_string();
+            wait_for(&format!("node '{n}' registered"), || {
+                cm.get_node(&n).is_some()
+            });
+        }
+
+        async fn spawn_mock_agent_substituting(gpus: Vec<u64>) -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                substitute_gpus: Some(gpus),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
+        }
+
+        fn register_gpu_node_at(
+            cm: &ClusterManager,
+            name: &str,
+            addr: std::net::SocketAddr,
+            stable_ids: &[u64],
+        ) {
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    gpus: stable_ids.iter().map(|&id| partition_gpu(id)).collect(),
                     ..Default::default()
                 },
                 addr.ip().to_string(),
@@ -4896,7 +5099,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed(_)));
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(
@@ -5550,7 +5753,7 @@ mod tests {
             .await;
             let elapsed = start.elapsed();
 
-            assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed(_)));
             elapsed
         }
 
@@ -5594,7 +5797,7 @@ mod tests {
             )
             .await;
 
-            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed(_)));
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n-dead"),
                 "a connect failure must still cool the node down"
@@ -5661,7 +5864,7 @@ mod tests {
             .await;
 
             assert!(
-                !matches!(outcome, DispatchConfirmOutcome::Confirmed),
+                !matches!(outcome, DispatchConfirmOutcome::Confirmed(_)),
                 "a node that never answered must not count as confirmed"
             );
             assert!(
@@ -5711,7 +5914,7 @@ mod tests {
             )
             .await;
 
-            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            assert!(!matches!(outcome, DispatchConfirmOutcome::Confirmed(_)));
             assert!(
                 cm.dispatch_cooldown_remaining("n-slow").is_some(),
                 "a node that burned the whole deadline must not be re-picked on the next tick"
@@ -5820,6 +6023,62 @@ mod tests {
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Running);
             assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+        }
+
+        fn gpu_assignment(
+            job_id: spur_core::job::JobId,
+            gpus: &[u64],
+        ) -> spur_sched::traits::Assignment {
+            let mut alloc = ResourceAllocations::from_device_ids("gpu", gpus);
+            alloc.cpus = 1;
+            spur_sched::traits::Assignment {
+                job_id,
+                nodes: vec!["n1".into()],
+                per_node_alloc: HashMap::from([("n1".to_string(), alloc)]),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_records_the_sibling_partitions_kubernetes_picked() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let addr = spawn_mock_agent_substituting(vec![CPX_A + 2, CPX_A + 3]).await;
+            register_gpu_node_at(&cm, "n1", addr, &[CPX_A, CPX_A + 1, CPX_A + 2, CPX_A + 3]);
+            let job_id = submit_and_wait(&cm, batch_spec("cpx", 1));
+
+            let started =
+                process_assignment(cm.clone(), gpu_assignment(job_id, &[CPX_A, CPX_A + 1])).await;
+
+            assert!(started);
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Running);
+            let recorded = &job.per_node_alloc["n1"];
+            assert_eq!(recorded.device_ids("gpu"), vec![CPX_A + 2, CPX_A + 3]);
+            assert_eq!(recorded.cpus, 1);
+            let node = cm.get_node("n1").unwrap();
+            let mut busy = node.alloc_resources.device_ids("gpu");
+            busy.sort_unstable();
+            assert_eq!(busy, vec![CPX_A + 2, CPX_A + 3]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_requeues_a_substitution_onto_another_physical_gpu() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let addr = spawn_mock_agent_substituting(vec![CPX_A, CPX_B]).await;
+            register_gpu_node_at(&cm, "n1", addr, &[CPX_A, CPX_A + 1, CPX_B]);
+            let job_id = submit_and_wait(&cm, batch_spec("cpx-wrong-parent", 1));
+
+            let started =
+                process_assignment(cm.clone(), gpu_assignment(job_id, &[CPX_A, CPX_A + 1])).await;
+
+            assert!(!started);
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+            assert!(!cm.get_node("n1").unwrap().alloc_resources.has_devices());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
