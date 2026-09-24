@@ -275,10 +275,13 @@ Before ``spurd`` starts a Spur job on a shared node, it makes one
 ``ResourceClaim`` and one placeholder pod for the job:
 
 - Namespace: ``spur-system``. ``spurd`` makes the namespace.
-- Name of the pod and of the claim: ``spur-job-<jobid>-<run_attempt>``, for
-  example ``spur-job-1042-0``.
-- Labels: ``spur.amd.com/job-id``, ``spur.amd.com/user``,
-  ``spur.amd.com/account`` and ``app.kubernetes.io/managed-by=spurd``.
+- Name of the pod and of the claim: ``spur-job-<jobid>-<run_attempt>-<node>``,
+  for example ``spur-job-1042-0-gpu01``. A job on many nodes has one
+  placeholder on each node.
+- Labels: ``spur.amd.com/job-id``, ``spur.amd.com/run-attempt``,
+  ``spur.amd.com/node``, ``spur.amd.com/user``, ``spur.amd.com/account`` and
+  ``app.kubernetes.io/managed-by=spurd``. A user or account name that is not a
+  valid label value is left out.
 - The pod runs the pause image of k0s. It has no CPU or memory request.
 - The pod selects the node with a node selector on the hostname. It does not
   use ``spec.nodeName``, because then kube-scheduler does not allocate the
@@ -294,17 +297,19 @@ For example:
    apiVersion: resource.k8s.io/v1
    kind: ResourceClaim
    metadata:
-     name: spur-job-1042-0
+     name: spur-job-1042-0-gpu01
      namespace: spur-system
      labels:
        spur.amd.com/job-id: "1042"
+       spur.amd.com/run-attempt: "0"
+       spur.amd.com/node: gpu01
        spur.amd.com/user: alice
        spur.amd.com/account: research
        app.kubernetes.io/managed-by: spurd
    spec:
      devices:
        requests:
-         - name: gpu-0
+         - name: g0
            exactly:
              deviceClassName: gpu.amd.com
              allocationMode: ExactCount
