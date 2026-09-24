@@ -7,6 +7,7 @@
 //! Kubernetes allocation is the ledger of record: this module reads which
 //! GPUs Kubernetes allocated (holds) and reports them on the heartbeat.
 
+pub mod credential;
 pub mod holds;
 pub mod kubelet_links;
 pub mod placeholder;
@@ -15,8 +16,8 @@ pub(crate) mod test_support;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use k8s_openapi::api::core::v1::Node;
@@ -28,32 +29,56 @@ use kube::Api;
 use spur_core::resource::ResourceSet;
 use spur_devices::cdi::{discover_sharing_identities, SharingIdentity};
 use spur_proto::proto::GpuHoldReport;
-use tokio::sync::{Notify, OnceCell};
+use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tracing::{info, warn};
 
+use crate::cluster::ClusterRole;
+use crate::reporter::NodeReporter;
 use holds::{K8sView, DRA_DRIVER};
 pub use kubelet_links::KubeletLinks;
+pub use spur_core::k0s::k8s_node_name;
 
 /// Node label the GPU operator's `DeviceConfig`s select on.
 pub const SHARING_LABEL: &str = "spur.amd.com/gpu-sharing";
 
 const CONVERGE_INTERVAL: Duration = Duration::from_secs(30);
+/// A worker's token is bound and expires (see [`credential::TOKEN_DURATION`]).
+const CLIENT_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
 
-/// The Kubernetes Node name of the host `hostname`. k0s starts the kubelet
-/// without `--hostname-override`, and the kubelet lowercases the hostname.
-pub fn k8s_node_name(hostname: &str) -> String {
-    hostname.to_lowercase()
+fn client_expired(built: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(built) >= CLIENT_MAX_AGE
+}
+
+/// Only a node with a kubelet and GPUs has a Node the GPU operator selects on.
+fn carries_label(role: Option<ClusterRole>, has_gpus: bool) -> bool {
+    has_gpus && matches!(role, Some(ClusterRole::Worker | ClusterRole::Single))
+}
+
+fn is_unauthorized(e: &kube::Error) -> bool {
+    matches!(e, kube::Error::Api(s) if s.code == 401)
+}
+
+fn watch_unauthorized(e: &watcher::Error) -> bool {
+    match e {
+        watcher::Error::InitialListFailed(e)
+        | watcher::Error::WatchStartFailed(e)
+        | watcher::Error::WatchFailed(e) => is_unauthorized(e),
+        watcher::Error::WatchError(s) => s.code == 401,
+        watcher::Error::NoResourceVersion => false,
+    }
 }
 
 /// Shared handle for this node's GPU sharing state.
 pub struct GpuSharing {
     node_name: String,
     k0s: Option<Arc<crate::cluster::K0sAgent>>,
+    /// Asks the controller for a worker's kubeconfig and knows the GPU inventory.
+    reporter: Weak<NodeReporter>,
     links: KubeletLinks,
     /// The controller's flag; `None` until the first heartbeat response.
     desired: Mutex<Option<bool>>,
-    client: OnceCell<kube::Client>,
+    client: Mutex<Option<(kube::Client, Instant)>>,
     /// Why the whole node cannot share now, e.g. a foreign kubelet path.
     problem: Mutex<Option<String>>,
     /// Label value last written to the Node.
@@ -78,10 +103,15 @@ impl Drop for Watch {
 }
 
 impl GpuSharing {
-    pub fn new(hostname: &str, k0s: Arc<crate::cluster::K0sAgent>) -> Arc<Self> {
+    pub fn new(
+        hostname: &str,
+        k0s: Arc<crate::cluster::K0sAgent>,
+        reporter: &Arc<NodeReporter>,
+    ) -> Arc<Self> {
         Arc::new(Self::build(
             hostname,
             Some(k0s),
+            Arc::downgrade(reporter),
             KubeletLinks::system(),
             None,
         ))
@@ -90,15 +120,17 @@ impl GpuSharing {
     fn build(
         hostname: &str,
         k0s: Option<Arc<crate::cluster::K0sAgent>>,
+        reporter: Weak<NodeReporter>,
         links: KubeletLinks,
         client: Option<kube::Client>,
     ) -> Self {
         Self {
             node_name: k8s_node_name(hostname),
             k0s,
+            reporter,
             links,
             desired: Mutex::new(None),
-            client: OnceCell::new_with(client),
+            client: Mutex::new(client.map(|c| (c, Instant::now()))),
             problem: Mutex::new(None),
             labeled: Mutex::new(None),
             watch: Mutex::new(None),
@@ -118,24 +150,57 @@ impl GpuSharing {
         *lock(&self.desired) == Some(true)
     }
 
-    /// Admin client for the managed k0s, built on first use. The client keeps
-    /// kube's defaults (30 s connect, 295 s read), so a slow API server is
-    /// waited for, not treated as lost. A failed build is retried on the next call.
+    /// Client for the managed k0s, built on first use and rebuilt after
+    /// [`CLIENT_MAX_AGE`] or a 401. The client keeps kube's defaults (30 s
+    /// connect, 295 s read), so a slow API server is waited for, not treated
+    /// as lost. A failed build is retried on the next call.
     pub async fn client(&self) -> anyhow::Result<kube::Client> {
-        self.client
-            .get_or_try_init(|| async {
-                let k0s = self.k0s.as_ref().context("no k0s agent on this node")?;
-                let yaml = k0s.admin_kubeconfig().await?;
-                let kubeconfig = kube::config::Kubeconfig::from_yaml(&yaml)?;
-                let config = kube::Config::from_custom_kubeconfig(
-                    kubeconfig,
-                    &kube::config::KubeConfigOptions::default(),
-                )
-                .await?;
-                Ok(kube::Client::try_from(config)?)
-            })
+        let cached = lock(&self.client).clone();
+        if let Some((client, built)) = cached {
+            if !client_expired(built, Instant::now()) {
+                return Ok(client);
+            }
+        }
+        let yaml = self.kubeconfig().await?;
+        let kubeconfig = kube::config::Kubeconfig::from_yaml(&yaml)?;
+        let config = kube::Config::from_custom_kubeconfig(
+            kubeconfig,
+            &kube::config::KubeConfigOptions::default(),
+        )
+        .await?;
+        let client = kube::Client::try_from(config)?;
+        *lock(&self.client) = Some((client.clone(), Instant::now()));
+        Ok(client)
+    }
+
+    /// A control-plane node reads its admin kubeconfig. A worker has none, so
+    /// it gets a scoped one through the controller.
+    async fn kubeconfig(&self) -> anyhow::Result<String> {
+        let k0s = self.k0s.as_ref().context("no k0s agent on this node")?;
+        if k0s.role().await != Some(ClusterRole::Worker) {
+            return k0s.admin_kubeconfig().await;
+        }
+        self.reporter
+            .upgrade()
+            .context("no controller connection")?
+            .gpu_sharing_kubeconfig()
             .await
-            .cloned()
+    }
+
+    /// Drop the client when the API server rejects its token, so the next
+    /// call builds a new one.
+    pub fn forget_client_if_unauthorized(&self, e: &kube::Error) {
+        if is_unauthorized(e) && lock(&self.client).take().is_some() {
+            info!("Kubernetes rejected the token; rebuilding the client");
+        }
+    }
+
+    async fn carries_label(&self) -> bool {
+        let Some(k0s) = &self.k0s else {
+            return false;
+        };
+        let has_gpus = self.reporter.upgrade().is_some_and(|r| r.has_gpus());
+        carries_label(k0s.role().await, has_gpus)
     }
 
     /// Sharing identity of the GPU with `stable_id`, rediscovered when unknown.
@@ -184,11 +249,16 @@ impl GpuSharing {
     }
 
     async fn converge_once(self: &Arc<Self>) {
+        let labelled = self.carries_label().await;
+        self.converge_as(labelled).await;
+    }
+
+    async fn converge_as(self: &Arc<Self>, carries_label: bool) {
         let desired = *lock(&self.desired);
         match desired {
             None => {}
             Some(true) => self.opt_in().await,
-            Some(false) => self.opt_out().await,
+            Some(false) => self.opt_out(carries_label).await,
         }
     }
 
@@ -206,21 +276,24 @@ impl GpuSharing {
         };
         self.set_problem(None);
         if let Err(e) = self.set_label(&client, true).await {
+            self.forget_client_if_unauthorized(&e);
             warn!(error = %e, "cannot label the Node as shared; retrying");
         }
         self.ensure_watch(client);
     }
 
-    async fn opt_out(self: &Arc<Self>) {
+    /// Every enrolled GPU node that is not shared carries the label `false`,
+    /// because the GPU operator's selectors match equality only.
+    async fn opt_out(self: &Arc<Self>, carries_label: bool) {
         lock(&self.watch).take();
         self.set_problem(None);
         let was_shared = self.links.any_ours() || *lock(&self.labeled) == Some(true);
-        if !was_shared {
-            return;
-        }
-        if *lock(&self.labeled) != Some(false) {
+        if (carries_label || was_shared) && *lock(&self.labeled) != Some(false) {
             let result = match self.client().await {
-                Ok(client) => self.set_label(&client, false).await.map_err(Into::into),
+                Ok(client) => self.set_label(&client, false).await.map_err(|e| {
+                    self.forget_client_if_unauthorized(&e);
+                    e.into()
+                }),
                 Err(e) => Err(e),
             };
             if let Err(e) = result {
@@ -228,7 +301,7 @@ impl GpuSharing {
                 return;
             }
         }
-        if self.live_placeholders() > 0 {
+        if !self.links.any_ours() || self.live_placeholders() > 0 {
             return;
         }
         match self.links.remove_ours() {
@@ -329,6 +402,11 @@ impl GpuSharing {
                 Event::Claim(Err(e)) | Event::Slice(Err(e)) => {
                     warn!(error = %e, "Kubernetes watch failed; holds not reported until it recovers");
                     healthy.store(false, Ordering::Relaxed);
+                    if watch_unauthorized(&e) {
+                        // Restarted with a new client by the next converge.
+                        lock(&self.client).take();
+                        return;
+                    }
                     continue;
                 }
             }
@@ -422,6 +500,7 @@ mod tests {
         Arc::new(GpuSharing::build(
             "GPU-Node-1",
             None,
+            Weak::new(),
             KubeletLinks::under(root),
             Some(server.client()),
         ))
@@ -435,8 +514,67 @@ mod tests {
     }
 
     #[test]
-    fn node_name_is_the_lowercase_hostname() {
-        assert_eq!(k8s_node_name("GPU-Node-1"), "gpu-node-1");
+    fn client_is_rebuilt_after_twelve_hours() {
+        let built = Instant::now();
+
+        assert!(!client_expired(built, built));
+        assert!(!client_expired(
+            built,
+            built + Duration::from_secs(12 * 3600 - 1)
+        ));
+        assert!(client_expired(
+            built,
+            built + Duration::from_secs(12 * 3600)
+        ));
+        assert!(!client_expired(built + Duration::from_secs(1), built));
+    }
+
+    #[test]
+    fn only_enrolled_gpu_nodes_with_a_kubelet_carry_the_label() {
+        assert!(carries_label(Some(ClusterRole::Worker), true));
+        assert!(carries_label(Some(ClusterRole::Single), true));
+        assert!(!carries_label(Some(ClusterRole::Controller), true));
+        assert!(!carries_label(None, true));
+        assert!(!carries_label(Some(ClusterRole::Worker), false));
+    }
+
+    #[tokio::test]
+    async fn rejected_token_drops_the_client() {
+        let server = FakeApiServer::answering(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                "reason": "Unauthorized", "code": 401}),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let sharing = sharing(&server, root.path());
+        sharing.set_desired(false);
+
+        sharing.converge_as(true).await;
+
+        assert_eq!(server.requests().len(), 1);
+        assert!(lock(&sharing.client).is_none());
+        assert_eq!(*lock(&sharing.labeled), None);
+    }
+
+    #[tokio::test]
+    async fn non_shared_enrolled_gpu_node_is_labelled_false_without_watches() {
+        let server = node_ok();
+        let root = tempfile::tempdir().unwrap();
+        let sharing = sharing(&server, root.path());
+        sharing.set_desired(false);
+
+        sharing.converge_as(true).await;
+        sharing.converge_as(true).await;
+
+        let seen = server.requests();
+        assert_eq!(seen.len(), 1, "the label is written once");
+        assert_eq!(seen[0].method, http::Method::PATCH);
+        assert_eq!(
+            seen[0].body,
+            serde_json::json!({"metadata": {"labels": {SHARING_LABEL: "false"}}})
+        );
+        assert!(lock(&sharing.watch).is_none());
+        assert!(!root.path().join("var/lib/kubelet").exists());
     }
 
     #[tokio::test]
