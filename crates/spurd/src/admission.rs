@@ -223,7 +223,7 @@ impl RunAdmission {
     pub fn is_over(&self) -> bool {
         self.state == RunState::Cleaned
             || self.cancelled_by_controller
-            || self.controller_ack.is_committed()
+            || self.controller_ack.release_raft_index.is_some()
     }
 
     /// When this run stops being interesting if nothing else ever happens to it.
@@ -1086,8 +1086,8 @@ impl AdmissionStore {
         Ok((AdmittedRun { run, participants }, rejected))
     }
 
-    /// Settle every hook whose owner `owner_is_gone` proves cannot still be running
-    /// it. Supervisors outlive an agent restart, so the restart alone proves nothing.
+    /// Settle every hook whose owner `owner_is_gone` proves cannot still be running it.
+    /// May call `owner_is_gone` twice per run; keep it cheap and idempotent.
     pub fn settle_hooks_whose_owner_is_gone(
         &self,
         owner_is_gone: impl Fn(&AdmittedRun) -> bool,
@@ -2545,6 +2545,25 @@ mod tests {
             "nothing proves this run is over, so nothing may settle it"
         );
         assert!(!entry.disposition.may_be_settled());
+    }
+
+    #[test]
+    fn a_settled_unrecorded_claim_reports_unresolved_before_teardown_is_marked() {
+        // release_raft_index=Some(0) is still a controller decision that ends
+        // the run; a cut taken before Cleaned must not read it as an ordinary
+        // live claim.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.record_settled_claim(key(7, 1)).unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert_eq!(entry.disposition, LedgerDisposition::Unresolved);
     }
 
     #[test]
