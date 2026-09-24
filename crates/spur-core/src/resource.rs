@@ -218,6 +218,35 @@ impl ResourceSet {
         (self.cpus, self.memory_mb, gpu_ids, generic)
     }
 
+    /// Clamp this detected inventory to operator caps. `cpus_cap`/`memory_cap_mb`
+    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory.
+    /// The smaller of cap and (detected - reserved) wins; GPUs/generic are unaffected.
+    pub fn clamped(
+        &self,
+        cpus_cap: u32,
+        memory_cap_mb: u64,
+        reserved_memory_mb: u64,
+    ) -> ResourceSet {
+        let cpus = if cpus_cap > 0 {
+            self.cpus.min(cpus_cap)
+        } else {
+            self.cpus
+        };
+        let mem_cap = if memory_cap_mb > 0 {
+            memory_cap_mb
+        } else {
+            self.memory_mb
+        };
+        let memory_mb = mem_cap.min(self.memory_mb.saturating_sub(reserved_memory_mb));
+        ResourceSet {
+            cpus,
+            memory_mb,
+            gpus: self.gpus.clone(),
+            generic: self.generic.clone(),
+            generation: self.generation,
+        }
+    }
+
     /// Check if this inventory can satisfy a count-based request with no prior allocation.
     pub fn can_satisfy(&self, request: &ResourceSet) -> bool {
         self.can_satisfy_with_allocated(&ResourceAllocations::default(), request)
@@ -472,6 +501,70 @@ mod tests {
             generic: HashMap::new(),
             generation: 0,
         }
+    }
+
+    #[test]
+    fn clamp_no_config_is_identity() {
+        // cpus=0, memory_mb=0, reserved=0 means "no limits configured".
+        let detected = sample_inventory();
+        let clamped = detected.clamped(0, 0, 0);
+        assert_eq!(clamped.cpus, 64);
+        assert_eq!(clamped.memory_mb, 256_000);
+        // GPUs and generic pass through untouched.
+        assert_eq!(clamped.gpus.len(), 2);
+    }
+
+    #[test]
+    fn clamp_cpus_caps_below_detected() {
+        let detected = sample_inventory();
+        let clamped = detected.clamped(32, 0, 0);
+        assert_eq!(clamped.cpus, 32);
+    }
+
+    #[test]
+    fn clamp_cpus_over_claim_capped_to_detected() {
+        // Config asking for more CPUs than the host has cannot invent hardware.
+        let detected = sample_inventory();
+        let clamped = detected.clamped(128, 0, 0);
+        assert_eq!(clamped.cpus, 64);
+    }
+
+    #[test]
+    fn clamp_memory_cap_below_detected() {
+        let detected = sample_inventory();
+        let clamped = detected.clamped(0, 200_000, 0);
+        assert_eq!(clamped.memory_mb, 200_000);
+    }
+
+    #[test]
+    fn clamp_memory_over_claim_capped_to_detected() {
+        let detected = sample_inventory();
+        let clamped = detected.clamped(0, 512_000, 0);
+        assert_eq!(clamped.memory_mb, 256_000);
+    }
+
+    #[test]
+    fn clamp_reserved_subtracts_from_detected() {
+        let detected = sample_inventory();
+        let clamped = detected.clamped(0, 0, 16_000);
+        assert_eq!(clamped.memory_mb, 240_000);
+    }
+
+    #[test]
+    fn clamp_memory_levers_compose_smaller_wins() {
+        // memory_mb cap = 250_000; detected - reserved = 256_000 - 16_000 = 240_000.
+        // The smaller (reserved-derived) value wins.
+        let detected = sample_inventory();
+        let clamped = detected.clamped(0, 250_000, 16_000);
+        assert_eq!(clamped.memory_mb, 240_000);
+    }
+
+    #[test]
+    fn clamp_reserved_saturates_at_zero() {
+        // reserved >= detected must floor at 0, never underflow.
+        let detected = sample_inventory();
+        let clamped = detected.clamped(0, 0, 999_999);
+        assert_eq!(clamped.memory_mb, 0);
     }
 
     #[test]
