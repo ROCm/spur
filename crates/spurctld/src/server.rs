@@ -198,6 +198,33 @@ fn node_comm_socket(node: &spur_core::node::Node, node_name: &str) -> Result<Str
     Ok(spur_net::format_comm_socket(host, node.port))
 }
 
+/// Kubernetes Node name of `node` when it may get the GPU sharing credential: it runs a kubelet
+/// (k0s role Worker or Single) and has GPUs. The node need not be shared, because a non-shared GPU
+/// node still writes its `spur.amd.com/gpu-sharing=false` label.
+#[allow(clippy::result_large_err)]
+fn gpu_sharing_credential_node(node: &spur_core::node::Node) -> Result<String, Status> {
+    use spur_core::k0s::K0sRole;
+    if !matches!(node.k0s_role, Some(K0sRole::Worker | K0sRole::Single)) {
+        return Err(Status::permission_denied(format!(
+            "node {} is not a k0s worker",
+            node.name
+        )));
+    }
+    if node.total_resources.gpus.is_empty() {
+        return Err(Status::permission_denied(format!(
+            "node {} has no GPUs",
+            node.name
+        )));
+    }
+    let k8s_name = spur_core::k0s::k8s_node_name(&node.name);
+    if !spur_core::k0s::is_dns1123_label(&k8s_name) {
+        return Err(Status::failed_precondition(format!(
+            "Kubernetes Node name {k8s_name:?} is not a DNS-1123 label"
+        )));
+    }
+    Ok(k8s_name)
+}
+
 /// Forwarding decision for read RPCs, split out so it's unit-testable.
 fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
     !is_leader && !is_forwarded
@@ -2538,6 +2565,40 @@ impl SlurmController for ControllerService {
                 "node {} not found — is the node registered?",
                 req.hostname
             )))
+        }
+    }
+
+    async fn get_gpu_sharing_kubeconfig(
+        &self,
+        request: Request<GetGpuSharingKubeconfigRequest>,
+    ) -> Result<Response<GetGpuSharingKubeconfigResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let fwd = Self::forward_request(request);
+                    return client.get_gpu_sharing_kubeconfig(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward GPU sharing kubeconfig request to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        self.verify_node_identity(&req.hostname, &req.node_token)?;
+        let node = self
+            .cluster
+            .get_node(&req.hostname)
+            .ok_or_else(|| Status::not_found(format!("node {} not found", req.hostname)))?;
+        let k8s_name = gpu_sharing_credential_node(&node)?;
+        match crate::cluster_k8s::fetch_gpu_sharing_kubeconfig(&self.cluster, &k8s_name).await {
+            Ok(kubeconfig) => Ok(Response::new(GetGpuSharingKubeconfigResponse {
+                kubeconfig,
+            })),
+            Err(e) => Err(Status::unavailable(format!(
+                "could not mint the GPU sharing kubeconfig of {k8s_name}: {e}"
+            ))),
         }
     }
 
@@ -7212,6 +7273,97 @@ mod tests {
             .await
             .expect_err("another node's credential must not speak for this one");
         assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpu_sharing_kubeconfig_is_authenticated_like_a_heartbeat() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        let ask = |node_token: String| {
+            svc.get_gpu_sharing_kubeconfig(Request::new(GetGpuSharingKubeconfigRequest {
+                hostname: "n1".into(),
+                node_token,
+            }))
+        };
+
+        let error = ask(String::new()).await.expect_err("no token");
+        assert_eq!(error.code(), Code::Unauthenticated);
+        let forged = spur_core::admission::generate_node_token("n1", b"not-the-real-signing-key")
+            .expect("forged node token");
+        let error = ask(forged).await.expect_err("forged token");
+        assert_eq!(error.code(), Code::Unauthenticated);
+        let other = spur_core::admission::generate_node_token("n2", svc.jwt_key.as_bytes())
+            .expect("node token");
+        let error = ask(other).await.expect_err("another node's token");
+        assert_eq!(error.code(), Code::PermissionDenied);
+
+        let own = spur_core::admission::generate_node_token("n1", svc.jwt_key.as_bytes())
+            .expect("node token");
+        let error = ask(own).await.expect_err("n1 is not a k0s worker");
+        assert_eq!(error.code(), Code::PermissionDenied);
+        assert!(error.message().contains("not a k0s worker"), "{error:?}");
+    }
+
+    fn credential_node(
+        name: &str,
+        role: Option<spur_core::k0s::K0sRole>,
+        gpus: usize,
+    ) -> spur_core::node::Node {
+        let gpu = spur_core::resource::GpuResource {
+            device_id: 0,
+            gpu_type: "mi300x".into(),
+            memory_mb: 196_608,
+            peer_gpus: Vec::new(),
+            link_type: spur_core::resource::GpuLinkType::PCIe,
+            stable_id: 0,
+        };
+        let mut node = spur_core::node::Node::new(
+            name.into(),
+            spur_core::resource::ResourceSet {
+                gpus: vec![gpu; gpus],
+                ..Default::default()
+            },
+        );
+        node.k0s_role = role;
+        node
+    }
+
+    #[test]
+    fn gpu_sharing_credential_goes_to_gpu_nodes_with_a_kubelet() {
+        use spur_core::k0s::K0sRole;
+
+        for role in [K0sRole::Worker, K0sRole::Single] {
+            let node = credential_node("GPU-Node-1", Some(role), 1);
+            assert_eq!(gpu_sharing_credential_node(&node).unwrap(), "gpu-node-1");
+        }
+        let mut shared = credential_node("n1", Some(K0sRole::Worker), 8);
+        shared.gpu_sharing = true;
+        assert_eq!(gpu_sharing_credential_node(&shared).unwrap(), "n1");
+    }
+
+    #[test]
+    fn gpu_sharing_credential_is_refused_without_a_kubelet_gpus_or_a_valid_name() {
+        use spur_core::k0s::K0sRole;
+
+        for (node, code) in [
+            (credential_node("n1", None, 1), Code::PermissionDenied),
+            (
+                credential_node("n1", Some(K0sRole::Controller), 1),
+                Code::PermissionDenied,
+            ),
+            (
+                credential_node("n1", Some(K0sRole::Worker), 0),
+                Code::PermissionDenied,
+            ),
+            (
+                credential_node("n1.example.com", Some(K0sRole::Worker), 1),
+                Code::FailedPrecondition,
+            ),
+        ] {
+            let error = gpu_sharing_credential_node(&node).expect_err("refused");
+            assert_eq!(error.code(), code, "{error:?}");
+        }
     }
 
     // The positive case uses the credential registration actually handed back, so

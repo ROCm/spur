@@ -445,6 +445,8 @@ service SlurmController {
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportStepdRecovery(StepdRecoveryRequest) returns (StepdRecoveryResponse);
+  // Kubernetes credential of a k0s worker for GPU sharing (node label, holds, placeholders).
+  rpc GetGpuSharingKubeconfig(GetGpuSharingKubeconfigRequest) returns (GetGpuSharingKubeconfigResponse);
 
   // Admission token management
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
@@ -959,6 +961,15 @@ message HeartbeatResponse {
   bool gpu_sharing = 1;
 }
 
+message GetGpuSharingKubeconfigRequest {
+  string hostname = 1;
+  string node_token = 2;
+}
+message GetGpuSharingKubeconfigResponse {
+  // Kubeconfig of the ServiceAccount spur-system/spurd-gpu-sharing-<node>, with a bound token.
+  string kubeconfig = 1;
+}
+
 message StepdRecoveryRequest {
   string hostname = 1;
   uint32 job_id = 2;
@@ -1340,6 +1351,9 @@ message GetKubeconfigRequest {
   string user = 1;
   string namespace = 2;
   string service_account = 3;
+  // Kubernetes Node name. When set, the other fields are ignored: the control-plane node applies
+  // the GPU-sharing RBAC of this node and mints a bound token for its ServiceAccount.
+  string gpu_sharing_node = 4;
 }
 message GetKubeconfigResponse {
   // Admin (or scoped) kubeconfig YAML read/minted on the control-plane node.

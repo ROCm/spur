@@ -16959,6 +16959,7 @@ mod tests {
             register_agent(spur_proto::proto::RegisterAgentRequest) -> spur_proto::proto::RegisterAgentResponse;
             heartbeat(spur_proto::proto::HeartbeatRequest) -> spur_proto::proto::HeartbeatResponse;
             report_stepd_recovery(spur_proto::proto::StepdRecoveryRequest) -> spur_proto::proto::StepdRecoveryResponse;
+            get_gpu_sharing_kubeconfig(spur_proto::proto::GetGpuSharingKubeconfigRequest) -> spur_proto::proto::GetGpuSharingKubeconfigResponse;
             create_token(spur_proto::proto::CreateTokenRequest) -> spur_proto::proto::CreateTokenResponse;
             list_tokens(spur_proto::proto::ListTokensRequest) -> spur_proto::proto::ListTokensResponse;
             revoke_token(spur_proto::proto::RevokeTokenRequest) -> spur_proto::proto::RevokeTokenResponse;
