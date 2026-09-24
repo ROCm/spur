@@ -241,7 +241,9 @@ and Raft high-availability topology.
      - none
      - Restart
      - Seconds without a heartbeat before a node is marked Down. Unset by
-       default; the controller applies a 90-second fallback when absent.
+       default; the controller applies a 90-second fallback when absent. It is
+       also the maximum age of the GPU hold report of a node that shares its
+       GPUs with Kubernetes (:doc:`/deployment/gpu-sharing`).
    * - ``max_batch_requeue``
      - integer
      - ``5``
@@ -1097,7 +1099,7 @@ These control-plane mutations define cluster tenancy and require
 
 * partitions;
 * node state and labels — ``scontrol update NodeName=``, ``spur node drain``,
-  ``spur node remove``;
+  ``spur node remove``, ``spur node gpu-sharing``;
 * ``scontrol reconfigure``;
 * admission tokens;
 * the k0s cluster manager.
@@ -2358,6 +2360,10 @@ systemd or k0s.
 This section is split across both daemons: the controller reads the network and
 control-plane fields at startup, while ``spurd`` reads the on-node fields at its
 own startup. Only ``allow_admin_kubeconfig`` is reloadable.
+
+GPU sharing with Kubernetes has no field in this section. You set it per node
+with ``spur k8s up --gpu-sharing-nodes`` or ``spur node gpu-sharing``. See
+:doc:`/deployment/gpu-sharing`.
 
 .. list-table::
    :header-rows: 1
