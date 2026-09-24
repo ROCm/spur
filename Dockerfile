@@ -107,9 +107,9 @@ COPY --from=builder /dist/lib/spur/ /lib/spur/
 RUN groupadd --gid 1001 spur && useradd --uid 1001 --gid spur --no-create-home --shell /usr/sbin/nologin spur
 USER spur
 
-# Multi-binary image: Kubernetes manifests must set container command per workload
-# (e.g. spurctld, spur-k8s-operator, spurd). Workloads that need root (e.g. spurd
-# for seccomp/Landlock) should override with securityContext.runAsUser: 0.
+# Multi-binary image: Kubernetes manifests set the container command per workload.
+# Workloads that need root (spurd for seccomp/Landlock, spurauthd for its default
+# /run/spur socket and root-owned keys) should override with securityContext.runAsUser: 0.
 
 FROM scratch AS dist
 COPY --from=builder /build/target/release/spur /bin/

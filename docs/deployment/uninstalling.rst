@@ -55,6 +55,7 @@ Stop and disable the daemons
    sudo systemctl disable --now spurctld spurd
    sudo pkill -x spurctld
    sudo pkill -x spurd
+   sudo pkill -x spurauthd
 
 Remove binaries and symlinks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -81,7 +82,7 @@ by hand:
 .. code-block:: bash
 
    cd /root/.local/bin
-   rm -f spur spurctld spurd \
+   rm -f spur spurctld spurd spurstepd spurauthd \
      sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun \
      sattach scrontab sdiag smd sprio sreport sshare sstat strigger
 
