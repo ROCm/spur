@@ -40,6 +40,8 @@ use spur_core::task_launch::{
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
+use crate::gpu_sharing::jobs::{launch_deadline, PlaceholderJob};
+use crate::gpu_sharing::{placeholder, GpuSharing};
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
@@ -1993,6 +1995,7 @@ pub struct StepdRecoveryCleanup {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
+    gpu_sharing: Option<Arc<GpuSharing>>,
 }
 
 #[derive(Clone)]
@@ -2043,6 +2046,7 @@ impl StepdRecoveryCleanup {
             &self.stepds,
             descriptor,
             "controller-rejected",
+            self.gpu_sharing.as_ref(),
         )
         .await;
     }
@@ -2054,6 +2058,7 @@ async fn release_stepd_tracking(
     stepds: &Arc<Mutex<StepdMap>>,
     descriptor: &crate::stepd::StepdDescriptor,
     reason: &'static str,
+    gpu_sharing: Option<&Arc<GpuSharing>>,
 ) -> bool {
     if let Some(state_dir) = descriptor
         .socket_path
@@ -2113,6 +2118,9 @@ async fn release_stepd_tracking(
         }
     };
     drop(sessions);
+    if let Some(sharing) = gpu_sharing.filter(|_| removed_tracked) {
+        sharing.release_placeholder(descriptor.job_id, descriptor.run_attempt);
+    }
 
     // The job node is the agent's to remove: it creates it, and the steps that
     // live in it only ever own their own leaf. Once the last of them is gone
@@ -2264,6 +2272,7 @@ async fn settle_recovered_stepd(
     descriptor: &crate::stepd::StepdDescriptor,
     exit_code: i32,
     signal: i32,
+    gpu_sharing: Option<&Arc<GpuSharing>>,
 ) -> Option<crate::stepd::PendingStepdCompletion> {
     if !claim_stepd(stepds, descriptor).await {
         return None;
@@ -2274,6 +2283,7 @@ async fn settle_recovered_stepd(
         stepds,
         descriptor,
         "runtime completion",
+        gpu_sharing,
     )
     .await;
     deliver_runtime_completion(
@@ -2301,6 +2311,7 @@ async fn settle_recovered_stepd(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_recovered_stepds(
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
@@ -2380,6 +2391,7 @@ pub(crate) fn monitor_recovered_stepds(
                         descriptor,
                         exit_code,
                         signal,
+                        reporter.gpu_sharing(),
                     )
                     .await
                     {
@@ -2426,6 +2438,7 @@ pub(crate) fn monitor_recovered_stepds(
                             &stepds,
                             descriptor,
                             "recovered completion",
+                            reporter.gpu_sharing(),
                         )
                         .await;
                         deliver_runtime_completion(
@@ -2741,7 +2754,15 @@ async fn fence_dead_stepd(
         }
     }
     let epilog_drain = settle_lost_teardown(store, &descriptor);
-    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    release_stepd_tracking(
+        running,
+        allocation,
+        stepds,
+        &descriptor,
+        "stepd crash",
+        reporter.gpu_sharing(),
+    )
+    .await;
     // The supervisor cannot be recovered, but its death still has to reach the
     // controller: unreported, the job holds its allocation in Running forever.
     let reported = report_runtime_completion(
@@ -2761,7 +2782,15 @@ async fn fence_dead_stepd(
     )
     .await;
     // The first release is a no-op while cleanup is stalled; a recorded report now permits it.
-    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    release_stepd_tracking(
+        running,
+        allocation,
+        stepds,
+        &descriptor,
+        "stepd crash",
+        reporter.gpu_sharing(),
+    )
+    .await;
     if !reported {
         warn!(
             job_id = descriptor.job_id,
@@ -2900,6 +2929,7 @@ async fn handle_completion_notification(
                 &context.stepds,
                 &descriptor,
                 "runtime completion",
+                context.reporter.gpu_sharing(),
             )
             .await;
             let reported = report_runtime_completion(
@@ -2927,6 +2957,7 @@ async fn handle_completion_notification(
                 &context.stepds,
                 &descriptor,
                 "runtime completion",
+                context.reporter.gpu_sharing(),
             )
             .await;
             deliver_runtime_completion(
@@ -3052,6 +3083,7 @@ async fn settle_replayed_completions(
                 &context.stepds,
                 &descriptor,
                 "completion replay",
+                context.reporter.gpu_sharing(),
             )
             .await;
         }
@@ -4511,6 +4543,8 @@ pub struct AgentService {
     launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
     auth_policy: spur_core::config::AuthConfig,
     block_file: Option<std::path::PathBuf>,
+    /// `controller.dispatch_timeout_secs`, which bounds the GPU placeholder wait.
+    dispatch_timeout_secs: u64,
 }
 
 impl AgentService {
@@ -4649,6 +4683,8 @@ impl AgentService {
             launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
             auth_policy: spur_core::config::AuthConfig::default(),
             block_file: None,
+            dispatch_timeout_secs: spur_core::config::ControllerConfig::default()
+                .dispatch_timeout_secs,
         }
     }
 
@@ -4703,6 +4739,11 @@ impl AgentService {
     #[cfg(test)]
     fn with_job_spool_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
         self.job_spool_roots = roots;
+        self
+    }
+
+    pub fn with_dispatch_timeout_secs(mut self, secs: u64) -> Self {
+        self.dispatch_timeout_secs = secs;
         self
     }
 
@@ -4899,6 +4940,7 @@ impl AgentService {
                 &self.stepds,
                 descriptor,
                 "stale session",
+                self.reporter.gpu_sharing(),
             )
             .await;
         }
@@ -5139,6 +5181,7 @@ impl AgentService {
                 &self.stepds,
                 &descriptor,
                 "supervised step could not be released",
+                self.reporter.gpu_sharing(),
             )
             .await;
             return Err(Status::internal(format!(
@@ -5298,6 +5341,7 @@ impl AgentService {
                 &self.stepds,
                 &descriptor,
                 "interactive step could not be released",
+                self.reporter.gpu_sharing(),
             )
             .await;
             return Err(Status::internal(format!(
@@ -5331,6 +5375,7 @@ impl AgentService {
             &self.stepds,
             descriptor,
             "interactive session failed after launch",
+            self.reporter.gpu_sharing(),
         )
         .await;
     }
@@ -5340,6 +5385,7 @@ impl AgentService {
             running: self.running.clone(),
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
+            gpu_sharing: self.reporter.gpu_sharing().cloned(),
         }
     }
 
@@ -5498,6 +5544,30 @@ fn reconcile_orphaned_allocations(
     }
 }
 
+/// Moves a launching reservation to the GPUs Kubernetes allocated, in one
+/// step under the allocation lock so no other launch sees the gap.
+fn rebind_gpus(
+    allocation: &mut NodeAllocation,
+    job_id: u32,
+    run_attempt: u32,
+    cpus: u32,
+    memory_mb: u64,
+    gpu_ids: &[u64],
+) -> Result<AllocationResult, Status> {
+    if !allocation.release_job_if(job_id, run_attempt) {
+        return Err(Status::resource_exhausted(
+            "reservation reclaimed while Kubernetes allocated the GPUs",
+        ));
+    }
+    allocation
+        .allocate_for_job(job_id, run_attempt, cpus, memory_mb, gpu_ids)
+        .map_err(|e| {
+            Status::resource_exhausted(format!(
+                "GPUs {gpu_ids:?} that Kubernetes allocated are not free here: {e:?}"
+            ))
+        })
+}
+
 /// Releases a launch reservation if the handler exits between reserve and
 /// commit, including on future cancellation which no error path can catch.
 /// Disarmed once the job is committed to the running set.
@@ -5506,6 +5576,7 @@ struct LaunchReservationGuard {
     job_id: u32,
     run_attempt: u32,
     armed: bool,
+    placeholder: Option<Arc<GpuSharing>>,
 }
 
 impl LaunchReservationGuard {
@@ -5515,7 +5586,13 @@ impl LaunchReservationGuard {
             job_id,
             run_attempt,
             armed: true,
+            placeholder: None,
         }
+    }
+
+    /// Also release the job's GPU placeholder if the launch does not commit.
+    fn cover_placeholder(&mut self, sharing: Arc<GpuSharing>) {
+        self.placeholder = Some(sharing);
     }
 
     fn disarm(&mut self) {
@@ -5530,6 +5607,9 @@ impl Drop for LaunchReservationGuard {
         }
         let job_id = self.job_id;
         let run_attempt = self.run_attempt;
+        if let Some(sharing) = &self.placeholder {
+            sharing.release_placeholder(job_id, run_attempt);
+        }
         // Generation-checked: a redispatch may have already superseded this
         // reservation, and releasing it here must not free the new one.
         if let Ok(mut alloc) = self.allocation.try_lock() {
@@ -6466,6 +6546,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
+        let received = tokio::time::Instant::now();
         Self::require_controller(&request)?;
         let mut req = request.into_inner();
         // A launch may carry a layout newer than our last registration adopted;
@@ -6983,7 +7064,7 @@ impl SlurmAgent for AgentService {
         // The generation check is performed inside `allocate_local_resources`
         // under the same allocation lock as the allocate, so a refresh publish
         // cannot slip a newer topology between the check and the bind.
-        let (alloc_result, allocated_device_ids) = self
+        let (mut alloc_result, mut allocated_device_ids) = self
             .allocate_local_resources(
                 job_id,
                 run_attempt,
@@ -6998,6 +7079,38 @@ impl SlurmAgent for AgentService {
         // cancelled launch future; disarmed once committed to `running`.
         let mut reservation_guard =
             LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
+
+        let mut substituted_alloc = None;
+        if let Some(sharing) = self.shared_gpu_node(&allocated_device_ids) {
+            reservation_guard.cover_placeholder(sharing.clone());
+            let job = PlaceholderJob {
+                job_id,
+                run_attempt,
+                user: &spec.user,
+                account: &spec.account,
+            };
+            let deadline = launch_deadline(received, self.dispatch_timeout_secs);
+            let chosen = sharing
+                .acquire_placeholder(job, &allocated_device_ids, deadline)
+                .await?;
+            if let Some(alloc) = req
+                .allocated
+                .as_ref()
+                .and_then(|a| placeholder::substituted_alloc(a, &chosen))
+            {
+                allocated_device_ids = chosen.iter().map(|g| g.stable_id).collect();
+                alloc_result = rebind_gpus(
+                    &mut *self.allocation.lock().await,
+                    job_id,
+                    run_attempt,
+                    cpus,
+                    memory_mb,
+                    &allocated_device_ids,
+                )?;
+                info!(job_id, gpus = ?allocated_device_ids, "Kubernetes picked other partitions");
+                substituted_alloc = Some(alloc);
+            }
+        }
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -7277,7 +7390,9 @@ impl SlurmAgent for AgentService {
                     run_attempt,
                     &launch_cfg.gpu_devices,
                 );
-                reservation_guard.disarm();
+                if committed.is_some() {
+                    reservation_guard.disarm();
+                }
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
                 // the TTL). Don't track a job with no backing allocation — kill,
@@ -7387,7 +7502,7 @@ impl SlurmAgent for AgentService {
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
-                    substituted_alloc: Default::default(),
+                    substituted_alloc,
                     success: true,
                     error: String::new(),
                     stdout_path,
@@ -7525,6 +7640,7 @@ impl SlurmAgent for AgentService {
                         &self.stepds,
                         descriptor,
                         "fabric binding changed before start",
+                        self.reporter.gpu_sharing(),
                     )
                     .await;
                     return Err(error);
@@ -7545,6 +7661,7 @@ impl SlurmAgent for AgentService {
                     &self.stepds,
                     descriptor,
                     "supervised job could not be released",
+                    self.reporter.gpu_sharing(),
                 )
                 .await;
                 return Err(Status::internal(format!(
@@ -10811,6 +10928,14 @@ impl AgentService {
         Ok((result, gpu_ids))
     }
 
+    /// GPU sharing when this node shares its GPUs with Kubernetes and the job
+    /// has GPUs here, so the job needs a placeholder.
+    fn shared_gpu_node(&self, gpu_ids: &[u64]) -> Option<&Arc<GpuSharing>> {
+        self.reporter
+            .gpu_sharing()
+            .filter(|s| !gpu_ids.is_empty() && s.is_shared())
+    }
+
     /// Resolve the per-node budget the way `launch_job` does, then reserve, so
     /// GPU-path tests exercise the real resolution instead of fixed numbers.
     #[cfg(test)]
@@ -13332,6 +13457,7 @@ mod tests {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            gpu_sharing: None,
         };
         let state = tempfile::tempdir().expect("runtime state directory");
         let mut descriptor = crate::stepd::StepdDescriptor::new(
@@ -13404,6 +13530,7 @@ mod tests {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            gpu_sharing: None,
         };
         let state = tempfile::tempdir().expect("runtime state directory");
         let descriptor = crate::stepd::StepdDescriptor::new(
@@ -13459,6 +13586,7 @@ mod tests {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            gpu_sharing: None,
         };
         let state = tempfile::tempdir().expect("runtime state directory");
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
@@ -13566,6 +13694,7 @@ mod tests {
                 &sessions,
                 &descriptor,
                 "runtime completion",
+                None,
             )
             .await
         );
@@ -13623,7 +13752,7 @@ mod tests {
                 .insert(stepd_key(descriptor), descriptor.clone());
         }
 
-        release_stepd_tracking(&running, &allocation, &sessions, &first, "step exit").await;
+        release_stepd_tracking(&running, &allocation, &sessions, &first, "step exit", None).await;
 
         assert!(
             running.lock().await.contains_key(&42),
@@ -13635,7 +13764,7 @@ mod tests {
             "the sibling step is still drawing on the allocation"
         );
 
-        release_stepd_tracking(&running, &allocation, &sessions, &second, "step exit").await;
+        release_stepd_tracking(&running, &allocation, &sessions, &second, "step exit", None).await;
 
         assert!(!running.lock().await.contains_key(&42));
         assert_eq!(
@@ -13690,7 +13819,15 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
-        release_stepd_tracking(&running, &allocation, &sessions, &descriptor, "stale reap").await;
+        release_stepd_tracking(
+            &running,
+            &allocation,
+            &sessions,
+            &descriptor,
+            "stale reap",
+            None,
+        )
+        .await;
 
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
@@ -13804,7 +13941,15 @@ mod tests {
                 .insert(stepd_key(descriptor), descriptor.clone());
         }
 
-        release_stepd_tracking(&running, &allocation, &sessions, &current, "step exit").await;
+        release_stepd_tracking(
+            &running,
+            &allocation,
+            &sessions,
+            &current,
+            "step exit",
+            None,
+        )
+        .await;
 
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
@@ -13847,8 +13992,15 @@ mod tests {
         running.lock().await.insert(42, newer);
 
         assert!(
-            !release_stepd_tracking(&running, &allocation, &sessions, &stale, "stale report",)
-                .await
+            !release_stepd_tracking(
+                &running,
+                &allocation,
+                &sessions,
+                &stale,
+                "stale report",
+                None
+            )
+            .await
         );
 
         assert_eq!(
@@ -14674,7 +14826,8 @@ mod tests {
             &context.stepds_store,
             &descriptor,
             9,
-            0
+            0,
+            None,
         )
         .await
         .is_some());
@@ -17743,6 +17896,7 @@ mod tests {
             &descriptor,
             0,
             0,
+            None,
         )
         .await
         .expect("the recovery poll owns this session's completion");
@@ -21780,6 +21934,83 @@ mod tests {
             0,
             "attempt 1's stale guard must not release attempt 2's reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn reservation_guard_releases_the_gpu_placeholder_of_an_uncommitted_launch() {
+        use crate::gpu_sharing::test_support::{identity, placeholder_api};
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let server = placeholder_api(&["gpu-1-129"], &[]);
+        let sharing =
+            GpuSharing::shared_for_test(&server, vec![identity(0, 1, 129, "0000:01:00.0")]);
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(12, 1, 1, 0, &[0])
+            .unwrap();
+        let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 12, 1);
+        guard.cover_placeholder(sharing.clone());
+        let job = PlaceholderJob {
+            job_id: 12,
+            run_attempt: 1,
+            user: "alice",
+            account: "research",
+        };
+        sharing
+            .acquire_placeholder(
+                job,
+                &[0],
+                tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+            )
+            .await
+            .unwrap();
+
+        drop(guard);
+
+        assert_eq!(sharing.live_placeholders(), 0);
+        assert_eq!(svc.free_gpu_count().await, 1);
+    }
+
+    fn allocation_with_gpus(ids: &[u32]) -> NodeAllocation {
+        NodeAllocation::new(
+            "test-node".into(),
+            &test_reporter_with_gpus(ids).snapshot_resources(),
+        )
+    }
+
+    #[test]
+    fn rebind_moves_the_reservation_to_the_gpus_kubernetes_allocated() {
+        let mut alloc = allocation_with_gpus(&[0, 1, 2]);
+        alloc.allocate_for_job(5, 1, 2, 64, &[0, 1]).unwrap();
+
+        let result = rebind_gpus(&mut alloc, 5, 1, 2, 64, &[0, 2]).unwrap();
+
+        assert_eq!(result.gpu_ids, vec![0, 2]);
+        assert_eq!(alloc.held_job_gpu_ids()[&5], vec![0, 2]);
+        assert_eq!(alloc.allocated_memory_mb, 64);
+        assert!(
+            alloc.allocate_for_job(6, 1, 0, 0, &[1]).is_ok(),
+            "the GPU the job gave up is free again"
+        );
+    }
+
+    #[test]
+    fn rebind_refuses_a_gpu_in_use_or_a_reclaimed_reservation() {
+        let mut alloc = allocation_with_gpus(&[0, 1, 2]);
+        alloc.allocate_for_job(5, 1, 0, 0, &[0]).unwrap();
+        alloc.allocate_for_job(6, 1, 0, 0, &[2]).unwrap();
+
+        let in_use = rebind_gpus(&mut alloc, 5, 1, 0, 0, &[2]).unwrap_err();
+        let reclaimed = rebind_gpus(&mut alloc, 7, 1, 0, 0, &[1]).unwrap_err();
+
+        assert_eq!(in_use.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(reclaimed.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(alloc.held_job_gpu_ids()[&6], vec![2]);
     }
 
     #[tokio::test]
