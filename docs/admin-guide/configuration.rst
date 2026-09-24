@@ -787,6 +787,8 @@ unauthenticated callers.
    none is demanded afterwards — so a caller that reaches the controller port
    can act as any registered node. ``spurctld`` warns at startup in that state.
 
+.. _native-auth-plugin:
+
 ``plugin = "spur"``
 ~~~~~~~~~~~~~~~~~~~
 
@@ -888,6 +890,10 @@ users can connect; the signing keys stay in ``/etc/spur`` and are never
 readable through the socket. Run it under systemd so it starts before
 ``spurctld`` and ``spurd``. Without a reachable mint, ``mode = "required"``
 rejects those callers.
+
+``spurauthd`` ships in the release and nightly tarballs, so ``install.sh``
+installs it with the other binaries. From source, build it with
+``cargo build --release -p spurauthd``.
 
 Step 4 — configure the cluster
 """"""""""""""""""""""""""""""

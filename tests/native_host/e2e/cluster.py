@@ -24,8 +24,7 @@ import tomli_w
 
 logger = logging.getLogger(__name__)
 
-BINARIES = ["spurctld", "spurd", "spur", "spurstepd"]
-OPTIONAL_BINARIES = ["spurauthd"]
+BINARIES = ["spurctld", "spurd", "spur", "spurstepd", "spurauthd"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
@@ -200,13 +199,6 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
                 f"Set SPUR_TEST_BINARIES_DIR or run: cargo build --release"
             )
         _upload_binary(nodes, local_path, bin_dir, name)
-
-    for name in OPTIONAL_BINARIES:
-        local_path = Path(binaries_dir) / name
-        if local_path.is_file():
-            _upload_binary(nodes, local_path, bin_dir, name)
-        else:
-            logger.info("Optional binary %s not present; skipping upload", name)
 
     # Create CLI symlinks
     symlink_cmd = (
@@ -839,12 +831,6 @@ class SpurCluster:
 
     def start_native_mint(self, jwks: str, socket: str):
         """Start ``spurauthd`` on every node so agents can mint controller RPCs."""
-        remote = f"{self.bin_dir}/spurauthd"
-        present = self.nodes[0].exec_allow_fail(
-            f"test -x '{remote}' && echo ok || true"
-        ).strip()
-        if present != "ok":
-            pytest.skip("spurauthd is not deployed; cargo build --release -p spurauthd")
         self._kill_mint()
         for node, name in zip(self.nodes, self.node_names):
             cmd = (
