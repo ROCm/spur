@@ -3806,6 +3806,8 @@ dependencies = [
  "clap",
  "hostname",
  "http",
+ "k8s-openapi",
+ "kube",
  "libc",
  "libloading",
  "nix",
