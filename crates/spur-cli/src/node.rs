@@ -41,6 +41,17 @@ pub enum NodeCommand {
         #[arg(required = true)]
         labels: Vec<String>,
     },
+    /// Share the GPUs of k0s-enrolled worker nodes with Kubernetes pods, or stop sharing.
+    ///
+    /// "off" works like drain for the GPUs: running jobs finish, and the node is then reserved
+    /// for Kubernetes again.
+    GpuSharing {
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
+        node: String,
+        /// on or off (also accepts yes/no, true/false)
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+    },
     /// Drain one or more nodes: stop scheduling new jobs while existing jobs finish.
     Drain {
         /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
@@ -74,6 +85,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let controller = parsed.controller;
     match parsed.command {
         NodeCommand::Label { node, labels } => cmd_label(&controller, node, labels).await,
+        NodeCommand::GpuSharing { node, enabled } => {
+            cmd_gpu_sharing(&controller, node, enabled).await
+        }
         NodeCommand::Drain { node, reason } => cmd_drain(&controller, node, reason).await,
         NodeCommand::Remove {
             node,
@@ -120,7 +134,7 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
     for node in &nodes {
         match client
             .update_node(UpdateNodeRequest {
-                gpu_sharing: Default::default(),
+                gpu_sharing: None,
                 name: node.to_string(),
                 state: None,
                 reason: None,
@@ -144,6 +158,44 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
         }
     }
 
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_gpu_sharing(controller: &str, node_pattern: String, enabled: bool) -> Result<()> {
+    let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
+    } else {
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
+
+    let state = if enabled { "on" } else { "off" };
+    let mut failed: Vec<String> = Vec::new();
+    for node in &nodes {
+        match client
+            .update_node(UpdateNodeRequest {
+                name: node.to_string(),
+                gpu_sharing: Some(enabled),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => println!("Node {node}: GPU sharing {state}"),
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
+        }
+    }
     if !failed.is_empty() {
         bail!(
             "failed on {} of {} node(s): {}",
@@ -423,6 +475,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(capture.update_node_names(), vec!["node1", "node2"]);
+    }
+
+    #[tokio::test]
+    async fn gpu_sharing_sends_the_flag_per_node() {
+        for (arg, want) in [("on", true), ("off", false)] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            main_with_args(vec![
+                "node".into(),
+                "--controller".into(),
+                format!("http://{addr}"),
+                "gpu-sharing".into(),
+                "gpu[1-2]".into(),
+                arg.into(),
+            ])
+            .await
+            .unwrap();
+
+            assert_eq!(capture.update_node_names(), vec!["gpu1", "gpu2"]);
+            assert_eq!(capture.update_node_gpu_sharing(), vec![Some(want); 2]);
+        }
+    }
+
+    #[test]
+    fn gpu_sharing_rejects_an_unknown_value() {
+        assert!(NodeArgs::try_parse_from(["node", "gpu-sharing", "gpu1", "maybe"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn label_does_not_touch_gpu_sharing() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "gpu1".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(capture.update_node_gpu_sharing(), vec![None]);
     }
 
     #[tokio::test]
