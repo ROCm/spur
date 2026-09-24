@@ -6538,6 +6538,7 @@ impl SlurmAgent for AgentService {
                         .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
                         .unwrap_or_default();
                     return Ok(Response::new(LaunchJobResponse {
+                        substituted_alloc: Default::default(),
                         success: true,
                         error: String::new(),
                         stdout_path: paths.0,
@@ -6615,6 +6616,7 @@ impl SlurmAgent for AgentService {
                     "stepd already tracked for this attempt; treating retried launch as success"
                 );
                 return Ok(Response::new(LaunchJobResponse {
+                    substituted_alloc: Default::default(),
                     success: true,
                     error: String::new(),
                     stdout_path: paths.0,
@@ -7038,6 +7040,7 @@ impl SlurmAgent for AgentService {
                 let err_msg = format!("prolog failed: {e:#}");
                 error!(job_id, error = %err_msg, "prolog hook failed before launch");
                 return Ok(Response::new(LaunchJobResponse {
+                    substituted_alloc: Default::default(),
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
@@ -7253,6 +7256,7 @@ impl SlurmAgent for AgentService {
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
                         return Ok(Response::new(LaunchJobResponse {
+                            substituted_alloc: Default::default(),
                             success: false,
                             error: "stepd superseded by a newer attempt".into(),
                             stdout_path: String::new(),
@@ -7319,6 +7323,7 @@ impl SlurmAgent for AgentService {
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {
+                        substituted_alloc: Default::default(),
                         success: false,
                         error: "reservation reclaimed during launch".into(),
                         stdout_path: String::new(),
@@ -7382,6 +7387,7 @@ impl SlurmAgent for AgentService {
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
+                    substituted_alloc: Default::default(),
                     success: true,
                     error: String::new(),
                     stdout_path,
@@ -7402,6 +7408,7 @@ impl SlurmAgent for AgentService {
                 self.drain_on_node_fault(&e, job_id);
 
                 Ok(Response::new(LaunchJobResponse {
+                    substituted_alloc: Default::default(),
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),

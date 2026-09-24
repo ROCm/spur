@@ -2796,7 +2796,10 @@ impl SlurmController for ControllerService {
                 req.core_layout_fingerprint,
                 &req.spec_enforcement_error,
             );
-            Ok(Response::new(HeartbeatResponse { reregister }))
+            Ok(Response::new(HeartbeatResponse {
+                reregister,
+                gpu_sharing: Default::default(),
+            }))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -5764,6 +5767,8 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         ),
     };
     NodeInfo {
+        gpu_holds: Default::default(),
+        gpu_sharing: Default::default(),
         name: node.name.clone(),
         state,
         state_reason,

@@ -611,6 +611,7 @@ impl NodeReporter {
                 )
             };
             let req = spur_proto::proto::HeartbeatRequest {
+                gpu_holds: Default::default(),
                 hostname: self.hostname.clone(),
                 cpu_load: load,
                 free_memory_mb: free_mem,

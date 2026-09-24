@@ -2123,6 +2123,7 @@ async fn update_node(
 ) -> Result<()> {
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
+            gpu_sharing: Default::default(),
             name: name.to_string(),
             state,
             reason,
