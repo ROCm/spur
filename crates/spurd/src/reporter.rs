@@ -379,6 +379,7 @@ impl NodeReporter {
             let current_token = read_recover(&self.node_token).clone();
             let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
             let req = spur_proto::proto::HeartbeatRequest {
+                gpu_holds: Default::default(),
                 hostname: self.hostname.clone(),
                 cpu_load: load,
                 free_memory_mb: free_mem,
