@@ -319,10 +319,13 @@ For example:
                    expression: device.attributes["resource.kubernetes.io"].pciBusID == "0000:2f:00.0"
 
 ``spurd`` waits until kube-scheduler allocates the claim and schedules the pod.
-Then it starts the job. The launch deadline
-``controller.dispatch_timeout_secs`` (default 300 seconds) is the only limit of
-this wait. A slow API server does not cause a failure: ``spurd`` tries a timed
-out API call again, in the deadline.
+Then it starts the job. The launch deadline is the only limit of this wait.
+``spurd`` reads ``controller.dispatch_timeout_secs`` (default 300 seconds) from
+its own configuration file and stops the wait 10 seconds before this time
+passes, counted from when the launch request arrives. Thus the controller
+gets the answer before its own deadline. Use the same value on the controller
+and on the agents. A slow API server does not cause a failure: ``spurd`` tries
+a timed out API call again, in the deadline.
 
 Two conditions stop the wait:
 
@@ -339,9 +342,20 @@ job then runs on those partitions. The controller accepts a different
 partition only when the number of devices is the same and each device has the
 same parent GPU as a device in the request.
 
-When the job ends, ``spurd`` deletes the pod and the claim. ``spurd`` also
-deletes placeholders that have no live job. If an administrator deletes the
-placeholder of a running job, ``spurd`` makes it again.
+When the job ends, or when its launch fails after ``spurd`` made the
+placeholder, ``spurd`` deletes the pod and the claim. Every 30 seconds
+``spurd`` also does a check of its placeholders:
+
+- It deletes each placeholder of the node that has no live job. A job is live
+  from the start of its launch until its resources are released.
+- If an administrator deletes the placeholder of a running job, ``spurd`` makes
+  it again.
+- If the claim of a running job does not hold the GPUs of the job, ``spurd``
+  reports these GPUs as ``conflict``.
+
+After a restart, ``spurd`` does these two last steps only for the jobs that it
+started after the restart. It keeps and deletes the placeholders of the older
+jobs as usual.
 
 How Spur sees pod GPUs: holds
 -----------------------------
@@ -497,8 +511,8 @@ Failure cases
      - ``spurd`` makes the placeholder again. If a pod gets the GPU first,
        the GPU shows ``conflict``.
    * - A GPU is in conflict.
-     - ``scontrol show node`` shows ``conflict``, and the job gets a comment.
-       The controller gives the GPU to no new job. Spur stops no job and no
+     - ``scontrol show node`` shows ``conflict`` and the reason. The job gets
+       no comment. The controller gives the GPU to no new job. Spur stops no job and no
        pod. The administrator decides what to do.
    * - ``spurd`` cannot connect to the API server.
      - ``spurd`` refuses new launches on the node. The last report becomes old,
