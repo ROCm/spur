@@ -53,6 +53,10 @@ pub enum K8sCommand {
         /// Scope the cluster to nodes matching every key=value label (repeatable).
         #[arg(long = "selector", value_parser = parse_key_val)]
         selector: Vec<(String, String)>,
+        /// Enrolled worker nodes that share their GPUs with Kubernetes pods (hostlist, e.g.
+        /// "gpu[01-02]"). Other enrolled nodes are reserved for Kubernetes as a whole.
+        #[arg(long)]
+        gpu_sharing_nodes: Option<String>,
     },
     /// Add worker nodes to a running cluster (scoped clusters only; no down/reset needed).
     AddNodes {
@@ -65,6 +69,9 @@ pub enum K8sCommand {
         /// Add nodes matching every key=value label (repeatable).
         #[arg(long = "selector", value_parser = parse_key_val)]
         selector: Vec<(String, String)>,
+        /// The added nodes share their GPUs with Kubernetes pods.
+        #[arg(long)]
+        gpu_sharing: bool,
     },
     /// Remove worker nodes from a running cluster: cordon + drain, then `k0s reset` the node
     /// (destructive — the node re-downloads/re-seeds on a later add). Use `spur node drain` instead
@@ -129,6 +136,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             nodes,
             partition,
             selector,
+            gpu_sharing_nodes,
         } => {
             cmd_up(
                 &controller,
@@ -138,6 +146,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 nodes,
                 partition,
                 selector,
+                gpu_sharing_nodes,
             )
             .await
         }
@@ -145,7 +154,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             nodes,
             partition,
             selector,
-        } => cmd_add_nodes(&controller, nodes, partition, selector).await,
+            gpu_sharing,
+        } => cmd_add_nodes(&controller, nodes, partition, selector, gpu_sharing).await,
         K8sCommand::RemoveNodes {
             nodes,
             drain_timeout,
@@ -220,12 +230,13 @@ async fn cmd_up(
     nodes: Option<String>,
     partition: Option<String>,
     selector: Vec<(String, String)>,
+    gpu_sharing_nodes: Option<String>,
 ) -> Result<()> {
     let selector = selector_map(selector)?;
     let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
-            gpu_sharing_nodes: Default::default(),
+            gpu_sharing_nodes: gpu_sharing_nodes.unwrap_or_default(),
             control_plane_node,
             control_plane_replicas: replicas,
             control_plane_nodes,
@@ -252,12 +263,13 @@ async fn cmd_add_nodes(
     nodes: Option<String>,
     partition: Option<String>,
     selector: Vec<(String, String)>,
+    gpu_sharing: bool,
 ) -> Result<()> {
     let selector = selector_map(selector)?;
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
         .cluster_add_nodes(ClusterAddNodesRequest {
-            gpu_sharing: Default::default(),
+            gpu_sharing,
             nodes: nodes.unwrap_or_default(),
             partition: partition.unwrap_or_default(),
             selector,
@@ -512,6 +524,25 @@ mod tests {
                 assert_eq!(drain_timeout, Some(300));
                 assert!(force);
             }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn parses_gpu_sharing_flags() {
+        let args =
+            K8sArgs::try_parse_from(["k8s", "up", "--gpu-sharing-nodes", "gpu[01-02]"]).unwrap();
+        match args.command {
+            K8sCommand::Up {
+                gpu_sharing_nodes, ..
+            } => assert_eq!(gpu_sharing_nodes.as_deref(), Some("gpu[01-02]")),
+            _ => panic!("wrong command"),
+        }
+        let args =
+            K8sArgs::try_parse_from(["k8s", "add-nodes", "--nodes", "gpu09", "--gpu-sharing"])
+                .unwrap();
+        match args.command {
+            K8sCommand::AddNodes { gpu_sharing, .. } => assert!(gpu_sharing),
             _ => panic!("wrong command"),
         }
     }
