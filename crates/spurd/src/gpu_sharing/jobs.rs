@@ -128,7 +128,13 @@ impl GpuSharing {
         let key = (job.job_id, job.run_attempt);
         lock(&self.placeholders).insert(key, Tracked::Acquiring);
 
-        let allocated = placeholder::acquire(&client, &spec, deadline).await?;
+        let allocated = placeholder::acquire(&client, &spec, deadline)
+            .await
+            .inspect_err(|e| {
+                if let AcquireError::Rejected(e) = e {
+                    self.forget_client_if_unauthorized(e);
+                }
+            })?;
         let chosen =
             placeholder::map_allocation(&spec, &allocated, |name| self.requested_gpu_named(name))
                 .map_err(AcquireError::from)?;
@@ -166,6 +172,7 @@ impl GpuSharing {
             let result = match this.client().await {
                 Ok(client) => placeholder::release(&client, job_id, run_attempt, &this.node_name)
                     .await
+                    .inspect_err(|e| this.forget_client_if_unauthorized(e))
                     .map_err(anyhow::Error::from),
                 Err(e) => Err(e),
             };
@@ -221,7 +228,10 @@ impl GpuSharing {
                 )
             }
             Ok(_) => {}
-            Err(e) => warn!(error = %e, "cannot list the GPU placeholders"),
+            Err(e) => {
+                self.forget_client_if_unauthorized(&e);
+                warn!(error = %e, "cannot list the GPU placeholders");
+            }
         }
         if shared {
             self.check_presence(&client).await;
@@ -241,6 +251,7 @@ impl GpuSharing {
                 Ok(Presence::Conflict(reason)) => Some(reason),
                 Ok(Presence::Held | Presence::Pending) => None,
                 Err(e) => {
+                    self.forget_client_if_unauthorized(&e);
                     warn!(job_id = spec.job_id, error = %e, "cannot check the GPU placeholder");
                     continue;
                 }
