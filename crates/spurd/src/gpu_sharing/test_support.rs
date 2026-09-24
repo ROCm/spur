@@ -108,6 +108,7 @@ impl GpuSharing {
         let sharing = Self::build(
             "GPU-Node-1",
             None,
+            std::sync::Weak::new(),
             KubeletLinks::under(std::path::Path::new("/nonexistent")),
             Some(server.client()),
         );
