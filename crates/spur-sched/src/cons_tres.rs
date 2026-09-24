@@ -9,7 +9,113 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use spur_core::job::RunKey;
 use spur_core::resource::{GpuResource, ResourceSet};
+
+/// Why a caller is entitled to hand a run's slice back. A slice is released only
+/// on a controller decision, so every ground names the decision it rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseGround {
+    /// The controller committed the run's completion at this Raft index.
+    Acknowledged(u64),
+    /// The controller ordered the run to end. Its cancel is its own word that
+    /// the run is over, so nothing further has to be acknowledged.
+    ControllerCancelled,
+    /// The reservation never had anything spawned against it, so there is no
+    /// payload to answer for and nothing for the controller to acknowledge.
+    NeverSpawned,
+    /// The controller answered a claim Raft never had. Its answer is the whole
+    /// of the acknowledgement, so there is no committed index to name.
+    SettledUnrecordedClaim,
+    /// The controller dispatched a newer attempt onto this job id, and that
+    /// dispatch is the decision which ends the attempt being displaced.
+    SupersededByNewerAttempt,
+    /// Teardown finished and the cores are idle, though the record persists
+    /// (state `Cleaned`) until an ack clears it.
+    TeardownComplete,
+}
+
+/// Licence to hand a run's slice back. Deliberately not `Clone` and built only
+/// through a named ground, so a release cannot be written without saying why.
+#[derive(Debug)]
+#[must_use = "a warrant does nothing until it is spent on a release"]
+pub struct ReleaseWarrant {
+    run: RunKey,
+    ground: ReleaseGround,
+}
+
+impl ReleaseWarrant {
+    /// The controller has committed this run's completion. Mint this from the
+    /// recorded acknowledgement, never from the agent's own reading of an exit.
+    pub fn acknowledged(run: RunKey, release_raft_index: u64) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::Acknowledged(release_raft_index),
+        }
+    }
+
+    pub fn controller_cancelled(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::ControllerCancelled,
+        }
+    }
+
+    pub fn never_spawned(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::NeverSpawned,
+        }
+    }
+
+    /// The controller has answered a claim it holds no record of. Mint this only
+    /// from that answer, so the audit never reads it as a committed completion.
+    pub fn settled_unrecorded_claim(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::SettledUnrecordedClaim,
+        }
+    }
+
+    /// A newer attempt is taking over this job id's reservation. Mint this only
+    /// where that attempt has already been judged feasible.
+    pub fn superseded_by_newer_attempt(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::SupersededByNewerAttempt,
+        }
+    }
+
+    /// Teardown finished and the record is durably marked `Cleaned`. Mint this
+    /// only after the fsync succeeds, so a crash re-charges nothing.
+    pub fn teardown_complete(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::TeardownComplete,
+        }
+    }
+
+    pub fn run(&self) -> RunKey {
+        self.run
+    }
+
+    pub fn ground(&self) -> ReleaseGround {
+        self.ground
+    }
+}
+
+impl std::fmt::Display for ReleaseGround {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acknowledged(index) => write!(f, "acknowledged at raft index {index}"),
+            Self::ControllerCancelled => f.write_str("controller cancelled"),
+            Self::NeverSpawned => f.write_str("never spawned"),
+            Self::SettledUnrecordedClaim => f.write_str("settled an unrecorded claim"),
+            Self::SupersededByNewerAttempt => f.write_str("superseded by a newer attempt"),
+            Self::TeardownComplete => f.write_str("teardown complete"),
+        }
+    }
+}
 
 /// Why a reservation could not be made. Distinguished so the caller can map
 /// each to the right gRPC status instead of reporting every failure as GPU
