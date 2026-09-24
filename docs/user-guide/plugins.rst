@@ -39,8 +39,8 @@ exists, so a plugin can own a whole command tree:
    * - Command
      - Executable tried, longest first
      - Arguments the plugin gets
-   * - ``spur silo install demo``
-     - ``spur-silo-install-demo``, ``spur-silo-install``, ``spur-silo``
+   * - ``spur aims install demo``
+     - ``spur-aims-install-demo``, ``spur-aims-install``, ``spur-aims``
      - the part of the command that is left over
 
 Only the directories on ``PATH`` are searched, and the first directory that
@@ -70,7 +70,7 @@ Spur exports these variables before it runs a plugin:
    * - ``SPUR_VERSION``
      - Version string of that binary
    * - ``SPUR_PLUGIN_NAME``
-     - Resolved plugin name, for example ``silo``
+     - Resolved plugin name, for example ``aims``
 
 No user identity and no token are exported. A plugin that needs cluster data
 asks Spur for it, for example with ``$SPUR_BIN k8s kubeconfig --admin``.
