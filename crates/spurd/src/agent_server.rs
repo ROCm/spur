@@ -1540,14 +1540,18 @@ fn cleanup_stepd_files(descriptor: &crate::stepd::StepdDescriptor) {
 async fn discard_stepd_session(descriptor: &crate::stepd::StepdDescriptor) {
     let job_id = descriptor.job_id;
     let run_attempt = descriptor.run_attempt;
-    if let Err(error) = stop_stepd_process(descriptor).await {
+    let stop_result = stop_stepd_process(descriptor).await;
+    if let Err(error) = &stop_result {
         warn!(job_id, run_attempt, %error, "failed to stop abandoned stepd");
     }
-    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)) {
+    // Unconfirmed teardown must not delete the on-disk session: it is the
+    // only record a future restart could use to retry reaping this process.
+    if !runtime_teardown_confirmed(descriptor, &stop_result).await {
         warn!(
             job_id,
-            run_attempt, "could not confirm the abandoned stepd's cgroup is empty"
+            run_attempt, "could not confirm the abandoned stepd is torn down; leaving its state"
         );
+        return;
     }
     cleanup_stepd_files(descriptor);
 }
@@ -1598,8 +1602,9 @@ pub async fn recover_stepds(
             tracked.run_attempt = descriptor.run_attempt;
         }
         // Sessions arrive in directory order, so only take these from the job's
-        // own: a step's spool file and rootfs are the step's, not the job's.
-        if !owns_lifetime {
+        // own, and only from its newest attempt — a stale sibling must not
+        // describe the job's cgroup/output paths out from under the current one.
+        if !owns_lifetime || descriptor.run_attempt < tracked.run_attempt {
             continue;
         }
         tracked.cgroup_path = cgroup_path;
@@ -3652,6 +3657,11 @@ impl AgentService {
                 // older session can silently replace the live current one.
                 let key = stepd_key(&descriptor);
                 if let Some(existing) = sessions.get(&key) {
+                    // A duplicate re-discovery of the exact same session is not
+                    // a displacement — fencing it would kill a live, current stepd.
+                    if existing == &descriptor {
+                        continue;
+                    }
                     if existing.run_attempt > descriptor.run_attempt {
                         displaced.push(descriptor);
                         continue;
@@ -10115,43 +10125,132 @@ mod tests {
         );
     }
 
+    // A duplicate discovery of the exact same session is not a displacement;
+    // fencing it would kill a live, current stepd for no reason.
+    #[tokio::test]
+    async fn adopt_stepds_does_not_fence_a_rediscovered_identical_session() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        let cgroup = cgroup_root.path().join("job_73_1");
+        std::fs::create_dir(&cgroup).expect("cgroup");
+
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            73,
+            1,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/dup.sock"),
+            cgroup.clone(),
+        );
+
+        svc.adopt_stepds(&[descriptor.clone(), descriptor.clone()])
+            .await;
+
+        assert_eq!(
+            svc.stepds
+                .lock()
+                .await
+                .get(&(73, spur_core::step::STEP_EXTERN)),
+            Some(&descriptor),
+            "the identical session must still be tracked"
+        );
+        assert!(
+            cgroup.exists(),
+            "a session identical to the one already tracked must not be fenced"
+        );
+    }
+
     // `recover_stepds` and `adopt_stepds` both discover from the same
     // filesystem-ordered list; if one picks first-seen and the other picks
     // last-seen, they can end up tracking two different epochs for one job.
     #[tokio::test]
     async fn recover_stepds_tracks_the_newest_attempt_regardless_of_arrival_order() {
+        let make_pair = |job_id: u32| {
+            let older = crate::stepd::StepdDescriptor::new(
+                job_id,
+                1,
+                spur_core::step::STEP_EXTERN,
+                0,
+                0,
+                std::path::PathBuf::new(),
+                std::path::PathBuf::new(),
+            );
+            let newer = crate::stepd::StepdDescriptor::new(
+                job_id,
+                2,
+                spur_core::step::STEP_EXTERN,
+                0,
+                0,
+                std::path::PathBuf::new(),
+                std::path::PathBuf::new(),
+            );
+            (older, newer)
+        };
         let running = new_running_jobs();
-        let older = crate::stepd::StepdDescriptor::new(
-            71,
-            1,
-            spur_core::step::STEP_EXTERN,
-            0,
-            0,
-            std::path::PathBuf::new(),
-            std::path::PathBuf::new(),
-        );
-        let newer = crate::stepd::StepdDescriptor::new(
-            71,
-            2,
-            spur_core::step::STEP_EXTERN,
-            0,
-            0,
-            std::path::PathBuf::new(),
-            std::path::PathBuf::new(),
-        );
 
-        // The older attempt is discovered first and seeds the entry; the
-        // newer sibling arriving after it must still move the epoch forward.
+        // Older-first would already pass under a naive last-wins overwrite;
+        // newer-first is what actually rules out first-wins too.
+        let (older, newer) = make_pair(71);
         recover_stepds(&running, vec![older, newer]).await;
+        let (newer, older) = make_pair(72);
+        recover_stepds(&running, vec![newer, older]).await;
 
+        let jobs = running.lock().await;
         assert_eq!(
-            running
-                .lock()
-                .await
-                .get(&71)
-                .map(|tracked| tracked.run_attempt),
+            jobs.get(&71).map(|tracked| tracked.run_attempt),
             Some(2),
-            "the job's tracked epoch must be the newest attempt discovered, not the first"
+            "older-then-newer must track the newest attempt discovered"
+        );
+        assert_eq!(
+            jobs.get(&72).map(|tracked| tracked.run_attempt),
+            Some(2),
+            "newer-then-older must not roll the tracked epoch back to the stale sibling"
+        );
+    }
+
+    // A stale sibling must not describe the job's cgroup out from under the
+    // attempt that now owns it, even though both are job-owning descriptors.
+    #[tokio::test]
+    async fn recover_stepds_keeps_the_newest_attempts_cgroup_against_a_stale_sibling() {
+        let running = new_running_jobs();
+        let mut newer = crate::stepd::StepdDescriptor::new(
+            74,
+            2,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("/cgroup/newer"),
+        );
+        newer.cgroup_path = std::path::PathBuf::from("/cgroup/newer");
+        let mut older = crate::stepd::StepdDescriptor::new(
+            74,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("/cgroup/older"),
+        );
+        older.cgroup_path = std::path::PathBuf::from("/cgroup/older");
+
+        // The newest attempt is discovered first; the stale sibling arriving
+        // after it must not overwrite the cgroup it already lost.
+        recover_stepds(&running, vec![newer, older]).await;
+
+        let jobs = running.lock().await;
+        let tracked = jobs.get(&74).expect("job must be tracked");
+        assert_eq!(tracked.run_attempt, 2);
+        assert_eq!(
+            tracked.cgroup_path,
+            Some(std::path::PathBuf::from("/cgroup/newer")),
+            "the stale attempt's cgroup must not replace the current attempt's"
         );
     }
 
@@ -18437,6 +18536,45 @@ mod tests {
             "the abort must drop the abandoned session's on-disk state"
         );
         let _ = child.wait();
+    }
+
+    // An unconfirmed teardown must not erase the only record a future
+    // restart could use to retry reaping this process.
+    #[tokio::test]
+    async fn discarding_a_stepd_session_keeps_its_state_when_teardown_is_unconfirmed() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(78, 3, spur_core::step::STEP_BATCH)
+            .expect("session directory");
+        // Named job_* so cleanup_cgroup accepts it as one of ours.
+        let cgroup_dir = state.path().join("job_78_3");
+        std::fs::create_dir_all(&cgroup_dir).expect("stand-in cgroup directory");
+        // A leftover file fails rmdir the way a busy cgroup does, so teardown
+        // can never be confirmed regardless of the (trivial, pid 0) stop result.
+        std::fs::write(cgroup_dir.join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
+
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            78,
+            3,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            session_dir.join("runtime.sock"),
+            cgroup_dir.clone(),
+        );
+
+        discard_stepd_session(&descriptor).await;
+
+        assert!(
+            cgroup_dir.exists(),
+            "an unconfirmed cgroup must be left for a future retry, not silently forgotten"
+        );
+        assert!(
+            session_dir.exists(),
+            "the on-disk session must survive an unconfirmed teardown so it can be rediscovered"
+        );
     }
 
     #[tokio::test]
