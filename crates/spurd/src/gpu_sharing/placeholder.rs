@@ -451,12 +451,13 @@ fn job_of(meta: &ObjectMeta) -> Option<(u32, u32)> {
 }
 
 /// Deletes the placeholders of this node whose (job id, run attempt) is not
-/// in `live`. `live` must also hold the attempts that are still launching.
+/// live. `live` must also hold the attempts that are still launching. It is
+/// read after the listing, so a placeholder a launch creates meanwhile is kept.
 /// Returns the deleted names.
 pub async fn reconcile_orphans(
     client: &Client,
     node_name: &str,
-    live: &HashSet<(u32, u32)>,
+    live: impl FnOnce() -> HashSet<(u32, u32)>,
 ) -> Result<Vec<String>, kube::Error> {
     let lp = ListParams::default().labels(&format!(
         "{LABEL_MANAGED_BY}={MANAGED_BY},{LABEL_NODE}={node_name}"
@@ -467,6 +468,7 @@ pub async fn reconcile_orphans(
     let claims = Api::<ResourceClaim>::namespaced(client.clone(), NAMESPACE)
         .list(&lp)
         .await?;
+    let live = live();
     let orphans: HashSet<String> = pods
         .items
         .iter()
@@ -1055,7 +1057,7 @@ mod tests {
             _ => api_error(500, "unexpected"),
         });
 
-        let deleted = reconcile_orphans(&api.client(), NODE, &HashSet::from([(1, 0)]))
+        let deleted = reconcile_orphans(&api.client(), NODE, || HashSet::from([(1, 0)]))
             .await
             .expect("reconciled");
 
