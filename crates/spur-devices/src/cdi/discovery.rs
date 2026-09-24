@@ -1077,6 +1077,42 @@ mod tests {
         assert_eq!(unique.len(), 4);
     }
 
+    /// Values measured on an MI300X at 0000:11:00.0 in CPX mode (amdgpu
+    /// 6.19.14): the kernel ORs the partition node_id into the low three bits
+    /// of location_id, so the eight partitions read 0x1100..0x1107 while lspci
+    /// lists function 0 only. A SPX neighbour at 0000:2f:00.0 is the control.
+    #[test]
+    fn cpx_partitions_share_parent_bdf_with_function_zero() {
+        let mut nodes: Vec<KfdGpuNode> = (0u32..8)
+            .map(|i| kfd_node(9 + i, 128 + i, 0x1100 | u64::from(i)))
+            .collect();
+        nodes.push(kfd_node(2, 136, 0x2f00));
+
+        let map = partition_indices_by_bdf(&nodes);
+        for i in 0u32..8 {
+            let node = &nodes[i as usize];
+            assert_eq!(
+                map[&node.render_minor], i,
+                "partition rank of renderD{}",
+                node.render_minor
+            );
+            let sid = encode_stable_id(node.location_id, node.domain, map[&node.render_minor]);
+            assert_eq!(stable_id_to_bdf(sid), "0000:11:00.0");
+            assert_eq!(
+                bdf_from_location_id(node.location_id, node.domain),
+                "0000:11:00.0"
+            );
+        }
+        assert_eq!(map[&136], 0);
+        assert_eq!(bdf_from_location_id(0x2f00, 0), "0000:2f:00.0");
+
+        let sids: std::collections::HashSet<u64> = nodes
+            .iter()
+            .map(|n| encode_stable_id(n.location_id, n.domain, map[&n.render_minor]))
+            .collect();
+        assert_eq!(sids.len(), 9, "stable_ids stay distinct across partitions");
+    }
+
     #[test]
     fn stable_ids_unchanged_when_render_minor_pool_shifts() {
         let bdf_a = 0x0500u64;
