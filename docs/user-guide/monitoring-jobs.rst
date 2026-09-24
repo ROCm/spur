@@ -58,6 +58,12 @@ Common flags:
    * - ``--name``
      - ``-n``
      - Filter by job name.
+   * - ``--qos``
+     - ``-q``
+     - Filter by QOS (comma-separated list).
+   * - ``--reservation``
+     - ``-R``
+     - Filter by reservation (comma-separated list).
    * - ``--format``
      - ``-o``
      - Custom column format (see below).

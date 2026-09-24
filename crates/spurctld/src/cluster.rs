@@ -541,6 +541,8 @@ pub struct JobFilter<'a> {
     pub partition: Option<&'a str>,
     pub account: Option<&'a str>,
     pub name: Option<&'a str>,
+    pub qos: Option<&'a str>,
+    pub reservation: Option<&'a str>,
     pub job_ids: &'a [JobId],
     /// Concrete node names (already hostlist-expanded); keeps only jobs
     /// allocated on at least one of them.
@@ -1254,6 +1256,24 @@ impl ClusterManager {
             }
             if let Some(n) = filter.name {
                 if !n.is_empty() && !n.split(',').any(|pat| pat.trim() == j.spec.name) {
+                    return false;
+                }
+            }
+            if let Some(q) = filter.qos {
+                if !q.is_empty()
+                    && !q
+                        .split(',')
+                        .any(|pat| Some(pat.trim()) == j.spec.qos.as_deref())
+                {
+                    return false;
+                }
+            }
+            if let Some(r) = filter.reservation {
+                if !r.is_empty()
+                    && !r
+                        .split(',')
+                        .any(|pat| Some(pat.trim()) == j.spec.reservation.as_deref())
+                {
                     return false;
                 }
             }
@@ -24633,6 +24653,81 @@ mod tests {
 
         let empty = by_name(Some(""));
         assert_eq!(empty.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_filters_by_qos_and_reservation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["high", "low"] {
+            cm.qos_cache().insert(Qos {
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+
+        let spec_with = |name: &str, qos: &str, reservation: Option<&str>| {
+            let mut spec = basic_spec(name);
+            spec.qos = Some(qos.into());
+            spec.reservation = reservation.map(Into::into);
+            spec
+        };
+
+        submit_and_wait(&cm, spec_with("a", "high", Some("resv1")));
+        submit_and_wait(&cm, spec_with("b", "low", Some("resv1")));
+        submit_and_wait(&cm, spec_with("c", "high", None));
+
+        let by_qos = |qos: Option<&str>| {
+            cm.get_jobs(&JobFilter {
+                qos,
+                ..Default::default()
+            })
+        };
+
+        assert_eq!(by_qos(Some("high")).len(), 2);
+        assert_eq!(by_qos(Some("low")).len(), 1);
+        // Comma-separated QOS list matches either.
+        assert_eq!(by_qos(Some("high,low")).len(), 3);
+        assert!(by_qos(Some("nonexistent")).is_empty());
+        // Empty filter is a no-op.
+        assert_eq!(by_qos(Some("")).len(), 3);
+
+        let by_reservation = |reservation: Option<&str>| {
+            cm.get_jobs(&JobFilter {
+                reservation,
+                ..Default::default()
+            })
+        };
+
+        assert_eq!(by_reservation(Some("resv1")).len(), 2);
+        assert!(by_reservation(Some("other")).is_empty());
+        assert_eq!(by_reservation(Some("")).len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_reservation_filter_accepts_comma_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let with_resv = |name: &str, reservation: &str| {
+            let mut spec = basic_spec(name);
+            spec.reservation = Some(reservation.into());
+            spec
+        };
+
+        submit_and_wait(&cm, with_resv("a", "maint"));
+        submit_and_wait(&cm, with_resv("b", "upgrade"));
+        submit_and_wait(&cm, with_resv("c", "other"));
+
+        // Slurm's -R accepts a comma-separated list, matching any (OR).
+        let matched = cm.get_jobs(&JobFilter {
+            reservation: Some("maint,upgrade"),
+            ..Default::default()
+        });
+        assert_eq!(matched.len(), 2);
+        assert!(matched
+            .iter()
+            .all(|j| matches!(j.spec.reservation.as_deref(), Some("maint" | "upgrade"))));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

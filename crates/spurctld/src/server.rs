@@ -1393,6 +1393,16 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.name.as_str())
         };
+        let qos = if req.qos.is_empty() {
+            None
+        } else {
+            Some(req.qos.as_str())
+        };
+        let reservation = if req.reservation.is_empty() {
+            None
+        } else {
+            Some(req.reservation.as_str())
+        };
 
         let jobs = self.cluster.get_jobs(&JobFilter {
             states: &states,
@@ -1400,6 +1410,8 @@ impl SlurmController for ControllerService {
             partition,
             account,
             name,
+            qos,
+            reservation,
             job_ids: &req.job_ids,
             nodes: &req.nodes,
         });

@@ -584,6 +584,10 @@ message GetJobsRequest {
   string name = 6;
   // Filter: only jobs allocated on any of these nodes (expanded hostlist).
   repeated string nodes = 7;
+  // Filter: only jobs with one of these QOS names (comma-separated).
+  string qos = 8;
+  // Filter: only jobs in one of these reservations (comma-separated).
+  string reservation = 9;
 }
 
 message GetJobsResponse {

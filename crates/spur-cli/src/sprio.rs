@@ -72,6 +72,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             job_ids,
             name: String::new(),
             nodes: Vec::new(),
+            qos: String::new(),
+            reservation: String::new(),
         })
         .await
         .context("failed to get jobs")?;
