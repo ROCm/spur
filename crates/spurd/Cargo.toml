@@ -43,6 +43,9 @@ tokio-stream = "0.1"
 shlex = "2"
 subtle = { workspace = true }
 uuid = { workspace = true }
+# GPU sharing with Kubernetes: own-node label, ResourceClaim/ResourceSlice watch
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
