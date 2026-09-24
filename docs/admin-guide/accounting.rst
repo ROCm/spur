@@ -1222,32 +1222,151 @@ unrecognized state defaults to idle with a warning.
 Auditing administrative actions
 -------------------------------
 
-Reservation admin commands (``scontrol create/update/delete-reservation``) are
-recorded in the accounting database's ``txn`` (transaction) log, capturing
-**who** ran the command, **when**, and the **outcome**. This closes a gap in
-stock Slurm, whose ``txn_table`` does not cover ``scontrol`` reservation
-operations and whose reservation records carry no actor. Recording is
-best-effort: a database outage never blocks the reservation operation itself.
+Every mutating action a user takes against the controller is recorded in the
+accounting database's ``txn`` (transaction) log, capturing **who** ran the
+command, **from where**, **when**, and the **outcome**. Recording is
+best-effort: a database outage never blocks the operation itself.
+
+Coverage is a property of the RPC pipeline, not of individual commands. A single
+layer in front of every controller and accounting RPC writes the row, so no
+mutating action is left unaudited by omission; a newly added RPC fails the test
+suite until it is explicitly classified as mutating, read-only, or internal, and
+a mutating one fails until it also names the object it acts on.
+
+That is coverage, not durability. The write itself is best-effort, so an action
+can still be applied and its row lost — see `When a row is lost`_ below.
+
+The REST API is covered by the same rule rather than a parallel one: its submit
+and cancel endpoints dispatch into those controller handlers, so a REST mutation
+is recorded with the same actor, target and outcome as the equivalent
+``sbatch``/``scancel``, and shows ``api`` as its **Source**.
+
+This goes well beyond stock Slurm. Slurm's ``txn_table`` records only
+``slurmdbd``-side entities (accounts, users, associations, QOS, clusters, TRES);
+``scontrol`` node, partition, and reservation operations appear in no table at
+all. Spur records all of them, and additionally records denied and failed
+attempts rather than only committed ones.
+
+Audited entities are ``node``, ``job``, ``partition``, ``reservation``,
+``account``, ``user``, ``qos``, ``token``, ``cluster`` (k0s lifecycle), and
+``config`` (``scontrol reconfigure``).
+
+Deliberately **not** recorded: daemon-to-daemon traffic (node registration,
+heartbeats, job-status reports, accounting job records) and the high-rate client
+calls ``srun``/``salloc`` make per step or per poll (job keepalive, step create
+and complete). These would bury operator actions; enable
+``logging.audit_rpcs`` (below) if you need them.
 
 Each record captures:
 
 - **Time** — when the action was attempted.
 - **Actor** — the requesting user. Under ``auth.mode = required`` this is the
   JWT-verified identity; under the default ``permissive`` mode an unauthenticated
-  caller's name is trusted on the wire (see ``Verified``).
+  caller's asserted name is used when the request carries one (see ``Verified``).
+  A verified credential always wins over an asserted name.
 - **Verified** — ``yes`` only when a JWT identity was cryptographically verified;
   ``no`` for permissive/disabled anonymous callers (asserted, trust-on-wire) and
   for internal ``system`` actions such as the expired-reservation purge.
-- **Action** — ``create``, ``update``, or ``delete``.
+- **Peer** — the address the request arrived from. Often the only attribution
+  left for an unauthenticated caller under ``permissive``, and what lets a host's
+  login records be matched against a Spur action.
+
+  Under Raft HA a client may reach a non-leader, which forwards to the leader;
+  the hop replaces the client's connection, so **Peer** is then the forwarding
+  controller. Such rows carry ``"forwarded": true`` in **Info** so a controller
+  address is never mistaken for the caller's. The caller itself is still
+  attributed correctly — the credential survives the hop, so **Actor** and
+  **Verified** are unaffected. To recover the client address in that case,
+  enable ``logging.audit_rpcs``: the controller the client actually reached logs
+  the request with its real peer.
+- **Action** — ``create``, ``update``, or ``delete``. ``sacctmgr add`` and
+  ``sacctmgr modify`` reach the same RPC as an upsert, so the verb recorded is
+  the one the write actually performed: adding an account that already exists is
+  logged as ``update``, not ``create``.
 - **Where** — the target, rendered ``entity_type:entity_name`` (e.g.
-  ``reservation:daily``).
+  ``node:node07``). Jobs are named by their id, and credentials by their token
+  id — never the secret.
+
+  A mutating RPC records its target, and a test enforces that: a newly added one
+  cannot ship with a blank name. The exceptions are the actions that have no
+  single target, where the name is permanently blank — ``scontrol reconfigure``
+  and bringing the embedded k0s cluster up or down. Filter those with
+  ``Entity=`` rather than ``Name=``.
 - **Outcome** — ``success``, ``denied`` (permission/ownership rejected), or
   ``error`` (validation or other failure). Unlike Slurm, which logs only
   committed transactions, Spur also records denied and failed attempts.
 - **Info** — a JSON payload of the requested parameters (and the error message on
   failure). These are the values as requested, before server-side normalization.
+
+  For the accounting entities, a modification also carries a ``changed`` object
+  of ``{column: {from, to}}`` for the columns the write actually moved, read
+  under lock in the same transaction. This is what answers "what was the QOS
+  wall time before?". The Raft-backed entities record the request only; their
+  prior state is not available to the handler.
+  Job scripts, environments, and credential material are deliberately excluded,
+  so the log can be read by anyone who can read the rest of the accounting data
+  without leaking job contents or secrets. Populated alongside **Where**.
 - **Source** — ``api`` for external RPC/CLI callers, ``system`` for internal
   maintenance.
+
+.. note::
+
+   ``spur token user`` cannot be audited. It signs a JWT locally from
+   ``auth.jwt_key`` without contacting the controller, so no server-side record
+   of it can exist. Treat read access to ``auth.jwt_key`` as equivalent to the
+   ability to mint an admin credential.
+
+When a row is lost
+~~~~~~~~~~~~~~~~~~
+
+This depends on where the changed object lives, and the two halves differ.
+
+**Accounting entities (account, user, QOS) cannot be applied unrecorded.** Their
+rows live in the same database as the ``txn`` table, so the audit row is written
+inside the very transaction that changes them: both commit or neither does. If
+the row cannot be written the command fails, which is deliberate — a cluster
+whose audit backend is unreachable should stop accepting administrative changes,
+not make them silently. This adds no outage exposure that was not already there,
+since those commands already fail when PostgreSQL is down.
+
+**Everything else is still best-effort.** Node, job, partition, reservation,
+token and cluster state lives in the Raft log, not PostgreSQL, so there is no
+shared transaction to join. Those rows are written after the fact: the write is
+retried three times over roughly half a second, and a failure past that is
+logged and abandoned. A controller that dies between applying the action and
+finishing the write loses the row with no log line at all, because the process
+is gone. Denied and failed attempts are recorded this way for every entity,
+since nothing changed and no transaction was opened.
+
+Two counters on ``/metrics/audit`` make this visible rather than leaving it to
+whoever reads the controller log:
+
+.. code-block:: text
+
+   spur_audit_rows_written_total   rows persisted
+   spur_audit_rows_dropped_total   rows abandoned after retries
+
+Alert on ``spur_audit_rows_dropped_total`` increasing. Any increase means the
+log is incomplete for that window, and the controller log names the actor,
+action and entity of each row that was dropped.
+
+Who drained a node
+~~~~~~~~~~~~~~~~~~
+
+Node state changes are recorded twice, for different questions. The ``txn`` log
+holds the **history** — every drain, resume, and failed attempt, which can be
+searched by actor across entities. The node record itself holds the
+**current** reason's attribution, shown by ``sinfo -R`` and
+``scontrol show node`` without needing
+the accounting database at all:
+
+.. code-block:: bash
+
+   # Current state: who set the reason this node is down for, and when.
+   sinfo -R
+
+   # History: every node action, including resumes and rejected attempts.
+   sacctmgr show txn Entity=node Name=node07 format=Time,Actor,Action,Outcome,Peer,Info
 
 Viewing the log
 ~~~~~~~~~~~~~~~~
@@ -1259,24 +1378,88 @@ List records with ``sacctmgr show txn`` (aliases: ``transaction``,
 
    sacctmgr show txn
    sacctmgr show txn Actor=alice Action=delete
-   sacctmgr show txn Entity=reservation Name=daily Outcome=denied
+   sacctmgr show txn Entity=node Name=node07 Outcome=denied
+   sacctmgr show txn Peer=10.11.99.42
    sacctmgr show txn Start=2026-01-01 End=now-1hours
-   sacctmgr show txn format=Time,Actor,Action,Where,Outcome,Verified,Info
+   sacctmgr show txn format=Time,Actor,Action,Where,Outcome,Verified,Peer,Info
 
 Filters are ``Actor=``, ``Action=``, ``Entity=`` (entity type), ``Name=`` (entity
-name), ``Outcome=``, ``Start=``, ``End=``, and ``limit=``. ``Start``/``End``
-accept the same formats as ``sacct`` (``YYYY-MM-DD``, ISO datetime,
-``now-Ndays``/``now-Nhours``). ``limit=`` defaults to 1000 and is capped at
-10000 rows per query (larger requests are clamped). The default columns match
-Slurm (``Time,Action,Actor,Where,Info``); additional ``format=`` fields are
-``Outcome``, ``Verified``, ``Source``, ``ID``, and ``ActorUID``.
+name), ``Outcome=``, ``Peer=``, ``Start=``, ``End=``, and ``limit=``.
+``Start``/``End`` accept the same formats as ``sacct`` (``YYYY-MM-DD``, ISO
+datetime, ``now-Ndays``/``now-Nhours``). ``limit=`` defaults to 1000 and is
+capped at 10000 rows per query (larger requests are clamped). The default columns
+match Slurm (``Time,Action,Actor,Where,Info``); additional ``format=`` fields are
+``Outcome``, ``Verified``, ``Source``, ``Peer``, ``ID``, and ``ActorUID``.
 
 .. note::
 
-   Reads are **not** access-gated — the same as ``sacct`` job history and the
-   rest of the accounting service. Confidentiality of the audit log therefore
-   requires ``auth.mode = required``; under the default ``permissive`` mode any
-   caller that can reach the controller can read it.
+   ``ActorUID`` is recorded only when the kernel vouched for it, which means the
+   native ``spur`` plugin's peer-credential path. A JWT carries whatever UID the
+   token was minted with, so under ``plugin = "jwt"`` the column is blank and
+   ``Actor`` is the attribution — a blank UID never means the caller was root.
+   The same rule governs the ``reason_uid`` that ``sinfo -R`` renders for a
+   drained node, which shows ``Unknown`` in that case.
+
+``Peer=`` matches on the ``host:port`` boundary, so a bare address finds every
+ephemeral port that host connected from, while ``10.0.0.4`` does not also match
+``10.0.0.42``. Both plain and bracketed forms are matched, so a bare IPv6
+address finds the ``[2001:db8::1]:6817`` form it is stored as.
+
+.. note::
+
+   The controller listens dual-stack, so an IPv4 caller arrives as the mapped
+   address ``::ffff:10.0.0.42``. Peers are recorded unwrapped to plain
+   ``10.0.0.42``, so search for the address you know rather than the mapped
+   form. Rows written before this normalization store the mapped form and are
+   found by querying ``Peer=[::ffff:10.0.0.42]:<port>``.
+
+.. note::
+
+   Reading the log requires the **Operator** or **Administrator** role, matching
+   Slurm's restriction on ``sacctmgr show transaction``. It is gated more tightly
+   than ``sacct`` job history because a reader learns the cluster's full
+   administrative history — every user's actions and the addresses they came
+   from.
+
+   As with the accounting mutations, an *unauthenticated* caller is still
+   admitted: ``auth.mode = permissive`` and ``disabled`` trust the client by
+   design. Confidentiality against untrusted callers therefore still requires
+   ``mode = required``, which is what makes the role check bind.
+
+Logging every RPC
+~~~~~~~~~~~~~~~~~
+
+The ``txn`` log covers mutations. To log every **authenticated** controller RPC,
+reads included, set ``logging.audit_rpcs``:
+
+.. code-block:: toml
+
+   [logging]
+   audit_rpcs = true
+
+Each request emits one line on the ``audit_rpc`` tracing target with the method,
+authenticated user and UID (under the same rule as above), peer address, and
+outcome. This is the equivalent of
+Slurm's ``DebugFlags=AuditRPCs`` and is off by default for the same reason: on a
+busy cluster it is the highest-volume log Spur produces, since it includes
+``squeue``/``sinfo`` polling and node heartbeats. The dedicated target lets it be
+routed to its own file rather than mixed into the controller log.
+
+.. note::
+
+   A request whose credential is missing, malformed, expired, or forged is
+   refused during authentication, before either audit tier runs, so it appears
+   in neither this stream nor the ``txn`` log. Those refusals are instead logged
+   **unconditionally** at warning level on the controller's main log, with the
+   path, peer address, and reason — they are not gated behind ``audit_rpcs``,
+   because a rejected credential is worth recording on every cluster.
+
+   Slurm behaves the same way: its ``AUDIT_RPCS`` line prints the *authenticated*
+   user and so runs only after the credential verifies, while a failure is
+   reported separately as an error (``Protocol authentication error``). Refused
+   credentials also get no ``txn`` row deliberately — there is no verified actor
+   to attribute one to, and letting unauthenticated traffic insert rows would
+   give an unauthenticated caller a way to grow the database.
 
 Retention
 ~~~~~~~~~

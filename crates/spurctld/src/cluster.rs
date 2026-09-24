@@ -4815,6 +4815,8 @@ impl ClusterManager {
                 actor: "system".to_string(),
                 actor_uid: None,
                 verified: false,
+                // No request, so no peer; `source` already says it was internal.
+                peer_addr: String::new(),
                 source: TxnSource::System,
                 action: TxnAction::Delete,
                 entity_type: TxnEntity::Reservation,
@@ -5258,6 +5260,16 @@ impl ClusterManager {
 
     pub fn set_raft(&self, raft: SpurRaft) {
         *self.raft.write() = Some(raft);
+    }
+
+    /// False if writes were still pending at `limit`, meaning rows were lost.
+    pub async fn drain_accounting(&self, limit: std::time::Duration) -> bool {
+        // Taken out of the lock: the drain awaits, and the guard is not Send.
+        let handle = self.accounting.read().as_ref().map(|n| n.drain_handle());
+        match handle {
+            Some(h) => h.wait(limit).await,
+            None => true,
+        }
     }
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {

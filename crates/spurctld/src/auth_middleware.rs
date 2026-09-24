@@ -24,8 +24,8 @@ use tracing::warn;
 use spur_core::auth::{BearerAuth, BearerOutcome};
 use spur_core::config::AuthMode;
 
-/// Marker inserted alongside the identity so handlers can tell "verified" from "asserted" without
-/// re-reading config. Absent in `disabled` mode and for unauthenticated calls under `permissive`.
+/// Marks an `Identity` as credential-verified, which the audit log's `verified` column keys off.
+/// A path deriving an identity without checking a credential must insert the `Identity` and not this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verified;
 
@@ -101,6 +101,12 @@ where
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
         }
+        // Handlers forward by signing this path, so it must come from the wire
+        // rather than from the Rust request type, which `Empty` RPCs all share.
+        let path = req.uri().path().to_owned();
+        req.extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(path));
+
         let forwarded = req
             .headers()
             .get(spur_core::native_peer::FORWARDED_HEADER)
@@ -122,6 +128,17 @@ where
                 let now = spur_core::native_mint::unix_now().unwrap_or(0);
                 match peer.verify(&env, now) {
                     Ok((identity, binding)) => {
+                        // Stops a captured `Empty`-bodied read from being
+                        // replayed onto another RPC, such as Reconfigure.
+                        let path = req.uri().path().to_owned();
+                        if binding.action != path {
+                            let resp = tonic::Status::unauthenticated(format!(
+                                "forwarded identity is bound to {}, not {path}",
+                                binding.action
+                            ))
+                            .into_http();
+                            return Box::pin(async move { Ok(resp) });
+                        }
                         req.extensions_mut().insert(identity);
                         req.extensions_mut().insert(binding);
                         req.extensions_mut().insert(Verified);
@@ -161,6 +178,14 @@ where
                 }
             }
             BearerOutcome::Reject(msg) => {
+                // Audit runs inside this layer, so a rejection reaches neither
+                // tier. Unconditional, as Slurm errors regardless of DebugFlags.
+                warn!(
+                    path = %req.uri().path(),
+                    peer = crate::rpc_middleware::peer_addr(req.extensions()).as_deref().unwrap_or("-"),
+                    reason = %msg,
+                    "rejected an RPC with an invalid credential"
+                );
                 let resp = tonic::Status::unauthenticated(msg).into_http();
                 return Box::pin(async move { Ok(resp) });
             }
@@ -255,5 +280,53 @@ mod tests {
             decide(&cfg(AuthMode::Permissive, ""), Some(&header)),
             BearerOutcome::Reject(_)
         ));
+    }
+
+    /// Counts calls so a test can assert the inner service was never reached.
+    #[derive(Clone, Default)]
+    struct CountingInner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Service<Request<()>> for CountingInner {
+        type Response = Response<tonic::body::Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(Response::new(tonic::body::Body::default())))
+        }
+    }
+
+    /// A rejection short-circuits here, so nothing downstream — audit included —
+    /// observes it. Hence the log line lives in this module.
+    #[tokio::test]
+    async fn a_rejected_credential_never_reaches_the_inner_service() {
+        use tower::ServiceExt;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let forged = format!("Bearer {}", token("attacker-key"));
+        let req = Request::builder()
+            .uri("/slurm.SlurmController/UpdateNode")
+            .header(http::header::AUTHORIZATION, forged)
+            .body(())
+            .expect("request");
+
+        let response = AuthLayer::new(AuthMode::Required, "real-key")
+            .layer(CountingInner(calls.clone()))
+            .oneshot(req)
+            .await
+            .expect("middleware must not fail");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a forged credential must not reach the service"
+        );
+        let status = tonic::Status::from_header_map(response.headers()).expect("grpc-status");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 }

@@ -1031,7 +1031,7 @@ fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
 // Slurm's default `sacctmgr show transaction` columns: Time, Action, Actor,
 // Where, Info. Where renders entity_type:entity_name; Info renders details JSON.
 const TXN_DEFAULT_FORMAT: &str = "%-20t %-8a %-14A %-24w %-40i";
-const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-24w %-10o %-8u %-40i";
+const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-22p %-24w %-10o %-8u %-40i";
 
 fn txn_header(spec: char) -> &'static str {
     match spec {
@@ -1045,6 +1045,7 @@ fn txn_header(spec: char) -> &'static str {
         's' => "Source",
         'd' => "ID",
         'u' => "ActorUID",
+        'p' => "Peer",
         _ => "?",
     }
 }
@@ -1061,6 +1062,7 @@ fn txn_field_spec(name: &str) -> Option<char> {
         "source" => Some('s'),
         "id" => Some('d'),
         "actoruid" | "uid" => Some('u'),
+        "peer" | "peeraddr" => Some('p'),
         _ => None,
     }
 }
@@ -1074,13 +1076,12 @@ fn txn_format_fields(
         TXN_ALL_FORMAT,
         &txn_field_spec,
         &txn_header,
-        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID",
+        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID, Peer",
     )
 }
 
-/// Build a `GetTransactions` request from Slurm-style `key=value` filters
-/// (`Actor=`, `Action=`, `Entity=`, `Name=`, `Outcome=`, `Start=`, `End=`,
-/// `limit=`). `action`/`outcome` are lowercased to match the stored values.
+/// Build a `GetTransactions` request from Slurm-style `key=value` filters.
+/// `action`/`outcome` are lowercased to match the stored values.
 fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransactionsRequest {
     GetTransactionsRequest {
         actor: p.get("actor").cloned().unwrap_or_default(),
@@ -1101,6 +1102,11 @@ fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransa
         outcome: p
             .get("outcome")
             .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        peer_addr: p
+            .get("peer")
+            .or_else(|| p.get("peeraddr"))
+            .cloned()
             .unwrap_or_default(),
         start_after: p
             .get("start")
@@ -1125,15 +1131,9 @@ fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
         'v' => if t.verified { "yes" } else { "no" }.to_string(),
         's' => t.source.clone(),
         'd' => t.id.to_string(),
-        // uid is recorded only for a verified identity; render blank otherwise so
-        // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
-        'u' => {
-            if t.verified {
-                t.actor_uid.to_string()
-            } else {
-                String::new()
-            }
-        }
+        'p' => t.peer_addr.clone(),
+        // Absent whenever nothing vouched for the uid, so it cannot read as root.
+        'u' => t.actor_uid.map(|u| u.to_string()).unwrap_or_default(),
         _ => "?".to_string(),
     }
 }
@@ -2149,7 +2149,7 @@ mod tests {
             id: 7,
             timestamp: None,
             actor: "bob".into(),
-            actor_uid: 1000,
+            actor_uid: Some(1000),
             verified: true,
             source: "api".into(),
             action: "create".into(),
@@ -2157,26 +2157,46 @@ mod tests {
             entity_name: "daily".into(),
             outcome: "success".into(),
             details: "{}".into(),
+            peer_addr: "10.11.99.42:51234".into(),
         };
         assert_eq!(resolve_txn_field(&t, 'w'), "reservation:daily");
         assert_eq!(resolve_txn_field(&t, 'v'), "yes");
         assert_eq!(resolve_txn_field(&t, 'A'), "bob");
         assert_eq!(resolve_txn_field(&t, 'd'), "7");
         assert_eq!(resolve_txn_field(&t, 'u'), "1000");
+        assert_eq!(resolve_txn_field(&t, 'p'), "10.11.99.42:51234");
     }
 
     #[test]
-    fn resolve_txn_field_blanks_uid_when_unverified() {
-        // Unverified rows carry an unknown uid (stored NULL, 0 on the wire); it
-        // must render blank so it can't be mistaken for root (uid 0).
-        let t = TransactionRecord {
+    fn resolve_txn_field_blanks_an_unrecorded_uid() {
+        // No uid is stored unless the kernel vouched for it, so an absent one
+        // must render blank rather than as uid 0, which would read as root.
+        let unverified = TransactionRecord {
             actor: "vm".into(),
-            actor_uid: 0,
+            actor_uid: None,
             verified: false,
             ..Default::default()
         };
-        assert_eq!(resolve_txn_field(&t, 'u'), "");
-        assert_eq!(resolve_txn_field(&t, 'v'), "no");
+        assert_eq!(resolve_txn_field(&unverified, 'u'), "");
+        assert_eq!(resolve_txn_field(&unverified, 'v'), "no");
+
+        // A JWT caller is verified but its uid was never proven.
+        let jwt = TransactionRecord {
+            actor: "mallory".into(),
+            actor_uid: None,
+            verified: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&jwt, 'u'), "");
+        assert_eq!(resolve_txn_field(&jwt, 'A'), "mallory");
+
+        // A real root action is still distinguishable from the blank case.
+        let root = TransactionRecord {
+            actor_uid: Some(0),
+            verified: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&root, 'u'), "0");
     }
 
     #[test]
@@ -2607,7 +2627,7 @@ mod tests {
             id: 7,
             timestamp: None,
             actor: "bob".into(),
-            actor_uid: 1000,
+            actor_uid: Some(1000),
             verified: true,
             source: "api".into(),
             action: "create".into(),
@@ -2615,6 +2635,7 @@ mod tests {
             entity_name: "gpu".into(),
             outcome: "success".into(),
             details: "{}".into(),
+            peer_addr: "10.11.99.42:51234".into(),
         }
     }
 
@@ -2633,6 +2654,30 @@ mod tests {
         .output_style();
         let row = style.row(&fields, &|spec| resolve_txn_field(&stub_txn(), spec));
         (style.header_lines(&fields), row)
+    }
+
+    /// An unauthenticated `UpdateNode` records an empty actor, and dropping the
+    /// column would silently shift every field after it for a parser.
+    #[test]
+    fn delimited_txn_output_keeps_an_empty_actor_column() {
+        let t = TransactionRecord {
+            actor: String::new(),
+            action: "update".into(),
+            entity_type: "node".into(),
+            entity_name: "node07".into(),
+            outcome: "success".into(),
+            peer_addr: "10.11.99.42:51234".into(),
+            ..Default::default()
+        };
+        let fields = txn_format_fields(Some("Action,Actor,Where,Outcome,Peer"))
+            .expect("txn format must parse");
+        let style = SacctmgrArgs::try_parse_from(["sacctmgr", "-n", "-P", "show", "txn"])
+            .expect("flags must parse")
+            .output_style();
+
+        let row = style.row(&fields, &|spec| resolve_txn_field(&t, spec));
+        assert_eq!(row, "update||node:node07|success|10.11.99.42:51234");
+        assert_eq!(row.split('|').count(), 5);
     }
 
     #[test]

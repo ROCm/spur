@@ -4,6 +4,7 @@
 mod accounting;
 mod agent_client;
 mod association_cache;
+mod audit;
 mod auth_middleware;
 mod cluster;
 mod cluster_k8s;
@@ -305,6 +306,17 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("native auth key set: {e}"))?;
 
+    // One instance, shared with the REST server below.
+    let controller = server::build_service(
+        cluster.clone(),
+        raft_handle.clone(),
+        rpc_stats.clone(),
+        sched_stats.clone(),
+        config.cluster.control_plane_replicas,
+        jwt_key,
+        &bearer,
+    );
+
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
         if !rest_addr.ip().is_loopback() {
@@ -327,8 +339,17 @@ async fn main() -> anyhow::Result<()> {
         let rest_cluster = cluster.clone();
         let rest_raft = raft_handle.clone();
         let rest_auth = bearer.clone();
+        let rest_controller = controller.clone();
         tokio::spawn(async move {
-            if let Err(e) = rest::serve(rest_addr, rest_cluster, rest_raft, rest_auth).await {
+            if let Err(e) = rest::serve(
+                rest_addr,
+                rest_cluster,
+                rest_raft,
+                rest_auth,
+                rest_controller,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "REST API server failed");
             }
         });
@@ -366,20 +387,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
-    server::serve(
-        addr,
-        cluster,
-        raft_handle,
-        rpc_stats,
-        sched_stats,
-        accounting_service,
-        config.cluster.control_plane_replicas,
-        jwt_key,
-        bearer,
-    )
-    .await?;
+    server::serve(addr, controller, accounting_service, bearer).await?;
 
     sched_handle.abort();
+    // Audit rows are written off the request path; the runtime would drop them.
+    if !cluster
+        .drain_accounting(std::time::Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
+    }
     Ok(())
 }
 

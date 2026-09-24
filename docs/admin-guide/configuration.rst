@@ -1052,9 +1052,11 @@ These control-plane mutations define cluster tenancy and require
 * the k0s cluster manager.
 
 Managing anyone's jobs and reservations, and writing accounting records,
-requires **Operator** or above. After a user, account, or QOS write, the
-association cache is refreshed immediately so a new role binding takes effect
-without waiting for the next poll.
+requires **Operator** or above — as does *reading* the ``txn`` audit log with
+``sacctmgr show txn``, which exposes every user's actions and the addresses they
+came from. After a user, account, or QOS write, the association cache is
+refreshed immediately so a new role binding takes effect without waiting for the
+next poll.
 
 A caller whose verified role is below the bar is refused with
 ``PermissionDenied``. A caller with *no* verified identity is allowed through,
@@ -1370,32 +1372,45 @@ WireGuard mesh networking and the agent port.
 ``[logging]``
 -------------
 
-**Reload: Not implemented** for every field below. The section is parsed but no
-daemon reads it.
-
 .. list-table::
    :header-rows: 1
-   :widths: 20 14 20 46
+   :widths: 18 12 12 18 40
 
    * - Field
      - Type
+     - Reload
      - Default
      - Description
    * - ``level``
      - string
+     - Not implemented
      - ``"info"``
      - Intended log level. Use the ``--log-level`` flag or the ``RUST_LOG``
        environment variable instead.
    * - ``format``
      - string
+     - Not implemented
      - ``"text"``
      - Intended log format. Output format is not configurable.
    * - ``file``
      - string
+     - Not implemented
      - none
      - Intended log file path. Logging to a file is not implemented; daemons log
        to stderr, so redirect via the service manager (for example systemd's
        journal) instead.
+   * - ``audit_rpcs``
+     - bool
+     - Restart
+     - ``false``
+     - Log every authenticated controller RPC, reads included, on the
+       ``audit_rpc`` tracing target with the method, authenticated user, peer
+       address, and outcome. Slurm's ``DebugFlags=AuditRPCs``. Off by default
+       because it is the highest-volume log Spur emits. Requests refused during
+       authentication are logged unconditionally on the main log instead, so
+       they do not depend on this setting. The controller reads this at startup,
+       so changing it needs a restart rather than ``scontrol reconfigure``. See
+       :doc:`accounting`.
 
 ``[rlimits]``
 -------------
@@ -2043,8 +2058,10 @@ OpenMetrics HTTP export from ``spurctld``.
      - Start the Slurm-compatible REST server (default port 6820). Off by
        default. REST uses the same ``[auth]`` plugin and mode as gRPC: list and
        cancel require a Bearer credential when ``mode = required``, and submit
-       binds the job to that identity. Enable it only where that policy is
-       acceptable.
+       binds the job to that identity. Submit and cancel dispatch into the same
+       controller handlers the gRPC surface uses, so they share its
+       authorization, validation, leader forwarding and ``txn`` audit row.
+       Enable it only where that policy is acceptable.
    * - ``allow_non_loopback``
      - bool
      - ``false``

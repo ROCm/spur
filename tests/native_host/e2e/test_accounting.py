@@ -1012,7 +1012,10 @@ def _wait_txn_rows(c, res_name: str, predicate, timeout: int = 60) -> list[dict]
     deadline = time.time() + timeout
     last: list[dict] = []
     while time.time() < deadline:
-        rows = _parse_txn_rows(c.sacctmgr(["show", "txn", f"Name={res_name}", fmt]), where)
+        # Entity= as well as Name=, now that other entities share the log.
+        rows = _parse_txn_rows(
+            c.sacctmgr(["show", "txn", "Entity=reservation", f"Name={res_name}", fmt]), where
+        )
         if any(predicate(r) for r in rows):
             return rows
         last = rows
@@ -1173,3 +1176,219 @@ class TestSshareAndSreportUnits:
         c = accounting_cluster
         out = c.sreport(["cluster", "AccountUtilizationByUser"])
         assert "CPU Seconds" in out, f"expected 'CPU Seconds' header: {out}"
+
+
+def _wait_entity_rows(c, entity: str, name: str, fields: str, predicate,
+                      timeout: int = 60) -> list[list[str]]:
+    """Poll the audit log for `entity:name` until some row satisfies `predicate`.
+
+    Pipe-delimited because Info is JSON containing spaces, which column
+    splitting would tear apart. `fields` must start with Action.
+    """
+    width = len(fields.split(","))
+    deadline = time.time() + timeout
+    last: list[list[str]] = []
+    while time.time() < deadline:
+        out = c.sacctmgr(
+            ["-P", "show", "txn", f"Entity={entity}", f"Name={name}", f"format={fields}"]
+        )
+        rows = [
+            parts
+            for line in out.splitlines()
+            if len(parts := line.split("|")) == width
+            and parts[0] in ("create", "update", "delete")
+        ]
+        if any(predicate(r) for r in rows):
+            return rows
+        last = rows
+        time.sleep(2)
+    raise TimeoutError(f"no {entity}:{name} row matched within {timeout}s (last: {last!r})")
+
+
+def _delimited_txn_rows(c, node: str, fields: str) -> list[list[str]]:
+    """Rows for a node. Delimited rather than column-aligned because an
+    unauthenticated `UpdateNode` leaves Actor empty, which splitting would lose."""
+    out = c.sacctmgr(["-P", "show", "txn", "Entity=node", f"Name={node}", f"format={fields}"])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) == len(fields.split(",")) and parts[0] in ("create", "update", "delete"):
+            rows.append(parts)
+    return rows
+
+
+class TestNodeAudit:
+    """Node state changes are audited, which is the question the audit log was
+    built to answer: who drained this node, and when."""
+
+    def test_drain_recorded_in_txn_log(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        reason = f"e2e-drain-{int(time.time())}"
+
+        try:
+            c.cli_as_user(
+                "root",
+                ["scontrol", "update", f"NodeName={node}", "State=DRAIN", f"Reason={reason}"],
+            )
+
+            # Audit writes are async, so poll for the row rather than racing it.
+            deadline = time.time() + 60
+            rows: list[list[str]] = []
+            while time.time() < deadline:
+                rows = _delimited_txn_rows(c, node, "Action,Where,Outcome,Peer,Info")
+                if any(r[0] == "update" and r[2] == "success" for r in rows):
+                    break
+                time.sleep(2)
+
+            drained = [r for r in rows if r[0] == "update" and r[2] == "success"]
+            assert drained, f"no successful node update recorded: {rows}"
+            _action, where, _outcome, peer, info = drained[0]
+            assert where == f"node:{node}", drained
+            assert reason in info, f"the requested reason must be captured: {info}"
+            # No jwt_key here and no user field on UpdateNode, so the peer
+            # address is the only attribution left — which is why it exists.
+            assert peer, f"an unauthenticated action must still record a peer: {drained[0]}"
+
+            # The node record's own attribution and the audit log must agree.
+            assert reason in c.cli(["sinfo", "-R"]), "sinfo -R should show the drain reason"
+        finally:
+            # Leaving a node drained would starve every later test.
+            c.cli_as_user("root", ["scontrol", "update", f"NodeName={node}", "State=RESUME"])
+
+
+class TestAccountingEntityAudit:
+    """`sacctmgr add` and `modify` reach one upsert RPC, so only the write knows
+    which verb happened. Before this was fixed a modify logged as a create with
+    no target, which reads as a different action against an unknown object."""
+
+    def test_qos_add_modify_delete_are_named_and_distinguished(self, accounting_cluster):
+        c = accounting_cluster
+        qos = f"auditqos{int(time.time())}"
+
+        try:
+            c.sacctmgr(["-i", "add", "qos", f"name={qos}", "maxwall=60"])
+            c.sacctmgr(["-i", "modify", "qos", f"name={qos}", "set", "maxwall=120"])
+            c.sacctmgr(["-i", "delete", "qos", f"name={qos}"])
+
+            # Delete is the last write, so its row implies the earlier two landed.
+            rows = _wait_entity_rows(
+                c, "qos", qos, "Action,Where,Outcome,Info",
+                lambda r: r[0] == "delete" and r[2] == "success",
+            )
+            by_action = {r[0]: r for r in rows if r[2] == "success"}
+
+            assert set(by_action) == {"create", "update", "delete"}, rows
+            for action, row in by_action.items():
+                assert row[1] == f"qos:{qos}", f"{action} must name the qos: {row}"
+
+            # The modify is a real SQL UPDATE, so the row carries both sides —
+            # this is what answers "what was the wall time before?".
+            info = by_action["update"][3]
+            assert '"max_wall_min":{"from":60,"to":120}' in info.replace(" ", ""), (
+                f"the update must record old and new: {info}"
+            )
+            # An insert has no prior value, so it carries no diff.
+            assert "changed" not in by_action["create"][3], by_action["create"]
+        finally:
+            c.cli_allow_fail(["sacctmgr", "-i", "delete", "qos", f"name={qos}"])
+
+    def test_account_modify_is_not_recorded_as_a_creation(self, accounting_cluster):
+        c = accounting_cluster
+        account = f"auditacct{int(time.time())}"
+
+        try:
+            c.sacctmgr(["-i", "add", "account", f"name={account}", "description=first"])
+            # Same verb as the add, against a row that now exists.
+            c.sacctmgr(["-i", "add", "account", f"name={account}", "description=second"])
+
+            rows = _wait_entity_rows(
+                c, "account", account, "Action,Where,Outcome,Info",
+                lambda r: r[0] == "update" and r[2] == "success",
+            )
+            creates = [r for r in rows if r[0] == "create" and r[2] == "success"]
+            updates = [r for r in rows if r[0] == "update" and r[2] == "success"]
+
+            assert len(creates) == 1, f"only the first add created the account: {rows}"
+            assert updates, f"the second add modified it and must say so: {rows}"
+            assert "second" in updates[0][3], updates
+            assert updates[0][1] == f"account:{account}", updates
+        finally:
+            c.cli_allow_fail(["sacctmgr", "-i", "delete", "account", f"name={account}"])
+
+
+class TestJobAudit:
+    """A job's id is its only name, and it is assigned by the submission being
+    audited — so the row has to be annotated after the job is created."""
+
+    def test_submit_and_cancel_name_the_job_id(self, accounting_cluster):
+        c = accounting_cluster
+        script = c.write_file("audit-job.sh", "#!/bin/bash\nsleep 120\n")
+        job_id = parse_job_id(c.sbatch(["-J", "audit-job", "-N", "1", script]))
+        assert job_id, "sbatch must return a job id"
+
+        c.cli(["scancel", str(job_id)])
+
+        rows = _wait_entity_rows(
+            c, "job", str(job_id), "Action,Where,Outcome,Info",
+            lambda r: r[0] == "delete" and r[2] == "success",
+        )
+        by_action = {r[0]: r for r in rows if r[2] == "success"}
+
+        assert "create" in by_action, f"the submission must be audited: {rows}"
+        for action, row in by_action.items():
+            assert row[1] == f"job:{job_id}", f"{action} must name the job id: {row}"
+        assert "audit-job" in by_action["create"][3], (
+            f"the submission should record what was asked for: {by_action['create']}"
+        )
+
+
+# Groups stay unset so role resolution never needs NSS on the test nodes.
+AUDIT_READ_AUTH = {
+    "auth": {
+        "plugin": "jwt",
+        "jwt_key": "e2e-audit-read-key",
+        "cluster_admins": ["root"],
+    },
+}
+
+
+def _audit_token(c, user: str) -> str:
+    out = c.cli(
+        ["spur", "token", "user", f"--user={user}", f"--config={c.etc_dir}/spur.conf"]
+    )
+    token = out.strip().split("\n")[0]
+    assert token.count(".") == 2, f"unexpected token format: {out}"
+    return token
+
+
+class TestAuditReadAuthorization:
+    """The log carries every user's actions and the addresses they came from,
+    so reading it is Operator-or-above, as Slurm restricts `show transaction`."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return AUDIT_READ_AUTH
+
+    def test_identified_non_admin_cannot_read_the_log(self, accounting_cluster):
+        c = accounting_cluster
+        login = c.nodes[0].user
+
+        admin = c.cli_as_user(
+            login,
+            ["sacctmgr", "show", "txn", "limit=1"],
+            extra_env={"SPUR_AUTH_TOKEN": _audit_token(c, "root")},
+        )
+        assert "requires cluster operator" not in admin.lower(), (
+            f"a cluster admin must still be able to read the log: {admin}"
+        )
+
+        # Same command, a token for a user bound to no role.
+        denied = c.cli_as_user(
+            login,
+            ["sacctmgr", "show", "txn", "limit=1"],
+            extra_env={"SPUR_AUTH_TOKEN": _audit_token(c, login)},
+        )
+        assert "requires cluster operator or administrator" in denied.lower(), (
+            f"an identified non-admin must be refused: {denied}"
+        )

@@ -21,7 +21,8 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
-use crate::accounting::{txn, TxnAction, TxnEntity, TxnRecord, TxnSource};
+use crate::accounting::txn;
+use crate::audit::{annotate, Annotation};
 use crate::cluster::{CancelError, ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
@@ -114,6 +115,9 @@ fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
     !is_leader && !is_forwarded
 }
 
+/// Every field is an `Arc` or immutable config, so clones share state rather
+/// than fork it — the recovery fences below must be one map, not several.
+#[derive(Clone)]
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
@@ -133,7 +137,7 @@ pub struct ControllerService {
     /// Stepd agents need an explicit signing secret. The built-in
     /// compatibility fallback is public and cannot establish node identity.
     node_identity_key_configured: bool,
-    incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>,
+    incomplete_stepd_recoveries: Arc<Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>>,
     /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
     auth_audience: String,
     auth_epoch: u64,
@@ -146,10 +150,16 @@ enum StepdRecoveryCohortState {
     Fencing(std::time::Instant),
 }
 
+/// The leader's node id and an open client to it.
+type CachedLeader = Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>;
+
+/// The cache is shared rather than copied, or each clone would separately dial
+/// the leader it already has a connection to.
+#[derive(Clone)]
 struct LeaderProxy {
     raft: Arc<RaftHandle>,
     client_addrs: BTreeMap<u64, String>,
-    cached_client: Mutex<Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>>,
+    cached_client: Arc<Mutex<CachedLeader>>,
 }
 
 impl LeaderProxy {
@@ -157,7 +167,7 @@ impl LeaderProxy {
         Self {
             raft,
             client_addrs,
-            cached_client: Mutex::new(None),
+            cached_client: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -288,6 +298,9 @@ impl ControllerService {
     fn check_leader<T: prost::Message>(&self, request: &Request<T>) -> Result<(), Status> {
         Self::enforce_forward_binding(request)?;
         if self.raft.is_leader() {
+            // The single point that decides execute-vs-forward, so the audit
+            // layer keys off this rather than sampling leadership again.
+            crate::audit::mark_executed_locally(request);
             return Ok(());
         }
 
@@ -300,22 +313,7 @@ impl ControllerService {
 
     #[allow(clippy::result_large_err)]
     fn enforce_forward_binding<T: prost::Message>(request: &Request<T>) -> Result<(), Status> {
-        let Some(binding) = request
-            .extensions()
-            .get::<spur_core::native_peer::ForwardedBinding>()
-        else {
-            return Ok(());
-        };
-        let mut buf = Vec::new();
-        request
-            .get_ref()
-            .encode(&mut buf)
-            .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
-        let digest = spur_core::native_peer::request_digest(&buf);
-        let action = std::any::type_name::<T>();
-        binding.require(action, &digest).map_err(|e| {
-            Status::unauthenticated(format!("forwarded identity does not match this RPC: {e}"))
-        })
+        enforce_forward_binding(request)
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -828,61 +826,8 @@ impl ControllerService {
         identity_role(&self.cluster, identity)
     }
 
-    /// Fire a best-effort audit record and a structured log line for a reservation
-    /// admin action, so operators keep attribution even when the accounting DB is
-    /// down. Never alters the RPC result.
-    fn audit_reservation(
-        &self,
-        action: TxnAction,
-        entity_name: &str,
-        actor: &str,
-        identity: Option<&spur_core::auth::Identity>,
-        details_base: serde_json::Value,
-        result: &Result<(), Status>,
-    ) {
-        let record =
-            Self::build_reservation_txn(action, entity_name, actor, identity, details_base, result);
-        info!(
-            actor = %record.actor,
-            entity = %record.entity_name,
-            action = record.action.as_str(),
-            outcome = record.outcome.as_str(),
-            "reservation admin action"
-        );
-        self.cluster.record_txn(record);
-    }
-
-    /// Build the audit record from the resolved outcome and caller identity.
-    /// `verified` is true only for a verified JWT identity, and the actor uid is
-    /// taken from that identity — never the forgeable wire value.
-    fn build_reservation_txn(
-        action: TxnAction,
-        entity_name: &str,
-        actor: &str,
-        identity: Option<&spur_core::auth::Identity>,
-        details_base: serde_json::Value,
-        result: &Result<(), Status>,
-    ) -> TxnRecord {
-        TxnRecord {
-            ts: Utc::now(),
-            actor: actor.to_string(),
-            actor_uid: identity.map(|id| i64::from(id.uid)),
-            verified: identity.is_some(),
-            source: TxnSource::Api,
-            action,
-            entity_type: TxnEntity::Reservation,
-            entity_name: entity_name.to_string(),
-            outcome: txn::outcome_from_status(result),
-            details: txn::finalize_details(
-                details_base,
-                result.as_ref().err().map(|s| s.message()),
-            ),
-        }
-    }
-
-    /// Parse, validate, and submit a create-reservation request. Split out so the
-    /// handler audits the outcome uniformly, including `invalid_argument` parse
-    /// failures that occur before the cluster call.
+    /// Split out so the audit layer records the outcome uniformly, including
+    /// `invalid_argument` parse failures that occur before the cluster call.
     fn build_and_create_reservation(&self, req: CreateReservationRequest) -> Result<(), Status> {
         let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
         {
@@ -1048,7 +993,19 @@ impl ControllerService {
     /// Native plugin: a signed identity envelope replaces the original user
     /// credential so the leader does not see a consumed nonce. JWT plugin:
     /// the Authorization header is preserved as before.
-    fn forward_request<T: prost::Message>(request: Request<T>) -> Request<T> {
+    #[allow(clippy::result_large_err)]
+    fn forward_request<T: prost::Message>(request: Request<T>) -> Result<Request<T>, Status> {
+        // Already forwarded once. Re-signing would mint a fresh envelope over
+        // whatever body we now hold, laundering a tampered one into a valid id.
+        if request
+            .extensions()
+            .get::<spur_core::native_peer::ForwardedBinding>()
+            .is_some()
+        {
+            return Err(Status::unauthenticated(
+                "refusing to re-forward an already-forwarded request",
+            ));
+        }
         let identity = request
             .extensions()
             .get::<spur_core::auth::Identity>()
@@ -1056,12 +1013,16 @@ impl ControllerService {
         let mut buf = Vec::new();
         let _ = prost::Message::encode(request.get_ref(), &mut buf);
         let digest = spur_core::native_peer::request_digest(&buf);
-        let action = std::any::type_name::<T>();
+        // Fail closed: without the wire path we would have to fall back to the
+        // request type, which cannot tell one `Empty` RPC from another.
+        let action = rpc_path(&request).ok_or_else(|| {
+            Status::internal("cannot forward a request with no recorded RPC path")
+        })?;
         let meta =
-            Self::forwarded_metadata_for(request.metadata(), identity.as_ref(), digest, action);
+            Self::forwarded_metadata_for(request.metadata(), identity.as_ref(), digest, &action);
         let mut fwd = Request::new(request.into_inner());
         *fwd.metadata_mut() = meta;
-        fwd
+        Ok(fwd)
     }
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
@@ -1299,7 +1260,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.submit_job(fwd).await;
                 }
                 Err(e) => {
@@ -1312,6 +1273,7 @@ impl SlurmController for ControllerService {
         // Bind to the authenticated caller BEFORE the spec reaches the cluster, so a stale or
         // hostile client cannot choose the user/uid the job runs as.
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let spec = request
             .into_inner()
             .spec
@@ -1328,10 +1290,23 @@ impl SlurmController for ControllerService {
             self.cluster.config().scheduler.max_user_priority,
         );
 
+        let submitted = txn::requested(&[
+            ("name", Some(core_spec.name.clone().into())),
+            ("partition", core_spec.partition.clone().map(Into::into)),
+            ("account", core_spec.account.clone().map(Into::into)),
+            ("qos", core_spec.qos.clone().map(Into::into)),
+            ("num_nodes", Some(core_spec.num_nodes.into())),
+            ("num_tasks", Some(core_spec.num_tasks.into())),
+        ]);
         let outcome = self
             .cluster
             .submit_job(core_spec)
             .map_err(submit_rpc_status)?;
+        // The id is the target, and only the submission assigns it.
+        annotate(
+            &audit,
+            Annotation::new(&outcome.job_id.to_string(), submitted),
+        );
 
         let mut warnings = outcome.warnings;
         warnings.extend(priority_warning);
@@ -1345,6 +1320,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let __identity = Self::verified_identity(&request).cloned();
@@ -1433,6 +1409,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         // Capture identity before the forward so the serving node (leader or read-allowed follower)
@@ -1469,7 +1446,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cancel_job(fwd).await;
                 }
                 Err(e) => {
@@ -1480,9 +1457,18 @@ impl SlurmController for ControllerService {
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                txn::requested(&[("signal", (req.signal != 0).then(|| req.signal.into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
 
         // Snapshot the job before cancelling so we have allocated_nodes
         let job = self.cluster.get_job(job_id);
@@ -1514,7 +1500,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.complete_job(fwd).await;
                 }
                 Err(e) => {
@@ -1577,7 +1563,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.job_keepalive(fwd).await;
                 }
                 Err(e) => {
@@ -1629,7 +1615,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.suspend_job(fwd).await;
                 }
                 Err(e) => {
@@ -1639,9 +1625,14 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
+        );
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Snapshot up-front for agent dispatch.
         let job = self
@@ -1667,7 +1658,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.resume_job(fwd).await;
                 }
                 Err(e) => {
@@ -1677,9 +1668,14 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
+        );
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Allocation is retained across resume, so this
         // up-front snapshot's allocated_nodes is still valid for agent dispatch.
@@ -1706,7 +1702,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_job(fwd).await;
                 }
                 Err(e) => {
@@ -1718,8 +1714,22 @@ impl SlurmController for ControllerService {
 
         let __identity = Self::verified_identity(&request).cloned();
         let caller_is_privileged = self.caller_is_privileged(__identity.as_ref());
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.job_id.to_string(),
+                txn::requested(&[
+                    ("partition", req.partition.clone().map(Into::into)),
+                    ("account", req.account.clone().map(Into::into)),
+                    ("priority", req.priority.map(Into::into)),
+                    ("comment", req.comment.clone().map(Into::into)),
+                ]),
+            )
+            .asserted_actor(&req.user),
+        );
 
         // Reject a caller who does not own the target job before any mutation —
         // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
@@ -1789,7 +1799,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.requeue_job(fwd).await;
                 }
                 Err(e) => {
@@ -1801,8 +1811,17 @@ impl SlurmController for ControllerService {
 
         let __identity = Self::verified_identity(&request).cloned();
         let caller_is_admin = self.caller_is_operator(__identity.as_ref());
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.job_id.to_string(),
+                txn::requested(&[("hold", req.hold.then_some(true.into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
         let outcome = self
             .cluster
             .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
@@ -1827,6 +1846,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -1872,6 +1892,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -1916,7 +1937,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_node(fwd).await;
                 }
                 Err(e) => {
@@ -1926,13 +1947,38 @@ impl SlurmController for ControllerService {
             }
         }
 
+        // Annotate before the gate and before validating, so a refused or
+        // malformed request is still attributed to the node it targeted.
+        let audit = crate::audit::slot(&request);
+        let parsed = request
+            .get_ref()
+            .state
+            .map(spur_core::node::NodeState::from_proto_i32);
+        {
+            let r = request.get_ref();
+            annotate(
+                &audit,
+                Annotation::new(
+                    &r.name,
+                    txn::node_update_details(
+                        requested_node_state(r.state, parsed.flatten()).as_deref(),
+                        r.reason.as_deref(),
+                        &r.labels,
+                        &r.remove_labels,
+                    ),
+                ),
+            );
+        }
+
         self.require_admin(&request, "update node")?;
 
-        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
-        if let Some(state) = req.state {
-            let node_state = spur_core::node::NodeState::from_proto_i32(state)
-                .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
+        let node_state = match parsed {
+            Some(None) => return Err(Status::invalid_argument("invalid node state")),
+            other => other.flatten(),
+        };
+        if let Some(node_state) = node_state {
             self.cluster
                 .update_node_state(&req.name, node_state, req.reason, reason_uid)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -1953,7 +1999,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.drain_node(fwd).await;
                 }
                 Err(e) => {
@@ -1963,11 +2009,22 @@ impl SlurmController for ControllerService {
             }
         }
 
+        // Annotate before the gate so a refused attempt still names the node it
+        // targeted, which is the whole question the audit log answers.
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                txn::node_drain_details(&request.get_ref().reason),
+            ),
+        );
+
         // Draining a node takes it out of service cluster-wide, so it needs the
         // same bar as `update_node`, which reaches the identical state change.
         self.require_admin(&request, "drain node")?;
 
-        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
         let reason = if req.reason.is_empty() {
             None
@@ -1995,7 +2052,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.deregister_node(fwd).await;
                 }
                 Err(e) => {
@@ -2004,6 +2061,15 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                txn::node_remove_details(&request.get_ref().reason, request.get_ref().force),
+            ),
+        );
 
         // Removing a node evicts its running jobs, so it needs the same bar as
         // the other operator-driven node RPCs.
@@ -2037,7 +2103,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.deregister_agent(fwd).await;
                 }
                 Err(e) => {
@@ -2046,7 +2112,12 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(&req.hostname, txn::node_deregister_details(&req.reason)),
+        );
 
         self.verify_node_identity(&req.hostname, &req.node_token)?;
 
@@ -2073,6 +2144,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2120,6 +2192,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2146,6 +2219,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2173,7 +2247,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.get_rpc_stats(fwd).await;
             }
         }
@@ -2188,7 +2262,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.get_sched_stats(fwd).await;
             }
         }
@@ -2206,7 +2280,7 @@ impl SlurmController for ControllerService {
         if self.check_leader(&request).is_err() {
             let proxy = &self.leader_proxy;
             let mut client = proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.get_assoc_mgr_info(fwd).await;
         }
 
@@ -2236,7 +2310,7 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.reset_diag_stats(fwd).await;
             }
         }
@@ -2254,7 +2328,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.register_agent(fwd).await;
                 }
                 Err(e) => {
@@ -2333,7 +2407,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.report_job_status(fwd).await;
                 }
                 Err(e) => {
@@ -2462,7 +2536,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.heartbeat(fwd).await;
                 }
                 Err(e) => {
@@ -2517,7 +2591,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.report_stepd_recovery(fwd).await;
                 }
                 Err(error) => {
@@ -2693,7 +2767,7 @@ impl SlurmController for ControllerService {
                 Ok(mut client) => {
                     // Preserve the caller's credential (and set the forwarded marker) so the leader
                     // authorizes the ORIGINAL caller, not an anonymous forwarded request.
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_token(fwd).await;
                 }
                 Err(_) => return Err(status),
@@ -2702,6 +2776,7 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "create token")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
         let ttl_secs = req.ttl_secs.filter(|&v| v > 0);
 
@@ -2709,6 +2784,14 @@ impl SlurmController for ControllerService {
             .cluster
             .create_token(ttl_secs)
             .map_err(|e| Status::internal(e.to_string()))?;
+        // The id only; `full_string` carries the secret and must never be logged.
+        annotate(
+            &audit,
+            Annotation::new(
+                &token.id,
+                txn::requested(&[("ttl_secs", ttl_secs.map(Into::into))]),
+            ),
+        );
 
         Ok(Response::new(CreateTokenResponse {
             token: full_string,
@@ -2720,6 +2803,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListTokensRequest>,
     ) -> Result<Response<ListTokensResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         use spur_proto::proto::TokenInfo;
 
         // Admission tokens are cluster secrets; only an admin may enumerate them.
@@ -2749,7 +2833,7 @@ impl SlurmController for ControllerService {
                 Ok(mut client) => {
                     // Preserve the caller's credential (and set the forwarded marker) so the leader
                     // authorizes the ORIGINAL caller, not an anonymous forwarded request.
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.revoke_token(fwd).await;
                 }
                 Err(_) => return Err(status),
@@ -2758,7 +2842,12 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "revoke token")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(&req.token_id, txn::delete_details(None)),
+        );
         self.cluster
             .revoke_token(&req.token_id)
             .map_err(|e| Status::not_found(e.to_string()))?;
@@ -2770,6 +2859,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -2819,7 +2909,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_job_step(fwd).await;
                 }
                 Err(e) => {
@@ -2938,7 +3028,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.complete_job_step(fwd).await;
                 }
                 Err(e) => {
@@ -3001,7 +3091,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_partition(fwd).await;
                 }
                 Err(e) => {
@@ -3013,7 +3103,28 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "create partition")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::requested(&[
+                    (
+                        "nodes",
+                        (!req.nodes.is_empty()).then(|| req.nodes.clone().into()),
+                    ),
+                    (
+                        "selector",
+                        (!req.selector.is_empty()).then(|| serde_json::json!(req.selector)),
+                    ),
+                    (
+                        "max_time",
+                        (!req.max_time.is_empty()).then(|| req.max_time.clone().into()),
+                    ),
+                ]),
+            ),
+        );
 
         if req.nodes.is_empty() && req.selector.is_empty() {
             return Err(Status::invalid_argument(
@@ -3108,7 +3219,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_partition(fwd).await;
                 }
                 Err(e) => {
@@ -3120,7 +3231,19 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "update partition")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::requested(&[
+                    ("state", req.state.clone().map(Into::into)),
+                    ("nodes", req.nodes.clone().map(Into::into)),
+                    ("max_time", req.max_time.clone().map(Into::into)),
+                ]),
+            ),
+        );
 
         let state = req
             .state
@@ -3219,7 +3342,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.delete_partition(fwd).await;
                 }
                 Err(e) => {
@@ -3231,7 +3354,9 @@ impl SlurmController for ControllerService {
 
         self.require_admin(&request, "delete partition")?;
 
+        let audit = crate::audit::slot(&request);
         let name = request.into_inner().name;
+        annotate(&audit, Annotation::new(&name, txn::delete_details(None)));
         self.cluster
             .delete_partition(&name)
             .map_err(partition_rpc_status)?;
@@ -3244,7 +3369,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.reconfigure(fwd).await;
                 }
                 Err(e) => {
@@ -3271,7 +3396,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.create_reservation(fwd).await;
                 }
                 Err(e) => {
@@ -3282,32 +3407,30 @@ impl SlurmController for ControllerService {
         }
 
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::create_details(
+                    &req.start_time,
+                    req.duration_minutes,
+                    &req.nodes,
+                    &req.accounts,
+                    &req.users,
+                    &req.flags,
+                ),
+            )
+            .asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
-        let details = txn::create_details(
-            &req.start_time,
-            req.duration_minutes,
-            &req.nodes,
-            &req.accounts,
-            &req.users,
-            &req.flags,
-        );
-        let entity_name = req.name.clone();
-        let actor = req.user.clone();
-
-        let result = self.build_and_create_reservation(req);
-        self.audit_reservation(
-            TxnAction::Create,
-            &entity_name,
-            &actor,
-            identity.as_ref(),
-            details,
-            &result,
-        );
-        result.map(|()| Response::new(()))
+        self.build_and_create_reservation(req)
+            .map(|()| Response::new(()))
     }
 
     async fn update_reservation(
@@ -3318,7 +3441,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.update_reservation(fwd).await;
                 }
                 Err(e) => {
@@ -3329,25 +3452,30 @@ impl SlurmController for ControllerService {
         }
 
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::update_details(
+                    req.duration_minutes,
+                    &req.add_nodes,
+                    &req.remove_nodes,
+                    &req.add_users,
+                    &req.remove_users,
+                    &req.add_accounts,
+                    &req.remove_accounts,
+                ),
+            )
+            .asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
-        let details = txn::update_details(
-            req.duration_minutes,
-            &req.add_nodes,
-            &req.remove_nodes,
-            &req.add_users,
-            &req.remove_users,
-            &req.add_accounts,
-            &req.remove_accounts,
-        );
-        let entity_name = req.name.clone();
-        let actor = req.user.clone();
-
-        let result = self
-            .cluster
+        self.cluster
             .update_reservation(
                 &req.name,
                 req.duration_minutes,
@@ -3358,16 +3486,8 @@ impl SlurmController for ControllerService {
                 &req.add_accounts,
                 &req.remove_accounts,
             )
-            .map_err(reservation_rpc_status);
-        self.audit_reservation(
-            TxnAction::Update,
-            &entity_name,
-            &actor,
-            identity.as_ref(),
-            details,
-            &result,
-        );
-        result.map(|()| Response::new(()))
+            .map_err(reservation_rpc_status)
+            .map(|()| Response::new(()))
     }
 
     async fn delete_reservation(
@@ -3378,7 +3498,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.delete_reservation(fwd).await;
                 }
                 Err(e) => {
@@ -3389,33 +3509,28 @@ impl SlurmController for ControllerService {
         }
 
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        annotate(
+            &audit,
+            Annotation::new(&req.name, txn::delete_details(None)).asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
-        let entity_name = req.name.clone();
-        let actor = req.user.clone();
-
-        let result = self
-            .cluster
+        self.cluster
             .delete_reservation(&req.name)
-            .map_err(reservation_rpc_status);
-        self.audit_reservation(
-            TxnAction::Delete,
-            &entity_name,
-            &actor,
-            identity.as_ref(),
-            txn::delete_details(None),
-            &result,
-        );
-        result.map(|()| Response::new(()))
+            .map_err(reservation_rpc_status)
+            .map(|()| Response::new(()))
     }
 
     async fn list_reservations(
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
+        Self::enforce_forward_binding(&request)?;
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
@@ -3463,15 +3578,24 @@ impl SlurmController for ControllerService {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
+                let fwd = Self::forward_request(request)?;
                 return client.exec_in_job(fwd).await;
             }
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                serde_json::json!({ "command": req.command.join(" ") }),
+            )
+            .asserted_actor(&req.user),
+        );
 
         let job = self
             .cluster
@@ -3538,15 +3662,24 @@ impl SlurmController for ControllerService {
         if self.check_leader(&request).is_err() {
             let proxy = &self.leader_proxy;
             let mut client = proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.run_step(fwd).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                serde_json::json!({ "command": req.command.join(" ") }),
+            )
+            .asserted_actor(&req.user),
+        );
 
         let job = self
             .cluster
@@ -3928,7 +4061,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_up(fwd).await;
                 }
                 Err(e) => {
@@ -4055,7 +4188,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_add_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -4065,8 +4198,26 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.nodes,
+                txn::requested(&[
+                    (
+                        "partition",
+                        (!req.partition.is_empty()).then(|| req.partition.clone().into()),
+                    ),
+                    (
+                        "selector",
+                        (!req.selector.is_empty()).then(|| serde_json::json!(req.selector)),
+                    ),
+                ]),
+            )
+            .asserted_actor(&req.caller),
+        );
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster add-nodes")?;
 
         let state = self.cluster.k0s_state();
@@ -4132,7 +4283,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_remove_nodes(fwd).await;
                 }
                 Err(e) => {
@@ -4142,8 +4293,17 @@ impl SlurmController for ControllerService {
             }
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.nodes,
+                txn::requested(&[("drain_timeout_secs", req.drain_timeout_secs.map(Into::into))]),
+            )
+            .asserted_actor(&req.caller),
+        );
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster remove-nodes")?;
 
         let state = self.cluster.k0s_state();
@@ -4267,7 +4427,7 @@ impl SlurmController for ControllerService {
         if let Err(status) = self.check_leader(&request) {
             match self.leader_proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.cluster_down(fwd).await;
                 }
                 Err(e) => {
@@ -4301,7 +4461,7 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         if self.check_leader(&request).is_err() {
             let mut client = self.leader_proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.cluster_status(fwd).await;
         }
         let state = self.cluster.k0s_state();
@@ -4321,12 +4481,23 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<ClusterKubeconfigResponse>, Status> {
         if self.check_leader(&request).is_err() {
             let mut client = self.leader_proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
+            let fwd = Self::forward_request(request)?;
             return client.cluster_kubeconfig(fwd).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        // The subject the credential is minted for, which is what a reader needs
+        // to know; `--admin` mints the cluster-admin one instead of a user's.
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.user,
+                txn::requested(&[("admin", req.admin.then_some(true.into()))]),
+            )
+            .asserted_actor(&req.caller),
+        );
         let is_admin = self.k0s_caller_is_admin(__identity.as_ref(), &req.caller);
 
         if req.admin {
@@ -4393,17 +4564,17 @@ impl SlurmController for ControllerService {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    addr: SocketAddr,
+/// Separate from [`serve`] so `main` can hand a clone to the REST server, which
+/// dispatches into these handlers instead of reaching past them into the cluster.
+pub fn build_service(
     cluster: Arc<ClusterManager>,
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
-    accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
     jwt_key: String,
-    bearer: spur_core::auth::BearerAuth,
-) -> anyhow::Result<()> {
+    bearer: &spur_core::auth::BearerAuth,
+) -> ControllerService {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
         .iter()
@@ -4423,41 +4594,138 @@ pub async fn serve(
         cluster.config().auth.has_jwt_key() || crate::native_keys::node_signer().is_some();
     let (auth_audience, auth_epoch) = bearer.advertised_handshake();
 
-    let service = ControllerService {
+    ControllerService {
         cluster,
         client_addrs,
-        raft: raft_handle.clone(),
+        raft: raft_handle,
         leader_proxy,
-        rpc_stats: rpc_stats.clone(),
-        sched_stats: sched_stats.clone(),
+        rpc_stats,
+        sched_stats,
         control_plane_replicas,
         jwt_key,
         node_identity_key_configured,
-        incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+        incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
         auth_audience,
         auth_epoch,
-    };
+    }
+}
 
-    let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
+pub async fn serve(
+    addr: SocketAddr,
+    service: ControllerService,
+    accounting_service: Option<crate::accounting::AccountingService>,
+    bearer: spur_core::auth::BearerAuth,
+) -> anyhow::Result<()> {
+    let audit_cluster = service.cluster.clone();
+    let audit_rpcs = service.cluster.config().logging.audit_rpcs;
+
+    let stats_layer = RpcStatsLayer::new(service.rpc_stats.clone(), service.raft.clone());
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
     let mut auth_layer = crate::auth_middleware::AuthLayer::from_bearer(bearer);
     if let Some(peer) = crate::native_keys::peer() {
         auth_layer = auth_layer.with_peer(peer);
     }
+    let audit_layer = crate::audit::AuditLayer::new(
+        Arc::new(crate::audit::ControllerAudit::new(audit_cluster)),
+        audit_rpcs,
+    );
 
+    // Order is load-bearing: each `.layer` sits closer to the service, so audit
+    // runs inside auth and sees the `Identity` it inserted.
     let mut builder = tonic::transport::Server::builder()
         .layer(stats_layer)
-        .layer(auth_layer);
+        .layer(auth_layer)
+        .layer(audit_layer);
 
     let mut router = builder.add_service(spur_proto::controller_server(service));
     if let Some(service) = accounting_service {
         router = router.add_service(crate::accounting::accounting_server(service));
     }
 
-    router.serve(addr).await?;
+    router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
     Ok(())
+}
+
+/// Resolves on SIGTERM or Ctrl-C, so the caller can flush work that a dropped
+/// runtime would discard.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Without the handler this arm must never win the select.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown signal received, draining");
+}
+
+/// A uid only when the kernel vouched for it. A JWT claims its own, possibly 0,
+/// so recording it would attribute an action to an unproven uid. Cf. `bind_job_spec`.
+pub(crate) fn trusted_uid(identity: Option<&spur_core::auth::Identity>) -> Option<u32> {
+    identity.filter(|id| id.trusted_unix).map(|id| id.uid)
+}
+
+/// The gRPC method path this request arrived on, as recorded by the auth layer.
+pub(crate) fn rpc_path<T>(request: &Request<T>) -> Option<String> {
+    request
+        .extensions()
+        .get::<spur_core::native_peer::RpcPath>()
+        .map(|p| p.0.clone())
+}
+
+/// Every handler reachable with a forwarded identity must call this: the auth
+/// layer verifies the envelope's signature but cannot hash a typed body.
+#[allow(clippy::result_large_err)]
+pub(crate) fn enforce_forward_binding<T: prost::Message>(
+    request: &Request<T>,
+) -> Result<(), Status> {
+    let Some(binding) = request
+        .extensions()
+        .get::<spur_core::native_peer::ForwardedBinding>()
+    else {
+        return Ok(());
+    };
+    let mut buf = Vec::new();
+    request
+        .get_ref()
+        .encode(&mut buf)
+        .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
+    let digest = spur_core::native_peer::request_digest(&buf);
+    // The auth layer already matched this against the wire path; re-checking it
+    // here keeps the digest and action verdicts in one place.
+    let action = rpc_path(request)
+        .ok_or_else(|| Status::internal("forwarded request has no recorded RPC path"))?;
+    binding.require(&action, &digest).map_err(|e| {
+        Status::unauthenticated(format!("forwarded identity does not match this RPC: {e}"))
+    })
+}
+
+/// Keeps an unrecognized value verbatim rather than dropping it, so the audit
+/// row still answers what a rejected request tried to set.
+fn requested_node_state(
+    raw: Option<i32>,
+    parsed: Option<spur_core::node::NodeState>,
+) -> Option<String> {
+    let raw = raw?;
+    Some(match parsed {
+        Some(state) => state.display().to_string(),
+        None => format!("invalid({raw})"),
+    })
 }
 
 /// Resolve the target node for a job step. Empty = first allocated (legacy
@@ -6040,8 +6308,13 @@ mod tests {
         let mut request = Request::new(inner);
         request
             .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/SubmitJob".into(),
+            ));
+        request
+            .extensions_mut()
             .insert(spur_core::native_peer::ForwardedBinding {
-                action: std::any::type_name::<SubmitJobRequest>().into(),
+                action: "/slurm.SlurmController/SubmitJob".into(),
                 request_digest: [0u8; 32],
             });
         let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
@@ -6058,8 +6331,13 @@ mod tests {
         let mut request = Request::new(inner);
         request
             .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/SubmitJob".into(),
+            ));
+        request
+            .extensions_mut()
             .insert(spur_core::native_peer::ForwardedBinding {
-                action: std::any::type_name::<SubmitJobRequest>().into(),
+                action: "/slurm.SlurmController/SubmitJob".into(),
                 request_digest: digest,
             });
         ControllerService::enforce_forward_binding(&request).unwrap();
@@ -6071,8 +6349,13 @@ mod tests {
         let mut request = Request::new(inner);
         request
             .extensions_mut()
+            .insert(spur_core::native_peer::RpcPath(
+                "/slurm.SlurmController/GetNodes".into(),
+            ));
+        request
+            .extensions_mut()
             .insert(spur_core::native_peer::ForwardedBinding {
-                action: std::any::type_name::<GetNodesRequest>().into(),
+                action: "/slurm.SlurmController/GetNodes".into(),
                 request_digest: [1u8; 32],
             });
         let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
@@ -6130,7 +6413,7 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key: String::new(),
             node_identity_key_configured: false,
-            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
             auth_audience: String::new(),
             auth_epoch: 0,
         }
@@ -6829,7 +7112,7 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key,
             node_identity_key_configured,
-            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
             auth_audience: String::new(),
             auth_epoch: 0,
         }
@@ -9284,6 +9567,29 @@ mod tests {
         );
     }
 
+    /// A node's `reason_uid` and the audit log both attribute through this, so a
+    /// token claiming uid 0 must not leave a root fingerprint on either.
+    #[test]
+    fn only_a_kernel_vouched_uid_is_attributable() {
+        let native = spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        };
+        assert_eq!(super::trusted_uid(Some(&native)), Some(1000));
+
+        let jwt = spur_core::auth::Identity {
+            user: "mallory".into(),
+            uid: 0,
+            trusted_unix: false,
+            ..native.clone()
+        };
+        assert_eq!(super::trusted_uid(Some(&jwt)), None);
+        assert_eq!(super::trusted_uid(None), None);
+    }
+
     // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
     // (a) an admin whose username is not literally "root" is still treated as internal, and (b) an
     // unauthenticated caller cannot bypass ownership by claiming user = "root".
@@ -11659,6 +11965,40 @@ mod tests {
         );
     }
 
+    /// `caller` is client-supplied, so a verified non-admin must not reach the
+    /// k0s gate by asserting `root`. Every k0s RPC binds it from the identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_membership_rejects_a_spoofed_root_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut add = Request::new(spur_proto::proto::ClusterAddNodesRequest {
+            caller: "root".into(), // spoofed on the wire
+            ..Default::default()
+        });
+        add.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_add_nodes(add)
+                .await
+                .expect_err("a spoofed root caller must not add k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut remove = Request::new(spur_proto::proto::ClusterRemoveNodesRequest {
+            caller: "root".into(),
+            ..Default::default()
+        });
+        remove.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_remove_nodes(remove)
+                .await
+                .expect_err("a spoofed root caller must not remove k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+
     /// Draining and removing a node both take it out of service and evict
     /// running work, so neither may be reachable by a valid non-admin token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11694,9 +12034,8 @@ mod tests {
         );
     }
 
-    /// `spurd` drains a node from its launch-failure path over an unauthenticated
-    /// channel, so the gate must keep waving through a caller with no identity —
-    /// which is also how `update_node` has always behaved.
+    /// `spurd` drains a node over an unauthenticated channel on launch failure,
+    /// so the gate must keep admitting a caller with no identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unidentified_caller_still_passes_the_node_gates() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -11722,6 +12061,58 @@ mod tests {
             svc.deregister_node(remove).await.unwrap_err().code(),
             Code::NotFound
         );
+    }
+
+    /// A refused mutation must still name what it targeted — "who tried to drain
+    /// node07 and was denied" is exactly what the audit log is for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_node_action_is_annotated_before_the_gate() {
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        for (name, run) in [("DrainNode", 0), ("DeregisterNode", 1), ("UpdateNode", 2)] {
+            let slot = Arc::new(crate::audit::AuditSlot::default());
+            let err = match run {
+                0 => {
+                    let mut r = Request::new(spur_proto::proto::DrainNodeRequest {
+                        name: "node07".into(),
+                        reason: "dc cycle".into(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.drain_node(r).await.unwrap_err()
+                }
+                1 => {
+                    let mut r = Request::new(spur_proto::proto::DeregisterNodeRequest {
+                        name: "node07".into(),
+                        force: true,
+                        reason: String::new(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.deregister_node(r).await.unwrap_err()
+                }
+                _ => {
+                    let mut r = Request::new(UpdateNodeRequest {
+                        name: "node07".into(),
+                        state: None,
+                        reason: None,
+                        labels: Default::default(),
+                        remove_labels: Vec::new(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.update_node(r).await.unwrap_err()
+                }
+            };
+
+            assert_eq!(err.code(), Code::PermissionDenied, "{name}");
+            let annotation = crate::audit::take_for_test(&slot)
+                .unwrap_or_else(|| panic!("{name} must annotate before refusing"));
+            assert_eq!(annotation.target, "node07", "{name}");
+        }
     }
 
     // --- authoritative_user ---
@@ -11842,49 +12233,117 @@ mod tests {
         );
     }
 
-    // --- build_reservation_txn (audit attribution) ---
-
+    /// Every `Empty` RPC shares one type and one digest, so a type-bound
+    /// envelope for a read also validated as `Reconfigure`.
     #[test]
-    fn build_reservation_txn_records_verified_identity_and_large_uid() {
-        let id = spur_core::auth::Identity {
-            user: "alice".to_string(),
-            uid: 4_000_000_000, // > i32::MAX: must survive as i64, not wrap negative
-            gid: 0,
-            is_admin: false,
-            trusted_unix: false,
-        };
-        let rec = ControllerService::build_reservation_txn(
-            TxnAction::Create,
-            "resv1",
-            "alice",
-            Some(&id),
-            serde_json::json!({}),
-            &Ok(()),
-        );
-        assert!(rec.verified);
-        assert_eq!(rec.actor_uid, Some(4_000_000_000));
-        assert_eq!(rec.actor, "alice");
-        assert_eq!(rec.source, TxnSource::Api);
-        assert_eq!(rec.entity_type, TxnEntity::Reservation);
-        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Success);
+    fn an_empty_bodied_envelope_cannot_be_replayed_onto_another_rpc() {
+        let mut req = Request::new(());
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/Reconfigure".into(),
+        ));
+        let mut buf = Vec::new();
+        prost::Message::encode(req.get_ref(), &mut buf).unwrap();
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                // Signed for a read; the digest is identical to Reconfigure's.
+                action: "/slurm.SlurmController/GetRpcStats".into(),
+                request_digest: spur_core::native_peer::request_digest(&buf),
+            });
+
+        let err = enforce_forward_binding(&req)
+            .expect_err("an envelope bound to GetRpcStats must not authorize Reconfigure");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    /// The same envelope on the RPC it was actually signed for still works, so
+    /// the check above is not just rejecting everything.
+    #[test]
+    fn an_empty_bodied_envelope_validates_on_its_own_rpc() {
+        let mut req = Request::new(());
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/GetRpcStats".into(),
+        ));
+        let mut buf = Vec::new();
+        prost::Message::encode(req.get_ref(), &mut buf).unwrap();
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/GetRpcStats".into(),
+                request_digest: spur_core::native_peer::request_digest(&buf),
+            });
+
+        enforce_forward_binding(&req).expect("the bound RPC must still be accepted");
+    }
+
+    /// Re-signing would bind the victim's identity to whatever body we now hold,
+    /// laundering a tampered request into a validly signed one.
+    #[test]
+    fn an_already_forwarded_request_is_never_re_signed() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: true,
+            reason: "tampered".into(),
+        });
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/DeregisterNode".into(),
+                request_digest: [0u8; 32],
+            });
+
+        let err = ControllerService::forward_request(req)
+            .expect_err("a request carrying a binding must not be forwarded again");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    /// The same guard must not block ordinary client traffic, which carries no
+    /// binding and is exactly what forwarding exists for.
+    #[test]
+    fn a_first_hop_client_request_still_forwards() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: false,
+            reason: String::new(),
+        });
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/DeregisterNode".into(),
+        ));
+        let fwd = ControllerService::forward_request(req).expect("first hop must forward");
+        assert!(fwd.metadata().get(FORWARDED_HEADER).is_some());
+    }
+
+    /// A mismatched binding is rejected rather than being treated as "not
+    /// leader", which is what previously routed it into the forwarding path.
+    #[test]
+    fn a_mismatched_binding_is_rejected() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: false,
+            reason: String::new(),
+        });
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/DeregisterNode".into(),
+        ));
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/DeregisterNode".into(),
+                request_digest: [0u8; 32],
+            });
+
+        let err = enforce_forward_binding(&req).expect_err("digest mismatch must be rejected");
+        assert_eq!(err.code(), Code::Unauthenticated);
     }
 
     #[test]
-    fn build_reservation_txn_anonymous_is_unverified_and_captures_error() {
-        let rec = ControllerService::build_reservation_txn(
-            TxnAction::Delete,
-            "resv1",
-            "bob",
-            None,
-            serde_json::json!({}),
-            &Err(Status::permission_denied(
-                "user 'bob' cannot delete reservation",
-            )),
+    fn requested_node_state_keeps_an_unrecognized_value_verbatim() {
+        assert_eq!(requested_node_state(None, None), None);
+        assert_eq!(
+            requested_node_state(Some(99), None).as_deref(),
+            Some("invalid(99)")
         );
-        assert!(!rec.verified);
-        assert_eq!(rec.actor_uid, None);
-        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Denied);
-        assert!(rec.details.contains("cannot delete"));
+        let drain = spur_core::node::NodeState::Drain;
+        assert_eq!(
+            requested_node_state(Some(4), Some(drain)).as_deref(),
+            Some(drain.display())
+        );
     }
 
     // --- bind_spec_to_identity ---
