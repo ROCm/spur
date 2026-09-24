@@ -681,7 +681,7 @@ async fn main() -> anyhow::Result<()> {
     if cluster_config.enabled {
         reporter.set_k0s_status(k0s.node_state());
         // Stays inactive, with no Kubernetes client, until the controller marks the node shared.
-        let gpu_sharing = spurd::gpu_sharing::GpuSharing::new(&hostname, k0s.clone());
+        let gpu_sharing = spurd::gpu_sharing::GpuSharing::new(&hostname, k0s.clone(), &reporter);
         reporter.set_gpu_sharing(gpu_sharing.clone());
         tokio::spawn(gpu_sharing.converge_loop());
     }

@@ -8409,7 +8409,9 @@ impl SlurmAgent for AgentService {
         // user's account namespace). The controller already gates admin kubeconfig behind
         // `is_k0s_admin` + `allow_admin_kubeconfig`; requiring the controller here keeps that from
         // being sidestepped by dialing the agent directly.
-        let result = if req.user.is_empty() {
+        let result = if !req.gpu_sharing_node.is_empty() {
+            self.k0s.gpu_sharing_kubeconfig(&req.gpu_sharing_node).await
+        } else if req.user.is_empty() {
             self.k0s.admin_kubeconfig().await
         } else {
             self.k0s

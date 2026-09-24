@@ -250,6 +250,32 @@ impl NodeReporter {
         Ok(response.into_inner())
     }
 
+    /// Kubeconfig for GPU sharing on a k0s worker, minted by a control-plane
+    /// node through the controller.
+    pub async fn gpu_sharing_kubeconfig(&self) -> anyhow::Result<String> {
+        let mut client = crate::controller_auth::connect(&self.controller_addr)
+            .await
+            .context("failed to connect to spurctld for the GPU sharing kubeconfig")?;
+        let node_token = self
+            .node_token
+            .read()
+            .map_err(|_| anyhow::anyhow!("node token lock poisoned"))?
+            .clone();
+        let response = client
+            .get_gpu_sharing_kubeconfig(spur_proto::proto::GetGpuSharingKubeconfigRequest {
+                hostname: self.hostname.clone(),
+                node_token,
+            })
+            .await
+            .context("GPU sharing kubeconfig request failed")?;
+        Ok(response.into_inner().kubeconfig)
+    }
+
+    /// Whether this node reports GPUs to the controller.
+    pub fn has_gpus(&self) -> bool {
+        !self.snapshot_resources().gpus.is_empty()
+    }
+
     /// Periodic heartbeat loop.
     pub async fn heartbeat_loop(&self) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
