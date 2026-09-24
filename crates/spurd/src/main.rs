@@ -636,9 +636,26 @@ async fn main() -> anyhow::Result<()> {
         running_jobs,
         allow_root_jobs,
     )
-    .with_runtime_state_dir(stepd_state_dir.clone());
+    .with_runtime_state_dir(stepd_state_dir.clone())
+    .with_dispatch_timeout_secs(
+        config
+            .as_ref()
+            .map(|c| c.controller.dispatch_timeout_secs)
+            .unwrap_or_else(|| {
+                spur_core::config::ControllerConfig::default().dispatch_timeout_secs
+            }),
+    );
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
+    }
+    // Before the stepd recovery below, whose teardown releases GPU placeholders.
+    if cluster_config.enabled {
+        // Stays inactive, with no Kubernetes client, until the controller marks the node shared.
+        let gpu_sharing =
+            spurd::gpu_sharing::GpuSharing::new(&hostname, agent_service.k0s(), &reporter);
+        reporter.set_gpu_sharing(gpu_sharing.clone());
+        tokio::spawn(gpu_sharing.clone().converge_loop());
+        tokio::spawn(gpu_sharing.placeholder_loop(agent_service.allocation_handle()));
     }
     // Give the reporter the live allocation so heartbeats carry each held job's
     // translated GPU stable_ids. Wired before the replay below records adopted
@@ -680,10 +697,6 @@ async fn main() -> anyhow::Result<()> {
     // deployments don't emit spur_k8s_node_* series.
     if cluster_config.enabled {
         reporter.set_k0s_status(k0s.node_state());
-        // Stays inactive, with no Kubernetes client, until the controller marks the node shared.
-        let gpu_sharing = spurd::gpu_sharing::GpuSharing::new(&hostname, k0s.clone(), &reporter);
-        reporter.set_gpu_sharing(gpu_sharing.clone());
-        tokio::spawn(gpu_sharing.converge_loop());
     }
     k0s.adopt_running_unit().await;
     tokio::spawn(k0s.supervise());
