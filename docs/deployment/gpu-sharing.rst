@@ -323,6 +323,11 @@ The CDI specifications do not collide. ``spurd`` writes the kind
 ``k8s.gpu.amd.com/gpu`` into ``/var/run/cdi``. The containerd of k0s reads both
 directories.
 
+``spurd`` also reads ``/var/run/cdi``, but it ignores each CDI kind whose
+vendor starts with ``k8s.``. DRA drivers use such a vendor for the
+specifications that they write for each allocated claim. These devices belong
+to a pod, and are not in the inventory of the node.
+
 How Spur holds a GPU: the placeholder pod
 -----------------------------------------
 
@@ -584,6 +589,15 @@ Failure cases
      - The hold starts at allocation, so Spur does not use the GPU.
    * - No ``ResourceSlice`` from ``gpu.amd.com`` exists for the node.
      - The node is unshareable, with the reason in ``scontrol show node``.
+   * - The node has a DRM card that is not AMD, for example the virtual
+       display of a cloud VM.
+     - The DRA driver v1.0.1 reads the driver version of the first card in
+       ``/sys/class/drm``. If that card is not AMD, the version can be a
+       value such as ``1``, which is not semantic versioning. The API server
+       then refuses each ``ResourceSlice``, and the driver log shows
+       ``must be a string compatible with semver.org``. The node stays
+       unshareable. Remove the other card from DRM, for example with
+       ``modprobe -r virtio_gpu``.
    * - A foreign file or directory is at a kubelet link path.
      - ``spurd`` does not change it. The node is unshareable, and the reason
        names the path.
