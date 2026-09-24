@@ -172,6 +172,7 @@ pub(crate) fn relinquish_leadership(
     cluster.set_planned_reservations(HashMap::new());
     cluster.set_planned_job_starts(HashMap::new());
     scheduler.clear_outcomes();
+    cluster.clear_gpu_holds();
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -388,12 +389,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
+        let held_gpus = cluster.held_gpus(&nodes);
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
             topology: topology.as_ref(),
             busy_until: &busy_until,
+            held_gpus: &held_gpus,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -994,12 +997,14 @@ pub(crate) fn trial_placement(
     let partitions = cluster.get_partitions();
     let reservations = cluster.get_reservations();
     let busy_until = running_jobs_busy_until(cluster);
+    let held_gpus = cluster.held_gpus(&nodes);
     let state = ClusterState {
         nodes: &nodes,
         partitions: &partitions,
         reservations: &reservations,
         topology,
         busy_until: &busy_until,
+        held_gpus: &held_gpus,
     };
     let mut list = classification.jobs.clone();
     list.extend(

@@ -61,6 +61,7 @@ pub fn node_to_json(
         "operating_system": node.os,
         "planned_job_id": planned.map(|(id, _)| id),
         "planned_start": planned.map(|(_, start)| start.timestamp()),
+        "gpu_sharing": node.gpu_sharing,
     })
 }
 
@@ -108,6 +109,14 @@ pub fn parse_states_query(s: &str) -> Result<Vec<JobState>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_to_json_reports_gpu_sharing() {
+        let mut node = Node::new("n1".into(), spur_core::resource::ResourceSet::default());
+        assert_eq!(node_to_json(&node, None)["gpu_sharing"], false);
+        node.gpu_sharing = true;
+        assert_eq!(node_to_json(&node, None)["gpu_sharing"], true);
+    }
 
     #[test]
     fn partition_to_json_includes_access_control_fields() {
