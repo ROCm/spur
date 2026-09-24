@@ -8,6 +8,7 @@
 //! GPUs Kubernetes allocated (holds) and reports them on the heartbeat.
 
 pub mod holds;
+pub mod jobs;
 pub mod kubelet_links;
 pub mod placeholder;
 #[cfg(test)]
@@ -60,6 +61,7 @@ pub struct GpuSharing {
     labeled: Mutex<Option<bool>>,
     watch: Mutex<Option<Watch>>,
     identities: Mutex<(u64, HashMap<u64, SharingIdentity>)>,
+    placeholders: Mutex<HashMap<(u32, u32), jobs::Tracked>>,
     changed: Notify,
     converge: Notify,
 }
@@ -103,6 +105,7 @@ impl GpuSharing {
             labeled: Mutex::new(None),
             watch: Mutex::new(None),
             identities: Mutex::new((0, HashMap::new())),
+            placeholders: Mutex::new(HashMap::new()),
             changed: Notify::new(),
             converge: Notify::new(),
         }
@@ -168,9 +171,8 @@ impl GpuSharing {
 
     /// Placeholder pods of Spur jobs still on this node. Opt-out keeps the
     /// kubelet links until this is zero.
-    // ponytail: stub until placeholder pods exist; they replace it with a real count.
-    fn live_placeholders(&self) -> usize {
-        0
+    pub fn live_placeholders(&self) -> usize {
+        lock(&self.placeholders).len()
     }
 
     pub async fn converge_loop(self: Arc<Self>) {
@@ -383,14 +385,16 @@ impl GpuSharing {
             cache.1.clone()
         };
         let stable_ids: Vec<u64> = inventory.gpus.iter().map(|g| g.stable_id).collect();
-        Some(holds::build_report(
+        let mut report = holds::build_report(
             inventory.generation,
             &stable_ids,
             &identities,
             &view,
             job_gpus,
             &self.node_name,
-        ))
+        );
+        jobs::mark_conflicts(&mut report, &self.conflicts());
+        Some(report)
     }
 }
 
