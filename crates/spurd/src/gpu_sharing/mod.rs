@@ -9,6 +9,7 @@
 
 pub mod holds;
 pub mod kubelet_links;
+pub mod placeholder;
 #[cfg(test)]
 pub(crate) mod test_support;
 
