@@ -1591,6 +1591,12 @@ pub async fn recover_stepds(
             mpi: descriptor.resources.mpi.clone(),
             run_attempt: descriptor.run_attempt,
         });
+        // Discovery order is filesystem-dependent; the job's epoch must track
+        // whichever descriptor names the newest attempt, not just the first seen
+        // (which `stepds` — keyed and merged separately — may disagree with).
+        if descriptor.run_attempt > tracked.run_attempt {
+            tracked.run_attempt = descriptor.run_attempt;
+        }
         // Sessions arrive in directory order, so only take these from the job's
         // own: a step's spool file and rootfs are the step's, not the job's.
         if !owns_lifetime {
@@ -3622,36 +3628,59 @@ impl AgentService {
     }
 
     pub async fn adopt_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
-        let mut sessions = self.stepds.lock().await;
-        for descriptor in descriptors {
-            let mut descriptor = descriptor.clone();
-            // A recorded path is treated as authoritative for teardown, so one
-            // that no longer exists has to fall back to answering for the workload.
-            if !descriptor.cgroup_path.as_os_str().is_empty() && !descriptor.cgroup_path.is_dir() {
-                warn!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    step_id = descriptor.step_id,
-                    cgroup_path = %descriptor.cgroup_path.display(),
-                    "adopted a stepd whose recorded cgroup is gone; deriving instead"
-                );
-                descriptor.cgroup_path = std::path::PathBuf::new();
+        let mut displaced = Vec::new();
+        {
+            let mut sessions = self.stepds.lock().await;
+            for descriptor in descriptors {
+                let mut descriptor = descriptor.clone();
+                // A recorded path is treated as authoritative for teardown, so one
+                // that no longer exists has to fall back to answering for the workload.
+                if !descriptor.cgroup_path.as_os_str().is_empty()
+                    && !descriptor.cgroup_path.is_dir()
+                {
+                    warn!(
+                        job_id = descriptor.job_id,
+                        run_attempt = descriptor.run_attempt,
+                        step_id = descriptor.step_id,
+                        cgroup_path = %descriptor.cgroup_path.display(),
+                        "adopted a stepd whose recorded cgroup is gone; deriving instead"
+                    );
+                    descriptor.cgroup_path = std::path::PathBuf::new();
+                }
+                // Discovery order is filesystem-dependent, so the newest attempt
+                // must win the slot regardless of arrival order, or a stray
+                // older session can silently replace the live current one.
+                let key = stepd_key(&descriptor);
+                if let Some(existing) = sessions.get(&key) {
+                    if existing.run_attempt > descriptor.run_attempt {
+                        displaced.push(descriptor);
+                        continue;
+                    }
+                    displaced.push(existing.clone());
+                }
+                sessions.insert(key, descriptor.clone());
+                if let (Some(id), Some(digest)) = (
+                    decode_fixed_b64::<{ spur_core::native_cred::CREDENTIAL_ID_LEN }>(
+                        &descriptor.cred_id,
+                    ),
+                    decode_fixed_b64::<{ spur_core::native_cred::DIGEST_LEN }>(
+                        &descriptor.cred_digest,
+                    ),
+                ) {
+                    self.launch_acceptance.restore(
+                        descriptor.job_id,
+                        descriptor.step_id,
+                        descriptor.run_attempt,
+                        id,
+                        digest,
+                    );
+                }
             }
-            sessions.insert(stepd_key(&descriptor), descriptor.clone());
-            if let (Some(id), Some(digest)) = (
-                decode_fixed_b64::<{ spur_core::native_cred::CREDENTIAL_ID_LEN }>(
-                    &descriptor.cred_id,
-                ),
-                decode_fixed_b64::<{ spur_core::native_cred::DIGEST_LEN }>(&descriptor.cred_digest),
-            ) {
-                self.launch_acceptance.restore(
-                    descriptor.job_id,
-                    descriptor.step_id,
-                    descriptor.run_attempt,
-                    id,
-                    digest,
-                );
-            }
+        }
+        // A session that lost its slot is never revisited by anything else —
+        // fence it now instead of leaking it forever.
+        for stray in displaced {
+            discard_stepd_session(&stray).await;
         }
     }
 
@@ -10025,6 +10054,105 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
+    }
+
+    // Restart-time discovery order is filesystem-dependent, so a stale
+    // session arriving after the current one must not win the slot and strand
+    // the live attempt untracked.
+    #[tokio::test]
+    async fn adopt_stepds_keeps_the_newest_attempt_and_fences_the_loser() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let older_cgroup = cgroup_root.path().join("job_70_1");
+        let newer_cgroup = cgroup_root.path().join("job_70_2");
+        std::fs::create_dir(&older_cgroup).expect("older cgroup");
+        std::fs::create_dir(&newer_cgroup).expect("newer cgroup");
+
+        let older = crate::stepd::StepdDescriptor::new(
+            70,
+            1,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/older.sock"),
+            older_cgroup.clone(),
+        );
+        let newer = crate::stepd::StepdDescriptor::new(
+            70,
+            2,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/newer.sock"),
+            newer_cgroup.clone(),
+        );
+
+        // Discovery returns the newer attempt first; the stale sibling
+        // arriving after it must not clobber the slot it already lost.
+        svc.adopt_stepds(&[newer.clone(), older]).await;
+
+        assert_eq!(
+            svc.stepds
+                .lock()
+                .await
+                .get(&(70, spur_core::step::STEP_EXTERN)),
+            Some(&newer),
+            "the newest attempt must win the tracked slot regardless of arrival order"
+        );
+        assert!(
+            !older_cgroup.exists(),
+            "the superseded attempt's cgroup must be reaped, not left to leak"
+        );
+        assert!(
+            newer_cgroup.exists(),
+            "the live current attempt must not be torn down"
+        );
+    }
+
+    // `recover_stepds` and `adopt_stepds` both discover from the same
+    // filesystem-ordered list; if one picks first-seen and the other picks
+    // last-seen, they can end up tracking two different epochs for one job.
+    #[tokio::test]
+    async fn recover_stepds_tracks_the_newest_attempt_regardless_of_arrival_order() {
+        let running = new_running_jobs();
+        let older = crate::stepd::StepdDescriptor::new(
+            71,
+            1,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        let newer = crate::stepd::StepdDescriptor::new(
+            71,
+            2,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+
+        // The older attempt is discovered first and seeds the entry; the
+        // newer sibling arriving after it must still move the epoch forward.
+        recover_stepds(&running, vec![older, newer]).await;
+
+        assert_eq!(
+            running
+                .lock()
+                .await
+                .get(&71)
+                .map(|tracked| tracked.run_attempt),
+            Some(2),
+            "the job's tracked epoch must be the newest attempt discovered, not the first"
+        );
     }
 
     // A successful unit stop must NOT substitute for cgroup confirmation: the
