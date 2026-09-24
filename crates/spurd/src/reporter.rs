@@ -381,22 +381,18 @@ impl NodeReporter {
     /// Kubeconfig for GPU sharing on a k0s worker, minted by a control-plane
     /// node through the controller.
     pub async fn gpu_sharing_kubeconfig(&self) -> anyhow::Result<String> {
-        let mut client = crate::controller_auth::connect(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for the GPU sharing kubeconfig")?;
-        let node_token = self
-            .node_token
-            .read()
-            .map_err(|_| anyhow::anyhow!("node token lock poisoned"))?
-            .clone();
-        let response = client
-            .get_gpu_sharing_kubeconfig(spur_proto::proto::GetGpuSharingKubeconfigRequest {
-                hostname: self.hostname.clone(),
-                node_token,
-            })
+        let node_token = read_recover(&self.node_token).clone();
+        let req = spur_proto::proto::GetGpuSharingKubeconfigRequest {
+            hostname: self.hostname.clone(),
+            node_token,
+        };
+        let response = self
+            .with_controller(
+                move |mut client| async move { client.get_gpu_sharing_kubeconfig(req).await },
+            )
             .await
             .context("GPU sharing kubeconfig request failed")?;
-        Ok(response.into_inner().kubeconfig)
+        Ok(response.kubeconfig)
     }
 
     /// Whether this node reports GPUs to the controller.
