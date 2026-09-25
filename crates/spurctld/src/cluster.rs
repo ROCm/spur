@@ -482,7 +482,7 @@ pub struct ClusterManager {
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
     /// Victim taken for a pending job, keyed by that beneficiary. Leader-local:
     /// a failover costs one extra victim per starved beneficiary, not one total.
-    preempt_debt: RwLock<HashMap<JobId, JobId>>,
+    preempt_debt: RwLock<HashMap<JobId, HashSet<JobId>>>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
     /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
@@ -2266,9 +2266,15 @@ impl ClusterManager {
     }
 
     /// Record that a victim is already giving up its slice for this pending job,
-    /// so the next pass waits for it instead of killing a second job.
+    /// so the next pass waits for it instead of killing another one. A single
+    /// beneficiary can be owed more than one victim (a multi-node reclaim can
+    /// evict one per node), so this adds to the set rather than replacing it.
     pub(crate) fn record_preempt_debt(&self, beneficiary: JobId, victim: JobId) {
-        self.preempt_debt.write().insert(beneficiary, victim);
+        self.preempt_debt
+            .write()
+            .entry(beneficiary)
+            .or_default()
+            .insert(victim);
     }
 
     /// Whether a victim taken for this pending job is still giving up its slice.
@@ -2276,32 +2282,38 @@ impl ClusterManager {
         self.preempt_debt.read().contains_key(&beneficiary)
     }
 
-    /// Drop every debt whose victim has handed its slice back. Charged, not
-    /// Preempted: a cancel-mode victim holds its slice through its epilog too.
+    /// Drop every debt whose victims have all handed their slice back, or whose
+    /// beneficiary is no longer around to wait for them (charged, not Preempted:
+    /// a cancel-mode victim holds its slice through its epilog too).
     pub(crate) fn discharge_preempt_debt(&self) {
-        let taken: Vec<(JobId, JobId)> = self
+        let taken: Vec<(JobId, HashSet<JobId>)> = self
             .preempt_debt
             .read()
             .iter()
-            .map(|(&beneficiary, &victim)| (beneficiary, victim))
+            .map(|(&beneficiary, victims)| (beneficiary, victims.clone()))
             .collect();
         if taken.is_empty() {
             return;
         }
-        let discharged: Vec<JobId> = {
+        let cleared: Vec<JobId> = {
             let jobs = self.jobs.read();
+            let still_charged = |victim: &JobId| {
+                jobs.get(victim)
+                    .is_some_and(|j| j.allocated_nodes.iter().any(|name| j.is_held_on(name)))
+            };
             taken
                 .into_iter()
-                .filter(|(_, victim)| {
-                    !jobs
-                        .get(victim)
-                        .is_some_and(|j| j.allocated_nodes.iter().any(|name| j.is_held_on(name)))
+                .filter(|(beneficiary, victims)| {
+                    let beneficiary_still_waiting = jobs
+                        .get(beneficiary)
+                        .is_some_and(|j| j.state == JobState::Pending);
+                    !beneficiary_still_waiting || !victims.iter().any(still_charged)
                 })
                 .map(|(beneficiary, _)| beneficiary)
                 .collect()
         };
         let mut debt = self.preempt_debt.write();
-        for beneficiary in discharged {
+        for beneficiary in cleared {
             debt.remove(&beneficiary);
         }
     }
@@ -4176,14 +4188,11 @@ impl ClusterManager {
     /// Whether `name` has any job holding an allocation (Running/Completing/Suspended). Shared by
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
+    /// Whether any job still charges this node — including one resting in
+    /// Preempted whose epilog here hasn't answered yet, not just Running.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
         let jobs = self.jobs.read();
-        jobs.values().any(|j| {
-            matches!(
-                j.state,
-                JobState::Running | JobState::Completing | JobState::Suspended
-            ) && j.allocated_nodes.iter().any(|n| n == name)
-        })
+        jobs.values().any(|j| j.is_held_on(name))
     }
 
     /// Mark a node Down because its agent is stopping (reboot, service restart).
@@ -18482,6 +18491,135 @@ mod tests {
             cm.get_job(victim2_id).unwrap().state,
             JobState::Pending,
             "n2 owes no hook, so this requeue completes in one apply"
+        );
+    }
+
+    // A suspended victim has no auto-resume, so it never clears is_held_on;
+    // debt must not be recorded for it or the beneficiary starves forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspended_victim_never_records_debt() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "suspend".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut victim = basic_spec("victim");
+        victim.qos = Some("burst".into());
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        let victim_id = submit_and_wait(&cm, victim);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            victim_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, victim_id, JobState::Running);
+
+        let mut primus = basic_spec("primus");
+        primus.qos = Some("primus".into());
+        cm.qos_cache().insert(Qos {
+            name: "primus".into(),
+            priority: 10000,
+            ..Default::default()
+        });
+        let primus_id = submit_and_wait(&cm, primus);
+
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
+
+        settle(&cm, victim_id, JobState::Suspended);
+        assert!(
+            !cm.owed_a_preempted_slice(primus_id),
+            "a suspended victim never discharges, so debt for it must never be recorded"
+        );
+    }
+
+    // A node parked mid-preempt-requeue still owes an epilog; treating it as
+    // idle would let the health pass or an operator reclaim it mid-hook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_has_running_jobs_counts_a_parked_epilog_gated_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        preempt_requeue(&cm, 1, Utc::now() + chrono::Duration::seconds(5));
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Preempted);
+
+        assert!(
+            cm.node_has_running_jobs("n1"),
+            "n1's hook is still running this job's epilog"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        assert!(
+            !cm.node_has_running_jobs("n1"),
+            "the hook answered, so n1 is genuinely idle now"
+        );
+    }
+
+    // A beneficiary can leave the system (cancelled, here) before its victim's
+    // slice actually comes back; its debt entry must not linger forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discharging_a_cancelled_beneficiarys_debt_does_not_wait_on_its_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        let beneficiary_id = submit_and_wait(&cm, basic_spec("beneficiary"));
+        cm.record_preempt_debt(beneficiary_id, 1);
+        cm.cancel_job(beneficiary_id, "testuser").unwrap();
+
+        assert!(
+            cm.owed_a_preempted_slice(beneficiary_id),
+            "debt exists before a discharge pass"
+        );
+        cm.discharge_preempt_debt();
+        assert!(
+            !cm.owed_a_preempted_slice(beneficiary_id),
+            "a cancelled beneficiary can never collect on this debt, so it must not linger"
+        );
+    }
+
+    // Cancelling a parked victim ends its run but not its hook: discharge must
+    // keep waiting for the epilog report, not the run's terminal state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_parked_victim_still_blocks_discharge_until_its_hook_answers() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        preempt_requeue(&cm, 1, Utc::now() + chrono::Duration::seconds(5));
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Preempted);
+        let beneficiary_id = submit_and_wait(&cm, basic_spec("beneficiary"));
+        cm.record_preempt_debt(beneficiary_id, 1);
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            at: None,
+        });
+        cm.discharge_preempt_debt();
+        assert!(
+            cm.owed_a_preempted_slice(beneficiary_id),
+            "n1's hook still hasn't answered, so the debt must survive the cancel"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        cm.discharge_preempt_debt();
+        assert!(
+            !cm.owed_a_preempted_slice(beneficiary_id),
+            "the hook answered, so the debt must clear even though the run was cancelled"
         );
     }
 

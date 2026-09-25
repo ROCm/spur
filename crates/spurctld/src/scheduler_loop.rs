@@ -1080,8 +1080,14 @@ pub(crate) async fn try_preempt(
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
+                    // Bounded by the victim's epilog, unlike Suspended below, so
+                    // debt recorded here is guaranteed to eventually discharge.
+                    cluster.record_preempt_debt(pending.job_id, candidate.job_id);
                 }
                 Ok(PreemptOutcome::Suspended) => {
+                    // A suspended victim has no auto-resume, so it never clears
+                    // is_held_on; debt recorded here would starve this
+                    // beneficiary forever instead of just for one cycle.
                     send_suspend_to_agents(cluster, candidate, false).await;
                 }
                 Err(e) => {
@@ -1093,8 +1099,7 @@ pub(crate) async fn try_preempt(
                     continue;
                 }
             }
-            cluster.record_preempt_debt(pending.job_id, candidate.job_id);
-            break; // One preemption per cycle, re-evaluate next cycle
+            break; // One victim per beneficiary per cycle; other beneficiaries continue below
         }
     }
 }
@@ -1166,6 +1171,12 @@ async fn reclaim_for_unplaced(
         states: &[spur_core::job::JobState::Running],
         ..Default::default()
     });
+    // Parked, not Running: still charges the nodes it hasn't heard an epilog
+    // report from yet, so the occupancy view below must not skip it.
+    let parked = cluster.get_jobs(&JobFilter {
+        states: &[spur_core::job::JobState::Preempted],
+        ..Default::default()
+    });
 
     // Both sources of "borrowed" (§4.1): jobs stamped `idle_fill` because they
     // exceeded their own quota, and jobs whose QOS is marked
@@ -1214,12 +1225,18 @@ async fn reclaim_for_unplaced(
         return (Vec::new(), None);
     }
 
-    // Which running jobs sit on each node, so a node is only counted as freed when
-    // *every* job on it is one this reclaim would evict.
+    // Which jobs sit on each node, so a node is only counted as freed when
+    // *every* job on it is one this reclaim would evict. Includes a job parked
+    // in Preempted still owing an epilog on that node: it never appears in
+    // `reclaimable_ids`, so it correctly blocks the node from being counted
+    // as already-empty or evacuable, the same as any other non-reclaimable
+    // occupant.
     let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
-    for job in &running {
+    for job in running.iter().chain(parked.iter()) {
         for node in &job.allocated_nodes {
-            occupants.entry(node.as_str()).or_default().push(job.job_id);
+            if job.is_held_on(node) {
+                occupants.entry(node.as_str()).or_default().push(job.job_id);
+            }
         }
     }
     let reclaimable_ids: HashSet<spur_core::job::JobId> =
@@ -1266,6 +1283,11 @@ async fn reclaim_for_unplaced(
                         nodes = ?victim.nodes,
                         "reclaimed a borrowed job for a job with a quota claim"
                     );
+                    // Requeue is always epilog-bounded (unlike a Suspend victim
+                    // in try_preempt), so this is guaranteed to eventually
+                    // discharge; recorded so try_preempt doesn't also take a
+                    // victim for this same reclaimer while this one drains.
+                    cluster.record_preempt_debt(reclaimer.job_id, victim.job_id);
                     // Await the kill before the caller may reuse these nodes. The
                     // requeue apply deallocates inside Raft and only then fires a
                     // fire-and-forget cancel, while the agent does SIGTERM, waits five
@@ -6949,6 +6971,167 @@ mod tests {
                 "failed-precondition-reject",
             )
             .await;
+        }
+
+        // A node still gated by a job resting in Preempted (parked, not Running)
+        // must not be miscounted as already-empty recovered capacity — it isn't,
+        // and evicting a real victim elsewhere to "close" a shortfall this node
+        // can't actually help with wastes that victim's run for nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_still_gated_by_a_parked_job_is_not_counted_as_recovered() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node_without_comm_addr(&cm, "n1");
+            // n2 runs the node epilog, so a requeue-preempted job there parks
+            // in Preempted instead of returning straight to Pending.
+            use crate::raft::StateMachineApply;
+            cm.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+                name: "n2".into(),
+                hostname: "n2".into(),
+                resources: ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                address: String::new(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                source: NodeSource::NativeHost,
+                runs_job_epilog: true,
+            });
+            wait_for("node 'n2' registered", || cm.get_node("n2").is_some());
+
+            cm.qos_cache().insert(spur_core::accounting::Qos {
+                name: "burst".into(),
+                idle_fill_preemptable: true,
+                ..Default::default()
+            });
+            let mut borrowed_spec = batch_spec("borrowed", 1);
+            borrowed_spec.qos = Some("burst".into());
+            let borrowed_id = submit_and_wait(&cm, borrowed_spec);
+            cm.start_job(
+                borrowed_id,
+                vec!["n1".into()],
+                ResourceAllocations::with_scalar(2, 0),
+                HashMap::from([("n1".to_string(), ResourceAllocations::with_scalar(2, 0))]),
+            )
+            .unwrap();
+            settle(&cm, borrowed_id, spur_core::job::JobState::Running);
+
+            let parked_id = submit_and_wait(&cm, batch_spec("parked", 1));
+            cm.start_job(
+                parked_id,
+                vec!["n2".into()],
+                ResourceAllocations::with_scalar(2, 0),
+                HashMap::from([("n2".to_string(), ResourceAllocations::with_scalar(2, 0))]),
+            )
+            .unwrap();
+            settle(&cm, parked_id, spur_core::job::JobState::Running);
+            cm.preempt_job_with_provenance(
+                parked_id,
+                spur_core::partition::PreemptMode::Requeue,
+                None,
+                None,
+            )
+            .unwrap();
+            settle(&cm, parked_id, spur_core::job::JobState::Preempted);
+
+            let reclaimer_id = submit_and_wait(&cm, batch_spec("reclaimer", 2));
+            let reclaimer = cm.get_job(reclaimer_id).unwrap();
+
+            let nodes = cm.get_nodes();
+            let busy = HashMap::new();
+            let cluster_state = ClusterState {
+                nodes: &nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+                busy_until: &busy,
+            };
+            let (freed, freed_for) =
+                reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &cluster_state, 0).await;
+            assert!(
+                freed.is_empty(),
+                "n2 still owes an epilog, so the shortfall is not really closed"
+            );
+            assert_eq!(freed_for, None);
+            assert_eq!(
+                cm.get_job(borrowed_id).unwrap().state,
+                spur_core::job::JobState::Running,
+                "nothing should be evicted for a reclaim that cannot actually be satisfied"
+            );
+        }
+
+        // A reclaim that evicts a victim owes the reclaimer the same debt
+        // try_preempt would record, or try_preempt could take a second victim
+        // for the same reclaimer while the first one's epilog still drains.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_successful_reclaim_records_debt_for_its_reclaimer() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            use crate::raft::StateMachineApply;
+            cm.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+                name: "n1".into(),
+                hostname: "n1".into(),
+                resources: ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                address: String::new(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                source: NodeSource::NativeHost,
+                runs_job_epilog: true,
+            });
+            wait_for("node 'n1' registered", || cm.get_node("n1").is_some());
+
+            cm.qos_cache().insert(spur_core::accounting::Qos {
+                name: "burst".into(),
+                idle_fill_preemptable: true,
+                ..Default::default()
+            });
+            let mut borrowed_spec = batch_spec("borrowed", 1);
+            borrowed_spec.qos = Some("burst".into());
+            let borrowed_id = submit_and_wait(&cm, borrowed_spec);
+            cm.start_job(
+                borrowed_id,
+                vec!["n1".into()],
+                ResourceAllocations::with_scalar(2, 0),
+                HashMap::from([("n1".to_string(), ResourceAllocations::with_scalar(2, 0))]),
+            )
+            .unwrap();
+            settle(&cm, borrowed_id, spur_core::job::JobState::Running);
+
+            let reclaimer_id = submit_and_wait(&cm, batch_spec("reclaimer", 1));
+            let reclaimer = cm.get_job(reclaimer_id).unwrap();
+
+            let nodes = cm.get_nodes();
+            let busy = HashMap::new();
+            let cluster_state = ClusterState {
+                nodes: &nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+                busy_until: &busy,
+            };
+            let (freed, freed_for) =
+                reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &cluster_state, 0).await;
+            assert_eq!(freed, vec!["n1".to_string()]);
+            assert_eq!(freed_for, Some(reclaimer_id));
+            assert_eq!(
+                cm.get_job(borrowed_id).unwrap().state,
+                spur_core::job::JobState::Preempted,
+                "n1's hook still owes, so the reclaimed job parks"
+            );
+            assert!(
+                cm.owed_a_preempted_slice(reclaimer_id),
+                "the reclaimer must not look free to take a second victim while this one drains"
+            );
         }
     }
 
