@@ -55,6 +55,19 @@ def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -
     return sessions
 
 
+# The reserved-range floor above also matches the allocation's own
+# batch/extern placeholder, which exists well before a nested `srun --pty`.
+_STEP_INTERACTIVE = 0xFFFFFFFA
+
+
+def _interactive_step_session_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
+    return {
+        name
+        for name in _reserved_step_sessions_for_job(cluster, job_id, node_index)
+        if name.rsplit(".", 1)[-1] == str(_STEP_INTERACTIVE)
+    }
+
+
 def _assert_ticks_not_replayed(out: str, ticks: int = 20) -> None:
     """A shell relaunched from scratch after a restart repeats its early
     ticks; a reconnect racing the restart only drops a line or two of a
@@ -197,7 +210,9 @@ class TestSrunPtyStepSupervision:
                 "srun --pty bash -c '"
                 "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
                 "echo SURVIVED'\n",
-                salloc_args=["-N", "1", "-w", node, "-t", "0:05", "-J", job_name],
+                # `-t` is Slurm's MM:SS form, not HH:MM — "0:05" is a 5s limit,
+                # not 5 minutes, which the ~20s workload plus restart overran.
+                salloc_args=["-N", "1", "-w", node, "-t", "3:00", "-J", job_name],
             )
 
         thread = threading.Thread(target=run)
@@ -213,11 +228,12 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
+            # Own deadline: a shared one with the poll above could expire
+            # before the nested `srun --pty` creates its own session.
+            step_deadline = time.time() + 30
             before: set[str] = set()
-            while time.time() < deadline:
-                # A bare (non-container) --pty step has no numbered-step
-                # supervisor of its own — only the shared terminal placeholder.
-                before = _reserved_step_sessions_for_job(cluster, job_id)
+            while time.time() < step_deadline:
+                before = _interactive_step_session_for_job(cluster, job_id)
                 if before:
                     break
                 time.sleep(1)
@@ -228,7 +244,7 @@ class TestSrunPtyStepSupervision:
 
             # Identity, not count: a supervisor killed with the agent and
             # respawned afterwards would satisfy any "still one running" check.
-            after = _reserved_step_sessions_for_job(cluster, job_id)
+            after = _interactive_step_session_for_job(cluster, job_id)
             assert before <= after, (
                 "the pty step's supervisor must outlive the agent that spawned it: "
                 f"{sorted(before)} before the restart, {sorted(after)} after"
@@ -293,7 +309,9 @@ class TestSrunPtyStepSupervision:
 
         def run():
             result["code"], result["out"] = cluster.srun_with_exit([
-                "-N", "1", "-w", node, "-t", "0:05", "-J", job_name, "--pty",
+                # "0:05" is MM:SS (5s), not 5 minutes — too short for the ~20s
+                # workload plus the restart below.
+                "-N", "1", "-w", node, "-t", "3:00", "-J", job_name, "--pty",
                 "bash", "-c",
                 "for i in $(seq 1 20); do echo tick $i; sleep 1; done; echo SURVIVED",
             ])
@@ -311,9 +329,12 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the standalone job to appear before the restart"
 
+            # Own deadline: a shared one with the poll above could expire
+            # before the separate interactive step has even been created.
+            step_deadline = time.time() + 30
             before: set[str] = set()
-            while time.time() < deadline:
-                before = _reserved_step_sessions_for_job(cluster, job_id)
+            while time.time() < step_deadline:
+                before = _interactive_step_session_for_job(cluster, job_id)
                 if before:
                     break
                 time.sleep(1)
@@ -322,7 +343,7 @@ class TestSrunPtyStepSupervision:
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
 
-            after = _reserved_step_sessions_for_job(cluster, job_id)
+            after = _interactive_step_session_for_job(cluster, job_id)
             assert before <= after, (
                 "a standalone --pty job's own supervisor must outlive the agent "
                 f"that spawned it: {sorted(before)} before, {sorted(after)} after"
@@ -347,7 +368,9 @@ class TestSrunPtyStepSupervision:
                 "srun --pty bash -c '"
                 "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
                 "echo SURVIVED'\n",
-                salloc_args=["-N", "1", "-w", node, "-t", "0:05", "-J", job_name],
+                # "0:05" is MM:SS (5s), not 5 minutes — too short for the ~20s
+                # workload plus the restart below.
+                salloc_args=["-N", "1", "-w", node, "-t", "3:00", "-J", job_name],
             )
 
         thread = threading.Thread(target=run)
@@ -363,9 +386,12 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
+            # Own deadline: a shared one with the poll above could expire
+            # before the nested `srun --pty` creates its own session.
+            step_deadline = time.time() + 30
             before: set[str] = set()
-            while time.time() < deadline:
-                before = _reserved_step_sessions_for_job(cluster, job_id)
+            while time.time() < step_deadline:
+                before = _interactive_step_session_for_job(cluster, job_id)
                 if before:
                     break
                 time.sleep(1)
