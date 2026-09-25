@@ -3042,6 +3042,15 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
     }
 }
 
+/// Same `(pid, start_ticks)` read as `stepd_liveness`, for a recorded admission
+/// supervisor rather than a discovered descriptor. Not boot-scoped, the same
+/// accepted gap as `workload_process_liveness` below.
+pub(crate) fn supervisor_liveness(
+    recorded: &crate::admission::SupervisorRef,
+) -> io::Result<StepdLiveness> {
+    process_liveness(recorded.pid, recorded.start_ticks)
+}
+
 /// What a published descriptor says about a session's workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkloadLiveness {

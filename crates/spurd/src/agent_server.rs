@@ -391,6 +391,21 @@ fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
     !cgroup_path.exists()
 }
 
+/// The run a loose `(job, attempt)` pair names. Attempt 0 names no run, so a
+/// caller that cannot name one is told rather than left keying on a phantom.
+fn named_run(job_id: u32, run_attempt: u32) -> Option<RunKey> {
+    let key = RunKey::new(job_id, run_attempt);
+    if key.is_none() {
+        warn!(job_id, "a command named run attempt 0, which is no run");
+    }
+    key
+}
+
+#[cfg(test)]
+fn key(job_id: u32, run_attempt: u32) -> RunKey {
+    RunKey::new(job_id, run_attempt).expect("attempts start at 1")
+}
+
 /// Supervisors are per (job, step): a job may hold several at once.
 pub(crate) type StepdKey = (u32, spur_core::step::StepId);
 pub(crate) type StepdMap = HashMap<StepdKey, crate::stepd::StepdDescriptor>;
@@ -978,6 +993,7 @@ async fn run_completion_hooks_and_report(
                 reporting_node: &local_hostname,
                 drain: drain.as_ref(),
                 step_id: None,
+                payload: PayloadEvidence::Reaped,
             },
         )
         .await;
@@ -1418,6 +1434,7 @@ pub struct CompletionListenerContext {
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
     stepds_store: crate::stepd::StepdStore,
+    admissions: crate::admission::AdmissionStore,
     controller_addr: String,
     hostname: String,
 }
@@ -1783,9 +1800,11 @@ pub(crate) fn monitor_recovered_stepds(
                             reason: "epilog script failed".into(),
                         }),
                         step_id: Some(completion.step_id),
+                        payload: PayloadEvidence::Supervised(&store),
                     },
                 )
                 .await
+                .settled()
                 {
                     if let Err(error) = store.acknowledge_completion(completion) {
                         warn!(
@@ -1871,6 +1890,7 @@ async fn fence_dead_stepd(
         allocation,
         stepds,
         stepds_store: store,
+        admissions: _,
         controller_addr,
         hostname,
     } = context;
@@ -1937,9 +1957,11 @@ async fn fence_dead_stepd(
             reporting_node: hostname,
             drain: None,
             step_id: Some(descriptor.step_id),
+            payload: PayloadEvidence::Supervised(store),
         },
     )
-    .await;
+    .await
+    .settled();
     if reported {
         if let Err(error) =
             obligations.append(&crate::stepd::StepdObligation::CompletionAcknowledged)
@@ -2090,9 +2112,11 @@ async fn handle_completion_notification(
                         reason: "epilog script failed".into(),
                     }),
                     step_id: Some(step_id),
+                    payload: PayloadEvidence::Supervised(&context.stepds_store),
                 },
             )
-            .await;
+            .await
+            .settled();
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -2165,9 +2189,11 @@ pub async fn replay_unacknowledged_stepd_completions(
                     reason: "epilog script failed".into(),
                 }),
                 step_id: Some(completion.step_id),
+                payload: PayloadEvidence::Supervised(store),
             },
         )
         .await
+        .settled()
         {
             store.acknowledge_completion(&completion)?;
             reconciled.push((
@@ -2178,6 +2204,82 @@ pub async fn replay_unacknowledged_stepd_completions(
         }
     }
     Ok(reconciled)
+}
+
+/// What a run's recorded supervisors can be *proven* to be. "No evidence" is its
+/// own answer, so silence can never be spent as proof of death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Every recorded supervisor read as stale, and there was one to read.
+    Gone,
+    Live,
+    /// Nothing was recorded, or a read could not be completed.
+    CannotTell,
+}
+
+/// Whether the reads prove anything. No reads at all proves nothing, and neither
+/// does one that could not be completed.
+fn liveness_of(reads: &[std::io::Result<crate::stepd::StepdLiveness>]) -> Liveness {
+    if reads
+        .iter()
+        .any(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Live)))
+    {
+        return Liveness::Live;
+    }
+    if !reads.is_empty()
+        && reads
+            .iter()
+            .all(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Stale)))
+    {
+        return Liveness::Gone;
+    }
+    Liveness::CannotTell
+}
+
+fn recorded_supervisor_liveness(admitted: &crate::admission::AdmittedRun) -> Liveness {
+    let reads: Vec<std::io::Result<crate::stepd::StepdLiveness>> = admitted
+        .recorded_supervisors()
+        .map(crate::stepd::supervisor_liveness)
+        .collect();
+    for (supervisor, read) in admitted.recorded_supervisors().zip(reads.iter()) {
+        if let Err(error) = read {
+            warn!(
+                job_id = admitted.run.job_id,
+                run_attempt = admitted.run.run_attempt,
+                pid = supervisor.pid,
+                %error,
+                "could not tell whether a supervisor is alive; holding its slice"
+            );
+        }
+    }
+    liveness_of(&reads)
+}
+
+/// Whether some participant left an exit behind. One exists only on disk, so a
+/// session still holding it is what will report this run, with the real status.
+fn an_exit_is_still_on_disk(
+    store: &crate::stepd::StepdStore,
+    admitted: &crate::admission::AdmittedRun,
+) -> bool {
+    admitted.participants.iter().any(|participant| {
+        !matches!(
+            store.observed_exit(
+                admitted.run.job_id,
+                admitted.run.run_attempt,
+                participant.step_id,
+            ),
+            Ok(None)
+        )
+    })
+}
+
+/// How a run's epilog ended, as the record spells it.
+pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
+    if failed {
+        crate::admission::HookState::Failed
+    } else {
+        crate::admission::HookState::Succeeded
+    }
 }
 
 pub fn retry_unacknowledged_stepd_completions(
@@ -4096,9 +4198,15 @@ impl AgentService {
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
             stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+            admissions: self.admissions(),
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
         }
+    }
+
+    /// The entitlement ledger, keyed to the node this agent serves.
+    pub(crate) fn admissions(&self) -> crate::admission::AdmissionStore {
+        crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
     }
 
     /// Spawns the release wait (and force-reclaim escalation) for a
@@ -4806,9 +4914,94 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
+    pub payload: PayloadEvidence<'a>,
 }
 
-pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
+/// Carried on every report, so a path reporting a run over cannot be written
+/// without answering for the processes it says have stopped.
+pub(crate) enum PayloadEvidence<'a> {
+    /// The agent spawned and reaped the payload itself, so none of it is left.
+    Reaped,
+    /// A `spurstepd` session owns the payload; its published identity decides.
+    Supervised(&'a crate::stepd::StepdStore),
+}
+
+/// Read from the recorded `(pid, start_ticks)` identity, not cgroup population:
+/// available where cgroups are not, and names only the process the report ends.
+fn payload_still_executing(report: &CompletionReport<'_>) -> bool {
+    let PayloadEvidence::Supervised(store) = report.payload else {
+        return false;
+    };
+    // Every participant, not the reporting step alone: this report ends the
+    // whole run, and a sibling's payload is as much of it as the owner's.
+    let sessions = match store.published_sessions_for_run(report.job_id, report.run_attempt) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            warn!(
+                job_id = report.job_id,
+                run_attempt = report.run_attempt,
+                %error,
+                "could not enumerate a run's sessions; withholding its completion report"
+            );
+            return true;
+        }
+    };
+    for published in &sessions {
+        let live = crate::stepd::workload_liveness(published);
+        if live == crate::stepd::WorkloadLiveness::Gone {
+            continue;
+        }
+        warn!(
+            job_id = report.job_id,
+            run_attempt = report.run_attempt,
+            step_id = published.as_ref().map(|s| s.step_id).unwrap_or_default(),
+            ?live,
+            "this run's payload is still executing; withholding its completion report"
+        );
+        return true;
+    }
+    false
+}
+
+/// What the controller said when handed one node's account of a finished run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    /// The controller committed the completion.
+    Acknowledged,
+    /// The controller answered that it has no record of the run.
+    NoSuchRun,
+    /// Nothing that settles the run; the report is still owed.
+    Undelivered,
+}
+
+impl CompletionOutcome {
+    /// A definite "no such job" is the controller's own word that it is not
+    /// accounting for the run; anything else leaves the report owed.
+    fn for_error(error: &ControllerRpcError) -> Self {
+        match error {
+            ControllerRpcError::Rpc(status) if status.code() == tonic::Code::NotFound => {
+                Self::NoSuchRun
+            }
+            _ => Self::Undelivered,
+        }
+    }
+
+    /// Whether the controller has settled this run, so its slice may go. A run
+    /// the controller has no record of will never be acknowledged by anything.
+    pub(crate) fn settled(self) -> bool {
+        matches!(self, Self::Acknowledged | Self::NoSuchRun)
+    }
+}
+
+pub(crate) async fn report_completion(
+    controller_addr: &str,
+    report: CompletionReport<'_>,
+) -> CompletionOutcome {
+    // Before the RPC, not after: an acknowledgement frees the slice, and a
+    // payload still on the cores makes this report a lie the controller acts on.
+    if payload_still_executing(&report) {
+        return CompletionOutcome::Undelivered;
+    }
     let CompletionReport {
         job_id,
         exit_code,
@@ -4817,6 +5010,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         reporting_node,
         drain,
         step_id,
+        payload: _,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
@@ -4863,7 +5057,6 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
     })
     .await;
 
-    let acknowledged = result.is_ok();
     match result {
         Ok(_) => {
             info!(
@@ -4872,22 +5065,36 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 controller = %controller_addr,
                 "reported completion to controller"
             );
+            CompletionOutcome::Acknowledged
         }
-        Err(e) if e.retryable() => error!(
-            job_id,
-            exit_code,
-            attempts = CONTROLLER_RPC_ATTEMPTS,
-            error = %e,
-            "gave up reporting completion to controller"
-        ),
-        Err(e) => error!(
-            job_id,
-            exit_code,
-            error = %e,
-            "ReportJobStatus failed with non-retryable error"
-        ),
+        Err(e) => {
+            let outcome = CompletionOutcome::for_error(&e);
+            if outcome == CompletionOutcome::NoSuchRun {
+                warn!(
+                    job_id,
+                    exit_code,
+                    controller = %controller_addr,
+                    "controller has no record of this run; no acknowledgement will ever come for it"
+                );
+            } else if e.retryable() {
+                error!(
+                    job_id,
+                    exit_code,
+                    attempts = CONTROLLER_RPC_ATTEMPTS,
+                    error = %e,
+                    "gave up reporting completion to controller"
+                );
+            } else {
+                error!(
+                    job_id,
+                    exit_code,
+                    error = %e,
+                    "ReportJobStatus failed with non-retryable error"
+                );
+            }
+            outcome
+        }
     }
-    acknowledged
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -11138,6 +11345,7 @@ mod tests {
             allocation,
             stepds: sessions.clone(),
             stepds_store: crate::stepd::StepdStore::new(state_dir.path()),
+            admissions: crate::admission::AdmissionStore::new(state_dir.path(), "test-node"),
             controller_addr: controller_addr.into(),
             hostname: "test-node".into(),
         };
@@ -16983,6 +17191,7 @@ mod tests {
             allocation: allocation.clone(),
             stepds: sessions.clone(),
             stepds_store: store.clone(),
+            admissions: crate::admission::AdmissionStore::new(store.root(), "test-node"),
             controller_addr: "http://127.0.0.1:1".into(),
             hostname: "test-node".into(),
         }
