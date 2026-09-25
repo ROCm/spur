@@ -1960,21 +1960,42 @@ async fn settle_recovered_stepd(
     })
 }
 
+/// What the recovery monitor needs to settle an adopted supervisor.
+pub(crate) struct RecoveryContext {
+    pub running: RunningJobs,
+    pub allocation: Arc<Mutex<NodeAllocation>>,
+    pub stepds: Arc<Mutex<StepdMap>>,
+    pub completions: crate::step_completion::StepCompletions,
+    pub store: crate::stepd::StepdStore,
+    pub admissions: crate::admission::AdmissionStore,
+    pub controller_addr: String,
+}
+
 pub(crate) fn monitor_recovered_stepds(
-    running: RunningJobs,
-    allocation: Arc<Mutex<NodeAllocation>>,
-    stepds: Arc<Mutex<StepdMap>>,
-    completions: crate::step_completion::StepCompletions,
+    context: RecoveryContext,
     descriptors: Vec<crate::stepd::StepdDescriptor>,
-    store: crate::stepd::StepdStore,
-    controller_addr: String,
 ) {
+    let RecoveryContext {
+        running,
+        allocation,
+        stepds,
+        completions,
+        store,
+        admissions,
+        controller_addr,
+    } = context;
     tokio::spawn(async move {
         let mut pending: StepdMap = descriptors
             .into_iter()
             .map(|descriptor| (stepd_key(&descriptor), descriptor))
             .collect();
         let mut completed = HashMap::new();
+        // Attempt count and first-failure instant per outstanding report. The
+        // durable driver is the record; this only paces and surfaces the retry.
+        let mut attempts: HashMap<(u32, spur_core::step::StepId), (u32, std::time::Instant)> =
+            HashMap::new();
+        let mut hooking_since: HashMap<(u32, spur_core::step::StepId), std::time::Instant> =
+            HashMap::new();
         let hostname = hostname::get()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|_| "localhost".into());
@@ -2011,10 +2032,12 @@ pub(crate) fn monitor_recovered_stepds(
                             false
                         }
                     };
-                let exit = if inactive {
-                    match durable_runtime_exit(&store, descriptor) {
-                        Ok(exit) => exit,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                let progress = if inactive {
+                    match recovered_session_progress(&store, descriptor) {
+                        Ok(progress) => progress,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            RecoveredSession::Unfinished
+                        }
                         Err(error) => {
                             warn!(
                                 job_id,
@@ -2022,40 +2045,56 @@ pub(crate) fn monitor_recovered_stepds(
                                 %error,
                                 "failed to read durable recovered runtime completion"
                             );
-                            None
+                            RecoveredSession::Unfinished
                         }
                     }
                 } else {
-                    None
+                    RecoveredSession::Unfinished
                 };
-                if let Some((exit_code, signal)) = exit {
-                    match settle_recovered_stepd(
-                        &running,
-                        &allocation,
-                        &stepds,
-                        &completions,
-                        &store,
-                        descriptor,
-                        exit_code,
-                        signal,
-                    )
-                    .await
-                    {
-                        Some(completion) => newly_completed.push((*key, completion)),
-                        None => released.push(*key),
+                match progress {
+                    RecoveredSession::Ended { exit_code, signal } => {
+                        match settle_recovered_stepd(
+                            &running,
+                            &allocation,
+                            &stepds,
+                            &completions,
+                            &store,
+                            descriptor,
+                            exit_code,
+                            signal,
+                        )
+                        .await
+                        {
+                            Some(completion) => newly_completed.push((*key, completion)),
+                            None => released.push(*key),
+                        }
                     }
-                } else if !tracked {
-                    released.push(*key);
+                    // Held pending rather than released: the report is what frees
+                    // the slice, and the hook is still standing on it.
+                    RecoveredSession::Hooking => {
+                        if epilog_hold_is_worth_saying(&mut hooking_since, *key) {
+                            warn!(
+                                job_id,
+                                run_attempt = descriptor.run_attempt,
+                                step_id = descriptor.step_id,
+                                "an epilog is still running; holding this run's completion report"
+                            );
+                        }
+                    }
+                    RecoveredSession::Unfinished if !tracked => released.push(*key),
+                    RecoveredSession::Unfinished => {}
                 }
             }
             for key in released {
                 pending.remove(&key);
+                hooking_since.remove(&key);
             }
             for (key, completion) in newly_completed {
                 completed.insert(key, completion);
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
+                let key = (completion.job_id, completion.step_id);
                 if report_completion(
                     &controller_addr,
                     CompletionReport {
@@ -2082,13 +2121,50 @@ pub(crate) fn monitor_recovered_stepds(
                             "failed to acknowledge recovered runtime completion"
                         );
                     } else {
-                        acknowledged.push((completion.job_id, completion.step_id));
+                        // Only now may the slice go: the controller has it.
+                        if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                            record_run_epilog(
+                                &admissions,
+                                run,
+                                completion.step_id,
+                                epilog_outcome(completion.epilog_failed),
+                            );
+                            settle_acknowledged_completion(
+                                &allocation,
+                                &admissions,
+                                run,
+                                completion.step_id,
+                            )
+                            .await;
+                        }
+                        acknowledged.push(key);
+                        attempts.remove(&key);
                     }
+                } else {
+                    // Nothing ends the obligation but an acknowledgement: this
+                    // report is the only thing that will ever free the slice.
+                    let attempt = attempts
+                        .entry(key)
+                        .or_insert((0u32, std::time::Instant::now()));
+                    attempt.0 = attempt.0.saturating_add(1);
+                    if attempt.1.elapsed() >= COMPLETION_STUCK_AFTER {
+                        error!(
+                            job_id = completion.job_id,
+                            run_attempt = completion.run_attempt,
+                            attempts = attempt.0,
+                            held_for_secs = attempt.1.elapsed().as_secs(),
+                            "a completion report the controller will not accept is holding this \
+                             job's resources"
+                        );
+                        attempt.1 = std::time::Instant::now();
+                    }
+                    tokio::time::sleep(completion_backoff(attempt.0, completion.job_id)).await;
                 }
             }
             for key in acknowledged {
                 completed.remove(&key);
                 pending.remove(&key);
+                hooking_since.remove(&key);
             }
         }
     });
@@ -2434,12 +2510,46 @@ fn durable_runtime_exit(
     )
 }
 
+/// How far a recovered supervisor's own ledger says its session has got. The
+/// exit is recorded before the epilog runs, so an exit alone is not the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredSession {
+    Unfinished,
+    /// Exited, with the hook that follows it yet to say how it ended.
+    Hooking,
+    Ended {
+        exit_code: i32,
+        signal: i32,
+    },
+}
+
+fn recovered_session_progress(
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<RecoveredSession> {
+    let Some((exit_code, signal)) = durable_runtime_exit(store, descriptor)? else {
+        return Ok(RecoveredSession::Unfinished);
+    };
+    // Only the hook's own record proves it ended: a hook can outlive the process
+    // that started it, so nothing about the supervisor answers for it.
+    match store.epilog_result(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    )? {
+        Some(_) => Ok(RecoveredSession::Ended { exit_code, signal }),
+        None => Ok(RecoveredSession::Hooking),
+    }
+}
+
 /// One runtime session: a step of one attempt of one job. Two sessions of the
 /// same attempt are distinct, so dedup keyed on the job alone over-matches.
 pub type SessionIdentity = (u32, u32, spur_core::step::StepId);
 
 pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+    allocation: &Arc<Mutex<NodeAllocation>>,
     controller_addr: &str,
     reporting_node: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
@@ -2464,6 +2574,18 @@ pub async fn replay_unacknowledged_stepd_completions(
         .settled()
         {
             store.acknowledge_completion(&completion)?;
+            if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                record_run_epilog(
+                    admissions,
+                    run,
+                    completion.step_id,
+                    epilog_outcome(completion.epilog_failed),
+                );
+                // A late delivery frees the slice here, like every other settled
+                // report: leaving it to a later sweep frees it with nothing said.
+                settle_acknowledged_completion(allocation, admissions, run, completion.step_id)
+                    .await;
+            }
             reconciled.push((
                 completion.job_id,
                 completion.run_attempt,
@@ -2471,6 +2593,16 @@ pub async fn replay_unacknowledged_stepd_completions(
             ));
         }
     }
+    // After the sessions above, which carry the real exit status: a run only
+    // reaches the pass below once nothing is left that could report one.
+    report_runs_nothing_can_speak_for(
+        store,
+        admissions,
+        allocation,
+        controller_addr,
+        reporting_node,
+    )
+    .await;
     Ok(reconciled)
 }
 
@@ -2541,6 +2673,77 @@ fn an_exit_is_still_on_disk(
     })
 }
 
+/// Runs no session is left to speak for; without this nothing ever asks, and the
+/// record charges the node's cores for good.
+fn runs_nothing_can_speak_for(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+) -> Vec<crate::admission::AdmittedRun> {
+    let Ok(loaded) = admissions.load_all() else {
+        return Vec::new();
+    };
+    loaded
+        .runs
+        .into_iter()
+        .filter(|admitted| {
+            !admitted.run.controller_ack.is_committed()
+                && admitted.owes_a_report()
+                && recorded_supervisor_liveness(admitted) == Liveness::Gone
+                && !an_exit_is_still_on_disk(store, admitted)
+        })
+        .collect()
+}
+
+/// Report the loss of a run nothing is left to speak for, so its slice is freed
+/// on the controller's acknowledgement like every other completion.
+async fn report_runs_nothing_can_speak_for(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    controller_addr: &str,
+    reporting_node: &str,
+) {
+    for admitted in runs_nothing_can_speak_for(store, admissions) {
+        let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
+        let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
+            continue;
+        };
+        let acknowledged = report_completion(
+            controller_addr,
+            CompletionReport {
+                job_id,
+                exit_code: 0,
+                signal: nix::sys::signal::Signal::SIGKILL as i32,
+                run_attempt,
+                reporting_node,
+                drain: None,
+                step_id: Some(step_id),
+                payload: PayloadEvidence::Supervised(store),
+            },
+        )
+        .await
+        .settled();
+        if !acknowledged {
+            debug!(
+                job_id,
+                run_attempt, "a lost run's completion is not acknowledged yet; holding its slice"
+            );
+            continue;
+        }
+        settle_acknowledged_completion(allocation, admissions, run, step_id).await;
+        // The run's completion is committed, so no sibling's report will ever be
+        // answered, and one left owed keeps the record forever.
+        if let Err(error) = admissions.discharge_owed_reports(run) {
+            warn!(job_id, run_attempt, %error, "failed to discharge a lost run's owed reports");
+        }
+        warn!(
+            job_id,
+            run_attempt,
+            "no supervisor was left for this run; reported its loss and freed its slice"
+        );
+    }
+}
+
 /// How a run's epilog ended, as the record spells it.
 pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
     if failed {
@@ -2552,14 +2755,22 @@ pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
 
 pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
+    admissions: crate::admission::AdmissionStore,
+    allocation: Arc<Mutex<NodeAllocation>>,
     controller_addr: String,
     reporting_node: String,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match replay_unacknowledged_stepd_completions(&store, &controller_addr, &reporting_node)
-                .await
+            match replay_unacknowledged_stepd_completions(
+                &store,
+                &admissions,
+                &allocation,
+                &controller_addr,
+                &reporting_node,
+            )
+            .await
             {
                 Ok(reconciled) if !reconciled.is_empty() => {
                     tracing::info!(
@@ -4155,13 +4366,16 @@ impl AgentService {
 
     pub fn monitor_recovered_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         monitor_recovered_stepds(
-            self.running.clone(),
-            self.allocation.clone(),
-            self.stepds.clone(),
-            self.step_completions.clone(),
+            RecoveryContext {
+                running: self.running.clone(),
+                allocation: self.allocation.clone(),
+                stepds: self.stepds.clone(),
+                completions: self.step_completions.clone(),
+                store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                admissions: self.admissions(),
+                controller_addr: self.reporter.controller_addr.clone(),
+            },
             descriptors.to_vec(),
-            crate::stepd::StepdStore::new(&self.stepd_state_dir),
-            self.reporter.controller_addr.clone(),
         );
     }
 
@@ -4683,10 +4897,62 @@ impl Drop for LaunchReservationGuard {
     }
 }
 
+/// Record how a run's epilog ended, from the step that owns the hook. A numbered
+/// step reports `epilog_failed: false` for a hook it never ran.
+fn record_run_epilog(
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+    state: crate::admission::HookState,
+) {
+    if spur_core::step::is_user_step(step_id) {
+        return;
+    }
+    let _ = admissions.record_epilog(run, state);
+}
+
+/// How long a hook may hold a slice before it is called out by name. An epilog
+/// standing on the cores is correct, but an unbounded one must not be silent.
+const EPILOG_HOLD_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Whether this hold has gone on long enough to say so, restarting its clock when
+/// it has. A hook has no deadline, so the only thing that can be periodic is this.
+fn epilog_hold_is_worth_saying<K: std::hash::Hash + Eq>(
+    held_since: &mut HashMap<K, std::time::Instant>,
+    held: K,
+) -> bool {
+    let since = held_since
+        .entry(held)
+        .or_insert_with(std::time::Instant::now);
+    if since.elapsed() < EPILOG_HOLD_STUCK_AFTER {
+        return false;
+    }
+    *since = std::time::Instant::now();
+    true
+}
+
 use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The completion report is now the only thing that frees a slice, so the
+/// obligation to deliver it is unbounded in attempts and bounded only in rate.
+const COMPLETION_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a report may go unacknowledged before it is called out. A run that
+/// holds its slice forever is correct but must not be silent.
+const COMPLETION_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Next backoff, capped. Jittered so a controller coming back does not meet
+/// every node's retry at the same instant.
+fn completion_backoff(attempt: u32, job_id: u32) -> std::time::Duration {
+    let base = CONTROLLER_RPC_RETRY_GAP
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(COMPLETION_RETRY_CAP);
+    let jitter = std::time::Duration::from_millis(u64::from(job_id % 1000));
+    (base + jitter).min(COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1))
+}
 
 /// A single failed attempt at a controller RPC.
 enum ControllerRpcError {
