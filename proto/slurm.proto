@@ -1004,6 +1004,10 @@ enum LaunchFailureKind {
   // and holds the job rather than retrying, since a prolog sees the job's own
   // context and so fails the same way everywhere.
   LAUNCH_FAILURE_PROLOG = 1;
+  // The agent refused the launch on a fixed execution policy (e.g. [auth]
+  // allow_root_jobs). It fails identically on every retry, so the controller holds
+  // the job rather than looping — unlike a control-plane authorization error.
+  LAUNCH_FAILURE_POLICY = 2;
 }
 
 message PreparePmixRequest {

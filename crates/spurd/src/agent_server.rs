@@ -5082,7 +5082,13 @@ impl SlurmAgent for AgentService {
             self.spurd_is_root,
         ) {
             warn!(job_id, uid = spec.uid, "{msg}");
-            return Err(Status::permission_denied(msg));
+            return Ok(Response::new(LaunchJobResponse {
+                success: false,
+                error: msg,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: LaunchFailureKind::LaunchFailurePolicy as i32,
+            }));
         }
 
         // Only now, past every refusal check, commit the acceptance. A duplicate of an
@@ -12723,9 +12729,9 @@ mod tests {
         path
     }
 
-    /// The refusal driven through the real RPC entry point, not just the helper: a launch asking to
-    /// run as root on a root spurd must be denied before anything is spawned. `with_root_override`
-    /// makes this deterministic on an unprivileged runner, where the guard would otherwise be inert.
+    /// A launch asking to run as root on a root spurd must be denied before anything is
+    /// spawned, and come back as a launch-policy failure (`success=false`, `Policy`), not a
+    /// transport error. `with_root_override` makes this deterministic on an unprivileged runner.
     #[tokio::test]
     async fn launch_job_refuses_uid_zero_when_spurd_is_root_and_not_opted_in() {
         let svc = AgentService::new(
@@ -12736,7 +12742,7 @@ mod tests {
         )
         .with_root_override(true);
 
-        let err = svc
+        let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 4242,
                 spec: Some(JobSpec {
@@ -12753,21 +12759,30 @@ mod tests {
                 ..Default::default()
             }))
             .await
-            .expect_err("a uid-0 launch must be refused, not accepted");
+            .expect("a uid-0 refusal is a launch-policy failure, not a transport error")
+            .into_inner();
 
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(
-            err.message().contains("allow_root_jobs"),
+            !resp.success,
+            "a uid-0 launch must be refused, not accepted"
+        );
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailurePolicy as i32,
+            "the controller relies on this kind to hold rather than retry"
+        );
+        assert!(
+            resp.error.contains("allow_root_jobs"),
             "the refusal should tell the operator which option governs it: {}",
-            err.message()
+            resp.error
         );
     }
 
-    /// A refused root launch must NOT record an acceptance: if it did, the controller's
-    /// teardown-cancel would poison the attempt and every retry would fail as WrongAttempt
-    /// ("run_attempt mismatch"), masking the real reason. Acceptance follows the root guard.
+    /// A launch refused before `accept()` (uid-0 with allow_root_jobs off) must survive the
+    /// controller's teardown CancelJob: refuse -> cancel -> retry stays a clean allow_root_jobs
+    /// refusal (never a WrongAttempt from a poisoned slot), and the ledger stays empty.
     #[tokio::test]
-    async fn launch_job_refusing_uid_zero_does_not_record_an_acceptance() {
+    async fn a_refused_root_launch_survives_cancel_and_retry_without_poisoning() {
         use spur_core::native_cred::{
             CredentialKind, ExecutionCredential, NodeResourceSlice, CREDENTIAL_ID_LEN,
         };
@@ -12831,37 +12846,68 @@ mod tests {
         let decoded =
             spur_core::native_exec::verify_execution(&token, &verify, "test-cluster", now).unwrap();
 
-        let err = svc
-            .launch_job(Request::new(LaunchJobRequest {
-                job_id: 4242,
-                run_attempt: 1,
-                execution_credential: token,
-                spec: Some(JobSpec {
-                    uid: 0,
-                    gid: 0,
-                    name: "root-job".into(),
-                    script,
-                    num_tasks: 1,
-                    num_nodes: 1,
-                    cpus_per_task: 1,
-                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
-                    ..Default::default()
-                }),
+        let launch = || LaunchJobRequest {
+            job_id: 4242,
+            run_attempt: 1,
+            execution_credential: token.clone(),
+            spec: Some(JobSpec {
+                uid: 0,
+                gid: 0,
+                name: "root-job".into(),
+                script: script.clone(),
+                num_tasks: 1,
+                num_nodes: 1,
+                cpus_per_task: 1,
+                work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
                 ..Default::default()
-            }))
-            .await
-            .expect_err("a uid-0 launch must be refused even with a valid credential");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(
-            err.message().contains("allow_root_jobs"),
-            "{}",
-            err.message()
-        );
+            }),
+            ..Default::default()
+        };
 
+        // A refusal now comes back as a launch-policy response, never a transport error.
+        let assert_policy_refusal = |resp: LaunchJobResponse, ctx: &str| {
+            assert!(!resp.success, "{ctx}: must be refused");
+            assert_eq!(
+                resp.failure_kind,
+                LaunchFailureKind::LaunchFailurePolicy as i32,
+                "{ctx}: must stay a launch-policy refusal, never a WrongAttempt from a poisoned slot"
+            );
+            assert!(
+                resp.error.contains("allow_root_jobs"),
+                "{ctx}: {}",
+                resp.error
+            );
+        };
+
+        // 1. First dispatch: the root guard refuses before accept() records anything.
+        let resp = svc
+            .launch_job(Request::new(launch()))
+            .await
+            .expect("a uid-0 refusal is a launch-policy failure, not a transport error")
+            .into_inner();
+        assert_policy_refusal(resp, "first dispatch");
+
+        // 2. The controller's dispatch teardown fires CancelJob for the same attempt.
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 4242,
+            signal: 9,
+            run_attempt: 1,
+        }))
+        .await
+        .expect("cancel of a never-launched attempt is a no-op, not an error");
+
+        // 3. Retry at the same attempt: still a policy refusal, never a WrongAttempt.
+        let resp = svc
+            .launch_job(Request::new(launch()))
+            .await
+            .expect("the retry must be a launch-policy refusal, not a transport error")
+            .into_inner();
+        assert_policy_refusal(resp, "retry after cancel");
+
+        // Nothing poisoned the slot: a fresh accept is still the first presentation.
         assert!(
             matches!(shared.accept(&decoded), Ok(true)),
-            "the refused launch must not have recorded an acceptance: a fresh accept of the \
-             same credential must be the first presentation, not a duplicate or a cancelled attempt"
+            "refuse -> cancel -> retry must leave no acceptance record for the attempt"
         );
     }
 
