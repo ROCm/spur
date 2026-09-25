@@ -523,6 +523,23 @@ fn gpu_ids_match(a: &[u64], b: &[u64]) -> bool {
     sa == sb
 }
 
+fn device_counts(alloc: &ResourceAllocations) -> HashMap<(&str, u64), u64> {
+    let mut counts: HashMap<(&str, u64), u64> = HashMap::new();
+    for (gres, devices) in &alloc.devices {
+        for dev in devices {
+            *counts.entry((gres.as_str(), dev.device_id)).or_default() += dev.count;
+        }
+    }
+    counts.retain(|_, count| *count > 0);
+    counts
+}
+
+/// Device order is not drift: the accumulator's per-gres `Vec` follows the
+/// add/subtract sequence while the derivation's follows job id.
+fn allocations_equivalent(a: &ResourceAllocations, b: &ResourceAllocations) -> bool {
+    a.cpus == b.cpus && a.memory_mb == b.memory_mb && device_counts(a) == device_counts(b)
+}
+
 struct PendingJobClassification {
     jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
@@ -2842,7 +2859,8 @@ impl ClusterManager {
         job_id: JobId,
         detail: Option<String>,
     ) -> anyhow::Result<()> {
-        self.evict_job_attempt(job_id, None, detail)
+        self.evict_job_attempt(job_id, None, detail, PendingReason::JobLaunchFailure)
+            .map(|_| ())
     }
 
     /// Evict only while `run_attempt` is still the job's current one. A caller
@@ -2852,26 +2870,29 @@ impl ClusterManager {
         job_id: JobId,
         run_attempt: Option<u32>,
         detail: Option<String>,
-    ) -> anyhow::Result<()> {
+        reason: PendingReason,
+    ) -> anyhow::Result<bool> {
         {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
-                return Ok(());
+                return Ok(false);
             }
             if run_attempt.is_some_and(|attempt| job.run_attempt != attempt) {
-                return Ok(());
+                return Ok(false);
             }
         }
         let resp = self.propose(WalOperation::JobEvict {
             job_id,
             detail,
+            reason,
             at: None,
         })?;
+        let evicted = !resp.jobs_finalized.is_empty();
         self.run_all_finalized_side_effects(&resp);
-        Ok(())
+        Ok(evicted)
     }
 
     /// Gets (creating if absent) the per-node lock `register_node` serializes on.
@@ -2898,6 +2919,7 @@ impl ClusterManager {
         source: NodeSource,
         labels: HashMap<String, String>,
         caller_privileged: bool,
+        runs_job_epilog: bool,
     ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
             name.clone()
@@ -2926,7 +2948,8 @@ impl ClusterManager {
                         || (!wg_pubkey.is_empty()
                             && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
                         || (!version.is_empty()
-                            && existing.version.as_deref() != Some(version.as_str()));
+                            && existing.version.as_deref() != Some(version.as_str()))
+                        || existing.runs_job_epilog != runs_job_epilog;
                     if needs_update {
                         self.propose(WalOperation::NodeUpdate {
                             name: name.clone(),
@@ -2937,6 +2960,8 @@ impl ClusterManager {
                             wg_pubkey,
                             version,
                             source: source.clone(),
+                            reconcile_pending: None,
+                            runs_job_epilog: Some(runs_job_epilog),
                         })
                         .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         info!(node = %name, "node comm address or metadata updated");
@@ -2958,6 +2983,8 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     source: source.clone(),
+                    reconcile_pending: None,
+                    runs_job_epilog: Some(runs_job_epilog),
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
@@ -2977,6 +3004,7 @@ impl ClusterManager {
                     version,
                     labels,
                     source: source.clone(),
+                    runs_job_epilog,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -6085,42 +6113,144 @@ impl ClusterManager {
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
+    /// Nodes a finished run keeps charged rather than releasing at once: still
+    /// reporting, or still owing an epilog.
+    fn slices_to_keep(job: &Job) -> Vec<String> {
+        job.node_completions
+            .keys()
+            .chain(job.epilog_gated_nodes.iter())
+            .cloned()
+            .collect()
+    }
+
+    /// Nodes a requeue must not hand back, because this run is no longer charged
+    /// there. Read before a transition or clear rewrites what decides it.
+    fn slices_no_longer_held(job: &Job) -> Vec<String> {
+        job.allocated_nodes
+            .iter()
+            .filter(|name| !job.is_held_on(name))
+            .cloned()
+            .collect()
+    }
+
     /// Return a finished job's per-node slice to each node it held, skipping any
-    /// in `already_deallocated`; pass `allocated_resources = None` if freed already.
+    /// in `keep_charged`; pass `allocated_resources = None` if freed already.
     fn deallocate_job_slices(
         nodes: &mut HashMap<String, Node>,
         freed_nodes: &[String],
         allocated_resources: Option<&ResourceAllocations>,
         per_node_alloc: &HashMap<String, ResourceAllocations>,
-        already_deallocated: &[String],
+        keep_charged: &[String],
         job_id: JobId,
     ) {
-        let Some(total) = allocated_resources else {
+        if allocated_resources.is_none() {
             return;
-        };
+        }
         let node_count = freed_nodes.len().max(1) as u32;
         for name in freed_nodes {
-            if already_deallocated.iter().any(|n| n == name) {
+            if keep_charged.iter().any(|n| n == name) {
                 continue;
             }
             let Some(node) = nodes.get_mut(name) else {
                 continue;
             };
-            let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
-                warn!(job_id, node = %name, "per_node_alloc missing at deallocation, using scalar fallback");
-                ResourceAllocations::with_scalar(
-                    total.cpus / node_count,
-                    total.memory_mb / node_count as u64,
-                )
-            });
+            let Some(slice) = Self::job_node_slice(
+                per_node_alloc,
+                allocated_resources,
+                name,
+                node_count,
+                job_id,
+                "deallocate",
+            ) else {
+                continue;
+            };
             node.alloc_resources.subtract(&slice);
-            node.update_state_from_alloc();
-            if node.state == NodeState::Draining
-                && node.alloc_resources.cpus == 0
-                && !node.alloc_resources.has_devices()
-            {
-                node.state = NodeState::Drain;
+            Self::refresh_node_state_for_alloc(node);
+        }
+    }
+
+    /// A job's slice of one node: the recorded value, or an even split of the job
+    /// total when no per-node entry exists. `None` means nothing to charge or free.
+    fn job_node_slice(
+        per_node_alloc: &HashMap<String, ResourceAllocations>,
+        allocated_resources: Option<&ResourceAllocations>,
+        node_name: &str,
+        node_count: u32,
+        job_id: JobId,
+        phase: &'static str,
+    ) -> Option<ResourceAllocations> {
+        if let Some(slice) = per_node_alloc.get(node_name) {
+            return Some(slice.clone());
+        }
+        let total = allocated_resources?;
+        warn!(job_id, node = %node_name, phase, "per_node_alloc missing, using scalar fallback");
+        Some(ResourceAllocations::with_scalar(
+            total.cpus / node_count,
+            total.memory_mb / node_count as u64,
+        ))
+    }
+
+    /// Refresh node state after its allocation changed. `update_state_from_alloc`
+    /// leaves hold states alone, so a fully-released Draining node completes here.
+    fn refresh_node_state_for_alloc(node: &mut Node) {
+        node.update_state_from_alloc();
+        if node.state == NodeState::Draining
+            && node.alloc_resources.cpus == 0
+            && !node.alloc_resources.has_devices()
+        {
+            node.state = NodeState::Drain;
+        }
+    }
+
+    /// Rebuild the node allocation cache from the job records that own the slices,
+    /// for `only` or for every node. The WAL apply sites maintain it in between.
+    fn derive_node_allocations(
+        jobs: &HashMap<JobId, Job>,
+        nodes: &mut HashMap<String, Node>,
+        only: Option<&str>,
+    ) {
+        let wanted = |name: &str| only.is_none_or(|n| n == name);
+        let mut derived: HashMap<String, ResourceAllocations> = HashMap::new();
+        // Sorted so the derived value is the same on every replica.
+        let mut job_ids: Vec<JobId> = jobs.keys().copied().collect();
+        job_ids.sort_unstable();
+        for job_id in job_ids {
+            let Some(job) = jobs.get(&job_id) else {
+                continue;
+            };
+            let node_count = job.allocated_nodes.len().max(1) as u32;
+            for name in &job.allocated_nodes {
+                // `is_held_on` carries the liveness clause: JobComplete and
+                // eviction clear node_completions but leave allocated_nodes set.
+                if !job.is_held_on(name) || !wanted(name) || !nodes.contains_key(name) {
+                    continue;
+                }
+                let Some(slice) = Self::job_node_slice(
+                    &job.per_node_alloc,
+                    job.allocated_resources.as_ref(),
+                    name,
+                    node_count,
+                    job_id,
+                    "derive",
+                ) else {
+                    continue;
+                };
+                match derived.get_mut(name) {
+                    Some(acc) => acc.add(&slice),
+                    None => {
+                        derived.insert(name.clone(), slice);
+                    }
+                }
             }
+        }
+
+        for (name, node) in nodes.iter_mut().filter(|(n, _)| wanted(n)) {
+            let next = derived.remove(name).unwrap_or_default();
+            if allocations_equivalent(&node.alloc_resources, &next) {
+                continue;
+            }
+            node.alloc_resources = next;
+            Self::refresh_node_state_for_alloc(node);
         }
     }
 
@@ -6696,7 +6826,12 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id, detail, .. } => {
+            WalOperation::JobEvict {
+                job_id,
+                detail,
+                reason,
+                ..
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -6705,7 +6840,7 @@ impl ClusterManager {
                     &mut jobs,
                     &mut nodes,
                     timestamp,
-                    PendingReason::JobLaunchFailure,
+                    reason.clone(),
                 ) {
                     response.jobs_finalized.push(fin);
                 }
@@ -7069,11 +7204,13 @@ impl ClusterManager {
                 version,
                 labels,
                 source,
+                runs_job_epilog,
             } => {
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
                 resources.backfill_stable_ids();
                 let mut node = Node::new(name.clone(), resources);
+                node.runs_job_epilog = *runs_job_epilog;
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -7117,6 +7254,9 @@ impl ClusterManager {
 
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
+                // A fresh Node starts at zero, so this is the one apply that can
+                // silently discard a charge rather than adjust one.
+                Self::derive_node_allocations(&jobs, &mut nodes, Some(name));
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse::default();
             }
@@ -7129,28 +7269,49 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 source,
+                reconcile_pending,
+                runs_job_epilog,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
-                    // Normalize legacy Raft entries so replay can't collide on stable_id==0.
-                    let mut resources = resources.clone();
-                    resources.backfill_stable_ids();
-                    node.total_resources = resources;
-                    if !hostname.is_empty() {
-                        node.hostname = hostname.clone();
+                    // An entry carrying nothing the node asserted is not the node
+                    // speaking: it moves the gate alone, overwriting nothing else.
+                    let asserted = !hostname.is_empty()
+                        || !address.is_empty()
+                        || !wg_pubkey.is_empty()
+                        || !version.is_empty()
+                        || *port != 0;
+                    if asserted {
+                        // Normalize legacy Raft entries so replay can't collide on stable_id==0.
+                        let mut resources = resources.clone();
+                        resources.backfill_stable_ids();
+                        node.total_resources = resources;
+                        if !hostname.is_empty() {
+                            node.hostname = hostname.clone();
+                        }
+                        if !address.is_empty() {
+                            node.address = Some(address.clone());
+                        }
+                        if *port != 0 {
+                            node.port = *port;
+                        }
+                        if !wg_pubkey.is_empty() {
+                            node.wg_pubkey = Some(wg_pubkey.clone());
+                        }
+                        if !version.is_empty() {
+                            node.version = Some(version.clone());
+                        }
+                        node.source =
+                            spur_core::node::resolve_wal_node_source(source, version, &node.labels);
+                        node.last_heartbeat = Some(Utc::now());
                     }
-                    if !address.is_empty() {
-                        node.address = Some(address.clone());
+                    // Only an entry that speaks to the gate moves it: a plain
+                    // re-registration must not release a reconcile it never saw.
+                    if let Some(pending) = reconcile_pending {
+                        node.reconcile_pending = *pending;
                     }
-                    node.port = *port;
-                    if !wg_pubkey.is_empty() {
-                        node.wg_pubkey = Some(wg_pubkey.clone());
+                    if let Some(runs_epilog) = runs_job_epilog {
+                        node.runs_job_epilog = *runs_epilog;
                     }
-                    if !version.is_empty() {
-                        node.version = Some(version.clone());
-                    }
-                    node.source =
-                        spur_core::node::resolve_wal_node_source(source, version, &node.labels);
-                    node.last_heartbeat = Some(Utc::now());
                 }
             }
             WalOperation::NodeStateChange {
@@ -9819,6 +9980,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
             true,
+            false,
         )
         .unwrap();
         let n = name.to_string();
@@ -10585,6 +10747,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::from([("pool".to_string(), pool.to_string())]),
                 privileged,
+                false,
             )
         };
 
@@ -10637,6 +10800,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
             true,
+            false,
         )
         .unwrap();
         let n = name.to_string();
@@ -11272,6 +11436,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
             true,
+            false,
         )
         .unwrap();
         let n = name.to_string();
@@ -12081,6 +12246,7 @@ mod tests {
             version: "1.0".into(),
             labels: HashMap::new(),
             source: NodeSource::default(),
+            runs_job_epilog: false,
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -23964,6 +24130,7 @@ mod tests {
             NodeSource::NativeHost,
             HashMap::new(),
             true,
+            false,
         )
         .unwrap();
         let node = cm.get_node("locked").unwrap();
@@ -26292,6 +26459,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("role".into(), "infer".into())]),
             true,
+            false,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("dyn-node").is_some());
@@ -26360,6 +26528,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
             true,
+            false,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -26384,6 +26553,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "infer".into()), ("tier".into(), "1".into())]),
             true,
+            false,
         )
         .unwrap();
         wait_for("labels synced", || {
@@ -26418,6 +26588,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
             true,
+            false,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -26433,6 +26604,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
             true,
+            false,
         )
         .unwrap();
         wait_for("comm address updated", || {
@@ -26471,6 +26643,7 @@ mod tests {
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
             true,
+            false,
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -26517,6 +26690,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
+            runs_job_epilog: false,
         });
 
         assert_eq!(
@@ -26556,6 +26730,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::new(),
             source: NodeSource::default(),
+            runs_job_epilog: false,
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -26603,6 +26778,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
             source: NodeSource::default(),
+            runs_job_epilog: false,
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -26650,6 +26826,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
             source: NodeSource::default(),
+            runs_job_epilog: false,
         });
 
         let node = cm.get_node("cpu-node").unwrap();
@@ -27126,6 +27303,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
+            runs_job_epilog: false,
         });
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 
