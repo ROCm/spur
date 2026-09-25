@@ -198,6 +198,9 @@ mock_agent_impl! {
     }
     unimplemented {
         launch_job(proto::LaunchJobRequest) -> proto::LaunchJobResponse;
+        request_node_ledger(proto::RequestNodeLedgerRequest) -> proto::RequestNodeLedgerResponse;
+        fence_run(proto::FenceRunRequest) -> proto::FenceRunResponse;
+        settle_run(proto::SettleRunRequest) -> proto::SettleRunResponse;
         prepare_pmix(proto::PreparePmixRequest) -> proto::PreparePmixResponse;
         release_pmix(proto::ReleasePmixRequest) -> proto::ReleasePmixResponse;
         start_job(proto::AgentStartJobRequest) -> ();

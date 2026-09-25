@@ -247,6 +247,33 @@ impl SlurmAgent for VirtualAgent {
         }))
     }
 
+    async fn request_node_ledger(
+        &self,
+        _request: Request<RequestNodeLedgerRequest>,
+    ) -> Result<Response<RequestNodeLedgerResponse>, Status> {
+        Err(Status::unimplemented(
+            "node ledger reconciliation is not yet wired on this agent",
+        ))
+    }
+
+    async fn fence_run(
+        &self,
+        _request: Request<FenceRunRequest>,
+    ) -> Result<Response<FenceRunResponse>, Status> {
+        Err(Status::unimplemented(
+            "run fencing is not yet wired on this agent",
+        ))
+    }
+
+    async fn settle_run(
+        &self,
+        _request: Request<SettleRunRequest>,
+    ) -> Result<Response<SettleRunResponse>, Status> {
+        Err(Status::unimplemented(
+            "run settlement is not yet wired on this agent",
+        ))
+    }
+
     /// Steps here run as pods the kubelet owns, so there is no supervisor
     /// session for a lost caller to re-park on.
     async fn await_step(
