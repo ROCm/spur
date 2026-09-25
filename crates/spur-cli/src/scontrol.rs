@@ -1379,6 +1379,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     let mut node_name: Option<String> = None;
     let mut node_state: Option<String> = None;
     let mut node_reason: Option<String> = None;
+    let mut node_reconcile = false;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1393,6 +1394,11 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
                 "nodename" | "node" => node_name = Some(value.into()),
                 "state" => node_state = Some(value.into()),
                 "reason" => node_reason = Some(value.into()),
+                "reconcile" => {
+                    node_reconcile = value.eq_ignore_ascii_case("yes")
+                        || value == "1"
+                        || value.eq_ignore_ascii_case("true");
+                }
                 other => eprintln!("scontrol: unknown update key '{}'", other),
             }
         }
@@ -1401,6 +1407,14 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     // Node update takes priority if NodeName is specified
     if let Some(node_pattern) = node_name {
         let proto_state = node_state.as_deref().map(parse_node_state).transpose()?;
+        // Only required when actually requested: an ordinary state/reason
+        // update must not start failing in an environment that cannot
+        // resolve a username just because reconcile is unused there.
+        let caller = if node_reconcile {
+            crate::interactive::current_user()?
+        } else {
+            String::new()
+        };
 
         let channel = crate::authclient::connect(controller)
             .await
@@ -1410,7 +1424,16 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         let names = resolve_node_names(&mut client, &node_pattern).await?;
         let mut failed: Vec<String> = Vec::new();
         for name in &names {
-            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
+            if let Err(e) = update_node(
+                &mut client,
+                name,
+                proto_state,
+                node_reason.clone(),
+                node_reconcile,
+                caller.clone(),
+            )
+            .await
+            {
                 eprintln!("error: {name}: {e}");
                 failed.push(name.clone());
             }
@@ -1616,6 +1639,8 @@ async fn update_node(
     name: &str,
     state: Option<i32>,
     reason: Option<String>,
+    reconcile: bool,
+    caller: String,
 ) -> Result<()> {
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
@@ -1624,8 +1649,8 @@ async fn update_node(
             reason,
             labels: HashMap::new(),
             remove_labels: Vec::new(),
-            reconcile: false,
-            caller: String::new(),
+            reconcile,
+            caller,
         })
         .await
         .context("node update failed")?;
@@ -2606,6 +2631,43 @@ mod tests {
             "error should mention failed node: {msg}"
         );
         assert!(msg.contains("1 of 3"), "error should report counts: {msg}");
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_reconcile_yes_threads_through_with_caller() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n1".into(),
+            "Reconcile=yes".into(),
+        ])
+        .await
+        .unwrap();
+        let calls = capture.update_node_reconcile_calls();
+        assert_eq!(calls.len(), 1);
+        let (reconcile, caller) = &calls[0];
+        assert!(*reconcile);
+        assert!(!caller.is_empty(), "the invoking user must be attributed");
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_without_reconcile_sends_false_and_no_caller() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n1".into(),
+            "State=DRAIN".into(),
+        ])
+        .await
+        .unwrap();
+        let calls = capture.update_node_reconcile_calls();
+        assert_eq!(calls, vec![(false, String::new())]);
     }
 
     #[tokio::test]

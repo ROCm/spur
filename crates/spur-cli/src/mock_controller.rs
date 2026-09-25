@@ -46,6 +46,8 @@ pub(crate) struct StepCapture {
     get_node_names: Arc<Mutex<Vec<String>>>,
     get_node_requests: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
+    /// `(reconcile, caller)` from the most recent `UpdateNode` calls, in order.
+    update_node_reconcile_calls: Arc<Mutex<Vec<(bool, String)>>>,
     drain_node_names: Arc<Mutex<Vec<String>>>,
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
@@ -114,6 +116,11 @@ impl StepCapture {
 
     pub(crate) fn update_node_names(&self) -> Vec<String> {
         self.update_node_names.lock().unwrap().clone()
+    }
+
+    /// `(reconcile, caller)` from every `UpdateNode` call, in order.
+    pub(crate) fn update_node_reconcile_calls(&self) -> Vec<(bool, String)> {
+        self.update_node_reconcile_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn drain_node_names(&self) -> Vec<String> {
@@ -274,10 +281,15 @@ mock_controller_impl! {
             &self,
             request: tonic::Request<proto::UpdateNodeRequest>,
         ) -> Result<tonic::Response<()>, tonic::Status> {
-            let name = request.into_inner().name;
-            self.capture.update_node_names.lock().unwrap().push(name.clone());
-            if self.capture.update_node_fail_names.lock().unwrap().contains(&name) {
-                return Err(tonic::Status::not_found(format!("node {name} not found")));
+            let req = request.into_inner();
+            self.capture.update_node_names.lock().unwrap().push(req.name.clone());
+            self.capture
+                .update_node_reconcile_calls
+                .lock()
+                .unwrap()
+                .push((req.reconcile, req.caller.clone()));
+            if self.capture.update_node_fail_names.lock().unwrap().contains(&req.name) {
+                return Err(tonic::Status::not_found(format!("node {} not found", req.name)));
             }
             Ok(tonic::Response::new(()))
         }
