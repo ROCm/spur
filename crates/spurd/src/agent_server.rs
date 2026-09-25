@@ -21141,6 +21141,63 @@ mod tests {
         assert!(resp.error.contains("no record"));
     }
 
+    // The success path: a claim the controller has no record of, but whose
+    // record here has already quiesced (Cleaned, no hook in flight), must
+    // actually free the slice it names -- not just answer `released: true`.
+    #[tokio::test]
+    async fn settle_run_releases_a_quiescent_unrecorded_claim() {
+        let svc = ledger_agent();
+        let job_id = 57;
+        let run_attempt = 1;
+        let run = key(job_id, run_attempt);
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(svc.allocation.lock().await.commit_job(job_id, run_attempt));
+
+        let admissions = svc.admissions();
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
+        assert!(
+            admissions
+                .mark_run_cleaned(run, crate::admission::EpilogOwed::No)
+                .expect("mark the run cleaned"),
+            "settle_permit requires an already-quiescent record"
+        );
+
+        let mut req = Request::new(SettleRunRequest {
+            job_id,
+            run_attempt,
+        });
+        req.extensions_mut().insert(controller_identity());
+        let resp = svc
+            .settle_run(req)
+            .await
+            .expect("a quiescent unrecorded claim is answered, not refused")
+            .into_inner();
+
+        assert!(resp.released, "error: {}", resp.error);
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "the underlying slice must actually be freed, not just reported as released"
+        );
+        assert!(
+            admissions.load_run(run).expect("run record").slice_released,
+            "the record must reflect the release too"
+        );
+    }
+
     #[tokio::test]
     async fn replay_admitted_allocations_rebuilds_a_recorded_slice_exactly() {
         let svc = ledger_agent();
