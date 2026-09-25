@@ -763,3 +763,112 @@ class TestExemptWindowProtectsAFreshBorrow:
             )
         finally:
             _cancel_all(c, ids)
+
+
+class TestOpportunisticReclaimsFromCheaperOpportunistic:
+    """Rule (B): an opportunistic job may displace only cheaper opportunistic work.
+
+    Distinct from the eviction-order case above, where the reclaimer holds a quota
+    claim. Here the reclaimer is itself over quota and has no claim, so the only
+    thing entitling it to a node is being dearer than what sits there.
+    """
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config()
+
+    def test_a_dearer_idle_fill_job_displaces_a_cheaper_burst_job(
+        self, accounting_cluster
+    ):
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        # Cap 1, so this QOS's second run borrows. Dearer than burst.
+        c.sacctmgr(["add", "qos", "name=bteam", "grptres=node=1", "priority=5000"])
+        c.sacctmgr(["add", "qos", "name=bburst", "grptres=node=8",
+                    "priority=1", "idlefillpreemptable=yes"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "b-legit", "bteam", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            burst = _submit(c, "b-burst", "bburst", "-t", "30")
+            ids.append(burst)
+            wait_job_state(c, burst, "R", timeout=60)
+
+            cheap_ids = [burst] + _fill_remaining(c, "bburst", "b-fill")
+            ids += cheap_ids
+            assert _idle_nodes(c) == 0, "cluster must be full before the reclaimer"
+            time.sleep(_EXEMPT_SECS + 3)
+
+            # Over its own cap, so it can only run by borrowing, and the only
+            # capacity is held by work cheaper than it.
+            borrower = _submit(c, "b-borrow", "bteam", "-t", "30")
+            ids.append(borrower)
+
+            deadline = time.time() + _WAIT_RECLAIM
+            displaced = None
+            while time.time() < deadline and displaced is None:
+                rows = c.squeue(["-t", "all", "-o", "%i %t %r"]).splitlines()[1:]
+                for row in rows:
+                    parts = row.split(maxsplit=2)
+                    if len(parts) == 3 and f"job {borrower}" in parts[2]:
+                        displaced = int(parts[0])
+                        break
+                if displaced is None:
+                    time.sleep(2)
+
+            assert displaced in cheap_ids, (
+                f"a dearer idle-fill job must displace cheaper opportunistic work, "
+                f"got {displaced}\n{_diagnostics(c)}"
+            )
+            assert job_state(c.squeue_all(), legit) == "R", (
+                "the in-quota run is never a victim"
+            )
+        finally:
+            _cancel_all(c, ids)
+
+    def test_a_cheaper_burst_job_cannot_displace_a_dearer_borrowed_run(
+        self, accounting_cluster
+    ):
+        """The negative control. Without it a reclaimer that ignores the ceiling
+        entirely would pass the positive case."""
+        c = accounting_cluster
+        _require_nodes(c, 3)
+        c.sacctmgr(["add", "qos", "name=nteam", "grptres=node=1", "priority=5000"])
+        # Over its own cap so it must borrow, but cheaper than every borrowed run.
+        c.sacctmgr(["add", "qos", "name=nburst", "grptres=node=1",
+                    "priority=1", "idlefillpreemptable=yes"])
+        time.sleep(15)
+
+        ids = []
+        try:
+            legit = _submit(c, "n-legit", "nteam", "-t", "30")
+            ids.append(legit)
+            wait_job_state(c, legit, "R", timeout=60)
+
+            borrowed = _submit(c, "n-borrow", "nteam", "-t", "30")
+            ids.append(borrowed)
+            wait_job_state(c, borrowed, "R", timeout=60)
+            assert _borrowed(c, borrowed) == "yes", "fixture needs a borrowed run"
+
+            ids += _fill_remaining(c, "nteam", "n-fill")
+            assert _idle_nodes(c) == 0, "cluster must be full before the reclaimer"
+            time.sleep(_EXEMPT_SECS + 3)
+
+            cheap = _submit(c, "n-cheap", "nburst", "-t", "30")
+            ids.append(cheap)
+            time.sleep(_WAIT_RECLAIM)
+
+            sq = c.squeue_all()
+            assert job_state(sq, cheap) == "PD", (
+                f"a cheaper opportunistic job must not displace a dearer one"
+                f"\n{_diagnostics(c)}"
+            )
+            assert job_state(sq, borrowed) == "R", (
+                f"the dearer borrowed run must keep its node\n{_diagnostics(c)}"
+            )
+        finally:
+            _cancel_all(c, ids)
