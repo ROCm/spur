@@ -72,6 +72,9 @@ pub struct NodeReporter {
     /// Whether the last heartbeat asked for a reconcile, so the one that finds
     /// nothing left to reconcile still asks — see `judge_cut`.
     asked_for_reconcile: AtomicBool,
+    /// Whether this node's hook config runs a job epilog, per the last
+    /// resolved `HooksConfig`. Read at registration; false until wired.
+    runs_job_epilog: AtomicBool,
 }
 
 impl NodeReporter {
@@ -106,7 +109,15 @@ impl NodeReporter {
             agent_session_id: uuid::Uuid::new_v4().to_string(),
             inventory_was_complete: AtomicBool::new(true),
             asked_for_reconcile: AtomicBool::new(false),
+            runs_job_epilog: AtomicBool::new(false),
         }
+    }
+
+    /// Wire whether this node's hook config runs a job epilog, so
+    /// registration reports it instead of the default. Called once, before
+    /// the first `register()`.
+    pub fn set_runs_job_epilog(&self, runs: bool) {
+        self.runs_job_epilog.store(runs, Ordering::Relaxed);
     }
 
     /// Wire the live per-node allocation so heartbeats can report each held job's
@@ -261,7 +272,7 @@ impl NodeReporter {
                 labels,
                 join_token: self.join_token.clone(),
                 ledger: self.ledger_cut(),
-                runs_job_epilog: false,
+                runs_job_epilog: self.runs_job_epilog.load(Ordering::Relaxed),
             })
             .await
             .context("registration failed")?;

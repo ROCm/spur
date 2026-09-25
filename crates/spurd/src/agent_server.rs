@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -873,6 +873,21 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
+/// What a run's record still owes once teardown finishes. Teardown runs ahead of
+/// the hook, so a configured epilog is a debt the mark has to carry.
+pub(crate) fn epilog_owed(hooks: &HooksConfig) -> crate::admission::EpilogOwed {
+    match hooks.epilog {
+        Some(_) => crate::admission::EpilogOwed::Yes,
+        None => crate::admission::EpilogOwed::No,
+    }
+}
+
+/// What this node declares at registration. One reading of the hook config, so
+/// the controller's gate and the agent's own debt cannot disagree.
+pub fn runs_job_epilog(hooks: &HooksConfig) -> bool {
+    epilog_owed(hooks) == crate::admission::EpilogOwed::Yes
+}
+
 /// Release what a finished run owned, once the monitor has dropped it from
 /// `running`. Skipped if the id is tracked again: it is all keyed by job id.
 async fn teardown_completed_job(
@@ -881,6 +896,8 @@ async fn teardown_completed_job(
     running: &RunningJobs,
     allocation: &Arc<Mutex<NodeAllocation>>,
     mpi_host: &MpiPluginHost,
+    admissions: &crate::admission::AdmissionStore,
+    epilog: crate::admission::EpilogOwed,
 ) {
     let job_id = completed.job_id;
     // Held across the check below and every release under it, so a re-dispatch either
@@ -910,16 +927,233 @@ async fn teardown_completed_job(
         job_id,
         completed.run_attempt,
     ));
-    // Teardown just finished locally (rootfs/cgroup cleaned up above); the
-    // physical slice can go back now even though the ledger record persists
-    // as `Cleaned` until the controller's ack settles it separately.
-    let run =
-        RunKey::new(job_id, completed.run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
-    allocation
-        .lock()
-        .await
-        .release_job(ReleaseWarrant::teardown_complete(run));
+    // The slice is NOT freed here. Cleanup finishing locally is not the
+    // controller's word that the run is over, and only that word frees it —
+    // the periodic sweep releases it once the ledger proves it is safe.
+    let _ = allocation;
+    if let Some(run) = named_run(job_id, completed.run_attempt) {
+        if let Err(error) = admissions.mark_run_cleaned(run, epilog) {
+            warn!(job_id, %error, "failed to settle the admission record after teardown");
+        }
+    }
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
+}
+
+/// What releasing a run's slice against its ledger record did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    Freed,
+    AlreadyFree,
+    NotDue,
+}
+
+/// Releases a run's slice once its ledger record proves it is due, and
+/// records the release so a later sweep does not try again.
+async fn release_acknowledged_allocation(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+) -> ReleaseOutcome {
+    let warrant = match admissions.release_is_due(run, step_id) {
+        Ok(Some(warrant)) => warrant,
+        Ok(None) => return ReleaseOutcome::NotDue,
+        Err(error) => {
+            warn!(%run, %error, "could not tell whether a release is due; holding");
+            return ReleaseOutcome::NotDue;
+        }
+    };
+    let ground = warrant.ground();
+    let released = allocation.lock().await.release_job(warrant);
+    if let Err(error) = admissions.record_slice_released(run) {
+        warn!(%run, %error, "failed to record a released slice");
+    }
+    if !released {
+        debug!(%run, %ground, "a run's slice was already free at its acknowledgement");
+        return ReleaseOutcome::AlreadyFree;
+    }
+    info!(%run, %ground, "released a run's slice on its acknowledgement");
+    ReleaseOutcome::Freed
+}
+
+/// What settling a run the controller has answered for did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleRunOutcome {
+    Released,
+    AlreadyFree,
+    NoRecord,
+    NotQuiescent,
+    Declined,
+}
+
+/// Settles a run the controller has no record of (an unrecorded claim it
+/// answered), discharging its owed reports and releasing its slice if
+/// nothing else still holds it.
+async fn settle_and_release_run(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+) -> std::io::Result<SettleRunOutcome> {
+    let store = admissions.clone();
+    let permit = tokio::task::spawn_blocking(move || store.settle_permit(run))
+        .await
+        .map_err(|error| std::io::Error::other(format!("settle permit task failed: {error}")))??;
+    let step_id = match permit {
+        crate::admission::SettlePermit::Due(step_id) => step_id,
+        crate::admission::SettlePermit::NoRecord => return Ok(SettleRunOutcome::NoRecord),
+        crate::admission::SettlePermit::NotQuiescent => return Ok(SettleRunOutcome::NotQuiescent),
+    };
+    let store = admissions.clone();
+    let settled = tokio::task::spawn_blocking(move || store.settle_acknowledged_run(run))
+        .await
+        .map_err(|error| std::io::Error::other(format!("settle task failed: {error}")))??;
+    if !settled {
+        return Ok(SettleRunOutcome::NoRecord);
+    }
+    Ok(
+        match release_acknowledged_allocation(allocation, admissions, run, step_id).await {
+            ReleaseOutcome::Freed => SettleRunOutcome::Released,
+            ReleaseOutcome::AlreadyFree => SettleRunOutcome::AlreadyFree,
+            ReleaseOutcome::NotDue => SettleRunOutcome::Declined,
+        },
+    )
+}
+
+/// Marks the controller's acknowledgement of a run's completion and releases
+/// its slice if nothing else still holds it.
+pub(crate) async fn settle_acknowledged_completion(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+) -> bool {
+    let _ = admissions.record_acknowledged_completion(run, step_id, 1);
+    let _ = admissions.record_report_acknowledged(run, step_id);
+    release_acknowledged_allocation(allocation, admissions, run, step_id).await
+        == ReleaseOutcome::Freed
+}
+
+/// Flag claims the agent has no tracked job for. It does **not** free them:
+/// forgetting a job is not evidence its work finished, and no timeout makes it so.
+async fn flag_unbacked_allocations(
+    unbacked: &[(u32, u32)],
+    admissions: &crate::admission::AdmissionStore,
+) {
+    for &(job_id, run_attempt) in unbacked {
+        let Some(run) = named_run(job_id, run_attempt) else {
+            continue;
+        };
+        let store = admissions.clone();
+        let taken = tokio::task::spawn_blocking(move || {
+            store.take_conflict_hold(run, "held with no tracked job on this agent")
+        })
+        .await;
+        match taken {
+            Ok(Ok(crate::admission::HoldOutcome::Taken)) => warn!(
+                job_id,
+                run_attempt, "holding a claim with no tracked job; it needs reconciliation"
+            ),
+            Ok(Ok(crate::admission::HoldOutcome::AlreadyHeld)) => {}
+            Ok(Ok(crate::admission::HoldOutcome::AlreadyReleased)) => {
+                debug!(
+                    job_id,
+                    run_attempt, "a claim released since the sweep read it needs no hold"
+                )
+            }
+            Ok(Ok(crate::admission::HoldOutcome::NoRecord)) => debug!(
+                job_id,
+                run_attempt, "holding a claim with neither a tracked job nor a record"
+            ),
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a conflict hold")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "conflict-hold task failed"),
+        }
+    }
+}
+
+/// Settles a cancelled run once its epilog (if any) has quiesced, releasing
+/// its slice. The controller's cancel is its own word the run is over, so no
+/// further acknowledgement is needed once teardown has finished locally.
+async fn settle_cancelled_runs(
+    lifecycle: &crate::job_lifecycle::JobLifecycle,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    for admitted in loaded.runs {
+        let run = &admitted.run;
+        if !run.cancelled_by_controller
+            || run.state != crate::admission::RunState::Cleaned
+            || run.controller_ack.is_committed()
+        {
+            continue;
+        }
+        let (job_id, run_attempt) = (run.job_id, run.run_attempt);
+        let Some(run_key) = run.key() else {
+            continue;
+        };
+        let _lifecycle = lifecycle.acquire(job_id).await;
+        match settle_and_release_run(allocation, admissions, run_key).await {
+            Ok(SettleRunOutcome::NotQuiescent) => {
+                debug!(
+                    job_id,
+                    run_attempt, "a hook is still running under a cancelled run"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => warn!(job_id, run_attempt, %error, "failed to settle a cancelled run"),
+        }
+    }
+}
+
+/// Releases every run whose ledger record says its release is due — the
+/// controller has acknowledged it and no hook is still in flight.
+async fn release_due_allocations(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    for admitted in loaded.runs {
+        let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
+            continue;
+        };
+        release_acknowledged_allocation(allocation, admissions, run, step_id).await;
+    }
+}
+
+/// Sweeps settled admission records off disk, keeping every record this node
+/// still charges regardless of age.
+async fn collect_settled_admissions(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let (charged, unnameable) = allocation.lock().await.charged_runs();
+    for job_id in unnameable {
+        warn!(
+            job_id,
+            "this node charges a reservation that names no run; keeping its records"
+        );
+    }
+    let store = admissions.clone();
+    let swept = tokio::task::spawn_blocking(move || {
+        store.sweep(
+            crate::admission::now_unix_ms(),
+            crate::admission::DEFAULT_RETENTION_SECS * 1000,
+            &charged,
+        )
+    })
+    .await;
+    match swept {
+        Ok(Ok(0)) => {}
+        Ok(Ok(swept)) => info!(swept, "swept settled admission records"),
+        Ok(Err(error)) => warn!(%error, "failed to sweep admission records"),
+        Err(error) => warn!(%error, "admission sweep task failed"),
+    }
 }
 
 /// Shared by the periodic monitor tick and a cancel's active wait, so a job
@@ -929,6 +1163,8 @@ async fn run_completion_hooks_and_report(
     hooks: &HooksConfig,
     spank: &Option<SpankHost>,
     controller_addr: &str,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
 ) {
     let mut drain_jobs: HashMap<u32, String> = HashMap::new();
 
@@ -983,7 +1219,7 @@ async fn run_completion_hooks_and_report(
         let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
             reason: reason.clone(),
         });
-        report_completion(
+        let outcome = report_completion(
             controller_addr,
             CompletionReport {
                 job_id: c.job_id,
@@ -997,6 +1233,18 @@ async fn run_completion_hooks_and_report(
             },
         )
         .await;
+        if !outcome.settled() {
+            continue;
+        }
+        if let Some(run) = named_run(c.job_id, c.run_attempt) {
+            settle_acknowledged_completion(
+                allocation,
+                admissions,
+                run,
+                spur_core::step::STEP_BATCH,
+            )
+            .await;
+        }
     }
 }
 
@@ -1026,6 +1274,8 @@ async fn wait_for_exit_and_teardown(
     hooks: Arc<HooksConfig>,
     spank: Arc<Option<SpankHost>>,
     controller_addr: String,
+    admissions: crate::admission::AdmissionStore,
+    epilog: crate::admission::EpilogOwed,
 ) {
     let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
     loop {
@@ -1075,9 +1325,27 @@ async fn wait_for_exit_and_teardown(
             }
         };
         if let Some(c) = completed {
-            teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
+            teardown_completed_job(
+                &c,
+                lifecycle,
+                running,
+                allocation,
+                mpi_host,
+                &admissions,
+                epilog,
+            )
+            .await;
+            let allocation = allocation.clone();
             tokio::spawn(async move {
-                run_completion_hooks_and_report(&[c], &hooks, &spank, &controller_addr).await;
+                run_completion_hooks_and_report(
+                    &[c],
+                    &hooks,
+                    &spank,
+                    &controller_addr,
+                    &allocation,
+                    &admissions,
+                )
+                .await;
             });
             return;
         }
@@ -4249,6 +4517,8 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let admissions = self.admissions();
+        let epilog = epilog_owed(&hooks);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -4306,19 +4576,48 @@ impl AgentService {
                 drop(jobs);
 
                 for c in &completed {
-                    teardown_completed_job(c, &lifecycle, &running, &allocation, &mpi_host).await;
+                    teardown_completed_job(
+                        c,
+                        &lifecycle,
+                        &running,
+                        &allocation,
+                        &mpi_host,
+                        &admissions,
+                        epilog,
+                    )
+                    .await;
                 }
 
-                // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `running` is re-taken before `allocation`,
-                // the order commit_job uses, so the live set the reclaim reads
-                // can't race a committing launch.
+                // Self-heal, ledger-gated: nothing here frees a slice on a mere
+                // "we don't remember this job" — a forgotten claim is flagged for
+                // reconciliation, never guessed away, since its process may still
+                // be running under a stale bookkeeping entry.
                 {
                     let jobs = running.lock().await;
-                    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+                    let unbacked = {
+                        let alloc = allocation.lock().await;
+                        alloc.unbacked_claims(
+                            &jobs.keys().copied().collect(),
+                            std::time::Instant::now(),
+                            LAUNCHING_TTL,
+                        )
+                    };
+                    drop(jobs);
+                    settle_cancelled_runs(&lifecycle, &allocation, &admissions).await;
+                    release_due_allocations(&allocation, &admissions).await;
+                    flag_unbacked_allocations(&unbacked, &admissions).await;
+                    collect_settled_admissions(&allocation, &admissions).await;
                 }
 
-                run_completion_hooks_and_report(&completed, &hooks, &spank, &controller_addr).await;
+                run_completion_hooks_and_report(
+                    &completed,
+                    &hooks,
+                    &spank,
+                    &controller_addr,
+                    &allocation,
+                    &admissions,
+                )
+                .await;
             }
         });
     }
@@ -4332,24 +4631,6 @@ pub(crate) struct DrainRequest {
 /// above a typical image pull + fork so a normal launch is spared; one stalled
 /// past this bound is reclaimed.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Reclaim allocations whose job is no longer tracked and is not mid-launch,
-/// using the running set as ground truth. Callers hold the `running` lock
-/// across building `running` and this call so the live set is a consistent
-/// snapshot (see the monitor loop). Returns nothing; logs what it reclaimed.
-fn reconcile_orphaned_allocations(
-    running: &HashMap<u32, TrackedJob>,
-    allocation: &mut NodeAllocation,
-) {
-    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
-    let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
-    if !reclaimed.is_empty() {
-        warn!(
-            ?reclaimed,
-            "reconciled orphaned resource allocations with no tracked job"
-        );
-    }
-}
 
 /// Releases a launch reservation if the handler exits between reserve and
 /// commit, including on future cancellation which no error path can catch.
@@ -9135,6 +9416,8 @@ impl AgentService {
                 self.hooks.clone(),
                 self.spank.clone(),
                 self.reporter.controller_addr.clone(),
+                self.admissions(),
+                epilog_owed(&self.hooks),
             )
             .await;
         }
@@ -9377,6 +9660,8 @@ impl AgentService {
             self.hooks.clone(),
             self.spank.clone(),
             self.reporter.controller_addr.clone(),
+            self.admissions(),
+            epilog_owed(&self.hooks),
         )
         .await;
 
@@ -9387,6 +9672,8 @@ impl AgentService {
         let hooks = self.hooks.clone();
         let spank = self.spank.clone();
         let controller_addr = self.reporter.controller_addr.clone();
+        let admissions = self.admissions();
+        let epilog = epilog_owed(&self.hooks);
         tokio::spawn(async move {
             // Timed from the signal, not from after the immediate wait above,
             // so a slow (or bounded-out) wait can't push escalation past ~5s.
@@ -9415,6 +9702,8 @@ impl AgentService {
                     hooks,
                     spank,
                     controller_addr,
+                    admissions,
+                    epilog,
                 )
                 .await;
             }
@@ -14684,7 +14973,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cgroup = dir.path().join("job_910");
         std::fs::create_dir(&cgroup).unwrap();
-        let completed = completed_job(job_id, cgroup.clone());
+        let completed = completed_job(job_id, 0, cgroup.clone());
 
         // Stands in for a launch of the same id: it owns the id's state until it is done.
         let launching = svc.lifecycle.acquire(job_id).await;
@@ -14698,9 +14987,18 @@ mod tests {
                 svc.mpi_host.clone(),
             );
             let flag = Arc::clone(&torn_down);
+            let admissions = svc.admissions();
             async move {
-                teardown_completed_job(&completed, &lifecycle, &running, &allocation, &mpi_host)
-                    .await;
+                teardown_completed_job(
+                    &completed,
+                    &lifecycle,
+                    &running,
+                    &allocation,
+                    &mpi_host,
+                    &admissions,
+                    crate::admission::EpilogOwed::No,
+                )
+                .await;
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
@@ -16199,12 +16497,14 @@ mod tests {
         );
     }
 
-    // The monitor loop's reconcile step must reclaim an
-    // allocation whose job is no longer tracked, while sparing a job that is
-    // still in `running`. Exercises the real reconcile_orphaned_allocations
-    // wiring the monitor loop calls, without driving the timed loop.
+    // The monitor loop's self-heal step must flag (never silently free) a
+    // claim with no tracked job behind it, while sparing a job that is still
+    // in `running`. Exercises flag_unbacked_allocations + unbacked_claims,
+    // the ledger-gated replacement for the old auto-release reconcile: a
+    // forgotten job's process may still be executing, so nothing here may
+    // guess its work is done and hand its slice to someone else.
     #[tokio::test]
-    async fn reconcile_reclaims_orphan_but_spares_tracked_job() {
+    async fn unbacked_claim_is_flagged_but_spares_tracked_job() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0, 1]),
             HooksConfig::default(),
@@ -16214,7 +16514,7 @@ mod tests {
 
         // job 1: tracked (live) and committed.
         svc.insert_test_job(1, TrackedJob::dummy(0)).await;
-        // job 2: orphan — committed allocation but never entered `running`
+        // job 2: unbacked — committed allocation but never entered `running`
         // (simulating a teardown path that dropped the job without releasing).
         {
             let mut alloc = svc.allocation.lock().await;
@@ -16225,50 +16525,58 @@ mod tests {
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
-        {
-            let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
-        }
+        let admissions = svc.admissions();
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                2,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .unwrap();
 
-        // Orphan (job 2) reclaimed; live job 1 still holds its GPU.
+        let unbacked = {
+            let jobs = svc.running.lock().await;
+            let alloc = svc.allocation.lock().await;
+            alloc.unbacked_claims(
+                &jobs.keys().copied().collect(),
+                std::time::Instant::now(),
+                LAUNCHING_TTL,
+            )
+        };
+        assert_eq!(
+            unbacked,
+            vec![(2, 1)],
+            "only the untracked job's claim is unbacked; the tracked one is spared"
+        );
+
+        flag_unbacked_allocations(&unbacked, &admissions).await;
+
+        // Nothing is freed: forgetting a job is not evidence its work finished.
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
+            0,
+            "an unbacked claim must never be silently released"
+        );
+        let flagged = admissions
+            .load_run(RunKey::new(2, 1).unwrap())
+            .unwrap()
+            .conflict_hold;
+        assert!(
+            flagged.is_some(),
+            "an unbacked claim with no tracked job must be flagged for reconciliation"
         );
     }
 
-    #[derive(Clone, Default)]
-    struct CapturingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    // start_monitor's real completion tick must release a job's allocation
-    // before reconcile can see it as parentless, or reconcile misclassifies
-    // every ordinary completion as an orphan and logs it as one.
+    // start_monitor's completion tick marks a finished run's ledger record
+    // cleaned, but the slice itself is released only once the controller
+    // acknowledges it -- an ordinary completion must settle within the
+    // sweep pipeline, not get stranded or left permanently flagged as an
+    // unbacked claim.
     #[tokio::test]
-    async fn start_monitor_does_not_log_an_orphan_reclaim_for_an_ordinary_completion() {
-        let log = CapturingWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
-        let _trace_guard = tracing::subscriber::set_default(subscriber);
+    async fn start_monitor_settles_an_ordinary_completion_once_acknowledged() {
+        let (controller_addr, _reports) = spawn_mock_controller();
 
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
@@ -16277,34 +16585,58 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         let job_id = 961;
+        let run_attempt = 1;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
-            alloc.commit_job(job_id, 1);
+            alloc
+                .allocate_for_job(job_id, run_attempt, 1, 0, &[0])
+                .unwrap();
+            alloc.commit_job(job_id, run_attempt);
         }
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .unwrap();
         let child = tokio::process::Command::new("/bin/true")
             .process_group(0)
             .spawn()
             .expect("spawn short-lived job");
         let mut tracked = TrackedJob::dummy(0);
         tracked.job = executor::RunningJob::Managed { child };
+        tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.start_monitor("http://127.0.0.1:1".into());
+        svc.start_monitor(controller_addr);
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,
             "monitor should reap the exited job within 5s"
         );
 
-        assert_eq!(
-            svc.free_gpu_count().await,
-            1,
-            "the completed job's GPU must be released"
-        );
-        let output = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let mut released = false;
+        while tokio::time::Instant::now() < deadline {
+            if svc.free_gpu_count().await == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
         assert!(
-            !output.contains("reconciled orphaned"),
-            "an ordinary completion must not be reported as an orphan reclaim: {output}"
+            released,
+            "the completed job's GPU must be released once the controller acknowledges it"
+        );
+        let run = svc
+            .admissions()
+            .load_run(RunKey::new(job_id, run_attempt).unwrap())
+            .expect("the run's record must still be readable");
+        assert!(
+            run.conflict_hold.is_none(),
+            "an acknowledged completion must not leave a stale conflict hold"
         );
     }
 
@@ -16546,9 +16878,9 @@ mod tests {
     }
 
     // A registered srun allocation must be committed AND tracked in `running`
-    // so a reconcile pass spares it — the reservation is backed, not orphaned.
+    // so the self-heal sweep spares it — the reservation is backed, not unbacked.
     #[tokio::test]
-    async fn register_job_allocation_survives_reconcile() {
+    async fn register_job_allocation_survives_unbacked_claim_sweep() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -16588,15 +16920,24 @@ mod tests {
             "registered allocation holds the GPU"
         );
 
-        // The job is in `running`, so reconcile must spare it (not orphan-reclaim).
-        {
+        // The job is in `running`, so it must not show up as an unbacked claim.
+        let unbacked = {
             let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
-        }
+            let alloc = svc.allocation.lock().await;
+            alloc.unbacked_claims(
+                &jobs.keys().copied().collect(),
+                std::time::Instant::now(),
+                LAUNCHING_TTL,
+            )
+        };
+        assert!(
+            unbacked.is_empty(),
+            "a committed+tracked allocation must not be flagged as unbacked"
+        );
         assert_eq!(
             svc.free_gpu_count().await,
             0,
-            "committed+tracked allocation must survive reconcile"
+            "committed+tracked allocation must survive the sweep"
         );
     }
 
@@ -16873,6 +17214,8 @@ mod tests {
             svc.hooks.clone(),
             svc.spank.clone(),
             svc.reporter.controller_addr.clone(),
+            svc.admissions(),
+            epilog_owed(&svc.hooks),
         )
         .await;
 
@@ -18733,12 +19076,12 @@ mod tests {
         );
     }
 
-    fn completed_job(job_id: u32, cgroup: std::path::PathBuf) -> CompletedJob {
+    fn completed_job(job_id: u32, run_attempt: u32, cgroup: std::path::PathBuf) -> CompletedJob {
         CompletedJob {
             job_id,
             exit_code: 0,
             signal: 0,
-            run_attempt: 0,
+            run_attempt,
             rootfs_mode: crate::container::RootfsMode::Extracted,
             cgroup: Some(cgroup),
             work_dir: "/tmp".into(),
@@ -18769,7 +19112,7 @@ mod tests {
         );
 
         let job_id = 907;
-        let completed = completed_job(job_id, cgroup.clone());
+        let completed = completed_job(job_id, 0, cgroup.clone());
 
         // The re-dispatch: tracked again under the same id, holding the GPU.
         svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
@@ -18786,6 +19129,8 @@ mod tests {
             &svc.running,
             &svc.allocation,
             &svc.mpi_host,
+            &svc.admissions(),
+            crate::admission::EpilogOwed::No,
         )
         .await;
 
@@ -18800,10 +19145,12 @@ mod tests {
         );
     }
 
-    // The counterpart: with no live run under the id, the same teardown must
-    // still release everything, so the guard above cannot just skip always.
+    // The counterpart: with no live run under the id, teardown must still
+    // clean up local state and mark the ledger record cleaned -- but the
+    // slice itself is freed only once the controller's acknowledgement (or
+    // an equivalent settle) says so, never synchronously inside teardown.
     #[tokio::test]
-    async fn teardown_releases_a_job_id_nothing_holds() {
+    async fn teardown_marks_cleaned_but_defers_release_to_the_ledger() {
         let dir = tempfile::tempdir().unwrap();
         let cgroup = dir.path().join("job_908");
         std::fs::create_dir(&cgroup).unwrap();
@@ -18816,12 +19163,25 @@ mod tests {
         );
 
         let job_id = 908;
-        let completed = completed_job(job_id, cgroup.clone());
+        let run_attempt = 1;
+        let run = RunKey::new(job_id, run_attempt).unwrap();
+        let completed = completed_job(job_id, run_attempt, cgroup.clone());
         {
             let mut alloc = svc.allocation.lock().await;
             alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
             alloc.commit_job(job_id, 1);
         }
+
+        let admissions = svc.admissions();
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .unwrap();
 
         teardown_completed_job(
             &completed,
@@ -18829,6 +19189,8 @@ mod tests {
             &svc.running,
             &svc.allocation,
             &svc.mpi_host,
+            &admissions,
+            crate::admission::EpilogOwed::No,
         )
         .await;
 
@@ -18838,8 +19200,30 @@ mod tests {
         );
         assert_eq!(
             svc.free_gpu_count().await,
+            0,
+            "the slice stays held until the ledger says release is due"
+        );
+        assert_eq!(
+            admissions.load_run(run).unwrap().state,
+            crate::admission::RunState::Cleaned,
+            "teardown must mark the run's ledger record cleaned"
+        );
+
+        let freed = settle_acknowledged_completion(
+            &svc.allocation,
+            &admissions,
+            run,
+            spur_core::step::STEP_BATCH,
+        )
+        .await;
+        assert!(
+            freed,
+            "an acknowledged completion must release the deferred slice"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
             1,
-            "teardown must release the finished run's reservation"
+            "the slice must be released once the controller acknowledges it"
         );
     }
 
