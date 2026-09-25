@@ -5837,29 +5837,112 @@ impl SlurmAgent for AgentService {
 
     async fn request_node_ledger(
         &self,
-        _request: Request<RequestNodeLedgerRequest>,
+        request: Request<RequestNodeLedgerRequest>,
     ) -> Result<Response<RequestNodeLedgerResponse>, Status> {
-        Err(Status::unimplemented(
-            "node ledger reconciliation is not yet wired on this agent",
-        ))
+        Self::require_controller(&request)?;
+        let reason = request.into_inner().reason;
+        let admissions = self.admissions();
+        let session = self.reporter.agent_session_id().to_string();
+        let cut = tokio::task::spawn_blocking(move || admissions.ledger_cut(&session))
+            .await
+            .map_err(|error| Status::internal(format!("ledger task failed: {error}")))?;
+        info!(%reason, entries = cut.entries.len(), complete = cut.inventory_complete, "answered a ledger pull");
+        self.reporter.note_ledger_pulled();
+        Ok(Response::new(RequestNodeLedgerResponse {
+            ledger: Some(crate::reporter::ledger_to_proto(cut)),
+        }))
     }
 
     async fn fence_run(
         &self,
-        _request: Request<FenceRunRequest>,
+        request: Request<FenceRunRequest>,
     ) -> Result<Response<FenceRunResponse>, Status> {
-        Err(Status::unimplemented(
-            "run fencing is not yet wired on this agent",
-        ))
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let admissions = self.admissions();
+        let (job_id, run_attempt, cutoff) =
+            (req.job_id, req.run_attempt, req.reject_before_unix_ms);
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to fence"))?;
+        let fenced = tokio::task::spawn_blocking(move || admissions.fence_run(run, cutoff))
+            .await
+            .map_err(|error| Status::internal(format!("fence task failed: {error}")))?;
+        match fenced {
+            Ok(reject_before_unix_ms) => {
+                info!(
+                    job_id,
+                    run_attempt, reject_before_unix_ms, "fenced a run against in-flight launches"
+                );
+                Ok(Response::new(FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms,
+                }))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not persist the fence for job {job_id}: {error}"
+            ))),
+        }
     }
 
     async fn settle_run(
         &self,
-        _request: Request<SettleRunRequest>,
+        request: Request<SettleRunRequest>,
     ) -> Result<Response<SettleRunResponse>, Status> {
-        Err(Status::unimplemented(
-            "run settlement is not yet wired on this agent",
-        ))
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let (job_id, run_attempt) = (req.job_id, req.run_attempt);
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to settle"))?;
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
+        if self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt)
+        {
+            warn!(
+                job_id,
+                run_attempt, "declining to settle a run this agent is still running"
+            );
+            return Ok(Response::new(SettleRunResponse {
+                released: false,
+                error: "this agent is still running the run".into(),
+            }));
+        }
+        let outcome = settle_and_release_run(&self.allocation, &self.admissions(), run)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "could not settle run {job_id}.{run_attempt}: {error}"
+                ))
+            })?;
+        let declined = match outcome {
+            SettleRunOutcome::Released => {
+                info!(
+                    job_id,
+                    run_attempt,
+                    "controller answered a claim it has no record of; released the slice"
+                );
+                return Ok(Response::new(SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }));
+            }
+            SettleRunOutcome::AlreadyFree => "the slice was already free",
+            SettleRunOutcome::NoRecord => "this agent has no record of the run",
+            SettleRunOutcome::NotQuiescent => "the run is still being torn down",
+            SettleRunOutcome::Declined => "this agent's release gate licensed nothing",
+        };
+        warn!(
+            job_id,
+            run_attempt, declined, "declining to report a slice as released"
+        );
+        Ok(Response::new(SettleRunResponse {
+            released: false,
+            error: declined.into(),
+        }))
     }
 
     async fn launch_job(
@@ -20380,5 +20463,168 @@ mod tests {
             "non-interactive bridge dropped output after input close, got: {text:?}"
         );
         assert!(got_exit, "bridge did not report an exit status");
+    }
+
+    fn ledger_agent() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    #[tokio::test]
+    async fn request_node_ledger_rejects_a_non_controller_caller() {
+        let svc = ledger_agent();
+        let mut req = Request::new(RequestNodeLedgerRequest {
+            reason: "reconcile".into(),
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .request_node_ledger(req)
+            .await
+            .expect_err("a user token must not pull this node's admission ledger");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn request_node_ledger_reports_a_seeded_run() {
+        let svc = ledger_agent();
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                51,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("seed an admitted run");
+
+        let mut req = Request::new(RequestNodeLedgerRequest {
+            reason: "reconcile".into(),
+        });
+        req.extensions_mut().insert(controller_identity());
+        let resp = svc
+            .request_node_ledger(req)
+            .await
+            .expect("the controller may pull the ledger")
+            .into_inner();
+        let ledger = resp.ledger.expect("a ledger must be returned");
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].job_id, 51);
+        assert_eq!(ledger.entries[0].run_attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn fence_run_rejects_a_non_controller_caller() {
+        let svc = ledger_agent();
+        let mut req = Request::new(FenceRunRequest {
+            job_id: 52,
+            run_attempt: 1,
+            reject_before_unix_ms: 1,
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .fence_run(req)
+            .await
+            .expect_err("a user token must not fence a run on this agent");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn fence_run_rejects_run_attempt_zero() {
+        let svc = ledger_agent();
+        let mut req = Request::new(FenceRunRequest {
+            job_id: 52,
+            run_attempt: 0,
+            reject_before_unix_ms: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        let err = svc
+            .fence_run(req)
+            .await
+            .expect_err("attempt 0 names no run to fence");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn fence_run_persists_a_cutoff_for_a_real_run() {
+        let svc = ledger_agent();
+        let cutoff = crate::admission::now_unix_ms();
+        let mut req = Request::new(FenceRunRequest {
+            job_id: 53,
+            run_attempt: 1,
+            reject_before_unix_ms: cutoff,
+        });
+        req.extensions_mut().insert(controller_identity());
+        let resp = svc
+            .fence_run(req)
+            .await
+            .expect("the controller may fence a run")
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.reject_before_unix_ms, cutoff);
+        assert_eq!(
+            svc.admissions().reject_before(key(53, 1)),
+            Some(cutoff),
+            "the fence must be persisted so a later launch attempt reads it"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_run_rejects_a_non_controller_caller() {
+        let svc = ledger_agent();
+        let mut req = Request::new(SettleRunRequest {
+            job_id: 54,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .settle_run(req)
+            .await
+            .expect_err("a user token must not settle a run on this agent");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn settle_run_declines_while_this_agent_is_still_running_it() {
+        let svc = ledger_agent();
+        svc.insert_test_job(55, TrackedJob::dummy(std::process::id()))
+            .await;
+        {
+            let mut running = svc.running.lock().await;
+            running.get_mut(&55).expect("job just inserted").run_attempt = 1;
+        }
+
+        let mut req = Request::new(SettleRunRequest {
+            job_id: 55,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        let resp = svc
+            .settle_run(req)
+            .await
+            .expect("a still-running run is answered, not refused")
+            .into_inner();
+        assert!(!resp.released);
+        assert!(resp.error.contains("still running"));
+    }
+
+    #[tokio::test]
+    async fn settle_run_reports_no_record_for_an_unknown_run() {
+        let svc = ledger_agent();
+        let mut req = Request::new(SettleRunRequest {
+            job_id: 56,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        let resp = svc
+            .settle_run(req)
+            .await
+            .expect("an unknown run is answered, not refused")
+            .into_inner();
+        assert!(!resp.released);
+        assert!(resp.error.contains("no record"));
     }
 }
