@@ -87,20 +87,23 @@ pub fn list(dirs: &[PathBuf]) -> Vec<Plugin> {
 #[cfg(unix)]
 pub fn exec(plugin: &Plugin, args: &[String]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
+    command(plugin, args).exec()
+}
 
+fn command(plugin: &Plugin, args: &[String]) -> std::process::Command {
     let conf =
         std::env::var_os("SPUR_CONF").unwrap_or_else(|| OsString::from("/etc/spur/spur.conf"));
     let bin = std::env::current_exe()
         .map(OsString::from)
         .unwrap_or_else(|_| OsString::from("spur"));
 
-    std::process::Command::new(&plugin.path)
-        .args(args)
+    let mut cmd = std::process::Command::new(&plugin.path);
+    cmd.args(args)
         .env("SPUR_CONF", conf)
         .env("SPUR_BIN", bin)
         .env("SPUR_VERSION", spur_core::version::version_string())
-        .env("SPUR_PLUGIN_NAME", &plugin.name)
-        .exec()
+        .env("SPUR_PLUGIN_NAME", &plugin.name);
+    cmd
 }
 
 /// `spur <name> ...` with no built-in match: run a plugin or explain why not.
@@ -221,6 +224,31 @@ mod tests {
         let (plugin, _) = resolve(&dirs, &args(&["aims"])).unwrap();
         assert_eq!(plugin.path, first.path().join("spur-aims"));
         assert_eq!(list(&dirs).len(), 1);
+    }
+
+    #[test]
+    fn command_passes_args_and_plugin_env() {
+        let plugin = Plugin {
+            name: "aims-debug".into(),
+            path: PathBuf::from("/opt/bin/spur-aims-debug"),
+        };
+        let cmd = command(&plugin, &args(&["x", "--y"]));
+
+        assert_eq!(cmd.get_program(), "/opt/bin/spur-aims-debug");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["x", "--y"]);
+        let env = |key: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(env("SPUR_PLUGIN_NAME").as_deref(), Some("aims-debug"));
+        assert_eq!(
+            env("SPUR_VERSION"),
+            Some(spur_core::version::version_string())
+        );
+        assert!(env("SPUR_CONF").is_some());
+        assert!(env("SPUR_BIN").is_some());
     }
 
     #[test]
