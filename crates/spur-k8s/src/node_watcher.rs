@@ -70,6 +70,8 @@ async fn sync_taint_state(name: &str, entry: &mut NodeTaintState, client: &mut C
         reason,
         labels: HashMap::new(),
         remove_labels: Vec::new(),
+        reconcile: false,
+        caller: String::new(),
     };
 
     match client
@@ -133,6 +135,8 @@ pub async fn run(
                         wg_pubkey: String::new(),
                         labels: std::collections::HashMap::new(),
                         join_token: String::new(),
+                        ledger: None,
+                        runs_job_epilog: false,
                     };
 
                     let reg = req.clone();
@@ -185,6 +189,8 @@ pub async fn run(
                     reason: Some("K8s node removed".into()),
                     labels: HashMap::new(),
                     remove_labels: Vec::new(),
+                    reconcile: false,
+                    caller: String::new(),
                 };
 
                 if let Err(e) = ctrl

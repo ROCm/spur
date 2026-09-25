@@ -4976,6 +4976,33 @@ impl SlurmAgent for AgentService {
         }))
     }
 
+    async fn request_node_ledger(
+        &self,
+        _request: Request<RequestNodeLedgerRequest>,
+    ) -> Result<Response<RequestNodeLedgerResponse>, Status> {
+        Err(Status::unimplemented(
+            "node ledger reconciliation is not yet wired on this agent",
+        ))
+    }
+
+    async fn fence_run(
+        &self,
+        _request: Request<FenceRunRequest>,
+    ) -> Result<Response<FenceRunResponse>, Status> {
+        Err(Status::unimplemented(
+            "run fencing is not yet wired on this agent",
+        ))
+    }
+
+    async fn settle_run(
+        &self,
+        _request: Request<SettleRunRequest>,
+    ) -> Result<Response<SettleRunResponse>, Status> {
+        Err(Status::unimplemented(
+            "run settlement is not yet wired on this agent",
+        ))
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -5039,6 +5066,8 @@ impl SlurmAgent for AgentService {
                         stdout_path: paths.0,
                         stderr_path: paths.1,
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+
+                        conflict: None,
                     }));
                 }
                 Err(e) => return Err(map_exec_err(e)),
@@ -5122,6 +5151,8 @@ impl SlurmAgent for AgentService {
                     stdout_path: paths.0,
                     stderr_path: paths.1,
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+
+                    conflict: None,
                 }));
             }
         }
@@ -5475,6 +5506,8 @@ impl SlurmAgent for AgentService {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
+
+                    conflict: None,
                 }));
             }
         }
@@ -5685,6 +5718,8 @@ impl SlurmAgent for AgentService {
                             stdout_path: String::new(),
                             stderr_path: String::new(),
                             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+
+                            conflict: None,
                         }));
                     }
                 }
@@ -5746,6 +5781,8 @@ impl SlurmAgent for AgentService {
                         stdout_path: String::new(),
                         stderr_path: String::new(),
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+
+                        conflict: None,
                     }));
                 }
 
@@ -5806,6 +5843,8 @@ impl SlurmAgent for AgentService {
                     stdout_path,
                     stderr_path,
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+
+                    conflict: None,
                 }))
             }
             Err(e) => {
@@ -5834,6 +5873,8 @@ impl SlurmAgent for AgentService {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     failure_kind: failure_kind as i32,
+
+                    conflict: None,
                 }))
             }
         }
