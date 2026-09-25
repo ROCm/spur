@@ -1624,6 +1624,8 @@ async fn update_node(
             reason,
             labels: HashMap::new(),
             remove_labels: Vec::new(),
+            reconcile: false,
+            caller: String::new(),
         })
         .await
         .context("node update failed")?;

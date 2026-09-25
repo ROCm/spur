@@ -42,6 +42,39 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+/// Milliseconds since the epoch, saturating rather than panicking on a clock
+/// set before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// Identifies what a launch asks the node to run, so an exact repeat stays
+/// idempotent and a different command under the same identity is refused.
+fn command_digest(params: &AgentDispatchParams<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let spec = params.spec;
+    let mut hasher = Sha256::new();
+    hasher.update(params.job_id.to_le_bytes());
+    hasher.update(params.run_attempt.to_le_bytes());
+    hasher.update(params.task_offset.to_le_bytes());
+    hasher.update(spec.script.as_deref().unwrap_or_default().as_bytes());
+    for arg in spec.argv.iter().chain(spec.script_args.iter()) {
+        hasher.update([0u8]);
+        hasher.update(arg.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 /// True on the tick a leadership term begins, so per-term setup runs once rather
 /// than on every tick or on a follower. Advances `was_leader` to the new value.
 fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
@@ -69,13 +102,17 @@ fn should_sweep_orphaned_placements(
     }
 }
 
-/// Drop everything a former leader may no longer speak for.
+/// Drop everything a former leader may no longer speak for. Kept whole so state
+/// that only one term can vouch for is not left behind in one place and not another.
 pub(crate) fn relinquish_leadership(
     cluster: &Arc<ClusterManager>,
     scheduler: &mut BackfillScheduler,
 ) {
     cluster.set_planned_reservations(HashMap::new());
     cluster.set_planned_job_starts(HashMap::new());
+    // Registrations during another term went to that leader, so what is recorded
+    // here may already name a lifetime that has been replaced.
+    cluster.agent_sessions().clear();
     scheduler.clear_outcomes();
 }
 
@@ -157,6 +194,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
     let mut was_leader = false;
     let mut leadership_entered_at: Option<Instant> = None;
+    let mut last_ledger_sweep: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -180,6 +218,27 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         if entering_term {
             leadership_entered_at = Some(Instant::now());
+        }
+
+        // A promoted follower's totals were maintained across an unknown replay
+        // history; rebuild from the job records before this term's placements.
+        if entering_term {
+            cluster.recompute_node_allocations();
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "leadership gain").await;
+            });
+        }
+
+        // Routine sweep: drift nothing reported is only found by looking.
+        if !entering_term
+            && last_ledger_sweep.is_none_or(|last| last.elapsed() >= LEDGER_SWEEP_INTERVAL)
+        {
+            last_ledger_sweep = Some(Instant::now());
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "routine sweep").await;
+            });
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -659,7 +718,12 @@ async fn process_assignment(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) = cluster.evict_job_attempt(job_id, Some(run_attempt), Some(detail)) {
+        if let Err(e) = cluster.evict_job_attempt(
+            job_id,
+            Some(run_attempt),
+            Some(detail),
+            spur_core::job::PendingReason::JobLaunchFailure,
+        ) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -1737,6 +1801,7 @@ async fn dispatch_to_agent(
         submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
+    let issued_at = now_unix_ms();
     let response = client
         .launch_job(LaunchJobRequest {
             job_id: params.job_id,
@@ -1753,6 +1818,9 @@ async fn dispatch_to_agent(
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
             execution_credential: params.execution_credential.to_string(),
+            issued_at_unix_ms: issued_at,
+            expires_at_unix_ms: issued_at.saturating_add(spur_core::job::LAUNCH_LIFETIME_MS),
+            command_digest: command_digest(params),
         })
         .await
         .map_err(|s| match s.code() {
@@ -2893,9 +2961,194 @@ pub async fn cancel_job_on_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Refuse every launch for this run attempt issued at or before now, so a
+/// retry already in flight cannot land after the decision that cancelled it.
+async fn fence_run_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+) {
+    // Attempt 0 is the "whichever is tracked" wildcard the cancel below accepts.
+    // A cutoff has no run to live on without an attempt, so there is none to set.
+    if run_attempt == 0 {
+        return;
+    }
+    let cutoff = now_unix_ms();
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(fence_one_agent(agent_addr, job_id, run_attempt, cutoff));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+async fn fence_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    reject_before_unix_ms: u64,
+) {
+    let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+        Ok(client) => client,
+        // An unreachable node runs nothing the controller can see; its
+        // registration reconcile covers it when it returns.
+        Err(error) => {
+            debug!(job_id, agent = %agent_addr, %error, "could not reach an agent to fence a run");
+            return;
+        }
+    };
+    let fenced = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.fence_run(spur_proto::proto::FenceRunRequest {
+            job_id,
+            run_attempt,
+            reject_before_unix_ms,
+        }),
+    )
+    .await;
+    match fenced {
+        Ok(Ok(_)) => {}
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, agent = %agent_addr, "agent predates run fencing")
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, agent = %agent_addr, %status, "agent refused a run fence")
+        }
+        Err(_) => warn!(job_id, agent = %agent_addr, "timed out fencing a run"),
+    }
+}
+
+/// One node's agent connection, opened on first use and reused for the rest of
+/// that node's pass: a handshake and a minted credential per claim is a tax.
+pub type AgentLink = Option<
+    spur_proto::proto::slurm_agent_client::SlurmAgentClient<crate::agent_client::AgentChannel>,
+>;
+
+/// Tell a node the controller is not accounting for a run it still holds, which
+/// is the acknowledgement that run's slice is waiting on. Whether it went back.
+pub async fn settle_run_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    run: spur_core::job::RunKey,
+    link: &mut AgentLink,
+) -> bool {
+    let job_id = run.job_id();
+    // A settle names one run's slice; the wildcard key names no slice to free.
+    let Some(run_attempt) = run.attempt() else {
+        return false;
+    };
+    if link.is_none() {
+        let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+            return false;
+        };
+        match crate::agent_client::connect(addr).await {
+            Ok(client) => *link = Some(client),
+            Err(_) => {
+                debug!(job_id, node = %node, "could not reach an agent to settle a run");
+                return false;
+            }
+        }
+    }
+    let Some(client) = link.as_mut() else {
+        return false;
+    };
+    let settled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.settle_run(spur_proto::proto::SettleRunRequest {
+            job_id,
+            run_attempt,
+        }),
+    )
+    .await;
+    match settled {
+        Ok(Ok(response)) => response.into_inner().released,
+        // An agent that predates the settle keeps holding; the next pass retries.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, node = %node, "agent predates run settlement");
+            false
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, node = %node, %status, "agent refused a run settlement");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node = %node, "timed out settling a run");
+            false
+        }
+    }
+}
+
+/// How often the controller sweeps the cluster for drift nothing reported.
+pub(crate) const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Pull a fresh cut of one node's ledger and reconcile it. The heartbeat
+/// carries no inventory, so this is how a controller-side event gets one.
+pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason: &str) {
+    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+        return;
+    };
+    let Ok(mut client) = crate::agent_client::connect(addr).await else {
+        return;
+    };
+    // Opened before the cut is asked for, so any launch the cut could have
+    // missed is one this watch has seen.
+    let dispatched = cluster.dispatch_tracker().watch(node);
+    // Logged here rather than at each trigger: the controller is otherwise silent
+    // about every pull but one, which reads as a reconciler that never runs.
+    info!(node = %node, reason, "pulling this node's ledger");
+    let pulled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.request_node_ledger(spur_proto::proto::RequestNodeLedgerRequest {
+            reason: reason.to_string(),
+        }),
+    )
+    .await;
+    match pulled {
+        Ok(Ok(response)) => {
+            if let Some(ledger) = response.into_inner().ledger {
+                let outcome = crate::server::reconcile_node_ledger(
+                    cluster,
+                    node,
+                    ledger,
+                    &dispatched,
+                    crate::server::CutProvenance::Pulled,
+                )
+                .await;
+                info!(
+                    node = %node,
+                    reason,
+                    cancelled = outcome.cancelled.len(),
+                    settled = outcome.settled.len(),
+                    released = outcome.released.len(),
+                    unresolved = outcome.unresolved.len(),
+                    "reconciled this node's ledger"
+                );
+            }
+        }
+        // An agent that predates the pull keeps its pre-upgrade behaviour.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
+        Ok(Err(status)) => warn!(node = %node, %status, "ledger pull refused"),
+        Err(_) => warn!(node = %node, "ledger pull timed out"),
+    }
+}
+
+/// Pull every node's ledger. Used where the controller has reason to distrust
+/// its own view rather than any one node's: a leader took over, or the sweep.
+pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) {
+    let nodes: Vec<String> = cluster.get_nodes().into_iter().map(|n| n.name).collect();
+    let mut set = tokio::task::JoinSet::new();
+    for node in nodes {
+        let cluster = cluster.clone();
+        let reason = reason.to_string();
+        set.spawn(async move { pull_node_ledger(&cluster, &node, &reason).await });
     }
     while set.join_next().await.is_some() {}
 }
@@ -4099,6 +4352,39 @@ mod tests {
             type InteractiveSessionStream =
                 tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
 
+            async fn request_node_ledger(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+                ))
+            }
+
+            async fn fence_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms: 0,
+                }))
+            }
+
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }))
+            }
+
             async fn start_job(
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
@@ -4637,6 +4923,7 @@ mod tests {
                 NodeSource::NativeHost,
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -4663,6 +4950,7 @@ mod tests {
                 version: String::new(),
                 labels: HashMap::new(),
                 source: NodeSource::NativeHost,
+                runs_job_epilog: false,
             });
             let n = name.to_string();
             wait_for(
@@ -5858,6 +6146,7 @@ mod tests {
                 },
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -6399,8 +6688,13 @@ mod tests {
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
 
-            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
-                .expect("a stale eviction must be a no-op, not an error");
+            cm.evict_job_attempt(
+                job_id,
+                Some(current.wrapping_sub(1)),
+                Some("stale".into()),
+                spur_core::job::PendingReason::JobLaunchFailure,
+            )
+            .expect("a stale eviction must be a no-op, not an error");
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(

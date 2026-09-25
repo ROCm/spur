@@ -125,6 +125,8 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
                 reason: None,
                 labels: set_labels.clone(),
                 remove_labels: remove_labels.clone(),
+                reconcile: false,
+                caller: String::new(),
             })
             .await
         {

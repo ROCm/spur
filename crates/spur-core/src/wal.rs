@@ -17,6 +17,11 @@ fn default_port() -> u16 {
     6818
 }
 
+/// The only eviction an entry from before the reason field could carry.
+fn evicted_after_launch_failure() -> PendingReason {
+    PendingReason::JobLaunchFailure
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
@@ -227,6 +232,10 @@ pub enum WalOperation {
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
+        /// Why the run is coming off its nodes. Decides whether the requeue takes
+        /// the launch backoff, so a run that did launch must not claim one.
+        #[serde(default = "evicted_after_launch_failure")]
+        reason: PendingReason,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -253,6 +262,10 @@ pub enum WalOperation {
         labels: HashMap<String, String>,
         #[serde(default)]
         source: NodeSource,
+        /// Whether this node runs an epilog after a run's tasks exit. Absent from
+        /// a pre-declaration entry, which replays as a node that never gates.
+        #[serde(default)]
+        runs_job_epilog: bool,
     },
     NodeUpdate {
         name: String,
@@ -265,6 +278,14 @@ pub enum WalOperation {
         version: String,
         #[serde(default)]
         source: NodeSource,
+        /// Hold the node out of scheduling until its asserted state has been
+        /// diffed against Raft, or release it. `None` leaves the gate as it is.
+        #[serde(default)]
+        reconcile_pending: Option<bool>,
+        /// Whether this node runs an epilog after a run's tasks exit. `None`
+        /// leaves the recorded answer alone, so a gate-only entry cannot clear it.
+        #[serde(default)]
+        runs_job_epilog: Option<bool>,
     },
     NodeStateChange {
         name: String,
@@ -1572,6 +1593,7 @@ mod evict_wal_tests {
         let op = WalOperation::JobEvict {
             job_id: 9,
             detail: Some("PMIx prepare failed".into()),
+            reason: PendingReason::JobLaunchFailure,
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1594,6 +1616,20 @@ mod evict_wal_tests {
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(detail, "PMIx prepare failed: n1: connect failed");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // A pre-upgrade entry never named a reason; every one it could carry was a
+    // launch failure, so that is the only default a replay may assume.
+    #[test]
+    fn a_pre_reason_evict_entry_defaults_to_launch_failure() {
+        let frozen = r#"{"JobEvict":{"job_id":9,"detail":"PMIx prepare failed"}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).expect("must deserialize");
+        match op {
+            WalOperation::JobEvict { reason, .. } => {
+                assert_eq!(reason, PendingReason::JobLaunchFailure);
             }
             _ => panic!("wrong variant"),
         }
