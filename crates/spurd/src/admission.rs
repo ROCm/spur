@@ -1479,6 +1479,31 @@ impl AdmissionStore {
         })
     }
 
+    /// As [`Self::remove_run`], but only if the on-disk record is still the
+    /// exact one this caller admitted -- a re-admission for the same run since
+    /// then must not be deleted out from under it.
+    pub fn remove_run_if_created_at(
+        &self,
+        run_key: RunKey,
+        created_at_unix_ms: u64,
+    ) -> io::Result<()> {
+        self.with_run_lock(run_key, || {
+            let run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if run.created_at_unix_ms != created_at_unix_ms {
+                return Ok(());
+            }
+            match fs::remove_dir_all(self.run_dir(run_key)?) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// As [`Self::sweep`]'s per-run body, but re-validated under this run's own
     /// lock so a write landing between the unlocked scan and this call can't be swept.
     fn remove_run_if_eligible(
@@ -2116,6 +2141,49 @@ mod tests {
         assert!(
             store.load_run(key(7, 1)).is_ok(),
             "the record, and the participant that just landed, must survive"
+        );
+    }
+
+    // A launch aborts before spawning anything and schedules a background
+    // `remove_run_if_created_at(run, T1)`. Before that runs, the controller's
+    // legitimate retry re-admits the same run with a newer `created_at_unix_ms`
+    // (T2). The stale, now-late delete must not take T2's record with it.
+    #[test]
+    fn remove_run_if_created_at_spares_a_retrys_record_admitted_after_the_stale_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let aborted = run_with(7, 1, 1_000);
+        store.admit_run(&aborted).unwrap();
+
+        // The legitimate retry: same run key, re-admitted with a newer stamp.
+        let retried = run_with(7, 1, 2_000);
+        store.admit_run(&retried).unwrap();
+
+        store
+            .remove_run_if_created_at(key(7, 1), aborted.created_at_unix_ms)
+            .unwrap();
+
+        let loaded = store.load_run(key(7, 1)).expect(
+            "the retry's record must survive a stale delete for an older created_at_unix_ms",
+        );
+        assert_eq!(loaded.created_at_unix_ms, retried.created_at_unix_ms);
+    }
+
+    #[test]
+    fn remove_run_if_created_at_still_removes_a_matching_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let run = run_with(7, 1, 1_000);
+        store.admit_run(&run).unwrap();
+
+        store
+            .remove_run_if_created_at(key(7, 1), run.created_at_unix_ms)
+            .unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "a delete whose created_at still matches must still take effect"
         );
     }
 

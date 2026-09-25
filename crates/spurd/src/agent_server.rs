@@ -5251,6 +5251,9 @@ struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
     admissions: crate::admission::AdmissionStore,
     run: RunKey,
+    /// The same stamp the admission record was created with, so a Drop-deferred
+    /// cleanup can be checked against a re-admission for this run since then.
+    created_at: u64,
     armed: bool,
     spawned: bool,
 }
@@ -5260,11 +5263,13 @@ impl LaunchReservationGuard {
         allocation: Arc<Mutex<NodeAllocation>>,
         admissions: crate::admission::AdmissionStore,
         run: RunKey,
+        created_at: u64,
     ) -> Self {
         Self {
             allocation,
             admissions,
             run,
+            created_at,
             armed: true,
             spawned: false,
         }
@@ -5301,17 +5306,20 @@ impl Drop for LaunchReservationGuard {
             warn!(%run, "an aborted launch left a payload running; its slice stays held");
             return;
         }
-        // `remove_run` fsyncs, so it must not run inline on Drop's thread --
-        // unlike the allocation release below, which is pure in-memory.
+        // `remove_run_if_created_at` fsyncs, so it must not run inline on Drop's
+        // thread -- unlike the allocation release below, which is pure in-memory.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let admissions = self.admissions.clone();
+            let created_at = self.created_at;
             handle.spawn(async move {
-                let removed = tokio::task::spawn_blocking(move || admissions.remove_run(run))
-                    .await
-                    .map_err(|error| {
-                        std::io::Error::other(format!("admission cleanup task failed: {error}"))
-                    })
-                    .and_then(std::convert::identity);
+                let removed = tokio::task::spawn_blocking(move || {
+                    admissions.remove_run_if_created_at(run, created_at)
+                })
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!("admission cleanup task failed: {error}"))
+                })
+                .and_then(std::convert::identity);
                 if let Err(error) = removed {
                     warn!(%run, %error, "failed to drop the admission record of an aborted launch");
                 }
@@ -6764,8 +6772,15 @@ impl SlurmAgent for AgentService {
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
         let admissions = self.admissions();
-        let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), run_key);
+        // Shared with the admission record below, so the Drop-deferred cleanup
+        // can be checked against exactly the record this call admitted.
+        let created_at = crate::admission::now_unix_ms();
+        let mut reservation_guard = LaunchReservationGuard::new(
+            self.allocation.clone(),
+            admissions.clone(),
+            run_key,
+            created_at,
+        );
 
         // Durable before anything is spawned against it: a crash before this
         // leaves neither a record nor a process, a crash after leaves both.
@@ -6778,7 +6793,7 @@ impl SlurmAgent for AgentService {
                 memory_mb: alloc_result.memory_mb,
                 gpu_devices: admitted_gpu_ids(&allocated_device_ids, job_id),
             },
-            crate::admission::now_unix_ms(),
+            created_at,
         );
         run_record.lifecycle_owner_step = Some(launch_step);
         let allocation = run_record.allocation.clone();
@@ -7710,8 +7725,15 @@ impl SlurmAgent for AgentService {
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
         let admissions = self.admissions();
-        let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), alloc_run);
+        // Shared with the admission record below, so the Drop-deferred cleanup
+        // can be checked against exactly the record this call admitted.
+        let created_at = crate::admission::now_unix_ms();
+        let mut reservation_guard = LaunchReservationGuard::new(
+            self.allocation.clone(),
+            admissions.clone(),
+            alloc_run,
+            created_at,
+        );
 
         // An srun allocation holds a slice with no launch of its own, so it
         // needs the same record: the claim outlives whatever steps join it.
@@ -7724,7 +7746,7 @@ impl SlurmAgent for AgentService {
                 memory_mb: alloc_result.memory_mb,
                 gpu_devices: admitted_gpu_ids(&controller_gpu_ids, req.job_id),
             },
-            crate::admission::now_unix_ms(),
+            created_at,
         );
         run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
         let allocation = run_record.allocation.clone();
@@ -18340,7 +18362,7 @@ mod tests {
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let mut reservation_guard =
-            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1));
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1), 0);
 
         // Mirrors either arm right after `launch_stepd`/`claim_stepd_slot`
         // succeeds, then losing the race and reaping what it just spawned.
@@ -18375,7 +18397,7 @@ mod tests {
             alloc.commit_job(42, 1);
         }
         let reservation =
-            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(42, 1));
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(42, 1), 0);
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let status = {
@@ -18733,7 +18755,7 @@ mod tests {
                 .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
             let guard =
-                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(9, 1));
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(9, 1), 0);
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -18751,8 +18773,12 @@ mod tests {
                 .allocate_for_job(10, 1, 1, 0, &[0])
                 .unwrap();
             svc.allocation.lock().await.commit_job(10, 1);
-            let mut guard =
-                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(10, 1));
+            let mut guard = LaunchReservationGuard::new(
+                svc.allocation.clone(),
+                svc.admissions(),
+                key(10, 1),
+                0,
+            );
             guard.disarm();
             drop(guard);
         }
@@ -18781,7 +18807,7 @@ mod tests {
             .allocate_for_job(11, 1, 1, 0, &[0])
             .unwrap();
         let guard =
-            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(11, 1));
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(11, 1), 0);
 
         // A cancel races the still-in-flight launch, releasing attempt 1's
         // reservation; the controller redispatches attempt 2, which reserves
