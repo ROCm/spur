@@ -138,6 +138,13 @@ impl NodeReporter {
         let _ = self.admissions.set(admissions);
     }
 
+    /// The store `set_admissions` wired in, if any. Every caller must share
+    /// this one instance -- a fresh `AdmissionStore` has its own unshared
+    /// per-run lock table, so a second instance serializes against nothing.
+    pub(crate) fn admissions(&self) -> Option<crate::admission::AdmissionStore> {
+        self.admissions.get().cloned()
+    }
+
     fn ledger_cut(&self) -> Option<spur_proto::proto::NodeLedger> {
         let cut = self.admissions.get()?.ledger_cut(&self.agent_session_id);
         Some(ledger_to_proto(cut))

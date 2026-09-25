@@ -4204,9 +4204,18 @@ impl AgentService {
         }
     }
 
-    /// The entitlement ledger, keyed to the node this agent serves.
+    /// The entitlement ledger, keyed to the node this agent serves. Reuses the
+    /// single instance startup wired into the reporter: a second instance
+    /// would carry its own unshared per-run lock table and serialize against
+    /// nothing, racing the real one on the same on-disk records.
     pub(crate) fn admissions(&self) -> crate::admission::AdmissionStore {
-        crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
+        self.reporter.admissions().unwrap_or_else(|| {
+            warn!(
+                "admission store requested before startup wired one; \
+                 constructing an unshared instance"
+            );
+            crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
+        })
     }
 
     /// Spawns the release wait (and force-reclaim escalation) for a
