@@ -1,11 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Leader-local record of launches on the wire, so `abort_orphaned_placements`
-//! can tell a genuinely-abandoned reservation from one still in flight. Also
-//! answers reconciliation's different question: an agent cuts its ledger at an
-//! instant the controller cannot observe, so a cut taken mid-launch omits a run
-//! Raft records. Watch the overlap, don't filter after.
+//! Leader-local record of launches on the wire: tells an abandoned reservation
+//! from one in flight, and lets a reconcile pass watch for a launch its cut predates.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
