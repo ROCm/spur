@@ -42,6 +42,39 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+/// Milliseconds since the epoch, saturating rather than panicking on a clock
+/// set before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// Identifies what a launch asks the node to run, so an exact repeat stays
+/// idempotent and a different command under the same identity is refused.
+fn command_digest(params: &AgentDispatchParams<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let spec = params.spec;
+    let mut hasher = Sha256::new();
+    hasher.update(params.job_id.to_le_bytes());
+    hasher.update(params.run_attempt.to_le_bytes());
+    hasher.update(params.task_offset.to_le_bytes());
+    hasher.update(spec.script.as_deref().unwrap_or_default().as_bytes());
+    for arg in spec.argv.iter().chain(spec.script_args.iter()) {
+        hasher.update([0u8]);
+        hasher.update(arg.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 /// True on the tick a leadership term begins, so per-term setup runs once rather
 /// than on every tick or on a follower. Advances `was_leader` to the new value.
 fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
@@ -659,7 +692,12 @@ async fn process_assignment(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) = cluster.evict_job_attempt(job_id, Some(run_attempt), Some(detail)) {
+        if let Err(e) = cluster.evict_job_attempt(
+            job_id,
+            Some(run_attempt),
+            Some(detail),
+            spur_core::job::PendingReason::JobLaunchFailure,
+        ) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -1737,6 +1775,7 @@ async fn dispatch_to_agent(
         submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
+    let issued_at = now_unix_ms();
     let response = client
         .launch_job(LaunchJobRequest {
             job_id: params.job_id,
@@ -1753,6 +1792,9 @@ async fn dispatch_to_agent(
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
             execution_credential: params.execution_credential.to_string(),
+            issued_at_unix_ms: issued_at,
+            expires_at_unix_ms: issued_at.saturating_add(spur_core::job::LAUNCH_LIFETIME_MS),
+            command_digest: command_digest(params),
         })
         .await
         .map_err(|s| match s.code() {
@@ -4099,6 +4141,39 @@ mod tests {
             type InteractiveSessionStream =
                 tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
 
+            async fn request_node_ledger(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+                ))
+            }
+
+            async fn fence_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms: 0,
+                }))
+            }
+
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }))
+            }
+
             async fn start_job(
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
@@ -4637,6 +4712,7 @@ mod tests {
                 NodeSource::NativeHost,
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -4663,6 +4739,7 @@ mod tests {
                 version: String::new(),
                 labels: HashMap::new(),
                 source: NodeSource::NativeHost,
+                runs_job_epilog: false,
             });
             let n = name.to_string();
             wait_for(
@@ -5858,6 +5935,7 @@ mod tests {
                 },
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -6399,8 +6477,13 @@ mod tests {
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
 
-            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
-                .expect("a stale eviction must be a no-op, not an error");
+            cm.evict_job_attempt(
+                job_id,
+                Some(current.wrapping_sub(1)),
+                Some("stale".into()),
+                spur_core::job::PendingReason::JobLaunchFailure,
+            )
+            .expect("a stale eviction must be a no-op, not an error");
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(

@@ -2389,6 +2389,7 @@ impl SlurmController for ControllerService {
                 source,
                 req.labels,
                 caller_privileged,
+                req.runs_job_epilog,
             )
             .map_err(register_node_rpc_status)?;
 
@@ -7187,6 +7188,24 @@ mod tests {
         ) -> Result<Response<spur_proto::proto::LaunchJobResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
+        async fn request_node_ledger(
+            &self,
+            _request: Request<spur_proto::proto::RequestNodeLedgerRequest>,
+        ) -> Result<Response<spur_proto::proto::RequestNodeLedgerResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn fence_run(
+            &self,
+            _request: Request<spur_proto::proto::FenceRunRequest>,
+        ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn settle_run(
+            &self,
+            _request: Request<spur_proto::proto::SettleRunRequest>,
+        ) -> Result<Response<spur_proto::proto::SettleRunResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
         async fn ping(
             &self,
             _request: Request<()>,
@@ -7879,6 +7898,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("update recovery probe address");
     }
@@ -7902,6 +7922,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point the node at its probe agent");
         for _ in 0..200 {
@@ -8186,6 +8207,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point n1 at its live probe agent");
 
@@ -8206,6 +8228,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("register the untouched peer");
         for name in ["n1", "n2"] {
@@ -8527,6 +8550,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -8752,6 +8776,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -8921,6 +8946,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -9325,6 +9351,7 @@ mod tests {
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
         }
@@ -9431,6 +9458,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -9818,6 +9846,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -9902,6 +9931,7 @@ mod tests {
                     NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
             svc.cluster
@@ -10037,6 +10067,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         svc.cluster
@@ -10120,6 +10151,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
     }
@@ -11487,6 +11519,7 @@ mod tests {
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
         }
@@ -12102,6 +12135,8 @@ mod tests {
                         reason: None,
                         labels: Default::default(),
                         remove_labels: Vec::new(),
+                        reconcile: false,
+                        caller: String::new(),
                     });
                     r.extensions_mut().insert(viewer("mallory", false));
                     r.extensions_mut().insert(slot.clone());
