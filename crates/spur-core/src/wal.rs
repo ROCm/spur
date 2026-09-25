@@ -153,14 +153,8 @@ pub enum WalOperation {
         #[serde(default)]
         run_attempt: u32,
     },
-    /// Preempt a running job and requeue it in one atomic step: free its node
-    /// allocation, end the prior run for accounting (as PREEMPTED), return it to
-    /// Pending, and hold it ineligible until `begin_time` so the scheduler can't
-    /// re-dispatch it into its own in-flight kill. A single committed entry
-    /// leaves the job Pending-with-hold and nodes freed, so a leadership change
-    /// or restart mid-sequence cannot strand it in PREEMPTED. `begin_time` is
-    /// the leader-computed absolute instant (already max'd against any user
-    /// `--begin`); followers apply it verbatim and re-apply is a NoOp.
+    /// End a running job's run as PREEMPTED and return it to Pending, held until
+    /// the leader-computed `begin_time`. Deferred while an epilog owes a slice.
     JobPreemptRequeue {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
