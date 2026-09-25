@@ -553,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
         &stepd_state_dir,
         &hostname,
     ));
+    reporter.set_runs_job_epilog(agent_server::runs_job_epilog(&hooks_config));
 
     // Register with controller
     reporter.register().await?;
