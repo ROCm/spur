@@ -1135,7 +1135,8 @@ async fn settle_cancelled_runs(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
+    let store = admissions.clone();
+    let Ok(Ok(loaded)) = tokio::task::spawn_blocking(move || store.load_all()).await else {
         return;
     };
     for admitted in loaded.runs {
@@ -1170,7 +1171,8 @@ async fn release_due_allocations(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
+    let store = admissions.clone();
+    let Ok(Ok(loaded)) = tokio::task::spawn_blocking(move || store.load_all()).await else {
         return;
     };
     for admitted in loaded.runs {
