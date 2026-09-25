@@ -681,6 +681,14 @@ impl AdmissionStore {
         &self.root
     }
 
+    /// Whether two handles serialize on the same per-run lock table. A clone
+    /// shares it; a separately-constructed instance never does, even against
+    /// the same `root` -- exactly the distinction callers must not get wrong.
+    #[cfg(test)]
+    pub(crate) fn shares_lock_table_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.run_locks, &other.run_locks)
+    }
+
     /// The mutex for one run's identity, created on first use. Held for a
     /// whole load-mutate-write cycle, never just the write.
     fn run_lock(&self, run_key: RunKey) -> Arc<Mutex<()>> {

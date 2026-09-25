@@ -1136,8 +1136,16 @@ async fn settle_cancelled_runs(
     admissions: &crate::admission::AdmissionStore,
 ) {
     let store = admissions.clone();
-    let Ok(Ok(loaded)) = tokio::task::spawn_blocking(move || store.load_all()).await else {
-        return;
+    let loaded = match tokio::task::spawn_blocking(move || store.load_all()).await {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(error)) => {
+            warn!(%error, "failed to load the admission ledger; skipping cancelled-run settlement this tick");
+            return;
+        }
+        Err(error) => {
+            warn!(%error, "admission-ledger load task failed; skipping cancelled-run settlement this tick");
+            return;
+        }
     };
     for admitted in loaded.runs {
         let run = &admitted.run;
@@ -1172,8 +1180,16 @@ async fn release_due_allocations(
     admissions: &crate::admission::AdmissionStore,
 ) {
     let store = admissions.clone();
-    let Ok(Ok(loaded)) = tokio::task::spawn_blocking(move || store.load_all()).await else {
-        return;
+    let loaded = match tokio::task::spawn_blocking(move || store.load_all()).await {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(error)) => {
+            warn!(%error, "failed to load the admission ledger; skipping due-release sweep this tick");
+            return;
+        }
+        Err(error) => {
+            warn!(%error, "admission-ledger load task failed; skipping due-release sweep this tick");
+            return;
+        }
     };
     for admitted in loaded.runs {
         let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
@@ -20985,6 +21001,38 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         )
+    }
+
+    /// `AgentService::admissions()` must reuse the single instance startup
+    /// wires in, not build a fresh one per call -- a second instance would
+    /// carry its own unshared per-run lock table and serialize against nothing.
+    #[tokio::test]
+    async fn admissions_reuses_the_reporters_shared_store() {
+        let reporter = test_reporter();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::admission::AdmissionStore::new(state_dir.path(), "test-node");
+        reporter.set_admissions(store);
+        let svc = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        assert!(
+            svc.admissions().shares_lock_table_with(&svc.admissions()),
+            "two calls to admissions() must share one lock table once startup has wired one"
+        );
+    }
+
+    /// Documents the fallback's real cost: a reporter nothing ever wired an
+    /// admission store into hands back an unshared instance on every call.
+    #[tokio::test]
+    async fn admissions_without_startup_wiring_does_not_share_a_lock_table() {
+        let svc = ledger_agent();
+        assert!(
+            !svc.admissions().shares_lock_table_with(&svc.admissions()),
+            "an unwired reporter's fallback must not appear to share a lock table it never had"
+        );
     }
 
     #[tokio::test]
