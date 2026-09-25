@@ -265,6 +265,50 @@ class TestJobLifecycle:
         assert "MULTIVAR=world456" in content, f"output:\n{content}"
 
 
+def _sbatch_held(cluster, name: str, run_as: str | None = None) -> str:
+    """Held jobs stay pending, so they are still queued when the test looks."""
+    script = cluster.write_file(f"{name}.sh", "#!/bin/bash\necho HELD\n")
+    sbatch = ["sbatch", "-J", name, "-N", "1", "-H", script]
+    return cluster.cli_as_user(run_as, sbatch) if run_as else cluster.cli(sbatch)
+
+
+def _job_ids(squeue_out: str) -> set[int]:
+    """Anything but job IDs fails, so an error message can't pass as an empty queue."""
+    tokens = squeue_out.split()
+    assert all(t.isdigit() for t in tokens), f"expected only job IDs:\n{squeue_out}"
+    return {int(t) for t in tokens}
+
+
+class TestQueueMe:
+    """``squeue --me`` filters to the invoking account, like ``-u <username>``."""
+
+    def test_me_lists_own_job(self, cluster):
+        job_id = parse_job_id(_sbatch_held(cluster, "me-own"))
+        assert job_id is not None
+        try:
+            assert job_id in _job_ids(cluster.squeue(["--me", "-h", "-o", "%i"]))
+            # The later of -u and --me wins, as in Slurm.
+            last_wins = cluster.squeue(["-u", "no-such-user", "--me", "-h", "-o", "%i"])
+            assert job_id in _job_ids(last_wins)
+        finally:
+            cluster.scancel(job_id)
+
+    def test_me_hides_another_accounts_job(self, cluster):
+        # Any account but the harness's own; nobody stands in when the harness is root.
+        other = "nobody" if cluster.nodes[0].user == "root" else "root"
+        out = _sbatch_held(cluster, "me-other", run_as=other)
+        job_id = parse_job_id(out)
+        assert job_id is not None, f"sbatch as {other} failed: {out}"
+        try:
+            # Visible without --me, so its absence below comes from the filter.
+            assert job_id in _job_ids(cluster.squeue(["-h", "-o", "%i"]))
+            assert job_id not in _job_ids(cluster.squeue(["--me", "-h", "-o", "%i"]))
+            last_wins = cluster.squeue(["-u", "no-such-user", "--me", "-h", "-o", "%i"])
+            assert job_id not in _job_ids(last_wins)
+        finally:
+            cluster.cli_as_user(other, ["scancel", str(job_id)])
+
+
 class TestArrayDependencies:
     """Array submission returns a parent placeholder id P; the individual task
     jobs get ids P+1, P+2, ... each carrying array_job_id=P. These tests assert

@@ -46,6 +46,10 @@ Common flags:
    * - ``--user``
      - ``-u``
      - Show only this user's jobs.
+   * - ``--me``
+     -
+     - Show only your own jobs (same as ``-u`` with your username). If both
+       ``--me`` and ``-u`` are given, the last one wins.
    * - ``--partition``
      - ``-p``
      - Filter by partition.
@@ -74,6 +78,13 @@ Common flags:
    * - ``--noheader``
      - ``-h``
      - Omit the header line.
+
+.. note::
+
+   ``--me`` looks up your username on the machine you run it from. If your
+   login token names a different user than your local account, pass ``-u``
+   with the token's name instead: ``--me`` would list the local account's
+   jobs, or nothing when your site sets ``private_data = ["jobs"]``.
 
 When ``--states`` is omitted the default filter is **PENDING, RUNNING,
 SUSPENDED, COMPLETING**.
@@ -151,6 +162,7 @@ is a normalized float, ``%Q`` the integer); Spur exposes the integer under both.
 .. code-block:: bash
 
    spur queue -u alice -t R
+   squeue --me -t PD
    squeue -p gpu -o "%.18i %.9P %.8T %.10M %R"
    squeue --states=PD,R --noheader
 
