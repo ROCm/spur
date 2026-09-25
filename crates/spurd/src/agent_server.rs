@@ -5393,45 +5393,59 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let launch_script =
-            if use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script) {
-                // Write the user script to disk first so the wrapper can reference it
-                let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
-                std::fs::write(&user_script_path, &launch_script)
-                    .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &user_script_path,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
-                }
+        let fan_out =
+            use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+        // A script that launches its own steps is a driver, not a rank, so it must
+        // not be given a rank's environment.
+        let script_is_a_rank = spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
+        let launch_script = if fan_out || script_is_a_rank {
+            // Write the user script to disk first so the wrapper can reference it
+            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
+            std::fs::write(&user_script_path, &launch_script)
+                .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &user_script_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
 
-                if spec.mpi == MPI_PMIX {
-                    warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
-                    // The per-rank wrapper needs each rank's PMIx environment,
-                    // which only the process hosting the server can hand out.
-                    if let Some(pmix) = supervised_pmix.as_mut() {
-                        pmix.user_script_path = user_script_path.clone();
-                        launch_script
-                    } else {
-                        build_multi_task_pmix_wrapper(
-                            &user_script_path,
-                            tasks_per_node,
-                            pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                                Status::internal("missing PMIx per-rank env for multi-task launch")
-                            })?,
-                            Some(&spec.environment),
-                        )
-                        .map_err(Status::failed_precondition)?
-                    }
+            if !fan_out {
+                // A lone rank on this node still needs `env.sh` and the
+                // `PMIX_SERVER_URI` aliases the per-rank wrapper carries.
+                spur_core::task_launch::build_single_task_wrapper(
+                    &user_script_path,
+                    req.task_offset,
+                    Some(&spec.environment),
+                    false,
+                    true,
+                )
+            } else if spec.mpi == MPI_PMIX {
+                warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
+                // The per-rank wrapper needs each rank's PMIx environment,
+                // which only the process hosting the server can hand out.
+                if let Some(pmix) = supervised_pmix.as_mut() {
+                    pmix.user_script_path = user_script_path.clone();
+                    launch_script
                 } else {
-                    build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+                    build_multi_task_pmix_wrapper(
+                        &user_script_path,
+                        tasks_per_node,
+                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                            Status::internal("missing PMIx per-rank env for multi-task launch")
+                        })?,
+                        Some(&spec.environment),
+                    )
+                    .map_err(Status::failed_precondition)?
                 }
             } else {
-                launch_script
-            };
+                build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+            }
+        } else {
+            launch_script
+        };
 
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
@@ -6831,7 +6845,10 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
-        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
+        // A lone PMIx rank needs the wrapper too: it carries `env.sh` and the
+        // `PMIX_SERVER_URI` aliases, which no other part of the launch applies.
+        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label || step_mpi
+        {
             let step_dir =
                 crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
                     .map_err(|e| {
@@ -6882,10 +6899,12 @@ impl SlurmAgent for AgentService {
                     ))
                 }
             } else {
-                Some(spur_core::task_launch::build_labeled_single_task_wrapper(
+                Some(spur_core::task_launch::build_single_task_wrapper(
                     user_script_path.to_string_lossy().as_ref(),
                     req.task_offset,
                     Some(&req.environment),
+                    req.label,
+                    step_mpi,
                 ))
             };
             if let Some(wrapper) = wrapper {
