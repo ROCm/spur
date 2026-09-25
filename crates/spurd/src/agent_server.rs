@@ -18272,9 +18272,9 @@ mod tests {
         );
     }
 
-    // A TTL reclaim racing the tail of `register_job_allocation` must fail the
-    // call, not report success over a reservation that no longer exists.
-    #[tokio::test]
+    // A TTL reclaim racing the tail of `register_job_allocation` must fail it.
+    // current_thread is load-bearing: it makes the interleaving below deterministic.
+    #[tokio::test(flavor = "current_thread")]
     async fn register_job_allocation_fails_when_the_ttl_reclaims_it_mid_flight() {
         let svc = Arc::new(AgentService::new(
             test_reporter(),
