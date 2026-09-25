@@ -1523,6 +1523,10 @@ enum DispatchError {
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
+    /// The agent refused on policy/credential grounds that won't change on retry
+    /// (`allow_root_jobs`, uid/credential mismatch — `PermissionDenied` on the wire).
+    /// The controller holds the job with the reason rather than looping the backoff.
+    PermanentlyRejected(String),
     Other(anyhow::Error),
 }
 
@@ -1536,6 +1540,7 @@ impl DispatchError {
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
+            Self::PermanentlyRejected(_) => "agent refused launch (permanent)",
             Self::Other(_) => "dispatch error",
         }
     }
@@ -1553,6 +1558,7 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::PermanentlyRejected(reason) => write!(f, "agent refused job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1736,6 +1742,11 @@ async fn dispatch_to_agent(
             // the operator looking for a network fault that does not exist.
             tonic::Code::NotFound | tonic::Code::FailedPrecondition => {
                 DispatchError::AgentRejected(s.message().to_string())
+            }
+            // A policy/credential denial (allow_root_jobs, uid mismatch) fails the same
+            // on every retry, so mark it permanent — the handler holds instead of looping.
+            tonic::Code::PermissionDenied => {
+                DispatchError::PermanentlyRejected(s.message().to_string())
             }
             _ => DispatchError::Other(s.into()),
         })?;
@@ -2079,6 +2090,7 @@ async fn confirm_dispatch_on_nodes(
     let mut successes = 0u32;
     let mut failures = 0u32;
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
+    let mut permanent_rejection: Option<String> = None;
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
 
@@ -2319,6 +2331,11 @@ async fn confirm_dispatch_on_nodes(
                     // Held for the deadline it actually burned: while assignments are processed
                     // serially, re-picking this node stalls every job behind it, not just this one.
                     DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
+                    // The node is healthy; the launch itself is the problem — keep the
+                    // reason (first one wins) but do not cool down or drain the node.
+                    DispatchError::PermanentlyRejected(reason) => {
+                        permanent_rejection.get_or_insert(reason);
+                    }
                     DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
@@ -2385,7 +2402,19 @@ async fn confirm_dispatch_on_nodes(
         }
     }
 
-    if !prolog_failed.is_empty() && cluster.config().controller.hold_on_prolog_fail {
+    if let Some(reason) = permanent_rejection {
+        // Retrying can never succeed, so hold now instead of burning the requeue budget.
+        // Surface the agent's raw reason (e.g. "allow_root_jobs is false") over the
+        // category so the operator sees what to change; interactive jobs cancel instead.
+        let _ = cluster.set_job_launch_failure_detail(job_id, reason.clone());
+        if spec.interactive {
+            if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+                error!(job_id, error = %e, "failed to cancel interactive job after permanent dispatch rejection");
+            }
+        } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&reason)) {
+            error!(job_id, error = %e, "failed to hold job after permanent dispatch rejection");
+        }
+    } else if !prolog_failed.is_empty() && cluster.config().controller.hold_on_prolog_fail {
         if spec.interactive {
             // Holding an interactive job would strand its waiting srun forever
             // with nothing to wait for; Slurm cancels these too.
@@ -5419,6 +5448,54 @@ mod tests {
                 job.state_reason().contains("agent rejected launch"),
                 "an explicit non-prolog rejection must get its own category, got {:?}",
                 job.state_reason()
+            );
+        }
+
+        // A permanent denial (agent PermissionDenied, e.g. `[auth] allow_root_jobs`)
+        // can never succeed on retry: hold the job with the real reason on the first
+        // failure rather than burning the requeue budget, and never drain the node.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_permanent_rejection_holds_the_job_without_retrying_or_draining() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_rejecting_with_status(tonic::Status::permission_denied(
+                "refusing to execute as uid 0: the job requested root and spurd is running as \
+                 root, but [auth] allow_root_jobs is false",
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("root-denied", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(
+                job.pending_reason,
+                PendingReason::Held,
+                "a permanent rejection holds the job, it must not back off as JobLaunchFailure"
+            );
+            assert_eq!(job.priority, 0);
+            assert_eq!(
+                job.requeue_count, 0,
+                "a rejection that can never succeed must not consume the requeue budget"
+            );
+            assert!(
+                job.state_reason().contains("allow_root_jobs"),
+                "the held reason must surface the agent's actual denial, got {:?}",
+                job.state_reason()
+            );
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "a policy denial is the job's fault, not the node's — the node must not drain"
+            );
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "a held job must not be scheduled anywhere, closing the retry loop for good"
             );
         }
 
