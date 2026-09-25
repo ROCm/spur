@@ -166,7 +166,8 @@ Fields are comma-separated, each ``type[:[.][size][suffix]]``:
 - ``suffix`` is arbitrary text appended after the field, e.g. a separator.
 
 Field names are case-insensitive and render the same data as their ``%``-letter
-equivalents. ``-O`` takes precedence over ``-o`` when both are given.
+equivalents. ``-O`` and ``-o``/``--format`` are mutually exclusive; passing both
+is an error, matching Slurm.
 
 .. code-block:: bash
 
@@ -181,11 +182,13 @@ Supported field names: ``Account``, ``ArrayJobID``, ``Command``, ``Comment``,
 ``TimeUsed``, ``UserName``, ``WorkDir``.
 
 Slurm exposes many more ``-O`` fields that Spur has no backing data for
-(``Licenses``, ``Dependency``, ``Nice``, ``Reboot``, the ``tres-*`` family,
-federation fields, job-step fields, and others). Requesting an unsupported name
-is an error rather than a blank column. ``Priority`` renders Spur's integer
-priority (same as ``PriorityLong``); Spur does not compute Slurm's normalized
-0.0-1.0 float.
+(``Licenses``, ``Dependency``, ``Nice``, ``Reboot``, most of the ``tres-*``
+family, federation fields, job-step fields, and others). Requesting an
+unsupported name is an error listing the supported fields, rather than the
+blank column Slurm prints. This is a deliberate divergence: fail fast on a
+typo instead of silently emitting an empty column. ``Priority`` renders Spur's
+integer priority (same as ``PriorityLong``); Spur does not compute Slurm's
+normalized 0.0-1.0 float.
 
 Projected Start Times — ``squeue --start``
 -------------------------------------------
