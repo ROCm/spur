@@ -710,6 +710,21 @@ async fn claim_stepd_slot(
     Ok(())
 }
 
+/// Runs `record_supervisor` off the executor thread: it fsyncs through the
+/// same per-run lock as every other admission write, so it must not block
+/// whatever thread this is awaited from.
+async fn record_supervisor_off_executor(
+    admissions: &crate::admission::AdmissionStore,
+    run_key: RunKey,
+    step_id: spur_core::step::StepId,
+    supervisor: crate::admission::SupervisorRef,
+) -> std::io::Result<bool> {
+    let admissions = admissions.clone();
+    tokio::task::spawn_blocking(move || admissions.record_supervisor(run_key, step_id, supervisor))
+        .await
+        .map_err(|error| std::io::Error::other(format!("record_supervisor task failed: {error}")))?
+}
+
 /// True when `job_id`'s stepd is already tracked under the exact
 /// same `run_attempt` — a retried LaunchJob for an attempt already alive on
 /// this node, not a genuine new dispatch.
@@ -5272,8 +5287,25 @@ impl Drop for LaunchReservationGuard {
             warn!(%run, "an aborted launch left a payload running; its slice stays held");
             return;
         }
-        if let Err(error) = self.admissions.remove_run(run) {
-            warn!(%run, %error, "failed to drop the admission record of an aborted launch");
+        // `remove_run` fsyncs through the same per-run std::sync::Mutex as every
+        // other admission write, so it must never run inline on whatever thread
+        // Drop executes on (often a tokio worker) — unlike the allocation
+        // release below, which is pure in-memory and safe on this thread.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let admissions = self.admissions.clone();
+            handle.spawn(async move {
+                let removed = tokio::task::spawn_blocking(move || admissions.remove_run(run))
+                    .await
+                    .map_err(|error| {
+                        std::io::Error::other(format!("admission cleanup task failed: {error}"))
+                    })
+                    .and_then(std::convert::identity);
+                if let Err(error) = removed {
+                    warn!(%run, %error, "failed to drop the admission record of an aborted launch");
+                }
+            });
+        } else {
+            warn!(%run, "could not drop the admission record of an aborted launch; it stays held");
         }
         if let Ok(mut alloc) = self.allocation.try_lock() {
             alloc.release_job(ReleaseWarrant::never_spawned(run));
@@ -6995,7 +7027,8 @@ impl SlurmAgent for AgentService {
                 // launch must leave the slice held rather than hand it back.
                 reservation_guard.mark_spawned();
                 if let Some(ref descriptor) = runtime_descriptor {
-                    if let Err(error) = admissions.record_supervisor(
+                    if let Err(error) = record_supervisor_off_executor(
+                        &admissions,
                         run_key,
                         launch_step,
                         crate::admission::SupervisorRef {
@@ -7003,7 +7036,9 @@ impl SlurmAgent for AgentService {
                             start_ticks: descriptor.process_start_ticks,
                             boot_id: crate::admission::current_boot_id(),
                         },
-                    ) {
+                    )
+                    .await
+                    {
                         error!(job_id, run_attempt, %error,
                             "failed to record the supervisor identity; this run's slice is \
                              held until the agent restarts");
@@ -7828,7 +7863,8 @@ impl SlurmAgent for AgentService {
 
             // Names who answers for this run's hooks. Unrecorded, no ledger can
             // answer for them, so the gate holds until a restart settles it.
-            if let Err(error) = admissions.record_supervisor(
+            if let Err(error) = record_supervisor_off_executor(
+                &admissions,
                 alloc_run,
                 spur_core::step::STEP_EXTERN,
                 crate::admission::SupervisorRef {
@@ -7836,7 +7872,9 @@ impl SlurmAgent for AgentService {
                     start_ticks: descriptor.process_start_ticks,
                     boot_id: crate::admission::current_boot_id(),
                 },
-            ) {
+            )
+            .await
+            {
                 error!(job_id = req.job_id, %error,
                     "failed to record the supervisor identity; this allocation's slice is \
                      held until the agent restarts");
