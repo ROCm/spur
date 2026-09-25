@@ -292,7 +292,555 @@ pub(crate) fn resolve_startup_jwt_key(
     Ok("spur-default-key".to_string())
 }
 
+/// How long a controller waits for its own log replay before treating an
+/// absence in cluster state as evidence rather than ignorance.
+const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a node may stay gated for one reconcile. A node held past this is
+/// worse than one reconciled imperfectly: it is silently out of the cluster.
+const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Releases a node's reconcile gate however the reconcile ends, including a
+/// panic: a gate that only clears on success removes the node permanently.
+struct ReconcileGate {
+    cluster: Arc<ClusterManager>,
+    node: String,
+}
+
+impl ReconcileGate {
+    fn new(cluster: Arc<ClusterManager>, node: String) -> Self {
+        Self { cluster, node }
+    }
+}
+
+impl Drop for ReconcileGate {
+    fn drop(&mut self) {
+        self.cluster.set_reconcile_pending(&self.node, false);
+    }
+}
+
+/// What one reconcile pass resolved. Settling is reported separately from
+/// cancelling because the apply layer drops a completion it considers stale.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconcileOutcome {
+    /// Direction A: claims the node held that Raft did not record.
+    pub cancelled: Vec<u32>,
+    /// Direction B: records the node stopped holding, that the apply accepted.
+    pub settled: Vec<u32>,
+    /// Direction A: finished runs Raft did not record, answered by releasing the
+    /// slice the agent was holding out for an acknowledgement to free.
+    pub released: Vec<u32>,
+    /// Direction A: claims neither side can account for. Nothing may end them and
+    /// nothing proves them over, so they are surfaced rather than acted on.
+    pub unresolved: Vec<u32>,
+}
+
+/// How the controller came by a cut. Under open admission neither one attests
+/// the node: a caller that can register may repoint the address a pull dials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutProvenance {
+    Pulled,
+    Registered,
+}
+
+/// Diff an agent's asserted ledger against Raft and resolve the differences.
+/// `dispatched` must predate the cut: it names launches that could postdate it.
+pub(crate) async fn reconcile_node_ledger(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: spur_proto::proto::NodeLedger,
+    dispatched: &crate::dispatch_tracker::DispatchWatch,
+    provenance: CutProvenance,
+) -> ReconcileOutcome {
+    reconcile_node_ledger_after(
+        cluster,
+        node,
+        ledger,
+        dispatched,
+        provenance,
+        cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT),
+    )
+    .await
+}
+
+/// What a cut licenses, established once for every direction. Built whole so a
+/// safety condition cannot be wired into one direction and forgotten in another.
+struct ReconcileLicense<'a> {
+    /// What the node asserts it is holding, keyed by the run, not the job: a
+    /// leaked attempt beside a recorded one is invisible to a job-keyed diff.
+    held: std::collections::HashMap<spur_core::job::RunKey, &'a spur_proto::proto::LedgerEntry>,
+    /// Whether something missing from `held` is evidence that the node let it
+    /// go. A cut the agent could not complete says nothing about what is absent.
+    absence_is_evidence: bool,
+    /// How the controller came by this cut, which is what decides whether it may
+    /// license an act or only be read for drift.
+    provenance: CutProvenance,
+    /// The agent lifetime that took the cut, so a direction acting over several
+    /// awaits can tell whether it is still the one this node is running.
+    session: &'a str,
+}
+
+impl ReconcileLicense<'_> {
+    /// Why the licence no longer holds. Re-checked between acts, since a premise
+    /// that lapsed mid-pass cannot undo what has already been done under it.
+    fn lapsed(&self, cluster: &ClusterManager, node: &str) -> Option<&'static str> {
+        if !cluster.is_raft_leader() {
+            return Some("no longer the leader");
+        }
+        if !cluster.agent_sessions().vouches_for(node, self.session) {
+            return Some("a later registration replaced the lifetime that took this cut");
+        }
+        None
+    }
+
+    /// Whether the controller can attest whoever produced this cut. Read per act
+    /// rather than fixed at the open: a mode revoked mid-pass licenses no more.
+    fn teardown_is_licensed(&self, cluster: &ClusterManager) -> bool {
+        match self.provenance {
+            CutProvenance::Pulled => true,
+            // Open admission lets any reachable host assert any hostname, so the
+            // cut names a node the controller has no way to place the caller at.
+            CutProvenance::Registered => matches!(
+                cluster.config().admission.mode,
+                spur_core::config::AdmissionMode::Token
+            ),
+        }
+    }
+}
+
+/// `None` when nothing may be acted on: a half-replayed log, or a cut whose
+/// lifetime a later registration replaced -- both settled before any sampling.
+async fn open_reconcile_license<'a>(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: &'a spur_proto::proto::NodeLedger,
+    provenance: CutProvenance,
+    replayed: impl std::future::Future<Output = bool>,
+) -> Option<ReconcileLicense<'a>> {
+    if !replayed.await {
+        warn!(
+            node = %node,
+            "controller has not replayed its own log; leaving this node's claims alone"
+        );
+        return None;
+    }
+    // Read after the wait, so a re-registration that landed while this pass was
+    // blocked is still seen to overtake the cut.
+    if !cluster
+        .agent_sessions()
+        .vouches_for(node, &ledger.agent_session_id)
+    {
+        warn!(
+            node = %node,
+            agent_session_id = %ledger.agent_session_id,
+            "a later registration replaced the agent lifetime that took this cut; discarding it"
+        );
+        return None;
+    }
+    let mut held = std::collections::HashMap::new();
+    let mut every_entry_named_a_run = true;
+    for entry in &ledger.entries {
+        match spur_core::job::RunKey::new(entry.job_id, entry.run_attempt) {
+            Some(run) => {
+                held.insert(run, entry);
+            }
+            // Nothing can be keyed on attempt 0, and a cut carrying one cannot
+            // be read as a complete account of what the node holds either.
+            None => {
+                warn!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    "agent reported a claim under run attempt 0; it names no run to act on"
+                );
+                every_entry_named_a_run = false;
+            }
+        }
+    }
+    Some(ReconcileLicense {
+        held,
+        absence_is_evidence: ledger.inventory_complete && every_entry_named_a_run,
+        provenance,
+        session: &ledger.agent_session_id,
+    })
+}
+
+/// Direction A: the node asserts a claim Raft has no record of. Reasons from a
+/// presence, which an incomplete cut does not weaken. Every such claim gets an
+/// answer -- ended, released, or named as one only an operator can clear.
+/// False when a claim went unanswered, leaving `outcome.unresolved` a part of
+/// this node's account rather than the whole of it.
+async fn answer_unrecorded_claims(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    license: &ReconcileLicense<'_>,
+    outcome: &mut ReconcileOutcome,
+) -> bool {
+    let recorded = cluster.jobs_allocated_on_node(node);
+    let mut answered_every_claim = true;
+    let mut link: crate::scheduler_loop::AgentLink = None;
+    for (run, entry) in license
+        .held
+        .iter()
+        .filter(|(run, _)| !recorded.contains(run))
+    {
+        // Both answers leave Raft behind -- a kill cannot be taken back and a
+        // release hands cores away -- so the premises are retaken before each.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's claims alone");
+            answered_every_claim = false;
+            break;
+        }
+        // Reported either way: an operator sees the drift even where the caller
+        // proved too little for the controller to act on it.
+        if !license.teardown_is_licensed(cluster) {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "unattested registration cannot license answering a claim; leaving it alone"
+            );
+            answered_every_claim = false;
+            continue;
+        }
+        let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
+        // Teardown is done and Raft has no record of the run, so the completion
+        // this claim is waiting on is one only this side can still give it.
+        if disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
+            // Said of the answer, never of the intent: an agent that declines --
+            // because a hook is still on the cores -- leaves the claim standing.
+            if crate::scheduler_loop::settle_run_on_node(cluster, node, *run, &mut link).await {
+                info!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    run_attempt = entry.run_attempt,
+                    "agent held a finished run the controller has no record of; released it"
+                );
+                outcome.released.push(entry.job_id);
+                continue;
+            }
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "agent would not release a finished run the controller has no record of"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        }
+        // "Cannot tell" is never "dead". Nothing here licenses ending the claim
+        // and nothing proves it is over, so it is named rather than acted on.
+        if disposition.is_some_and(spur_core::job::LedgerDisposition::already_accounted_for) {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                disposition = %entry.disposition,
+                "agent holds a claim it cannot resolve and the controller has no record of"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        }
+        warn!(
+            node = %node,
+            job_id = entry.job_id,
+            run_attempt = entry.run_attempt,
+            "agent holds a claim the controller has no record of; cancelling it"
+        );
+        crate::scheduler_loop::cancel_job_on_nodes(
+            cluster,
+            run.job_id(),
+            run.attempt().unwrap_or_default(),
+            std::slice::from_ref(&node.to_string()),
+            9,
+        )
+        .await;
+        outcome.cancelled.push(run.job_id());
+    }
+    answered_every_claim
+}
+
+/// As [`reconcile_node_ledger`], readiness taken unresolved so no part of the
+/// record can be read before it settles.
+async fn reconcile_node_ledger_after(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: spur_proto::proto::NodeLedger,
+    dispatched: &crate::dispatch_tracker::DispatchWatch,
+    provenance: CutProvenance,
+    replayed: impl std::future::Future<Output = bool>,
+) -> ReconcileOutcome {
+    let Some(license) = open_reconcile_license(cluster, node, &ledger, provenance, replayed).await
+    else {
+        return ReconcileOutcome::default();
+    };
+    let mut outcome = ReconcileOutcome::default();
+    let answered_every_claim =
+        answer_unrecorded_claims(cluster, node, &license, &mut outcome).await;
+
+    // Direction B: Raft records a run the agent did not report. Reasons from an
+    // absence, so it needs a complete cut and a run no launch of ours raced.
+    let raced_the_cut = dispatched.observed();
+    for run in cluster.jobs_confirmed_on_node(node) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        // Every settle below awaits a round trip, so the premises this pass
+        // opened on are at least that stale and have to be taken again.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's records alone");
+            break;
+        }
+        if license.held.contains_key(&run) {
+            continue;
+        }
+        if raced_the_cut.contains(&job_id) {
+            warn!(
+                node = %node,
+                job_id,
+                "this cut could not have seen the launch we were dispatching; leaving it alone"
+            );
+            continue;
+        }
+        if !license.absence_is_evidence {
+            warn!(
+                node = %node,
+                job_id,
+                "agent could not enumerate its state; leaving this job's record alone"
+            );
+            continue;
+        }
+        warn!(
+            node = %node,
+            job_id, run_attempt, "node no longer holds a job the controller placed on it"
+        );
+        // Reported either way: an operator sees the drift even where the caller
+        // proved too little for the controller to act on it.
+        if !license.teardown_is_licensed(cluster) {
+            warn!(
+                node = %node,
+                job_id,
+                "unattested registration cannot license settling a job; leaving its record alone"
+            );
+            continue;
+        }
+        if settle_vanished_run(cluster, node, job_id, run_attempt).await {
+            outcome.settled.push(job_id);
+        }
+    }
+
+    // Direction C: both agree the run exists but the slices differ. Correcting
+    // means rewriting the record the controller derives its totals from.
+    for entry in &ledger.entries {
+        if entry.conflict_hold {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                disposition = %entry.disposition,
+                "agent is holding evidence it cannot resolve on its own"
+            );
+        }
+    }
+
+    // A pass that answered only some of this node's claims knows a subset, and a
+    // subset may neither clear the reason nor rewrite it to a shorter list.
+    if answered_every_claim {
+        name_unresolved_claims_on_node(cluster, node, &license, &outcome);
+    }
+    outcome
+}
+
+/// End a run the node stopped holding, reporting whether the record took it.
+/// A refusal leaves the job placed here, which is not a settlement.
+async fn settle_vanished_run(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    if only_the_epilog_is_owed(cluster, job_id, node) {
+        return release_the_owed_epilog(cluster, node, job_id, run_attempt);
+    }
+    // The job ends on every node it spans, so the ranks still running on its
+    // peers have to be told before the record stops accounting for them.
+    let peers = peers_still_holding(cluster, job_id, node);
+    if !peers.is_empty() {
+        crate::scheduler_loop::cancel_job_on_nodes(cluster, job_id, run_attempt, &peers, 9).await;
+    }
+    // A run the node dropped reported no exit, so it is an eviction and not a
+    // failure: only that reading is eligible for the node-fault retry.
+    let detail = format!("node {node} no longer holds this job");
+    match cluster.evict_job_attempt(
+        job_id,
+        Some(run_attempt),
+        Some(detail),
+        spur_core::job::PendingReason::NodeDown,
+    ) {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(node = %node, job_id, "the eviction was not applied; this job stays recorded on the node");
+            false
+        }
+        Err(error) => {
+            warn!(node = %node, job_id, ?error, "could not settle a job the node no longer holds");
+            false
+        }
+    }
+}
+
+/// Whether the run is over and only the hook this node owes keeps its slice
+/// charged. Such a record has no eviction left to take, just a debt to discharge.
+fn only_the_epilog_is_owed(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    node: &str,
+) -> bool {
+    cluster
+        .get_job(job_id)
+        .is_some_and(|job| job.state.is_finalized() && job.is_epilog_gated_on(node))
+}
+
+/// The other nodes this run is still charged to, which a whole-job settle ends
+/// the work on.
+fn peers_still_holding(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    node: &str,
+) -> Vec<String> {
+    let Some(job) = cluster.get_job(job_id) else {
+        return Vec::new();
+    };
+    job.allocated_nodes
+        .iter()
+        .filter(|peer| peer.as_str() != node && job.is_held_on(peer))
+        .cloned()
+        .collect()
+}
+
+/// Answer the epilog a finalized run is still gated on here. Only the completion
+/// path ends that debt; an eviction has nothing left to evict.
+fn release_the_owed_epilog(
+    cluster: &ClusterManager,
+    node: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
+        Ok(crate::cluster::NodeCompleteResult::EpilogReleased) => true,
+        Ok(result) => {
+            warn!(node = %node, job_id, ?result, "the report was not applied; this job stays recorded on the node");
+            false
+        }
+        Err(error) => {
+            warn!(node = %node, job_id, ?error, "could not release an epilog the node no longer owes");
+            false
+        }
+    }
+}
+
+/// Marks the reason this pass owns, so a later pass can tell its own stale text
+/// from an operator's and clear only the former.
+const UNRESOLVED_CLAIM_REASON: &str = "holding claims the controller has no record of";
+
+/// Hold a node whose claims nobody can account for out of service: left
+/// schedulable it is picked every cycle and refuses every launch, indefinitely.
+fn name_unresolved_claims_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    license: &ReconcileLicense<'_>,
+    outcome: &ReconcileOutcome,
+) {
+    // Both directions took awaits, so the premises this pass opened on are at
+    // least that stale, and putting a node in or out of service is an act.
+    if let Some(reason) = license.lapsed(cluster, node) {
+        warn!(node = %node, reason, "leaving this node's reason alone");
+        return;
+    }
+    let Some(current) = cluster.get_node(node) else {
+        return;
+    };
+    // Power management owns this node's state and is not a fault to report over.
+    if current.state == spur_core::node::NodeState::Suspended {
+        return;
+    }
+    let existing = current.state_reason.as_deref().unwrap_or_default();
+    // Authorship, not state: the hold below is itself an admin hold, so without
+    // this the pass would be locked out of lifting the one it placed.
+    let mine = existing.starts_with(UNRESOLVED_CLAIM_REASON);
+    // A reason set anywhere else is somebody's, and its attribution goes with
+    // it; an admin hold with no text at all is theirs on the same grounds.
+    if !mine && (current.admin_locked || !existing.is_empty()) {
+        return;
+    }
+    // The ids come out of a map, so an unsorted list rewrites the same fact in a
+    // different order every pass and proposes a state change through Raft for it.
+    let mut claims = outcome.unresolved.clone();
+    claims.sort_unstable();
+    claims.dedup();
+    let wanted = match claims.as_slice() {
+        [] => String::new(),
+        claims => format!(
+            "{UNRESOLVED_CLAIM_REASON}: {}",
+            claims
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    };
+    if wanted.is_empty() {
+        release_unresolved_claim_hold(cluster, &current, mine, license);
+        return;
+    }
+    let target = claim_hold_state(&current);
+    if current.state == target && existing == wanted {
+        return;
+    }
+    // uid 0 so `sinfo -R` names the controller rather than an unknown user.
+    if let Err(error) = cluster.update_node_state(node, target, Some(wanted), Some(0)) {
+        warn!(node = %node, ?error, "could not hold the node for an unresolved claim");
+    }
+}
+
+/// Where a held node's state goes. A node another subsystem already took out of
+/// service keeps that state, so only the reason and the hold move.
+fn claim_hold_state(node: &spur_core::node::Node) -> spur_core::node::NodeState {
+    match node.state {
+        spur_core::node::NodeState::Down | spur_core::node::NodeState::Error => node.state,
+        _ if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() => {
+            spur_core::node::NodeState::Draining
+        }
+        _ => spur_core::node::NodeState::Drain,
+    }
+}
+
+/// Put a node back in service once its claims are answered. Lifting a hold is an
+/// inference from absence, so it needs the premises a settle needs, and the tag.
+fn release_unresolved_claim_hold(
+    cluster: &Arc<ClusterManager>,
+    current: &spur_core::node::Node,
+    mine: bool,
+    license: &ReconcileLicense<'_>,
+) {
+    if !mine || !license.absence_is_evidence || !license.teardown_is_licensed(cluster) {
+        return;
+    }
+    if let Err(error) = cluster.release_controller_hold(&current.name) {
+        warn!(node = %current.name, ?error, "could not return the node to service");
+    }
+}
+
 impl ControllerService {
+    /// On its own task: the heartbeat must not wait on an RPC back to the node,
+    /// and the node's alternative is the routine sweep, an hour away.
+    fn pull_ledger_for_asking_node(&self, node: String) {
+        if !self.cluster.claim_ledger_pull_slot(&node) {
+            return;
+        }
+        info!(node = %node, "node asked to be reconciled; pulling its ledger");
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::pull_node_ledger(&cluster, &node, "node asked").await;
+        });
+    }
+
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
     fn check_leader<T: prost::Message>(&self, request: &Request<T>) -> Result<(), Status> {
@@ -1974,6 +2522,10 @@ impl SlurmController for ControllerService {
 
         let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
+        if req.reconcile {
+            crate::scheduler_loop::pull_node_ledger(&self.cluster, &req.name, "operator audit")
+                .await;
+        }
         let node_state = match parsed {
             Some(None) => return Err(Status::invalid_argument("invalid node state")),
             other => other.flatten(),
@@ -2375,6 +2927,17 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
+        // A node the controller has never seen has no record to carry the
+        // gate yet, so a first registration sets it below instead.
+        let ledger = req.ledger.clone();
+        // The agent took this cut before it called, so the watch can only cover
+        // launches still on the wire now -- the best this direction allows.
+        let dispatched = self.cluster.dispatch_tracker().watch(&req.hostname);
+        let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
+        if known_before {
+            self.cluster.set_reconcile_pending(&req.hostname, true);
+        }
+
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
             .register_node(
@@ -2392,6 +2955,48 @@ impl SlurmController for ControllerService {
                 req.runs_job_epilog,
             )
             .map_err(register_node_rpc_status)?;
+
+        // A first registration builds the node record from scratch, which is
+        // also the earliest moment the gate has anything to be recorded on.
+        if ledger.is_some() && !known_before {
+            self.cluster.set_reconcile_pending(&req.hostname, true);
+        }
+
+        // Recorded only once the registration has been accepted, and before the
+        // reconcile below: a rejected one must disown no other lifetime.
+        self.cluster.agent_sessions().observe_registration(
+            &req.hostname,
+            ledger
+                .as_ref()
+                .map(|l| l.agent_session_id.as_str())
+                .unwrap_or_default(),
+        );
+
+        if let Some(ledger) = ledger {
+            let node = req.hostname.clone();
+            let cluster = self.cluster.clone();
+            let cluster_for_reconcile = self.cluster.clone();
+            // On its own task: tonic drops a handler future when the client
+            // disconnects, and a gate left set removes the node for good.
+            tokio::spawn(async move {
+                let _gate = ReconcileGate::new(cluster, node.clone());
+                if tokio::time::timeout(
+                    RECONCILE_BUDGET,
+                    reconcile_node_ledger(
+                        &cluster_for_reconcile,
+                        &node,
+                        ledger,
+                        &dispatched,
+                        CutProvenance::Registered,
+                    ),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(node = %node, "reconcile did not finish within its budget");
+                }
+            });
+        }
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -2582,6 +3187,9 @@ impl SlurmController for ControllerService {
             self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
+            }
+            if req.needs_reconcile {
+                self.pull_ledger_for_asking_node(req.hostname.clone());
             }
             Ok(Response::new(HeartbeatResponse {}))
         } else {
