@@ -417,6 +417,7 @@ class SpurCluster:
         parts = [
             f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            f"SPUR_CONF={shlex.quote(self.etc_dir)}/spur.conf",
         ]
         for key, value in self.cli_env.items():
             parts.append(f"{key}={shlex.quote(str(value))}")
@@ -1065,6 +1066,55 @@ class SpurCluster:
             )
             if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
                 pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
+        return remote_bin
+
+    def rccl_preflight(self, min_nodes: int = 1) -> tuple[str, str]:
+        """Skip unless the nodes already carry the ROCm toolchain RCCL needs.
+
+        Provisioning belongs to the host image; this only reports what is absent.
+        Returns node 0's hipcc and ROCm include root, which the build needs.
+        """
+        self.gpu_preflight(min_nodes)
+        self.mpi_preflight(min_nodes)
+
+        include_probe = (
+            'for d in "${ROCM_PATH:-/opt/rocm}/include" /opt/rocm/include; do '
+            '[ -f "$d/rccl/rccl.h" ] && { echo "$d"; break; }; done'
+        )
+        missing: list[str] = []
+        paths: list[tuple[str, str]] = []
+        for i in range(min(min_nodes, len(self.nodes))):
+            node, name = self.nodes[i], self.node_names[i]
+            hipcc = node.exec_allow_fail("command -v hipcc").strip()
+            include = node.exec_allow_fail(include_probe).strip()
+            paths.append((hipcc, include))
+            if not hipcc:
+                missing.append(f"hipcc on {name}")
+            if not include:
+                missing.append(f"rccl/rccl.h on {name}")
+            if not node.exec_allow_fail("ldconfig -p | grep -q librccl && echo y").strip():
+                missing.append(f"librccl on {name}")
+
+        if missing:
+            pytest.skip("RCCL toolchain missing: " + "; ".join(missing))
+        return paths[0]
+
+    def compile_rccl_fixture(self, source_name: str = "rccl_all_reduce.c") -> str:
+        """Build the MPI+RCCL fixture on every node, with that node's own toolchain."""
+        hipcc, rocm_include = self.rccl_preflight(len(self.nodes))
+        self.ship_fixture(source_name)
+        remote_src = f"{self.remote_dir}/{source_name}"
+        remote_bin = remote_src.rsplit(".", 1)[0]
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        # OMPI_CC points the MPI wrapper at hipcc, so it contributes its own include
+        # and link flags. The macro is needed because this payload is plain C.
+        build = (
+            f"OMPI_CC={shlex.quote(hipcc)} {shlex.quote(mpicc)} "
+            f"-o {shlex.quote(remote_bin)} {shlex.quote(remote_src)} "
+            f"-I{shlex.quote(rocm_include)} -D__HIP_PLATFORM_AMD__ -lrccl"
+        )
+        for node in self.nodes:
+            node.exec(build)
         return remote_bin
 
     def mpi_plugin_dir(self) -> str:
