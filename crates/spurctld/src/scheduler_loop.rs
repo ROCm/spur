@@ -263,6 +263,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
+        cluster.requeue_stranded_preempted_jobs();
         cluster.evict_expired_terminal_jobs();
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
@@ -962,6 +963,7 @@ pub(crate) async fn try_preempt(
     use spur_core::reservation::job_runs_in_active_reservation;
 
     let now = chrono::Utc::now();
+    cluster.discharge_preempt_debt();
     let reservations = cluster.get_reservations();
     let cluster_nodes = cluster.get_nodes();
 
@@ -1004,6 +1006,11 @@ pub(crate) async fn try_preempt(
         .collect();
 
     for pending in unscheduled {
+        // A victim taken last cycle can still be handing its slice back through
+        // an epilog; taking a second one now kills a job for nothing.
+        if cluster.owed_a_preempted_slice(pending.job_id) {
+            continue;
+        }
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
@@ -1093,6 +1100,7 @@ pub(crate) async fn try_preempt(
                     continue;
                 }
             }
+            cluster.record_preempt_debt(pending.job_id, candidate.job_id);
             break; // One preemption per cycle, re-evaluate next cycle
         }
     }
