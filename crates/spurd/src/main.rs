@@ -547,6 +547,13 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
     ));
 
+    // Wired before registration so the first cut carries this node's claims:
+    // registering with no ledger tells the controller it has no evidence.
+    reporter.set_admissions(spurd::admission::AdmissionStore::new(
+        &stepd_state_dir,
+        &hostname,
+    ));
+
     // Register with controller
     reporter.register().await?;
 
