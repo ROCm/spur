@@ -1798,9 +1798,21 @@ impl StepdRecoveryCleanup {
             &self.stepds,
             descriptor,
             "controller-rejected",
+            ReleaseTiming::Immediate,
         )
         .await;
     }
+}
+
+/// When a step's physical slice may be freed, relative to its tracking removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseTiming {
+    /// Free the slice now: nothing here was ever admitted past this point, so
+    /// deferring would strand it forever instead of releasing it promptly.
+    Immediate,
+    /// Leave the slice held; only the admission ledger's own release (once it
+    /// proves the run is actually settled) may free it.
+    DeferredToLedger,
 }
 
 async fn release_stepd_tracking(
@@ -1809,6 +1821,7 @@ async fn release_stepd_tracking(
     stepds: &Arc<Mutex<StepdMap>>,
     descriptor: &crate::stepd::StepdDescriptor,
     reason: &'static str,
+    timing: ReleaseTiming,
 ) -> bool {
     // The allocation outlives the individual steps drawing on it, so only the
     // job's last supervisor releases it. Held across the release so a step
@@ -1838,12 +1851,14 @@ async fn release_stepd_tracking(
             // The stepd supervising this run is exiting locally (normal exit,
             // crash, rejection, or an unreleasable step/session); the ledger
             // ack that fully settles the run is handled separately.
-            let run = RunKey::new(descriptor.job_id, descriptor.run_attempt)
-                .unwrap_or_else(|| RunKey::any_attempt(descriptor.job_id));
-            allocation
-                .lock()
-                .await
-                .release_job(ReleaseWarrant::teardown_complete(run));
+            if timing == ReleaseTiming::Immediate {
+                let run = RunKey::new(descriptor.job_id, descriptor.run_attempt)
+                    .unwrap_or_else(|| RunKey::any_attempt(descriptor.job_id));
+                allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::teardown_complete(run));
+            }
             true
         } else {
             false
@@ -1986,6 +2001,7 @@ async fn settle_recovered_stepd(
         stepds,
         descriptor,
         "runtime completion",
+        ReleaseTiming::DeferredToLedger,
     )
     .await;
     // The controller report this poll goes on to make does not reach a client
@@ -2391,7 +2407,15 @@ async fn fence_dead_stepd(
         );
     }
 
-    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    release_stepd_tracking(
+        running,
+        allocation,
+        stepds,
+        &descriptor,
+        "stepd crash",
+        ReleaseTiming::DeferredToLedger,
+    )
+    .await;
     if reported {
         if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
             record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
@@ -2543,6 +2567,7 @@ async fn handle_completion_notification(
                 &context.stepds,
                 &descriptor,
                 "runtime completion",
+                ReleaseTiming::DeferredToLedger,
             )
             .await;
             // A user step's exit ends the RPC that launched it, not the job, so
@@ -2557,6 +2582,21 @@ async fn handle_completion_notification(
                 )
                 .await;
             if reported {
+                if let Some(run) = named_run(job_id, run_attempt) {
+                    record_run_epilog(
+                        &context.admissions,
+                        run,
+                        step_id,
+                        epilog_outcome(epilog_failed),
+                    );
+                    settle_acknowledged_completion(
+                        &context.allocation,
+                        &context.admissions,
+                        run,
+                        step_id,
+                    )
+                    .await;
+                }
                 crate::stepd::AgentNotificationResponse::Acknowledged
             } else {
                 crate::stepd::AgentNotificationResponse::Deferred
@@ -4809,6 +4849,7 @@ impl AgentService {
                 &self.stepds,
                 &descriptor,
                 "supervised step could not be released",
+                ReleaseTiming::Immediate,
             )
             .await;
             return Err(Status::internal(format!(
@@ -4936,6 +4977,7 @@ impl AgentService {
                 &self.stepds,
                 &descriptor,
                 "interactive step could not be released",
+                ReleaseTiming::Immediate,
             )
             .await;
             return Err(Status::internal(format!(
@@ -4969,6 +5011,7 @@ impl AgentService {
             &self.stepds,
             descriptor,
             "interactive session failed after launch",
+            ReleaseTiming::Immediate,
         )
         .await;
     }
@@ -7131,6 +7174,7 @@ impl SlurmAgent for AgentService {
                     &self.stepds,
                     descriptor,
                     "supervised job could not be released",
+                    ReleaseTiming::Immediate,
                 )
                 .await;
                 return Err(Status::internal(format!(
@@ -11706,6 +11750,7 @@ mod tests {
                 &sessions,
                 &descriptor,
                 "runtime completion",
+                ReleaseTiming::Immediate,
             )
             .await
         );
@@ -11763,7 +11808,15 @@ mod tests {
                 .insert(stepd_key(descriptor), descriptor.clone());
         }
 
-        release_stepd_tracking(&running, &allocation, &sessions, &first, "step exit").await;
+        release_stepd_tracking(
+            &running,
+            &allocation,
+            &sessions,
+            &first,
+            "step exit",
+            ReleaseTiming::Immediate,
+        )
+        .await;
 
         assert!(
             running.lock().await.contains_key(&42),
@@ -11775,7 +11828,15 @@ mod tests {
             "the sibling step is still drawing on the allocation"
         );
 
-        release_stepd_tracking(&running, &allocation, &sessions, &second, "step exit").await;
+        release_stepd_tracking(
+            &running,
+            &allocation,
+            &sessions,
+            &second,
+            "step exit",
+            ReleaseTiming::Immediate,
+        )
+        .await;
 
         assert!(!running.lock().await.contains_key(&42));
         assert_eq!(
@@ -11833,7 +11894,15 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
-        release_stepd_tracking(&running, &allocation, &sessions, &descriptor, "stale reap").await;
+        release_stepd_tracking(
+            &running,
+            &allocation,
+            &sessions,
+            &descriptor,
+            "stale reap",
+            ReleaseTiming::Immediate,
+        )
+        .await;
 
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
@@ -11947,7 +12016,15 @@ mod tests {
                 .insert(stepd_key(descriptor), descriptor.clone());
         }
 
-        release_stepd_tracking(&running, &allocation, &sessions, &current, "step exit").await;
+        release_stepd_tracking(
+            &running,
+            &allocation,
+            &sessions,
+            &current,
+            "step exit",
+            ReleaseTiming::Immediate,
+        )
+        .await;
 
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
@@ -11990,8 +12067,15 @@ mod tests {
         running.lock().await.insert(42, newer);
 
         assert!(
-            !release_stepd_tracking(&running, &allocation, &sessions, &stale, "stale report",)
-                .await
+            !release_stepd_tracking(
+                &running,
+                &allocation,
+                &sessions,
+                &stale,
+                "stale report",
+                ReleaseTiming::Immediate,
+            )
+            .await
         );
 
         assert_eq!(
@@ -13043,6 +13127,133 @@ mod tests {
         (context, running, sessions, state_dir)
     }
 
+    // handle_completion_notification must not free a run's slice just because
+    // the controller acknowledged it -- the admission ledger's own gate (an
+    // epilog still in flight) has the last word, and only once it clears does
+    // the slice actually go.
+    #[tokio::test]
+    async fn a_completion_notification_holds_the_slice_until_its_epilog_clears() {
+        const JOB: u32 = 4242;
+        const ATTEMPT: u32 = 1;
+        const STEP: spur_core::step::StepId = 3;
+
+        let (controller_addr, _reports) = spawn_mock_controller();
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            JOB,
+            ATTEMPT,
+            STEP,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(JOB, ATTEMPT, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(JOB, ATTEMPT));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = ATTEMPT;
+        running.lock().await.insert(JOB, tracked);
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let admissions = crate::admission::AdmissionStore::new(state_dir.path(), "test-node");
+        let run = RunKey::new(JOB, ATTEMPT).expect("attempt 1 names a run");
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                JOB,
+                ATTEMPT,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
+        admissions
+            .record_epilog(run, crate::admission::HookState::Pending)
+            .expect("seed an in-flight epilog");
+
+        let context = CompletionListenerContext {
+            running: running.clone(),
+            step_completions: crate::step_completion::StepCompletions::new(),
+            allocation: allocation.clone(),
+            stepds: sessions.clone(),
+            stepds_store: crate::stepd::StepdStore::new(state_dir.path()),
+            admissions: admissions.clone(),
+            controller_addr,
+            hostname: "test-node".into(),
+        };
+
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: JOB,
+            run_attempt: ATTEMPT,
+            step_id: STEP,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        assert_eq!(
+            serde_json::from_str::<crate::stepd::AgentNotificationResponse>(&line)
+                .expect("decode response"),
+            crate::stepd::AgentNotificationResponse::Acknowledged,
+            "the controller did acknowledge the completion"
+        );
+        assert_eq!(
+            allocation.lock().await.allocated_memory_mb,
+            128,
+            "the slice must stay held while the run's epilog is still in flight"
+        );
+
+        // The epilog resolves; only now may the ledger's own gate let the
+        // slice go, proving (b): once due, the release actually happens.
+        admissions
+            .record_epilog(run, crate::admission::HookState::Succeeded)
+            .expect("resolve the epilog");
+        assert!(
+            settle_acknowledged_completion(&allocation, &admissions, run, STEP).await,
+            "release must proceed once the ledger says it is due"
+        );
+        assert_eq!(allocation.lock().await.allocated_memory_mb, 0);
+    }
+
     #[tokio::test]
     async fn completion_notification_releases_local_tracking_even_when_controller_is_unreachable() {
         let (context, running, sessions, _state_dir) =
@@ -14014,9 +14225,16 @@ mod tests {
     }
 
     fn test_reporter() -> Arc<NodeReporter> {
+        test_reporter_with_controller("http://localhost:6817")
+    }
+
+    /// Same fixture as `test_reporter`, pointed at a caller-chosen controller
+    /// address — needed wherever a test must observe a real acknowledgement
+    /// (e.g. `spawn_mock_controller`) rather than an always-unreachable one.
+    fn test_reporter_with_controller(controller_addr: &str) -> Arc<NodeReporter> {
         Arc::new(NodeReporter::new(
             "test-node".into(),
-            "http://localhost:6817".into(),
+            controller_addr.into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8192,
@@ -16722,6 +16940,15 @@ mod tests {
     }
 
     fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
+        test_reporter_with_gpus_and_controller(device_ids, "http://localhost:6817")
+    }
+
+    /// Same fixture as `test_reporter_with_gpus`, pointed at a caller-chosen
+    /// controller address — see `test_reporter_with_controller`.
+    fn test_reporter_with_gpus_and_controller(
+        device_ids: &[u32],
+        controller_addr: &str,
+    ) -> Arc<NodeReporter> {
         use spur_core::resource::{GpuLinkType, GpuResource};
         let gpus = device_ids
             .iter()
@@ -16736,7 +16963,7 @@ mod tests {
             .collect();
         Arc::new(NodeReporter::new(
             "test-node".into(),
-            "http://localhost:6817".into(),
+            controller_addr.into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8192,
@@ -18598,8 +18825,12 @@ mod tests {
     // to the 15s crash watchdog, GPU release would lag well past the cancel RPC.
     #[tokio::test]
     async fn send_explicit_signal_fences_a_session_that_never_started() {
+        // Fencing now defers the actual release to the admission ledger, so
+        // this needs a controller that can really acknowledge the completion,
+        // and a ledger record for it to acknowledge into.
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter_with_gpus(&[0]),
+            test_reporter_with_gpus_and_controller(&[0], &controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -18630,6 +18861,15 @@ mod tests {
                 .unwrap();
             assert!(alloc.commit_job(descriptor.job_id, descriptor.run_attempt));
         }
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
 
         tokio::time::timeout(
             CANCEL_REAP_TIMEOUT,
@@ -19009,8 +19249,12 @@ mod tests {
     // will never come, so the cancel must force the release itself.
     #[tokio::test]
     async fn graceful_cancel_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        // Fencing now defers the actual release to the admission ledger, so
+        // this needs a controller that can really acknowledge the completion,
+        // and a ledger record for it to acknowledge into.
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter(),
+            test_reporter_with_controller(&controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -19042,6 +19286,15 @@ mod tests {
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
 
         svc.graceful_cancel(job_id, 0).await;
 
@@ -19220,8 +19473,12 @@ mod tests {
     // supervised job; cover it through this entry point too.
     #[tokio::test]
     async fn send_explicit_signal_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        // Fencing now defers the actual release to the admission ledger, so
+        // this needs a controller that can really acknowledge the completion,
+        // and a ledger record for it to acknowledge into.
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter(),
+            test_reporter_with_controller(&controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -19253,6 +19510,15 @@ mod tests {
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
 
         svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
@@ -19273,8 +19539,12 @@ mod tests {
     // the only thing that can notice an already-dead stepd on this path.
     #[tokio::test]
     async fn send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal() {
+        // Fencing now defers the actual release to the admission ledger, so
+        // this needs a controller that can really acknowledge the completion,
+        // and a ledger record for it to acknowledge into.
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter(),
+            test_reporter_with_controller(&controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -19306,6 +19576,15 @@ mod tests {
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
 
         svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGUSR1 as i32)
             .await;
