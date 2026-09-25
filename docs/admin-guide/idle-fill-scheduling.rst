@@ -25,8 +25,10 @@ Configuration
 .. code-block:: toml
 
    [scheduler]
-   idle_fill_enabled = true    # default false
-   idle_fill_exempt_secs = 60  # default 60
+   idle_fill_enabled = true              # default false
+   idle_fill_exempt_secs = 60            # default 60
+   idle_fill_max_borrow_factor = 2.0     # default 0.0, unbounded
+   idle_fill_max_cluster_fraction = 0.25 # default 0.0, unbounded
 
 ``idle_fill_enabled``
    The master switch. With it off, nothing in this page applies and no job is
@@ -38,6 +40,23 @@ Configuration
    of a minute — and it is capped. The window **doubles on each successive
    eviction of the same job**, up to one hour, so a job that keeps losing its
    node backs off rather than being lent and evicted indefinitely.
+
+``idle_fill_max_borrow_factor``
+   A ceiling on what one QOS may hold on loan, as a multiple of that QOS's own
+   group node cap. ``2.0`` against a cap of ``node=4`` allows 8 borrowed nodes.
+
+``idle_fill_max_cluster_fraction``
+   A ceiling as a share of the registered nodes. Not redundant with the factor: a
+   multiple of a large quota can still swallow the cluster.
+
+Both default to ``0.0``, meaning unbounded, so an already tuned cluster behaves as
+before. When both are set the tighter wins, and fractions floor, so a ceiling never
+overshoots. Each is consulted only where a new loan is admitted, which makes them
+one-directional — lowering a ceiling refuses the next borrow and never evicts a run
+that is already borrowing.
+
+Without either, borrowing is bounded only by idle capacity, because borrowed nodes sit
+outside the quota aggregates by design.
 
 There is deliberately no reuse of ``preempt_exempt_time`` here. That knob is
 unbounded, and a user can raise their own by submitting to several partitions,
@@ -142,6 +161,31 @@ preferred next victim — the more capacity it lost, the more it would go on to 
 Reclaim is attempted before preemption, since recovering lent capacity is always
 preferable to evicting a job that holds a claim to it.
 
+Priority inside the opportunistic tier
+--------------------------------------
+
+Borrowed runs and jobs in a QOS marked ``idlefillpreemptable=yes`` form one
+opportunistic tier. Within it, QOS priority decides what happens, under two rules.
+
+**A reclaim takes the cheapest opportunistic run first.** A job with a quota claim
+evicts the lowest-priority opportunistic run available — typically a burst job — and
+climbs to a dearer borrowed run only if that was not enough. Only as many nodes as
+the claim needs are taken.
+
+**An opportunistic job may only displace work cheaper than itself.** A borrowed job
+that needs nodes can reclaim from an ``idlefillpreemptable`` QOS of strictly lower
+priority, so a high-priority idle-fill job outranks a low-priority burst job. The
+reverse is refused: a burst job never displaces a dearer borrowed run.
+
+The comparison is the QOS's ``priority``, not the job's computed priority. A job's
+priority folds in an age factor and climbs while it waits, so a long-queued burst job
+would otherwise outrank a freshly borrowed run and invert both rules. Standing within
+the tier is a property of the QOS, which is stable.
+
+This is what makes the burst pattern and idle-fill coexist while burst is phased out:
+a burst QOS sits at a large negative priority by construction, so it sorts below
+stamped idle-fill work without any special case.
+
 What the guarantee becomes
 --------------------------
 
@@ -150,9 +194,12 @@ never kicked out. With idle-fill enabled that promise narrows to:
 
    **Jobs with a quota claim are never kicked out.**
 
-Reclaim consults none of ``preempt_mode``, the priority gap, the QOS allow list,
-or ``preempt_exempt_time``. It is not preemption: preemption arbitrates between two
-jobs that both hold a claim, whereas a borrowed job holds none.
+A reclaim driven by a job with a quota claim consults none of ``preempt_mode``, the
+priority gap, the QOS allow list, or ``preempt_exempt_time``. It is not preemption:
+preemption arbitrates between two jobs that both hold a claim, whereas a borrowed
+job holds none. Priority does decide *which* borrowed run is taken, and an
+opportunistic job reclaiming from another is bounded by its own QOS priority — see
+`Priority inside the opportunistic tier`_.
 
 The alternative — refusing to lend capacity wherever reclaim is not permitted —
 was rejected because it would make idle-fill inert on a default-configured cluster.

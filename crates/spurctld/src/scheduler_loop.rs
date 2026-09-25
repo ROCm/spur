@@ -270,7 +270,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
+            }
 
+            {
+                // Deliberately outside the `unscheduled` guard: that list excludes
+                // borrow candidates, so gating reclaim on it made rule (B) reachable
+                // only when some unrelated in-quota job happened to be pending too.
                 // Reclaim runs before preemption: recovering capacity that was lent
                 // out is always preferable to evicting a job that holds a claim to
                 // it. A job whose shortfall reclaim closes never reaches
@@ -319,7 +324,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         continue;
                     }
                 }
+            }
 
+            if !unscheduled.is_empty() {
                 try_preempt(
                     &cluster,
                     &partitions,
