@@ -7866,6 +7866,7 @@ impl SlurmAgent for AgentService {
                     warn!(job_id = req.job_id, %error, "failed to stop superseded stepd");
                 }
                 cleanup_stepd_files(&descriptor);
+                reservation_guard.mark_reaped();
                 return Err(Status::failed_precondition(format!(
                     "job {} was superseded by a newer attempt on this node",
                     req.job_id
@@ -7891,6 +7892,7 @@ impl SlurmAgent for AgentService {
                     }
                 }
             }
+            reservation_guard.mark_reaped();
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
                 req.job_id
@@ -18220,6 +18222,47 @@ mod tests {
             svc.free_gpu_count().await,
             0,
             "committed+tracked allocation must survive the sweep"
+        );
+    }
+
+    // `register_job_allocation` has two arms that kill+reap a stepd it just
+    // spawned (a superseded `claim_stepd_slot`, and a post-claim duplicate
+    // registration) after already calling `mark_spawned()`. Both must call
+    // `mark_reaped()` before returning, or `Drop` reads the reservation as
+    // "something is still running" and holds it forever even though nothing
+    // is. This reproduces that exact sequence against the real guard.
+    #[tokio::test]
+    async fn a_registration_that_loses_its_post_claim_race_reaps_the_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(77, 1, 1, 0, &[0])
+            .expect("reserve allocation");
+        assert!(svc.allocation.lock().await.commit_job(77, 1));
+        assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
+
+        let mut reservation_guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1));
+
+        // A supervisor is live against this reservation (mirrors either fixed
+        // arm right after `launch_stepd`/`claim_stepd_slot` succeeds), then
+        // this registration loses the race and kills+reaps what it just
+        // spawned before returning an error -- exactly what both arms do.
+        reservation_guard.mark_spawned();
+        reservation_guard.mark_reaped();
+        drop(reservation_guard);
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a reaped reservation must release the GPU it held, not hold it forever"
         );
     }
 
