@@ -2289,7 +2289,7 @@ async fn fence_dead_stepd(
         allocation,
         stepds,
         stepds_store: store,
-        admissions: _,
+        admissions,
         controller_addr,
         hostname,
     } = context;
@@ -2318,6 +2318,21 @@ async fn fence_dead_stepd(
         .flatten();
     let (exit_code, signal) =
         recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
+    // Strictly above both the synthetic exit below, which would read as a hook
+    // not reached, and the teardown that retires the ledger holding this answer.
+    let recorded_epilog = match store.epilog_result(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    ) {
+        Ok(Some(failed)) => epilog_outcome(failed),
+        Ok(None) => crate::admission::HookState::Unknown,
+        Err(error) => {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                "could not read how a dead stepd's epilog ended");
+            crate::admission::HookState::Unknown
+        }
+    };
     if recorded_exit.is_none() {
         if let Some(reason) = store.recorded_failure(
             descriptor.job_id,
@@ -2377,6 +2392,12 @@ async fn fence_dead_stepd(
     }
 
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    if reported {
+        if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
+            record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
+            settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id).await;
+        }
+    }
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
@@ -11859,6 +11880,68 @@ mod tests {
             pending_replays(&store),
             0,
             "an acknowledged report leaves nothing for the replay loop"
+        );
+    }
+
+    // The supervisor's own obligation log is ground truth for how its epilog
+    // ended; fencing must carry that into the ledger rather than guess.
+    #[tokio::test]
+    async fn fencing_a_dead_stepd_reads_its_own_recorded_epilog_outcome() {
+        let (controller_addr, _reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let descriptor = fenced_session(&store);
+        store
+            .obligations(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
+            .expect("record the supervisor's own epilog outcome before it dies");
+
+        let admissions = crate::admission::AdmissionStore::new(store.root(), "test-node");
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit the run fencing will settle");
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        fence_dead_stepd(&context, descriptor.clone()).await;
+
+        let run =
+            RunKey::new(descriptor.job_id, descriptor.run_attempt).expect("attempt is nonzero");
+        assert_eq!(
+            admissions
+                .load_run(run)
+                .expect("load the settled run")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Failed,
+            "fencing must carry the supervisor's own recorded epilog outcome, not guess Unknown"
         );
     }
 
