@@ -2731,6 +2731,15 @@ fn recorded_supervisor_liveness(admitted: &crate::admission::AdmittedRun) -> Liv
     liveness_of(&reads)
 }
 
+/// Whether nothing that could still run this run's epilog survived the restart.
+/// A run that named no supervisor had the previous agent's own hook.
+fn hook_owner_did_not_survive_restart(admitted: &crate::admission::AdmittedRun) -> bool {
+    if admitted.recorded_supervisors().next().is_none() {
+        return true;
+    }
+    matches!(recorded_supervisor_liveness(admitted), Liveness::Gone)
+}
+
 /// Whether some participant left an exit behind. One exists only on disk, so a
 /// session still holding it is what will report this run, with the real status.
 fn an_exit_is_still_on_disk(
@@ -4064,6 +4073,14 @@ async fn run_containerized_step(
     }
 }
 
+/// What one admitted run's evidence said at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedRunOutcome {
+    pub job_id: u32,
+    pub run_attempt: u32,
+    pub disposition: crate::admission::RunDisposition,
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     /// In-memory only: starts empty on every spurd start/restart, regardless
@@ -4395,6 +4412,221 @@ impl AgentService {
                      accounting is short until the job ends"
                 ),
             }
+        }
+    }
+
+    /// Put every admitted run back on the node's ledger from the admission
+    /// store, which is the exact record of what this node claimed rather than
+    /// a descriptor rebuild's under-counted approximation. Falls back to
+    /// `replay_adopted_allocations` only when the ledger itself cannot be
+    /// read, and always replays any descriptor the ledger has no record of
+    /// (a session that predates it).
+    pub async fn replay_admitted_allocations(
+        &self,
+        descriptors: &[crate::stepd::StepdDescriptor],
+    ) -> Vec<AdoptedRunOutcome> {
+        let admissions = self.admissions();
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        let boot_id = crate::admission::current_boot_id();
+        // Before the read below, so the rebuilt ledger sees the settled values.
+        // Gated on the owner: an adopted supervisor outlives this restart.
+        match admissions.settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart) {
+            Ok(settled) if settled > 0 => {
+                warn!(
+                    runs = settled,
+                    "settled epilogs whose owner did not survive"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "could not settle the epilogs of a previous agent"),
+        }
+        let loaded = match admissions.load_all() {
+            Ok(loaded) => loaded,
+            // An empty index reads as a free node while the jobs are still on
+            // it, so fall back to what the descriptors can still account for.
+            Err(error) => {
+                error!(%error, "could not read the admission ledger; falling back to descriptors");
+                self.replay_adopted_allocations(descriptors).await;
+                return Vec::new();
+            }
+        };
+
+        let mut outcomes = Vec::new();
+        for rejected in &loaded.rejected {
+            let (job_id, run_attempt) =
+                crate::admission::parse_run_dir_name(&rejected.path).unwrap_or_default();
+            // Its slice is unknown, so nothing is restored for it. The node is
+            // short until the controller reconciles, which is the safe side.
+            warn!(
+                job_id,
+                run_attempt,
+                path = %rejected.path.display(),
+                reason = %rejected.reason,
+                "unreadable admission record; its claim needs reconciliation"
+            );
+            outcomes.push(AdoptedRunOutcome {
+                job_id,
+                run_attempt,
+                disposition: crate::admission::RunDisposition::Corrupt,
+            });
+        }
+
+        // A record whose supervisor is proven gone must not take a contested core
+        // from one still running: the loser of that race goes unprotected.
+        let mut ordered: Vec<&crate::admission::AdmittedRun> = loaded.runs.iter().collect();
+        ordered.sort_by_key(|admitted| recorded_supervisor_liveness(admitted) == Liveness::Gone);
+
+        let mut allocation = self.allocation.lock().await;
+        for admitted in ordered {
+            let run = &admitted.run;
+            let evidence =
+                self.gather_run_evidence(admitted, descriptors, &store, boot_id.as_deref());
+            let disposition = crate::admission::classify_run(&evidence);
+
+            // Every disposition holds, but a slice already handed back does not:
+            // re-charging one takes a core from whatever the node gave it to.
+            if run.slice_released {
+                debug!(
+                    job_id = run.job_id,
+                    run_attempt = run.run_attempt,
+                    ?disposition,
+                    "an admitted run's slice was already released; not re-charging it"
+                );
+            } else {
+                // The recorded slice is exact, so this does not under-count the
+                // way a descriptor rebuild does.
+                let gpu_ids: Vec<u64> = run
+                    .allocation
+                    .gpu_devices
+                    .iter()
+                    .map(|&id| id as u64)
+                    .collect();
+                match allocation.restore_for_job(
+                    run.job_id,
+                    run.run_attempt,
+                    &run.allocation.cpu_ids,
+                    run.allocation.memory_mb,
+                    &gpu_ids,
+                ) {
+                    Ok(_) => info!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        cpus = run.allocation.cpu_ids.len(),
+                        gpus = gpu_ids.len(),
+                        ?disposition,
+                        "restored an admitted run's claim"
+                    ),
+                    // Superseded means a newer attempt already holds the slice,
+                    // which is the expected outcome, not a loss.
+                    Err(AllocError::Superseded) => debug!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        "a newer attempt already holds this run's slice"
+                    ),
+                    Err(error) => error!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        ?error,
+                        "could not restore an admitted run's claim; the slice is unprotected"
+                    ),
+                }
+            }
+            outcomes.push(AdoptedRunOutcome {
+                job_id: run.job_id,
+                run_attempt: run.run_attempt,
+                disposition,
+            });
+        }
+        drop(allocation);
+
+        // A session with no record predates this ledger. Falling back keeps an
+        // in-place upgrade over a live node lossless.
+        let unrecorded: Vec<crate::stepd::StepdDescriptor> = descriptors
+            .iter()
+            .filter(|d| {
+                !loaded
+                    .runs
+                    .iter()
+                    .any(|r| r.run.job_id == d.job_id && r.run.run_attempt == d.run_attempt)
+            })
+            .cloned()
+            .collect();
+        if !unrecorded.is_empty() {
+            info!(
+                sessions = unrecorded.len(),
+                "replaying sessions that predate the admission ledger"
+            );
+            self.replay_adopted_allocations(&unrecorded).await;
+        }
+        outcomes
+    }
+
+    /// What one admitted run's on-disk record and this restart's live evidence
+    /// together say happened to it, for `classify_run` to turn into a disposition.
+    fn gather_run_evidence(
+        &self,
+        admitted: &crate::admission::AdmittedRun,
+        descriptors: &[crate::stepd::StepdDescriptor],
+        store: &crate::stepd::StepdStore,
+        boot_id: Option<&str>,
+    ) -> crate::admission::RunEvidence {
+        let run = &admitted.run;
+        let mine: Vec<&crate::stepd::StepdDescriptor> = descriptors
+            .iter()
+            .filter(|d| d.job_id == run.job_id && d.run_attempt == run.run_attempt)
+            .collect();
+        let boot_scope_of_supervisor = admitted
+            .participants
+            .iter()
+            .filter_map(|p| p.supervisor.as_ref())
+            .map(|s| s.boot_scope(boot_id))
+            .chain(mine.iter().map(|d| {
+                // This node's own stepd descriptors carry no boot id (unlike a
+                // ledger-recorded supervisor), so a live one never contributes
+                // reboot evidence on its own — it can only agree or stay silent.
+                crate::admission::SupervisorRef {
+                    pid: d.pid,
+                    start_ticks: d.process_start_ticks,
+                    boot_id: None,
+                }
+                .boot_scope(boot_id)
+            }))
+            // A single definite reboot settles the run; otherwise an unknown
+            // must not be promoted into a change.
+            .reduce(|a, b| match (a, b) {
+                (crate::admission::BootScope::Different, _)
+                | (_, crate::admission::BootScope::Different) => {
+                    crate::admission::BootScope::Different
+                }
+                (crate::admission::BootScope::Same, _) | (_, crate::admission::BootScope::Same) => {
+                    crate::admission::BootScope::Same
+                }
+                _ => crate::admission::BootScope::Unknown,
+            });
+        // From the record's participants, not the live set: an exit only exists
+        // once the supervisor is gone, so a live descriptor never carries one.
+        let recorded_exit = admitted.participants.iter().find_map(|p| {
+            store
+                .observed_exit(run.job_id, run.run_attempt, p.step_id)
+                .ok()
+                .flatten()
+        });
+        // Re-checked rather than trusted from the caller's bucket: reporting a
+        // dead supervisor as running holds a phantom indefinitely.
+        let live = mine.iter().any(|d| {
+            matches!(
+                crate::stepd::stepd_liveness(d),
+                Ok(crate::stepd::StepdLiveness::Live)
+            )
+        });
+        crate::admission::RunEvidence {
+            supervisor_matches_a_live_process: live,
+            boot_scope_of_supervisor,
+            recorded_exit,
+            never_spawned: !live
+                && mine.is_empty()
+                && admitted.participants.iter().all(|p| p.supervisor.is_none()),
+            residual_or_corrupt: false,
         }
     }
 
@@ -20626,5 +20858,132 @@ mod tests {
             .into_inner();
         assert!(!resp.released);
         assert!(resp.error.contains("no record"));
+    }
+
+    #[tokio::test]
+    async fn replay_admitted_allocations_rebuilds_a_recorded_slice_exactly() {
+        let svc = ledger_agent();
+        let run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "test-node",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![2, 3],
+                memory_mb: 2048,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit a run");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].job_id, 7);
+        assert_eq!(outcomes[0].run_attempt, 1);
+
+        // Exact, where a descriptor rebuild falls back to "the lowest free
+        // cores" and under-counts a job whose cores were never recorded.
+        let alloc = svc.allocation.lock().await;
+        for cpu in [2usize, 3] {
+            assert!(
+                alloc.allocated_cpus[cpu],
+                "core {cpu} must still read as held"
+            );
+        }
+        assert!(
+            !alloc.allocated_cpus[0],
+            "an unrecorded core must stay free"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_admitted_allocations_holds_an_unresolved_runs_slice() {
+        // A run whose supervisor is recorded but this restart has no live
+        // process or exit for must be held, not guessed either way — and
+        // "held" means its cores stay charged, not released.
+        let svc = ledger_agent();
+        let run = crate::admission::RunAdmission::new(
+            8,
+            1,
+            "test-node",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0, 1],
+                memory_mb: 1024,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit a run");
+        svc.admissions()
+            .admit_participant(&crate::admission::ParticipantAdmission::new(
+                8,
+                1,
+                spur_core::step::STEP_BATCH,
+                "test-node",
+                run.allocation.clone(),
+            ))
+            .expect("admit a participant");
+        svc.admissions()
+            .record_supervisor(
+                key(8, 1),
+                spur_core::step::STEP_BATCH,
+                crate::admission::SupervisorRef {
+                    pid: 999_999,
+                    start_ticks: 1,
+                    boot_id: crate::admission::current_boot_id(),
+                },
+            )
+            .expect("record a supervisor");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(
+            outcomes[0].disposition,
+            crate::admission::RunDisposition::Unknown
+        );
+        assert!(outcomes[0].disposition.needs_reconciliation());
+
+        // The point of the whole ladder: not knowing is not a reason to free it.
+        let alloc = svc.allocation.lock().await;
+        assert!(alloc.allocated_cpus[0] && alloc.allocated_cpus[1]);
+    }
+
+    #[tokio::test]
+    async fn replay_admitted_allocations_falls_back_when_the_ledger_cannot_be_read() {
+        // Returning empty here would advertise every running job's cores as
+        // free on the next heartbeat.
+        let svc = ledger_agent();
+        std::fs::create_dir_all(&svc.stepd_state_dir).expect("state dir");
+        std::fs::write(svc.stepd_state_dir.join("admission"), b"not a directory")
+            .expect("block the admission directory with a file");
+
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            9,
+            1,
+            spur_core::step::STEP_BATCH,
+            std::process::id(),
+            crate::stepd::process_start_ticks(std::process::id()).expect("start ticks"),
+            svc.stepd_state_dir
+                .join("runtime/9.1.4294967294/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 1,
+            cpu_ids: vec![3],
+            memory_mb: 128,
+            gpu_devices: Vec::new(),
+            ..Default::default()
+        };
+
+        let outcomes = svc
+            .replay_admitted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+        assert!(
+            outcomes.is_empty(),
+            "a failed ledger read has nothing to classify"
+        );
+        assert!(
+            svc.allocation.lock().await.allocated_cpus[3],
+            "a failed ledger read must not leave live cores reading free"
+        );
     }
 }
