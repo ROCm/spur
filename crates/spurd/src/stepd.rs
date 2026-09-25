@@ -3011,7 +3011,12 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 /// The same reading as `process_is_live`, keeping "could not tell" apart from
 /// "gone" for callers that may not treat an unreadable `/proc` as a death.
 pub(crate) fn process_liveness(pid: u32, start_ticks: u64) -> io::Result<StepdLiveness> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        // A fully reaped process reads as gone, not as "could not tell".
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(StepdLiveness::Stale),
+        Err(error) => return Err(error),
+    };
     let Some((_, fields)) = stat.rsplit_once(") ") else {
         return Ok(StepdLiveness::Stale);
     };
@@ -4016,6 +4021,35 @@ mod tests {
         assert_eq!(discovered.live, vec![live]);
         assert_eq!(discovered.stale, vec![stale]);
         assert!(discovered.rejected.is_empty());
+    }
+
+    // A fully reaped process has no /proc entry left at all: that must read as
+    // Stale, the same as a zombie or a mismatched start time -- not as an error,
+    // or every caller downstream (recorded_supervisor_liveness, workload gates)
+    // loses the ability to tell "gone" from "cannot tell" and holds forever.
+    #[test]
+    fn process_liveness_reads_a_fully_reaped_pid_as_stale_not_an_error() {
+        let reading = process_liveness(999_999, 0).expect("a reaped pid must not error");
+        assert_eq!(reading, StepdLiveness::Stale);
+    }
+
+    #[test]
+    fn supervisor_liveness_reads_a_fully_reaped_supervisor_as_stale() {
+        let recorded = crate::admission::SupervisorRef {
+            pid: 999_999,
+            start_ticks: 0,
+            boot_id: None,
+        };
+        let reading = supervisor_liveness(&recorded).expect("a reaped supervisor must not error");
+        assert_eq!(reading, StepdLiveness::Stale);
+    }
+
+    #[test]
+    fn workload_process_liveness_reads_a_fully_reaped_workload_as_gone() {
+        let mut gone = descriptor(46, 1, std::process::id());
+        gone.workload_pid = 999_999;
+        gone.workload_start_ticks = 0;
+        assert_eq!(workload_process_liveness(&gone), WorkloadLiveness::Gone);
     }
 
     #[test]
