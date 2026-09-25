@@ -888,6 +888,61 @@ pub fn runs_job_epilog(hooks: &HooksConfig) -> bool {
     epilog_owed(hooks) == crate::admission::EpilogOwed::Yes
 }
 
+/// What a run still owes once the agent stops tracking it. Only proof that
+/// nothing can run the hook cancels the debt; anything less holds the slice.
+fn supervised_epilog_owed(
+    admitted: &crate::admission::AdmittedRun,
+    hooks: &HooksConfig,
+) -> crate::admission::EpilogOwed {
+    if hooks.epilog.is_none() {
+        return crate::admission::EpilogOwed::No;
+    }
+    match recorded_supervisor_liveness(admitted) {
+        Liveness::Gone => crate::admission::EpilogOwed::No,
+        Liveness::Live | Liveness::CannotTell => crate::admission::EpilogOwed::Yes,
+    }
+}
+
+/// What a cancelled run's teardown still owes. A record that cannot be read in
+/// full, or one with rejected participants, defaults to owing: guessing "no"
+/// would let a live hook's slice go while it's still running.
+fn cancelled_epilog_owed(
+    admissions: &crate::admission::AdmissionStore,
+    hooks: &HooksConfig,
+    run: RunKey,
+) -> crate::admission::EpilogOwed {
+    if hooks.epilog.is_none() {
+        return crate::admission::EpilogOwed::No;
+    }
+    let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+    match admissions.load_admitted(run) {
+        Ok((admitted, rejected)) if rejected.is_empty() => supervised_epilog_owed(&admitted, hooks),
+        Ok(_) => crate::admission::EpilogOwed::Yes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::admission::EpilogOwed::No
+        }
+        Err(error) => {
+            warn!(job_id, run_attempt, %error,
+                "could not read a cancelled run's participants; holding its slice");
+            crate::admission::EpilogOwed::Yes
+        }
+    }
+}
+
+/// Marks a controller-cancelled run's slice as still owing its epilog, if one
+/// is configured and still owed, so the sweep pipeline holds it until the hook clears.
+fn hold_cancelled_run_for_epilog(
+    admissions: &crate::admission::AdmissionStore,
+    hooks: &HooksConfig,
+    run: RunKey,
+) -> std::io::Result<()> {
+    if cancelled_epilog_owed(admissions, hooks, run) == crate::admission::EpilogOwed::No {
+        return Ok(());
+    }
+    admissions.record_epilog_if_unstarted(run, crate::admission::HookState::Pending)?;
+    Ok(())
+}
+
 /// Release what a finished run owned, once the monitor has dropped it from
 /// `running`. Skipped if the id is tracked again: it is all keyed by job id.
 async fn teardown_completed_job(
@@ -6797,29 +6852,30 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id, req.run_attempt).await;
         }
 
-        // The signal paths only act on a running job; release a still-launching
+        // The signal paths only act on a running job; settle a still-launching
         // reservation so a cancel-during-eviction doesn't strand it until the
-        // TTL. Hold the running lock across the release (matching launch_job's
-        // commit order) so this can't free a job that just became running, and
-        // generation-check the release itself so a redispatch that already
-        // reserved a newer attempt survives a cancel for the old one.
+        // TTL. Snapshot under the running lock (matching launch_job's commit
+        // order) so this can't act on a job that just became running, then
+        // drop it before the settle/mark calls below, which take other locks.
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
-        if !jobs.contains_key(&job_id) {
+        let nothing_tracked = !jobs.contains_key(&job_id);
+        drop(jobs);
+        if nothing_tracked {
             // `pre_cancel_attempt` already checked the ledger; `None` means
             // anything found now landed during the signal call and is not ours.
-            if let Some(attempt) = pre_cancel_attempt {
-                // This is the cancel_job RPC's own release of a still-launching
+            // An unaddressable attempt 0 has no admission record to settle.
+            if let Some(run) = pre_cancel_attempt.and_then(|attempt| named_run(job_id, attempt)) {
+                // This is the cancel_job RPC's own settle of a still-launching
                 // reservation, so the ground is the controller's own cancel.
-                let run =
-                    RunKey::new(job_id, attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
-                self.allocation
-                    .lock()
-                    .await
-                    .release_job(ReleaseWarrant::controller_cancelled(run));
+                self.settle_cancelled_run(run).await;
             }
+        } else if let Some(run) = tracked_attempt.and_then(|attempt| named_run(job_id, attempt)) {
+            // Still tracked: its own teardown will settle the run once it
+            // drops it, but the cancel has to land on the record now so a
+            // hook still running under it keeps the slice held.
+            self.mark_controller_cancelled(run).await;
         }
-        drop(jobs);
 
         // An allocation ends here rather than through the completion teardown,
         // so this is where its cgroup node has to go: the steps inside only
@@ -9321,7 +9377,10 @@ impl AgentService {
     /// attempt between the caller's peek and this call, and that entry must
     /// survive.
     async fn drop_tracked_job(&self, job_id: u32, run_attempt: u32) {
-        // The cgroup removal and the release below both key off the id, so a launch
+        // Both admission paths refuse attempt 0, so nothing production tracks
+        // widens here; the equality check below is what scopes the settle.
+        let run = RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
+        // The cgroup removal and the settle below both key off the id, so a launch
         // reusing it must not interleave with them.
         let _lifecycle = self.lifecycle.acquire(job_id).await;
         // Scoped so the guard is gone before `cgroup` is dropped below: removing
@@ -9333,16 +9392,6 @@ impl AgentService {
                 .is_some_and(|current| current.run_attempt == run_attempt)
             {
                 let (tracked, cgroup) = remove_tracked_job(&mut jobs, job_id);
-                // Once released the GPU leaves `allocated_gpu_ids`, so the next
-                // inventory tick classifies its real hardware as a free-pool
-                // change and converges — no explicit reconcile hook needed here.
-                // Only reachable through the cancel RPC's own allocation-only path.
-                let run =
-                    RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
-                self.allocation
-                    .lock()
-                    .await
-                    .release_job(ReleaseWarrant::controller_cancelled(run));
                 (tracked.is_some(), cgroup)
             } else {
                 (false, executor::CgroupGuard::new(None))
@@ -9351,6 +9400,11 @@ impl AgentService {
         drop(cgroup);
         if !removed {
             return;
+        }
+        // Tracking is gone, but the slice is the record's to hand back: a hook
+        // still running under this run is still standing on the cores.
+        if run.attempt().is_some() {
+            self.settle_cancelled_run(run).await;
         }
         self.interactive_launch_steps
             .lock()
@@ -9374,6 +9428,75 @@ impl AgentService {
         }
         if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %e, "PMIx stop failed on job drop");
+        }
+    }
+
+    /// Settle a cancelled run, as an acknowledged completion settles one. What
+    /// teardown still owes is recorded first, so the gate below can refuse.
+    async fn settle_cancelled_run(&self, run: RunKey) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        let admissions = self.admissions();
+        let hooks = self.hooks.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            let epilog = cancelled_epilog_owed(&admissions, &hooks, run);
+            admissions.mark_controller_cancelled(run)?;
+            admissions.mark_run_cleaned(run, epilog)
+        })
+        .await;
+        match recorded {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a cancelled run's teardown")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "cancel-record task failed"),
+        }
+        match settle_and_release_run(&self.allocation, &self.admissions(), run).await {
+            Ok(SettleRunOutcome::NotQuiescent) => info!(
+                job_id,
+                run_attempt, "holding a cancelled run's slice until its epilog ends"
+            ),
+            // Absent under the lifecycle guard, which excludes the launch that
+            // would write it: no record then means no payload and no hook.
+            Ok(SettleRunOutcome::NoRecord) => {
+                if self
+                    .allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::never_spawned(run))
+                {
+                    info!(
+                        job_id,
+                        run_attempt, "released a reservation nothing was spawned against"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(job_id, run_attempt, %error, "failed to settle a cancelled run's record")
+            }
+        }
+    }
+
+    /// Note the controller's cancel on a run still being torn down, and the hook
+    /// its teardown owes: settling here frees the slice under processes still exiting.
+    async fn mark_controller_cancelled(&self, run: RunKey) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        let admissions = self.admissions();
+        let hooks = self.hooks.clone();
+        let marked = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+            if !admissions.mark_controller_cancelled(run)? {
+                return Ok(false);
+            }
+            hold_cancelled_run_for_epilog(&admissions, &hooks, run)?;
+            Ok(true)
+        })
+        .await;
+        match marked {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a run's cancellation")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "cancel-record task failed"),
         }
     }
 
@@ -17416,7 +17539,12 @@ mod tests {
         // No start_monitor: the release must not depend on its tick.
 
         let job_id = 99;
-        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        // Tracked at the same attempt the allocation below commits: production
+        // never lets these diverge, and an unaddressable attempt 0 has no
+        // admission record for the settle path to find.
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(job_id, tracked).await;
         {
             let mut alloc = svc.allocation.lock().await;
             alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
