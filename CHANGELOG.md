@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/ROCm/spur/compare/v0.13.0...v0.14.0) (2026-09-25)
+
+
+### Features
+
+* **spur-cli:** add squeue -O/--Format field-name output ([#914](https://github.com/ROCm/spur/issues/914)) ([da676d0](https://github.com/ROCm/spur/commit/da676d0093e0303502c007385384ff3c4c18304e))
+
 ## [0.13.0](https://github.com/ROCm/spur/compare/v0.12.0...v0.13.0) (2026-09-24)
 
 
