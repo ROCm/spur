@@ -6349,6 +6349,8 @@ impl SlurmAgent for AgentService {
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
         let run_attempt = req.run_attempt;
+        let run_key = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to launch"))?;
         let stepd_enabled = true;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
@@ -6718,10 +6720,46 @@ impl SlurmAgent for AgentService {
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
         let admissions = self.admissions();
-        let run_key =
-            RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
         let mut reservation_guard =
             LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), run_key);
+
+        // Durable before anything is spawned against it: a crash before this
+        // leaves neither a record nor a process, a crash after leaves both.
+        let mut run_record = crate::admission::RunAdmission::new(
+            job_id,
+            run_attempt,
+            &self.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: alloc_result.cpu_ids.clone(),
+                memory_mb: alloc_result.memory_mb,
+                gpu_devices: allocated_device_ids.iter().map(|&id| id as u32).collect(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run_record.lifecycle_owner_step = Some(launch_step);
+        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+            error!(job_id, run_attempt, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {job_id}: {error}"
+            )));
+        }
+        let mut participant_record = crate::admission::ParticipantAdmission::new(
+            job_id,
+            run_attempt,
+            launch_step,
+            &self.reporter.hostname,
+            run_record.allocation.clone(),
+        );
+        participant_record.final_report.required = true;
+        participant_record.command_digest = req.command_digest.clone();
+        participant_record.issued_at_unix_ms = req.issued_at_unix_ms;
+        participant_record.expires_at_unix_ms = req.expires_at_unix_ms;
+        if let Err(error) = admissions.admit_participant_async(participant_record).await {
+            error!(job_id, run_attempt, %error, "failed to persist the participant admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {job_id}: {error}"
+            )));
+        }
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -6953,6 +6991,24 @@ impl SlurmAgent for AgentService {
         match launch_result {
             Ok((mut result, runtime_descriptor)) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
+                // A supervisor is live against this reservation now, so an aborted
+                // launch must leave the slice held rather than hand it back.
+                reservation_guard.mark_spawned();
+                if let Some(ref descriptor) = runtime_descriptor {
+                    if let Err(error) = admissions.record_supervisor(
+                        run_key,
+                        launch_step,
+                        crate::admission::SupervisorRef {
+                            pid: descriptor.pid,
+                            start_ticks: descriptor.process_start_ticks,
+                            boot_id: crate::admission::current_boot_id(),
+                        },
+                    ) {
+                        error!(job_id, run_attempt, %error,
+                            "failed to record the supervisor identity; this run's slice is \
+                             held until the agent restarts");
+                    }
+                }
 
                 // Claim the stepd slot before committing anything
                 // else. A concurrent LaunchJob for the same job (a retry
@@ -6975,6 +7031,7 @@ impl SlurmAgent for AgentService {
                         discard_stepd_session(&descriptor).await;
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
+                        reservation_guard.mark_reaped();
                         return Ok(Response::new(LaunchJobResponse {
                             success: false,
                             error: "stepd superseded by a newer attempt".into(),
@@ -6993,7 +7050,9 @@ impl SlurmAgent for AgentService {
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
                 let committed = self.allocation.lock().await.commit_job(job_id, run_attempt);
-                reservation_guard.disarm();
+                if committed {
+                    reservation_guard.disarm();
+                }
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
                 // the TTL). Don't track a job with no backing allocation — kill,
@@ -7002,6 +7061,7 @@ impl SlurmAgent for AgentService {
                 // job never enters `running`), then fail the launch.
                 if !committed {
                     drop(jobs);
+                    reservation_guard.mark_reaped();
                     warn!(
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
@@ -12789,6 +12849,7 @@ mod tests {
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 9002,
+                run_attempt: 1,
                 spec: Some(JobSpec {
                     script: "true".into(),
                     pty: true,
@@ -14330,6 +14391,7 @@ mod tests {
         let err = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 4242,
+                run_attempt: 1,
                 spec: Some(JobSpec {
                     // uid 0 is the default, but state it so the test's subject is unmissable.
                     uid: 0,
@@ -14373,6 +14435,7 @@ mod tests {
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 4243,
+                run_attempt: 1,
                 spec: Some(JobSpec {
                     uid: 0,
                     name: "root-job".into(),
@@ -14412,6 +14475,7 @@ mod tests {
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 7,
+                run_attempt: 1,
                 spec: Some(JobSpec {
                     name: "prolog-fail".into(),
                     script: "#!/bin/bash\ntrue\n".into(),
@@ -14457,6 +14521,7 @@ mod tests {
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 8,
+                run_attempt: 1,
                 spec: Some(JobSpec {
                     name: "prolog-missing".into(),
                     script: "#!/bin/bash\ntrue\n".into(),
@@ -17064,6 +17129,7 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 65,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
                 cpus_per_task: 1,
@@ -17219,6 +17285,7 @@ mod tests {
         );
         let req = Request::new(LaunchJobRequest {
             job_id: 52,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
                 cpus_per_task: 1,
@@ -17267,6 +17334,7 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 77,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
                 cpus_per_task: 1,
@@ -17375,6 +17443,7 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5350,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script,
                 num_tasks: 4,
@@ -17432,6 +17501,7 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5351,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script,
                 num_tasks: 4,
@@ -17478,6 +17548,7 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5352,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script: "#!/bin/bash\ntrue\n".into(),
                 num_tasks: 4,
@@ -17524,6 +17595,7 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5353,
+            run_attempt: 1,
             spec: Some(JobSpec {
                 script: format!(
                     "#!/bin/bash\necho ran >> \"{}\"\nsrun true\n",
