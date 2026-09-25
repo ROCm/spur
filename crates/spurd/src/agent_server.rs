@@ -17,11 +17,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
-use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
+use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation, ReleaseWarrant};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
+use spur_core::job::RunKey;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
@@ -894,7 +895,15 @@ async fn teardown_completed_job(
         job_id,
         completed.run_attempt,
     ));
-    allocation.lock().await.release_job(job_id);
+    // Teardown just finished locally (rootfs/cgroup cleaned up above); the
+    // physical slice can go back now even though the ledger record persists
+    // as `Cleaned` until the controller's ack settles it separately.
+    let run =
+        RunKey::new(job_id, completed.run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
+    allocation
+        .lock()
+        .await
+        .release_job(ReleaseWarrant::teardown_complete(run));
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
 
@@ -1478,7 +1487,7 @@ async fn release_stepd_tracking(
     });
 
     // Attempt-checked on both maps: `running`'s own check guards its entry,
-    // and `release_job_if` below guards the allocation the same way.
+    // and the named `RunKey` below guards the allocation the same way.
     let removed_tracked = was_last_step && {
         let mut jobs = running.lock().await;
         if jobs
@@ -1486,10 +1495,15 @@ async fn release_stepd_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
+            // The stepd supervising this run is exiting locally (normal exit,
+            // crash, rejection, or an unreleasable step/session); the ledger
+            // ack that fully settles the run is handled separately.
+            let run = RunKey::new(descriptor.job_id, descriptor.run_attempt)
+                .unwrap_or_else(|| RunKey::any_attempt(descriptor.job_id));
             allocation
                 .lock()
                 .await
-                .release_job_if(descriptor.job_id, descriptor.run_attempt);
+                .release_job(ReleaseWarrant::teardown_complete(run));
             true
         } else {
             false
@@ -4253,13 +4267,19 @@ impl Drop for LaunchReservationGuard {
         let job_id = self.job_id;
         let run_attempt = self.run_attempt;
         // Generation-checked: a redispatch may have already superseded this
-        // reservation, and releasing it here must not free the new one.
+        // reservation, and releasing it here must not free the new one. The
+        // guard firing un-disarmed means the launch it reserved for never
+        // completed, so nothing was ever spawned against it.
+        let run = RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
         if let Ok(mut alloc) = self.allocation.try_lock() {
-            alloc.release_job_if(job_id, run_attempt);
+            alloc.release_job(ReleaseWarrant::never_spawned(run));
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
             handle.spawn(async move {
-                allocation.lock().await.release_job_if(job_id, run_attempt);
+                allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::never_spawned(run));
             });
         }
     }
@@ -6026,7 +6046,14 @@ impl SlurmAgent for AgentService {
             // `pre_cancel_attempt` already checked the ledger; `None` means
             // anything found now landed during the signal call and is not ours.
             if let Some(attempt) = pre_cancel_attempt {
-                self.allocation.lock().await.release_job_if(job_id, attempt);
+                // This is the cancel_job RPC's own release of a still-launching
+                // reservation, so the ground is the controller's own cancel.
+                let run =
+                    RunKey::new(job_id, attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
+                self.allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::controller_cancelled(run));
             }
         }
         drop(jobs);
@@ -8546,7 +8573,13 @@ impl AgentService {
                 // Once released the GPU leaves `allocated_gpu_ids`, so the next
                 // inventory tick classifies its real hardware as a free-pool
                 // change and converges — no explicit reconcile hook needed here.
-                self.allocation.lock().await.release_job(job_id);
+                // Only reachable through the cancel RPC's own allocation-only path.
+                let run =
+                    RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
+                self.allocation
+                    .lock()
+                    .await
+                    .release_job(ReleaseWarrant::controller_cancelled(run));
                 (tracked.is_some(), cgroup)
             } else {
                 (false, executor::CgroupGuard::new(None))
@@ -8645,7 +8678,12 @@ impl AgentService {
                         "reclaiming stale GPU owners no longer running, then retrying dispatch"
                     );
                     for owner in &stale {
-                        alloc.release_job(*owner);
+                        // No local record of how the stale owner's run ended; the
+                        // controller re-dispatching onto its GPUs is itself the
+                        // answer to a claim this node never got a completion for.
+                        alloc.release_job(ReleaseWarrant::settled_unrecorded_claim(
+                            RunKey::any_attempt(*owner),
+                        ));
                     }
                 }
                 match alloc.allocate_for_job(
@@ -10546,7 +10584,10 @@ mod tests {
             .await
             .allocate_for_job(42, 1, 1, 128, &[])
             .expect("reserve old attempt");
-        allocation.lock().await.release_job(42);
+        allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::never_spawned(RunKey::new(42, 1).unwrap()));
         allocation
             .lock()
             .await
@@ -16519,7 +16560,7 @@ mod tests {
         {
             let mut alloc = svc.allocation.lock().await;
             alloc.allocate_for_job(7, 1, 1, 0, &[0]).unwrap();
-            alloc.release_job(7);
+            alloc.release_job(ReleaseWarrant::never_spawned(RunKey::new(7, 1).unwrap()));
             alloc.allocate_for_job(7, 2, 1, 0, &[0]).unwrap();
         }
 
@@ -16757,7 +16798,10 @@ mod tests {
         // A cancel races the still-in-flight launch, releasing attempt 1's
         // reservation; the controller redispatches attempt 2, which reserves
         // and commits before attempt 1's guard is ever dropped.
-        svc.allocation.lock().await.release_job(11);
+        svc.allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::never_spawned(RunKey::new(11, 1).unwrap()));
         svc.allocation
             .lock()
             .await
@@ -18023,7 +18067,9 @@ mod tests {
             alloc
                 .allocate_for_job(job_id, dead_attempt, 1, 0, &[0])
                 .expect("reserve dead attempt");
-            alloc.release_job(job_id);
+            alloc.release_job(ReleaseWarrant::never_spawned(
+                RunKey::new(job_id, dead_attempt).unwrap(),
+            ));
             alloc
                 .allocate_for_job(job_id, 2, 1, 0, &[0])
                 .expect("reserve newer attempt");
@@ -18717,7 +18763,7 @@ mod tests {
 
         // Core 2 is 910's alone: had 911 replayed it verbatim, releasing 911
         // would clear a core 910 is still running on.
-        alloc.release_job(911);
+        alloc.release_job(ReleaseWarrant::never_spawned(RunKey::new(911, 1).unwrap()));
         assert!(alloc.allocated_cpus[2]);
         assert!(!alloc.allocated_cpus[3]);
     }
