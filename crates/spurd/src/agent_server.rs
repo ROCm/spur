@@ -5012,6 +5012,10 @@ impl SlurmAgent for AgentService {
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
         let mut persist_cred = (String::new(), String::new(), String::new());
+        // Committed to the acceptance ledger only after the root-execution guard below:
+        // recording a launch the agent then refuses lets the controller's teardown-cancel
+        // poison the attempt, turning every same-attempt retry into a WrongAttempt.
+        let mut verified_cred: Option<spur_core::native_cred::ExecutionCredential> = None;
         if let Some(keys) = &self.cred_keys {
             if req.execution_credential.is_empty() {
                 spur_core::native_metrics::inc_exec_fail();
@@ -5047,28 +5051,7 @@ impl SlurmAgent for AgentService {
             cred.require_slice(hostname, cpus, memory_mb, &devices)
                 .map_err(map_exec_err)?;
             persist_cred = persist_execution_meta(&cred);
-            match self.launch_acceptance.accept(&cred) {
-                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
-                Ok(false) => {
-                    spur_core::native_metrics::inc_exec_ok();
-                    let paths = self
-                        .running
-                        .lock()
-                        .await
-                        .get(&req.job_id)
-                        .filter(|tracked| tracked.run_attempt == req.run_attempt)
-                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
-                        .unwrap_or_default();
-                    return Ok(Response::new(LaunchJobResponse {
-                        success: true,
-                        error: String::new(),
-                        stdout_path: paths.0,
-                        stderr_path: paths.1,
-                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-                    }));
-                }
-                Err(e) => return Err(map_exec_err(e)),
-            }
+            verified_cred = Some(cred);
         }
         let job_id = req.job_id;
         // A launch names the node the controller scheduled it onto. If it does not name this host it
@@ -5099,7 +5082,40 @@ impl SlurmAgent for AgentService {
             self.spurd_is_root,
         ) {
             warn!(job_id, uid = spec.uid, "{msg}");
-            return Err(Status::permission_denied(msg));
+            return Ok(Response::new(LaunchJobResponse {
+                success: false,
+                error: msg,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: LaunchFailureKind::LaunchFailurePolicy as i32,
+            }));
+        }
+
+        // Only now, past every refusal check, commit the acceptance. A duplicate of an
+        // already-accepted attempt is idempotent: report success without relaunching.
+        if let Some(cred) = &verified_cred {
+            match self.launch_acceptance.accept(cred) {
+                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
+                Ok(false) => {
+                    spur_core::native_metrics::inc_exec_ok();
+                    let paths = self
+                        .running
+                        .lock()
+                        .await
+                        .get(&req.job_id)
+                        .filter(|tracked| tracked.run_attempt == req.run_attempt)
+                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
+                        .unwrap_or_default();
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: true,
+                        error: String::new(),
+                        stdout_path: paths.0,
+                        stderr_path: paths.1,
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    }));
+                }
+                Err(e) => return Err(map_exec_err(e)),
+            }
         }
 
         // Held until this run is tracked (or its half-built state is cleaned up), so a
@@ -12713,9 +12729,9 @@ mod tests {
         path
     }
 
-    /// The refusal driven through the real RPC entry point, not just the helper: a launch asking to
-    /// run as root on a root spurd must be denied before anything is spawned. `with_root_override`
-    /// makes this deterministic on an unprivileged runner, where the guard would otherwise be inert.
+    /// A launch asking to run as root on a root spurd must be denied before anything is
+    /// spawned, and come back as a launch-policy failure (`success=false`, `Policy`), not a
+    /// transport error. `with_root_override` makes this deterministic on an unprivileged runner.
     #[tokio::test]
     async fn launch_job_refuses_uid_zero_when_spurd_is_root_and_not_opted_in() {
         let svc = AgentService::new(
@@ -12726,7 +12742,7 @@ mod tests {
         )
         .with_root_override(true);
 
-        let err = svc
+        let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 4242,
                 spec: Some(JobSpec {
@@ -12743,13 +12759,155 @@ mod tests {
                 ..Default::default()
             }))
             .await
-            .expect_err("a uid-0 launch must be refused, not accepted");
+            .expect("a uid-0 refusal is a launch-policy failure, not a transport error")
+            .into_inner();
 
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(
-            err.message().contains("allow_root_jobs"),
+            !resp.success,
+            "a uid-0 launch must be refused, not accepted"
+        );
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailurePolicy as i32,
+            "the controller relies on this kind to hold rather than retry"
+        );
+        assert!(
+            resp.error.contains("allow_root_jobs"),
             "the refusal should tell the operator which option governs it: {}",
-            err.message()
+            resp.error
+        );
+    }
+
+    /// A launch refused before `accept()` (uid-0 with allow_root_jobs off) must survive the
+    /// controller's teardown CancelJob: refuse -> cancel -> retry stays a clean allow_root_jobs
+    /// refusal (never a WrongAttempt from a poisoned slot), and the ledger stays empty.
+    #[tokio::test]
+    async fn a_refused_root_launch_survives_cancel_and_retry_without_poisoning() {
+        use spur_core::native_cred::{
+            CredentialKind, ExecutionCredential, NodeResourceSlice, CREDENTIAL_ID_LEN,
+        };
+
+        let now = spur_core::native_mint::unix_now().unwrap();
+        let (sign_doc, verify_doc) =
+            spur_core::native_jwks::generate_ed25519_jwks("cred-1").unwrap();
+        let sign =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(sign_doc.as_bytes(), now)
+                .unwrap();
+        let verify =
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(verify_doc.as_bytes(), now)
+                .unwrap();
+
+        let shared = Arc::new(spur_core::native_exec::LaunchAcceptance::new());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_root_override(true);
+        let svc = AgentService {
+            cred_keys: Some(Arc::new(verify.clone())),
+            cluster_id: "test-cluster".into(),
+            launch_acceptance: shared.clone(),
+            ..svc
+        };
+
+        let script = "#!/bin/bash\ntrue\n".to_string();
+        let cred = ExecutionCredential {
+            kind: CredentialKind::Job,
+            cluster_id: "test-cluster".into(),
+            key_id: String::new(),
+            job_id: 4242,
+            step_id: 0,
+            run_attempt: 1,
+            user: "root".into(),
+            uid: 0,
+            gid: 0,
+            supplementary_gids: vec![],
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            resources_by_node: vec![NodeResourceSlice {
+                node: "test-node".into(),
+                cpus: 0,
+                memory_mb: 0,
+                devices: vec![],
+            }],
+            command_digest: spur_core::native_exec::command_digest(&script, &[], ""),
+            container_digest: None,
+            issued_at: 0,
+            not_before: 0,
+            expires_at: 0,
+            credential_id: [0u8; CREDENTIAL_ID_LEN],
+        };
+        let token = spur_core::native_exec::sign_execution(cred, &sign, now).unwrap();
+        // The exact credential the agent will decode, so the ledger check below keys
+        // on the same (job, step, attempt) and credential_id the handler would.
+        let decoded =
+            spur_core::native_exec::verify_execution(&token, &verify, "test-cluster", now).unwrap();
+
+        let launch = || LaunchJobRequest {
+            job_id: 4242,
+            run_attempt: 1,
+            execution_credential: token.clone(),
+            spec: Some(JobSpec {
+                uid: 0,
+                gid: 0,
+                name: "root-job".into(),
+                script: script.clone(),
+                num_tasks: 1,
+                num_nodes: 1,
+                cpus_per_task: 1,
+                work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // A refusal now comes back as a launch-policy response, never a transport error.
+        let assert_policy_refusal = |resp: LaunchJobResponse, ctx: &str| {
+            assert!(!resp.success, "{ctx}: must be refused");
+            assert_eq!(
+                resp.failure_kind,
+                LaunchFailureKind::LaunchFailurePolicy as i32,
+                "{ctx}: must stay a launch-policy refusal, never a WrongAttempt from a poisoned slot"
+            );
+            assert!(
+                resp.error.contains("allow_root_jobs"),
+                "{ctx}: {}",
+                resp.error
+            );
+        };
+
+        // 1. First dispatch: the root guard refuses before accept() records anything.
+        let resp = svc
+            .launch_job(Request::new(launch()))
+            .await
+            .expect("a uid-0 refusal is a launch-policy failure, not a transport error")
+            .into_inner();
+        assert_policy_refusal(resp, "first dispatch");
+
+        // 2. The controller's dispatch teardown fires CancelJob for the same attempt.
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 4242,
+            signal: 9,
+            run_attempt: 1,
+        }))
+        .await
+        .expect("cancel of a never-launched attempt is a no-op, not an error");
+
+        // 3. Retry at the same attempt: still a policy refusal, never a WrongAttempt.
+        let resp = svc
+            .launch_job(Request::new(launch()))
+            .await
+            .expect("the retry must be a launch-policy refusal, not a transport error")
+            .into_inner();
+        assert_policy_refusal(resp, "retry after cancel");
+
+        // Nothing poisoned the slot: a fresh accept is still the first presentation.
+        assert!(
+            matches!(shared.accept(&decoded), Ok(true)),
+            "refuse -> cancel -> retry must leave no acceptance record for the attempt"
         );
     }
 

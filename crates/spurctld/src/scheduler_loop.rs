@@ -1523,6 +1523,10 @@ enum DispatchError {
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
+    /// The agent refused on a fixed execution policy that won't change on retry
+    /// (`allow_root_jobs`), reported via `LaunchFailureKind::Policy`. The controller
+    /// holds the job rather than looping; a control-plane auth error is not this.
+    PermanentlyRejected(String),
     Other(anyhow::Error),
 }
 
@@ -1536,6 +1540,7 @@ impl DispatchError {
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
+            Self::PermanentlyRejected(_) => "agent refused launch (permanent)",
             Self::Other(_) => "dispatch error",
         }
     }
@@ -1553,6 +1558,7 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::PermanentlyRejected(reason) => write!(f, "agent refused job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1742,13 +1748,15 @@ async fn dispatch_to_agent(
 
     let inner = response.into_inner();
     if !inner.success {
-        // An agent predating the classification sends UNSPECIFIED, which falls
-        // through to the generic requeue this has always done.
+        // A launch-policy denial is permanent (the controller holds it); prolog is
+        // handled specially. Everything else — including the UNSPECIFIED an older
+        // agent sends — takes the generic AgentRejected requeue.
+        use spur_proto::proto::LaunchFailureKind;
         return Err(
-            if inner.failure_kind
-                == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32
-            {
+            if inner.failure_kind == LaunchFailureKind::LaunchFailureProlog as i32 {
                 DispatchError::PrologFailed(inner.error)
+            } else if inner.failure_kind == LaunchFailureKind::LaunchFailurePolicy as i32 {
+                DispatchError::PermanentlyRejected(inner.error)
             } else {
                 DispatchError::AgentRejected(inner.error)
             },
@@ -2079,6 +2087,7 @@ async fn confirm_dispatch_on_nodes(
     let mut successes = 0u32;
     let mut failures = 0u32;
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
+    let mut permanent_rejection: Option<String> = None;
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
 
@@ -2319,6 +2328,11 @@ async fn confirm_dispatch_on_nodes(
                     // Held for the deadline it actually burned: while assignments are processed
                     // serially, re-picking this node stalls every job behind it, not just this one.
                     DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
+                    // The node is healthy; the launch itself is the problem — keep the
+                    // reason (first one wins) but do not cool down or drain the node.
+                    DispatchError::PermanentlyRejected(reason) => {
+                        permanent_rejection.get_or_insert(reason);
+                    }
                     DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
@@ -2385,7 +2399,19 @@ async fn confirm_dispatch_on_nodes(
         }
     }
 
-    if !prolog_failed.is_empty() && cluster.config().controller.hold_on_prolog_fail {
+    if let Some(reason) = permanent_rejection {
+        // Retrying can never succeed, so hold now instead of burning the requeue budget.
+        // Surface the agent's raw reason (e.g. "allow_root_jobs is false") over the
+        // category so the operator sees what to change; interactive jobs cancel instead.
+        let _ = cluster.set_job_launch_failure_detail(job_id, reason.clone());
+        if spec.interactive {
+            if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+                error!(job_id, error = %e, "failed to cancel interactive job after permanent dispatch rejection");
+            }
+        } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&reason)) {
+            error!(job_id, error = %e, "failed to hold job after permanent dispatch rejection");
+        }
+    } else if !prolog_failed.is_empty() && cluster.config().controller.hold_on_prolog_fail {
         if spec.interactive {
             // Holding an interactive job would strand its waiting srun forever
             // with nothing to wait for; Slurm cancels these too.
@@ -4054,10 +4080,15 @@ mod tests {
                     return Err(status.clone());
                 }
                 if let Some(kind) = self.reject_launch_as {
+                    let error = if kind == spur_proto::proto::LaunchFailureKind::LaunchFailurePolicy
+                    {
+                        "refusing to execute as uid 0: [auth] allow_root_jobs is false".into()
+                    } else {
+                        "prolog failed: prolog_slurmd script exited with exit status: 1".into()
+                    };
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
                         success: false,
-                        error: "prolog failed: prolog_slurmd script exited with exit status: 1"
-                            .into(),
+                        error,
                         failure_kind: kind as i32,
                         ..Default::default()
                     }));
@@ -5419,6 +5450,128 @@ mod tests {
                 job.state_reason().contains("agent rejected launch"),
                 "an explicit non-prolog rejection must get its own category, got {:?}",
                 job.state_reason()
+            );
+            assert_ne!(
+                job.pending_reason,
+                PendingReason::Held,
+                "an UNSPECIFIED kind from an older agent must stay generic, never a policy hold"
+            );
+        }
+
+        // A launch-policy denial (agent reports LaunchFailureKind::Policy, e.g.
+        // `[auth] allow_root_jobs`) can never succeed on retry: hold the job with the
+        // real reason on the first failure, don't burn the requeue budget or drain.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_permanent_rejection_holds_the_job_without_retrying_or_draining() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailurePolicy,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("root-denied", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(
+                job.pending_reason,
+                PendingReason::Held,
+                "a permanent rejection holds the job, it must not back off as JobLaunchFailure"
+            );
+            assert_eq!(job.priority, 0);
+            assert_eq!(
+                job.requeue_count, 0,
+                "a rejection that can never succeed must not consume the requeue budget"
+            );
+            assert!(
+                job.state_reason().contains("allow_root_jobs"),
+                "the held reason must surface the agent's actual denial, got {:?}",
+                job.state_reason()
+            );
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "a policy denial is the job's fault, not the node's — the node must not drain"
+            );
+            assert!(
+                cm.nodes_on_dispatch_cooldown().is_empty(),
+                "a policy denial is not a resource/reachability fault — no node cooldown"
+            );
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "a held job must not be scheduled anywhere, closing the retry loop for good"
+            );
+        }
+
+        // An interactive job can't be held for a launch failure — its srun would wait
+        // forever — so a policy rejection cancels it, the same as a prolog failure does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_interactive_policy_rejection_is_cancelled_not_held() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailurePolicy,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("policy-interactive", 1);
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            settle(&cm, job_id, JobState::Cancelled);
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "a policy denial is the job's fault; the node must not drain"
+            );
+        }
+
+        // A control-plane authorization failure arrives as a PermissionDenied *status*
+        // (require_controller), not a launch-policy failure_kind. It must back off and
+        // stay eligible, never masquerade as a permanent per-job policy hold.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_control_plane_permission_denied_backs_off_not_held() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_rejecting_with_status(tonic::Status::permission_denied(
+                "this RPC is reachable only by the cluster controller; caller 'x' is not the \
+                 controller",
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("transport-denied", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(
+                job.pending_reason,
+                PendingReason::JobLaunchFailure,
+                "a transport PermissionDenied must back off, not hold as a permanent policy denial"
+            );
+            assert_eq!(
+                job.requeue_count, 1,
+                "the backoff counts against max_batch_requeue, unlike a policy hold"
+            );
+            assert!(
+                cm.nodes_on_dispatch_cooldown().is_empty(),
+                "a PermissionDenied is not a resource/reachability fault — no node cooldown"
             );
         }
 

@@ -1168,6 +1168,18 @@ caller is. It is read by ``spurd``, so it applies whichever plugin is selected.
 The UID arrives as part of the job spec, so enable this only on a cluster where
 everyone allowed to submit is already trusted with root on the compute nodes.
 
+While it is ``false`` (the default), a job asking to run as UID 0 on a root
+``spurd`` is refused as a fixed policy, not a transient error. The controller
+**holds** a batch job — left ``Pending`` at priority 0, its reason
+(``... allow_root_jobs is false``) shown by ``squeue`` and ``scontrol show job``
+— rather than retrying it onto the same denial, so it does not consume the
+launch requeue budget. An interactive job is **cancelled** instead, because a
+hold would strand its waiting ``srun``. Because the setting is read at startup,
+clearing the condition takes both an agent restart and a job release: set
+``allow_root_jobs = true``, restart ``spurd`` on that node, then
+``scontrol release <jobid>`` — or simply resubmit the job as an unprivileged
+user.
+
 ``[[partitions]]``
 ------------------
 
