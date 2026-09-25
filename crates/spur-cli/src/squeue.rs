@@ -58,6 +58,11 @@ pub struct SqueueArgs {
     #[arg(short = 'o', long)]
     pub format: Option<String>,
 
+    /// Output format using field names, comma-separated: type[:[.][size][suffix]].
+    /// Mutually exclusive with -o/--format (Slurm rejects combining the two).
+    #[arg(short = 'O', long = "Format", conflicts_with = "format")]
+    pub format2: Option<String>,
+
     /// Long format (more columns)
     #[arg(short = 'l', long)]
     pub long: bool,
@@ -99,10 +104,12 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-/// The format, state filter, and sort order a run resolves to, before any
-/// network I/O so a bad spec surfaces its own error rather than a connect failure.
+/// The resolved output columns, state filter, and sort order a run reduces to,
+/// all computed before any network I/O so a bad spec surfaces its own error
+/// rather than a connect failure. `-O`/`--Format` is resolved here too, so the
+/// choice between the `%`-form and the field-name form lives in one place.
 struct QueryPlan {
-    fmt: String,
+    fields: Vec<format_engine::FormatToken>,
     states: Vec<spur_proto::proto::JobState>,
     sort_keys: Vec<SortKey>,
 }
@@ -110,14 +117,28 @@ struct QueryPlan {
 /// `--start` supplies a default format, state filter, and sort order; each is
 /// still overridable by passing the corresponding flag explicitly.
 fn plan_query(args: &SqueueArgs) -> Result<QueryPlan> {
-    let fmt = if let Some(ref f) = args.format {
-        f.clone()
-    } else if args.start {
-        START_FORMAT.to_string()
-    } else if args.long {
-        "%.18i %.9P %.8j %.8u %.8T %.10M %.9l %.6D %R".to_string()
+    // -O/--Format selects columns by field name; it cannot be combined with the
+    // %-form (clap enforces the conflict), and it overrides the --long/--start
+    // default layouts.
+    let fields = if let Some(f2) = args.format2.as_deref() {
+        format_engine::parse_format2(f2, &squeue_field_spec, &format_engine::squeue_header)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{e}\nSupported -O/--Format fields: {}",
+                    SUPPORTED_O_FIELDS.join(", ")
+                )
+            })?
     } else {
-        format_engine::SQUEUE_DEFAULT_FORMAT.to_string()
+        let fmt = if let Some(ref f) = args.format {
+            f.clone()
+        } else if args.start {
+            START_FORMAT.to_string()
+        } else if args.long {
+            "%.18i %.9P %.8j %.8u %.8T %.10M %.9l %.6D %R".to_string()
+        } else {
+            format_engine::SQUEUE_DEFAULT_FORMAT.to_string()
+        };
+        format_engine::parse_format(&fmt, &format_engine::squeue_header)
     };
 
     let states = match args.states.as_deref() {
@@ -136,7 +157,7 @@ fn plan_query(args: &SqueueArgs) -> Result<QueryPlan> {
     };
 
     Ok(QueryPlan {
-        fmt,
+        fields,
         states,
         sort_keys,
     })
@@ -146,11 +167,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SqueueArgs>(&args);
 
     let QueryPlan {
-        fmt,
+        fields,
         states,
         sort_keys,
     } = plan_query(&args)?;
-    let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
 
     let job_ids = args
         .jobs
@@ -250,7 +270,16 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
             }
         }
         'k' => job.comment.clone(),
-        'A' => job.job_id.to_string(),
+        // Parent array job id for array tasks; the job's own id otherwise
+        // (array_job_id is 0 for non-array jobs).
+        'A' => {
+            let id = if job.array_job_id != 0 {
+                job.array_job_id
+            } else {
+                job.job_id
+            };
+            id.to_string()
+        }
         // Generic resources (GRES) requested, e.g. "gpu:8" or "gpu:mi300x:4/node".
         'b' => {
             if job.req_gpus_detail.is_empty() {
@@ -507,6 +536,80 @@ fn format_duration_hms(total_seconds: i64) -> String {
     }
 }
 
+/// Canonical `-O`/`--Format` field names Spur supports, for help and error text.
+/// Kept in sync with [`squeue_field_spec`] by a unit test. Hidden Slurm aliases
+/// (e.g. `tres-per-node`) are accepted but omitted here, matching Slurm.
+const SUPPORTED_O_FIELDS: &[&str] = &[
+    "Account",
+    "ArrayJobID",
+    "Command",
+    "Comment",
+    "EndTime",
+    "GRES",
+    "JobID",
+    "Name",
+    "NodeList",
+    "NumCPUs",
+    "NumNodes",
+    "Partition",
+    "Priority",
+    "PriorityLong",
+    "QOS",
+    "Reason",
+    "ReasonList",
+    "Reservation",
+    "SchedNodes",
+    "StartTime",
+    "State",
+    "StateCompact",
+    "SubmitTime",
+    "TimeLeft",
+    "TimeLimit",
+    "TimeUsed",
+    "UserName",
+    "WorkDir",
+];
+
+/// Map a Slurm `-O`/`--Format` field name to the specifier used by
+/// [`resolve_job_field`]. Case-insensitive. Only names Spur can render map to a
+/// spec; anything else is rejected by the caller. Names resolve to the same
+/// fields as their `%`-form equivalents.
+fn squeue_field_spec(name: &str) -> Option<char> {
+    let spec = match name.to_lowercase().as_str() {
+        "account" => 'a',
+        "arrayjobid" | "jobarrayid" => 'A',
+        "command" => 'o',
+        "comment" => 'k',
+        "endtime" => 'e',
+        // Slurm's `tres-per-node` is a hidden alias sharing the GRES printer.
+        "gres" | "tres-per-node" => 'b',
+        "jobid" => 'i',
+        "name" => 'j',
+        "nodelist" => 'N',
+        "numcpus" => 'C',
+        "numnodes" => 'D',
+        "partition" => 'P',
+        // Spur exposes only the integer priority, so both map to it (see %Q/%p).
+        "priority" | "prioritylong" => 'p',
+        "qos" => 'q',
+        "reason" => 'r',
+        "reasonlist" => 'R',
+        "reservation" => 'v',
+        "schednodes" => 'Y',
+        "starttime" => 'S',
+        "state" => 'T',
+        "statecompact" => 't',
+        "submittime" => 'V',
+        "timeleft" => 'L',
+        "timelimit" => 'l',
+        "timeused" => 'M',
+        "username" => 'u',
+        "workdir" => 'Z',
+        _ => return None,
+    };
+    Some(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +617,27 @@ mod tests {
 
     fn plan_from(argv: &[&str]) -> QueryPlan {
         plan_query(&SqueueArgs::try_parse_from(argv).unwrap()).unwrap()
+    }
+
+    fn plan_header(plan: &QueryPlan) -> String {
+        format_engine::format_header(&plan.fields)
+    }
+
+    fn header_for_fmt(fmt: &str) -> String {
+        format_engine::format_header(&format_engine::parse_format(
+            fmt,
+            &format_engine::squeue_header,
+        ))
+    }
+
+    fn plan_specs(plan: &QueryPlan) -> Vec<char> {
+        plan.fields
+            .iter()
+            .filter_map(|t| match t {
+                format_engine::FormatToken::Field(f) => Some(f.spec),
+                _ => None,
+            })
+            .collect()
     }
 
     fn ts(seconds: i64) -> prost_types::Timestamp {
@@ -539,14 +663,13 @@ mod tests {
                 descending: false
             }]
         );
-        assert_eq!(plan.fmt, START_FORMAT);
+        assert_eq!(plan_header(&plan), header_for_fmt(START_FORMAT));
     }
 
     #[test]
     fn start_flag_renders_a_schednodes_column() {
         let plan = plan_from(&["squeue", "--start"]);
-        let fields = format_engine::parse_format(&plan.fmt, &format_engine::squeue_header);
-        assert!(format_engine::format_header(&fields).contains("SCHEDNODES"));
+        assert!(format_engine::format_header(&plan.fields).contains("SCHEDNODES"));
     }
 
     #[test]
@@ -560,7 +683,7 @@ mod tests {
                 descending: false
             }]
         );
-        assert_eq!(plan.fmt, "%i");
+        assert_eq!(plan_header(&plan), header_for_fmt("%i"));
     }
 
     #[test]
@@ -568,7 +691,10 @@ mod tests {
         let plan = plan_from(&["squeue"]);
         assert_eq!(plan.states, default_squeue_states());
         assert_eq!(plan.sort_keys, default_sort_keys());
-        assert_eq!(plan.fmt, format_engine::SQUEUE_DEFAULT_FORMAT);
+        assert_eq!(
+            plan_header(&plan),
+            header_for_fmt(format_engine::SQUEUE_DEFAULT_FORMAT)
+        );
     }
 
     #[test]
@@ -997,5 +1123,125 @@ mod tests {
                 .unwrap();
         assert_eq!(long.qos.as_deref(), Some("batch"));
         assert_eq!(long.reservation.as_deref(), Some("resv1"));
+    }
+
+    #[test]
+    fn squeue_field_spec_maps_names_case_insensitively() {
+        assert_eq!(squeue_field_spec("JobID"), Some('i'));
+        assert_eq!(squeue_field_spec("jobid"), Some('i'));
+        assert_eq!(squeue_field_spec("Partition"), Some('P'));
+        assert_eq!(squeue_field_spec("StateCompact"), Some('t'));
+        assert_eq!(squeue_field_spec("state"), Some('T'));
+        assert_eq!(squeue_field_spec("QOS"), Some('q'));
+        assert_eq!(squeue_field_spec("reservation"), Some('v'));
+        // Spur has no normalized-float priority, so both map to the integer spec.
+        assert_eq!(squeue_field_spec("Priority"), Some('p'));
+        assert_eq!(squeue_field_spec("PriorityLong"), Some('p'));
+    }
+
+    #[test]
+    fn squeue_field_spec_rejects_unsupported_names() {
+        assert_eq!(squeue_field_spec("Licenses"), None);
+        assert_eq!(squeue_field_spec("Dependency"), None);
+        // `TRESPerNode` is not a Slurm field name; only the hidden
+        // `tres-per-node` alias exists, and it shares the GRES printer.
+        assert_eq!(squeue_field_spec("TRESPerNode"), None);
+        assert_eq!(squeue_field_spec("tres-per-node"), Some('b'));
+    }
+
+    #[test]
+    fn supported_o_fields_all_resolve_to_a_spec() {
+        for name in SUPPORTED_O_FIELDS {
+            assert!(
+                squeue_field_spec(name).is_some(),
+                "listed field {name} has no spec"
+            );
+        }
+    }
+
+    #[test]
+    fn array_job_id_renders_parent_for_array_tasks_and_own_id_otherwise() {
+        let spec = squeue_field_spec("ArrayJobID").unwrap();
+        let task = spur_proto::proto::JobInfo {
+            job_id: 57,
+            array_job_id: 42,
+            ..Default::default()
+        };
+        assert_eq!(resolve_job_field(&task, spec), "42");
+        let plain = spur_proto::proto::JobInfo {
+            job_id: 57,
+            array_job_id: 0,
+            ..Default::default()
+        };
+        assert_eq!(resolve_job_field(&plain, spec), "57");
+    }
+
+    #[test]
+    fn every_squeue_field_spec_has_a_render_arm() {
+        let j = spur_proto::proto::JobInfo::default();
+        for name in [
+            "account",
+            "command",
+            "comment",
+            "endtime",
+            "gres",
+            "jobid",
+            "arrayjobid",
+            "name",
+            "nodelist",
+            "numcpus",
+            "numnodes",
+            "partition",
+            "priority",
+            "qos",
+            "reason",
+            "reasonlist",
+            "reservation",
+            "schednodes",
+            "starttime",
+            "state",
+            "statecompact",
+            "submittime",
+            "timeleft",
+            "timelimit",
+            "timeused",
+            "username",
+            "workdir",
+        ] {
+            let spec = squeue_field_spec(name)
+                .unwrap_or_else(|| panic!("name {name} should map to a spec"));
+            assert_ne!(
+                format_engine::squeue_header(spec),
+                "?",
+                "name {name} (spec {spec}) has no header"
+            );
+            assert_ne!(
+                resolve_job_field(&j, spec),
+                "?",
+                "name {name} (spec {spec}) has no render arm"
+            );
+        }
+    }
+
+    #[test]
+    fn format2_resolves_field_names_to_specs() {
+        let plan = plan_from(&["squeue", "-O", "JobID:10,Partition,QOS"]);
+        assert_eq!(plan_specs(&plan), vec!['i', 'P', 'q']);
+    }
+
+    #[test]
+    fn format_and_format2_are_mutually_exclusive() {
+        let err = SqueueArgs::try_parse_from(["squeue", "-o", "%i", "-O", "JobID"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn format2_error_lists_supported_fields() {
+        let err = plan_query(&SqueueArgs::try_parse_from(["squeue", "-O", "Bogus"]).unwrap())
+            .err()
+            .expect("unknown field should be rejected")
+            .to_string();
+        assert!(err.contains("Supported -O/--Format fields:"));
+        assert!(err.contains("JobID"));
     }
 }
