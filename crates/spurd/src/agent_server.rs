@@ -710,9 +710,8 @@ async fn claim_stepd_slot(
     Ok(())
 }
 
-/// Runs `record_supervisor` off the executor thread: it fsyncs through the
-/// same per-run lock as every other admission write, so it must not block
-/// whatever thread this is awaited from.
+/// Runs `record_supervisor`'s fsync off the executor thread, like every
+/// other admission write.
 async fn record_supervisor_off_executor(
     admissions: &crate::admission::AdmissionStore,
     run_key: RunKey,
@@ -746,6 +745,21 @@ fn stepd_is_current(
     expected: &crate::stepd::StepdDescriptor,
 ) -> bool {
     current == expected
+}
+
+/// Narrows a GPU stable id to the ledger's `u32` field. A missing device is a
+/// lesser evil than one silently misnamed, so an id that overflows is dropped.
+fn admitted_gpu_ids(gpu_ids: &[u64], job_id: u32) -> Vec<u32> {
+    gpu_ids
+        .iter()
+        .filter_map(|&id| match u32::try_from(id) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                error!(job_id, id, "GPU stable id does not fit in the ledger's u32 field; omitting it from the admission record");
+                None
+            }
+        })
+        .collect()
 }
 
 fn unreported_durable_exit(
@@ -5287,10 +5301,8 @@ impl Drop for LaunchReservationGuard {
             warn!(%run, "an aborted launch left a payload running; its slice stays held");
             return;
         }
-        // `remove_run` fsyncs through the same per-run std::sync::Mutex as every
-        // other admission write, so it must never run inline on whatever thread
-        // Drop executes on (often a tokio worker) — unlike the allocation
-        // release below, which is pure in-memory and safe on this thread.
+        // `remove_run` fsyncs, so it must not run inline on Drop's thread --
+        // unlike the allocation release below, which is pure in-memory.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let admissions = self.admissions.clone();
             handle.spawn(async move {
@@ -6764,12 +6776,13 @@ impl SlurmAgent for AgentService {
             crate::admission::AdmittedResources {
                 cpu_ids: alloc_result.cpu_ids.clone(),
                 memory_mb: alloc_result.memory_mb,
-                gpu_devices: allocated_device_ids.iter().map(|&id| id as u32).collect(),
+                gpu_devices: admitted_gpu_ids(&allocated_device_ids, job_id),
             },
             crate::admission::now_unix_ms(),
         );
         run_record.lifecycle_owner_step = Some(launch_step);
-        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+        let allocation = run_record.allocation.clone();
+        if let Err(error) = admissions.admit_run_async(run_record).await {
             error!(job_id, run_attempt, %error, "failed to persist the run admission record");
             return Err(Status::unavailable(format!(
                 "could not record the admission for job {job_id}: {error}"
@@ -6780,7 +6793,7 @@ impl SlurmAgent for AgentService {
             run_attempt,
             launch_step,
             &self.reporter.hostname,
-            run_record.allocation.clone(),
+            allocation,
         );
         participant_record.final_report.required = true;
         participant_record.command_digest = req.command_digest.clone();
@@ -7646,10 +7659,8 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        // The duplicate check only needs a point-in-time read: nothing else can
-        // insert this id while `_lifecycle` is held, so the lock need not span
-        // the reserve, the admission writes (real fsyncs), or the cgroup setup
-        // below — it is reacquired only where `running` is actually mutated.
+        // A point-in-time read: `_lifecycle` already excludes a concurrent
+        // insert, so the lock need not span the reserve or the admission writes.
         let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
             Status::invalid_argument("run attempt 0 names no run to hold an allocation")
         })?;
@@ -7711,12 +7722,13 @@ impl SlurmAgent for AgentService {
             crate::admission::AdmittedResources {
                 cpu_ids: alloc_result.cpu_ids.clone(),
                 memory_mb: alloc_result.memory_mb,
-                gpu_devices: controller_gpu_ids.iter().map(|&id| id as u32).collect(),
+                gpu_devices: admitted_gpu_ids(&controller_gpu_ids, req.job_id),
             },
             crate::admission::now_unix_ms(),
         );
         run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
-        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+        let allocation = run_record.allocation.clone();
+        if let Err(error) = admissions.admit_run_async(run_record).await {
             error!(job_id = req.job_id, %error, "failed to persist the run admission record");
             return Err(Status::unavailable(format!(
                 "could not record the admission for job {}: {error}",
@@ -7730,7 +7742,7 @@ impl SlurmAgent for AgentService {
             req.run_attempt,
             spur_core::step::STEP_EXTERN,
             &self.reporter.hostname,
-            run_record.allocation.clone(),
+            allocation,
         );
         participant_record.final_report.required = true;
         if let Err(error) = admissions.admit_participant_async(participant_record).await {
@@ -7976,9 +7988,8 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(RegisterJobAllocationResponse {}));
         }
 
-        // reconcile reclaimed the reservation mid-registration (registration
-        // exceeded the TTL). Undo the insert and tear down what was set up for
-        // it rather than report an allocation with nothing backing it.
+        // reconcile reclaimed the reservation mid-registration; undo the insert
+        // rather than report an allocation with nothing backing it.
         let removed = jobs.remove(&req.job_id);
         drop(jobs);
         reservation_guard.mark_reaped();
@@ -17492,10 +17503,8 @@ mod tests {
         assert_eq!(inner.stderr_path, expected);
     }
 
-    /// The whole point of this file's admission-ledger wiring: a real launch
-    /// through the RPC handler must leave a run admission record behind, not
-    /// just exercise a hand-rolled ledger write in a narrower test. Without
-    /// this, every ledger-gated release path downstream has nothing to gate on.
+    /// A real launch through the RPC handler must leave a run admission
+    /// record behind, not just exercise a hand-rolled ledger write.
     #[tokio::test]
     async fn launch_job_admits_a_run_record_for_the_launch_it_performs() {
         let reporter = test_reporter();
@@ -18263,47 +18272,6 @@ mod tests {
         );
     }
 
-    // `register_job_allocation` has two arms that kill+reap a stepd it just
-    // spawned (a superseded `claim_stepd_slot`, and a post-claim duplicate
-    // registration) after already calling `mark_spawned()`. Both must call
-    // `mark_reaped()` before returning, or `Drop` reads the reservation as
-    // "something is still running" and holds it forever even though nothing
-    // is. This reproduces that exact sequence against the real guard.
-    #[tokio::test]
-    async fn a_registration_that_loses_its_post_claim_race_reaps_the_reservation() {
-        let svc = AgentService::new(
-            test_reporter_with_gpus(&[0]),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(test_gpu_registry())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
-
-        svc.allocation
-            .lock()
-            .await
-            .allocate_for_job(77, 1, 1, 0, &[0])
-            .expect("reserve allocation");
-        assert!(svc.allocation.lock().await.commit_job(77, 1));
-        assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
-
-        let mut reservation_guard =
-            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1));
-
-        // A supervisor is live against this reservation (mirrors either fixed
-        // arm right after `launch_stepd`/`claim_stepd_slot` succeeds), then
-        // this registration loses the race and kills+reaps what it just
-        // spawned before returning an error -- exactly what both arms do.
-        reservation_guard.mark_spawned();
-        reservation_guard.mark_reaped();
-        drop(reservation_guard);
-
-        assert_eq!(
-            svc.free_gpu_count().await,
-            1,
-            "a reaped reservation must release the GPU it held, not hold it forever"
-        );
-    }
-
     // A TTL reclaim racing the tail of `register_job_allocation` must fail the
     // call, not report success over a reservation that no longer exists.
     #[tokio::test]
@@ -18349,6 +18317,41 @@ mod tests {
         assert!(
             !svc.running.lock().await.contains_key(&91),
             "a failed registration must leave no tracked job behind"
+        );
+    }
+
+    // A registration that kills+reaps a stepd it just spawned must call
+    // `mark_reaped()`, or `Drop` reads it as still running and holds it forever.
+    #[tokio::test]
+    async fn a_registration_that_loses_its_post_claim_race_reaps_the_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(77, 1, 1, 0, &[0])
+            .expect("reserve allocation");
+        assert!(svc.allocation.lock().await.commit_job(77, 1));
+        assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
+
+        let mut reservation_guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1));
+
+        // Mirrors either arm right after `launch_stepd`/`claim_stepd_slot`
+        // succeeds, then losing the race and reaping what it just spawned.
+        reservation_guard.mark_spawned();
+        reservation_guard.mark_reaped();
+        drop(reservation_guard);
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a reaped reservation must release the GPU it held, not hold it forever"
         );
     }
 
