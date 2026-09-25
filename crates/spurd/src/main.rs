@@ -547,6 +547,21 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
     ));
 
+    // Wired before registration so the first cut carries this node's claims:
+    // registering with no ledger tells the controller it has no evidence. Bound
+    // to a local so every later user shares this instance's per-run lock table
+    // rather than racing an unshared one on the same on-disk records.
+    let admissions = spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname);
+    reporter.set_admissions(admissions.clone());
+    reporter.set_runs_job_epilog(agent_server::runs_job_epilog(&hooks_config));
+
+    // Bound before registering, not when the server starts serving. Registration
+    // makes the controller reconcile this node and call straight back; until the
+    // port is bound those calls are refused outright and never retried.
+    let listen_addr: std::net::SocketAddr = args.listen.parse()?;
+    let agent_listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    info!(addr = %listen_addr, "agent port bound");
+
     // Register with controller
     reporter.register().await?;
 
@@ -565,25 +580,6 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .map(session_identity)
         .collect();
-    let reconciled_stepd_completions: std::collections::HashSet<_> =
-        agent_server::replay_unacknowledged_stepd_completions(&stepds, &args.controller, &hostname)
-            .await?
-            .into_iter()
-            .collect();
-    // Runs for the daemon's life, not just when this scan found something —
-    // a push notification deferred later needs the same reconciliation.
-    agent_server::retry_unacknowledged_stepd_completions(
-        stepds.clone(),
-        args.controller.clone(),
-        hostname.clone(),
-    );
-    // Housekeeping, and the periodic sweeper retries it; failing to read the
-    // runtime root is not a reason to refuse to start.
-    match stepds.prune_finalized() {
-        Ok(pruned) if pruned > 0 => info!(sessions = pruned, "pruned finalized stepd state"),
-        Ok(_) => {}
-        Err(error) => warn!(%error, "failed to prune finalized stepd state"),
-    }
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
@@ -645,9 +641,50 @@ async fn main() -> anyhow::Result<()> {
     // jobs; the OnceLock only shares the handle, so the ordering is immaterial.
     reporter.set_allocation(agent_service.allocation_handle());
     agent_service.adopt_stepds(&recovered_stepds).await;
-    agent_service
-        .replay_adopted_allocations(&recovered_stepds)
+    // The admission records are exact where a descriptor rebuild under-counts;
+    // sessions predating them fall back to the descriptor path inside this.
+    let adopted = agent_service
+        .replay_admitted_allocations(&recovered_stepds)
         .await;
+    for outcome in &adopted {
+        if outcome.disposition.needs_reconciliation() {
+            warn!(
+                job_id = outcome.job_id,
+                run_attempt = outcome.run_attempt,
+                disposition = ?outcome.disposition,
+                "this run cannot be resolved from local evidence"
+            );
+        }
+    }
+    // After the ledger rebuild above: a completion delivered late frees the
+    // slice it settles, and there is nothing to free until the claims are back.
+    let reconciled_stepd_completions: std::collections::HashSet<_> =
+        agent_server::replay_unacknowledged_stepd_completions(
+            &stepds,
+            &admissions,
+            &agent_service.allocation_handle(),
+            &args.controller,
+            &hostname,
+        )
+        .await?
+        .into_iter()
+        .collect();
+    // Runs for the daemon's life, not just when this scan found something —
+    // a push notification deferred later needs the same reconciliation.
+    agent_server::retry_unacknowledged_stepd_completions(
+        stepds.clone(),
+        admissions.clone(),
+        agent_service.allocation_handle(),
+        args.controller.clone(),
+        hostname.clone(),
+    );
+    // Housekeeping, and the periodic sweeper retries it; failing to read the
+    // runtime root is not a reason to refuse to start.
+    match stepds.prune_finalized() {
+        Ok(pruned) if pruned > 0 => info!(sessions = pruned, "pruned finalized stepd state"),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to prune finalized stepd state"),
+    }
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
@@ -685,9 +722,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(k0s.supervise());
 
     agent_service.start_monitor(args.controller.clone());
-
-    let addr = args.listen.parse()?;
-    info!(%addr, "agent gRPC server listening");
 
     // Authenticate callers of the agent surface: without this, reaching this port is enough to ask
     // the node to run work, which steps around the controller's authentication entirely.
@@ -744,7 +778,9 @@ async fn main() -> anyhow::Result<()> {
     let server_future = tonic::transport::Server::builder()
         .layer(auth_middleware::AgentAuthLayer::from_bearer(bearer))
         .add_service(spur_proto::agent_server(agent_service))
-        .serve(addr);
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+            agent_listener,
+        ));
     let server_task = tokio::spawn(server_future);
 
     if !recovered_stepds.is_empty() {

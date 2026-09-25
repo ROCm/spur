@@ -681,6 +681,14 @@ impl AdmissionStore {
         &self.root
     }
 
+    /// Whether two handles serialize on the same per-run lock table. A clone
+    /// shares it; a separately-constructed instance never does, even against
+    /// the same `root` -- exactly the distinction callers must not get wrong.
+    #[cfg(test)]
+    pub(crate) fn shares_lock_table_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.run_locks, &other.run_locks)
+    }
+
     /// The mutex for one run's identity, created on first use. Held for a
     /// whole load-mutate-write cycle, never just the write.
     fn run_lock(&self, run_key: RunKey) -> Arc<Mutex<()>> {
@@ -1471,6 +1479,47 @@ impl AdmissionStore {
         })
     }
 
+    /// As [`Self::remove_run`], but only if the run is still unreadable -- a
+    /// legitimate admit landing since an unlocked scan classified it must not
+    /// be deleted by a sweep that only ever saw the earlier, broken state.
+    fn remove_run_if_still_unreadable(&self, run_key: RunKey) -> io::Result<bool> {
+        self.with_run_lock(run_key, || {
+            if self.load_run(run_key).is_ok() {
+                return Ok(false);
+            }
+            match fs::remove_dir_all(self.run_dir(run_key)?) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// As [`Self::remove_run`], but only if the on-disk record is still the
+    /// exact one this caller admitted -- a re-admission for the same run since
+    /// then must not be deleted out from under it.
+    pub fn remove_run_if_created_at(
+        &self,
+        run_key: RunKey,
+        created_at_unix_ms: u64,
+    ) -> io::Result<()> {
+        self.with_run_lock(run_key, || {
+            let run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if run.created_at_unix_ms != created_at_unix_ms {
+                return Ok(());
+            }
+            match fs::remove_dir_all(self.run_dir(run_key)?) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// As [`Self::sweep`]'s per-run body, but re-validated under this run's own
     /// lock so a write landing between the unlocked scan and this call can't be swept.
     fn remove_run_if_eligible(
@@ -1570,20 +1619,25 @@ impl AdmissionStore {
             {
                 continue;
             }
-            tracing::warn!(
-                path = %entry.path.display(),
-                reason = %entry.reason,
-                "collecting an unreadable admission record past its retention"
-            );
             // Route through the run's own lock whenever the name resolves to one,
             // so this delete can't race a concurrent locked writer for the same run.
-            match parse_run_dir_name(&entry.path)
+            let did_remove = match parse_run_dir_name(&entry.path)
                 .and_then(|(job_id, attempt)| RunKey::new(job_id, attempt))
             {
-                Some(run_key) => self.remove_run(run_key)?,
-                None => remove_path(&entry.path)?,
+                Some(run_key) => self.remove_run_if_still_unreadable(run_key)?,
+                None => {
+                    remove_path(&entry.path)?;
+                    true
+                }
+            };
+            if did_remove {
+                tracing::warn!(
+                    path = %entry.path.display(),
+                    reason = %entry.reason,
+                    "collecting an unreadable admission record past its retention"
+                );
+                removed += 1;
             }
-            removed += 1;
         }
         Ok(removed)
     }
@@ -1850,6 +1904,26 @@ mod tests {
     }
 
     #[test]
+    fn sweep_rejected_spares_a_run_that_became_readable_since_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let target = store.prepare_run_dir(key(9, 4)).unwrap();
+        let stale = vec![RejectedAdmission::new(target, "run record not found")];
+
+        // A legitimate admit lands after this scan captured `stale`, but
+        // before the sweep's own delete for that entry runs.
+        store.admit_run(&run_with(9, 4, 0)).unwrap();
+
+        assert_eq!(
+            store
+                .sweep_rejected(&stale, u64::MAX, 0, &HashSet::new())
+                .unwrap(),
+            0
+        );
+        assert!(store.load_run(key(9, 4)).is_ok());
+    }
+
+    #[test]
     fn a_newer_schema_is_rejected_rather_than_partially_understood() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
@@ -2108,6 +2182,49 @@ mod tests {
         assert!(
             store.load_run(key(7, 1)).is_ok(),
             "the record, and the participant that just landed, must survive"
+        );
+    }
+
+    // A launch aborts before spawning anything and schedules a background
+    // `remove_run_if_created_at(run, T1)`. Before that runs, the controller's
+    // legitimate retry re-admits the same run with a newer `created_at_unix_ms`
+    // (T2). The stale, now-late delete must not take T2's record with it.
+    #[test]
+    fn remove_run_if_created_at_spares_a_retrys_record_admitted_after_the_stale_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let aborted = run_with(7, 1, 1_000);
+        store.admit_run(&aborted).unwrap();
+
+        // The legitimate retry: same run key, re-admitted with a newer stamp.
+        let retried = run_with(7, 1, 2_000);
+        store.admit_run(&retried).unwrap();
+
+        store
+            .remove_run_if_created_at(key(7, 1), aborted.created_at_unix_ms)
+            .unwrap();
+
+        let loaded = store.load_run(key(7, 1)).expect(
+            "the retry's record must survive a stale delete for an older created_at_unix_ms",
+        );
+        assert_eq!(loaded.created_at_unix_ms, retried.created_at_unix_ms);
+    }
+
+    #[test]
+    fn remove_run_if_created_at_still_removes_a_matching_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let run = run_with(7, 1, 1_000);
+        store.admit_run(&run).unwrap();
+
+        store
+            .remove_run_if_created_at(key(7, 1), run.created_at_unix_ms)
+            .unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "a delete whose created_at still matches must still take effect"
         );
     }
 

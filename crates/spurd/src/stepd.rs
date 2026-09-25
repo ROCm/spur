@@ -2823,16 +2823,51 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<bool> {
+        Ok(self
+            .epilog_result(job_id, run_attempt, step_id)?
+            .unwrap_or(false))
+    }
+
+    /// How the supervisor's own ledger says its epilog ended, or `None` while it
+    /// has not said. Written by the hook's owner, so no teardown here loses it.
+    pub(crate) fn epilog_result(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<bool>> {
         let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
         Ok(obligations
             .iter()
             .rev()
             .find_map(|obligation| match obligation {
-                StepdObligation::EpilogCompleted { failed } => Some(*failed),
-                StepdObligation::ExitObserved { .. } => Some(false),
+                StepdObligation::EpilogCompleted { failed } => Some(Some(*failed)),
+                // An exit newer than the last result belongs to a session that
+                // has not reached its hook, so the older result does not answer it.
+                StepdObligation::ExitObserved { .. } => Some(None),
                 _ => None,
             })
-            .unwrap_or(false))
+            .flatten())
+    }
+
+    /// Every session this store holds for one run, whatever step it belongs to:
+    /// a run's payload is whatever any of its participants is still running.
+    pub(crate) fn published_sessions_for_run(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> io::Result<Vec<io::Result<StepdDescriptor>>> {
+        let prefix = format!("{job_id}.{run_attempt}.");
+        Ok(self
+            .session_dirs()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .map(|path| self.load_descriptor(&path))
+            .collect())
     }
 
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
@@ -2973,6 +3008,28 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
     matches!(fields.nth(18).and_then(|t| t.parse::<u64>().ok()), Some(ticks) if ticks == start_ticks)
 }
 
+/// The same reading as `process_is_live`, keeping "could not tell" apart from
+/// "gone" for callers that may not treat an unreadable `/proc` as a death.
+pub(crate) fn process_liveness(pid: u32, start_ticks: u64) -> io::Result<StepdLiveness> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        // A fully reaped process reads as gone, not as "could not tell".
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(StepdLiveness::Stale),
+        Err(error) => return Err(error),
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return Ok(StepdLiveness::Stale);
+    };
+    let mut fields = fields.split_ascii_whitespace();
+    if fields.next() == Some("Z") {
+        return Ok(StepdLiveness::Stale);
+    }
+    match fields.nth(18).and_then(|t| t.parse::<u64>().ok()) {
+        Some(ticks) if ticks == start_ticks => Ok(StepdLiveness::Live),
+        _ => Ok(StepdLiveness::Stale),
+    }
+}
+
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
     match process_start_ticks(descriptor.pid) {
         // A zombie's start ticks still match (the kernel keeps them until
@@ -2987,6 +3044,64 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
+    }
+}
+
+/// Same `(pid, start_ticks)` read as `stepd_liveness`, for a recorded admission
+/// supervisor rather than a discovered descriptor. Not boot-scoped, the same
+/// accepted gap as `workload_process_liveness` below.
+pub(crate) fn supervisor_liveness(
+    recorded: &crate::admission::SupervisorRef,
+) -> io::Result<StepdLiveness> {
+    process_liveness(recorded.pid, recorded.start_ticks)
+}
+
+/// What a published descriptor says about a session's workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadLiveness {
+    /// The recorded `(pid, start_ticks)` still names a running process.
+    Live,
+    Gone,
+    /// Neither the descriptor nor the process behind it could be read, so
+    /// nothing is proven. Never read as gone, and never as licence to kill.
+    Unknown,
+}
+
+/// The one verdict on whether a session's workload is still running: the
+/// completion gate and the teardown fence must not disagree about one process.
+pub(crate) fn workload_liveness(published: &io::Result<StepdDescriptor>) -> WorkloadLiveness {
+    match published {
+        Ok(descriptor) => workload_process_liveness(descriptor),
+        // No session on disk: nothing published a workload, so there is none.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+/// An unrecorded workload (`0`) holds nothing up. Unlike a supervisor, a
+/// zombie counts as gone -- it holds none of the slice.
+///
+/// This descriptor carries no boot id to scope the pid against, so (unlike
+/// the ported reference) a pid reused across a reboot cannot be told apart
+/// from the same process -- the same gap `stepd_liveness` above accepts.
+pub(crate) fn workload_process_liveness(descriptor: &StepdDescriptor) -> WorkloadLiveness {
+    if descriptor.workload_pid == 0 {
+        return WorkloadLiveness::Gone;
+    }
+    workload_liveness_of_reading(process_liveness(
+        descriptor.workload_pid,
+        descriptor.workload_start_ticks,
+    ))
+}
+
+/// A `/proc` read that failed for anything but absence proves nothing: the pid
+/// may be anyone's, so it holds the slice without ever licensing a kill.
+pub(crate) fn workload_liveness_of_reading(reading: io::Result<StepdLiveness>) -> WorkloadLiveness {
+    match reading {
+        Ok(StepdLiveness::Live) => WorkloadLiveness::Live,
+        Ok(_) => WorkloadLiveness::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
     }
 }
 
@@ -3906,6 +4021,35 @@ mod tests {
         assert_eq!(discovered.live, vec![live]);
         assert_eq!(discovered.stale, vec![stale]);
         assert!(discovered.rejected.is_empty());
+    }
+
+    // A fully reaped process has no /proc entry left at all: that must read as
+    // Stale, the same as a zombie or a mismatched start time -- not as an error,
+    // or every caller downstream (recorded_supervisor_liveness, workload gates)
+    // loses the ability to tell "gone" from "cannot tell" and holds forever.
+    #[test]
+    fn process_liveness_reads_a_fully_reaped_pid_as_stale_not_an_error() {
+        let reading = process_liveness(999_999, 0).expect("a reaped pid must not error");
+        assert_eq!(reading, StepdLiveness::Stale);
+    }
+
+    #[test]
+    fn supervisor_liveness_reads_a_fully_reaped_supervisor_as_stale() {
+        let recorded = crate::admission::SupervisorRef {
+            pid: 999_999,
+            start_ticks: 0,
+            boot_id: None,
+        };
+        let reading = supervisor_liveness(&recorded).expect("a reaped supervisor must not error");
+        assert_eq!(reading, StepdLiveness::Stale);
+    }
+
+    #[test]
+    fn workload_process_liveness_reads_a_fully_reaped_workload_as_gone() {
+        let mut gone = descriptor(46, 1, std::process::id());
+        gone.workload_pid = 999_999;
+        gone.workload_start_ticks = 0;
+        assert_eq!(workload_process_liveness(&gone), WorkloadLiveness::Gone);
     }
 
     #[test]

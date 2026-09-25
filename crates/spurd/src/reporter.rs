@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
@@ -14,7 +14,7 @@ use spur_proto::proto::{
 };
 use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
@@ -60,6 +60,21 @@ pub struct NodeReporter {
     allocation: std::sync::OnceLock<Arc<Mutex<NodeAllocation>>>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
+    /// The entitlement ledger, wired once the state root is known. Without one
+    /// the agent registers with no ledger, which asserts nothing.
+    admissions: std::sync::OnceLock<crate::admission::AdmissionStore>,
+    /// Identifies this agent process. A cut whose session a later registration
+    /// has replaced is discarded rather than applied as current.
+    agent_session_id: String,
+    /// Whether the last cut could see everything. Only the transition is worth
+    /// saying: the condition needs an operator, and it does not clear itself.
+    inventory_was_complete: AtomicBool,
+    /// Whether the last heartbeat asked for a reconcile, so the one that finds
+    /// nothing left to reconcile still asks — see `judge_cut`.
+    asked_for_reconcile: AtomicBool,
+    /// Whether this node's hook config runs a job epilog, per the last
+    /// resolved `HooksConfig`. Read at registration; false until wired.
+    runs_job_epilog: AtomicBool,
 }
 
 impl NodeReporter {
@@ -90,7 +105,19 @@ impl NodeReporter {
             held_jobs,
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
+            admissions: std::sync::OnceLock::new(),
+            agent_session_id: uuid::Uuid::new_v4().to_string(),
+            inventory_was_complete: AtomicBool::new(true),
+            asked_for_reconcile: AtomicBool::new(false),
+            runs_job_epilog: AtomicBool::new(false),
         }
+    }
+
+    /// Wire whether this node's hook config runs a job epilog, so
+    /// registration reports it instead of the default. Called once, before
+    /// the first `register()`.
+    pub fn set_runs_job_epilog(&self, runs: bool) {
+        self.runs_job_epilog.store(runs, Ordering::Relaxed);
     }
 
     /// Wire the live per-node allocation so heartbeats can report each held job's
@@ -114,6 +141,79 @@ impl NodeReporter {
     /// after the K0sAgent is constructed. No-op on a node without k0s (field stays unset).
     pub fn set_k0s_status(&self, status: Arc<crate::cluster::K0sNodeState>) {
         let _ = self.k0s_status.set(status);
+    }
+
+    /// Wire the ledger once the state root is resolved. Registration before this
+    /// sends no ledger, which the controller reads as no evidence.
+    pub fn set_admissions(&self, admissions: crate::admission::AdmissionStore) {
+        let _ = self.admissions.set(admissions);
+    }
+
+    /// The store `set_admissions` wired in, if any. Every caller must share
+    /// this one instance -- a fresh `AdmissionStore` has its own unshared
+    /// per-run lock table, so a second instance serializes against nothing.
+    pub(crate) fn admissions(&self) -> Option<crate::admission::AdmissionStore> {
+        self.admissions.get().cloned()
+    }
+
+    fn ledger_cut(&self) -> Option<spur_proto::proto::NodeLedger> {
+        let cut = self.admissions.get()?.ledger_cut(&self.agent_session_id);
+        Some(ledger_to_proto(cut))
+    }
+
+    /// Whether to ask the controller to reconcile this node. Unlatched, so it
+    /// clears when the reconcile lands; off the runtime, because it reads disk.
+    pub(crate) async fn wants_reconcile(&self) -> bool {
+        let Some(admissions) = self.admissions.get().cloned() else {
+            return false;
+        };
+        let session = self.agent_session_id.clone();
+        match tokio::task::spawn_blocking(move || admissions.ledger_cut(&session)).await {
+            Ok(cut) => self.judge_cut(&cut),
+            Err(error) => {
+                warn!(%error, "could not read this node's ledger for the heartbeat");
+                false
+            }
+        }
+    }
+
+    /// Only the transition is worth saying: an unreadable record needs an
+    /// operator, and no reconcile the controller could run would clear it.
+    fn judge_cut(&self, cut: &crate::admission::LedgerCut) -> bool {
+        let complete = cut.inventory_complete;
+        if self
+            .inventory_was_complete
+            .swap(complete, Ordering::Relaxed)
+            != complete
+        {
+            if complete {
+                info!("every admission record on this node is readable again");
+            } else {
+                error!(
+                    "an admission record on this node cannot be read; it may hold a claim \
+                     nothing can account for, and only an operator can clear it"
+                );
+            }
+        }
+        let wants = cut.wants_reconcile();
+        // Keep asking after the holds clear, until a pull actually lands: the
+        // controller retires the reason it wrote on this node only from a cut.
+        if wants {
+            self.asked_for_reconcile.store(true, Ordering::Relaxed);
+        }
+        wants || self.asked_for_reconcile.load(Ordering::Relaxed)
+    }
+
+    /// The controller has taken a cut, so whatever this node was asking it to
+    /// look at has now been looked at.
+    pub(crate) fn note_ledger_pulled(&self) {
+        self.asked_for_reconcile.store(false, Ordering::Relaxed);
+    }
+
+    /// Identifies this agent process. A cut whose session a later registration
+    /// has replaced is discarded rather than applied as current.
+    pub fn agent_session_id(&self) -> &str {
+        &self.agent_session_id
     }
 
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
@@ -171,8 +271,8 @@ impl NodeReporter {
                 wg_pubkey: self.wg_pubkey(),
                 labels,
                 join_token: self.join_token.clone(),
-                ledger: None,
-                runs_job_epilog: false,
+                ledger: self.ledger_cut(),
+                runs_job_epilog: self.runs_job_epilog.load(Ordering::Relaxed),
             })
             .await
             .context("registration failed")?;
@@ -252,6 +352,10 @@ impl NodeReporter {
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
             let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let needs_reconcile = self.wants_reconcile().await;
+            if needs_reconcile {
+                warn!("holding evidence only the controller can resolve; asking it to reconcile");
+            }
 
             match crate::controller_auth::connect(&self.controller_addr).await {
                 Ok(mut client) => {
@@ -272,7 +376,7 @@ impl NodeReporter {
                                     install_duration_seconds: install_secs,
                                 }
                             }),
-                            needs_reconcile: false,
+                            needs_reconcile,
                         })
                         .await
                     {
@@ -720,6 +824,26 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
     }
 }
 
+pub fn ledger_to_proto(cut: crate::admission::LedgerCut) -> spur_proto::proto::NodeLedger {
+    spur_proto::proto::NodeLedger {
+        agent_session_id: cut.agent_session_id,
+        inventory_complete: cut.inventory_complete,
+        entries: cut
+            .entries
+            .into_iter()
+            .map(|entry| spur_proto::proto::LedgerEntry {
+                job_id: entry.job_id,
+                run_attempt: entry.run_attempt,
+                cpu_ids: entry.allocation.cpu_ids,
+                memory_mb: entry.allocation.memory_mb,
+                gpu_devices: entry.allocation.gpu_devices,
+                disposition: entry.disposition.as_str().to_string(),
+                conflict_hold: entry.conflict_hold,
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +1122,40 @@ mod tests {
         )
     }
 
+    fn a_cut(conflict_hold: bool) -> crate::admission::LedgerCut {
+        crate::admission::LedgerCut {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![crate::admission::LedgerCutEntry {
+                job_id: 42,
+                run_attempt: 1,
+                allocation: Default::default(),
+                disposition: spur_core::job::LedgerDisposition::Unresolved,
+                conflict_hold,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_node_keeps_asking_after_its_holds_clear_until_a_pull_lands() {
+        let reporter = test_reporter(ResourceSet::default());
+
+        assert!(reporter.judge_cut(&a_cut(true)));
+        // The controller paces pulls, so the heartbeat that first reports "nothing
+        // left" can be refused; asking until a cut is taken cannot be.
+        assert!(
+            reporter.judge_cut(&a_cut(false)),
+            "the reason the controller wrote on this node is retired only by a pull"
+        );
+        assert!(reporter.judge_cut(&a_cut(false)), "and the next one too");
+
+        reporter.note_ledger_pulled();
+        assert!(
+            !reporter.judge_cut(&a_cut(false)),
+            "the cut was taken, so there is nothing left to ask for"
+        );
+    }
+
     #[test]
     fn classify_detects_free_growth_and_allocated_loss() {
         use std::collections::HashSet;
@@ -1185,7 +1343,8 @@ mod tests {
 
     #[test]
     fn after_release_next_classify_applies_current_baseline() {
-        use spur_sched::cons_tres::{CapacityChange, NodeAllocation};
+        use spur_core::job::RunKey;
+        use spur_sched::cons_tres::{CapacityChange, NodeAllocation, ReleaseWarrant};
         use std::collections::HashSet;
         // Real release_job + classify/update_capacity path (no simulation).
         // A job holds the GPU on BDF 5; the node repartitions it into two CPX
@@ -1211,7 +1370,7 @@ mod tests {
         );
 
         // Release the job; the held id leaves the allocated set.
-        assert!(node.release_job(7));
+        assert!(node.release_job(ReleaseWarrant::never_spawned(RunKey::any_attempt(7))));
         let held_after: HashSet<u64> = node.allocated_gpu_ids().into_iter().collect();
         assert!(held_after.is_empty());
 
