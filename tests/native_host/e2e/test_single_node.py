@@ -5,6 +5,8 @@
 
 import time
 
+import pytest
+
 from cluster import parse_job_id, job_state, wait_job
 
 
@@ -263,6 +265,45 @@ class TestJobLifecycle:
         content = cluster.read_output_on_any_node(out_path)
         assert "MYVAR=hello123" in content, f"output:\n{content}"
         assert "MULTIVAR=world456" in content, f"output:\n{content}"
+
+
+def _submit_held(cluster, name: str) -> int:
+    """A held job stays pending, so it is still queued when the test looks."""
+    script = cluster.write_file(f"{name}.sh", "#!/bin/bash\necho HELD\n")
+    job_id = parse_job_id(cluster.sbatch(["-J", name, "-N", "1", "-H", script]))
+    assert job_id is not None
+    return job_id
+
+
+def _lists(squeue_ids: str, job_id: int) -> bool:
+    return str(job_id) in squeue_ids.split()
+
+
+class TestQueueMe:
+    """``squeue --me`` filters to the invoking account, like ``-u <username>``."""
+
+    def test_me_lists_own_job(self, cluster):
+        job_id = _submit_held(cluster, "me-own")
+        try:
+            assert _lists(cluster.squeue(["--me", "-h", "-o", "%i"]), job_id)
+            # The later of -u and --me wins, as in Slurm.
+            last_wins = cluster.squeue(["-u", "no-such-user", "--me", "-h", "-o", "%i"])
+            assert _lists(last_wins, job_id)
+        finally:
+            cluster.scancel(job_id)
+
+    def test_me_hides_another_accounts_job(self, cluster):
+        job_id = _submit_held(cluster, "me-other")
+        try:
+            owner = cluster.squeue(["-j", str(job_id), "-h", "-o", "%u"]).strip()
+            if owner == "root":
+                pytest.skip("jobs are submitted as root, so root is not another account")
+            query = ["squeue", "-h", "-o", "%i"]
+            if not _lists(cluster.cli_as_user("root", query), job_id):
+                pytest.skip("cannot run the CLI as root on this node")
+            assert not _lists(cluster.cli_as_user("root", query + ["--me"]), job_id)
+        finally:
+            cluster.scancel(job_id)
 
 
 class TestArrayDependencies:
