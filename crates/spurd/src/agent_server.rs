@@ -18364,38 +18364,76 @@ mod tests {
         );
     }
 
-    // A registration that kills+reaps a stepd it just spawned must call
-    // `mark_reaped()`, or `Drop` reads it as still running and holds it forever.
-    #[tokio::test]
-    async fn a_registration_that_loses_its_post_claim_race_reaps_the_reservation() {
-        let svc = AgentService::new(
+    // A registration whose reservation is already tracked in `running` by the
+    // time it reaches the late duplicate check must call `mark_reaped()`
+    // through the real handler, or `Drop` reads it as still running and holds
+    // the GPU forever. `current_thread` is load-bearing, like the TTL-reclaim
+    // test above: it makes the interleaving below deterministic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_registration_that_finds_the_job_already_tracked_reaps_the_reservation() {
+        let svc = Arc::new(AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
             Arc::new(Mutex::new(test_gpu_registry())),
             spur_core::config::MemlockLimit::Unlimited,
+        ));
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
         );
 
-        svc.allocation
+        let handle = tokio::spawn({
+            let svc = svc.clone();
+            async move {
+                svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                    job_id: 91,
+                    run_attempt: 1,
+                    cpus: 1,
+                    allocated: Some(ResourceAllocations {
+                        cpus: 1,
+                        memory_mb: 0,
+                        devices,
+                        generation: 0,
+                    }),
+                    ..Default::default()
+                }))
+                .await
+            }
+        });
+
+        // Past the reservation but before the late duplicate check: plant the
+        // entry directly, the way a concurrent writer would have, so this
+        // in-flight call's own check finds it there.
+        for _ in 0..100 {
+            if svc.allocation.lock().await.owner_attempt(91) == Some(1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        svc.running
             .lock()
             .await
-            .allocate_for_job(77, 1, 1, 0, &[0])
-            .expect("reserve allocation");
-        assert!(svc.allocation.lock().await.commit_job(77, 1));
-        assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
+            .insert(91, TrackedJob::allocation_only(None));
 
-        let mut reservation_guard =
-            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1), 0);
-
-        // Mirrors either arm right after `launch_stepd`/`claim_stepd_slot`
-        // succeeds, then losing the race and reaping what it just spawned.
-        reservation_guard.mark_spawned();
-        reservation_guard.mark_reaped();
-        drop(reservation_guard);
-
+        let result = handle.await.expect("register_job_allocation task panicked");
+        assert_eq!(
+            result
+                .expect_err("a reservation found already tracked must fail the call")
+                .code(),
+            tonic::Code::AlreadyExists,
+        );
         assert_eq!(
             svc.free_gpu_count().await,
             1,
-            "a reaped reservation must release the GPU it held, not hold it forever"
+            "a reservation reaped by the late duplicate check must release the GPU it held, \
+             not hold it forever"
         );
     }
 
