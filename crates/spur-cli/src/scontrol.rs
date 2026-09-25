@@ -574,9 +574,15 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
 
     match entity.to_lowercase().as_str() {
         "job" | "jobs" => {
-            let job_ids = name
-                .map(|n| vec![n.parse::<u32>().unwrap_or(0)])
-                .unwrap_or_default();
+            // A named job must be a numeric id. Reject a typo with its own error
+            // and a non-zero exit instead of querying id 0 and printing nothing,
+            // which is indistinguishable from a job that has aged out of the queue.
+            let job_ids = match normalize_show_name(name) {
+                Some(n) => vec![n
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("Invalid job id specified: {n}"))?],
+                None => Vec::new(),
+            };
 
             let resp = client
                 .get_jobs(spur_proto::proto::GetJobsRequest {
@@ -2620,6 +2626,29 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(capture.update_node_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scontrol_show_job_rejects_a_malformed_id() {
+        // A non-numeric job id is a typo, not a job that aged out: it must fail
+        // with its own error and a non-zero exit rather than querying id 0 and
+        // printing nothing. The mock's get_jobs is unimplemented, so an error
+        // that names the bad id (rather than an RPC failure) proves the parse
+        // short-circuits before any request is sent.
+        let (addr, _capture) = crate::mock_controller::spawn().await;
+        let err = main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "show".into(),
+            "job".into(),
+            "abc".into(),
+        ])
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid job id"), "{msg}");
+        assert!(msg.contains("abc"), "error should echo the input: {msg}");
     }
 
     #[test]
