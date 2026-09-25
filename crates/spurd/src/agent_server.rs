@@ -7656,14 +7656,14 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        // Hold the running lock across the duplicate check, reserve+commit, and
-        // insert (running → allocation, as in commit) so the job is never
-        // committed-but-absent-from-running, which the reclaim reads as stale.
+        // The duplicate check only needs a point-in-time read: nothing else can
+        // insert this id while `_lifecycle` is held, so the lock need not span
+        // the reserve, the admission writes (real fsyncs), or the cgroup setup
+        // below — it is reacquired only where `running` is actually mutated.
         let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
             Status::invalid_argument("run attempt 0 names no run to hold an allocation")
         })?;
-        let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
+        if self.running.lock().await.contains_key(&req.job_id) {
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
                 req.job_id
@@ -7772,6 +7772,7 @@ impl SlurmAgent for AgentService {
                 None
             }
             AllocationCgroup::Refuse(reason) => {
+                let mut jobs = self.running.lock().await;
                 let (status, cgroup) =
                     refuse_allocation(req.job_id, reservation_guard, &mut jobs, &reason);
                 // Guard first, then the cgroup: removing it blocks retrying rmdir.
@@ -7780,7 +7781,6 @@ impl SlurmAgent for AgentService {
                 return Err(status);
             }
         };
-        drop(jobs);
 
         info!(
             job_id = req.job_id,
