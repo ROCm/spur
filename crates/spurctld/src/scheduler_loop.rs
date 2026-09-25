@@ -42,6 +42,43 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+/// True on the tick a leadership term begins, so per-term setup runs once rather
+/// than on every tick or on a follower. Advances `was_leader` to the new value.
+fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
+    let entering = is_leader && !*was_leader;
+    *was_leader = is_leader;
+    entering
+}
+
+/// Whether enough time has passed since this leader took over that it can
+/// trust its own (empty-at-first) view of what's in flight. `None` means no
+/// term has been recorded yet (never leader, or just relinquished).
+fn past_dispatch_grace(entered_leadership_at: Option<Instant>, grace: Duration) -> bool {
+    entered_leadership_at.is_none_or(|entered| entered.elapsed() >= grace)
+}
+
+/// A disabled dispatch timeout (`deadline = None`) has no bound to wait out,
+/// so the sweep must stay off rather than fall back to a guessed grace.
+fn should_sweep_orphaned_placements(
+    deadline: Option<Duration>,
+    entered_leadership_at: Option<Instant>,
+) -> bool {
+    match deadline {
+        Some(grace) => past_dispatch_grace(entered_leadership_at, grace),
+        None => false,
+    }
+}
+
+/// Drop everything a former leader may no longer speak for.
+pub(crate) fn relinquish_leadership(
+    cluster: &Arc<ClusterManager>,
+    scheduler: &mut BackfillScheduler,
+) {
+    cluster.set_planned_reservations(HashMap::new());
+    cluster.set_planned_job_starts(HashMap::new());
+    scheduler.clear_outcomes();
+}
+
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
@@ -118,6 +155,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // victim goes first and the dearer one follows a second later anyway. Remember
     // which reclaimer has capacity in flight and leave it alone until it lands.
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
+    let mut was_leader = false;
+    let mut leadership_entered_at: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -128,13 +167,19 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             _ = interval.tick() => {}
         }
 
-        if !raft.is_leader() {
+        let is_leader = raft.is_leader();
+        let entering_term = entering_leadership(&mut was_leader, is_leader);
+
+        if !is_leader {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
-            cluster.set_planned_reservations(HashMap::new());
-            cluster.set_planned_job_starts(HashMap::new());
-            scheduler.clear_outcomes();
+            relinquish_leadership(&cluster, &mut scheduler);
+            leadership_entered_at = None;
             continue;
+        }
+
+        if entering_term {
+            leadership_entered_at = Some(Instant::now());
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -145,6 +190,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // stage candidates. Real agent-side data movement is a follow-up;
         // drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
+        // Held back for a full dispatch_timeout_secs after a leadership change:
+        // an RPC the old leader had in flight needs time to land or time out first.
+        if should_sweep_orphaned_placements(dispatch_deadline(&cluster), leadership_entered_at) {
+            cluster.abort_orphaned_placements();
+        }
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
         cluster.evict_expired_terminal_jobs();
@@ -442,43 +492,10 @@ async fn process_assignment(
         }
     }
 
-    // `start_job_impl` advances the run epoch after the allocation has been
-    // registered. Give agents that impending epoch so their Stepds
-    // identify the controller-owned run rather than the pending job record.
-    let prospective_run_attempt = job.run_attempt.saturating_add(1);
-
-    if spec.srun_job && srun_step_dispatch {
-        match register_allocation_on_nodes(
-            cluster.clone(),
-            job_id,
-            dispatch_nodes.clone(),
-            &spec,
-            per_node_allocs.clone(),
-            allocated_nodelist.clone(),
-            prospective_run_attempt,
-        )
-        .await
-        {
-            // Both arms tear down identically: with a deadline in play, even "all failed" can mean
-            // every node registered and answered too late, so none of them may be left holding one.
-            AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
-                cancel_job_on_nodes(&cluster, job_id, prospective_run_attempt, &all_nodes, 9).await;
-                // The job never left Pending, so plain requeue is a no-op here — the same
-                // Pending-aware backoff the launch path uses is what actually throttles a retry.
-                if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
-                    error!(job_id, error = %e, "failed to back off after registration failure");
-                }
-                return false;
-            }
-            AllocationRegisterOutcome::AllSucceeded => {}
-        }
-    }
-
-    // Build peer_nodes list with addresses for cross-node communication
-    // and the effective per-node task count. Both are needed by the
-    // LaunchJob dispatch below, which — unlike the old fire-and-forget
-    // spawn — now runs (and is awaited) *before* the job is allowed to
-    // become visibly Running.
+    // Build peer_nodes list with addresses for cross-node communication.
+    // Pure controller-local lookups, no I/O — resolved before `reserve_placement`
+    // so a missing node/address is a validation failure, not something that
+    // needs unwinding a charge that was never made.
     let peer_addrs: Vec<String> = {
         let mut addrs = Vec::with_capacity(all_nodes.len());
         for name in &all_nodes {
@@ -502,6 +519,53 @@ async fn process_assignment(
         }
         addrs
     };
+
+    // Reserved first, before any dispatch RPC on either path below: a leader
+    // change in the window that follows then finds the slice already charged,
+    // so a new leader cannot place a second job onto these cores. The run
+    // epoch below is the one `reserve_placement` actually persisted, not a
+    // value recomputed separately — the two must never be able to diverge.
+    let run_attempt = match cluster.reserve_placement(
+        job_id,
+        assignment.nodes.clone(),
+        resources.clone(),
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+        borrowed,
+    ) {
+        Ok(run_attempt) => run_attempt,
+        Err(e) => {
+            warn!(job_id, error = %e, "could not reserve the placement");
+            return false;
+        }
+    };
+
+    if spec.srun_job && srun_step_dispatch {
+        match register_allocation_on_nodes(
+            cluster.clone(),
+            job_id,
+            dispatch_nodes.clone(),
+            &spec,
+            per_node_allocs.clone(),
+            allocated_nodelist.clone(),
+            run_attempt,
+        )
+        .await
+        {
+            // Both arms tear down identically: with a deadline in play, even "all failed" can mean
+            // every node registered and answered too late, so none of them may be left holding one.
+            AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
+                cancel_job_on_nodes(&cluster, job_id, run_attempt, &all_nodes, 9).await;
+                // The job never left Pending, so plain requeue is a no-op here — the same
+                // Pending-aware backoff the launch path uses is what actually throttles a retry.
+                if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+                    error!(job_id, error = %e, "failed to back off after registration failure");
+                }
+                return false;
+            }
+            AllocationRegisterOutcome::AllSucceeded => {}
+        }
+    }
 
     let tasks_per_node = if let Some(tpn) = spec.tasks_per_node {
         tpn
@@ -537,11 +601,6 @@ async fn process_assignment(
 
     let dispatched = dispatch_spec.is_some();
     if let Some(dspec) = dispatch_spec {
-        // The run epoch start_job_impl is about to persist for this
-        // dispatch. Safe to read ahead of that call: this iteration is
-        // the only place that can advance a Pending job's run_attempt,
-        // and nothing here yields back to another iteration for the
-        // same job in between.
         match confirm_dispatch_on_nodes(
             cluster.clone(),
             job_id,
@@ -551,7 +610,7 @@ async fn process_assignment(
             per_node_allocs.clone(),
             allocated_nodelist.clone(),
             tasks_per_node,
-            prospective_run_attempt,
+            run_attempt,
             task_fanout,
         )
         .await
@@ -563,45 +622,25 @@ async fn process_assignment(
 
     // Transition job to Running. Reached only once every assigned node
     // has confirmed (LaunchJob for batch dispatch above, or
-    // RegisterJobAllocation for the pure interactive case above that).
-    let start_result = if srun_step_dispatch {
-        cluster.start_job_impl(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-            true,
-            borrowed,
-        )
-    } else if borrowed {
-        cluster.start_borrowed_job(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-        )
-    } else {
-        cluster.start_job(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-        )
-    };
+    // RegisterJobAllocation for the pure interactive case above that). The
+    // placement itself is already in the log (see `reserve_placement` above).
+    let start_result = cluster.activate_job(
+        job_id,
+        run_attempt,
+        assignment.nodes.clone(),
+        resources,
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+        borrowed,
+    );
     if let Err(e) = start_result {
+        abort_placement(&cluster, job_id, run_attempt);
         // Confirmation above already registered the allocation or
-        // launched real processes on dispatch_nodes; stop them so a
-        // start_job failure here (e.g. the job was cancelled out from
+        // launched real processes on dispatch_nodes; stop them so an
+        // activate_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        cancel_job_on_nodes(
-            &cluster,
-            job_id,
-            prospective_run_attempt,
-            &dispatch_nodes,
-            0,
-        )
-        .await;
+        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0).await;
         debug!(
             job_id = assignment.job_id,
             error = %e,
@@ -612,26 +651,15 @@ async fn process_assignment(
 
     // The job is Running and committed, so anything it launches can now be
     // resolved by the controller. Only here is the workload let go.
-    if dispatched
-        && !start_job_on_nodes(&cluster, job_id, prospective_run_attempt, &dispatch_nodes).await
-    {
-        cancel_job_on_nodes(
-            &cluster,
-            job_id,
-            prospective_run_attempt,
-            &dispatch_nodes,
-            0,
-        )
-        .await;
+    if dispatched && !start_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes).await {
+        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0).await;
         // Already Running, so without a transition it would hold its nodes. Both
         // calls name this attempt: the awaits above give a requeue time to land.
         let detail = format!(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) =
-            cluster.evict_job_attempt(job_id, Some(prospective_run_attempt), Some(detail))
-        {
+        if let Err(e) = cluster.evict_job_attempt(job_id, Some(run_attempt), Some(detail)) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -1930,7 +1958,12 @@ async fn register_allocation_on_nodes(
             work_dir: spec.work_dir.clone(),
             run_attempt,
         };
+        // Held for the whole call: a cut taken before this lands must not read
+        // this job's absence as meaningful — the node's own answer is what the
+        // claim it takes partway through the call can be trusted about.
+        let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
         set.spawn(async move {
+            let _in_flight = in_flight;
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
@@ -2132,6 +2165,15 @@ async fn confirm_dispatch_on_nodes(
         node_agents.push((node_name.clone(), agent_addr));
     }
 
+    // Held across PMIx prepare (a real RPC round trip to every node, awaited
+    // below before any node's per-dispatch guard opens): without this, a
+    // multi-node PMIx job spends that whole window with no in-flight coverage,
+    // and an orphan sweep could free the reservation mid-prepare.
+    let _pmix_prepare_in_flight: Vec<_> = node_agents
+        .iter()
+        .map(|(node_name, _)| cluster.dispatch_tracker().begin(node_name, job_id))
+        .collect();
+
     let execution_credential = match crate::native_keys::sign_dispatch_credential(
         &cluster.config().cluster_name,
         job_id,
@@ -2177,6 +2219,9 @@ async fn confirm_dispatch_on_nodes(
         ) {
             error!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+            // Left charged, same as the reference this is ported from: a held
+            // job (priority 0) is not re-picked, so the slice sits idle until an
+            // operator releases it or `abort_orphaned_placements` reclaims it.
             if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
                 error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
             }
@@ -2263,7 +2308,11 @@ async fn confirm_dispatch_on_nodes(
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
         let execution_credential = execution_credential.clone();
+        // Held for the whole call: a cut taken before this lands is silent about
+        // the job for reasons that have nothing to do with the node dropping it.
+        let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
         set.spawn(async move {
+            let _in_flight = in_flight;
             let params = AgentDispatchParams {
                 job_id,
                 spec: &spec,
@@ -2851,6 +2900,16 @@ pub async fn cancel_job_on_nodes(
     while set.join_next().await.is_some() {}
 }
 
+/// Give up a reservation whose dispatch never confirmed, or the slice stays
+/// charged to a job that never got past this attempt. A dispatch-confirmation
+/// failure before `activate_job` releases the same charge via
+/// `backoff_pending_job_after_dispatch_failure` instead of this helper.
+fn abort_placement(cluster: &Arc<ClusterManager>, job_id: spur_core::job::JobId, run_attempt: u32) {
+    if let Err(error) = cluster.abort_placement(job_id, run_attempt, false) {
+        warn!(job_id, %error, "could not give up a reservation; it stays charged");
+    }
+}
+
 /// Cancel an in-flight srun step on the given nodes without tearing down the
 /// allocation job process (batch script / companion hold).
 pub async fn cancel_step_on_nodes(
@@ -3104,6 +3163,32 @@ mod tests {
         job.start_time = Some(start);
         job.allocated_nodes = vec![node.to_string()];
         job
+    }
+
+    #[test]
+    fn entering_leadership_fires_once_on_the_follower_to_leader_edge() {
+        let mut was_leader = false;
+
+        assert!(
+            !entering_leadership(&mut was_leader, false),
+            "a follower never enters a term"
+        );
+        assert!(
+            entering_leadership(&mut was_leader, true),
+            "the follower-to-leader edge is the entering tick"
+        );
+        assert!(
+            !entering_leadership(&mut was_leader, true),
+            "the next tick under the same term is not entering"
+        );
+        assert!(
+            !entering_leadership(&mut was_leader, false),
+            "losing leadership is not an entering edge"
+        );
+        assert!(
+            entering_leadership(&mut was_leader, true),
+            "regaining leadership is a fresh entering edge"
+        );
     }
 
     #[test]
@@ -5820,6 +5905,27 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_stamps_idle_fill_on_a_borrowed_dispatch() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("borrowed-batch", 1));
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), true).await;
+
+            assert!(started, "a clean single-node batch dispatch must start");
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Running);
+            assert!(
+                job.idle_fill,
+                "reserve_placement/activate_job must thread `borrowed` through as idle_fill"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn process_assignment_returns_false_for_a_job_that_no_longer_exists() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
@@ -6102,8 +6208,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn process_assignment_cancels_dispatched_nodes_when_start_job_fails_after_confirmation(
-        ) {
+        async fn process_assignment_rejects_a_malformed_assignment_before_dispatching_anything() {
             use spur_core::job::JobState;
 
             let dir = TempDir::new().unwrap();
@@ -6117,13 +6222,13 @@ mod tests {
 
             // A malformed assignment: confirm_dispatch_on_nodes tolerates a
             // missing per_node_alloc entry (falls back to a default
-            // allocation), but start_job validates every assigned node has
-            // one and rejects the whole call otherwise. This is what a
-            // scheduler/assignment bug producing inconsistent data — or the
-            // job being touched by another path between assignment and this
-            // call — looks like from here: both nodes already launched real
-            // work by the time start_job is rejected, so both must be torn
-            // back down rather than left running under a job stuck Pending.
+            // allocation), but `reserve_placement` validates every assigned
+            // node has one and rejects the whole call otherwise. Reserved
+            // before either dispatch path runs, so a scheduler/assignment bug
+            // producing inconsistent data is caught before anything is ever
+            // sent to a node — unlike the pre-raft-first design (where this
+            // same validation lived in the post-dispatch `start_job`), there
+            // is nothing on either node to tear back down here.
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
@@ -6131,20 +6236,108 @@ mod tests {
 
             assert!(
                 !started,
-                "start_job's own validation must still block on inconsistent per-node data"
+                "reserve_placement's own validation must still block on inconsistent per-node data"
             );
             assert_eq!(
                 cm.get_job(job_id).unwrap().state,
                 JobState::Pending,
-                "a start_job failure must not leave the job Running with no confirmed nodes"
+                "a reserve_placement failure must not leave the job Running with no confirmed nodes"
             );
-            wait_for(
-                "n1 cancelled after start_job rejected the assignment",
-                || cancel1.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                cancel1.load(Ordering::SeqCst),
+                0,
+                "n1 was never dispatched to, so there is nothing to cancel"
             );
-            wait_for(
-                "n2 cancelled after start_job rejected the assignment",
-                || cancel2.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                cancel2.load(Ordering::SeqCst),
+                0,
+                "n2 was never dispatched to, so there is nothing to cancel"
+            );
+        }
+
+        #[test]
+        fn past_dispatch_grace_holds_off_until_the_grace_elapses() {
+            let grace = Duration::from_secs(300);
+            assert!(
+                !past_dispatch_grace(Some(Instant::now()), grace),
+                "just entered leadership: nothing has had time to land or time out yet"
+            );
+            let long_ago = Instant::now() - Duration::from_secs(301);
+            assert!(
+                past_dispatch_grace(Some(long_ago), grace),
+                "grace window has elapsed"
+            );
+            assert!(
+                past_dispatch_grace(None, grace),
+                "no recorded term (never leader, or just relinquished) has nothing to wait out"
+            );
+        }
+
+        #[test]
+        fn should_sweep_orphaned_placements_never_fires_with_a_disabled_dispatch_timeout() {
+            let long_ago = Some(Instant::now() - Duration::from_secs(10_000));
+            assert!(
+                !should_sweep_orphaned_placements(None, long_ago),
+                "dispatch_timeout_secs = 0 means no RPC timeout, so there is no bound to wait out"
+            );
+            assert!(
+                should_sweep_orphaned_placements(Some(Duration::from_secs(300)), long_ago),
+                "a finite deadline that has elapsed must still sweep"
+            );
+        }
+
+        // Proves the entering-leadership fix through the real gate `run`'s tick
+        // body uses: `entering_leadership` and `past_dispatch_grace` together,
+        // not a hand-rolled bool standing in for them. Uses a short real grace
+        // window so the boundary is crossed with a bounded sleep, not a mock.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn abort_orphaned_placements_is_skipped_until_the_dispatch_grace_elapses() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(&cm, batch_spec("entering-term", 1));
+
+            let res = ResourceAllocations::with_scalar(1, 0);
+            cm.reserve_placement(
+                job_id,
+                vec!["n1".into()],
+                res.clone(),
+                [("n1".to_string(), res)].into_iter().collect(),
+                false,
+                false,
+            )
+            .expect("reserve");
+            wait_for("charged", || {
+                cm.get_job(job_id)
+                    .is_some_and(|j| !j.allocated_nodes.is_empty())
+            });
+
+            let grace = Duration::from_millis(200);
+            let mut was_leader = false;
+            let entering_term = entering_leadership(&mut was_leader, true);
+            assert!(entering_term, "the first observed leader tick must enter");
+            let leadership_entered_at = Some(Instant::now());
+
+            if past_dispatch_grace(leadership_entered_at, grace) {
+                cm.abort_orphaned_placements();
+            }
+            assert!(
+                cm.get_job(job_id)
+                    .is_some_and(|j| !j.allocated_nodes.is_empty()),
+                "freshly elected, still inside the grace window: must not sweep"
+            );
+
+            tokio::time::sleep(grace + Duration::from_millis(50)).await;
+            let entering_term = entering_leadership(&mut was_leader, true);
+            assert!(!entering_term, "still the same term");
+            if past_dispatch_grace(leadership_entered_at, grace) {
+                cm.abort_orphaned_placements();
+            }
+            assert!(
+                cm.get_job(job_id)
+                    .is_some_and(|j| j.allocated_nodes.is_empty()),
+                "grace window elapsed: the sweep must run"
             );
         }
 

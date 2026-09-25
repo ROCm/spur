@@ -78,6 +78,14 @@ pub struct ClientResponse {
     pub reservation_created: bool,
     #[serde(default)]
     pub partition_created: bool,
+    /// False when a `JobStart` apply hit the duplicate-reservation backstop
+    /// instead of actually charging the placement.
+    #[serde(default)]
+    pub job_started: bool,
+    /// False when a `JobStateChange` carrying `expected_run_attempt` was
+    /// refused as stale instead of actually transitioning the job.
+    #[serde(default)]
+    pub state_change_applied: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.
