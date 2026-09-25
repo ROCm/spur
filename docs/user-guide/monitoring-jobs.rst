@@ -921,12 +921,15 @@ silently skipped.
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, and ``QOS=``. Node updates need ``NodeName=`` and
-accept ``State=`` and ``Reason=``.
+accept ``State=``, ``Reason=``, and ``Reconcile=`` (``yes``/``true``/``1``, an
+immediate re-pull of that node's allocation ledger instead of waiting for the
+next periodic sweep).
 
 .. code-block:: bash
 
    scontrol update JobId=1024 TimeLimit=2:00:00 Priority=100
    scontrol update NodeName=node01 State=drain Reason="maintenance"
+   scontrol update NodeName=node01 Reconcile=yes
 
 See Also
 --------
