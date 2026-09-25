@@ -17420,6 +17420,58 @@ mod tests {
         assert_eq!(inner.stderr_path, expected);
     }
 
+    /// The whole point of this file's admission-ledger wiring: a real launch
+    /// through the RPC handler must leave a run admission record behind, not
+    /// just exercise a hand-rolled ledger write in a narrower test. Without
+    /// this, every ledger-gated release path downstream has nothing to gate on.
+    #[tokio::test]
+    async fn launch_job_admits_a_run_record_for_the_launch_it_performs() {
+        let reporter = test_reporter();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::admission::AdmissionStore::new(state_dir.path(), "test-node");
+        reporter.set_admissions(store);
+        let svc = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let req = Request::new(LaunchJobRequest {
+            job_id: 4400,
+            run_attempt: 1,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                work_dir: work_dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+                generation: 0,
+            }),
+            ..Default::default()
+        });
+
+        let resp = svc.launch_job(req).await.expect("launch should succeed");
+        assert!(resp.into_inner().success, "launch should succeed");
+
+        let run = svc
+            .admissions()
+            .load_run(key(4400, 1))
+            .expect("launch_job must admit a run record before it launches anything");
+        assert_eq!(run.job_id, 4400);
+        assert_eq!(run.run_attempt, 1);
+        assert_eq!(
+            run.lifecycle_owner_step,
+            Some(spur_core::step::STEP_BATCH),
+            "a non-pty batch launch's run record must be owned by the batch step"
+        );
+    }
+
     /// Poll `path` until its content stabilizes (unchanged across two
     /// consecutive checks) or `timeout_ms` elapses, then return it. Used to
     /// wait out a script's execution(s) without depending on job-completion
