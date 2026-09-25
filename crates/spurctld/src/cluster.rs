@@ -2138,9 +2138,8 @@ impl ClusterManager {
         &self.agent_sessions
     }
 
-    /// Hold or release a node's reconcile gate. Carries the gate and nothing
-    /// else: echoing back a read of the record would revert a registration
-    /// that commits before this entry applies.
+    /// Hold or release a node's reconcile gate, and nothing else -- echoing
+    /// back a read of the record could revert a concurrent registration.
     pub fn set_reconcile_pending(&self, name: &str, pending: bool) {
         if let Err(error) = self.propose(WalOperation::NodeUpdate {
             name: name.to_string(),
@@ -5413,9 +5412,8 @@ impl ClusterManager {
         }
     }
 
-    /// Whether a finished job's epilog hold still protects anything. A node that
-    /// is gone or unheard from runs no hook this could be shielding, and a node
-    /// that returns re-presents the claim through the normal reconcile path.
+    /// Whether a finished job's epilog hold still protects anything. A gone or
+    /// unheard-from node runs no hook this could be shielding.
     fn epilog_gate_still_binds(job: &Job, nodes: &HashMap<String, Node>) -> bool {
         job.epilog_gated_nodes
             .iter()
