@@ -305,17 +305,33 @@ const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60)
 struct ReconcileGate {
     cluster: Arc<ClusterManager>,
     node: String,
+    session: String,
 }
 
 impl ReconcileGate {
-    fn new(cluster: Arc<ClusterManager>, node: String) -> Self {
-        Self { cluster, node }
+    fn new(cluster: Arc<ClusterManager>, node: String, session: String) -> Self {
+        Self {
+            cluster,
+            node,
+            session,
+        }
     }
 }
 
 impl Drop for ReconcileGate {
     fn drop(&mut self) {
-        self.cluster.set_reconcile_pending(&self.node, false);
+        // Off the calling task: clearing the gate is a Raft propose, which must
+        // not block a destructor or run outside a runtime (e.g. at shutdown).
+        let cluster = self.cluster.clone();
+        let node = std::mem::take(&mut self.node);
+        let session = std::mem::take(&mut self.session);
+        tokio::spawn(async move {
+            // A later registration under a different session owns the gate now;
+            // clearing it here would race that registration's own reconcile.
+            if cluster.agent_sessions().vouches_for(&node, &session) {
+                cluster.set_reconcile_pending(&node, false);
+            }
+        });
     }
 }
 
@@ -464,11 +480,8 @@ async fn open_reconcile_license<'a>(
     })
 }
 
-/// Direction A: the node asserts a claim Raft has no record of. Reasons from a
-/// presence, which an incomplete cut does not weaken. Every such claim gets an
-/// answer -- ended, released, or named as one only an operator can clear.
-/// False when a claim went unanswered, leaving `outcome.unresolved` a part of
-/// this node's account rather than the whole of it.
+/// Direction A: answer every claim the node holds that Raft has no record of.
+/// False when one went unanswered, leaving it part of `outcome.unresolved`.
 async fn answer_unrecorded_claims(
     cluster: &Arc<ClusterManager>,
     node: &str,
@@ -2521,10 +2534,16 @@ impl SlurmController for ControllerService {
         self.require_admin(&request, "update node")?;
 
         let reason_uid = trusted_uid(Self::verified_identity(&request));
-        let req = request.into_inner();
+        let identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, identity.as_ref());
         if req.reconcile {
-            crate::scheduler_loop::pull_node_ledger(&self.cluster, &req.name, "operator audit")
-                .await;
+            crate::scheduler_loop::pull_node_ledger(
+                &self.cluster,
+                &req.name,
+                &format!("operator audit ({})", req.caller),
+            )
+            .await;
         }
         let node_state = match parsed {
             Some(None) => return Err(Status::invalid_argument("invalid node state")),
@@ -2927,16 +2946,10 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
-        // A node the controller has never seen has no record to carry the
-        // gate yet, so a first registration sets it below instead.
         let ledger = req.ledger.clone();
         // The agent took this cut before it called, so the watch can only cover
         // launches still on the wire now -- the best this direction allows.
         let dispatched = self.cluster.dispatch_tracker().watch(&req.hostname);
-        let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
-        if known_before {
-            self.cluster.set_reconcile_pending(&req.hostname, true);
-        }
 
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
@@ -2956,21 +2969,21 @@ impl SlurmController for ControllerService {
             )
             .map_err(register_node_rpc_status)?;
 
-        // A first registration builds the node record from scratch, which is
-        // also the earliest moment the gate has anything to be recorded on.
-        if ledger.is_some() && !known_before {
+        // Set only once registration has been accepted: setting it earlier risks
+        // leaving the gate stuck forever if register_node then fails.
+        if ledger.is_some() {
             self.cluster.set_reconcile_pending(&req.hostname, true);
         }
 
         // Recorded only once the registration has been accepted, and before the
         // reconcile below: a rejected one must disown no other lifetime.
-        self.cluster.agent_sessions().observe_registration(
-            &req.hostname,
-            ledger
-                .as_ref()
-                .map(|l| l.agent_session_id.as_str())
-                .unwrap_or_default(),
-        );
+        let session = ledger
+            .as_ref()
+            .map(|l| l.agent_session_id.clone())
+            .unwrap_or_default();
+        self.cluster
+            .agent_sessions()
+            .observe_registration(&req.hostname, &session);
 
         if let Some(ledger) = ledger {
             let node = req.hostname.clone();
@@ -2979,7 +2992,7 @@ impl SlurmController for ControllerService {
             // On its own task: tonic drops a handler future when the client
             // disconnects, and a gate left set removes the node for good.
             tokio::spawn(async move {
-                let _gate = ReconcileGate::new(cluster, node.clone());
+                let _gate = ReconcileGate::new(cluster, node.clone(), session);
                 if tokio::time::timeout(
                     RECONCILE_BUDGET,
                     reconcile_node_ledger(
@@ -12612,6 +12625,37 @@ mod tests {
             svc.cluster.get_node("racy-node").unwrap().labels["pool"],
             "prod",
             "only the admin's labels may land, whichever task the scheduler ran first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_registration_never_leaves_the_reconcile_gate_stuck() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "gate-node", 6825).await;
+
+        let mut r = Request::new(RegisterAgentRequest {
+            hostname: "gate-node".into(),
+            address: "127.0.0.1".into(),
+            port: 6825,
+            labels: [("pool".to_string(), "hacked".to_string())].into(),
+            ledger: Some(spur_proto::proto::NodeLedger {
+                agent_session_id: "session-a".into(),
+                inventory_complete: true,
+                entries: Vec::new(),
+            }),
+            ..Default::default()
+        });
+        r.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(r)
+            .await
+            .expect_err("a non-admin relabel on an already-registered node must be refused");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        assert!(
+            !svc.cluster.get_node("gate-node").unwrap().reconcile_pending,
+            "a registration that never took must not leave the node ungated forever"
         );
     }
 
