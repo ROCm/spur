@@ -555,6 +555,13 @@ async fn main() -> anyhow::Result<()> {
     reporter.set_admissions(admissions.clone());
     reporter.set_runs_job_epilog(agent_server::runs_job_epilog(&hooks_config));
 
+    // Bound before registering, not when the server starts serving. Registration
+    // makes the controller reconcile this node and call straight back; until the
+    // port is bound those calls are refused outright and never retried.
+    let listen_addr: std::net::SocketAddr = args.listen.parse()?;
+    let agent_listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    info!(addr = %listen_addr, "agent port bound");
+
     // Register with controller
     reporter.register().await?;
 
@@ -634,9 +641,21 @@ async fn main() -> anyhow::Result<()> {
     // jobs; the OnceLock only shares the handle, so the ordering is immaterial.
     reporter.set_allocation(agent_service.allocation_handle());
     agent_service.adopt_stepds(&recovered_stepds).await;
-    agent_service
-        .replay_adopted_allocations(&recovered_stepds)
+    // The admission records are exact where a descriptor rebuild under-counts;
+    // sessions predating them fall back to the descriptor path inside this.
+    let adopted = agent_service
+        .replay_admitted_allocations(&recovered_stepds)
         .await;
+    for outcome in &adopted {
+        if outcome.disposition.needs_reconciliation() {
+            warn!(
+                job_id = outcome.job_id,
+                run_attempt = outcome.run_attempt,
+                disposition = ?outcome.disposition,
+                "this run cannot be resolved from local evidence"
+            );
+        }
+    }
     // After the ledger rebuild above: a completion delivered late frees the
     // slice it settles, and there is nothing to free until the claims are back.
     let reconciled_stepd_completions: std::collections::HashSet<_> =
@@ -704,9 +723,6 @@ async fn main() -> anyhow::Result<()> {
 
     agent_service.start_monitor(args.controller.clone());
 
-    let addr = args.listen.parse()?;
-    info!(%addr, "agent gRPC server listening");
-
     // Authenticate callers of the agent surface: without this, reaching this port is enough to ask
     // the node to run work, which steps around the controller's authentication entirely.
     let auth_mode = config.as_ref().map(|c| c.auth.mode).unwrap_or_default();
@@ -762,7 +778,9 @@ async fn main() -> anyhow::Result<()> {
     let server_future = tonic::transport::Server::builder()
         .layer(auth_middleware::AgentAuthLayer::from_bearer(bearer))
         .add_service(spur_proto::agent_server(agent_service))
-        .serve(addr);
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+            agent_listener,
+        ));
     let server_task = tokio::spawn(server_future);
 
     if !recovered_stepds.is_empty() {
