@@ -2475,6 +2475,14 @@ impl SlurmController for ControllerService {
                 }
                 Ok(Response::new(()))
             }
+            Some(Ok(NodeCompleteResult::EpilogReleased)) => {
+                info!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    "epilog reported for a finished run; the node's slice is free"
+                );
+                Ok(Response::new(()))
+            }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
