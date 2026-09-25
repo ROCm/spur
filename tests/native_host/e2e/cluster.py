@@ -422,7 +422,6 @@ class SpurCluster:
         parts = [
             f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            # Or the CLI falls back to /etc/spur/spur.conf, not this cluster.
             f"SPUR_CONF={shlex.quote(self.etc_dir)}/spur.conf",
         ]
         for key, value in self.cli_env.items():
