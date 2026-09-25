@@ -7055,7 +7055,7 @@ impl SlurmAgent for AgentService {
                 // launch must leave the slice held rather than hand it back.
                 reservation_guard.mark_spawned();
                 if let Some(ref descriptor) = runtime_descriptor {
-                    if let Err(error) = record_supervisor_off_executor(
+                    match record_supervisor_off_executor(
                         &admissions,
                         run_key,
                         launch_step,
@@ -7067,9 +7067,20 @@ impl SlurmAgent for AgentService {
                     )
                     .await
                     {
-                        error!(job_id, run_attempt, %error,
-                            "failed to record the supervisor identity; this run's slice is \
-                             held until the agent restarts");
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                job_id,
+                                run_attempt,
+                                "supervisor registration found no eligible participant; this \
+                                 run's slice is held until the agent restarts"
+                            );
+                        }
+                        Err(error) => {
+                            error!(job_id, run_attempt, %error,
+                                "failed to record the supervisor identity; this run's slice is \
+                                 held until the agent restarts");
+                        }
                     }
                 }
 
@@ -7897,7 +7908,7 @@ impl SlurmAgent for AgentService {
 
             // Names who answers for this run's hooks. Unrecorded, no ledger can
             // answer for them, so the gate holds until a restart settles it.
-            if let Err(error) = record_supervisor_off_executor(
+            match record_supervisor_off_executor(
                 &admissions,
                 alloc_run,
                 spur_core::step::STEP_EXTERN,
@@ -7909,9 +7920,20 @@ impl SlurmAgent for AgentService {
             )
             .await
             {
-                error!(job_id = req.job_id, %error,
-                    "failed to record the supervisor identity; this allocation's slice is \
-                     held until the agent restarts");
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        job_id = req.job_id,
+                        run_attempt = req.run_attempt,
+                        "supervisor registration found no eligible participant; this \
+                         allocation's slice is held until the agent restarts"
+                    );
+                }
+                Err(error) => {
+                    error!(job_id = req.job_id, run_attempt = req.run_attempt, %error,
+                        "failed to record the supervisor identity; this allocation's slice is \
+                         held until the agent restarts");
+                }
             }
 
             // The allocation's cgroup is created here, not by the supervisor, so
