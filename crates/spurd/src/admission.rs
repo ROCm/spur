@@ -1479,6 +1479,22 @@ impl AdmissionStore {
         })
     }
 
+    /// As [`Self::remove_run`], but only if the run is still unreadable -- a
+    /// legitimate admit landing since an unlocked scan classified it must not
+    /// be deleted by a sweep that only ever saw the earlier, broken state.
+    fn remove_run_if_still_unreadable(&self, run_key: RunKey) -> io::Result<bool> {
+        self.with_run_lock(run_key, || {
+            if self.load_run(run_key).is_ok() {
+                return Ok(false);
+            }
+            match fs::remove_dir_all(self.run_dir(run_key)?) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// As [`Self::remove_run`], but only if the on-disk record is still the
     /// exact one this caller admitted -- a re-admission for the same run since
     /// then must not be deleted out from under it.
@@ -1603,20 +1619,25 @@ impl AdmissionStore {
             {
                 continue;
             }
-            tracing::warn!(
-                path = %entry.path.display(),
-                reason = %entry.reason,
-                "collecting an unreadable admission record past its retention"
-            );
             // Route through the run's own lock whenever the name resolves to one,
             // so this delete can't race a concurrent locked writer for the same run.
-            match parse_run_dir_name(&entry.path)
+            let did_remove = match parse_run_dir_name(&entry.path)
                 .and_then(|(job_id, attempt)| RunKey::new(job_id, attempt))
             {
-                Some(run_key) => self.remove_run(run_key)?,
-                None => remove_path(&entry.path)?,
+                Some(run_key) => self.remove_run_if_still_unreadable(run_key)?,
+                None => {
+                    remove_path(&entry.path)?;
+                    true
+                }
+            };
+            if did_remove {
+                tracing::warn!(
+                    path = %entry.path.display(),
+                    reason = %entry.reason,
+                    "collecting an unreadable admission record past its retention"
+                );
+                removed += 1;
             }
-            removed += 1;
         }
         Ok(removed)
     }
@@ -1880,6 +1901,26 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert!(loaded.runs.is_empty());
         assert_eq!(loaded.rejected.len(), 1);
+    }
+
+    #[test]
+    fn sweep_rejected_spares_a_run_that_became_readable_since_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let target = store.prepare_run_dir(key(9, 4)).unwrap();
+        let stale = vec![RejectedAdmission::new(target, "run record not found")];
+
+        // A legitimate admit lands after this scan captured `stale`, but
+        // before the sweep's own delete for that entry runs.
+        store.admit_run(&run_with(9, 4, 0)).unwrap();
+
+        assert_eq!(
+            store
+                .sweep_rejected(&stale, u64::MAX, 0, &HashSet::new())
+                .unwrap(),
+            0
+        );
+        assert!(store.load_run(key(9, 4)).is_ok());
     }
 
     #[test]

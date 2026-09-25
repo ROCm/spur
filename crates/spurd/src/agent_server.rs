@@ -18364,6 +18364,42 @@ mod tests {
         );
     }
 
+    // A guard that reaped a spawned session must actually release the GPU on
+    // drop, not just clear its own flag -- this pins the guard's own Drop
+    // contract, independent of which caller reaches it.
+    #[tokio::test]
+    async fn a_reaped_reservation_releases_its_gpu_on_drop() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(77, 1, 1, 0, &[0])
+            .expect("reserve allocation");
+        assert!(svc.allocation.lock().await.commit_job(77, 1));
+        assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
+
+        let mut reservation_guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(77, 1), 0);
+
+        // Mirrors either arm right after `launch_stepd`/`claim_stepd_slot`
+        // succeeds, then losing the race and reaping what it just spawned.
+        reservation_guard.mark_spawned();
+        reservation_guard.mark_reaped();
+        drop(reservation_guard);
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a reaped reservation must release its GPU, not hold it as if still running"
+        );
+    }
+
     // A registration whose reservation is already tracked in `running` by the
     // time it reaches the late duplicate check must call `mark_reaped()`
     // through the real handler, or `Drop` reads it as still running and holds
