@@ -5220,23 +5220,41 @@ const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Disarmed once the job is committed to the running set.
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
-    job_id: u32,
-    run_attempt: u32,
+    admissions: crate::admission::AdmissionStore,
+    run: RunKey,
     armed: bool,
+    spawned: bool,
 }
 
 impl LaunchReservationGuard {
-    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32, run_attempt: u32) -> Self {
+    fn new(
+        allocation: Arc<Mutex<NodeAllocation>>,
+        admissions: crate::admission::AdmissionStore,
+        run: RunKey,
+    ) -> Self {
         Self {
             allocation,
-            job_id,
-            run_attempt,
+            admissions,
+            run,
             armed: true,
+            spawned: false,
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// Past this point something is running, so an aborted launch must keep the
+    /// record: a live process with no ledger entry reads as free capacity.
+    fn mark_spawned(&mut self) {
+        self.spawned = true;
+    }
+
+    /// The workload was killed and reaped before the launch returned, so the
+    /// record describes nothing again and must not outlive the call.
+    fn mark_reaped(&mut self) {
+        self.spawned = false;
     }
 }
 
@@ -5245,13 +5263,18 @@ impl Drop for LaunchReservationGuard {
         if !self.armed {
             return;
         }
-        let job_id = self.job_id;
-        let run_attempt = self.run_attempt;
         // Generation-checked: a redispatch may have already superseded this
         // reservation, and releasing it here must not free the new one. The
         // guard firing un-disarmed means the launch it reserved for never
         // completed, so nothing was ever spawned against it.
-        let run = RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
+        let run = self.run;
+        if self.spawned {
+            warn!(%run, "an aborted launch left a payload running; its slice stays held");
+            return;
+        }
+        if let Err(error) = self.admissions.remove_run(run) {
+            warn!(%run, %error, "failed to drop the admission record of an aborted launch");
+        }
         if let Ok(mut alloc) = self.allocation.try_lock() {
             alloc.release_job(ReleaseWarrant::never_spawned(run));
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -5262,6 +5285,8 @@ impl Drop for LaunchReservationGuard {
                     .await
                     .release_job(ReleaseWarrant::never_spawned(run));
             });
+        } else {
+            warn!(%run, "could not release an aborted launch's reservation; it stays held");
         }
     }
 }
@@ -6692,8 +6717,11 @@ impl SlurmAgent for AgentService {
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
+        let admissions = self.admissions();
+        let run_key =
+            RunKey::new(job_id, run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
         let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
+            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), run_key);
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -7572,8 +7600,11 @@ impl SlurmAgent for AgentService {
         };
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
+        let admissions = self.admissions();
+        let alloc_run = RunKey::new(req.job_id, req.run_attempt)
+            .unwrap_or_else(|| RunKey::any_attempt(req.job_id));
         let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), req.job_id, req.run_attempt);
+            LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), alloc_run);
 
         // This allocation launches nothing, so its cgroup has to be created
         // here or the first step arriving has none to join.
@@ -17992,7 +18023,8 @@ mod tests {
             alloc.allocate_for_job(42, 1, 1, 0, &[0]).unwrap();
             alloc.commit_job(42, 1);
         }
-        let reservation = LaunchReservationGuard::new(svc.allocation.clone(), 42, 1);
+        let reservation =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(42, 1));
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let status = {
@@ -18344,7 +18376,8 @@ mod tests {
                 .await
                 .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9, 1);
+            let guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(9, 1));
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -18362,7 +18395,8 @@ mod tests {
                 .allocate_for_job(10, 1, 1, 0, &[0])
                 .unwrap();
             svc.allocation.lock().await.commit_job(10, 1);
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10, 1);
+            let mut guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(10, 1));
             guard.disarm();
             drop(guard);
         }
@@ -18390,7 +18424,8 @@ mod tests {
             .await
             .allocate_for_job(11, 1, 1, 0, &[0])
             .unwrap();
-        let guard = LaunchReservationGuard::new(svc.allocation.clone(), 11, 1);
+        let guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(11, 1));
 
         // A cancel races the still-in-flight launch, releasing attempt 1's
         // reservation; the controller redispatches attempt 2, which reserves
