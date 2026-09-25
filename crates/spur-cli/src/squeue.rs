@@ -22,6 +22,10 @@ pub struct SqueueArgs {
     #[arg(short = 'u', long)]
     pub user: Option<String>,
 
+    /// Show only your own jobs (same as -u with your username)
+    #[arg(long, overrides_with = "user")]
+    pub me: bool,
+
     /// Show only jobs in this partition
     #[arg(short = 'p', long)]
     pub partition: Option<String>,
@@ -99,17 +103,26 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-/// The format, state filter, and sort order a run resolves to, before any
-/// network I/O so a bad spec surfaces its own error rather than a connect failure.
+/// The format, state filter, sort order, and user filter a run resolves to,
+/// before any network I/O so a bad spec surfaces its own error rather than a
+/// connect failure.
+#[derive(Debug)]
 struct QueryPlan {
     fmt: String,
     states: Vec<spur_proto::proto::JobState>,
     sort_keys: Vec<SortKey>,
+    user: String,
 }
 
 /// `--start` supplies a default format, state filter, and sort order; each is
 /// still overridable by passing the corresponding flag explicitly.
-fn plan_query(args: &SqueueArgs) -> Result<QueryPlan> {
+///
+/// `current_user` runs only for `--me`, so a host that cannot resolve the
+/// caller's name still serves every other query.
+fn plan_query(
+    args: &SqueueArgs,
+    current_user: impl FnOnce() -> Result<String>,
+) -> Result<QueryPlan> {
     let fmt = if let Some(ref f) = args.format {
         f.clone()
     } else if args.start {
@@ -135,10 +148,17 @@ fn plan_query(args: &SqueueArgs) -> Result<QueryPlan> {
         None => default_sort_keys(),
     };
 
+    let user = if args.me {
+        current_user()?
+    } else {
+        args.user.clone().unwrap_or_default()
+    };
+
     Ok(QueryPlan {
         fmt,
         states,
         sort_keys,
+        user,
     })
 }
 
@@ -149,7 +169,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         fmt,
         states,
         sort_keys,
-    } = plan_query(&args)?;
+        user,
+    } = plan_query(&args, crate::interactive::current_user)?;
     let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
 
     let job_ids = args
@@ -174,7 +195,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let response = client
         .get_jobs(GetJobsRequest {
             states: states.iter().map(|s| *s as i32).collect(),
-            user: args.user.unwrap_or_default(),
+            user,
             partition: args.partition.unwrap_or_default(),
             account: args.account.unwrap_or_default(),
             job_ids,
@@ -512,8 +533,15 @@ mod tests {
     use super::*;
     use spur_proto::proto::JobState as P;
 
+    /// Fails the lookup so every plan built without `--me` proves it never asks.
     fn plan_from(argv: &[&str]) -> QueryPlan {
-        plan_query(&SqueueArgs::try_parse_from(argv).unwrap()).unwrap()
+        let args = SqueueArgs::try_parse_from(argv).unwrap();
+        plan_query(&args, || Err(anyhow::anyhow!("user lookup outside --me"))).unwrap()
+    }
+
+    fn plan_as(argv: &[&str], current_user: &str) -> QueryPlan {
+        let args = SqueueArgs::try_parse_from(argv).unwrap();
+        plan_query(&args, || Ok(current_user.to_string())).unwrap()
     }
 
     fn ts(seconds: i64) -> prost_types::Timestamp {
@@ -569,6 +597,46 @@ mod tests {
         assert_eq!(plan.states, default_squeue_states());
         assert_eq!(plan.sort_keys, default_sort_keys());
         assert_eq!(plan.fmt, format_engine::SQUEUE_DEFAULT_FORMAT);
+    }
+
+    #[test]
+    fn me_filters_to_the_current_user() {
+        assert_eq!(plan_as(&["squeue", "--me"], "alice").user, "alice");
+    }
+
+    #[test]
+    fn the_later_of_user_and_me_wins() {
+        assert_eq!(
+            plan_as(&["squeue", "-u", "bob", "--me"], "alice").user,
+            "alice"
+        );
+        assert_eq!(
+            plan_as(&["squeue", "--me", "-u", "bob"], "alice").user,
+            "bob"
+        );
+        assert_eq!(
+            plan_as(&["squeue", "-u", "bob", "--me", "-u", "carol"], "alice").user,
+            "carol"
+        );
+    }
+
+    #[test]
+    fn without_me_the_user_filter_passes_through() {
+        assert_eq!(plan_from(&["squeue", "-u", "bob"]).user, "bob");
+        assert_eq!(plan_from(&["squeue"]).user, "");
+    }
+
+    #[test]
+    fn me_surfaces_a_failed_user_lookup() {
+        let args = SqueueArgs::try_parse_from(["squeue", "--me"]).unwrap();
+        let err = plan_query(&args, || Err(anyhow::anyhow!("no passwd entry"))).unwrap_err();
+        assert!(err.to_string().contains("no passwd entry"));
+    }
+
+    #[test]
+    fn single_dash_me_is_rejected() {
+        // `-me` is the short flags -m and -e, neither of which exists (as in Slurm).
+        assert!(SqueueArgs::try_parse_from(["squeue", "-me"]).is_err());
     }
 
     #[test]
