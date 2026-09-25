@@ -1325,7 +1325,8 @@ mod tests {
 
     #[test]
     fn after_release_next_classify_applies_current_baseline() {
-        use spur_sched::cons_tres::{CapacityChange, NodeAllocation};
+        use spur_core::job::RunKey;
+        use spur_sched::cons_tres::{CapacityChange, NodeAllocation, ReleaseWarrant};
         use std::collections::HashSet;
         // Real release_job + classify/update_capacity path (no simulation).
         // A job holds the GPU on BDF 5; the node repartitions it into two CPX
@@ -1351,7 +1352,7 @@ mod tests {
         );
 
         // Release the job; the held id leaves the allocated set.
-        assert!(node.release_job(7));
+        assert!(node.release_job(ReleaseWarrant::never_spawned(RunKey::any_attempt(7))));
         let held_after: HashSet<u64> = node.allocated_gpu_ids().into_iter().collect();
         assert!(held_after.is_empty());
 
