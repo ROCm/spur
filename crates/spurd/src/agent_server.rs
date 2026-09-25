@@ -7614,6 +7614,9 @@ impl SlurmAgent for AgentService {
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
+        let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
+            Status::invalid_argument("run attempt 0 names no run to hold an allocation")
+        })?;
         let mut jobs = self.running.lock().await;
         if jobs.contains_key(&req.job_id) {
             return Err(Status::already_exists(format!(
@@ -7661,10 +7664,47 @@ impl SlurmAgent for AgentService {
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
         let admissions = self.admissions();
-        let alloc_run = RunKey::new(req.job_id, req.run_attempt)
-            .unwrap_or_else(|| RunKey::any_attempt(req.job_id));
         let mut reservation_guard =
             LaunchReservationGuard::new(self.allocation.clone(), admissions.clone(), alloc_run);
+
+        // An srun allocation holds a slice with no launch of its own, so it
+        // needs the same record: the claim outlives whatever steps join it.
+        let mut run_record = crate::admission::RunAdmission::new(
+            req.job_id,
+            req.run_attempt,
+            &self.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: alloc_result.cpu_ids.clone(),
+                memory_mb: alloc_result.memory_mb,
+                gpu_devices: controller_gpu_ids.iter().map(|&id| id as u32).collect(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
+        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+            error!(job_id = req.job_id, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {}: {error}",
+                req.job_id
+            )));
+        }
+        // The allocation's own participant. Without it the run has no step that
+        // can own a hook, and its teardown reads as owing nothing.
+        let mut participant_record = crate::admission::ParticipantAdmission::new(
+            req.job_id,
+            req.run_attempt,
+            spur_core::step::STEP_EXTERN,
+            &self.reporter.hostname,
+            run_record.allocation.clone(),
+        );
+        participant_record.final_report.required = true;
+        if let Err(error) = admissions.admit_participant_async(participant_record).await {
+            error!(job_id = req.job_id, %error, "failed to persist the participant admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {}: {error}",
+                req.job_id
+            )));
+        }
 
         // This allocation launches nothing, so its cgroup has to be created
         // here or the first step arriving has none to join.
@@ -7782,6 +7822,26 @@ impl SlurmAgent for AgentService {
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
 
+            // A supervisor is live against this reservation now, so an abandoned
+            // launch must leave the slice held rather than hand it back.
+            reservation_guard.mark_spawned();
+
+            // Names who answers for this run's hooks. Unrecorded, no ledger can
+            // answer for them, so the gate holds until a restart settles it.
+            if let Err(error) = admissions.record_supervisor(
+                alloc_run,
+                spur_core::step::STEP_EXTERN,
+                crate::admission::SupervisorRef {
+                    pid: descriptor.pid,
+                    start_ticks: descriptor.process_start_ticks,
+                    boot_id: crate::admission::current_boot_id(),
+                },
+            ) {
+                error!(job_id = req.job_id, %error,
+                    "failed to record the supervisor identity; this allocation's slice is \
+                     held until the agent restarts");
+            }
+
             // The allocation's cgroup is created here, not by the supervisor, so
             // record it or a stale session leaves its steps unreaped.
             if let Some(path) = cgroup_path.as_ref() {
@@ -7857,8 +7917,8 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // Matches the epoch the allocation table was keyed with; 0 from an
-                // older controller keeps the previous stale-report-disabled behavior.
+                // Matches the epoch the allocation table was keyed with, which
+                // the attempt-0 refusal above has already made a real one.
                 run_attempt: req.run_attempt,
                 cgroup_path,
             },
@@ -16511,6 +16571,7 @@ mod tests {
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
             job_id: 77,
+            run_attempt: 1,
             cpus: 1,
             ..Default::default()
         }))
@@ -17212,6 +17273,7 @@ mod tests {
 
         let req = Request::new(RegisterJobAllocationRequest {
             job_id: 51,
+            run_attempt: 1,
             cpus: 1,
             allocated: Some(ResourceAllocations {
                 cpus: 1,
@@ -18037,6 +18099,7 @@ mod tests {
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
             job_id: 55,
+            run_attempt: 1,
             cpus: 1,
             allocated: Some(ResourceAllocations {
                 cpus: 1,
@@ -18165,6 +18228,11 @@ mod tests {
             MpiConfig::default(),
             running,
             false, // allow_root_jobs
+        )
+        // Registration now writes an admission record; the production default
+        // state dir is not writable unprivileged.
+        .with_runtime_state_dir(
+            std::env::temp_dir().join(format!("spur-test-runtime-{}", uuid::Uuid::new_v4())),
         );
 
         assert!(
