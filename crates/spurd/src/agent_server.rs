@@ -7925,15 +7925,47 @@ impl SlurmAgent for AgentService {
         );
         // Commit under `running`, the order commit_job expects, so the job is
         // never committed while absent from the map a reclaim reads.
-        let _ = self
+        let committed = self
             .allocation
             .lock()
             .await
             .commit_job(req.job_id, req.run_attempt);
-        reservation_guard.disarm();
-        drop(jobs);
+        if committed {
+            reservation_guard.disarm();
+            drop(jobs);
+            return Ok(Response::new(RegisterJobAllocationResponse {}));
+        }
 
-        Ok(Response::new(RegisterJobAllocationResponse {}))
+        // reconcile reclaimed the reservation mid-registration (registration
+        // exceeded the TTL). Undo the insert and tear down what was set up for
+        // it rather than report an allocation with nothing backing it.
+        let removed = jobs.remove(&req.job_id);
+        drop(jobs);
+        reservation_guard.mark_reaped();
+        warn!(
+            job_id = req.job_id,
+            "reservation reclaimed during registration; aborting to avoid running unbacked"
+        );
+        if runtime_descriptor {
+            let session = self
+                .stepds
+                .lock()
+                .await
+                .remove(&(req.job_id, spur_core::step::STEP_EXTERN));
+            if let Some(descriptor) = session {
+                if let Err(error) = stop_stepd_process(&descriptor).await {
+                    warn!(job_id = req.job_id, %error, "failed to stop stepd after a reclaimed reservation");
+                }
+                cleanup_stepd_files(&descriptor);
+            }
+        }
+        if let Some(cg) = removed.and_then(|tracked| tracked.cgroup_path) {
+            crate::executor::cleanup_cgroup(&cg);
+        }
+        Err(Status::unavailable(format!(
+            "reservation reclaimed during registration for job {}",
+            req.job_id
+        )))
     }
 
     /// Run a one-shot command on this node, used by srun inside an allocation.
@@ -18188,6 +18220,54 @@ mod tests {
             svc.free_gpu_count().await,
             0,
             "committed+tracked allocation must survive the sweep"
+        );
+    }
+
+    // A TTL reclaim racing the tail of `register_job_allocation` must fail the
+    // call, not report success over a reservation that no longer exists.
+    #[tokio::test]
+    async fn register_job_allocation_fails_when_the_ttl_reclaims_it_mid_flight() {
+        let svc = Arc::new(AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+
+        let handle = tokio::spawn({
+            let svc = svc.clone();
+            async move {
+                svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                    job_id: 91,
+                    run_attempt: 1,
+                    cpus: 1,
+                    ..Default::default()
+                }))
+                .await
+            }
+        });
+
+        for _ in 0..100 {
+            if svc.allocation.lock().await.owner_attempt(91) == Some(1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        svc.allocation.lock().await.reconcile(
+            &std::collections::HashSet::new(),
+            std::time::Instant::now(),
+            std::time::Duration::ZERO,
+        );
+
+        let result = handle.await.expect("register_job_allocation task panicked");
+        assert!(
+            result.is_err(),
+            "a reservation reclaimed before commit must fail the call, not report an \
+             allocation with nothing backing it"
+        );
+        assert!(
+            !svc.running.lock().await.contains_key(&91),
+            "a failed registration must leave no tracked job behind"
         );
     }
 
