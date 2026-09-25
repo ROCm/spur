@@ -238,9 +238,25 @@ pub fn apply_gpu_bind_env(
         return;
     }
     target.insert("SPUR_JOB_GPUS".into(), visible.clone());
+    target.insert("HIP_VISIBLE_DEVICES".into(), hip_relative_indices(&visible));
     target.insert("ROCR_VISIBLE_DEVICES".into(), visible.clone());
     target.insert("CUDA_VISIBLE_DEVICES".into(), visible.clone());
     target.insert("GPU_DEVICE_ORDINAL".into(), visible);
+}
+
+/// Renumber a device list to `0..n-1` for the HIP-level selector.
+///
+/// `ROCR_VISIBLE_DEVICES` filters *and* renumbers the driver-visible set, and HIP
+/// then applies its own selector to what survived. Repeating the absolute ids
+/// there names devices that no longer exist, which ROCm reports as "no
+/// ROCm-capable device is detected". `HIP_VISIBLE_DEVICES` outranks
+/// `CUDA_VISIBLE_DEVICES` on ROCm, so the CUDA variable stays absolute for
+/// NVIDIA, where nothing narrowed the set first.
+fn hip_relative_indices(visible: &str) -> String {
+    (0..visible.split(',').filter(|id| !id.is_empty()).count())
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Hide all GPUs from the common vendor runtimes for a zero-GPU job.
@@ -545,6 +561,25 @@ fn bash_export_block(env: &HashMap<String, String>, indent: &str) -> String {
         .collect()
 }
 
+/// Bash that narrows one task's GPU visibility to its slice of `SPUR_JOB_GPUS`.
+///
+/// `HIP_VISIBLE_DEVICES` is renumbered because `ROCR_VISIBLE_DEVICES` has already
+/// filtered and renumbered the driver-visible set by the time HIP applies its own
+/// selector; see `hip_relative_indices`.
+const PER_TASK_GPU_VISIBILITY_BASH: &str = r#"  if [ -n "$SPUR_JOB_GPUS" ]; then
+    IFS=',' read -ra _ALL_GPUS <<< "$SPUR_JOB_GPUS"
+    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))
+    if [ $_GPUS_PER_TASK -gt 0 ]; then
+      _START=$((SPUR_LOCALID * _GPUS_PER_TASK))
+      _TASK_GPUS=$(echo "${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}" | tr ' ' ',')
+      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS
+      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS
+      export GPU_DEVICE_ORDINAL=$_TASK_GPUS
+      export HIP_VISIBLE_DEVICES=$(seq -s, 0 $((_GPUS_PER_TASK - 1)))
+    fi
+  fi
+"#;
+
 /// Fork one process per local rank, injecting per-rank `PMIx_server_setup_fork` env.
 pub fn build_multi_task_pmix_wrapper(
     user_script_path: &str,
@@ -591,19 +626,7 @@ pub fn build_multi_task_pmix_wrapper(
     }
     wrapper.push_str("  esac\n");
 
-    wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
-    wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
-    wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
-    wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
-    wrapper.push_str("      _START=$((SPUR_LOCALID * _GPUS_PER_TASK))\n");
-    wrapper.push_str(
-        "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
-    );
-    wrapper.push_str("      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS\n");
-    wrapper.push_str("      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS\n");
-    wrapper.push_str("      export GPU_DEVICE_ORDINAL=$_TASK_GPUS\n");
-    wrapper.push_str("    fi\n");
-    wrapper.push_str("  fi\n");
+    wrapper.push_str(PER_TASK_GPU_VISIBILITY_BASH);
 
     wrapper.push_str("  if [ \"$SPUR_LABEL\" = \"1\" ]; then\n");
     wrapper.push_str(&format!(
@@ -650,19 +673,7 @@ pub fn build_multi_task_wrapper(
     wrapper.push_str("  export SPUR_LOCALID\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
 
-    wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
-    wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
-    wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
-    wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
-    wrapper.push_str("      _START=$((SPUR_LOCALID * _GPUS_PER_TASK))\n");
-    wrapper.push_str(
-        "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
-    );
-    wrapper.push_str("      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS\n");
-    wrapper.push_str("      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS\n");
-    wrapper.push_str("      export GPU_DEVICE_ORDINAL=$_TASK_GPUS\n");
-    wrapper.push_str("    fi\n");
-    wrapper.push_str("  fi\n");
+    wrapper.push_str(PER_TASK_GPU_VISIBILITY_BASH);
 
     wrapper.push_str("  if [ \"$SPUR_LABEL\" = \"1\" ]; then\n");
     wrapper.push_str(&format!(
@@ -1024,6 +1035,41 @@ mod tests {
         assert_eq!(
             target.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
             Some("-1")
+        );
+    }
+
+    #[test]
+    fn hip_selector_indexes_the_rocr_narrowed_set() {
+        let mut target = HashMap::new();
+        let mut source = HashMap::new();
+        source.insert("SPUR_GPU_BIND".to_string(), "map_gpu:5,6".to_string());
+        apply_gpu_bind_env(&mut target, &source, &[4, 5, 6, 7]);
+        assert_eq!(
+            target.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("5,6")
+        );
+        assert_eq!(
+            target.get("HIP_VISIBLE_DEVICES").map(String::as_str),
+            Some("0,1"),
+            "HIP indexes what ROCR left behind, not the absolute device ids"
+        );
+        // Absolute, since on NVIDIA nothing narrowed the set before CUDA saw it.
+        assert_eq!(
+            target.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
+            Some("5,6")
+        );
+    }
+
+    #[test]
+    fn per_task_gpu_visibility_renumbers_for_hip() {
+        let wrapper = build_multi_task_wrapper("/tmp/step.sh", 2, None);
+        assert!(
+            wrapper.contains("export ROCR_VISIBLE_DEVICES=$_TASK_GPUS"),
+            "ROCR must carry the absolute ids the task was granted"
+        );
+        assert!(
+            wrapper.contains("export HIP_VISIBLE_DEVICES=$(seq -s, 0 $((_GPUS_PER_TASK - 1)))"),
+            "HIP must be renumbered, or a task granted a non-zero device sees none"
         );
     }
 
