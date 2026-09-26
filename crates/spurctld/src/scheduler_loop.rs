@@ -1245,6 +1245,13 @@ async fn reclaim_for_unplaced(
         reclaimable.iter().map(|r| (r.job_id, r.priority)).collect();
 
     for reclaimer in unplaced {
+        // A victim taken last cycle can still be handing its slice back through
+        // an epilog; the fixed reclaim_in_flight cooldown below only covers the
+        // agent's kill grace, not that hook, so this reclaimer must wait for the
+        // same debt try_preempt already respects.
+        if cluster.owed_a_preempted_slice(reclaimer.job_id) {
+            continue;
+        }
         // An opportunistic reclaimer displaces only opportunistic work strictly
         // below it. A job with a genuine quota claim has no such ceiling: borrowed
         // capacity is a loan and anyone with a claim can call it in.
@@ -7131,6 +7138,101 @@ mod tests {
             assert!(
                 cm.owed_a_preempted_slice(reclaimer_id),
                 "the reclaimer must not look free to take a second victim while this one drains"
+            );
+        }
+
+        // reclaim_for_unplaced records debt but must also respect it: a
+        // reclaimer already owed a slice from a prior call must not take a
+        // second victim just because another satisfiable one exists.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reclaimer_already_owed_a_slice_takes_no_second_victim() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            use crate::raft::StateMachineApply;
+            for name in ["n1", "n2"] {
+                cm.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+                    name: name.into(),
+                    hostname: name.into(),
+                    resources: ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    address: String::new(),
+                    port: 6818,
+                    wg_pubkey: String::new(),
+                    version: String::new(),
+                    labels: HashMap::new(),
+                    source: NodeSource::NativeHost,
+                    runs_job_epilog: true,
+                });
+            }
+            wait_for("nodes registered", || {
+                cm.get_node("n1").is_some() && cm.get_node("n2").is_some()
+            });
+
+            cm.qos_cache().insert(spur_core::accounting::Qos {
+                name: "burst".into(),
+                idle_fill_preemptable: true,
+                ..Default::default()
+            });
+            let start_borrowed = |cm: &Arc<ClusterManager>, name: &str, node: &str| {
+                let mut spec = batch_spec(name, 1);
+                spec.qos = Some("burst".into());
+                let id = submit_and_wait(cm, spec);
+                cm.start_job(
+                    id,
+                    vec![node.into()],
+                    ResourceAllocations::with_scalar(2, 0),
+                    HashMap::from([(node.to_string(), ResourceAllocations::with_scalar(2, 0))]),
+                )
+                .unwrap();
+                settle(cm, id, spur_core::job::JobState::Running);
+                id
+            };
+            let victim1_id = start_borrowed(&cm, "victim1", "n1");
+            let victim2_id = start_borrowed(&cm, "victim2", "n2");
+
+            let reclaimer_id = submit_and_wait(&cm, batch_spec("reclaimer", 1));
+            let reclaimer = cm.get_job(reclaimer_id).unwrap();
+            let nodes = cm.get_nodes();
+            let busy = HashMap::new();
+            let cluster_state = ClusterState {
+                nodes: &nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+                busy_until: &busy,
+            };
+
+            let (freed1, freed_for1) =
+                reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &cluster_state, 0).await;
+            assert_eq!(
+                freed_for1,
+                Some(reclaimer_id),
+                "first call takes one victim"
+            );
+            assert_eq!(freed1.len(), 1);
+
+            // Still unplaced (the taken node hasn't actually freed up yet) and
+            // still owed: a second call must not touch the other borrowed job.
+            let (freed2, freed_for2) =
+                reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &cluster_state, 0).await;
+            assert!(
+                freed2.is_empty(),
+                "the reclaimer is already owed a slice; it must not take a second victim"
+            );
+            assert_eq!(freed_for2, None);
+
+            let victim1_state = cm.get_job(victim1_id).unwrap().state;
+            let victim2_state = cm.get_job(victim2_id).unwrap().state;
+            assert_eq!(
+                [victim1_state, victim2_state]
+                    .iter()
+                    .filter(|s| **s == spur_core::job::JobState::Preempted)
+                    .count(),
+                1,
+                "exactly one victim may be reclaimed while the debt is outstanding"
             );
         }
     }
