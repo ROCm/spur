@@ -2297,10 +2297,8 @@ impl ClusterManager {
         }
         let cleared: Vec<JobId> = {
             let jobs = self.jobs.read();
-            let still_charged = |victim: &JobId| {
-                jobs.get(victim)
-                    .is_some_and(|j| j.allocated_nodes.iter().any(|name| j.is_held_on(name)))
-            };
+            let still_charged =
+                |victim: &JobId| jobs.get(victim).is_some_and(Job::holds_a_placement);
             taken
                 .into_iter()
                 .filter(|(beneficiary, victims)| {
@@ -4185,11 +4183,10 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
-    /// Whether `name` has any job holding an allocation (Running/Completing/Suspended). Shared by
-    /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
-    /// busy node without `--force` using the same rule.
-    /// Whether any job still charges this node — including one resting in
-    /// Preempted whose epilog here hasn't answered yet, not just Running.
+    /// Whether any job still charges `name` — including one resting in Preempted
+    /// whose epilog here hasn't answered yet, not just Running. Shared by
+    /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so
+    /// both refuse to yank a busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
         let jobs = self.jobs.read();
         jobs.values().any(|j| j.is_held_on(name))
@@ -16135,10 +16132,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_preempt_requeue_is_atomic_and_replay_deterministic() {
-        // A single JobPreemptRequeue op takes a RUNNING job to Pending-with-hold
-        // AND frees its nodes AND finalizes the prior run as PREEMPTED for
-        // accounting — no intermediate state. Replay applies the exact begin_time
-        // and is a NoOp (no double-count, no drift, no re-dealloc).
+        // No node here owes an epilog, so one apply takes the job straight to
+        // Pending-with-hold; replay applies the same begin_time as a NoOp.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
