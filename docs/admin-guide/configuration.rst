@@ -322,6 +322,18 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        bounded only by this value. A node that exceeds it is skipped for new
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
+   * - ``shutdown_grace_secs``
+     - integer
+     - ``10``
+     - Restart
+     - How long ``spurctld`` waits, after ``SIGTERM`` or ``SIGINT``, for
+       in-flight RPCs to drain before forcing shutdown. An ``srun`` step holds
+       its RPC open for the step's whole runtime, so this bounds how long a
+       restart takes while steps are running. Range 0-86400; ``0`` waits
+       indefinitely. Keep it, plus a few seconds for the accounting flush that
+       follows, below your service manager's stop timeout (systemd
+       ``TimeoutStopSec``, Kubernetes ``terminationGracePeriodSeconds``): a
+       ``SIGKILL`` from that timeout skips the flush.
 
        Also sets how long a newly elected leader waits before reclaiming a
        placement reserved by a dispatch the previous leader never
