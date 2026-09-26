@@ -4618,6 +4618,8 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let audit_cluster = service.cluster.clone();
     let audit_rpcs = service.cluster.config().logging.audit_rpcs;
+    let shutdown_grace =
+        std::time::Duration::from_secs(service.cluster.config().controller.shutdown_grace_secs);
 
     let stats_layer = RpcStatsLayer::new(service.rpc_stats.clone(), service.raft.clone());
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
@@ -4643,9 +4645,54 @@ pub async fn serve(
         router = router.add_service(crate::accounting::accounting_server(service));
     }
 
-    router.serve_with_shutdown(addr, shutdown_signal()).await?;
+    // tonic consumes the shutdown future, so the drain deadline learns that
+    // draining began through this channel.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        shutdown_signal().await;
+        let _ = signalled_tx.send(());
+    };
+    serve_with_drain_deadline(
+        router.serve_with_shutdown(addr, shutdown),
+        async {
+            let _ = signalled_rx.await;
+        },
+        shutdown_grace,
+    )
+    .await?;
 
     Ok(())
+}
+
+/// Awaits `serve`, abandoning its drain `grace` after `signalled` fires (zero waits indefinitely).
+/// Abandoning returns `Ok` so `main` still flushes accounting; process exit closes what's left.
+async fn serve_with_drain_deadline<F, S, E>(
+    serve: F,
+    signalled: S,
+    grace: std::time::Duration,
+) -> Result<(), E>
+where
+    F: std::future::Future<Output = Result<(), E>>,
+    S: std::future::Future<Output = ()>,
+{
+    if grace.is_zero() {
+        return serve.await;
+    }
+    let deadline = async {
+        signalled.await;
+        tokio::time::sleep(grace).await;
+    };
+    tokio::select! {
+        result = serve => result,
+        () = deadline => {
+            warn!(
+                ?grace,
+                "graceful shutdown drain exceeded controller.shutdown_grace_secs; forcing \
+                 shutdown with requests still in flight"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Resolves on SIGTERM or Ctrl-C, so the caller can flush work that a dropped
@@ -5916,6 +5963,93 @@ mod tests {
         .expect("config with a key");
 
         assert_eq!(agent_signing_key(&config).expect("resolve"), "a-real-key");
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_returns_what_serve_returns_before_any_signal() {
+        let result: Result<(), std::io::Error> = serve_with_drain_deadline(
+            std::future::ready(Ok(())),
+            std::future::pending(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_propagates_a_serve_error() {
+        let result = serve_with_drain_deadline(
+            std::future::ready(Err(std::io::Error::other("address in use"))),
+            std::future::pending(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a serve failure such as a bind error must not read as a clean shutdown"
+        );
+    }
+
+    // These race against their own short outer timeout to prove the call is
+    // still pending; dropping a resource-free pending future there is clean.
+    #[tokio::test]
+    async fn drain_deadline_does_not_start_before_the_signal() {
+        let raced = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            serve_with_drain_deadline(
+                std::future::pending::<Result<(), std::io::Error>>(),
+                std::future::pending(),
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await;
+        assert!(
+            raced.is_err(),
+            "the grace period must bound only the drain, not the server's lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_of_zero_waits_indefinitely() {
+        let raced = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            serve_with_drain_deadline(
+                std::future::pending::<Result<(), std::io::Error>>(),
+                std::future::ready(()),
+                std::time::Duration::ZERO,
+            ),
+        )
+        .await;
+        assert!(
+            raced.is_err(),
+            "grace = 0 must wait indefinitely, not resolve early"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_forces_a_return_grace_after_the_signal() {
+        let signal_after = std::time::Duration::from_millis(100);
+        let grace = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let result = serve_with_drain_deadline(
+            std::future::pending::<Result<(), std::io::Error>>(),
+            tokio::time::sleep(signal_after),
+            grace,
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "a forced shutdown must surface as success, not an error"
+        );
+        assert!(
+            elapsed >= signal_after + grace,
+            "the grace period counts from the signal, not from startup: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must not wait anywhere near the unbounded default: {elapsed:?}"
+        );
     }
 
     #[test]
