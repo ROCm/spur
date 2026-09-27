@@ -5315,6 +5315,7 @@ struct LaunchReservationGuard {
     created_at: u64,
     armed: bool,
     spawned: bool,
+    preserve_admission_record: bool,
 }
 
 impl LaunchReservationGuard {
@@ -5331,11 +5332,18 @@ impl LaunchReservationGuard {
             created_at,
             armed: true,
             spawned: false,
+            preserve_admission_record: false,
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// The admission record belongs to a still-live earlier attempt, so Drop
+    /// must not delete it -- but the local allocation is still this call's own.
+    fn disarm_admission_record_only(&mut self) {
+        self.preserve_admission_record = true;
     }
 
     /// Past this point something is running, so an aborted launch must keep the
@@ -5367,7 +5375,9 @@ impl Drop for LaunchReservationGuard {
         }
         // `remove_run_if_created_at` fsyncs, so it must not run inline on Drop's
         // thread -- unlike the allocation release below, which is pure in-memory.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if self.preserve_admission_record {
+            // The record read at the gate outlives this call on purpose.
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let admissions = self.admissions.clone();
             let created_at = self.created_at;
             handle.spawn(async move {
@@ -6897,6 +6907,41 @@ impl SlurmAgent for AgentService {
                 "could not record the admission for job {job_id}: {error}"
             )));
         }
+
+        if self.hooks.prolog.is_some() {
+            // `admit_run_async` merged any prior admission forward, so a
+            // non-fresh state here is a prior attempt's outcome, not this launch's default.
+            let stuck_prolog = admissions.prolog_state(run_key);
+            if matches!(
+                stuck_prolog,
+                Some(crate::admission::HookState::Running)
+                    | Some(crate::admission::HookState::Unknown)
+                    | Some(crate::admission::HookState::Failed)
+            ) {
+                warn!(
+                    job_id,
+                    run_attempt,
+                    ?stuck_prolog,
+                    "refusing to run this run's prolog again: a prior attempt left it unresolved"
+                );
+                // This call never owned the run it read, so Drop must not delete that record --
+                // but the local allocation reserved above is this call's own and must still release.
+                reservation_guard.disarm_admission_record_only();
+                return Ok(Response::new(LaunchJobResponse {
+                    success: false,
+                    error: format!(
+                        "job {job_id} run {run_attempt}: prolog is still {stuck_prolog:?} \
+                         from a prior attempt; retry with a fresh run_attempt"
+                    ),
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    failure_kind: LaunchFailureKind::LaunchFailurePrologUnresolved as i32,
+
+                    conflict: None,
+                }));
+            }
+        }
+
         let mut participant_record = crate::admission::ParticipantAdmission::new(
             job_id,
             run_attempt,
@@ -6937,45 +6982,8 @@ impl SlurmAgent for AgentService {
         }
 
         if let Some(ref prolog) = self.hooks.prolog {
-            // `admit_run_async` above merged any prior admission of this exact
-            // (job_id, run_attempt) forward, so a Prolog left `Running`,
-            // `Unknown`, or `Failed` here is a genuinely settled-or-unresolved
-            // earlier invocation, not this launch's own fresh default. The hook
-            // may not be idempotent, so re-running it risks double-applying its
-            // side effects even when the prior run is known to have failed;
-            // only a fresh run_attempt can resolve that ambiguity.
-            let stuck_prolog = admissions.prolog_state(run_key);
-            if matches!(
-                stuck_prolog,
-                Some(crate::admission::HookState::Running)
-                    | Some(crate::admission::HookState::Unknown)
-                    | Some(crate::admission::HookState::Failed)
-            ) {
-                warn!(
-                    job_id,
-                    run_attempt,
-                    ?stuck_prolog,
-                    "refusing to run this run's prolog again: a prior attempt left it unresolved"
-                );
-                // This call never owned the run it just read -- the record
-                // belongs to the still-live earlier attempt. Its own Drop
-                // must not tear that down, the same way a superseded launch
-                // must not free a redispatch's reservation.
-                reservation_guard.disarm();
-                return Ok(Response::new(LaunchJobResponse {
-                    success: false,
-                    error: format!(
-                        "job {job_id} run {run_attempt}: prolog is still {stuck_prolog:?} \
-                         from a prior attempt; retry with a fresh run_attempt"
-                    ),
-                    stdout_path: String::new(),
-                    stderr_path: String::new(),
-                    failure_kind: LaunchFailureKind::LaunchFailurePrologUnresolved as i32,
-
-                    conflict: None,
-                }));
-            }
-
+            // The stuck-prolog refusal is checked earlier, right after
+            // `admit_run_async` -- reaching here means it's clear to run.
             if let Err(error) =
                 admissions.record_prolog(run_key, created_at, crate::admission::HookState::Running)
             {
@@ -15232,9 +15240,7 @@ mod tests {
         );
     }
 
-    /// A definitively failed prolog still ran once; redelivering the same
-    /// run_attempt must not risk double-applying a non-idempotent hook's
-    /// side effects, same as the Running/Unknown cases above.
+    /// Same gate as the Running/Unknown cases above: a failed prolog still ran once.
     #[tokio::test]
     async fn launch_job_refuses_to_relaunch_while_a_prior_attempts_prolog_has_failed() {
         let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -15290,6 +15296,14 @@ mod tests {
             std::fs::read_to_string(&marker).unwrap().lines().count(),
             0,
             "a failed prolog must never be re-run, not even once"
+        );
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(12, 1))
+                .expect("run record")
+                .prolog,
+            crate::admission::HookState::Failed,
+            "the refusal must not itself disturb the failed state it refused over"
         );
     }
 
@@ -19693,6 +19707,25 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "dropping an un-disarmed guard must release the reservation"
+        );
+
+        // The prolog gate's disarm mode: the record isn't this call's own, but
+        // the local reservation it just made is, and must still release.
+        {
+            svc.allocation
+                .lock()
+                .await
+                .allocate_for_job(9, 2, 1, 0, &[0])
+                .unwrap();
+            let mut guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(9, 2), 0);
+            guard.disarm_admission_record_only();
+            drop(guard);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "refusing at the prolog gate must not leak the local reservation this call made"
         );
 
         // A disarmed guard must NOT release (the job committed successfully).
