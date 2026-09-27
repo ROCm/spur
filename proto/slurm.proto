@@ -1106,6 +1106,12 @@ enum LaunchFailureKind {
   LAUNCH_FAILURE_RESIDUAL_STATE = 6;
   // The launch named a different node. A controller bug.
   LAUNCH_FAILURE_TARGET_MISMATCH = 7;
+  // This run's Prolog is still Running or Unknown on disk from an attempt
+  // this launch did not make -- the agent cannot tell whether that earlier
+  // invocation's side effects landed, so it refuses to run a possibly
+  // non-idempotent hook a second time. Retrying this exact attempt cannot
+  // resolve it; the controller must dispatch a fresh run_attempt instead.
+  LAUNCH_FAILURE_PROLOG_UNRESOLVED = 8;
 }
 
 // What the node named as already held when it refused. Diagnostic: the

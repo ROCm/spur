@@ -1317,6 +1317,14 @@ impl AdmissionStore {
             .map(|run| run.reject_before_unix_ms)
     }
 
+    /// This run's Prolog state, or none if it has no record yet. A relaunch
+    /// merges a prior admission's Prolog forward (see `admit_run_locked`), so
+    /// this is the one place a caller about to invoke the hook again can find
+    /// out whether an earlier attempt left it unresolved.
+    pub fn prolog_state(&self, run_key: RunKey) -> Option<HookState> {
+        self.load_run(run_key).ok().map(|run| run.prolog)
+    }
+
     /// Whether this run's allocation may now be released: the owner step only, its
     /// completion acknowledged, and, per the record, no epilog still in flight.
     pub fn release_is_due(

@@ -4520,12 +4520,12 @@ impl AgentService {
         match admissions.settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart) {
             Ok(settled) if settled > 0 => {
                 warn!(
-                    runs = settled,
-                    "settled epilogs whose owner did not survive"
+                    hooks = settled,
+                    "settled prolog/epilog hooks whose owner did not survive"
                 )
             }
             Ok(_) => {}
-            Err(error) => warn!(%error, "could not settle the epilogs of a previous agent"),
+            Err(error) => warn!(%error, "could not settle the hooks of a previous agent"),
         }
         let loaded = match admissions.load_all() {
             Ok(loaded) => loaded,
@@ -6853,6 +6853,44 @@ impl SlurmAgent for AgentService {
         }
 
         if let Some(ref prolog) = self.hooks.prolog {
+            // `admit_run_async` above merged any prior admission of this exact
+            // (job_id, run_attempt) forward, so a Prolog left `Running` or
+            // `Unknown` here is a genuinely unresolved earlier invocation, not
+            // this launch's own fresh default. The hook may not be idempotent,
+            // so re-running it without knowing whether it already ran would
+            // risk double-applying its side effects; only a fresh run_attempt
+            // can resolve that ambiguity.
+            let stuck_prolog = admissions.prolog_state(run_key);
+            if matches!(
+                stuck_prolog,
+                Some(crate::admission::HookState::Running)
+                    | Some(crate::admission::HookState::Unknown)
+            ) {
+                warn!(
+                    job_id,
+                    run_attempt,
+                    ?stuck_prolog,
+                    "refusing to run this run's prolog again: a prior attempt left it unresolved"
+                );
+                return Ok(Response::new(LaunchJobResponse {
+                    success: false,
+                    error: format!(
+                        "job {job_id} run {run_attempt}: prolog is still {stuck_prolog:?} \
+                         from a prior attempt; retry with a fresh run_attempt"
+                    ),
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    failure_kind: LaunchFailureKind::LaunchFailurePrologUnresolved as i32,
+
+                    conflict: None,
+                }));
+            }
+
+            if let Err(error) =
+                admissions.record_prolog(run_key, crate::admission::HookState::Running)
+            {
+                warn!(job_id, run_attempt, %error, "failed to record the prolog as running before invoking it");
+            }
             let ctx = spur_core::hooks::HookContext {
                 job_id,
                 work_dir: work_dir.clone(),
@@ -6866,6 +6904,11 @@ impl SlurmAgent for AgentService {
                 memory_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+                if let Err(error) =
+                    admissions.record_prolog(run_key, crate::admission::HookState::Failed)
+                {
+                    warn!(job_id, run_attempt, %error, "failed to record the prolog's failure");
+                }
                 // No completion report and no self-drain: the controller owns
                 // both decisions here, because only it can pair the drain with
                 // the hold that stops the job walking the cluster.
@@ -6880,6 +6923,11 @@ impl SlurmAgent for AgentService {
 
                     conflict: None,
                 }));
+            }
+            if let Err(error) =
+                admissions.record_prolog(run_key, crate::admission::HookState::Succeeded)
+            {
+                warn!(job_id, run_attempt, %error, "failed to record the prolog's success");
             }
         }
 
@@ -14676,6 +14724,25 @@ mod tests {
         path
     }
 
+    /// An executable script at a temp path that appends one line to `marker`
+    /// every time it runs, so a test can assert exactly how many times (if
+    /// any) a hook was actually invoked.
+    fn invocation_counting_hook_script(marker: &std::path::Path) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\necho invoked >> {}", shell_quote(marker)).unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Single-quotes a path for embedding in a generated shell script,
+    /// escaping any literal single quote it contains.
+    fn shell_quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    }
+
     /// The refusal driven through the real RPC entry point, not just the helper: a launch asking to
     /// run as root on a root spurd must be denied before anything is spawned. `with_root_override`
     /// makes this deterministic on an unprivileged runner, where the guard would otherwise be inert.
@@ -14802,6 +14869,14 @@ mod tests {
             "the operator needs the script's own failure, got {:?}",
             resp.error
         );
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(7, 1))
+                .expect("run record")
+                .prolog,
+            crate::admission::HookState::Failed,
+            "a failed prolog must be recorded, or the restart-recovery gate can never see it"
+        );
     }
 
     #[tokio::test]
@@ -14847,6 +14922,191 @@ mod tests {
             resp.error.contains("No such file or directory"),
             "the cause chain must survive into the reported error, got {:?}",
             resp.error
+        );
+    }
+
+    /// The success side of the same gate `a_failed_prolog_is_reported...`
+    /// pins for failure: nothing reads this record but a future restart, but
+    /// if a successful prolog is never marked `Succeeded` here, that future
+    /// gate has nothing to distinguish it from a stuck one.
+    #[tokio::test]
+    async fn a_successful_prolog_is_recorded_as_succeeded() {
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let prolog = invocation_counting_hook_script(&marker);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 9,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    name: "prolog-ok".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("transport ok")
+            .into_inner();
+
+        assert!(resp.success, "error: {}", resp.error);
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(9, 1))
+                .expect("run record")
+                .prolog,
+            crate::admission::HookState::Succeeded
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            1,
+            "the hook must run exactly once"
+        );
+    }
+
+    /// The restart-recovery gate: a Prolog left `Running` on disk from an
+    /// attempt this launch did not make (a crash mid-Prolog, before any
+    /// supervisor existed to own it) must refuse the relaunch outright
+    /// rather than silently re-run a hook that may not be idempotent.
+    #[tokio::test]
+    async fn launch_job_refuses_to_relaunch_while_a_prior_attempts_prolog_is_unresolved() {
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let prolog = invocation_counting_hook_script(&marker);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // Simulates a crash mid-Prolog: an admitted run whose Prolog never
+        // resolved, and (since Prolog runs before any supervisor is spawned)
+        // no supervisor recorded to say otherwise.
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                10,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
+        svc.admissions()
+            .record_prolog(key(10, 1), crate::admission::HookState::Running)
+            .expect("record the prolog as running");
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 10,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    name: "prolog-stuck".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a stuck prolog is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailurePrologUnresolved as i32
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            0,
+            "a stuck prolog must never be re-run, not even once"
+        );
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(10, 1))
+                .expect("run record")
+                .prolog,
+            crate::admission::HookState::Running,
+            "the refusal must not itself disturb the unresolved state it refused over"
+        );
+    }
+
+    /// Same gate, the settled-but-still-ambiguous branch: a restart already
+    /// resolved an owner-less `Running` to `Unknown` (see
+    /// `replay_admitted_allocations_settles_a_prolog_left_running_by_a_dead_owner`),
+    /// and that must refuse a relaunch exactly like `Running` does.
+    #[tokio::test]
+    async fn launch_job_refuses_to_relaunch_while_a_prior_attempts_prolog_is_unknown() {
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let prolog = invocation_counting_hook_script(&marker);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                11,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit a run");
+        svc.admissions()
+            .record_prolog(key(11, 1), crate::admission::HookState::Unknown)
+            .expect("record the prolog as unknown");
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 11,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    name: "prolog-unknown".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("an unknown prolog is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailurePrologUnresolved as i32
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            0,
+            "an unresolved prolog must never be re-run, not even once"
         );
     }
 
@@ -22088,6 +22348,42 @@ mod tests {
         assert!(
             svc.allocation.lock().await.allocated_cpus[3],
             "a failed ledger read must not leave live cores reading free"
+        );
+    }
+
+    /// `settle_hooks_whose_owner_is_gone` covers Prolog and epilog alike, but
+    /// that is a store-level guarantee; this drives it through the real
+    /// restart path (`replay_admitted_allocations`), which is the only place
+    /// production code actually calls it, to confirm the wiring — not just the
+    /// store method in isolation — settles a Prolog too.
+    #[tokio::test]
+    async fn replay_admitted_allocations_settles_a_prolog_left_running_by_a_dead_owner() {
+        let svc = ledger_agent();
+        let run = crate::admission::RunAdmission::new(
+            10,
+            1,
+            "test-node",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        svc.admissions().admit_run(&run).expect("admit a run");
+        // record_prolog requires the record to already exist, matching what a
+        // real crash-mid-Prolog leaves behind: an admitted run with no
+        // supervisor ever recorded for it, since Prolog runs before any
+        // supervisor is spawned.
+        svc.admissions()
+            .record_prolog(key(10, 1), crate::admission::HookState::Running)
+            .expect("record the prolog as running");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(10, 1))
+                .expect("run record")
+                .prolog,
+            crate::admission::HookState::Unknown,
+            "a prolog nobody survived to confirm must settle to Unknown, not stay Running forever"
         );
     }
 }
