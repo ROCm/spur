@@ -7915,12 +7915,33 @@ impl SlurmAgent for AgentService {
         );
         run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
         let allocation = run_record.allocation.clone();
-        if let Err(error) = admissions.admit_run_async(run_record).await {
-            error!(job_id = req.job_id, %error, "failed to persist the run admission record");
-            return Err(Status::unavailable(format!(
-                "could not record the admission for job {}: {error}",
-                req.job_id
-            )));
+        // The authoritative check: unlike the fast-path read above, this runs
+        // under the same run lock `fence_run` writes under, so a fence landing
+        // after that earlier read is still caught here, atomically with the
+        // write it would otherwise have raced. `reservation_guard` is still
+        // armed and unspawned, so returning now releases the tentative
+        // allocation instead of leaving it dangling.
+        match admissions.admit_run_unless_fenced_async(run_record).await {
+            Ok(crate::admission::AdmitOutcome::Admitted) => {}
+            Ok(crate::admission::AdmitOutcome::Fenced(cutoff)) => {
+                warn!(
+                    job_id = req.job_id,
+                    run_attempt = req.run_attempt,
+                    cutoff,
+                    "refusing a registration fenced against this run just before admitting it"
+                );
+                return Err(Status::failed_precondition(format!(
+                    "job {} run {} was fenced against a late registration",
+                    req.job_id, req.run_attempt
+                )));
+            }
+            Err(error) => {
+                error!(job_id = req.job_id, %error, "failed to persist the run admission record");
+                return Err(Status::unavailable(format!(
+                    "could not record the admission for job {}: {error}",
+                    req.job_id
+                )));
+            }
         }
         // The allocation's own participant. Without it the run has no step that
         // can own a hook, and its teardown reads as owing nothing.

@@ -128,6 +128,16 @@ pub enum HoldOutcome {
     AlreadyReleased,
 }
 
+/// Outcome of `admit_run_unless_fenced`: whether the write landed, or a fence
+/// already on record for this exact run took precedence over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitOutcome {
+    Admitted,
+    /// The cutoff already on record when the check ran, under the same lock
+    /// the write would have used.
+    Fenced(u64),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerAck {
     #[serde(default)]
@@ -881,6 +891,38 @@ impl AdmissionStore {
     pub async fn admit_run_async(&self, run: RunAdmission) -> io::Result<()> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || store.admit_run(&run))
+            .await
+            .map_err(|error| io::Error::other(format!("admission write failed: {error}")))?
+    }
+
+    /// `admit_run`, but refusing under the same run lock rather than after it:
+    /// a caller whose own unlocked pre-check already saw no fence still needs
+    /// this, since `fence_run` may land on that exact run before this call
+    /// takes its lock. Checking and writing in one critical section is the
+    /// only way to close that gap -- a second unlocked read would just move it.
+    pub fn admit_run_unless_fenced(&self, run: &RunAdmission) -> io::Result<AdmitOutcome> {
+        let key = run.key().ok_or_else(|| unaddressable(run.job_id))?;
+        self.with_run_lock(key, || {
+            let cutoff = match self.load_run(key) {
+                Ok(existing) => existing.reject_before_unix_ms,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error),
+            };
+            if cutoff > 0 {
+                return Ok(AdmitOutcome::Fenced(cutoff));
+            }
+            self.admit_run_locked(run)?;
+            Ok(AdmitOutcome::Admitted)
+        })
+    }
+
+    /// Async form of `admit_run_unless_fenced`, for the same reason `admit_run_async` exists.
+    pub async fn admit_run_unless_fenced_async(
+        &self,
+        run: RunAdmission,
+    ) -> io::Result<AdmitOutcome> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.admit_run_unless_fenced(&run))
             .await
             .map_err(|error| io::Error::other(format!("admission write failed: {error}")))?
     }
@@ -2662,6 +2704,60 @@ mod tests {
         let after = store.load_run(key(7, 1)).unwrap();
         assert_eq!(after.allocation, run.allocation);
         assert_eq!(after.created_at_unix_ms, 42);
+    }
+
+    // Proves the exact gap `register_job_allocation` used to leave open: its
+    // own unlocked `reject_before` pre-check can see no fence, yet a
+    // `fence_run` lands before its later, unconditional `admit_run_async`
+    // write -- and that write has no fence check of its own, so it always
+    // succeeds and gives the caller no signal that the run it just admitted
+    // had, by then, already been fenced. `admit_run_unless_fenced` closes the
+    // gap by checking and writing in the same critical section `fence_run`
+    // itself locks, so whichever of the two reaches that lock first is what
+    // the other observes.
+    #[test]
+    fn admit_run_unless_fenced_catches_a_fence_the_callers_own_pre_check_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let run_key = key(7, 1);
+
+        // The caller's fast-path pre-check, taken before this run has any record.
+        assert_eq!(
+            store.reject_before(run_key),
+            None,
+            "nothing has fenced this run yet"
+        );
+
+        // A concurrent cancel's FenceRun RPC lands in the window between that
+        // pre-check and the caller's eventual write.
+        let cutoff = store.fence_run(run_key, now_unix_ms()).unwrap();
+
+        // The atomic write must refuse rather than admit this attempt over
+        // the fence it can now see under its own lock.
+        let outcome = store
+            .admit_run_unless_fenced(&run_with(7, 1, 99))
+            .expect("the check-and-write itself must not fail");
+        assert_eq!(outcome, AdmitOutcome::Fenced(cutoff));
+
+        // The refused attempt must not have overwritten the record the fence covers.
+        let after = store.load_run(run_key).unwrap();
+        assert_ne!(
+            after.created_at_unix_ms, 99,
+            "a refused admission must not persist the attempt it refused"
+        );
+    }
+
+    #[test]
+    fn admit_run_unless_fenced_admits_normally_when_nothing_has_fenced_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let run = run_with(7, 1, 1);
+
+        let outcome = store
+            .admit_run_unless_fenced(&run)
+            .expect("an unfenced run must admit");
+        assert_eq!(outcome, AdmitOutcome::Admitted);
+        assert_eq!(store.load_run(key(7, 1)).unwrap().created_at_unix_ms, 1);
     }
 
     // Reading "no prior record" out of an IO error un-fences the run and writes
