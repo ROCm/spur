@@ -567,6 +567,7 @@ async fn answer_unrecorded_claims(
             run.attempt().unwrap_or_default(),
             std::slice::from_ref(&node.to_string()),
             9,
+            true,
         )
         .await;
         outcome.cancelled.push(run.job_id());
@@ -677,7 +678,8 @@ async fn settle_vanished_run(
     // peers have to be told before the record stops accounting for them.
     let peers = peers_still_holding(cluster, job_id, node);
     if !peers.is_empty() {
-        crate::scheduler_loop::cancel_job_on_nodes(cluster, job_id, run_attempt, &peers, 9).await;
+        crate::scheduler_loop::cancel_job_on_nodes(cluster, job_id, run_attempt, &peers, 9, true)
+            .await;
     }
     // A run the node dropped reported no exit, so it is an eviction and not a
     // failure: only that reading is eligible for the node-fault retry.
@@ -1155,6 +1157,7 @@ impl ControllerService {
                     0,
                     std::slice::from_ref(&node),
                     0,
+                    true,
                 )
                 .await;
             }
@@ -3105,12 +3108,17 @@ impl SlurmController for ControllerService {
                             let job_id = req.job_id;
                             let run_attempt = job.run_attempt;
                             tokio::spawn(async move {
+                                // The owner's script only finishes once every node's
+                                // original dispatch was already confirmed, so no
+                                // in-flight retry of this run_attempt can still land
+                                // here for the fence to guard against.
                                 crate::scheduler_loop::cancel_job_on_nodes(
                                     &cluster,
                                     job_id,
                                     run_attempt,
                                     &missing,
                                     15,
+                                    false,
                                 )
                                 .await;
                             });

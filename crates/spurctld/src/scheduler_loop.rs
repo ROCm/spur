@@ -614,7 +614,7 @@ async fn process_assignment(
             // Both arms tear down identically: with a deadline in play, even "all failed" can mean
             // every node registered and answered too late, so none of them may be left holding one.
             AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
-                cancel_job_on_nodes(&cluster, job_id, run_attempt, &all_nodes, 9).await;
+                cancel_job_on_nodes(&cluster, job_id, run_attempt, &all_nodes, 9, true).await;
                 // The job never left Pending, so plain requeue is a no-op here — the same
                 // Pending-aware backoff the launch path uses is what actually throttles a retry.
                 if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
@@ -699,7 +699,7 @@ async fn process_assignment(
         // activate_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0).await;
+        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0, true).await;
         debug!(
             job_id = assignment.job_id,
             error = %e,
@@ -711,7 +711,7 @@ async fn process_assignment(
     // The job is Running and committed, so anything it launches can now be
     // resolved by the controller. Only here is the workload let go.
     if dispatched && !start_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes).await {
-        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0).await;
+        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0, true).await;
         // Already Running, so without a transition it would hold its nodes. Both
         // calls name this attempt: the awaits above give a requeue time to land.
         let detail = format!(
@@ -1271,6 +1271,7 @@ async fn reclaim_for_unplaced(
                         victim.run_attempt,
                         &victim.nodes,
                         0,
+                        true,
                     )
                     .await;
                     freed.extend(victim.nodes.iter().cloned());
@@ -2489,7 +2490,7 @@ async fn confirm_dispatch_on_nodes(
 
     // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
     // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
-    cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
+    cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9, true).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -2808,7 +2809,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         let job_id = job.job_id;
         let run_attempt = job.run_attempt;
         tokio::spawn(async move {
-            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9).await;
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9, true).await;
         });
     }
 
@@ -2954,14 +2955,25 @@ pub async fn send_cancel_to_nodes(
 /// returning so the caller can establish a happens-before ordering against
 /// later actions. Each RPC is bounded by `CANCEL_RPC_TIMEOUT` so an
 /// unreachable agent can't stall the caller indefinitely.
+///
+/// `fence` guards against a stale in-flight `LaunchJob` retry landing after
+/// this teardown -- it is what holds `AdmissionStore::sweep()` off the node's
+/// admission record for `LAUNCH_LIFETIME_MS`. Pass `false` only when the
+/// caller can prove no such retry can still be outstanding (e.g. tearing down
+/// a companion after `confirm_dispatch_on_nodes` already confirmed every
+/// node's original dispatch); every genuine cancel/evict/dispatch-failure
+/// path must keep it `true`.
 pub async fn cancel_job_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
     node_names: &[String],
     signal: i32,
+    fence: bool,
 ) {
-    fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
+    if fence {
+        fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
+    }
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
@@ -4326,6 +4338,7 @@ mod tests {
         /// under a synthetic per-node launch cost rather than estimating it.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
+            fence_calls: Arc<AtomicU32>,
             release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
@@ -4367,6 +4380,7 @@ mod tests {
                 _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
             {
+                self.fence_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
                     success: true,
                     error: String::new(),
@@ -4723,6 +4737,7 @@ mod tests {
             let fanout_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
@@ -4751,6 +4766,7 @@ mod tests {
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4779,6 +4795,7 @@ mod tests {
             let cancel_calls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4797,6 +4814,35 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls)
+        }
+
+        /// Mock agent that counts `FenceRunRequest`s it receives, so a test can
+        /// assert whether `cancel_job_on_nodes` asked it to fence a run at all.
+        async fn spawn_mock_agent_capturing_fence() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let fence_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: fence_calls.clone(),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, fence_calls)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -5989,6 +6035,35 @@ mod tests {
             config.controller.dispatch_timeout_secs = 7;
             let cm = ClusterManager::new(config, dir2.path()).unwrap();
             assert_eq!(dispatch_deadline(&cm), Some(Duration::from_secs(7)));
+        }
+
+        /// `fence: false` is for a teardown that structurally cannot be racing an
+        /// in-flight launch retry (e.g. a companion node after the owner's script
+        /// finished, once every node's dispatch was already confirmed) — it must
+        /// skip the `FenceRun` RPC entirely rather than just weakening it, since
+        /// the fence is what keeps a settled run's admission record unsweepable
+        /// for `LAUNCH_LIFETIME_MS`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cancel_job_on_nodes_fence_flag_gates_the_fence_rpc() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster_with_config(&dir, test_config()).await;
+            let (addr, fence_calls) = spawn_mock_agent_capturing_fence().await;
+            register_node_at(&cm, "n1", addr);
+            let nodes = vec!["n1".to_string()];
+
+            cancel_job_on_nodes(&cm, 1, 1, &nodes, 9, false).await;
+            assert_eq!(
+                fence_calls.load(Ordering::SeqCst),
+                0,
+                "fence: false must not send a FenceRun RPC at all"
+            );
+
+            cancel_job_on_nodes(&cm, 1, 1, &nodes, 9, true).await;
+            assert_eq!(
+                fence_calls.load(Ordering::SeqCst),
+                1,
+                "fence: true must still protect a genuine cancel/evict path"
+            );
         }
 
         /// The node that timed out is the one most likely to have launched anyway, so it is the one
