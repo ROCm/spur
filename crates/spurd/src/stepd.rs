@@ -2894,7 +2894,7 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn verify_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn verify_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(path)?;
@@ -2911,6 +2911,35 @@ fn verify_private_dir(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Write `name` into `dir` so a reader sees either the previous record or the
+/// whole new one: a torn record on the recovery path reads as corruption.
+pub fn publish_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary_path = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temporary = options.open(&temporary_path)?;
+    let write_result = temporary
+        .write_all(contents)
+        .and_then(|()| temporary.sync_all());
+    drop(temporary);
+    // A failure past this point still owns a temp file nobody else created;
+    // a retry loop must not compound it into an unbounded pile of stragglers.
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary_path, dir.join(name)) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    fs::File::open(dir)?.sync_all()
 }
 
 pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
