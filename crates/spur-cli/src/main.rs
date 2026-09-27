@@ -7,6 +7,7 @@ mod clap_exit;
 mod env_defaults;
 mod exec;
 mod exit_fmt;
+mod export_env;
 mod format_engine;
 mod image;
 mod interactive;
