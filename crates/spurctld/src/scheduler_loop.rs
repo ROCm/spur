@@ -3152,15 +3152,27 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     }
 }
 
+/// How many of a node's ledgers this pulls at once. Leadership gain and the
+/// hourly sweep both fire one RPC per node in a single call; on a large
+/// cluster that is a thundering herd without some cap on the fan-out.
+const MAX_CONCURRENT_LEDGER_PULLS: usize = 16;
+
 /// Pull every node's ledger. Used where the controller has reason to distrust
 /// its own view rather than any one node's: a leader took over, or the sweep.
 pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) {
     let nodes: Vec<String> = cluster.get_nodes().into_iter().map(|n| n.name).collect();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LEDGER_PULLS));
     let mut set = tokio::task::JoinSet::new();
     for node in nodes {
         let cluster = cluster.clone();
         let reason = reason.to_string();
-        set.spawn(async move { pull_node_ledger(&cluster, &node, &reason).await });
+        let permits = permits.clone();
+        set.spawn(async move {
+            let Ok(_permit) = permits.acquire_owned().await else {
+                return;
+            };
+            pull_node_ledger(&cluster, &node, &reason).await
+        });
     }
     while set.join_next().await.is_some() {}
 }
@@ -4356,6 +4368,16 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            /// Sleeps inside `request_node_ledger`, standing in for the RPC's
+            /// real network + disk latency so a concurrency bound has something
+            /// to actually bound.
+            ledger_pull_delay: Duration,
+            /// Counted up for the duration of `request_node_ledger` and back
+            /// down after, so a test can read how many calls overlapped.
+            ledger_pull_in_flight: Option<Arc<AtomicU32>>,
+            /// High-water mark of `ledger_pull_in_flight`, so a test can assert
+            /// on the peak without racing to sample the live counter.
+            ledger_pull_max_in_flight: Option<Arc<AtomicU32>>,
         }
 
         #[tonic::async_trait]
@@ -4370,6 +4392,14 @@ mod tests {
                 _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
             {
+                if let (Some(in_flight), Some(max_in_flight)) =
+                    (&self.ledger_pull_in_flight, &self.ledger_pull_max_in_flight)
+                {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(self.ledger_pull_delay).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
                 Ok(tonic::Response::new(
                     spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
                 ))
@@ -4746,6 +4776,9 @@ mod tests {
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
                 cancel_delay,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4775,6 +4808,9 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4804,6 +4840,9 @@ mod tests {
                 fanout_calls: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4833,6 +4872,9 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4843,6 +4885,42 @@ mod tests {
                     .await;
             });
             (addr, fence_calls)
+        }
+
+        /// Mock agent whose `request_node_ledger` sleeps `delay` and records how
+        /// many calls (across every agent sharing these counters) were in flight
+        /// at once, so a test can observe whether a fan-out honored its bound.
+        async fn spawn_ledger_pull_probe(
+            delay: Duration,
+            in_flight: Arc<AtomicU32>,
+            max_in_flight: Arc<AtomicU32>,
+        ) -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                ledger_pull_delay: delay,
+                ledger_pull_in_flight: Some(in_flight),
+                ledger_pull_max_in_flight: Some(max_in_flight),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -5005,6 +5083,42 @@ mod tests {
                     cm.get_node(&n)
                         .is_some_and(|node| node.comm_addr().is_none())
                 },
+            );
+        }
+
+        /// A leadership-gain or hourly-sweep pull touches every node at once;
+        /// without a bound the fan-out is only as wide as the cluster. Proves
+        /// the peak concurrency the mock agents observe never exceeds the cap,
+        /// while also confirming the cap is genuinely exercised (not just an
+        /// accidentally-serial run) by driving well past it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn pull_all_node_ledgers_bounds_concurrent_pulls() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let in_flight = Arc::new(AtomicU32::new(0));
+            let max_in_flight = Arc::new(AtomicU32::new(0));
+            let delay = Duration::from_millis(150);
+
+            let node_count = MAX_CONCURRENT_LEDGER_PULLS * 3;
+            for i in 0..node_count {
+                let addr =
+                    spawn_ledger_pull_probe(delay, in_flight.clone(), max_in_flight.clone()).await;
+                register_node_at(&cm, &format!("ledger-node-{i}"), addr);
+            }
+
+            pull_all_node_ledgers(&cm, "test sweep").await;
+
+            let peak = max_in_flight.load(Ordering::SeqCst) as usize;
+            assert!(
+                peak <= MAX_CONCURRENT_LEDGER_PULLS,
+                "observed {peak} concurrent pulls, bound is {MAX_CONCURRENT_LEDGER_PULLS}"
+            );
+            assert!(
+                peak >= MAX_CONCURRENT_LEDGER_PULLS,
+                "peak concurrency was {peak}, well under the bound of \
+                 {MAX_CONCURRENT_LEDGER_PULLS} out of {node_count} nodes; this run never \
+                 exercised the cap, so it cannot tell a real one from an accidental one"
             );
         }
 
