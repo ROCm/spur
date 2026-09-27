@@ -6941,6 +6941,11 @@ impl SlurmAgent for AgentService {
                     ?stuck_prolog,
                     "refusing to run this run's prolog again: a prior attempt left it unresolved"
                 );
+                // This call never owned the run it just read -- the record
+                // belongs to the still-live earlier attempt. Its own Drop
+                // must not tear that down, the same way a superseded launch
+                // must not free a redispatch's reservation.
+                reservation_guard.disarm();
                 return Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: format!(
@@ -15184,6 +15189,140 @@ mod tests {
             0,
             "an unresolved prolog must never be re-run, not even once"
         );
+    }
+
+    /// The Drop-triggered admission cleanup is a spawned, fire-and-forget
+    /// task; a bare assertion right after `launch_job` returns can pass by
+    /// scheduling luck alone (the test runtime may shut down before the
+    /// spawned task is ever polled). This gives it real time to run first.
+    async fn settle_reservation_guard_drop() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// The reservation guard armed for THIS call belongs to a launch that
+    /// never happened -- the run it read is owned by the still-live earlier
+    /// attempt the gate above refused to race with. Its Drop must not tear
+    /// that record down, or the gate blocks the redispatch exactly once and
+    /// then erases the very evidence it needs to keep blocking.
+    #[tokio::test]
+    async fn launch_job_refusing_a_stuck_prolog_leaves_its_admission_record_intact() {
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let prolog = invocation_counting_hook_script(&marker);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let created_at = crate::admission::now_unix_ms();
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                12,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                created_at,
+            ))
+            .expect("admit a run");
+        svc.admissions()
+            .record_prolog(key(12, 1), created_at, crate::admission::HookState::Running)
+            .expect("record the prolog as running");
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 12,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    name: "prolog-stuck-guard".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a stuck prolog is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailurePrologUnresolved as i32
+        );
+
+        settle_reservation_guard_drop().await;
+
+        let run = svc.admissions().load_run(key(12, 1)).expect(
+            "refusing a launch this call never owned must not delete the record it refused over",
+        );
+        assert_eq!(
+            run.prolog,
+            crate::admission::HookState::Running,
+            "the still-unresolved prolog state must survive the refusal that read it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            0,
+            "a stuck prolog must never be re-run, not even once"
+        );
+    }
+
+    /// Contrast with the gate above: a prolog that actually ran and failed
+    /// IN THIS call is this call's own attempt concluding, not someone
+    /// else's still-live one -- the reservation genuinely has nothing left
+    /// to hold, so the guard's un-disarmed release-on-drop is correct here
+    /// and must keep firing once this change lands.
+    #[tokio::test]
+    async fn launch_job_still_releases_the_reservation_when_its_own_prolog_fails() {
+        let prolog = failing_hook_script(1);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 13,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    name: "prolog-fail-releases".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a prolog failure is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32
+        );
+
+        settle_reservation_guard_drop().await;
+
+        let err = svc.admissions().load_run(key(13, 1)).expect_err(
+            "this call's own failed attempt has nothing left to hold; its \
+                         un-disarmed guard must release the record on drop",
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]
