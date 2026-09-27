@@ -296,7 +296,7 @@ fn main() -> anyhow::Result<()> {
             ))
         }
         "help" | "--help" | "-h" => {
-            let _ = write_usage(&mut std::io::stdout().lock());
+            let _ = write_help(&mut std::io::stdout().lock());
             Ok(())
         }
         "plugin" => {
@@ -386,11 +386,23 @@ fn is_builtin(name: &str) -> bool {
     BUILTIN_COMMANDS.contains(&name)
 }
 
-/// Print top-level usage to stderr — used on error paths (no command given, or
-/// an unknown command). Explicit `help`/`--help` writes [`write_usage`] to
-/// stdout instead.
+/// Print top-level usage to stderr — used when no command is given. Explicit
+/// `help`/`--help` writes [`write_help`] to stdout instead.
 fn print_usage() {
-    let _ = write_usage(&mut std::io::stderr().lock());
+    let _ = write_help(&mut std::io::stderr().lock());
+}
+
+fn write_help<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    write_usage(w)?;
+    write_plugins(w, &plugin::names())
+}
+
+fn write_plugins<W: std::io::Write>(w: &mut W, plugins: &[String]) -> std::io::Result<()> {
+    if plugins.is_empty() {
+        return Ok(());
+    }
+    writeln!(w)?;
+    writeln!(w, "Plugins found on PATH: {}", plugins.join(" "))
 }
 
 fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
@@ -458,13 +470,7 @@ fn write_usage<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     writeln!(
         w,
         "  sprio sshare sstat sdiag sreport strigger sattach scrontab smd"
-    )?;
-    let plugins = plugin::names();
-    if !plugins.is_empty() {
-        writeln!(w)?;
-        writeln!(w, "Plugins found on PATH: {}", plugins.join(" "))?;
-    }
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -538,8 +544,31 @@ mod tests {
             "auth-keys",
             "version",
             "self-update",
+            "plugin",
         ] {
             assert!(text.contains(cmd), "usage is missing command `{cmd}`");
         }
+    }
+
+    #[test]
+    fn plugins_are_listed_after_a_blank_line() {
+        let mut buf = Vec::new();
+        let plugins = ["aims".to_string(), "my-tool".to_string()];
+
+        super::write_plugins(&mut buf, &plugins).expect("a Vec accepts every write");
+
+        assert_eq!(
+            String::from_utf8(buf).expect("plugin names are utf-8"),
+            "\nPlugins found on PATH: aims my-tool\n"
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_without_plugins() {
+        let mut buf = Vec::new();
+
+        super::write_plugins(&mut buf, &[]).expect("a Vec accepts every write");
+
+        assert!(buf.is_empty());
     }
 }
