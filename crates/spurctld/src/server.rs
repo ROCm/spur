@@ -1121,6 +1121,113 @@ impl ControllerService {
         }
         Ok(())
     }
+
+    /// Drains a step dispatch `JoinSet`, aggregating per-node results the same
+    /// way whether the nodes were just launched or reattached to. Aborts the
+    /// rest of the step's nodes on the first per-node failure.
+    async fn collect_step_dispatch_results(
+        &self,
+        mut set: tokio::task::JoinSet<Result<(String, spur_proto::RunCommandResponse), Status>>,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+        step_node_names: &[String],
+    ) -> (i32, String, String, Vec<String>, Vec<String>) {
+        let mut max_exit = 0i32;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut ran_nodes = Vec::new();
+        let mut dispatch_errors = Vec::new();
+        let mut step_abort_sent = false;
+
+        while let Some(result) = set.join_next().await {
+            let error = match result {
+                Ok(Ok((node_name, agent_resp))) => {
+                    max_exit = max_exit.max(agent_resp.exit_code);
+                    stdout.push_str(&agent_resp.stdout);
+                    stderr.push_str(&agent_resp.stderr);
+                    ran_nodes.push(node_name);
+                    continue;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => format!("step dispatch task panicked: {e}"),
+            };
+            warn!(job_id, step_id, error = %error, "step dispatch failed on one node");
+            dispatch_errors.push(error);
+            max_exit = max_exit.max(1);
+            if !step_abort_sent {
+                step_abort_sent = true;
+                crate::scheduler_loop::cancel_step_on_nodes(
+                    &self.cluster,
+                    job_id,
+                    run_attempt,
+                    step_id,
+                    step_node_names,
+                    15,
+                )
+                .await;
+            }
+        }
+        (max_exit, stdout, stderr, ran_nodes, dispatch_errors)
+    }
+
+    /// A step's agents were already contacted by an earlier `RunStep` call
+    /// that never made it back to the client (e.g. spurctld restarted).
+    /// Re-derive the step's nodes from Raft-persisted state and rejoin the
+    /// still-running (or by now finished) dispatch on every one of them,
+    /// exactly as `run_step` itself falls back to on a lost agent connection.
+    async fn reattach_step(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_user: String,
+        step: spur_core::step::JobStep,
+    ) -> Result<Response<RunStepResponse>, Status> {
+        let step_id = step.step_id;
+
+        let mut agent_addrs = Vec::with_capacity(step.nodes.len());
+        for node_name in &step.nodes {
+            let node = self.cluster.get_node(node_name).ok_or_else(|| {
+                Status::unavailable(format!(
+                    "node {node_name} is not currently registered; cannot reattach to step \
+                     {job_id}.{step_id}"
+                ))
+            })?;
+            agent_addrs.push((node_name.clone(), node_comm_http_url(&node, node_name)?));
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (node_name, agent_addr) in agent_addrs {
+            let user = step_user.clone();
+            set.spawn(async move {
+                let resp = reawait_step(&agent_addr, job_id, run_attempt, step_id, &user).await?;
+                Ok::<_, Status>((node_name, resp))
+            });
+        }
+
+        let (mut max_exit, stdout, mut stderr, ran_nodes, dispatch_errors) = self
+            .collect_step_dispatch_results(set, job_id, run_attempt, step_id, &step.nodes)
+            .await;
+
+        if !dispatch_errors.is_empty() {
+            max_exit = max_exit.max(1);
+            stderr.push_str(&format!(
+                "srun step dispatch errors:\n{}\n",
+                dispatch_errors.join("\n")
+            ));
+        }
+
+        if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
+            warn!(job_id, step_id, error = %e, "failed to record step completion");
+        }
+
+        Ok(Response::new(RunStepResponse {
+            exit_code: max_exit,
+            stdout,
+            stderr,
+            node: ran_nodes.join(","),
+        }))
+    }
 }
 
 /// Whether a runtime recovery report came from a node that proved its identity.
@@ -2987,6 +3094,7 @@ impl SlurmController for ControllerService {
             start_time: Some(chrono::Utc::now()),
             end_time: None,
             exit_code: None,
+            dispatched: false,
         };
 
         self.cluster
@@ -3715,6 +3823,15 @@ impl SlurmController for ControllerService {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
+        // A prior RunStep for this step already reached its agents (this call is
+        // itself a retry, e.g. spurctld restarted mid-run): reattach to what's
+        // already running rather than relaunching it a second time.
+        if step.dispatched {
+            return self
+                .reattach_step(job_id, job.run_attempt, job.spec.user.clone(), step)
+                .await;
+        }
+
         validate_step_nodes_for_run(
             job_id,
             req.step_id,
@@ -3788,6 +3905,12 @@ impl SlurmController for ControllerService {
                 dispatch_errors.join("; ")
             )));
         }
+
+        // Committed before any agent is contacted, so a crash from here on is
+        // recognized on retry as "already dispatched" rather than redispatched.
+        self.cluster
+            .mark_step_dispatched(job_id, step_id)
+            .map_err(|e| Status::internal(format!("failed to record step dispatch: {e}")))?;
 
         let pmix_peers = if mpi == MPI_PMIX {
             Some(
@@ -3967,57 +4090,11 @@ impl SlurmController for ControllerService {
             });
         }
 
-        let mut max_exit = 0i32;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let mut ran_nodes = Vec::new();
         let step_node_names: Vec<String> = dispatches.iter().map(|d| d.node_name.clone()).collect();
-        let mut step_abort_sent = false;
-
-        while let Some(result) = set.join_next().await {
-            match result {
-                Ok(Ok((node_name, agent_resp))) => {
-                    max_exit = max_exit.max(agent_resp.exit_code);
-                    stdout.push_str(&agent_resp.stdout);
-                    stderr.push_str(&agent_resp.stderr);
-                    ran_nodes.push(node_name);
-                }
-                Ok(Err(e)) => {
-                    warn!(job_id, step_id, error = %e, "step dispatch failed on one node");
-                    dispatch_errors.push(e.to_string());
-                    max_exit = max_exit.max(1);
-                    if !step_abort_sent {
-                        step_abort_sent = true;
-                        crate::scheduler_loop::cancel_step_on_nodes(
-                            &self.cluster,
-                            job_id,
-                            run_attempt,
-                            step_id,
-                            &step_node_names,
-                            15,
-                        )
-                        .await;
-                    }
-                }
-                Err(e) => {
-                    warn!(job_id, step_id, error = %e, "step dispatch task panicked");
-                    dispatch_errors.push(format!("step dispatch task panicked: {e}"));
-                    max_exit = max_exit.max(1);
-                    if !step_abort_sent {
-                        step_abort_sent = true;
-                        crate::scheduler_loop::cancel_step_on_nodes(
-                            &self.cluster,
-                            job_id,
-                            run_attempt,
-                            step_id,
-                            &step_node_names,
-                            15,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
+        let (mut max_exit, stdout, mut stderr, ran_nodes, agg_errors) = self
+            .collect_step_dispatch_results(set, job_id, run_attempt, step_id, &step_node_names)
+            .await;
+        dispatch_errors.extend(agg_errors);
 
         if !dispatch_errors.is_empty() {
             max_exit = max_exit.max(1);
@@ -7172,6 +7249,9 @@ mod tests {
 
     struct ProbeAgent {
         active: bool,
+        /// `await_step`'s canned reply; `None` keeps the RPC unimplemented,
+        /// matching every existing caller that never awaits a step here.
+        step_response: Option<spur_proto::proto::RunCommandResponse>,
     }
 
     #[tonic::async_trait]
@@ -7204,7 +7284,10 @@ mod tests {
             &self,
             _request: Request<spur_proto::proto::AwaitStepRequest>,
         ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            self.step_response
+                .clone()
+                .map(Response::new)
+                .ok_or_else(|| Status::unimplemented("not used in tests"))
         }
         async fn prepare_pmix(
             &self,
@@ -7333,10 +7416,29 @@ mod tests {
 
     /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
     async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_full(active, None).await
+    }
+
+    /// Like [`spawn_probe_agent`], but `await_step` answers with `step_response`
+    /// instead of erroring — a stand-in for a step already running or finished
+    /// on this node when a controller reattaches to it.
+    async fn spawn_probe_agent_with_step_response(
+        response: spur_proto::proto::RunCommandResponse,
+    ) -> std::net::SocketAddr {
+        spawn_probe_agent_full(false, Some(response)).await
+    }
+
+    async fn spawn_probe_agent_full(
+        active: bool,
+        step_response: Option<spur_proto::proto::RunCommandResponse>,
+    ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active };
+        let agent = ProbeAgent {
+            active,
+            step_response,
+        };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
@@ -9725,6 +9827,7 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                dispatched: false,
             })
             .expect("test setup: seed step");
         svc.cluster
@@ -9749,6 +9852,95 @@ mod tests {
         );
     }
 
+    // A step already marked dispatched means a prior RunStep call reached its
+    // agents; a retry (e.g. after spurctld itself restarted) must reattach via
+    // await_step rather than relaunching through run_command. The probe agent's
+    // run_command and await_step answer with different exit codes so a naive
+    // "just retry run_step" (still dispatching fresh) is distinguishable from a
+    // real reattach: reverting the `step.dispatched` check makes this test fail
+    // with exit_code 0 (run_command's default reply) instead of 7.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_reattaches_to_an_already_dispatched_step() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
+
+        let agent = spawn_probe_agent_with_step_response(spur_proto::proto::RunCommandResponse {
+            exit_code: 7,
+            stdout: "reattached-output".into(),
+            stderr: String::new(),
+        })
+        .await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "sleep 60".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: allocated_nodes,
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                dispatched: false,
+            })
+            .expect("test setup: seed step");
+        svc.cluster
+            .mark_step_dispatched(job_id, 0)
+            .expect("test setup: a prior RunStep already reached this step's agents");
+
+        let resp = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["sleep".into(), "60".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("a retried RunStep for an already-dispatched step must reattach, not error")
+            .into_inner();
+
+        assert_eq!(
+            resp.exit_code, 7,
+            "must return await_step's result, not a fresh run_command dispatch"
+        );
+        assert_eq!(resp.stdout, "reattached-output");
+
+        let step = svc.cluster.get_step(job_id, 0).expect("step");
+        assert_eq!(
+            step.state,
+            StepState::Failed,
+            "nonzero exit code 7 is a Failed step"
+        );
+        assert_eq!(step.exit_code, Some(7));
+
+        // A step already Completed still reattaches cleanly on a further retry
+        // (e.g. the RunStepResponse itself never made it back before the
+        // restart), replaying the same durable result instead of erroring.
+        let replay = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["sleep".into(), "60".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("reattaching to an already-completed dispatched step must not error")
+            .into_inner();
+        assert_eq!(replay.exit_code, 7);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_step_rejects_nodes_no_longer_allocated() {
         use spur_core::resource::ResourceAllocations;
@@ -9771,6 +9963,7 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                dispatched: false,
             })
             .expect("test setup: seed step with stale nodes");
 
@@ -9867,6 +10060,7 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                dispatched: false,
             })
             .expect("test setup: seed step for run_step");
 

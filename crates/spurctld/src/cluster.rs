@@ -1893,6 +1893,7 @@ impl ClusterManager {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                dispatched: false,
             };
             if let Err(e) = self.create_step(batch_step) {
                 warn!(job_id, error = %e, "failed to record batch step");
@@ -3880,6 +3881,13 @@ impl ClusterManager {
             step_id,
             exit_code,
         })?;
+        Ok(())
+    }
+
+    /// Mark a step as actually dispatched to its agents, durably via Raft. A
+    /// `RunStep` retry that finds this set reattaches instead of relaunching.
+    pub fn mark_step_dispatched(&self, job_id: JobId, step_id: u32) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobStepDispatchStarted { job_id, step_id })?;
         Ok(())
     }
 
@@ -6770,6 +6778,11 @@ impl ClusterManager {
                         .or_insert_with(|| (**step).clone());
                 }
             },
+            WalOperation::JobStepDispatchStarted { job_id, step_id } => {
+                if let Some(step) = self.steps.write().get_mut(&(*job_id, *step_id)) {
+                    step.dispatched = true;
+                }
+            }
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
@@ -10899,6 +10912,7 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            dispatched: false,
         };
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
@@ -12103,6 +12117,7 @@ mod tests {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                dispatched: false,
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
