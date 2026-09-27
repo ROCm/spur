@@ -6938,17 +6938,18 @@ impl SlurmAgent for AgentService {
 
         if let Some(ref prolog) = self.hooks.prolog {
             // `admit_run_async` above merged any prior admission of this exact
-            // (job_id, run_attempt) forward, so a Prolog left `Running` or
-            // `Unknown` here is a genuinely unresolved earlier invocation, not
-            // this launch's own fresh default. The hook may not be idempotent,
-            // so re-running it without knowing whether it already ran would
-            // risk double-applying its side effects; only a fresh run_attempt
-            // can resolve that ambiguity.
+            // (job_id, run_attempt) forward, so a Prolog left `Running`,
+            // `Unknown`, or `Failed` here is a genuinely settled-or-unresolved
+            // earlier invocation, not this launch's own fresh default. The hook
+            // may not be idempotent, so re-running it risks double-applying its
+            // side effects even when the prior run is known to have failed;
+            // only a fresh run_attempt can resolve that ambiguity.
             let stuck_prolog = admissions.prolog_state(run_key);
             if matches!(
                 stuck_prolog,
                 Some(crate::admission::HookState::Running)
                     | Some(crate::admission::HookState::Unknown)
+                    | Some(crate::admission::HookState::Failed)
             ) {
                 warn!(
                     job_id,
@@ -15228,6 +15229,67 @@ mod tests {
             std::fs::read_to_string(&marker).unwrap().lines().count(),
             0,
             "an unresolved prolog must never be re-run, not even once"
+        );
+    }
+
+    /// A definitively failed prolog still ran once; redelivering the same
+    /// run_attempt must not risk double-applying a non-idempotent hook's
+    /// side effects, same as the Running/Unknown cases above.
+    #[tokio::test]
+    async fn launch_job_refuses_to_relaunch_while_a_prior_attempts_prolog_has_failed() {
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let prolog = invocation_counting_hook_script(&marker);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let created_at = crate::admission::now_unix_ms();
+        svc.admissions()
+            .admit_run(&crate::admission::RunAdmission::new(
+                12,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                created_at,
+            ))
+            .expect("admit a run");
+        svc.admissions()
+            .record_prolog(key(12, 1), created_at, crate::admission::HookState::Failed)
+            .expect("record the prolog as failed");
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 12,
+                run_attempt: 1,
+                spec: Some(JobSpec {
+                    name: "prolog-failed".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a failed prolog is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailurePrologUnresolved as i32
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            0,
+            "a failed prolog must never be re-run, not even once"
         );
     }
 
