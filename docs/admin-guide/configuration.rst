@@ -1727,6 +1727,10 @@ converges to the new device count without restarting ``spurd``.
 * A partition switch is a hardware constraint: it must be performed on a
   **drained, idle** node. Once the switch completes, the agent's next refresh
   picks up the new inventory and converges automatically.
+* Each partition of a partitioned GPU is one device. Its
+  ``spur.amd.com/pci-bdf`` annotation is the address of the parent GPU, which is
+  the same for all partitions and is the address that ``lspci`` shows. Its
+  ``spur.amd.com/stable-id`` annotation is different for each partition.
 
 .. note::
 

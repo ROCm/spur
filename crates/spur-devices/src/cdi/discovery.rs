@@ -15,7 +15,7 @@ use crate::cdi::spec::{
 use crate::types::LinkType;
 
 const AMD_CDI_KIND: &str = "amd.com/gpu";
-const KFD_TOPOLOGY_ROOT: &str = "/sys/class/kfd/kfd/topology/nodes";
+const SYSFS_ROOT: &str = "/sys";
 const KFD_AMD_VENDOR_ID: u32 = 4098; // 0x1002
 const VRAM_HEAP_TYPE: u64 = 1;
 const IO_LINK_XGMI: u32 = 2;
@@ -68,10 +68,6 @@ struct KfdIoLink {
     link_type: u32,
     weight: u32,
     max_bandwidth: u64,
-}
-
-fn discover_kfd_gpus() -> Vec<KfdGpuNode> {
-    discover_kfd_gpus_from_root(Path::new(KFD_TOPOLOGY_ROOT))
 }
 
 fn discover_kfd_gpus_from_root(root: &Path) -> Vec<KfdGpuNode> {
@@ -244,11 +240,57 @@ fn parse_kv_file(path: &Path) -> Option<HashMap<String, String>> {
     Some(map)
 }
 
-fn bdf_from_location_id(location_id: u64, domain: u32) -> String {
-    let func = location_id & 0x07;
-    let dev = (location_id >> 3) & 0x1f;
-    let bus = (location_id >> 8) & 0xff;
-    format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PciIdentity {
+    domain: u32,
+    bus: u8,
+    device: u8,
+    function: u8,
+    partition_rank: u8,
+}
+
+/// Maps render minor to PCI identity. The low three bits of `location_id` are
+/// the PCI function for a lone KFD node, and the kernel's partition number when
+/// one device has several KFD nodes. So a device with several real functions,
+/// each with a KFD node, decodes as partitions, and at most 8 ranks exist.
+fn resolve_pci_identities(nodes: &[KfdGpuNode]) -> HashMap<u32, PciIdentity> {
+    let slot = |n: &KfdGpuNode| {
+        let bus = (n.location_id >> 8) as u8;
+        let device = ((n.location_id >> 3) & 0x1f) as u8;
+        (n.domain, bus, device)
+    };
+    let mut nodes_per_slot: HashMap<(u32, u8, u8), usize> = HashMap::new();
+    for node in nodes {
+        *nodes_per_slot.entry(slot(node)).or_default() += 1;
+    }
+
+    nodes
+        .iter()
+        .map(|node| {
+            let (domain, bus, device) = slot(node);
+            let low_bits = (node.location_id & 0x07) as u8;
+            let (function, partition_rank) = if nodes_per_slot[&(domain, bus, device)] == 1 {
+                (low_bits, 0)
+            } else {
+                (0, low_bits)
+            };
+            let identity = PciIdentity {
+                domain,
+                bus,
+                device,
+                function,
+                partition_rank,
+            };
+            (node.render_minor, identity)
+        })
+        .collect()
+}
+
+fn bdf_from_identity(id: &PciIdentity) -> String {
+    format!(
+        "{:04x}:{:02x}:{:02x}.{}",
+        id.domain, id.bus, id.device, id.function
+    )
 }
 
 /// Low 8 bits of a stable_id are the partition index; the rest is the PCIe BDF
@@ -260,16 +302,12 @@ pub const STABLE_ID_PARTITION_MASK: u64 = 0xFF;
 /// Encode a reload-invariant device id from the PCIe BDF (domain:bus:dev.func
 /// anchor) plus a per-partition rank. The domain occupies bits 24..39, so two
 /// GPUs on different PCI domains with the same bus:dev.func no longer collide.
-fn encode_stable_id(location_id: u64, domain: u32, partition_index: u32) -> u64 {
-    let func = location_id & 0x07;
-    let dev = (location_id >> 3) & 0x1f;
-    let bus = (location_id >> 8) & 0xff;
-    let domain = (domain as u64) & 0xffff;
-    (domain << 24)
-        | (bus << 16)
-        | (dev << 11)
-        | (func << 8)
-        | (partition_index as u64 & STABLE_ID_PARTITION_MASK)
+fn encode_stable_id(id: &PciIdentity) -> u64 {
+    (u64::from(id.domain & 0xffff) << 24)
+        | (u64::from(id.bus) << 16)
+        | (u64::from(id.device) << 11)
+        | (u64::from(id.function) << 8)
+        | u64::from(id.partition_rank)
 }
 
 /// Decode a stable_id's BDF anchor back to the k8s-DRA `dddd:bb:dd.f` form
@@ -281,27 +319,6 @@ pub fn stable_id_to_bdf(stable_id: u64) -> String {
     let dev = (stable_id >> 11) & 0x1f;
     let func = (stable_id >> 8) & 0x07;
     format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
-}
-
-/// Rank each node's render_minor WITHIN its BDF group, returning
-/// render_minor -> partition_index. SPX yields 0; CPX yields 0..N-1 per BDF.
-/// Global render_minor order is wrong across multiple physical GPUs, so the
-/// grouping is by BDF first.
-fn partition_indices_by_bdf(nodes: &[KfdGpuNode]) -> HashMap<u32, u32> {
-    let mut by_bdf: HashMap<u64, Vec<u32>> = HashMap::new();
-    for node in nodes {
-        let bdf_high = encode_stable_id(node.location_id, node.domain, 0);
-        by_bdf.entry(bdf_high).or_default().push(node.render_minor);
-    }
-
-    let mut map = HashMap::new();
-    for minors in by_bdf.values_mut() {
-        minors.sort_unstable();
-        for (idx, &rm) in minors.iter().enumerate() {
-            map.insert(rm, idx as u32);
-        }
-    }
-    map
 }
 
 fn format_unique_id(unique_id: u64) -> String {
@@ -456,7 +473,11 @@ fn gpu_supplementary_gids_from_group_file(path: &str) -> Vec<u32> {
 }
 
 fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
-    let kfd_nodes = discover_kfd_gpus();
+    discover_amd_gpus_in(Path::new(SYSFS_ROOT))
+}
+
+fn discover_amd_gpus_in(sysfs: &Path) -> Vec<DiscoveredGpu> {
+    let kfd_nodes = discover_kfd_gpus_from_root(&sysfs.join("class/kfd/kfd/topology/nodes"));
     if kfd_nodes.is_empty() {
         return Vec::new();
     }
@@ -467,15 +488,18 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
         .map(|(i, g)| (g.node_id, i))
         .collect();
 
-    let partition_index_by_render_minor = partition_indices_by_bdf(&kfd_nodes);
+    let identities = resolve_pci_identities(&kfd_nodes);
 
     kfd_nodes
         .iter()
         .enumerate()
         .map(|(index, node)| {
             let device_index = node.render_minor.saturating_sub(128);
-            let render_device = format!("/sys/class/drm/renderD{}", node.render_minor);
-            let device_path = Path::new(&render_device).join("device");
+            let identity = &identities[&node.render_minor];
+            let pci_bdf = bdf_from_identity(identity);
+            // A partition's render node links to an amdgpu_xcp platform device,
+            // which has none of these attributes, so read the PCI device.
+            let device_path = sysfs.join("bus/pci/devices").join(&pci_bdf);
 
             let gpu_type = if node.device_id != 0 {
                 detect_amd_gpu_type_from_id(node.device_id)
@@ -486,7 +510,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
             };
             let memory_mb = node.vram_bytes / (1024 * 1024);
             let numa_node = read_numa_node(&device_path);
-            let pci_bdf = Some(bdf_from_location_id(node.location_id, node.domain));
+            let pci_bdf = Some(pci_bdf);
             let link_type = if node.hive_id != 0 || has_xgmi_link(&node.io_links) {
                 LinkType::Xgmi
             } else {
@@ -501,12 +525,8 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
             } else {
                 read_sysfs_string(&device_path.join("unique_id"))
             };
-            let card_id = find_card_for_render_minor(node.render_minor);
-            let partition_index = partition_index_by_render_minor
-                .get(&node.render_minor)
-                .copied()
-                .unwrap_or(0);
-            let stable_id = encode_stable_id(node.location_id, node.domain, partition_index);
+            let card_id = find_card_for_render_minor(&sysfs.join("class/drm"), node.render_minor);
+            let stable_id = encode_stable_id(identity);
 
             debug!(
                 device_index,
@@ -557,9 +577,8 @@ fn build_link_weights(
     links
 }
 
-fn find_card_for_render_minor(render_minor: u32) -> Option<u32> {
+fn find_card_for_render_minor(drm_dir: &Path, render_minor: u32) -> Option<u32> {
     let render_name = format!("renderD{render_minor}");
-    let drm_dir = Path::new("/sys/class/drm");
     let entries = std::fs::read_dir(drm_dir).ok()?;
 
     for entry in entries.flatten() {
@@ -734,9 +753,15 @@ mod tests {
     }
 
     #[test]
-    fn test_bdf_from_location_id() {
-        assert_eq!(bdf_from_location_id(1280, 0), "0000:05:00.0");
-        assert_eq!(bdf_from_location_id(10496, 0), "0000:29:00.0");
+    fn test_bdf_from_identity() {
+        assert_eq!(
+            bdf_from_identity(&lone_node_identity(1280, 0)),
+            "0000:05:00.0"
+        );
+        assert_eq!(
+            bdf_from_identity(&lone_node_identity(10496, 0)),
+            "0000:29:00.0"
+        );
     }
 
     #[test]
@@ -877,7 +902,7 @@ mod tests {
         let gpu = DiscoveredGpu {
             device_index: 3,
             render_minor: 131,
-            stable_id: encode_stable_id(0xc100, 0, 0),
+            stable_id: encode_stable_id(&lone_node_identity(0xc100, 0)),
             card_id: Some(4),
             gpu_type: "mi300x".into(),
             memory_mb: 196608,
@@ -979,102 +1004,90 @@ mod tests {
         }
     }
 
+    fn lone_node_identity(location_id: u64, domain: u32) -> PciIdentity {
+        let node = KfdGpuNode {
+            domain,
+            ..kfd_node(2, 128, location_id)
+        };
+        resolve_pci_identities(&[node])[&128]
+    }
+
     #[test]
     fn encode_stable_id_is_collision_free_and_decodes_bdf() {
-        // location_id 0x0500 => bus 0x05, dev 0x00, func 0x00.
-        let bdf_a = 0x0500u64;
-        // location_id 0x2900 => bus 0x29, dev 0x00, func 0x00.
-        let bdf_b = 0x2900u64;
+        let a0 = lone_node_identity(0x0500, 0);
+        let a1 = PciIdentity {
+            partition_rank: 1,
+            ..a0
+        };
+        let b0 = lone_node_identity(0x2900, 0);
 
-        let a0 = encode_stable_id(bdf_a, 0, 0);
-        let a1 = encode_stable_id(bdf_a, 0, 1);
-        let b0 = encode_stable_id(bdf_b, 0, 0);
+        assert_ne!(encode_stable_id(&a0), encode_stable_id(&a1));
+        assert_ne!(encode_stable_id(&a0), encode_stable_id(&b0));
+        assert_eq!(encode_stable_id(&a0), 0x05u64 << 16);
 
-        // Same BDF, different partition rank -> distinct ids.
-        assert_ne!(a0, a1);
-        // Different BDF -> distinct ids.
-        assert_ne!(a0, b0);
-        // SPX (partition 0) high bits carry only the BDF (bus 0x05, dev/func 0).
-        assert_eq!(a0, 0x05u64 << 16);
-
-        // Decoding the high bits reproduces the original bus/dev/func.
-        let loc = 0x1234u64 & 0x7ff | (0x29 << 8);
-        let sid = encode_stable_id(loc, 0, 0);
-        let bus = (sid >> 16) & 0xff;
-        let dev = (sid >> 11) & 0x1f;
-        let func = (sid >> 8) & 0x07;
-        assert_eq!(bus, (loc >> 8) & 0xff);
-        assert_eq!(dev, (loc >> 3) & 0x1f);
-        assert_eq!(func, loc & 0x07);
+        // A lone node on a non-zero function keeps that function.
+        let loc = (0x29 << 8) | (0x06 << 3) | 0x01;
+        let sid = encode_stable_id(&lone_node_identity(loc, 0));
+        assert_eq!((sid >> 16) & 0xff, 0x29);
+        assert_eq!((sid >> 11) & 0x1f, 0x06);
+        assert_eq!((sid >> 8) & 0x07, 0x01);
+        assert_eq!(sid & STABLE_ID_PARTITION_MASK, 0);
     }
 
-    /// The bug `pre` reported: two GPUs with the SAME bus:dev.func but on
-    /// DIFFERENT PCI domains must not collide as allocation ids.
+    /// Two GPUs with the same bus:dev.func on different PCI domains must not
+    /// collide as allocation ids.
     #[test]
     fn encode_stable_id_disambiguates_by_pci_domain() {
-        // bus 0x19, dev 0x00, func 0x00 on domain 0 vs domain 1.
-        let loc = 0x1900u64;
-        let dom0_spx = encode_stable_id(loc, 0, 0);
-        let dom1_spx = encode_stable_id(loc, 1, 0);
-        assert_ne!(
-            dom0_spx, dom1_spx,
-            "same BDF on different domains must yield distinct stable_ids"
-        );
-        // The domain lives in bits 24..39, above the BDF anchor.
+        let dom0 = lone_node_identity(0x1900, 0);
+        let dom1 = lone_node_identity(0x1900, 1);
+        let dom0_spx = encode_stable_id(&dom0);
+        let dom1_spx = encode_stable_id(&dom1);
+        assert_ne!(dom0_spx, dom1_spx);
         assert_eq!(dom1_spx - dom0_spx, 1u64 << 24);
 
-        // CPX ranks stay distinct within each domain too.
-        let dom0_cpx1 = encode_stable_id(loc, 0, 1);
-        let dom1_cpx1 = encode_stable_id(loc, 1, 1);
-        let ids = [dom0_spx, dom1_spx, dom0_cpx1, dom1_cpx1];
+        let rank1 = |id: PciIdentity| PciIdentity {
+            partition_rank: 1,
+            ..id
+        };
+        let ids = [
+            dom0_spx,
+            dom1_spx,
+            encode_stable_id(&rank1(dom0)),
+            encode_stable_id(&rank1(dom1)),
+        ];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), 4, "all four (domain,rank) ids are distinct");
+        assert_eq!(unique.len(), 4);
     }
 
-    /// A known (domain,bus,dev,func,partition) round-trips through the decode
-    /// helper to the k8s-DRA `dddd:bb:dd.f` string form.
     #[test]
     fn stable_id_decodes_to_dra_pci_bus_id_form() {
-        // domain 0, bus 0x19, dev 0x00, func 0x00, SPX.
-        let sid = encode_stable_id(0x1900u64, 0, 0);
+        let sid = encode_stable_id(&lone_node_identity(0x1900, 0));
         assert_eq!(stable_id_to_bdf(sid), "0000:19:00.0");
 
-        // A non-zero domain and a func bit also round-trip.
-        // bus 0x3a, dev 0x02, func 0x01 on domain 0x0001.
         let loc = (0x3a << 8) | (0x02 << 3) | 0x01;
-        let sid = encode_stable_id(loc, 1, 0);
+        let sid = encode_stable_id(&lone_node_identity(loc, 1));
         assert_eq!(stable_id_to_bdf(sid), "0001:3a:02.1");
     }
 
     #[test]
     fn partition_index_ranks_within_bdf_not_globally() {
-        // Two physical GPUs (two BDFs), each with 2 CPX partitions.
-        // render_minors are interleaved across the BDFs to prove the rank is
-        // per-BDF, not a global 0..3 ordering.
-        let bdf_a = 0x0500u64;
-        let bdf_b = 0x2900u64;
+        // Two GPUs with 2 partitions each. The render minors interleave across
+        // the GPUs, so a global rank would give 0..3.
         let nodes = vec![
-            kfd_node(2, 128, bdf_a),
-            kfd_node(3, 129, bdf_b),
-            kfd_node(4, 130, bdf_a),
-            kfd_node(5, 131, bdf_b),
+            kfd_node(2, 128, 0x0500),
+            kfd_node(3, 129, 0x2900),
+            kfd_node(4, 130, 0x0501),
+            kfd_node(5, 131, 0x2901),
         ];
 
-        let map = partition_indices_by_bdf(&nodes);
-        // Within BDF A: minors 128,130 -> ranks 0,1.
-        assert_eq!(map.get(&128), Some(&0));
-        assert_eq!(map.get(&130), Some(&1));
-        // Within BDF B: minors 129,131 -> ranks 0,1 (NOT global 1,3).
-        assert_eq!(map.get(&129), Some(&0));
-        assert_eq!(map.get(&131), Some(&1));
+        let ids = resolve_pci_identities(&nodes);
+        assert_eq!(ids[&128].partition_rank, 0);
+        assert_eq!(ids[&130].partition_rank, 1);
+        assert_eq!(ids[&129].partition_rank, 0);
+        assert_eq!(ids[&131].partition_rank, 1);
 
-        let sids: Vec<u64> = nodes
-            .iter()
-            .map(|n| encode_stable_id(n.location_id, n.domain, map[&n.render_minor]))
-            .collect();
-        // All four stable_ids are distinct.
-        let unique: std::collections::HashSet<_> = sids.iter().collect();
-        assert_eq!(unique.len(), 4);
+        let sids: std::collections::HashSet<u64> = ids.values().map(encode_stable_id).collect();
+        assert_eq!(sids.len(), 4);
     }
 
     /// Values measured on an MI300X at 0000:11:00.0 in CPX mode (amdgpu
@@ -1088,64 +1101,95 @@ mod tests {
             .collect();
         nodes.push(kfd_node(2, 136, 0x2f00));
 
-        let map = partition_indices_by_bdf(&nodes);
+        let ids = resolve_pci_identities(&nodes);
+        let parent_anchor = encode_stable_id(&lone_node_identity(0x1100, 0));
         for i in 0u32..8 {
-            let node = &nodes[i as usize];
-            assert_eq!(
-                map[&node.render_minor], i,
-                "partition rank of renderD{}",
-                node.render_minor
-            );
-            let sid = encode_stable_id(node.location_id, node.domain, map[&node.render_minor]);
+            let id = &ids[&(128 + i)];
+            assert_eq!(u32::from(id.partition_rank), i, "renderD{}", 128 + i);
+            let sid = encode_stable_id(id);
             assert_eq!(stable_id_to_bdf(sid), "0000:11:00.0");
-            assert_eq!(
-                bdf_from_location_id(node.location_id, node.domain),
-                "0000:11:00.0"
-            );
+            assert_eq!(bdf_from_identity(id), "0000:11:00.0");
+            assert_eq!(sid & !STABLE_ID_PARTITION_MASK, parent_anchor);
         }
-        assert_eq!(map[&136], 0);
-        assert_eq!(bdf_from_location_id(0x2f00, 0), "0000:2f:00.0");
+        assert_eq!(ids[&136].partition_rank, 0);
+        assert_eq!(bdf_from_identity(&ids[&136]), "0000:2f:00.0");
 
-        let sids: std::collections::HashSet<u64> = nodes
-            .iter()
-            .map(|n| encode_stable_id(n.location_id, n.domain, map[&n.render_minor]))
-            .collect();
+        let sids: std::collections::HashSet<u64> = ids.values().map(encode_stable_id).collect();
         assert_eq!(sids.len(), 9, "stable_ids stay distinct across partitions");
     }
 
     #[test]
     fn stable_ids_unchanged_when_render_minor_pool_shifts() {
-        let bdf_a = 0x0500u64;
-        let bdf_b = 0x2900u64;
         let base = vec![
-            kfd_node(2, 128, bdf_a),
-            kfd_node(3, 129, bdf_b),
-            kfd_node(4, 130, bdf_a),
-            kfd_node(5, 131, bdf_b),
+            kfd_node(2, 128, 0x0500),
+            kfd_node(3, 129, 0x2900),
+            kfd_node(4, 130, 0x0501),
+            kfd_node(5, 131, 0x2901),
         ];
-        // Simulate a driver reload that shifted the whole DRM minor pool up by a
-        // constant while BDFs stayed fixed.
+        // A driver reload that moves the DRM minor pool while the BDFs stay.
         const SHIFT: u32 = 64;
         let shifted: Vec<KfdGpuNode> = base
             .iter()
             .map(|n| kfd_node(n.node_id, n.render_minor + SHIFT, n.location_id))
             .collect();
 
-        let map_base = partition_indices_by_bdf(&base);
-        let map_shifted = partition_indices_by_bdf(&shifted);
+        let ids_base = resolve_pci_identities(&base);
+        let ids_shifted = resolve_pci_identities(&shifted);
+        for node in &base {
+            assert_eq!(
+                encode_stable_id(&ids_base[&node.render_minor]),
+                encode_stable_id(&ids_shifted[&(node.render_minor + SHIFT)])
+            );
+        }
+    }
 
-        let sids_base: Vec<u64> = base
-            .iter()
-            .map(|n| encode_stable_id(n.location_id, n.domain, map_base[&n.render_minor]))
-            .collect();
-        let sids_shifted: Vec<u64> = shifted
-            .iter()
-            .map(|n| encode_stable_id(n.location_id, n.domain, map_shifted[&n.render_minor]))
-            .collect();
+    /// sysfs of an MI300X node with GPU 0 at 0000:11:00.0 in CPX and the
+    /// other seven in SPX, captured on amdgpu 6.19.14. Serials are synthetic.
+    fn mi300x_cpx_sysfs() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mi300x-cpx/sys")
+    }
 
-        // Keying on render_minor directly would have changed every id by SHIFT;
-        // keying on BDF + intra-BDF rank keeps them identical.
-        assert_eq!(sids_base, sids_shifted);
+    #[test]
+    fn cpx_partitions_resolve_to_parent_pci_device() {
+        let gpus = discover_amd_gpus_in(&mi300x_cpx_sysfs());
+        assert_eq!(gpus.len(), 15);
+
+        let (partitions, spx): (Vec<&DiscoveredGpu>, Vec<&DiscoveredGpu>) =
+            gpus.iter().partition(|g| g.render_minor < 136);
+        assert_eq!(partitions.len(), 8);
+        for (rank, gpu) in partitions.iter().enumerate() {
+            let at = format!("renderD{}", gpu.render_minor);
+            assert_eq!(gpu.pci_bdf.as_deref(), Some("0000:11:00.0"), "{at}");
+            assert_eq!(stable_id_to_bdf(gpu.stable_id), "0000:11:00.0", "{at}");
+            assert_eq!(
+                gpu.stable_id & STABLE_ID_PARTITION_MASK,
+                rank as u64,
+                "{at}"
+            );
+            assert_eq!(gpu.numa_node, Some(0), "{at}");
+            assert_eq!(gpu.compute_partition.as_deref(), Some("CPX"), "{at}");
+        }
+
+        let expected_spx = [
+            ("0000:2f:00.0", 0),
+            ("0000:46:00.0", 0),
+            ("0000:5d:00.0", 0),
+            ("0000:8b:00.0", 1),
+            ("0000:aa:00.0", 1),
+            ("0000:c2:00.0", 1),
+            ("0000:da:00.0", 1),
+        ];
+        assert_eq!(spx.len(), expected_spx.len());
+        for (gpu, (bdf, numa)) in spx.iter().zip(expected_spx) {
+            assert_eq!(gpu.pci_bdf.as_deref(), Some(bdf));
+            assert_eq!(stable_id_to_bdf(gpu.stable_id), bdf);
+            assert_eq!(gpu.stable_id & STABLE_ID_PARTITION_MASK, 0);
+            assert_eq!(gpu.numa_node, Some(numa));
+            assert_eq!(gpu.compute_partition.as_deref(), Some("SPX"));
+        }
+
+        let ids: std::collections::HashSet<u64> = gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(ids.len(), 15);
     }
 
     #[test]
@@ -1193,7 +1237,7 @@ mod tests {
         );
         assert_eq!(kfd_nodes[0].vram_bytes / (1024 * 1024), 196592);
         assert_eq!(
-            bdf_from_location_id(kfd_nodes[0].location_id, kfd_nodes[0].domain),
+            bdf_from_identity(&resolve_pci_identities(&kfd_nodes)[&128]),
             "0000:05:00.0"
         );
     }

@@ -196,7 +196,11 @@ fn assign_device_ids(devices: &mut [DeviceEntry]) {
 
 fn cdi_sort_key(a: &DeviceEntry, b: &DeviceEntry) -> std::cmp::Ordering {
     match (&a.pci_bdf, &b.pci_bdf) {
-        (Some(a_bdf), Some(b_bdf)) => a_bdf.cmp(b_bdf),
+        // Partitions of one GPU share a BDF; tie-break so a refresh keeps the order.
+        (Some(a_bdf), Some(b_bdf)) => a_bdf
+            .cmp(b_bdf)
+            .then(a.stable_id.cmp(&b.stable_id))
+            .then_with(|| primary_device_path(a).cmp(primary_device_path(b))),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => primary_device_path(a).cmp(primary_device_path(b)),
@@ -266,6 +270,53 @@ mod tests {
     ) {
         let gres_cache = GresCache::from_entries(gres_entries);
         reg.populate(cdi_cache, &gres_cache);
+    }
+
+    fn partition_entry(stable_id: u64, render_node: &str) -> DeviceEntry {
+        let pool = crate::gres::cache::CountableGresPool {
+            gres_name: "gpu".into(),
+            resource_type: None,
+            capacity: 1,
+        };
+        let mut entry = countable_pool_entry(&pool);
+        entry.pci_bdf = Some("0000:11:00.0".into());
+        entry.stable_id = stable_id;
+        entry.device_edits.device_nodes.push(DeviceNode {
+            path: render_node.into(),
+            host_path: None,
+            r#type: None,
+            major: None,
+            minor: None,
+            file_mode: None,
+            permissions: None,
+            uid: None,
+            gid: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn cdi_sort_key_orders_partitions_of_one_bdf() {
+        let mut entries = vec![
+            partition_entry(0x110002, "/dev/dri/renderD130"),
+            partition_entry(0, "/dev/dri/renderD129"),
+            partition_entry(0x110001, "/dev/dri/renderD131"),
+            partition_entry(0, "/dev/dri/renderD128"),
+        ];
+        entries.sort_by(cdi_sort_key);
+        let order: Vec<(u64, &str)> = entries
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (0, "/dev/dri/renderD128"),
+                (0, "/dev/dri/renderD129"),
+                (0x110001, "/dev/dri/renderD131"),
+                (0x110002, "/dev/dri/renderD130"),
+            ]
+        );
     }
 
     fn make_amd_cache() -> CdiCache {
