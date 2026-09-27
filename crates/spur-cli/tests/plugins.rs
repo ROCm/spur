@@ -134,6 +134,19 @@ fn unknown_plugin_subcommand_fails() {
 }
 
 #[test]
+fn no_command_prints_usage_and_plugins_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    write_exec(dir.path(), "spur-aims", "#!/bin/sh\n");
+
+    let out = spur(dir.path(), &[]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("Usage: spur <command>"), "{stderr}");
+    assert!(stderr.contains("Plugins found on PATH: aims"), "{stderr}");
+}
+
+#[test]
 fn help_lists_plugins_only_when_present() {
     let dir = tempfile::tempdir().unwrap();
 
