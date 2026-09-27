@@ -43,12 +43,20 @@ exists, so a plugin can own a whole command tree:
      - ``spur-aims-install-demo``, ``spur-aims-install``, ``spur-aims``
      - the part of the command that is left over
 
+The plugin name stops at the first argument that starts with a dash. For
+``spur aims --profile demo``, Spur tries only ``spur-aims`` and the plugin gets
+``--profile demo``.
+
 Only the directories on ``PATH`` are searched, and the first directory that
 holds a match wins. An underscore in the file name stands for a dash in the
-command name, so ``spur-my_tool`` answers to ``spur my-tool``.
+command name, so ``spur-my_tool`` answers to ``spur my-tool``. When one
+directory holds both ``spur-my-tool`` and ``spur-my_tool``, the name with the
+dash wins.
 
 Spur replaces its own process with the plugin, so the exit code and the signal
-handling of the plugin are the ones you see.
+handling of the plugin are the ones you see. When Spur finds a plugin but
+cannot start it, Spur exits with code 126. When Spur finds no built-in command
+and no plugin, it exits with code 1.
 
 Environment
 -----------
@@ -64,7 +72,8 @@ Spur exports these variables before it runs a plugin:
      - Controller endpoints, from ``spur.conf`` when the variable is not
        already set
    * - ``SPUR_CONF``
-     - Path of the configuration file in use
+     - Path of the configuration file, ``/etc/spur/spur.conf`` when the
+       variable is not already set
    * - ``SPUR_BIN``
      - Absolute path of the running ``spur`` binary
    * - ``SPUR_VERSION``
@@ -82,6 +91,7 @@ Listing Plugins
 
    spur plugin list
 
-It prints every ``spur-*`` executable on ``PATH`` with its path, and marks a
-plugin that shadows a built-in command. ``spur help`` also lists the plugin
+It prints each plugin name one time, with the path of the executable that
+Spur finds first on ``PATH``. It marks a plugin that has the name of a built-in
+command, because such a plugin never runs. ``spur help`` also lists the plugin
 names it finds.

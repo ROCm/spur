@@ -68,6 +68,34 @@ fn unknown_command_without_plugin_fails() {
 }
 
 #[test]
+fn unknown_flag_does_not_name_a_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = spur(dir.path(), &["--bogus"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("unknown command '--bogus'"), "{stderr}");
+    assert!(!stderr.contains("spur---bogus"), "{stderr}");
+}
+
+#[test]
+fn builtin_command_wins_over_a_plugin_with_the_same_name() {
+    let dir = tempfile::tempdir().unwrap();
+    write_exec(
+        dir.path(),
+        "spur-version",
+        "#!/bin/sh\necho plugin ran\nexit 3\n",
+    );
+
+    let out = spur(dir.path(), &["version"]);
+
+    assert!(out.status.success());
+    let stdout = text(&out.stdout);
+    assert!(!stdout.contains("plugin ran"), "{stdout}");
+}
+
+#[test]
 fn plugin_list_marks_shadowed_builtins() {
     let dir = tempfile::tempdir().unwrap();
     write_exec(dir.path(), "spur-aims", "#!/bin/sh\n");
