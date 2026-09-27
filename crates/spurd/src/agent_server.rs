@@ -926,6 +926,16 @@ fn supervised_epilog_owed(
     if hooks.epilog.is_none() {
         return crate::admission::EpilogOwed::No;
     }
+    // A failed job-level Prolog is an admission-time gate that runs before the
+    // run's slice is ever used: reaching `Failed` means `launch_job` returned
+    // before admitting any participant, and its own stuck-prolog check refuses
+    // to run Prolog again for this same run key. No stepd was, or ever can be,
+    // spawned for this run attempt, so there is no epilog left to run either --
+    // without this, an empty supervisor list reads as `CannotTell` and strands
+    // the slice forever (there is provably nothing left that could clear it).
+    if admitted.run.prolog == crate::admission::HookState::Failed {
+        return crate::admission::EpilogOwed::No;
+    }
     match recorded_supervisor_liveness(admitted) {
         Liveness::Gone => crate::admission::EpilogOwed::No,
         Liveness::Live | Liveness::CannotTell => crate::admission::EpilogOwed::Yes,
@@ -15406,6 +15416,44 @@ mod tests {
             std::fs::read_to_string(&marker).unwrap().lines().count(),
             1,
             "the hook must have run exactly once total, not once per delivery"
+        );
+    }
+
+    /// A failed job-level Prolog means execution never began: `launch_job`
+    /// returns before any participant or supervisor is ever admitted, and its
+    /// own gate refuses to re-run Prolog for the same run key. There is
+    /// therefore provably no epilog left to run, and the debt must not be
+    /// held forever on the strength of an empty, and so ambiguous,
+    /// supervisor list.
+    #[test]
+    fn cancelled_epilog_owed_is_no_when_prolog_never_let_execution_begin() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let admissions = crate::admission::AdmissionStore::new(state.path(), "test-node");
+        let run = key(41, 1);
+        let created_at = crate::admission::now_unix_ms();
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                41,
+                1,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                created_at,
+            ))
+            .expect("admit the run");
+        admissions
+            .record_prolog(run, created_at, crate::admission::HookState::Failed)
+            .expect("record the prolog's failure");
+
+        let hooks = HooksConfig {
+            epilog: Some("/bin/true".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cancelled_epilog_owed(&admissions, &hooks, run),
+            crate::admission::EpilogOwed::No,
+            "no stepd was ever spawned for a run whose prolog failed, \
+             so its epilog can never run and the debt must not be held"
         );
     }
 
