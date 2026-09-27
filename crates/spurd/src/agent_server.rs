@@ -7014,6 +7014,9 @@ impl SlurmAgent for AgentService {
                 // the hold that stops the job walking the cluster.
                 let err_msg = format!("prolog failed: {e:#}");
                 error!(job_id, error = %err_msg, "prolog hook failed before launch");
+                // The record above is what the fail-closed gate reads on a
+                // same-attempt redelivery; Drop must not erase it.
+                reservation_guard.disarm_admission_record_only();
                 return Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: err_msg,
@@ -14865,6 +14868,26 @@ mod tests {
         path
     }
 
+    /// Like `invocation_counting_hook_script`, but also fails -- so a test can
+    /// drive a real hook failure through `launch_job` and still count re-runs.
+    fn failing_invocation_counting_hook_script(
+        marker: &std::path::Path,
+        code: i32,
+    ) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "#!/bin/bash\necho invoked >> {}\nexit {code}",
+            shell_quote(marker)
+        )
+        .unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// Single-quotes a path for embedding in a generated shell script,
     /// escaping any literal single quote it contains.
     fn shell_quote(path: &std::path::Path) -> String {
@@ -15307,6 +15330,85 @@ mod tests {
         );
     }
 
+    /// The three tests above pre-seed `Failed` by hand -- none of them drive
+    /// an actual hook failure through `launch_job`, so none exercised the
+    /// branch that runs the hook, sees it fail, and returns. This one does,
+    /// which is the branch a live SysTest pass found still erased its own
+    /// record on Drop (missing the `disarm_admission_record_only()` call the
+    /// sibling stuck-prolog branch already has).
+    #[tokio::test]
+    async fn launch_job_with_a_genuinely_failing_prolog_leaves_the_failure_visible_to_a_retry() {
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let prolog = failing_invocation_counting_hook_script(&marker, 1);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let spec = JobSpec {
+            name: "prolog-fails-for-real".into(),
+            script: "#!/bin/bash\ntrue\n".into(),
+            num_tasks: 1,
+            num_nodes: 1,
+            cpus_per_task: 1,
+            work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let first = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 13,
+                run_attempt: 1,
+                spec: Some(spec.clone()),
+                ..Default::default()
+            }))
+            .await
+            .expect("a real prolog failure is a launch outcome, not a transport error")
+            .into_inner();
+        assert!(!first.success);
+        assert_eq!(
+            first.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32
+        );
+
+        settle_reservation_guard_drop().await;
+
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(13, 1))
+                .expect("the failed prolog's own record must survive the guard's Drop")
+                .prolog,
+            crate::admission::HookState::Failed,
+        );
+
+        let second = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 13,
+                run_attempt: 1,
+                spec: Some(spec),
+                ..Default::default()
+            }))
+            .await
+            .expect("a redelivery is a launch outcome, not a transport error")
+            .into_inner();
+        assert!(!second.success);
+        assert_eq!(
+            second.failure_kind,
+            LaunchFailureKind::LaunchFailurePrologUnresolved as i32,
+            "a same-run_attempt redelivery must be refused by the gate, not re-run the hook"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            1,
+            "the hook must have run exactly once total, not once per delivery"
+        );
+    }
+
     /// The Drop-triggered admission cleanup is a spawned, fire-and-forget
     /// task; a bare assertion right after `launch_job` returns can pass by
     /// scheduling luck alone (the test runtime may shut down before the
@@ -15389,13 +15491,14 @@ mod tests {
         );
     }
 
-    /// Contrast with the gate above: a prolog that actually ran and failed
-    /// IN THIS call is this call's own attempt concluding, not someone
-    /// else's still-live one -- the reservation genuinely has nothing left
-    /// to hold, so the guard's un-disarmed release-on-drop is correct here
-    /// and must keep firing once this change lands.
+    /// Corrected by a live SysTest finding: a prolog that ran and failed IN
+    /// THIS call still leaves its `Failed` record as the one thing a
+    /// same-attempt redelivery must see to be refused -- so the guard now
+    /// disarms the *record* half only. The *local allocation* half is still
+    /// this call's own to release, since nothing is running -- that release
+    /// is what this test actually guards now.
     #[tokio::test]
-    async fn launch_job_still_releases_the_reservation_when_its_own_prolog_fails() {
+    async fn launch_job_still_releases_the_local_allocation_when_its_own_prolog_fails() {
         let prolog = failing_hook_script(1);
         let svc = AgentService::new(
             test_reporter(),
@@ -15409,7 +15512,7 @@ mod tests {
 
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
-                job_id: 13,
+                job_id: 14,
                 run_attempt: 1,
                 spec: Some(JobSpec {
                     name: "prolog-fail-releases".into(),
@@ -15434,11 +15537,18 @@ mod tests {
 
         settle_reservation_guard_drop().await;
 
-        let err = svc.admissions().load_run(key(13, 1)).expect_err(
-            "this call's own failed attempt has nothing left to hold; its \
-                         un-disarmed guard must release the record on drop",
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(14, 1))
+                .expect("the failed prolog's own record must survive the guard's Drop")
+                .prolog,
+            crate::admission::HookState::Failed,
         );
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            svc.allocation.lock().await.owner_attempt(14),
+            None,
+            "the local allocation must still be released even though the record survives"
+        );
     }
 
     #[tokio::test]
