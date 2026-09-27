@@ -15,10 +15,13 @@ pub struct Plugin {
 }
 
 fn path_dirs() -> Vec<PathBuf> {
-    match std::env::var_os("PATH") {
-        Some(p) => std::env::split_paths(&p).collect(),
-        None => Vec::new(),
-    }
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default()
+}
+
+fn is_flag(arg: &str) -> bool {
+    arg.starts_with('-')
 }
 
 #[cfg(unix)]
@@ -29,24 +32,29 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn lookup(dirs: &[PathBuf], file: &str) -> Option<PathBuf> {
-    dirs.iter().map(|d| d.join(file)).find(|p| is_executable(p))
+/// The first directory that holds one of `files` wins. In one directory the
+/// earlier file wins.
+fn lookup(dirs: &[PathBuf], files: &[String]) -> Option<PathBuf> {
+    dirs.iter()
+        .flat_map(|d| files.iter().map(move |f| d.join(f)))
+        .find(|p| is_executable(p))
 }
 
-/// Longest match among `spur-a-b-c`, `spur-a-b`, `spur-a`. An underscore in the
-/// file name stands for a dash in the command name, as kubectl does.
+/// Longest match among `spur-a-b-c`, `spur-a-b`, `spur-a`. The name stops at
+/// the first flag. An underscore in the file name stands for a dash in the
+/// command name, as kubectl does.
 /// Returns the plugin and the arguments left over for it.
 pub fn resolve(dirs: &[PathBuf], args: &[String]) -> Option<(Plugin, Vec<String>)> {
-    for n in (1..=args.len()).rev() {
+    let words = args.iter().take_while(|a| !is_flag(a)).count();
+    for n in (1..=words).rev() {
         let name = args[..n].join("-");
         let underscored = args[..n]
             .iter()
             .map(|a| a.replace('-', "_"))
             .collect::<Vec<_>>()
             .join("-");
-        let Some(path) = lookup(dirs, &format!("spur-{name}"))
-            .or_else(|| lookup(dirs, &format!("spur-{underscored}")))
-        else {
+        let files = [format!("spur-{name}"), format!("spur-{underscored}")];
+        let Some(path) = lookup(dirs, &files) else {
             continue;
         };
         return Some((Plugin { name, path }, args[n..].to_vec()));
@@ -61,8 +69,10 @@ pub fn list(dirs: &[PathBuf]) -> Vec<Plugin> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        // A dash sorts before an underscore, so the file `resolve` prefers comes first.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
             let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
                 continue;
             };
@@ -115,7 +125,9 @@ pub fn dispatch(args: &[String]) -> ! {
         std::process::exit(126);
     }
     eprintln!("spur: unknown command '{}'", args[0]);
-    eprintln!("spur: no plugin named spur-{} on PATH either", args[0]);
+    if !is_flag(&args[0]) {
+        eprintln!("spur: no plugin named spur-{} on PATH either", args[0]);
+    }
     std::process::exit(1);
 }
 
@@ -224,6 +236,68 @@ mod tests {
         let (plugin, _) = resolve(&dirs, &args(&["aims"])).unwrap();
         assert_eq!(plugin.path, first.path().join("spur-aims"));
         assert_eq!(list(&dirs).len(), 1);
+    }
+
+    #[test]
+    fn the_first_path_entry_wins_for_an_underscore_name_too() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        touch_exec(first.path(), "spur-my_tool");
+        touch_exec(second.path(), "spur-my-tool");
+        let dirs = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+
+        let (plugin, _) = resolve(&dirs, &args(&["my-tool"])).unwrap();
+        assert_eq!(plugin.path, first.path().join("spur-my_tool"));
+        assert_eq!(list(&dirs)[0].path, plugin.path);
+    }
+
+    #[test]
+    fn the_dash_name_wins_in_one_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_exec(dir.path(), "spur-my_tool");
+        touch_exec(dir.path(), "spur-my-tool");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (plugin, _) = resolve(&dirs, &args(&["my-tool"])).unwrap();
+        assert_eq!(plugin.path, dir.path().join("spur-my-tool"));
+        assert_eq!(list(&dirs)[0].path, plugin.path);
+    }
+
+    #[test]
+    fn the_name_stops_at_the_first_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_exec(dir.path(), "spur-aims");
+        touch_exec(dir.path(), "spur-aims--v");
+        touch_exec(dir.path(), "spur---bogus");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (plugin, rest) = resolve(&dirs, &args(&["aims", "-v", "x"])).unwrap();
+        assert_eq!(plugin.name, "aims");
+        assert_eq!(rest, args(&["-v", "x"]));
+        assert!(resolve(&dirs, &args(&["--bogus"])).is_none());
+    }
+
+    #[test]
+    fn a_path_entry_that_does_not_exist_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_exec(dir.path(), "spur-aims");
+        let dirs = vec![dir.path().join("missing"), dir.path().to_path_buf()];
+
+        let (plugin, _) = resolve(&dirs, &args(&["aims"])).unwrap();
+        assert_eq!(plugin.path, dir.path().join("spur-aims"));
+        assert_eq!(list(&dirs)[0].path, plugin.path);
+    }
+
+    #[test]
+    fn a_file_name_that_is_not_utf8_is_not_a_plugin() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"spur-\xff");
+        std::fs::write(dir.path().join(name), "#!/bin/sh\n").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+
+        assert!(list(&dirs).is_empty());
     }
 
     #[test]
