@@ -7705,12 +7705,10 @@ impl SlurmAgent for AgentService {
         // seeing one here means the concurrent cancel could no longer reach this
         // node through the launch it was trying to stop.
         let admissions = self.admissions();
-        let fence_check = admissions.clone();
-        let fenced_since =
-            tokio::task::spawn_blocking(move || fence_check.reject_before(alloc_run))
-                .await
-                .map_err(|error| Status::internal(format!("fence check task failed: {error}")))?;
-        if fenced_since.is_some_and(|cutoff| cutoff > 0) {
+        if admissions
+            .reject_before(alloc_run)
+            .is_some_and(|cutoff| cutoff > 0)
+        {
             warn!(
                 job_id = req.job_id,
                 run_attempt = req.run_attempt,
