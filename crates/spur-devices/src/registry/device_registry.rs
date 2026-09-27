@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn cdi_sort_key_orders_partitions_of_one_bdf() {
-        let mut entries = vec![
+        let mut entries = [
             partition_entry(0x110002, "/dev/dri/renderD130"),
             partition_entry(0, "/dev/dri/renderD129"),
             partition_entry(0x110001, "/dev/dri/renderD131"),
