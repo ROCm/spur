@@ -7700,6 +7700,27 @@ impl SlurmAgent for AgentService {
         let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
             Status::invalid_argument("run attempt 0 names no run to hold an allocation")
         })?;
+        // A late registration racing a partial-dispatch cancel: `cancel_job_on_nodes`
+        // writes this cutoff to every dispatch target before it cancels them, so
+        // seeing one here means the concurrent cancel could no longer reach this
+        // node through the launch it was trying to stop.
+        let admissions = self.admissions();
+        let fence_check = admissions.clone();
+        let fenced_since =
+            tokio::task::spawn_blocking(move || fence_check.reject_before(alloc_run))
+                .await
+                .map_err(|error| Status::internal(format!("fence check task failed: {error}")))?;
+        if fenced_since.is_some_and(|cutoff| cutoff > 0) {
+            warn!(
+                job_id = req.job_id,
+                run_attempt = req.run_attempt,
+                "refusing a registration fenced against this run"
+            );
+            return Err(Status::failed_precondition(format!(
+                "job {} run {} was fenced against a late registration",
+                req.job_id, req.run_attempt
+            )));
+        }
         if self.running.lock().await.contains_key(&req.job_id) {
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
@@ -7745,7 +7766,6 @@ impl SlurmAgent for AgentService {
         };
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
-        let admissions = self.admissions();
         // Shared with the admission record below, so the Drop-deferred cleanup
         // can be checked against exactly the record this call admitted.
         let created_at = crate::admission::now_unix_ms();
@@ -17514,6 +17534,73 @@ mod tests {
         assert!(
             svc.running.lock().await.is_empty(),
             "a refused dispatch must not leave a tracked job"
+        );
+    }
+
+    /// `cancel_job_on_nodes` writes a fence (via the `FenceRun` RPC) to every
+    /// dispatch target before it cancels a partial multi-node launch, so a
+    /// registration for that exact run arriving after the fence is a stray
+    /// straggler racing the cancel, not a legitimate late join — admitting it
+    /// would spawn a live process the concurrent cancel can no longer reach.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_a_fenced_run() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let fenced_run = RunKey::new(51, 1).unwrap();
+        svc.admissions()
+            .fence_run(fenced_run, crate::admission::now_unix_ms())
+            .expect("fence a run ahead of the registration racing it");
+
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 51,
+            run_attempt: 1,
+            cpus: 1,
+            ..Default::default()
+        });
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a registration for a fenced run must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused registration must not leave a tracked job"
+        );
+        assert!(
+            svc.stepds.lock().await.is_empty(),
+            "a refused registration must not leave a tracked stepd session"
+        );
+    }
+
+    /// Companion to the fenced-run rejection above: a run with no fence on
+    /// record must register exactly as it did before that check existed.
+    #[tokio::test]
+    async fn register_job_allocation_admits_an_unfenced_run() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 52,
+            run_attempt: 1,
+            cpus: 1,
+            ..Default::default()
+        });
+
+        svc.register_job_allocation(req)
+            .await
+            .expect("an unfenced run must register normally");
+        assert!(
+            svc.running.lock().await.contains_key(&52),
+            "a successful registration must track the job"
         );
     }
 
