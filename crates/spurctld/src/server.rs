@@ -487,9 +487,9 @@ async fn answer_unrecorded_claims(
     cluster: &Arc<ClusterManager>,
     node: &str,
     license: &ReconcileLicense<'_>,
+    recorded: &std::collections::HashSet<spur_core::job::RunKey>,
     outcome: &mut ReconcileOutcome,
 ) -> bool {
-    let recorded = cluster.jobs_allocated_on_node(node);
     let mut answered_every_claim = true;
     let mut link: crate::scheduler_loop::AgentLink = None;
     for (run, entry) in license
@@ -576,17 +576,16 @@ async fn answer_unrecorded_claims(
     answered_every_claim
 }
 
-/// Direction A, continued: a claim Raft also holds. Only a disposition saying
-/// teardown is done is new information here; everything else is Raft's
-/// already, so this never marks `outcome.unresolved` -- that would drain a
-/// node over a finished job it just hasn't been told to release.
+/// Direction A, continued: a claim Raft also holds. Only a finished teardown
+/// is new information here, so this never marks `outcome.unresolved` -- that
+/// would drain a node over a job it just hasn't been told to release.
 async fn settle_recorded_claims_marked_done(
     cluster: &Arc<ClusterManager>,
     node: &str,
     license: &ReconcileLicense<'_>,
+    recorded: &std::collections::HashSet<spur_core::job::RunKey>,
     outcome: &mut ReconcileOutcome,
 ) {
-    let recorded = cluster.jobs_allocated_on_node(node);
     let mut link: crate::scheduler_loop::AgentLink = None;
     for (run, entry) in license
         .held
@@ -594,6 +593,8 @@ async fn settle_recorded_claims_marked_done(
         .filter(|(run, _)| recorded.contains(run))
     {
         let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
+        // Assumes a claim never straddles Raft still Running with the agent
+        // already fully cleaned and no Raft-side completion in flight.
         if !disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
             continue;
         }
@@ -647,9 +648,10 @@ async fn reconcile_node_ledger_after(
         return ReconcileOutcome::default();
     };
     let mut outcome = ReconcileOutcome::default();
+    let recorded = cluster.jobs_allocated_on_node(node);
     let answered_every_claim =
-        answer_unrecorded_claims(cluster, node, &license, &mut outcome).await;
-    settle_recorded_claims_marked_done(cluster, node, &license, &mut outcome).await;
+        answer_unrecorded_claims(cluster, node, &license, &recorded, &mut outcome).await;
+    settle_recorded_claims_marked_done(cluster, node, &license, &recorded, &mut outcome).await;
 
     // Direction B: Raft records a run the agent did not report. Reasons from an
     // absence, so it needs a complete cut and a run no launch of ours raced.
