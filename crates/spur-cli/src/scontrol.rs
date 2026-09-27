@@ -31,7 +31,8 @@ pub struct ScontrolArgs {
 pub enum ScontrolCommand {
     /// Show detailed information
     Show {
-        /// Entity type: job, node, partition, reservation, assoc_mgr, federation, config
+        /// Entity type: job, node, partition, reservation, assoc_mgr, federation,
+        /// config, hostnames, hostlist, hostlistsorted
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -320,6 +321,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     match args.command {
         ScontrolCommand::Show { entity, name } => {
+            let env = job_nodelist_env(|v| std::env::var(v).ok());
+            if let Some(out) = show_hostlist(&entity, name.as_deref(), env.as_deref()) {
+                print!("{}", out?);
+                return Ok(());
+            }
             show(&args.controller, &entity, name.as_deref()).await
         }
         ScontrolCommand::Ping => ping(&args.controller).await,
@@ -564,6 +570,71 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
         "ClusterName={}\nSlurmctldAddr={}\nVersion={}\n",
         ping.cluster_name, controller, ping.version
     )
+}
+
+/// The job's nodelist from the environment, preferring `SLURM_JOB_NODELIST`
+/// and falling back to `SPUR_JOB_NODELIST` (both set by `spurd`). A set-but-empty
+/// variable is treated as absent, so an empty `SLURM_JOB_NODELIST` still falls
+/// back to `SPUR_JOB_NODELIST` rather than masking it. `lookup` is injected so
+/// the precedence is testable without touching the process environment.
+fn job_nodelist_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["SLURM_JOB_NODELIST", "SPUR_JOB_NODELIST"]
+        .into_iter()
+        .filter_map(lookup)
+        .find(|v| !v.trim().is_empty())
+}
+
+/// `scontrol show hostnames|hostlist|hostlistsorted`: pure hostlist transforms
+/// that never contact the controller, so they work on a compute node with no
+/// controller reachable. `None` means `entity` is not one of these, so the
+/// caller should fall through to the controller-backed `show`.
+///
+/// Only `hostnames` falls back to the job's nodelist environment, matching
+/// Slurm. `hostlist`/`hostlistsorted` require an explicit argument. Both compress
+/// via [`spur_core::hostlist::compress`], which always dedups and natural-sorts,
+/// so they produce identical output here.
+fn show_hostlist(
+    entity: &str,
+    arg: Option<&str>,
+    env_nodelist: Option<&str>,
+) -> Option<Result<String>> {
+    let entity = entity.to_lowercase();
+    let arg = normalize_show_name(arg);
+    match entity.as_str() {
+        "hostnames" => {
+            let Some(list) = arg.or(normalize_show_name(env_nodelist)) else {
+                return Some(Err(anyhow::anyhow!(
+                    "scontrol show hostnames: no hostlist given and neither \
+                     SLURM_JOB_NODELIST nor SPUR_JOB_NODELIST is set"
+                )));
+            };
+            Some(
+                spur_core::hostlist::expand(list)
+                    .context("invalid hostlist")
+                    .map(|hosts| hosts.iter().map(|h| format!("{h}\n")).collect()),
+            )
+        }
+        "hostlist" | "hostlistsorted" => {
+            let Some(list) = arg else {
+                return Some(Err(anyhow::anyhow!(
+                    "scontrol show {entity}: a hostlist argument is required"
+                )));
+            };
+            Some(
+                spur_core::hostlist::expand(list)
+                    .context("invalid hostlist")
+                    .map(|hosts| {
+                        let compressed = spur_core::hostlist::compress(&hosts);
+                        if compressed.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{compressed}\n")
+                        }
+                    }),
+            )
+        }
+        _ => None,
+    }
 }
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
@@ -843,7 +914,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist, hostlistsorted",
                 other
             );
         }
@@ -2688,5 +2759,125 @@ mod tests {
         let parsed = parse_reservation_create_params(&params).unwrap();
         assert_eq!(parsed.name, "r1");
         assert_eq!(parsed.duration_minutes, 30 * 24 * 60);
+    }
+
+    #[test]
+    fn show_hostnames_expands_in_order_one_per_line() {
+        let out = show_hostlist("hostnames", Some("n[1-3],gpu01"), None)
+            .expect("hostnames is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "n1\nn2\nn3\ngpu01\n");
+    }
+
+    #[test]
+    fn show_hostnames_is_case_insensitive() {
+        let out = show_hostlist("HostNames", Some("n[1-2]"), None)
+            .expect("entity match ignores case")
+            .expect("valid pattern");
+        assert_eq!(out, "n1\nn2\n");
+    }
+
+    #[test]
+    fn show_hostnames_falls_back_to_env_nodelist() {
+        let out = show_hostlist("hostnames", None, Some("a[1-2]"))
+            .expect("hostnames is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "a1\na2\n");
+    }
+
+    #[test]
+    fn show_hostnames_argument_overrides_env() {
+        let out = show_hostlist("hostnames", Some("b1"), Some("a[1-2]"))
+            .expect("hostnames is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "b1\n");
+    }
+
+    #[test]
+    fn show_hostnames_errors_when_no_arg_and_no_env() {
+        let err = show_hostlist("hostnames", None, None)
+            .expect("hostnames is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("SLURM_JOB_NODELIST"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostnames_blank_arg_counts_as_missing() {
+        let err = show_hostlist("hostnames", Some("   "), None)
+            .expect("hostnames is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("SLURM_JOB_NODELIST"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostlist_compresses_and_sorts() {
+        let out = show_hostlist("hostlist", Some("n3,n1,n2,n2"), None)
+            .expect("hostlist is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "n[1-3]\n");
+    }
+
+    #[test]
+    fn show_hostlistsorted_matches_hostlist() {
+        let out = show_hostlist("hostlistsorted", Some("n3,n1,n2"), None)
+            .expect("hostlistsorted is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "n[1-3]\n");
+    }
+
+    #[test]
+    fn show_hostlist_requires_arg_even_with_env() {
+        let err = show_hostlist("hostlist", None, Some("a[1-2]"))
+            .expect("hostlist is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("required"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostlist_rejects_invalid_pattern() {
+        let err = show_hostlist("hostnames", Some("n[3-1"), None)
+            .expect("hostnames is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid hostlist"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostlist_passes_through_other_entities() {
+        assert!(show_hostlist("job", Some("1024"), None).is_none());
+        assert!(show_hostlist("node", Some("n1"), None).is_none());
+    }
+
+    #[test]
+    fn show_hostlist_empty_expansion_prints_nothing() {
+        let out = show_hostlist("hostlist", Some(","), None)
+            .expect("hostlist is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn job_nodelist_env_prefers_slurm() {
+        let env = |v: &str| match v {
+            "SLURM_JOB_NODELIST" => Some("s[1-2]".to_string()),
+            "SPUR_JOB_NODELIST" => Some("p1".to_string()),
+            _ => None,
+        };
+        assert_eq!(job_nodelist_env(env).as_deref(), Some("s[1-2]"));
+    }
+
+    #[test]
+    fn job_nodelist_env_empty_slurm_falls_back_to_spur() {
+        let env = |v: &str| match v {
+            "SLURM_JOB_NODELIST" => Some("   ".to_string()),
+            "SPUR_JOB_NODELIST" => Some("p1".to_string()),
+            _ => None,
+        };
+        assert_eq!(job_nodelist_env(env).as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn job_nodelist_env_none_when_all_unset_or_blank() {
+        assert_eq!(job_nodelist_env(|_| None), None);
+        assert_eq!(job_nodelist_env(|_| Some(String::new())), None);
     }
 }
