@@ -343,8 +343,9 @@ pub(crate) struct ReconcileOutcome {
     pub cancelled: Vec<u32>,
     /// Direction B: records the node stopped holding, that the apply accepted.
     pub settled: Vec<u32>,
-    /// Direction A: finished runs Raft did not record, answered by releasing the
-    /// slice the agent was holding out for an acknowledgement to free.
+    /// A finished run answered by releasing the slice the agent was holding
+    /// for an acknowledgement to free -- whether or not Raft still records
+    /// the claim.
     pub released: Vec<u32>,
     /// Direction A: claims neither side can account for. Nothing may end them and
     /// nothing proves them over, so they are surfaced rather than acted on.

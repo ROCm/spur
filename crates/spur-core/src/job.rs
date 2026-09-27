@@ -128,7 +128,7 @@ impl LedgerDisposition {
         matches!(self, Self::OverButCharged | Self::Unresolved)
     }
 
-    /// Whether a claim the controller has no record of may be answered by
+    /// Whether a claim -- recorded by Raft or not -- may be answered by
     /// settling it. Only a finished teardown proves there is nothing to end first.
     pub fn may_be_settled(self) -> bool {
         matches!(self, Self::OverButCharged)
