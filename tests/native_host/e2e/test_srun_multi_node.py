@@ -117,3 +117,54 @@ class TestSrunInBatch:
             f"expected 2 step task lines in batch output:\n{content}\n"
             f"{cluster.debug_job(job_id)}"
         )
+
+    def test_companion_node_admission_spool_clears_quickly_after_completion(
+        self, multi_node_cluster
+    ):
+        """Regression guard for the fence-on-completion teardown path.
+
+        Once the batch owner's script finishes, spurctld cancels the
+        companion node(s) with `fence=False` (see the `Completing` handling
+        in spurctld/src/server.rs) specifically so their admission record
+        isn't held for the full 120s `LAUNCH_LIFETIME_MS` fence window a
+        `fence=True` cancel would leave behind. That only has an observable
+        effect once the agent's `FenceRun` RPC is a real implementation
+        rather than a stub, so this asserts every node's admission spool for
+        the job actually clears within a bound well short of that window.
+        """
+        cluster = multi_node_cluster
+        out_path = f"{cluster.remote_dir}/srun-step-spool.out"
+        script = cluster.write_file(
+            "srun-in-batch-spool.sh",
+            "#!/bin/bash\n"
+            "srun -n 2 bash -c 'echo host=$(hostname)'\n",
+        )
+        sb = cluster.sbatch(
+            ["-J", "srun-step-spool", "-N", "2", "-n", "2", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        wait_job(cluster, job_id, timeout=90)
+
+        bound = 20
+        deadline = time.time() + bound
+        lingering: dict[str, list[str]] = {}
+        while time.time() < deadline:
+            lingering = {
+                node.host: dirs
+                for node in cluster.nodes
+                if (dirs := self._admission_dirs(node, cluster.state_dir, job_id))
+            }
+            if not lingering:
+                return
+            time.sleep(1)
+        raise AssertionError(
+            f"admission spool for job {job_id} still present after {bound}s: "
+            f"{lingering}\n{cluster.debug_job(job_id)}"
+        )
+
+    @staticmethod
+    def _admission_dirs(node, state_dir: str, job_id: int) -> list[str]:
+        out = node.exec_allow_fail(f"ls -d {state_dir}/admission/{job_id}.* 2>/dev/null")
+        return [ln for ln in out.splitlines() if ln.strip()]
