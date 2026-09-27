@@ -12847,12 +12847,9 @@ mod tests {
         (job_id, run_attempt)
     }
 
-    /// The gap this closes: `answer_unrecorded_claims` only ever looked at
-    /// claims Raft did *not* record, and Direction B only at runs the agent no
-    /// longer reported. A claim both sides agree is allocated fell through
-    /// both -- even though the agent's own disposition already said its
-    /// teardown was done. Before the fix this never gets examined at all, so
-    /// nothing here would fire; the assertions below fail against unfixed code.
+    /// The gap this closes: a claim both sides agree is allocated fell through
+    /// both `answer_unrecorded_claims` and Direction B, even though its own
+    /// disposition already said teardown was done.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_recorded_claim_whose_teardown_is_done_is_settled_via_reconcile() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -12905,11 +12902,63 @@ mod tests {
         );
     }
 
+    /// The same mutually-recorded, teardown-done claim, but the agent refuses
+    /// to release it (a hook still on the cores): the claim stays standing
+    /// rather than being reported as either settled or a fault.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_claim_whose_teardown_is_done_stays_when_the_agent_refuses_to_release() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let agent_addr = spawn_settling_probe_agent(false).await;
+        register_plain_node(&svc, "settle-refuse-node", agent_addr.port()).await;
+        svc.cluster
+            .agent_sessions()
+            .observe_registration("settle-refuse-node", "session-a");
+
+        let (job_id, run_attempt) = recorded_job_on_node(&svc, "settle-refuse-node").await;
+        assert!(
+            svc.cluster
+                .jobs_allocated_on_node("settle-refuse-node")
+                .contains(&spur_core::job::RunKey::new(job_id, run_attempt).unwrap()),
+            "the setup must place a claim Raft genuinely records, or this test proves nothing"
+        );
+
+        let ledger = spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![spur_proto::proto::LedgerEntry {
+                job_id,
+                run_attempt,
+                disposition: "over_but_charged".into(),
+                ..Default::default()
+            }],
+        };
+        let dispatched = svc.cluster.dispatch_tracker().watch("settle-refuse-node");
+
+        let outcome = reconcile_node_ledger_after(
+            &svc.cluster,
+            "settle-refuse-node",
+            ledger,
+            &dispatched,
+            CutProvenance::Pulled,
+            std::future::ready(true),
+        )
+        .await;
+
+        assert!(
+            outcome.released.is_empty(),
+            "an agent that refuses to release a recorded claim must not be reported as settled"
+        );
+        assert!(
+            outcome.cancelled.is_empty() && outcome.unresolved.is_empty(),
+            "a recorded claim is never cancelled, and a refusal to settle it is not a fault \
+             to report"
+        );
+    }
+
     /// The same mutually-recorded, teardown-done claim, but from an
-    /// unattested `Registered` cut under the default `Open` admission mode.
-    /// Settling is gated the same way an unrecorded claim's cancel is -- and,
-    /// unlike the unrecorded case, leaving it unsettled is not itself a fault
-    /// to surface, since Raft already accounts for the claim on its own.
+    /// unattested `Registered` cut under the default `Open` admission mode:
+    /// settling is gated the same way an unrecorded claim's cancel is.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_recorded_claim_whose_teardown_is_done_is_left_alone_when_unlicensed() {
         let dir = tempfile::TempDir::new().unwrap();
