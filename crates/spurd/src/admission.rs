@@ -241,6 +241,18 @@ impl RunAdmission {
                     .reject_before_unix_ms
                     .saturating_add(LAUNCH_LIFETIME_MS)
     }
+
+    /// Whether `self`, loaded from disk, could still be an earlier admission
+    /// of the very same launch a fresh call stamped `readmitted_at_unix_ms`
+    /// is naming, rather than a dead job's leftover left wearing a recycled
+    /// numeric key. Cleanup only ever starts after a run ends, and a retry of
+    /// a still-live job bumps its attempt to a new key, so nothing legitimate
+    /// ever re-admits one run's key once its own launch window has passed;
+    /// anything older than that is another job's record, not this one's history.
+    fn could_be_the_same_launch(&self, readmitted_at_unix_ms: u64) -> bool {
+        self.created_at_unix_ms > 0
+            && readmitted_at_unix_ms.saturating_sub(self.created_at_unix_ms) < LAUNCH_LIFETIME_MS
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,32 +791,42 @@ impl AdmissionStore {
         // read failure would silently reset the cutoffs a launch is fenced by.
         match self.load_run(key) {
             Ok(existing) => {
-                run.reject_before_unix_ms = run
-                    .reject_before_unix_ms
-                    .max(existing.reject_before_unix_ms);
-                run.max_launch_expiry_unix_ms = run
-                    .max_launch_expiry_unix_ms
-                    .max(existing.max_launch_expiry_unix_ms);
-                // Cleared only by a write that itself carries a fresh ack.
-                if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
-                    run.conflict_hold = existing.conflict_hold;
-                }
-                // A relaunch is always built fresh; without this, one arriving
-                // after the controller ends this run would un-decide it here.
-                if existing.state == RunState::Cleaned {
-                    run.state = RunState::Cleaned;
-                }
-                // Same reasoning for the epilog debt: only a relaunch's fresh default
-                // is refused, never a caller's own forward move (e.g. record_epilog).
-                if run.cleanup.epilog == HookState::NotStarted
-                    && existing.cleanup.epilog != HookState::NotStarted
-                {
-                    run.cleanup = existing.cleanup;
-                }
-                run.cancelled_by_controller |= existing.cancelled_by_controller;
-                run.slice_released |= existing.slice_released;
-                if run.controller_ack.release_raft_index.is_none() {
-                    run.controller_ack = existing.controller_ack;
+                // A numeric job id is eventually recycled, so a record found
+                // under this exact key can be a dead job's leftover rather
+                // than this run's own history. Every carry-forward below
+                // must stay gated on `existing` still being reachable by a
+                // genuine retry of this same launch -- never trusted just
+                // because it happens to share this key.
+                if existing.could_be_the_same_launch(run.created_at_unix_ms) {
+                    run.reject_before_unix_ms = run
+                        .reject_before_unix_ms
+                        .max(existing.reject_before_unix_ms);
+                    run.max_launch_expiry_unix_ms = run
+                        .max_launch_expiry_unix_ms
+                        .max(existing.max_launch_expiry_unix_ms);
+                    // Cleared only by a write that itself carries a fresh ack.
+                    if run.conflict_hold.is_none()
+                        && run.controller_ack.release_raft_index.is_none()
+                    {
+                        run.conflict_hold = existing.conflict_hold;
+                    }
+                    // A relaunch is always built fresh; without this, one arriving
+                    // after the controller ends this run would un-decide it here.
+                    if existing.state == RunState::Cleaned {
+                        run.state = RunState::Cleaned;
+                    }
+                    // Same reasoning for the epilog debt: only a relaunch's fresh default
+                    // is refused, never a caller's own forward move (e.g. record_epilog).
+                    if run.cleanup.epilog == HookState::NotStarted
+                        && existing.cleanup.epilog != HookState::NotStarted
+                    {
+                        run.cleanup = existing.cleanup;
+                    }
+                    run.cancelled_by_controller |= existing.cancelled_by_controller;
+                    run.slice_released |= existing.slice_released;
+                    if run.controller_ack.release_raft_index.is_none() {
+                        run.controller_ack = existing.controller_ack;
+                    }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -3636,6 +3658,33 @@ mod tests {
             store.load_run(key(7, 1)).unwrap().cleanup.epilog,
             HookState::Pending,
             "must not erase a real in-flight epilog debt"
+        );
+    }
+
+    // A job id is only ever recycled long after the job that had it last is
+    // gone -- far past the window in which a real retry of its own launch
+    // could still land. Unlike the relaunch tests above (a retry arriving
+    // seconds later, correctly still trusted), this is a brand-new job that
+    // happens to draw the same numeric id a dead job's leftover record is
+    // still wearing.
+    #[test]
+    fn a_new_job_reusing_a_recycled_id_is_not_born_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        assert_eq!(store.load_run(key(7, 1)).unwrap().state, RunState::Cleaned);
+
+        let recycled_created_at = 1 + LAUNCH_LIFETIME_MS + 1;
+        store
+            .admit_run(&run_with(7, 1, recycled_created_at))
+            .unwrap();
+
+        assert_ne!(
+            store.load_run(key(7, 1)).unwrap().state,
+            RunState::Cleaned,
+            "a brand-new admission must not be born dead because a dead \
+             job's leftover record still wears its recycled numeric key"
         );
     }
 
