@@ -2108,6 +2108,12 @@ pub(crate) fn monitor_recovered_stepds(
             .map(|descriptor| (stepd_key(&descriptor), descriptor))
             .collect();
         let mut completed = HashMap::new();
+        // Each run's `created_at_unix_ms` as observed the moment its completion
+        // was first discovered, not re-read on every retry tick -- record_epilog's
+        // TOCTOU guard is only meaningful against the run this agent actually
+        // watched end, not whatever run holds the key by the time a stuck
+        // delivery finally reports.
+        let mut completed_created_at: HashMap<StepdKey, u64> = HashMap::new();
         // Attempt count and first-failure instant per outstanding report. The
         // durable driver is the record; this only paces and surfaces the retry.
         let mut attempts: HashMap<(u32, spur_core::step::StepId), (u32, std::time::Instant)> =
@@ -2183,7 +2189,12 @@ pub(crate) fn monitor_recovered_stepds(
                         )
                         .await
                         {
-                            Some(completion) => newly_completed.push((*key, completion)),
+                            Some(completion) => {
+                                let created_at =
+                                    named_run(completion.job_id, completion.run_attempt)
+                                        .and_then(|run| observed_run_created_at(&admissions, run));
+                                newly_completed.push((*key, completion, created_at));
+                            }
                             None => released.push(*key),
                         }
                     }
@@ -2207,8 +2218,11 @@ pub(crate) fn monitor_recovered_stepds(
                 pending.remove(&key);
                 hooking_since.remove(&key);
             }
-            for (key, completion) in newly_completed {
+            for (key, completion, created_at) in newly_completed {
                 completed.insert(key, completion);
+                if let Some(created_at) = created_at {
+                    completed_created_at.insert(key, created_at);
+                }
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
@@ -2240,10 +2254,14 @@ pub(crate) fn monitor_recovered_stepds(
                         );
                     } else {
                         // Only now may the slice go: the controller has it.
-                        if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+                        if let (Some(run), Some(&created_at)) = (
+                            named_run(completion.job_id, completion.run_attempt),
+                            completed_created_at.get(&key),
+                        ) {
                             record_run_epilog(
                                 &admissions,
                                 run,
+                                created_at,
                                 completion.step_id,
                                 epilog_outcome(completion.epilog_failed),
                             );
@@ -2281,6 +2299,7 @@ pub(crate) fn monitor_recovered_stepds(
             }
             for key in acknowledged {
                 completed.remove(&key);
+                completed_created_at.remove(&key);
                 pending.remove(&key);
                 hooking_since.remove(&key);
             }
@@ -2359,6 +2378,11 @@ async fn fence_dead_stepd(
     if !claim_stepd(stepds, &descriptor).await {
         return;
     }
+    // Read before the completion report's round trip below, so a slow or
+    // retried delivery still refuses a recycled key rather than checking
+    // against whatever run happens to hold this key by the time it lands.
+    let run = named_run(descriptor.job_id, descriptor.run_attempt);
+    let run_created_at = run.and_then(|run| observed_run_created_at(admissions, run));
     warn!(
         job_id = descriptor.job_id,
         run_attempt = descriptor.run_attempt,
@@ -2464,8 +2488,14 @@ async fn fence_dead_stepd(
     )
     .await;
     if reported {
-        if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
-            record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
+        if let (Some(run), Some(created_at)) = (run, run_created_at) {
+            record_run_epilog(
+                admissions,
+                run,
+                created_at,
+                descriptor.step_id,
+                recorded_epilog,
+            );
             settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id).await;
         }
     }
@@ -2591,6 +2621,13 @@ async fn handle_completion_notification(
             crate::stepd::AgentNotificationResponse::Acknowledged
         }
         Some(descriptor) => {
+            // Read before the completion report's round trip below, so a slow
+            // or retried delivery still refuses a recycled key rather than
+            // checking against whatever run happens to hold this key by the
+            // time it lands.
+            let run = named_run(job_id, run_attempt);
+            let run_created_at =
+                run.and_then(|run| observed_run_created_at(&context.admissions, run));
             let reported = report_completion(
                 &context.controller_addr,
                 CompletionReport {
@@ -2629,10 +2666,11 @@ async fn handle_completion_notification(
                 )
                 .await;
             if reported {
-                if let Some(run) = named_run(job_id, run_attempt) {
+                if let (Some(run), Some(created_at)) = (run, run_created_at) {
                     record_run_epilog(
                         &context.admissions,
                         run,
+                        created_at,
                         step_id,
                         epilog_outcome(epilog_failed),
                     );
@@ -2718,6 +2756,11 @@ pub async fn replay_unacknowledged_stepd_completions(
 ) -> anyhow::Result<Vec<SessionIdentity>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
+        // Read before the completion report's round trip below, so a slow or
+        // retried delivery still refuses a recycled key rather than checking
+        // against whatever run happens to hold this key by the time it lands.
+        let run = named_run(completion.job_id, completion.run_attempt);
+        let run_created_at = run.and_then(|run| observed_run_created_at(admissions, run));
         if report_completion(
             controller_addr,
             CompletionReport {
@@ -2737,10 +2780,11 @@ pub async fn replay_unacknowledged_stepd_completions(
         .settled()
         {
             store.acknowledge_completion(&completion)?;
-            if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
+            if let (Some(run), Some(created_at)) = (run, run_created_at) {
                 record_run_epilog(
                     admissions,
                     run,
+                    created_at,
                     completion.step_id,
                     epilog_outcome(completion.epilog_failed),
                 );
@@ -5345,16 +5389,41 @@ impl Drop for LaunchReservationGuard {
 
 /// Record how a run's epilog ended, from the step that owns the hook. A numbered
 /// step reports `epilog_failed: false` for a hook it never ran.
+///
+/// `caller_created_at_unix_ms` must be this run's `created_at_unix_ms` as the
+/// caller itself observed it -- see `observed_run_created_at` for how callers
+/// that never admitted this run capture that observation.
 fn record_run_epilog(
     admissions: &crate::admission::AdmissionStore,
     run: RunKey,
+    caller_created_at_unix_ms: u64,
     step_id: spur_core::step::StepId,
     state: crate::admission::HookState,
 ) {
     if spur_core::step::is_user_step(step_id) {
         return;
     }
-    let _ = admissions.record_epilog(run, state);
+    let _ = admissions.record_epilog(run, caller_created_at_unix_ms, state);
+}
+
+/// The run's own `created_at_unix_ms`, read fresh from its admission record.
+///
+/// Completion-reporting paths (unlike a launch, which mints and holds this
+/// value from the moment it admits the run) only learn a run's identity from
+/// its `RunKey`, with no continuity across an agent restart to carry the
+/// original observation forward. Reading it here is still real protection for
+/// `record_epilog`'s TOCTOU guard over the retry window that follows -- e.g. a
+/// delivery stuck retrying against an unreachable controller -- though it
+/// cannot catch a recycle landing in the instant between this read and the
+/// eventual write.
+fn observed_run_created_at(
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+) -> Option<u64> {
+    admissions
+        .load_run(run)
+        .ok()
+        .map(|run| run.created_at_unix_ms)
 }
 
 /// How long a hook may hold a slice before it is called out by name. An epilog
@@ -6887,7 +6956,7 @@ impl SlurmAgent for AgentService {
             }
 
             if let Err(error) =
-                admissions.record_prolog(run_key, crate::admission::HookState::Running)
+                admissions.record_prolog(run_key, created_at, crate::admission::HookState::Running)
             {
                 warn!(job_id, run_attempt, %error, "failed to record the prolog as running before invoking it");
             }
@@ -6904,9 +6973,11 @@ impl SlurmAgent for AgentService {
                 memory_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
-                if let Err(error) =
-                    admissions.record_prolog(run_key, crate::admission::HookState::Failed)
-                {
+                if let Err(error) = admissions.record_prolog(
+                    run_key,
+                    created_at,
+                    crate::admission::HookState::Failed,
+                ) {
                     warn!(job_id, run_attempt, %error, "failed to record the prolog's failure");
                 }
                 // No completion report and no self-drain: the controller owns
@@ -6924,9 +6995,11 @@ impl SlurmAgent for AgentService {
                     conflict: None,
                 }));
             }
-            if let Err(error) =
-                admissions.record_prolog(run_key, crate::admission::HookState::Succeeded)
-            {
+            if let Err(error) = admissions.record_prolog(
+                run_key,
+                created_at,
+                crate::admission::HookState::Succeeded,
+            ) {
                 warn!(job_id, run_attempt, %error, "failed to record the prolog's success");
             }
         }
@@ -13634,17 +13707,18 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("state dir");
         let admissions = crate::admission::AdmissionStore::new(state_dir.path(), "test-node");
         let run = RunKey::new(JOB, ATTEMPT).expect("attempt 1 names a run");
+        let created_at = crate::admission::now_unix_ms();
         admissions
             .admit_run(&crate::admission::RunAdmission::new(
                 JOB,
                 ATTEMPT,
                 "test-node",
                 crate::admission::AdmittedResources::default(),
-                crate::admission::now_unix_ms(),
+                created_at,
             ))
             .expect("admit a run");
         admissions
-            .record_epilog(run, crate::admission::HookState::Pending)
+            .record_epilog(run, created_at, crate::admission::HookState::Pending)
             .expect("seed an in-flight epilog");
 
         let context = CompletionListenerContext {
@@ -13704,7 +13778,7 @@ mod tests {
         // The epilog resolves; only now may the ledger's own gate let the
         // slice go, proving (b): once due, the release actually happens.
         admissions
-            .record_epilog(run, crate::admission::HookState::Succeeded)
+            .record_epilog(run, created_at, crate::admission::HookState::Succeeded)
             .expect("resolve the epilog");
         assert!(
             settle_acknowledged_completion(&allocation, &admissions, run, STEP).await,
@@ -14997,17 +15071,18 @@ mod tests {
         // Simulates a crash mid-Prolog: an admitted run whose Prolog never
         // resolved, and (since Prolog runs before any supervisor is spawned)
         // no supervisor recorded to say otherwise.
+        let created_at = crate::admission::now_unix_ms();
         svc.admissions()
             .admit_run(&crate::admission::RunAdmission::new(
                 10,
                 1,
                 "test-node",
                 crate::admission::AdmittedResources::default(),
-                crate::admission::now_unix_ms(),
+                created_at,
             ))
             .expect("admit a run");
         svc.admissions()
-            .record_prolog(key(10, 1), crate::admission::HookState::Running)
+            .record_prolog(key(10, 1), created_at, crate::admission::HookState::Running)
             .expect("record the prolog as running");
 
         let resp = svc
@@ -15066,17 +15141,18 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
+        let created_at = crate::admission::now_unix_ms();
         svc.admissions()
             .admit_run(&crate::admission::RunAdmission::new(
                 11,
                 1,
                 "test-node",
                 crate::admission::AdmittedResources::default(),
-                crate::admission::now_unix_ms(),
+                created_at,
             ))
             .expect("admit a run");
         svc.admissions()
-            .record_prolog(key(11, 1), crate::admission::HookState::Unknown)
+            .record_prolog(key(11, 1), created_at, crate::admission::HookState::Unknown)
             .expect("record the prolog as unknown");
 
         let resp = svc
@@ -22372,7 +22448,11 @@ mod tests {
         // supervisor ever recorded for it, since Prolog runs before any
         // supervisor is spawned.
         svc.admissions()
-            .record_prolog(key(10, 1), crate::admission::HookState::Running)
+            .record_prolog(
+                key(10, 1),
+                run.created_at_unix_ms,
+                crate::admission::HookState::Running,
+            )
             .expect("record the prolog as running");
 
         let outcomes = svc.replay_admitted_allocations(&[]).await;
