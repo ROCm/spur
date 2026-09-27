@@ -504,7 +504,9 @@ async fn answer_unrecorded_claims(
             break;
         }
         // Reported either way: an operator sees the drift even where the caller
-        // proved too little for the controller to act on it.
+        // proved too little for the controller to act on it. This is a licence
+        // to act, not to look -- every entry is still examined, so it does not
+        // leave the rest of this node's claims unknown the way `lapsed` does.
         if !license.teardown_is_licensed(cluster) {
             warn!(
                 node = %node,
@@ -512,7 +514,7 @@ async fn answer_unrecorded_claims(
                 run_attempt = entry.run_attempt,
                 "unattested registration cannot license answering a claim; leaving it alone"
             );
-            answered_every_claim = false;
+            outcome.unresolved.push(entry.job_id);
             continue;
         }
         let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
@@ -12656,6 +12658,68 @@ mod tests {
         assert!(
             !svc.cluster.get_node("gate-node").unwrap().reconcile_pending,
             "a registration that never took must not leave the node ungated forever"
+        );
+    }
+
+    /// Under the default `Open` admission mode, a fresh registration is not
+    /// licensed to cancel or settle a claim Raft has no record of -- but that
+    /// is a gate on *acting*, not on *seeing*. The claim must still surface as
+    /// unresolved so `Reconcile=yes`/diagnostics show it and the node is held
+    /// out of service until a `Pulled` sweep (heartbeat, leadership gain, the
+    /// hourly pass) is licensed to resolve it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrecorded_claim_at_open_mode_registration_stays_visible() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        assert_eq!(
+            svc.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open,
+            "this test exercises the default mode; a config change elsewhere would silently \
+             stop covering it"
+        );
+        register_plain_node(&svc, "unattested-node", 6826).await;
+        svc.cluster
+            .agent_sessions()
+            .observe_registration("unattested-node", "session-a");
+
+        let ledger = spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![spur_proto::proto::LedgerEntry {
+                job_id: 777,
+                run_attempt: 1,
+                disposition: "held".into(),
+                ..Default::default()
+            }],
+        };
+        let dispatched = svc.cluster.dispatch_tracker().watch("unattested-node");
+
+        let outcome = reconcile_node_ledger_after(
+            &svc.cluster,
+            "unattested-node",
+            ledger,
+            &dispatched,
+            CutProvenance::Registered,
+            std::future::ready(true),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.unresolved,
+            vec![777],
+            "an unattested registration must not silently drop a claim Raft has no record of"
+        );
+        assert!(
+            outcome.cancelled.is_empty() && outcome.settled.is_empty(),
+            "visibility must not smuggle in the license to act that Open mode withholds"
+        );
+
+        let node = svc.cluster.get_node("unattested-node").unwrap();
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("holding claims the controller has no record of: 777"),
+            "the node must be named and held, not just logged, so an operator can see it \
+             without waiting an hour for the next automatic sweep"
         );
     }
 
