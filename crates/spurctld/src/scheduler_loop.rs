@@ -3157,16 +3157,21 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
 /// cluster that is a thundering herd without some cap on the fan-out.
 const MAX_CONCURRENT_LEDGER_PULLS: usize = 16;
 
+/// Shared across every call: leadership gain and the routine sweep can fire
+/// back to back, and a semaphore built fresh per call would let each run its
+/// own 16-wide fan-out instead of sharing one cluster-wide cap.
+static LEDGER_PULL_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LEDGER_PULLS)));
+
 /// Pull every node's ledger. Used where the controller has reason to distrust
 /// its own view rather than any one node's: a leader took over, or the sweep.
 pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) {
     let nodes: Vec<String> = cluster.get_nodes().into_iter().map(|n| n.name).collect();
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LEDGER_PULLS));
     let mut set = tokio::task::JoinSet::new();
     for node in nodes {
         let cluster = cluster.clone();
         let reason = reason.to_string();
-        let permits = permits.clone();
+        let permits = LEDGER_PULL_PERMITS.clone();
         set.spawn(async move {
             let Ok(_permit) = permits.acquire_owned().await else {
                 return;
@@ -5086,11 +5091,9 @@ mod tests {
             );
         }
 
-        /// A leadership-gain or hourly-sweep pull touches every node at once;
-        /// without a bound the fan-out is only as wide as the cluster. Proves
-        /// the peak concurrency the mock agents observe never exceeds the cap,
-        /// while also confirming the cap is genuinely exercised (not just an
-        /// accidentally-serial run) by driving well past it.
+        /// Proves the peak concurrency the mock agents observe never exceeds
+        /// the cap, while driving well past it to confirm the cap was
+        /// genuinely exercised and not just an accidentally-serial run.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn pull_all_node_ledgers_bounds_concurrent_pulls() {
             let dir = TempDir::new().unwrap();
