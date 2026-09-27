@@ -4249,6 +4249,12 @@ pub struct AgentService {
     /// keep the legacy path. Production always supervises.
     #[cfg(test)]
     force_legacy_launch: bool,
+    /// Fires synchronously just before `register_job_allocation`'s locked
+    /// admit-or-refuse call, so a test can land a concurrent `fence_run`
+    /// exactly in the gap after its own unlocked pre-check -- a window real
+    /// thread scheduling cannot be made to hit on demand.
+    #[cfg(test)]
+    before_locked_admit_check: Option<Arc<dyn Fn() + Send + Sync>>,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
@@ -4384,6 +4390,8 @@ impl AgentService {
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             force_legacy_launch: true,
+            #[cfg(test)]
+            before_locked_admit_check: None,
             stepd_state_dir: std::env::var("SPUR_STEPD_STATE_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
@@ -4412,6 +4420,13 @@ impl AgentService {
     #[cfg(test)]
     fn with_supervised_launch(mut self) -> Self {
         self.force_legacy_launch = false;
+        self
+    }
+
+    /// See `before_locked_admit_check`.
+    #[cfg(test)]
+    fn with_before_locked_admit_check(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.before_locked_admit_check = Some(Arc::new(hook));
         self
     }
 
@@ -7915,6 +7930,10 @@ impl SlurmAgent for AgentService {
         );
         run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
         let allocation = run_record.allocation.clone();
+        #[cfg(test)]
+        if let Some(hook) = self.before_locked_admit_check.clone() {
+            hook();
+        }
         // The authoritative check: unlike the fast-path read above, this runs
         // under the same run lock `fence_run` writes under, so a fence landing
         // after that earlier read is still caught here, atomically with the
@@ -18060,6 +18079,58 @@ mod tests {
             .register_job_allocation(req)
             .await
             .expect_err("a registration for a fenced run must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused registration must not leave a tracked job"
+        );
+        assert!(
+            svc.stepds.lock().await.is_empty(),
+            "a refused registration must not leave a tracked stepd session"
+        );
+    }
+
+    /// The rejection above only ever exercises the early, unlocked
+    /// `reject_before` pre-check -- it fences before the RPC is even called.
+    /// This drives the RPC through the *locked* arm that pre-check cannot
+    /// reach on its own: the run is unfenced when the pre-check runs, and a
+    /// `fence_run` lands only after it, in the gap before
+    /// `admit_run_unless_fenced_async` takes the same lock. Real thread
+    /// scheduling cannot be aimed at that gap on demand, so
+    /// `before_locked_admit_check` places the fence there deterministically.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_a_fence_that_lands_after_its_own_pre_check() {
+        let run_key = RunKey::new(52, 1).unwrap();
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let admissions = svc.admissions();
+        let svc = svc.with_before_locked_admit_check(move || {
+            admissions
+                .fence_run(run_key, crate::admission::now_unix_ms())
+                .expect("fence the run in the gap the RPC's early pre-check cannot see");
+        });
+
+        assert_eq!(
+            svc.admissions().reject_before(run_key),
+            None,
+            "nothing has fenced this run when the RPC's own pre-check would run"
+        );
+
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 52,
+            run_attempt: 1,
+            cpus: 1,
+            ..Default::default()
+        });
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a fence landing after the early pre-check must still be caught");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(
             svc.running.lock().await.is_empty(),

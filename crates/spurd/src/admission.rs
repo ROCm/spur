@@ -2760,6 +2760,72 @@ mod tests {
         assert_eq!(store.load_run(key(7, 1)).unwrap().created_at_unix_ms, 1);
     }
 
+    // The test above proves nothing about the lock: it fences fully, then admits,
+    // fully sequentially, so it would pass even against an unlocked check-then-write.
+    // This instead puts `fence_run` and `admit_run_unless_fenced` on separate threads,
+    // released together by a barrier, contending the same run's lock for real -- and
+    // checks an invariant that holds regardless of which one the OS runs first.
+    #[test]
+    fn admit_run_unless_fenced_races_fence_run_under_real_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        // A marker no wall-clock `now_unix_ms()` will ever collide with, so the
+        // stored record's provenance can be told apart after the race.
+        const ADMIT_MARKER: u64 = 55;
+
+        for round in 0..300u32 {
+            let job_id = 10_000 + round;
+            let run_key = key(job_id, 1);
+            let cutoff = now_unix_ms();
+            let attempt = run_with(job_id, 1, ADMIT_MARKER);
+
+            let barrier = std::sync::Barrier::new(2);
+            let (fence_result, admit_result) = std::thread::scope(|scope| {
+                let fence = scope.spawn(|| {
+                    barrier.wait();
+                    store.fence_run(run_key, cutoff)
+                });
+                let admit = scope.spawn(|| {
+                    barrier.wait();
+                    store.admit_run_unless_fenced(&attempt)
+                });
+                (fence.join().unwrap(), admit.join().unwrap())
+            });
+            fence_result.expect("fence_run must not fail under contention");
+            let admit_outcome =
+                admit_result.expect("admit_run_unless_fenced must not fail under contention");
+
+            let after = store
+                .load_run(run_key)
+                .expect("one of the two racers must leave a record behind");
+
+            // Whichever op the run lock let through first, the record on disk
+            // must reflect exactly that one op having won -- never a torn mix
+            // of both (e.g. the fence's cutoff next to the admit's payload
+            // with `Fenced` still reported, or vice versa).
+            match admit_outcome {
+                AdmitOutcome::Admitted => assert_eq!(
+                    after.created_at_unix_ms, ADMIT_MARKER,
+                    "round {round}: reported Admitted, so the admit's own data must be on record"
+                ),
+                AdmitOutcome::Fenced(reported_cutoff) => {
+                    assert_ne!(
+                        after.created_at_unix_ms, ADMIT_MARKER,
+                        "round {round}: a refused admission must never persist the attempt it refused"
+                    );
+                    assert_eq!(
+                        after.reject_before_unix_ms, reported_cutoff,
+                        "round {round}: the cutoff reported back must match what is on disk"
+                    );
+                    assert_eq!(
+                        reported_cutoff, cutoff,
+                        "round {round}: the only fence in play is this round's own"
+                    );
+                }
+            }
+        }
+    }
+
     // Reading "no prior record" out of an IO error un-fences the run and writes
     // over the only evidence that it may still hold a claim.
     #[test]
