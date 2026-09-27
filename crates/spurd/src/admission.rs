@@ -820,9 +820,9 @@ impl AdmissionStore {
                 // A recycled numeric key can wear a dead job's leftover, so every
                 // carry-forward below stays gated on this being the same launch.
                 if existing.could_be_the_same_launch(run.created_at_unix_ms) {
-                    // The merge is deciding this IS that earlier launch, so its
-                    // original timestamp -- not this call's -- is the run's age.
-                    run.created_at_unix_ms = existing.created_at_unix_ms;
+                    // created_at stays this call's own stamp (not existing's):
+                    // a stale remove_run_if_created_at from an earlier attempt's
+                    // dropped guard must not match a retry's now-current record.
                     run.reject_before_unix_ms = run
                         .reject_before_unix_ms
                         .max(existing.reject_before_unix_ms);
@@ -3796,32 +3796,6 @@ mod tests {
             RunState::Cleaned,
             "a brand-new admission must not be born dead because a dead \
              job's leftover record still wears its recycled numeric key"
-        );
-    }
-
-    // A merge deciding "this is the same launch" must keep that launch's own
-    // age, so a caller can still tell its retry from the original by comparing.
-    #[test]
-    fn a_same_launch_merge_keeps_the_original_created_at() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        store.admit_run(&run_with(7, 1, 1_000)).unwrap();
-        store
-            .record_prolog(key(7, 1), 1_000, HookState::Running)
-            .unwrap();
-
-        let retry_created_at = 1_000 + 5_000;
-        store.admit_run(&run_with(7, 1, retry_created_at)).unwrap();
-
-        let after = store.load_run(key(7, 1)).unwrap();
-        assert_eq!(
-            after.prolog,
-            HookState::Running,
-            "the merge must still fire"
-        );
-        assert_eq!(
-            after.created_at_unix_ms, 1_000,
-            "a same-launch merge must not re-stamp the record with the retry's age"
         );
     }
 
