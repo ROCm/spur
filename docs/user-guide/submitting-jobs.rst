@@ -238,6 +238,8 @@ variables the job inherits. Default is ``ALL``.
 
 The ``NONE`` and list forms still forward the caller's ``SLURM_*`` and
 ``SPUR_*`` variables, matching Slurm, so a job keeps its scheduler context.
+The exception is the ``SPUR_AUTH_TOKEN`` credential, which these forms drop
+unless you name it explicitly (``--export=NONE,SPUR_AUTH_TOKEN``).
 
 .. code-block:: bash
 

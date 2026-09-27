@@ -55,9 +55,13 @@ pub(crate) fn resolve_export_env(
 }
 
 /// Copy the `SLURM_*`/`SPUR_*` variables Slurm always propagates.
+///
+/// The auth token is scheduler-prefixed but is a credential, not allocation
+/// context; a restricted export must not carry it into the job unless named.
 fn scheduler_vars(source: &HashMap<String, String>) -> HashMap<String, String> {
     source
         .iter()
+        .filter(|(k, _)| k.as_str() != crate::authclient::TOKEN_ENV)
         .filter(|(k, _)| k.starts_with("SLURM_") || k.starts_with("SPUR_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
@@ -93,6 +97,20 @@ mod tests {
         assert_eq!(env["SLURM_JOB_ID"], "42");
         assert_eq!(env["SPUR_NTASKS"], "4");
         assert!(!env.contains_key("HOME"));
+    }
+
+    #[test]
+    fn resolve_export_restricted_modes_drop_auth_token_unless_named() {
+        let mut source = source_env();
+        source.insert("SPUR_AUTH_TOKEN".into(), "secret".into());
+
+        for spec in ["NONE", "HOME", "MASTER_PORT=1"] {
+            let env = resolve_export_env(spec, source.clone());
+            assert!(!env.contains_key("SPUR_AUTH_TOKEN"), "{spec}");
+            assert_eq!(env["SPUR_NTASKS"], "4", "{spec}");
+        }
+        let named = resolve_export_env("NONE,SPUR_AUTH_TOKEN", source);
+        assert_eq!(named["SPUR_AUTH_TOKEN"], "secret");
     }
 
     #[test]
