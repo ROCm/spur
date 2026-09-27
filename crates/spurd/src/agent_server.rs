@@ -926,13 +926,9 @@ fn supervised_epilog_owed(
     if hooks.epilog.is_none() {
         return crate::admission::EpilogOwed::No;
     }
-    // A failed job-level Prolog is an admission-time gate that runs before the
-    // run's slice is ever used: reaching `Failed` means `launch_job` returned
-    // before admitting any participant, and its own stuck-prolog check refuses
-    // to run Prolog again for this same run key. No stepd was, or ever can be,
-    // spawned for this run attempt, so there is no epilog left to run either --
-    // without this, an empty supervisor list reads as `CannotTell` and strands
-    // the slice forever (there is provably nothing left that could clear it).
+    // A failed job-level Prolog gates before the run's slice is ever used, and
+    // `launch_job` refuses to retry it for this run key -- so no supervisor
+    // was, or ever can be, recorded, and an empty list here is not `CannotTell`.
     if admitted.run.prolog == crate::admission::HookState::Failed {
         return crate::admission::EpilogOwed::No;
     }
@@ -15419,12 +15415,13 @@ mod tests {
         );
     }
 
-    /// A failed job-level Prolog means execution never began: `launch_job`
-    /// returns before any participant or supervisor is ever admitted, and its
-    /// own gate refuses to re-run Prolog for the same run key. There is
-    /// therefore provably no epilog left to run, and the debt must not be
-    /// held forever on the strength of an empty, and so ambiguous,
-    /// supervisor list.
+    /// A failed job-level Prolog means execution never began: its own gate
+    /// refuses to re-run Prolog for the same run key, so no supervisor can
+    /// ever be recorded. There is therefore provably no epilog left to run,
+    /// and the debt must not be held forever on the strength of an empty, and
+    /// so ambiguous, supervisor list. `launch_job` does admit a participant
+    /// for the launch step before running Prolog, so this seeds one (with no
+    /// supervisor) to match the real on-disk shape a failed prolog leaves.
     #[test]
     fn cancelled_epilog_owed_is_no_when_prolog_never_let_execution_begin() {
         let state = tempfile::tempdir().expect("runtime state directory");
@@ -15441,6 +15438,15 @@ mod tests {
             ))
             .expect("admit the run");
         admissions
+            .admit_participant(&crate::admission::ParticipantAdmission::new(
+                41,
+                1,
+                spur_core::step::STEP_BATCH,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+            ))
+            .expect("admit the launch step's own participant record");
+        admissions
             .record_prolog(run, created_at, crate::admission::HookState::Failed)
             .expect("record the prolog's failure");
 
@@ -15455,6 +15461,48 @@ mod tests {
             "no stepd was ever spawned for a run whose prolog failed, \
              so its epilog can never run and the debt must not be held"
         );
+    }
+
+    /// Companion to the test above: an in-flight or unresolved Prolog must
+    /// still hold the slice under an empty supervisor list -- only a proven
+    /// `Failed` short-circuits the conservative default.
+    #[test]
+    fn cancelled_epilog_owed_still_holds_the_slice_while_prolog_is_unresolved() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let admissions = crate::admission::AdmissionStore::new(state.path(), "test-node");
+        let hooks = HooksConfig {
+            epilog: Some("/bin/true".into()),
+            ..Default::default()
+        };
+
+        for (job_id, prolog_state) in [
+            (42, crate::admission::HookState::Running),
+            (43, crate::admission::HookState::Unknown),
+            (44, crate::admission::HookState::NotStarted),
+        ] {
+            let run = key(job_id, 1);
+            let created_at = crate::admission::now_unix_ms();
+            admissions
+                .admit_run(&crate::admission::RunAdmission::new(
+                    job_id,
+                    1,
+                    "test-node",
+                    crate::admission::AdmittedResources::default(),
+                    created_at,
+                ))
+                .expect("admit the run");
+            if prolog_state != crate::admission::HookState::NotStarted {
+                admissions
+                    .record_prolog(run, created_at, prolog_state)
+                    .expect("record the prolog's state");
+            }
+
+            assert_eq!(
+                cancelled_epilog_owed(&admissions, &hooks, run),
+                crate::admission::EpilogOwed::Yes,
+                "prolog {prolog_state:?} is not proof nothing can still run the epilog"
+            );
+        }
     }
 
     /// The Drop-triggered admission cleanup is a spawned, fire-and-forget
