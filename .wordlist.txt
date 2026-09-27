@@ -21,6 +21,7 @@ FFI
 fairshare
 gRPC
 GRES
+hostfile
 hostlist
 hyperconverged
 InfiniBand
