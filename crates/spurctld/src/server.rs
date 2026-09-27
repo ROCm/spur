@@ -575,6 +575,62 @@ async fn answer_unrecorded_claims(
     answered_every_claim
 }
 
+/// Direction A, continued: a claim Raft also holds. Only a disposition saying
+/// teardown is done is new information here; everything else is Raft's
+/// already, so this never marks `outcome.unresolved` -- that would drain a
+/// node over a finished job it just hasn't been told to release.
+async fn settle_recorded_claims_marked_done(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    license: &ReconcileLicense<'_>,
+    outcome: &mut ReconcileOutcome,
+) {
+    let recorded = cluster.jobs_allocated_on_node(node);
+    let mut link: crate::scheduler_loop::AgentLink = None;
+    for (run, entry) in license
+        .held
+        .iter()
+        .filter(|(run, _)| recorded.contains(run))
+    {
+        let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
+        if !disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
+            continue;
+        }
+        // Same premises as the unrecorded case, re-checked per act for the same
+        // reason: a release still hands cores away, even one both sides agree on.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's settled claims alone");
+            break;
+        }
+        if !license.teardown_is_licensed(cluster) {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "unattested registration cannot license settling a claim Raft also holds; \
+                 leaving it alone"
+            );
+            continue;
+        }
+        if crate::scheduler_loop::settle_run_on_node(cluster, node, *run, &mut link).await {
+            info!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "agent held a finished run Raft also still holds; released it"
+            );
+            outcome.released.push(entry.job_id);
+        } else {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "agent would not release a finished run Raft also still holds"
+            );
+        }
+    }
+}
+
 /// As [`reconcile_node_ledger`], readiness taken unresolved so no part of the
 /// record can be read before it settles.
 async fn reconcile_node_ledger_after(
@@ -592,6 +648,7 @@ async fn reconcile_node_ledger_after(
     let mut outcome = ReconcileOutcome::default();
     let answered_every_claim =
         answer_unrecorded_claims(cluster, node, &license, &mut outcome).await;
+    settle_recorded_claims_marked_done(cluster, node, &license, &mut outcome).await;
 
     // Direction B: Raft records a run the agent did not report. Reasons from an
     // absence, so it needs a complete cut and a run no launch of ours raced.
@@ -7812,6 +7869,9 @@ mod tests {
 
     struct ProbeAgent {
         active: bool,
+        /// `Some` makes `settle_run` answer with this value instead of
+        /// `unimplemented`, standing in for an agent that actually settles.
+        settle_released: Option<bool>,
     }
 
     #[tonic::async_trait]
@@ -7843,7 +7903,13 @@ mod tests {
             &self,
             _request: Request<spur_proto::proto::SettleRunRequest>,
         ) -> Result<Response<spur_proto::proto::SettleRunResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            match self.settle_released {
+                Some(released) => Ok(Response::new(spur_proto::proto::SettleRunResponse {
+                    released,
+                    error: String::new(),
+                })),
+                None => Err(Status::unimplemented("not used in tests")),
+            }
         }
         async fn ping(
             &self,
@@ -7991,10 +8057,26 @@ mod tests {
 
     /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
     async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_full(active, None).await
+    }
+
+    /// Like [`spawn_probe_agent`], but `settle_run` answers `released` instead
+    /// of `unimplemented`, standing in for an agent that actually settles a run.
+    async fn spawn_settling_probe_agent(released: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_full(false, Some(released)).await
+    }
+
+    async fn spawn_probe_agent_full(
+        active: bool,
+        settle_released: Option<bool>,
+    ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active };
+        let agent = ProbeAgent {
+            active,
+            settle_released,
+        };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
@@ -12728,6 +12810,161 @@ mod tests {
             Some("holding claims the controller has no record of: 777"),
             "the node must be named and held, not just logged, so an operator can see it \
              without waiting an hour for the next automatic sweep"
+        );
+    }
+
+    /// Places a job Raft genuinely records as allocated to `node`, returning
+    /// `(job_id, run_attempt)`. Shared by the mutually-recorded reconcile tests.
+    async fn recorded_job_on_node(svc: &ControllerService, node: &str) -> (u32, u32) {
+        use spur_core::resource::ResourceAllocations;
+
+        let spec = spur_core::job::JobSpec {
+            name: "mutually-recorded".into(),
+            user: "ubuntu".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [(node.to_string(), res.clone())].into_iter().collect();
+        let run_attempt = svc
+            .cluster
+            .start_job(job_id, vec![node.to_string()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (job_id, run_attempt)
+    }
+
+    /// The gap this closes: `answer_unrecorded_claims` only ever looked at
+    /// claims Raft did *not* record, and Direction B only at runs the agent no
+    /// longer reported. A claim both sides agree is allocated fell through
+    /// both -- even though the agent's own disposition already said its
+    /// teardown was done. Before the fix this never gets examined at all, so
+    /// nothing here would fire; the assertions below fail against unfixed code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_claim_whose_teardown_is_done_is_settled_via_reconcile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let agent_addr = spawn_settling_probe_agent(true).await;
+        register_plain_node(&svc, "settle-node", agent_addr.port()).await;
+        svc.cluster
+            .agent_sessions()
+            .observe_registration("settle-node", "session-a");
+
+        let (job_id, run_attempt) = recorded_job_on_node(&svc, "settle-node").await;
+        assert!(
+            svc.cluster
+                .jobs_allocated_on_node("settle-node")
+                .contains(&spur_core::job::RunKey::new(job_id, run_attempt).unwrap()),
+            "the setup must place a claim Raft genuinely records, or this test proves nothing"
+        );
+
+        let ledger = spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![spur_proto::proto::LedgerEntry {
+                job_id,
+                run_attempt,
+                disposition: "over_but_charged".into(),
+                ..Default::default()
+            }],
+        };
+        let dispatched = svc.cluster.dispatch_tracker().watch("settle-node");
+
+        let outcome = reconcile_node_ledger_after(
+            &svc.cluster,
+            "settle-node",
+            ledger,
+            &dispatched,
+            CutProvenance::Pulled,
+            std::future::ready(true),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.released,
+            vec![job_id],
+            "a claim both sides agree is allocated must still be settled once its own \
+             disposition says teardown is done"
+        );
+        assert!(
+            outcome.cancelled.is_empty() && outcome.unresolved.is_empty(),
+            "a recorded claim is never cancelled, and settling it is not a fault to report"
+        );
+    }
+
+    /// The same mutually-recorded, teardown-done claim, but from an
+    /// unattested `Registered` cut under the default `Open` admission mode.
+    /// Settling is gated the same way an unrecorded claim's cancel is -- and,
+    /// unlike the unrecorded case, leaving it unsettled is not itself a fault
+    /// to surface, since Raft already accounts for the claim on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_claim_whose_teardown_is_done_is_left_alone_when_unlicensed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        assert_eq!(
+            svc.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open,
+            "this test exercises the default mode; a config change elsewhere would silently \
+             stop covering it"
+        );
+        // Answers `released: true` if ever asked -- so an empty `outcome.released`
+        // below can only mean the gate stopped this before the RPC, not a refusal.
+        let agent_addr = spawn_settling_probe_agent(true).await;
+        register_plain_node(&svc, "unlicensed-settle-node", agent_addr.port()).await;
+        svc.cluster
+            .agent_sessions()
+            .observe_registration("unlicensed-settle-node", "session-a");
+
+        let (job_id, run_attempt) = recorded_job_on_node(&svc, "unlicensed-settle-node").await;
+
+        let ledger = spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![spur_proto::proto::LedgerEntry {
+                job_id,
+                run_attempt,
+                disposition: "over_but_charged".into(),
+                ..Default::default()
+            }],
+        };
+        let dispatched = svc
+            .cluster
+            .dispatch_tracker()
+            .watch("unlicensed-settle-node");
+
+        let outcome = reconcile_node_ledger_after(
+            &svc.cluster,
+            "unlicensed-settle-node",
+            ledger,
+            &dispatched,
+            CutProvenance::Registered,
+            std::future::ready(true),
+        )
+        .await;
+
+        assert!(
+            outcome.released.is_empty(),
+            "an unattested registration must not license settling a claim Raft also holds"
+        );
+        assert!(
+            outcome.unresolved.is_empty() && outcome.cancelled.is_empty(),
+            "Raft already accounts for a recorded claim, so leaving it unsettled is not \
+             itself a fault to surface"
+        );
+        let node = svc.cluster.get_node("unlicensed-settle-node").unwrap();
+        assert!(
+            node.state_reason.is_none(),
+            "a recorded claim must never hold a node out of service"
         );
     }
 
