@@ -1838,6 +1838,9 @@ pub struct StepdRecoveryCleanup {
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
     admissions: crate::admission::AdmissionStore,
+    stepds_store: crate::stepd::StepdStore,
+    controller_addr: String,
+    hostname: String,
 }
 
 #[derive(Clone)]
@@ -1902,6 +1905,38 @@ impl StepdRecoveryCleanup {
             // tracking now would let a new attempt double-book resources
             // it's still using.
             return;
+        }
+        // The job-owning step is the only one whose exit ends the run on the
+        // controller: an epilog-gated node stays charged until that report
+        // lands, and rejection otherwise discards this run silently. Mirrors
+        // fence_dead_stepd's synthesis for a supervisor that died without
+        // reporting; a no-op wherever nothing is actually still owed.
+        if spur_core::step::owns_job_lifetime(descriptor.step_id) {
+            let recorded_exit = self
+                .stepds_store
+                .observed_exit(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                )
+                .ok()
+                .flatten();
+            let (exit_code, signal) =
+                recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
+            report_completion(
+                &self.controller_addr,
+                CompletionReport {
+                    job_id: descriptor.job_id,
+                    exit_code,
+                    signal,
+                    run_attempt: descriptor.run_attempt,
+                    reporting_node: &self.hostname,
+                    drain: None,
+                    step_id: Some(descriptor.step_id),
+                    payload: PayloadEvidence::Supervised(&self.stepds_store),
+                },
+            )
+            .await;
         }
         self.release_tracking(descriptor).await;
         cleanup_stepd_files(descriptor);
@@ -5197,6 +5232,9 @@ impl AgentService {
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
             admissions: self.admissions(),
+            stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+            controller_addr: self.reporter.controller_addr.clone(),
+            hostname: self.reporter.hostname.clone(),
         }
     }
 
@@ -12160,11 +12198,15 @@ mod tests {
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let state = tempfile::tempdir().expect("runtime state directory");
+        let stepds_store_dir = tempfile::tempdir().expect("stepds store directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
             admissions: crate::admission::AdmissionStore::new(state.path(), "test-node"),
+            stepds_store: crate::stepd::StepdStore::new(stepds_store_dir.path()),
+            controller_addr: "http://127.0.0.1:1".into(),
+            hostname: "test-node".into(),
         };
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,
@@ -12233,11 +12275,15 @@ mod tests {
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let state = tempfile::tempdir().expect("runtime state directory");
+        let stepds_store_dir = tempfile::tempdir().expect("stepds store directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
             admissions: crate::admission::AdmissionStore::new(state.path(), "test-node"),
+            stepds_store: crate::stepd::StepdStore::new(stepds_store_dir.path()),
+            controller_addr: "http://127.0.0.1:1".into(),
+            hostname: "test-node".into(),
         };
         let descriptor = crate::stepd::StepdDescriptor::new(
             42,
@@ -12407,11 +12453,15 @@ mod tests {
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let state = tempfile::tempdir().expect("runtime state directory");
+        let stepds_store_dir = tempfile::tempdir().expect("stepds store directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
             admissions: crate::admission::AdmissionStore::new(state.path(), "test-node"),
+            stepds_store: crate::stepd::StepdStore::new(stepds_store_dir.path()),
+            controller_addr: "http://127.0.0.1:1".into(),
+            hostname: "test-node".into(),
         };
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
@@ -13058,6 +13108,106 @@ mod tests {
             pending_replays(&store),
             0,
             "an acknowledged report leaves nothing for the replay loop"
+        );
+    }
+
+    // A stale-recovery rejection tears down and discards the job-owning step's
+    // session exactly like fencing does, but previously never told the
+    // controller — so a node whose job finished only owing its epilog (an
+    // epilog-gated node per WalOperation::JobStart) stayed charged forever:
+    // nothing else was ever going to complete the report that frees it. Only
+    // an operator's `scontrol update Reconcile=yes` could clear it.
+    #[tokio::test]
+    async fn stale_recovery_rejection_reports_completion_to_the_controller() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let descriptor = fenced_session(&store);
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let cleanup = StepdRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            stepds: sessions.clone(),
+            stepds_store: store.clone(),
+            controller_addr,
+            hostname: "test-node".into(),
+        };
+
+        // `Ok(())`: the stop request succeeded and the descriptor carries no
+        // cgroup/workload pid to re-check, so teardown is confirmed the same
+        // way a bare `reject()` would see it for an allocation-only session.
+        cleanup.finish_rejection(&descriptor, Ok(())).await;
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(
+            reports.len(),
+            1,
+            "a confirmed-dead job-owning step must report its exit, same as fencing does"
+        );
+        assert_eq!(reports[0].job_id, 42);
+        assert_eq!(reports[0].run_attempt, 7);
+        assert_eq!(reports[0].step_id, Some(spur_core::step::STEP_BATCH));
+    }
+
+    // The interactive step never owns the job's lifetime, so its own rejection
+    // must stay silent — reporting it would race the real job-owning step's
+    // own completion (or invent one for a job that is still legitimately
+    // running elsewhere).
+    #[tokio::test]
+    async fn stale_recovery_rejection_of_a_non_lifecycle_step_reports_nothing() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            spur_core::step::STEP_INTERACTIVE,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            store
+                .session_dir(42, 7, spur_core::step::STEP_INTERACTIVE)
+                .join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let cleanup = StepdRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            stepds: sessions.clone(),
+            stepds_store: store.clone(),
+            controller_addr,
+            hostname: "test-node".into(),
+        };
+
+        cleanup.finish_rejection(&descriptor, Ok(())).await;
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert!(
+            reports.is_empty(),
+            "an interactive step's rejection must never report a job completion"
         );
     }
 
