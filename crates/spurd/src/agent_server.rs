@@ -12340,11 +12340,15 @@ mod tests {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let state = tempfile::tempdir().expect("runtime state directory");
         let admissions = crate::admission::AdmissionStore::new(state.path(), "test-node");
+        let stepds_store_dir = tempfile::tempdir().expect("stepds store directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
             admissions: admissions.clone(),
+            stepds_store: crate::stepd::StepdStore::new(stepds_store_dir.path()),
+            controller_addr: "http://127.0.0.1:1".into(),
+            hostname: "test-node".into(),
         };
         let (mut child, descriptor) = spawn_wedged_stepd_stub(925, 1).await;
         sessions
@@ -12400,11 +12404,15 @@ mod tests {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let state = tempfile::tempdir().expect("runtime state directory");
         let admissions = crate::admission::AdmissionStore::new(state.path(), "test-node");
+        let stepds_store_dir = tempfile::tempdir().expect("stepds store directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
             admissions,
+            stepds_store: crate::stepd::StepdStore::new(stepds_store_dir.path()),
+            controller_addr: "http://127.0.0.1:1".into(),
+            hostname: "test-node".into(),
         };
         let (mut child, descriptor) = spawn_wedged_stepd_stub(926, 1).await;
         sessions
@@ -13134,10 +13142,12 @@ mod tests {
             .lock()
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
+        let admissions_dir = tempfile::tempdir().expect("admission state directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            admissions: crate::admission::AdmissionStore::new(admissions_dir.path(), "test-node"),
             stepds_store: store.clone(),
             controller_addr,
             hostname: "test-node".into(),
@@ -13193,10 +13203,12 @@ mod tests {
             .lock()
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
+        let admissions_dir = tempfile::tempdir().expect("admission state directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            admissions: crate::admission::AdmissionStore::new(admissions_dir.path(), "test-node"),
             stepds_store: store.clone(),
             controller_addr,
             hostname: "test-node".into(),
