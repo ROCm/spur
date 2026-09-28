@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
@@ -481,6 +481,43 @@ async fn open_reconcile_license<'a>(
     })
 }
 
+/// How long a run's disappearance from Raft stays inconclusive rather than proof
+/// of an orphan. Bounds the round trip a completion's own acknowledgement needs
+/// to reach the agent and be applied there -- generous against realistic
+/// scheduling jitter (e.g. the ledger-pull fan-out right after a leadership
+/// change), far short of what it takes to call a genuinely abandoned run's slice
+/// still in doubt.
+const UNRECORDED_CLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(10);
+
+/// Whether an `end_time` falls less than `grace` before `now`. Split from its
+/// caller so the grace policy is checkable against exact instants, not just
+/// against whatever the wall clock reads while the test runs.
+fn recently_finalized(
+    end_time: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    end_time.is_some_and(|end_time| now.signed_duration_since(end_time) < grace)
+}
+
+/// Whether `job_id` finalized on this controller more recently than `grace` ago.
+/// Raft dropping a run's allocation and the agent hearing about it are the same
+/// event on two clocks; a job that finalized moments ago explains an "unrecorded"
+/// claim that is really just waiting on its own acknowledgement, not a run
+/// nothing will ever settle. A job this controller no longer remembers at all
+/// (evicted, or never existed) answers `false`: it lends the claim no cover.
+fn job_finalized_within(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    grace: chrono::Duration,
+) -> bool {
+    recently_finalized(
+        cluster.get_job(job_id).and_then(|job| job.end_time),
+        Utc::now(),
+        grace,
+    )
+}
+
 /// Direction A: answer every claim the node holds that Raft has no record of.
 /// False when one went unanswered, leaving it part of `outcome.unresolved`.
 async fn answer_unrecorded_claims(
@@ -546,6 +583,22 @@ async fn answer_unrecorded_claims(
         // "Cannot tell" is never "dead". Nothing here licenses ending the claim
         // and nothing proves it is over, so it is named rather than acted on.
         if disposition.is_some_and(spur_core::job::LedgerDisposition::already_accounted_for) {
+            // Raft dropping this run and the agent clearing its own hold are two
+            // sides of the same completion, joined only by a round trip: the
+            // controller commits, then answers the agent's report, then the agent
+            // acts on that answer. A pull that lands inside that gap reads the two
+            // sides mid-handoff -- not a run nothing will ever settle. Give it one
+            // more pass before spending it as proof of an orphan.
+            if job_finalized_within(cluster, entry.job_id, UNRECORDED_CLAIM_GRACE) {
+                debug!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    run_attempt = entry.run_attempt,
+                    disposition = %entry.disposition,
+                    "this job finalized moments ago; giving its acknowledgement time to reach the agent before treating the claim as unresolved"
+                );
+                continue;
+            }
             warn!(
                 node = %node,
                 job_id = entry.job_id,
@@ -13017,6 +13070,152 @@ mod tests {
         assert!(
             node.state_reason.is_none(),
             "a recorded claim must never hold a node out of service"
+        );
+    }
+
+    #[test]
+    fn recently_finalized_is_true_just_inside_the_grace_window() {
+        let now = Utc::now();
+        let end_time = now - chrono::Duration::seconds(9);
+        assert!(recently_finalized(
+            Some(end_time),
+            now,
+            chrono::Duration::seconds(10)
+        ));
+    }
+
+    #[test]
+    fn recently_finalized_is_false_once_the_grace_window_has_passed() {
+        let now = Utc::now();
+        let end_time = now - chrono::Duration::seconds(11);
+        assert!(!recently_finalized(
+            Some(end_time),
+            now,
+            chrono::Duration::seconds(10)
+        ));
+    }
+
+    #[test]
+    fn recently_finalized_is_false_with_no_end_time() {
+        assert!(!recently_finalized(
+            None,
+            Utc::now(),
+            chrono::Duration::seconds(10)
+        ));
+    }
+
+    /// Regression test for the outage-reconcile race: immediately after this
+    /// controller itself finalizes a job (dropping it from `recorded`), the
+    /// agent's own cut of the same run still says `unresolved` -- its
+    /// acknowledgement of that exact completion has not had time to reach it and
+    /// clear the hold. A pull landing in that gap (both the mandatory pass a
+    /// leadership change fires and, before this fix, the redundant one right
+    /// behind it) must not spend that as proof of an orphan and drain the node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrecorded_unresolved_claim_moments_after_finalizing_is_not_drained() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "race-node", 6827).await;
+        svc.cluster
+            .agent_sessions()
+            .observe_registration("race-node", "session-a");
+
+        let (job_id, run_attempt) = recorded_job_on_node(&svc, "race-node").await;
+        svc.cluster
+            .node_complete(job_id, "race-node", 0, 0, run_attempt)
+            .expect("finalizing the only node must succeed");
+        assert!(
+            !svc.cluster
+                .jobs_allocated_on_node("race-node")
+                .contains(&spur_core::job::RunKey::new(job_id, run_attempt).unwrap()),
+            "the setup must actually drop the job from Raft's allocation, or this test proves \
+             nothing"
+        );
+
+        let ledger = spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![spur_proto::proto::LedgerEntry {
+                job_id,
+                run_attempt,
+                disposition: "unresolved".into(),
+                ..Default::default()
+            }],
+        };
+        let dispatched = svc.cluster.dispatch_tracker().watch("race-node");
+
+        let outcome = reconcile_node_ledger_after(
+            &svc.cluster,
+            "race-node",
+            ledger,
+            &dispatched,
+            CutProvenance::Pulled,
+            std::future::ready(true),
+        )
+        .await;
+
+        assert!(
+            outcome.unresolved.is_empty(),
+            "a claim whose job finalized moments ago must not be drained on a pass that beat \
+             the claim's own acknowledgement round trip"
+        );
+        assert!(
+            outcome.cancelled.is_empty() && outcome.released.is_empty(),
+            "nothing here licenses acting on the claim either -- it is genuinely still in doubt"
+        );
+        let node = svc.cluster.get_node("race-node").unwrap();
+        assert!(
+            node.state_reason.is_none(),
+            "the node must not be held out of service over a claim that is only moments stale"
+        );
+    }
+
+    /// The other half of the same fix: a claim naming a job this controller has
+    /// no record of at all (never submitted, or long since evicted) gets no
+    /// grace -- nothing here says it is only moments stale, so it must still
+    /// surface as unresolved. Otherwise a genuinely abandoned run's slice would
+    /// never drain the node, which is the failure mode the grace period must
+    /// not introduce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrecorded_unresolved_claim_with_no_job_record_still_drains() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "orphan-node", 6828).await;
+        svc.cluster
+            .agent_sessions()
+            .observe_registration("orphan-node", "session-a");
+        assert!(
+            svc.cluster.get_job(999_999).is_none(),
+            "the setup must name a job this controller genuinely has no record of"
+        );
+
+        let ledger = spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: true,
+            entries: vec![spur_proto::proto::LedgerEntry {
+                job_id: 999_999,
+                run_attempt: 1,
+                disposition: "unresolved".into(),
+                ..Default::default()
+            }],
+        };
+        let dispatched = svc.cluster.dispatch_tracker().watch("orphan-node");
+
+        let outcome = reconcile_node_ledger_after(
+            &svc.cluster,
+            "orphan-node",
+            ledger,
+            &dispatched,
+            CutProvenance::Pulled,
+            std::future::ready(true),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.unresolved,
+            vec![999_999],
+            "a claim with no job record to explain its absence must still drain the node -- \
+             this is the genuinely-abandoned case the grace period must not blind"
         );
     }
 

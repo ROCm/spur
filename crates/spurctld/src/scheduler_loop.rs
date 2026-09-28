@@ -224,6 +224,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // history; rebuild from the job records before this term's placements.
         if entering_term {
             cluster.recompute_node_allocations();
+            // Counts as this term's first routine sweep too: without this, the
+            // `None` starting value below made the very next tick fire a second,
+            // redundant full-cluster pull a moment later instead of waiting out
+            // `LEDGER_SWEEP_INTERVAL` as intended -- doubling, on every leadership
+            // change, the odds of a pull landing inside a completion's own
+            // acknowledgement round trip.
+            last_ledger_sweep = Some(Instant::now());
             let pull_cluster = cluster.clone();
             tokio::spawn(async move {
                 pull_all_node_ledgers(&pull_cluster, "leadership gain").await;
