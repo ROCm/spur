@@ -5456,11 +5456,12 @@ impl SlurmAgent for AgentService {
             .await;
         let (alloc_result, allocated_device_ids) = match reserved {
             Ok(reserved) => reserved,
-            // A transport error has nowhere to carry the holder, so the
-            // controller's reconcile never fires on one.
+            // An ordinary response, not a transport error, so it can carry the
+            // holder the controller's reconcile needs.
             Err(LaunchRejection::Held(refusal)) => {
                 return Ok(Response::new(refusal.into_response()));
             }
+            // Nothing this node holds to name; a plain RPC error as before.
             Err(LaunchRejection::Failed(status)) => return Err(status),
         };
 
@@ -8552,6 +8553,8 @@ impl HeldRefusal {
                 job_id,
                 run_attempt,
                 cpu_ids: Vec::new(),
+                // Diagnostic only and unconsumed today; truncates a stable_id's
+                // domain bits above 0xFF (the wire field is a fixed u32).
                 gpu_devices: gpu_devices.into_iter().map(|id| id as u32).collect(),
             }),
         }
@@ -8742,8 +8745,8 @@ impl AgentService {
                             "rejecting dispatch: controller-allocated GPUs already in use in the \
                              local allocation table by a still-running or launching job"
                         );
-                        // Named so the controller can look the holder up rather
-                        // than guess which of the two is stale.
+                        // Named (arbitrarily, if more than one) so the controller
+                        // can look the holder up rather than guess which is stale.
                         let holder = alloc
                             .conflicting_owners(&controller_gpu_ids)
                             .first()
@@ -8752,11 +8755,7 @@ impl AgentService {
                             Some(job_id) => HeldRefusal::named(
                                 job_id,
                                 alloc.owner_attempt(job_id).unwrap_or(0),
-                                alloc
-                                    .held_job_gpu_ids()
-                                    .get(&job_id)
-                                    .cloned()
-                                    .unwrap_or_default(),
+                                alloc.owner_gpu_ids(job_id),
                             ),
                             None => HeldRefusal::unattributed(
                                 "controller-allocated GPUs unavailable on this node",

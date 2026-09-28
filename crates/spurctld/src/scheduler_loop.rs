@@ -1656,8 +1656,9 @@ impl std::fmt::Display for DispatchError {
             Self::TimedOut(limit) => {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
-            Self::AgentRejected(reason) | Self::NeedsReconcile(reason) => {
-                write!(f, "agent rejected job: {reason}")
+            Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::NeedsReconcile(reason) => {
+                write!(f, "node holds unaccounted resources: {reason}")
             }
             Self::Other(e) => write!(f, "{e:#}"),
         }
