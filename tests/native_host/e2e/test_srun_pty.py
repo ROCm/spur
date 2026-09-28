@@ -55,6 +55,15 @@ def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -
     return sessions
 
 
+def _wait_for_file(cluster, path: str, deadline: float, node_index: int = 0) -> bool:
+    node = cluster.nodes[node_index]
+    while time.time() < deadline:
+        if node.exec_allow_fail(f"test -e '{path}' && echo yes || true").strip() == "yes":
+            return True
+        time.sleep(1)
+    return False
+
+
 def _assert_ticks_not_replayed(out: str, ticks: int = 20) -> None:
     """A shell relaunched from scratch after a restart repeats its early
     ticks; a reconnect racing the restart only drops a line or two of a
@@ -188,6 +197,7 @@ class TestSrunPtyStepSupervision:
     def test_pty_step_survives_an_agent_restart(self, cluster):
         result: dict[str, object] = {}
         job_name = f"pty-restart-survival-{time.time_ns()}"
+        marker = f"{cluster.remote_dir}/{job_name}.started"
         # Pinned: the session check and the restart both target node 0, so an
         # unpinned allocation could land elsewhere and make both a no-op.
         node = cluster.node_names[0]
@@ -195,6 +205,7 @@ class TestSrunPtyStepSupervision:
         def run():
             result["code"], result["out"] = cluster.salloc_run(
                 "srun --pty bash -c '"
+                f'touch "{marker}"; '
                 "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
                 "echo SURVIVED'\n",
                 salloc_args=["-N", "1", "-w", node, "-t", "0:05", "-J", job_name],
@@ -213,14 +224,12 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
-            before: set[str] = set()
-            while time.time() < deadline:
-                # A bare (non-container) --pty step has no numbered-step
-                # supervisor of its own — only the shared terminal placeholder.
-                before = _reserved_step_sessions_for_job(cluster, job_id)
-                if before:
-                    break
-                time.sleep(1)
+            # The allocation's session exists before srun connects; restarting
+            # the agent in that gap fails the connect instead of dropping a live stream.
+            assert _wait_for_file(cluster, marker, deadline), "the pty command never started"
+            # A bare (non-container) --pty step has no numbered-step
+            # supervisor of its own — only the shared terminal placeholder.
+            before = _reserved_step_sessions_for_job(cluster, job_id)
             assert before, "expected a session for the pty step before the restart"
 
             cluster.restart_agent(0)
@@ -289,12 +298,14 @@ class TestSrunPtyStepSupervision:
         # just as durable, not skipped because the job happens to be --pty.
         result: dict[str, object] = {}
         job_name = f"standalone-pty-restart-{time.time_ns()}"
+        marker = f"{cluster.remote_dir}/{job_name}.started"
         node = cluster.node_names[0]
 
         def run():
             result["code"], result["out"] = cluster.srun_with_exit([
                 "-N", "1", "-w", node, "-t", "0:05", "-J", job_name, "--pty",
                 "bash", "-c",
+                f"touch '{marker}'; "
                 "for i in $(seq 1 20); do echo tick $i; sleep 1; done; echo SURVIVED",
             ])
 
@@ -311,12 +322,8 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the standalone job to appear before the restart"
 
-            before: set[str] = set()
-            while time.time() < deadline:
-                before = _reserved_step_sessions_for_job(cluster, job_id)
-                if before:
-                    break
-                time.sleep(1)
+            assert _wait_for_file(cluster, marker, deadline), "the pty command never started"
+            before = _reserved_step_sessions_for_job(cluster, job_id)
             assert before, "expected the job's own supervisor before the restart"
 
             cluster.restart_agent(0)
@@ -340,11 +347,13 @@ class TestSrunPtyStepSupervision:
         # retried by the CLI, not reported as if the workload itself failed.
         result: dict[str, object] = {}
         job_name = f"pty-reconnect-{time.time_ns()}"
+        marker = f"{cluster.remote_dir}/{job_name}.started"
         node = cluster.node_names[0]
 
         def run():
             result["code"], result["out"] = cluster.salloc_run(
                 "srun --pty bash -c '"
+                f'touch "{marker}"; '
                 "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
                 "echo SURVIVED'\n",
                 salloc_args=["-N", "1", "-w", node, "-t", "0:05", "-J", job_name],
@@ -363,13 +372,7 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
-            before: set[str] = set()
-            while time.time() < deadline:
-                before = _reserved_step_sessions_for_job(cluster, job_id)
-                if before:
-                    break
-                time.sleep(1)
-            assert before, "expected a session for the pty step before the restart"
+            assert _wait_for_file(cluster, marker, deadline), "the pty command never started"
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
